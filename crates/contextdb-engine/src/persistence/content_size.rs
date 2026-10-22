@@ -15,11 +15,13 @@ pub(crate) struct ContentSizeTotals {
     pub(crate) retained_vector_bytes: u64,
 }
 impl ContentSizeTotals {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn live_content_bytes(self) -> Result<u64> {
         self.live_row_bytes
             .checked_add(self.live_vector_bytes)
             .ok_or_else(|| corrupt("live content size overflow"))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 32 {
             return Err(corrupt("invalid content-size totals"));
@@ -60,12 +62,14 @@ fn corrupt(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
         reason: reason.into(),
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn changed(value: u64, old: u64, new: u64) -> Result<u64> {
     value
         .checked_sub(old)
         .and_then(|value| value.checked_add(new))
         .ok_or_else(|| corrupt("content-size counter overflow/underflow"))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn update(
     write: &redb::WriteTransaction,
     table: &str,
@@ -86,6 +90,7 @@ fn update(
         .map_err(RedbPersistence::storage_error)?;
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn initialize(write: &redb::WriteTransaction) -> Result<()> {
     write
         .open_table(TOTALS)
@@ -98,6 +103,7 @@ pub(super) fn initialize(write: &redb::WriteTransaction) -> Result<()> {
         .map_err(RedbPersistence::storage_error)?;
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn ensure_table(write: &redb::WriteTransaction, table: &str) -> Result<()> {
     let mut totals = write
         .open_table(TOTALS)
@@ -142,6 +148,7 @@ pub(super) fn ensure_table(write: &redb::WriteTransaction, table: &str) -> Resul
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn reset_rows(write: &redb::WriteTransaction, table: &str) -> Result<()> {
     ensure_table(write, table)?;
     update(write, table, |value| {
@@ -172,6 +179,7 @@ pub(super) fn reset_rows(write: &redb::WriteTransaction, table: &str) -> Result<
 }
 /// Reset one fixed-width component while preserving the independent component.
 /// The scan is part of the existing whole-image replacement, never query/open.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reset_bodies(write: &redb::WriteTransaction, bytes: bool) -> Result<()> {
     use std::ops::Bound;
     let mut after: Option<Vec<u8>> = None;
@@ -206,9 +214,11 @@ fn reset_bodies(write: &redb::WriteTransaction, bytes: bool) -> Result<()> {
         after = Some(key);
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn reset_vector_bytes(write: &redb::WriteTransaction) -> Result<()> {
     reset_bodies(write, true)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn reset_memberships(write: &redb::WriteTransaction) -> Result<()> {
     reset_bodies(write, false)
 }
@@ -241,6 +251,7 @@ pub(super) struct VersionLife<'k> {
 
 impl VersionLife<'_> {
     /// Every (key, row) position of a decoded `row` under `indexes`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn keys_of(indexes: &[IndexDecl], row: &VersionedRow) -> Result<Vec<Vec<u8>>> {
         indexes
             .iter()
@@ -255,6 +266,7 @@ impl VersionLife<'_> {
 
     /// Every (key, row) position of a stored row body under `indexes`,
     /// projecting only the indexed columns out of the body.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn keys_of_body(indexes: &[IndexDecl], body: &[u8]) -> Result<Vec<Vec<u8>>> {
         indexes
             .iter()
@@ -307,6 +319,7 @@ pub(super) fn open_vectors(
     })
 }
 impl ContentTable<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn transition(&self, key: &[u8], old: u64, new: u64) -> Result<()> {
         if self.vector {
             return body_bytes(self.write, key, old, new);
@@ -332,6 +345,7 @@ impl ContentTable<'_> {
         &self.indexes
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fold_versions(
         &self,
         batch: &mut historical_index_commitment::CommitmentBatch,
@@ -371,6 +385,7 @@ impl ContentTable<'_> {
     /// The lifetime already stored under `key`, with the given index keys: a
     /// physical key names one version, whose values never change, so only
     /// its lifetime is read back, without decoding any value.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stored_life<'k>(&self, key: &[u8], keys: &'k [Vec<u8>]) -> Result<Option<VersionLife<'k>>> {
         let Some(stored) = self
             .inner
@@ -390,6 +405,7 @@ impl ContentTable<'_> {
     /// Write one row version with its index keys, replacing the lifetime of
     /// the same version when it was already stored. For a table without
     /// index declarations `new.keys` is empty and nothing is folded.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn insert_version(
         &mut self,
         batch: &mut historical_index_commitment::CommitmentBatch,
@@ -417,6 +433,7 @@ impl ContentTable<'_> {
 
     /// Write one encoded row body whose caller holds no decoded row: its
     /// index keys are projected from the indexed columns' bytes only.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn insert_body(
         &mut self,
         batch: &mut historical_index_commitment::CommitmentBatch,
@@ -443,6 +460,7 @@ impl ContentTable<'_> {
 
     /// Remove one stored row version, with its index keys; nothing when no
     /// version is stored under `key`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn remove_version(
         &mut self,
         batch: &mut historical_index_commitment::CommitmentBatch,
@@ -467,6 +485,7 @@ impl ContentTable<'_> {
     }
 
     /// Remove one stored row version whose caller holds no decoded row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn remove_body(
         &mut self,
         batch: &mut historical_index_commitment::CommitmentBatch,
@@ -517,6 +536,7 @@ struct BodyState {
     bytes: u64,
     live: u64,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn body_table(key: &[u8]) -> Result<&str> {
     std::str::from_utf8(
         key.split(|byte| *byte == 0)
@@ -525,6 +545,7 @@ fn body_table(key: &[u8]) -> Result<&str> {
     )
     .map_err(|_| corrupt("invalid vector table"))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn body_transition(
     write: &redb::WriteTransaction,
     key: &[u8],
@@ -564,6 +585,7 @@ fn body_transition(
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn body_bytes(write: &redb::WriteTransaction, key: &[u8], old: u64, new: u64) -> Result<()> {
     body_transition(write, key, |state| {
         if state.bytes != old {
@@ -575,6 +597,7 @@ fn body_bytes(write: &redb::WriteTransaction, key: &[u8], old: u64, new: u64) ->
         Ok(())
     })
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn membership_transition(
     write: &redb::WriteTransaction,
     previous: Option<&VectorPartitionMembershipRecord>,
@@ -606,6 +629,7 @@ pub(super) fn membership_transition(
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn reconcile_row_heads(
     write: &redb::WriteTransaction,
     mutations: &[content_identity::ContentIdentityMutation],
@@ -617,6 +641,7 @@ pub(super) fn reconcile_row_heads(
     reconcile_row_heads_holding(write, mutations, &mut relations)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reconcile_row_heads_holding<'name, 'txn, A: writer_row_heads::RowHeadAdmission>(
     write: &'txn redb::WriteTransaction,
     mutations: &'name [content_identity::ContentIdentityMutation],
@@ -716,6 +741,7 @@ fn reconcile_row_heads_holding<'name, 'txn, A: writer_row_heads::RowHeadAdmissio
 }
 /// Abnormal transaction-order repair already selects and decodes each record.
 /// Reprice its exact rewritten value while that selected record is in hand.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn repair_row_value(
     write: &redb::WriteTransaction,
     table: &str,
@@ -772,6 +798,7 @@ pub(super) fn repair_row_value(
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn repair_vector_value(
     write: &redb::WriteTransaction,
     old_key: &[u8],
@@ -783,6 +810,7 @@ pub(super) fn repair_vector_value(
     body_bytes(write, new_key, 0, new_bytes as u64)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn read_totals(
     read: &redb::ReadTransaction,
     path: &str,

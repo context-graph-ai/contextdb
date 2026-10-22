@@ -9,6 +9,7 @@ use contextdb_vector::hnsw::paged_builder::{
 use contextdb_vector::hnsw::saved_topology::{SavedPointCursor, SavedTopology};
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_saved_topology_candidate(
         &self,
         candidate: &VectorPartitionGenerationCandidate,
@@ -21,6 +22,7 @@ impl RedbPersistence {
         self.prepare_saved_topology_candidate_with_schema_binding(candidate, binding, false, admit)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_saved_topology_candidate_with_schema_binding(
         &self,
         candidate: &VectorPartitionGenerationCandidate,
@@ -37,6 +39,7 @@ impl RedbPersistence {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_saved_topology_candidate_for_purge(
         &self,
         candidate: &VectorPartitionGenerationCandidate,
@@ -52,6 +55,7 @@ impl RedbPersistence {
         self.prepare_saved_topology_candidate_inner(candidate, binding, true, false, admit)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_saved_topology_candidate_inner(
         &self,
         candidate: &VectorPartitionGenerationCandidate,
@@ -185,6 +189,7 @@ impl RedbPersistence {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn export_saved_topology(
         &self,
         route: &VectorPartitionRef,
@@ -689,6 +694,7 @@ impl RedbPersistence {
     }
     /// The exact key of a saved row's original body, as the graph files it:
     /// F32 bits big-endian, or the quantized graph bytes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn saved_original_exact_key(
         &self,
         read: &redb::ReadTransaction,
@@ -759,6 +765,7 @@ impl RedbPersistence {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_saved_original_body(
         &self,
         read: &redb::ReadTransaction,
@@ -847,6 +854,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn install_saved_generation_objects(
         &self,
         candidate: &VectorPartitionGenerationCandidate,
@@ -968,6 +976,7 @@ impl RedbPersistence {
         })
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn saved_member(
     read: &redb::ReadTransaction,
     route: &VectorPartitionRef,
@@ -1039,6 +1048,7 @@ struct SavedExportRecord {
     generation_key: Vec<u8>,
     is_base: bool,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_saved_export(storage: u64, encoded: &[u8]) -> Result<SavedExportRecord> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     let owner: SavedExportRecord =
@@ -1058,6 +1068,7 @@ fn decode_saved_export(storage: u64, encoded: &[u8]) -> Result<SavedExportRecord
 }
 /// Only the still-owned private artifact may be retired. Atomic catalog
 /// publication removes this owner in the same transaction as selection.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn retire_saved_export_roots_in_write(
     write: &redb::WriteTransaction,
     owner: &SavedExportRecord,
@@ -1143,6 +1154,7 @@ fn retire_saved_export_roots_in_write(
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn saved_export_owned_in_write(
     write: &redb::WriteTransaction,
     storage: u64,
@@ -1159,6 +1171,7 @@ pub(super) fn saved_export_owned_in_write(
     }
     Ok(false)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn release_saved_export_in_write(
     write: &redb::WriteTransaction,
     storage: u64,
@@ -1172,6 +1185,7 @@ pub(super) fn release_saved_export_in_write(
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn recover_saved_exports_in_write(
     write: &redb::WriteTransaction,
     cutoff: u64,
@@ -1232,6 +1246,7 @@ pub(super) fn recover_saved_exports_in_write(
     Ok(())
 }
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn has_recoverable_saved_exports(&self) -> Result<bool> {
         let cutoff = self.saved_export_recovery_cutoff()?;
         self.with_db(|db| {
@@ -1293,6 +1308,7 @@ impl SavedExportOwnership {
             storage: [None; 2],
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire(&mut self, storage: u64) -> Result<()> {
         let slot = self
             .storage
@@ -1302,6 +1318,7 @@ impl SavedExportOwnership {
         *slot = Some(storage);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn abandon(&self) -> Result<()> {
         let companion = self
             .companion

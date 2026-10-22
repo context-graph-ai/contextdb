@@ -4,6 +4,7 @@ use super::*;
 use std::ops::Bound;
 
 impl WriterSnapshot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_config_into(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -12,12 +13,14 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).copy_config_into(owner, artifact)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_authored_into(
         self: &Arc<Self>, owner: SourceWindowOwner, artifact: &RedbPersistence, through: Lsn,
     ) -> Result<()> {
         WriterSnapshotHandle::from(self.clone()).copy_authored_into(owner, artifact, through)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_ddl_into(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -29,6 +32,7 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_config_into(
         &self,
         owner: SourceWindowOwner,
@@ -55,6 +59,7 @@ impl WriterSnapshotHandle {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_authored_into(
         &self, owner: SourceWindowOwner, artifact: &RedbPersistence, through: Lsn,
     ) -> Result<()> {
@@ -79,6 +84,7 @@ impl WriterSnapshotHandle {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_ddl_into(
         &self,
         owner: SourceWindowOwner,
@@ -131,6 +137,7 @@ impl WriterSnapshotHandle {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn append_authored_row(&self, table: &str, meta: &TableMeta, row: &VersionedRow) -> Result<()> {
         self.prepare_proof_owner()?;
         let _decode = self.writer_decode_scope()?;
@@ -141,6 +148,7 @@ impl RedbPersistence {
         self.append_encoded_authored_occurrence(&key, &encoded)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_encoded_authored_occurrence(&self, key: &str, encoded: &[u8]) -> Result<()> {
         self.prepare_proof_owner()?;
         let _decode = self.writer_decode_scope()?;
@@ -157,6 +165,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_encoded_config_occurrence(&self, key: &str, encoded: &[u8]) -> Result<()> {
         self.prepare_proof_owner()?;
         let mut admission = self.proof_admission();
@@ -192,6 +201,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_ddl_occurrence(&self, key: &str, lsn: Lsn, change: &DdlChange) -> Result<()> {
         self.prepare_proof_owner()?;
         let mut admission = self.proof_admission();

@@ -80,6 +80,7 @@ impl StorageFunding {
     // Bootstrap uses the same held Original and its existing scalar policy.
     // Static diagnostic labels borrow their backing; no diagnostic invoice is
     // needed. Legacy reader adapters retain their existing Error kernel.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_unqualified(&self, layout: Layout) -> Result<StorageAllocation> {
         match self {
             Self::Original(original) => {
@@ -113,6 +114,7 @@ impl StorageFunding {
             }
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_scope(
         &self,
         layout: Layout,
@@ -170,6 +172,7 @@ impl StorageFunding {
 // Validate and retain the exact held writer before entering scalar admission.
 // Both the zero-byte capability clone and the actual scope-cell debit keep the
 // bootstrap's original pending_directory labels and hint, including on refusal.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reserve_original_bootstrap(
     original: &OwnedMemoryReservation,
     bytes: usize,
@@ -219,6 +222,7 @@ unsafe fn finish_receipt(raw: NonNull<()>) {
     drop(allocation);
     drop(control);
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn paid_receipt(
     scope: &StorageScope,
     layout: Layout,
@@ -347,6 +351,7 @@ pub(crate) struct StorageAdmissionScope {
 unsafe impl Send for StorageAdmissionScope {}
 unsafe impl Sync for StorageAdmissionScope {}
 impl StorageAdmissionScope {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn writer_original(original: &OwnedMemoryReservation) -> Result<Self> {
         let original = reserve_original_bootstrap(original, 0)?;
         Self::new_unqualified(StorageFunding::Original(original))
@@ -383,6 +388,7 @@ impl StorageAdmissionScope {
         }
         Ok(Self { pointer })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn run_original_unqualified<R>(&self, operation: impl FnOnce() -> Result<R>) -> Result<R> {
         self.run_native(operation).map_err(original_storage_error)
     }
@@ -498,6 +504,7 @@ impl StorageAdmissionScope {
         unsafe { self.pointer.as_ref() }.payload.funding.reserve_native(layout)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new_unqualified(funding: StorageFunding) -> Result<Self> {
         let layout = Layout::new::<StorageScopeBlock>();
         // Original bootstrap uses scalar admission and borrowed diagnostics.
@@ -521,6 +528,7 @@ impl StorageAdmissionScope {
         }
         Ok(Self { pointer })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn writer_unqualified(
         original: &OwnedMemoryReservation,
         expected: &AccountantHandle,
@@ -533,11 +541,13 @@ impl StorageAdmissionScope {
             genuine_funder: funder.clone(),
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reader_unqualified(
         receipt: crate::vector_read_memory::NativeReadChildReceipt,
     ) -> Result<Self> {
         Self::new_unqualified(StorageFunding::Read(receipt.into_owner()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reader_operation(
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Self, NativeStorageFailure> {
@@ -555,6 +565,7 @@ impl StorageAdmissionScope {
 
     /// Use the executing begin_request child, never acquire another child or
     /// recover a Legacy budget. The scope's exact physical cell is prepaid.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reader_native_owner(
         owner: ReadMemoryOwner,
     ) -> std::result::Result<Self, NativeStorageFailure> {
@@ -583,6 +594,7 @@ impl StorageAdmissionScope {
         Ok(Self { pointer })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn run_native<R>(
         &self,
         operation: impl FnOnce() -> Result<R>,
@@ -638,6 +650,7 @@ pub(super) struct ColdMetadataOwner {
 unsafe impl Send for ColdMetadataOwner {}
 unsafe impl Sync for ColdMetadataOwner {}
 impl ColdMetadataOwner {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn new_unqualified(
         accountant: &AccountantHandle,
         metadata: ColdSnapshotMetadata,
@@ -710,6 +723,7 @@ impl Drop for StorageName {
     }
 }
 impl StorageAdmissionScope {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn with_rel_name<R>(
         &self,
         logical: &str,
@@ -852,6 +866,7 @@ impl PreparedReadFailure {
 impl StorageAdmissionScope {
     /// Authenticate the supplied Original before constructing the scope. Scope
     /// and per-allocation receipt controls use its scalar admission kernel.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepared_original(
         original: &OwnedMemoryReservation,
     ) -> std::result::Result<Self, PreparedReadFailure> {
@@ -937,6 +952,7 @@ impl StorageAdmissionScope {
         error
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_read<T>(
         &self,
         operation: impl FnOnce(&Self, NativeStorageAdmission) -> std::result::Result<T, PreparedReadCause>,

@@ -12,9 +12,11 @@ pub(super) struct ReceivedRetirementLog { next: u64, table: TableDefinition<'sta
 type EncodedRetirement = (u8, Vec<u8>, Option<content_identity::LogicalMutationValue>, Option<Option<[u8; 24]>>);
 
 impl ReceivedRetirementLog {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn new(persistence: &RedbPersistence, write: &redb::WriteTransaction) -> Result<Self> {
         Self::new_in(persistence,write,RECEIVED_RETIREMENT_LOG)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new_in(persistence: &RedbPersistence,write: &redb::WriteTransaction,
         table: TableDefinition<'static,u64,&'static [u8]>) -> Result<Self> {
         let source = write.open_table(table).map_err(RedbPersistence::storage_error)?;
@@ -24,6 +26,7 @@ impl ReceivedRetirementLog {
         Ok(Self { next: 0, table })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn append(
         &mut self, persistence: &RedbPersistence, write: &redb::WriteTransaction,
         mutations: &[content_identity::ContentIdentityMutation],
@@ -46,6 +49,7 @@ impl ReceivedRetirementLog {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn apply(self, persistence: &RedbPersistence, write: &redb::WriteTransaction) -> Result<()> {
         for ordinal in 0..self.next {
             let mut window = persistence.proof_admission();
@@ -83,15 +87,18 @@ pub(crate) struct OriginalMutationLog<'f, 'o, 'w> {
     write: &'w redb::WriteTransaction,
 }
 impl<'f, 'o, 'w> OriginalMutationLog<'f, 'o, 'w> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn new(persistence: &RedbPersistence, frame: &'f OriginalPersistenceFrame<'o>,
         write: &'w redb::WriteTransaction) -> Result<Self> {
         Ok(Self { log: ReceivedRetirementLog::new(persistence, write)?, frame, write })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn new_change_log(persistence: &RedbPersistence, frame: &'f OriginalPersistenceFrame<'o>,
         write: &'w redb::WriteTransaction) -> Result<Self> {
         const TABLE: TableDefinition<u64,&[u8]> = TableDefinition::new("__received_change_log_mutations");
         Ok(Self { log: ReceivedRetirementLog::new_in(persistence,write,TABLE)?, frame, write })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn append_to(self, destination: &mut OriginalMutationLog<'_, '_, '_>) -> Result<()> {
         if !std::ptr::eq(self.frame.original,destination.frame.original) {
             return Err(Error::Other("schema mutation logs have different original payers".into()));
@@ -111,6 +118,7 @@ impl<'f, 'o, 'w> OriginalMutationLog<'f, 'o, 'w> {
         self.write.delete_table(self.log.table).map_err(RedbPersistence::storage_error)?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn push(&mut self, mutation: content_identity::ContentIdentityMutation) -> Result<()> {
         let window = OriginalPersistenceFrame::new(self.frame.original)?;
         let encoded = window.encode(&(mutation.family as u8, &mutation.logical_key,
@@ -122,10 +130,12 @@ impl<'f, 'o, 'w> OriginalMutationLog<'f, 'o, 'w> {
         self.log.next = next;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn extend(&mut self, values: impl IntoIterator<Item = content_identity::ContentIdentityMutation>) -> Result<()> {
         for value in values { self.push(value)?; }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn push_at(&mut self, site: &'static str, mutation: content_identity::ContentIdentityMutation) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if REFUSED_IDENTITY_GROWTH_SITE.with(|armed| armed.get() == Some(site)) {
@@ -138,6 +148,7 @@ impl<'f, 'o, 'w> OriginalMutationLog<'f, 'o, 'w> {
         }
         self.push(mutation)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn apply(self, persistence: &RedbPersistence,
         groups: Option<&custody_groups::GroupPlan>,
     ) -> Result<()> {
@@ -187,6 +198,7 @@ impl ReceivedSchemaRecordStream {
             operation: "received_vector_projection".into(), io_kind: error.kind(),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open(store: &RedbPersistence, parent: &contextdb_vector::VectorCopyAdmission) -> Result<Self> {
         let mut owner = parent.scratch();
         owner.reserve(redb::scratch_backend_allocation_size()
@@ -196,6 +208,7 @@ impl ReceivedSchemaRecordStream {
         let backend = writer.scratch_backend().map_err(Self::io)?;
         Ok(Self { backend, end: 0, count: 0, _owner: owner })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push<T: serde::Serialize>(&mut self, value: &T) -> Result<()> {
         let mut window = self._owner.scratch();
         let mut measured = OwnedEventEncodedLength(0);
@@ -220,6 +233,7 @@ impl ReceivedSchemaRecordStream {
         self.count = count;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn header(&self, offset: u64) -> Result<(usize,u64,[u8;32])> {
         let mut header = [0u8;40];
         if offset.checked_add(40).is_none_or(|end| end > self.end) {
@@ -233,6 +247,7 @@ impl ReceivedSchemaRecordStream {
         let length = usize::try_from(length).map_err(|_| Error::Other("received record exceeds address space".into()))?;
         Ok((length,end,header[8..].try_into().unwrap()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn body(&self, offset: u64, length: usize, hash: &[u8;32]) -> Result<Vec<u8>> {
         // Caller admits length before entering this allocation door.
         let mut bytes = vec![0u8;length];
@@ -242,10 +257,12 @@ impl ReceivedSchemaRecordStream {
         }
         Ok(bytes)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_original<T: serde::de::DeserializeOwned>(&self, original: &OriginalPersistenceFrame<'_>,
         mut visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
         self.visit_original_range(original, (0,self.end,self.count), visit)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_original_range<T: serde::de::DeserializeOwned>(&self, original: &OriginalPersistenceFrame<'_>,
         range: (u64,u64,u64), mut visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
         let (mut offset,limit,count) = range;
@@ -262,10 +279,12 @@ impl ReceivedSchemaRecordStream {
         if offset != limit { return Err(Self::io(std::io::ErrorKind::InvalidData.into())); }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit<T: serde::de::DeserializeOwned>(&self, memory: &crate::read_image_memory::ImageMemoryHandle,
         mut visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
         self.visit_range(memory, (0,self.end,self.count), visit)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_range<T: serde::de::DeserializeOwned>(&self, memory: &crate::read_image_memory::ImageMemoryHandle,
         range: (u64,u64,u64), mut visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
         let (mut offset,limit,count) = range;
@@ -290,6 +309,7 @@ pub(crate) struct ReceivedVectorRecords {
     pub(crate) memberships: ReceivedSchemaRecordStream,
 }
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_received_vector_records(&self, owner: &contextdb_vector::VectorCopyAdmission) -> Result<ReceivedVectorRecords> {
         Ok(ReceivedVectorRecords {
             bodies: ReceivedSchemaRecordStream::open(self,owner)?,
@@ -306,6 +326,7 @@ pub(crate) struct ReceivedRowRecords {
     _owner: contextdb_vector::VectorCopyAdmission,
 }
 impl ReceivedRowRecords {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push_table(&mut self, table: &str, rows: &[VersionedRow]) -> Result<()> {
         self.push_table_with(table, |push| {
             for row in rows { push(row)?; }
@@ -314,6 +335,7 @@ impl ReceivedRowRecords {
     }
     /// The producer lends a single admitted body at a time. No body or
     /// callback is retained after this call; only the existing table range is.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push_table_with(&mut self, table: &str,
         produce: impl FnOnce(&mut dyn FnMut(&VersionedRow) -> Result<()>) -> Result<()>) -> Result<()> {
         if self.tables.contains_key(table) { return Err(Error::Other("received row table repeated".into())); }
@@ -332,12 +354,14 @@ impl ReceivedRowRecords {
         self.tables.insert(table.to_owned(),(start,self.stream.end,self.stream.count - count));
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_table_original(&self, original: &OriginalPersistenceFrame<'_>, table: &str,
         visit: impl FnMut(&VersionedRow) -> Result<()>) -> Result<()> {
         match self.tables.get(table) {
             Some(range) => self.stream.visit_original_range(original,*range,visit), None => Ok(()),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_original(&self, original: &OriginalPersistenceFrame<'_>,
         mut visit: impl FnMut(&str,&VersionedRow) -> Result<()>) -> Result<()> {
         for (table,range) in &self.tables {
@@ -345,6 +369,7 @@ impl ReceivedRowRecords {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit(&self, memory: &crate::read_image_memory::ImageMemoryHandle,
         mut visit: impl FnMut(&str,&VersionedRow) -> Result<()>) -> Result<()> {
         for (table,range) in &self.tables { self.stream.visit_range(memory,*range,|row| visit(table,row))?; }
@@ -352,6 +377,7 @@ impl ReceivedRowRecords {
     }
 }
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_received_row_records(&self, owner: &contextdb_vector::VectorCopyAdmission) -> Result<ReceivedRowRecords> {
         let mut directory = owner.scratch();
         directory.reserve(std::mem::size_of::<ReceivedRowRecords>())?;
@@ -361,9 +387,11 @@ impl RedbPersistence {
 
 pub(crate) struct ReceivedSyncSourceRecords { stream: ReceivedSchemaRecordStream }
 impl ReceivedSyncSourceRecords {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push(&mut self, table: &str, row: RowId, lsn: Lsn, kind: SyncSourceKind) -> Result<()> {
         self.stream.push(&(table,row,lsn,sync_source_kind_to_u8(kind)))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_original(&self, frame: &OriginalPersistenceFrame<'_>,
         mut visit: impl FnMut(&str,RowId,Lsn,u8) -> Result<()>) -> Result<()> {
         self.stream.visit_original(frame,|record: &(String,RowId,Lsn,u8)| {
@@ -371,6 +399,7 @@ impl ReceivedSyncSourceRecords {
             visit(&record.0,record.1,record.2,record.3)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit(&self, memory: &crate::read_image_memory::ImageMemoryHandle,
         mut visit: impl FnMut(&str,RowId,Lsn,u8) -> Result<()>) -> Result<()> {
         self.stream.visit(memory,|record: &(String,RowId,Lsn,u8)| {
@@ -380,6 +409,7 @@ impl ReceivedSyncSourceRecords {
     }
 }
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_received_sync_source_records(&self, owner: &contextdb_vector::VectorCopyAdmission) -> Result<ReceivedSyncSourceRecords> {
         Ok(ReceivedSyncSourceRecords { stream: ReceivedSchemaRecordStream::open(self,owner)? })
     }
@@ -391,6 +421,7 @@ const RECEIVED_LATEST_RECORDS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("__received_schema_latest_records");
 pub(super) struct ReceivedLatestRecords;
 impl ReceivedLatestRecords {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn new(write: &redb::WriteTransaction) -> Result<Self> {
         let table = write.open_table(RECEIVED_LATEST_RECORDS).map_err(RedbPersistence::storage_error)?;
         if !table.is_empty().map_err(RedbPersistence::storage_error)? {
@@ -398,6 +429,7 @@ impl ReceivedLatestRecords {
         }
         Ok(Self)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn consider(&self, persistence: &RedbPersistence,
         write: &redb::WriteTransaction, key: &[u8], lsn: Lsn, tx: TxId, index: usize,
     ) -> Result<()> {
@@ -417,6 +449,7 @@ impl ReceivedLatestRecords {
         table.insert(key, value.as_slice()).map_err(RedbPersistence::storage_error)?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn consider_original(&self, original: &OriginalPersistenceFrame<'_>,
         write: &redb::WriteTransaction, key: &[u8], lsn: Lsn, tx: TxId, index: usize,
     ) -> Result<()> {
@@ -436,6 +469,7 @@ impl ReceivedLatestRecords {
         table.insert(key, value.as_slice()).map_err(RedbPersistence::storage_error)?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn decode(value: &[u8]) -> Result<(u64, u64, u64)> {
         if value.len() != 24 {
             return Err(Error::Other("unpublished latest-version rank has invalid width".into()));
@@ -444,6 +478,7 @@ impl ReceivedLatestRecords {
             u64::from_be_bytes(value[8..16].try_into().unwrap()),
             u64::from_be_bytes(value[16..].try_into().unwrap())))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit(self, persistence: &RedbPersistence, write: &redb::WriteTransaction,
         mut visitor: impl FnMut(usize) -> Result<()>,
     ) -> Result<()> {
@@ -475,7 +510,8 @@ impl ReceivedLatestRecords {
         }
         write.delete_table(RECEIVED_LATEST_RECORDS).map_err(RedbPersistence::storage_error)?;
         Ok(())
-    }    pub(super) fn visit_original(self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
+    }    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    pub(super) fn visit_original(self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         mut visitor: impl FnMut(usize) -> Result<()>,
     ) -> Result<()> {
         let coordinate_credit = OriginalPersistenceFrame::new(original.original)?;
@@ -514,10 +550,12 @@ impl ReceivedLatestRecords {
 /// Equal ranks keep the first input, including a deleted latest record.
 pub(super) struct ReceivedLatestMutations;
 impl ReceivedLatestMutations {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn new(write: &redb::WriteTransaction) -> Result<Self> {
         ReceivedLatestRecords::new(write)?;
         Ok(Self)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn consider(&self, original: &OriginalPersistenceFrame<'_>,
         write: &redb::WriteTransaction, key: &[u8], lsn: Lsn, tx: TxId,
         mutation: Option<&content_identity::ContentIdentityMutation>,
@@ -549,6 +587,7 @@ impl ReceivedLatestMutations {
         table.insert(key, value.as_slice()).map_err(RedbPersistence::storage_error)?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit(self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         mut visitor: impl FnMut(content_identity::ContentIdentityMutation) -> Result<()>,
     ) -> Result<()> {
@@ -592,6 +631,7 @@ impl ReceivedLatestMutations {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_received_graph_adjacencies_in_write(
         &self, write: &redb::WriteTransaction, selected_types: &HashSet<String>,
     ) -> Result<()> {
@@ -640,6 +680,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_received_graph_adjacencies_in_write_original(
         &self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction, selected_types: &HashSet<String>,
         working: Option<(&received_working::ReceivedWorkingWrite, Option<&received_working_graph::WorkingGraphCapture>)>,
@@ -688,6 +729,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_received_index_counts_original(
         &self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         table: &str, mut retire: impl FnMut(content_identity::ContentIdentityMutation) -> Result<()>,
@@ -723,6 +765,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_received_retention_expiries_original(
         &self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         table: &str, mutations: &mut OriginalMutationLog<'_, '_, '_>,
@@ -757,6 +800,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_index_posting_identities_in_write(
         &self, write: &redb::WriteTransaction, table: &str, declaration: &IndexDecl,
         retired: &mut ReceivedRetirementLog,
@@ -816,6 +860,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_table_index_counts_in_write(
         &self, write: &redb::WriteTransaction, table: &str,
         retired: &mut ReceivedRetirementLog,
@@ -859,6 +904,7 @@ impl RedbPersistence {
     /// A schema rewrite owns only its addressed declaration. Its source bytes
     /// and decoded copy stay funded by the original writer through the caller's
     /// complete mutation, rather than borrowing a later decoder's call owner.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn schema_projection_metadata_point(
         &self, name: &str,
     ) -> Result<Option<(TableMeta, content_identity::OwnedProofAdmission)>> {
@@ -882,6 +928,7 @@ impl RedbPersistence {
 
     // The committed source, rather than the already-mutated memory catalog,
     // decides whether a direct received ALTER can use the bounded cursor.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scalar_schema_projection_source(
         &self, name: &str, meta: &TableMeta,
     ) -> Result<Option<(TableMeta, content_identity::OwnedProofAdmission)>> {
@@ -900,6 +947,7 @@ impl RedbPersistence {
         Ok(Some(source))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn supports_streamed_schema_projection(
         &self, name: &str, meta: &TableMeta,
     ) -> Result<bool> {
@@ -907,6 +955,7 @@ impl RedbPersistence {
         Ok(self.scalar_schema_projection_source(name, meta)?.is_some())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn stream_scalar_schema_projection(
         &self,
         name: &str,
@@ -1231,6 +1280,7 @@ struct ProjectedIndexes {
     _credit: content_identity::OwnedProofAdmission,
 }
 impl ProjectedIndexes {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(
         persistence: &RedbPersistence, write: &redb::WriteTransaction,
         table: &str, meta: &TableMeta,
@@ -1304,6 +1354,7 @@ impl ProjectedIndexes {
         let heads = (0..declarations.len()).map(|_| None).collect();
         Ok(Self { declarations, heads, row: None, _credit: credit })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn push(
         &mut self, persistence: &RedbPersistence, write: &redb::WriteTransaction,
         table: &str, meta: &TableMeta, row: &VersionedRow,
@@ -1328,6 +1379,7 @@ impl ProjectedIndexes {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn finish_row(
         &mut self, persistence: &RedbPersistence, write: &redb::WriteTransaction,
         table: &str, meta: &TableMeta,
@@ -1379,6 +1431,7 @@ impl ProjectedIndexes {
         self.row = None;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn finish(mut self, persistence: &RedbPersistence, write: &redb::WriteTransaction, table: &str, meta: &TableMeta) -> Result<()> {
         self.finish_row(persistence, write, table, meta)?;
         write.open_table(RELATIONAL_INDEX_READY_TABLE).map_err(RedbPersistence::storage_error)?
@@ -1406,6 +1459,7 @@ pub(super) struct OriginalProjectedIndexes<'o> {
     original: &'o crate::memory_accounting::OwnedMemoryReservation,
     _credit: crate::memory_accounting::OwnedMemoryReservation,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn original_projected_index_key(
     frame: &OriginalPersistenceFrame<'_>, key: IndexKey, row: RowId, created: TxId,
 ) -> Result<DurableRelationalIndexKey> {
@@ -1416,6 +1470,7 @@ fn original_projected_index_key(
         }),
     )?))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn apply_original_projected_mutation(
     persistence: &RedbPersistence, original: &crate::memory_accounting::OwnedMemoryReservation,
     write: &redb::WriteTransaction, mutation: content_identity::ContentIdentityMutation,
@@ -1426,6 +1481,7 @@ fn apply_original_projected_mutation(
     ).map(|_| ())
 }
 impl<'o> OriginalProjectedIndexes<'o> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare(
         persistence: &RedbPersistence, frame: &OriginalPersistenceFrame<'o>,
         write: &redb::WriteTransaction, table: &str, meta: &TableMeta,
@@ -1494,6 +1550,7 @@ impl<'o> OriginalProjectedIndexes<'o> {
         let heads = (0..declarations.len()).map(|_| None).collect();
         Ok(Self { declarations, heads, row: None, original: frame.original, _credit: credit.into_reservation() })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn push(
         &mut self, persistence: &RedbPersistence, write: &redb::WriteTransaction,
         table: &str, meta: &TableMeta, row: &VersionedRow,
@@ -1521,6 +1578,7 @@ impl<'o> OriginalProjectedIndexes<'o> {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn finish_row(
         &mut self, persistence: &RedbPersistence, write: &redb::WriteTransaction,
         table: &str, meta: &TableMeta,
@@ -1576,6 +1634,7 @@ impl<'o> OriginalProjectedIndexes<'o> {
         self.row = None;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn finish(mut self, persistence: &RedbPersistence, write: &redb::WriteTransaction,
         table: &str, meta: &TableMeta,
     ) -> Result<()> {
@@ -1590,6 +1649,7 @@ impl<'o> OriginalProjectedIndexes<'o> {
     }
 }
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn rebuild_received_indexes_paged_original(
         &self, frame: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         table: &str, meta: &TableMeta, supplied_rows: Option<&[VersionedRow]>,
@@ -1635,6 +1695,7 @@ const RECEIVED_VECTOR_OCCUPIED: TableDefinition<&[u8], u64> = TableDefinition::n
 const RECEIVED_VECTOR_COUNTS: TableDefinition<&[u8], u64> = TableDefinition::new("__received_vector_partition_counts");
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn received_vector_body_in_write_original(
         &self, frame: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         member: &VectorPartitionMembershipRecord,
@@ -1648,6 +1709,7 @@ impl RedbPersistence {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_complete_vector_partition_image_paged_original(
         &self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         stage: &ReceivedSchemaPersistenceProjection,
@@ -1781,6 +1843,7 @@ impl RedbPersistence {
         Ok(CompleteVectorPartitionImage { paged_memberships: true, ..Default::default() })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_complete_vector_image_memberships(
         &self, write: &redb::WriteTransaction, image: &CompleteVectorPartitionImage,
         original: Option<&OriginalPersistenceFrame<'_>>,
@@ -1817,6 +1880,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn replace_paged_vector_partition_image_in_write_original(
         &self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         image: &CompleteVectorPartitionImage, tables: &HashSet<String>, lsn: Lsn,
@@ -1860,6 +1924,7 @@ impl RedbPersistence {
 const RECEIVED_DROPPED_HISTORY_LSNS: TableDefinition<u64,u8> = TableDefinition::new("__received_dropped_history_lsns");
 const RECEIVED_HISTORY_SURVIVORS: TableDefinition<u64,&[u8]> = TableDefinition::new("__received_history_survivors");
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_received_change_log_paged_original(
         &self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         dropped: &HashSet<String>, mutations: &mut OriginalMutationLog<'_, '_, '_>,
@@ -1967,6 +2032,7 @@ impl RedbPersistence {
 }
 
 impl ReceivedSchemaPersistenceProjection {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_edges_original(
         &self,
         frame: &OriginalPersistenceFrame<'_>,

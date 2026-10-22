@@ -5,6 +5,7 @@ use super::*;
 // Private, process-local control identities never wrap or recycle. They are
 // neither durable epochs nor a replacement for authentic Original admission.
 static NEXT_WORKING_CONTROL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn next_working_control_identity() -> Result<u64> {
     NEXT_WORKING_CONTROL.fetch_update(std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed, |next| next.checked_add(1))
@@ -28,6 +29,7 @@ pub(crate) struct ReceivedWorkingWrite {
     original_owner: Option<crate::database::event_bus::OwnedEventBusHandle>,
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn begin(store: &RedbPersistence,
         original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<Self> {
         let storage_scope = super::native_storage_admission::StorageAdmissionScope::writer_original(original)?;
@@ -41,6 +43,7 @@ impl ReceivedWorkingWrite {
         scope.run_original(crate::funded_error::OriginalStoragePhase::ReceivedOuter, || store.with_db_original_funded(original, |db|
             Self::begin_in_funded(store, db, original)))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn begin_in(store: &RedbPersistence, db: &redb::Database,
         original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<Self> {
         Self::begin_in_route(store, original, || {
@@ -72,6 +75,7 @@ impl ReceivedWorkingWrite {
             store_address:store as *const _ as usize,scratch:parking_lot::Mutex::new(Vec::new()),
             lent_databases:parking_lot::Mutex::new(Vec::new()),schemas:parking_lot::Mutex::new(HashMap::new()),graph_state:parking_lot::Mutex::new(super::received_working_graph::WorkingGraphState::new()),graph_ready:std::sync::atomic::AtomicBool::new(false),vector_ready:std::sync::atomic::AtomicBool::new(false),vector_catalog:parking_lot::Mutex::new(None),owner:parking_lot::Mutex::new(owner),original_owner:None})
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retain_original_owner(
         &mut self, events: &crate::database::event_bus::OwnedEventBusHandle,
     ) -> Result<()> {
@@ -87,6 +91,7 @@ impl ReceivedWorkingWrite {
     fn transaction(&self)->&redb::WriteTransaction {
         self.write.as_ref().expect("live unpublished received write")
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn claim_database_loan(&self,database:crate::database::DatabaseId)->Result<()> {
         let mut lent=self.lent_databases.lock();
         if lent.contains(&database) {
@@ -104,10 +109,12 @@ impl ReceivedWorkingWrite {
         lent.push(database);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn with_write<R>(&self,
         f: impl FnOnce(&redb::WriteTransaction) -> Result<R>) -> Result<R> {
         f(self.transaction())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn require_original(&self,
         original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<()> {
         if self.original_address != original as *const _ as usize {
@@ -115,6 +122,7 @@ impl ReceivedWorkingWrite {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn install_vector_catalog(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         catalog: super::received_working_vector::WorkingVectorCatalogOwner) -> Result<()> {
         self.require_original(original)?;
@@ -123,6 +131,7 @@ impl ReceivedWorkingWrite {
         *slot = Some(catalog);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn refresh_vector_catalog(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<()> {
         self.require_original(original)?;
         let catalog = self.vector_catalog.lock().clone();
@@ -148,6 +157,7 @@ impl ReceivedWorkingWrite {
         self.graph_ready.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn require_store(&self, store: &RedbPersistence) -> Result<()> {
         if self.store_address != store as *const _ as usize {
             return Err(Error::Other("received working write belongs to another persistence owner".into()));
@@ -170,6 +180,7 @@ pub(crate) struct WorkingRow {
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_row(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -212,6 +223,7 @@ pub(crate) struct WorkingPosting {
     key: Vec<u8>,
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn index_bound(frame:&OriginalPersistenceFrame<'_>,bound:std::ops::Bound<&[u8]>)
     ->Result<std::ops::Bound<DurableRelationalIndexKey>> {
     match bound {
@@ -221,6 +233,7 @@ fn index_bound(frame:&OriginalPersistenceFrame<'_>,bound:std::ops::Bound<&[u8]>)
     }
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_posting(
         &self,original:&crate::memory_accounting::OwnedMemoryReservation,
         table:&str,index:&str,current:bool,
@@ -266,6 +279,7 @@ impl ReceivedWorkingWrite {
                 created_tx:position.created_tx,deleted_tx } };
         Ok(Some(WorkingPosting { posting,key,_owner:frame.into_reservation() }))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn sync_source(&self,original:&crate::memory_accounting::OwnedMemoryReservation,
         table:&str,row:RowId)->Result<Option<(Lsn,contextdb_relational::store::SyncSourceKind)>> {
         use contextdb_relational::store::SyncSourceKind;
@@ -325,10 +339,12 @@ struct ManifestWindow {
     _owner:content_identity::original_writer::ProofAdmission,
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn keep_scratch_name(&self,name:String,
         owner:crate::memory_accounting::OwnedMemoryReservation)->Result<()> {
         self.keep_scratch_name_kind(name,owner,false)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn keep_scratch_name_kind(&self,name:String,
         owner:crate::memory_accounting::OwnedMemoryReservation,index:bool)->Result<()> {
         // Pair before the first guard/early return/fallible growth, including
@@ -353,6 +369,7 @@ impl ReceivedWorkingWrite {
     /// copy on disk, authenticated against the outgoing version manifest.
     /// Each proof window is destroyed only after its carried key, including
     /// the successor retained across the next seek.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_rows(&self,store:&RedbPersistence,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str)->Result<()> {
         use content_identity::{original_version_manifest as manifest,original_writer::ProofAdmission};
@@ -409,6 +426,7 @@ impl ReceivedWorkingWrite {
     }
     /// All source cursors/loans end before terminal apply calls this. Scratch
     /// relations are never committed or visible to published readers.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reset_scratch(&self)->Result<()> {
         self.discard_scratch()?;
         self.scratch.lock().clear();
@@ -416,6 +434,7 @@ impl ReceivedWorkingWrite {
         self.vector_catalog.lock().take();
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn discard_scratch(&self)->Result<()> {
         self.vector_ready.store(false, std::sync::atomic::Ordering::Release);
         self.graph_ready.store(false, std::sync::atomic::Ordering::Release);
@@ -444,6 +463,7 @@ pub(super) fn working_index_name(table:&str,index:&str,current:bool)->String {
     format!("__received_working_{public}")
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn finish_index_head(&self,original:&crate::memory_accounting::OwnedMemoryReservation,
         name:&str,head:WorkingIndexHead)->Result<()> {
         if head.end.is_some() {return Ok(());}
@@ -463,6 +483,7 @@ impl ReceivedWorkingWrite {
     }
     /// Private indexes are derived only from authenticated working rows. They
     /// never replace or publish the outgoing public index/commitment records.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_index(&self,store:&RedbPersistence,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         table:&str,declaration:&IndexDecl)->Result<()> {
@@ -507,6 +528,7 @@ impl ReceivedWorkingWrite {
         self.keep_index_scratch_name(original,current_name)?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn keep_index_scratch_name(&self,original:&crate::memory_accounting::OwnedMemoryReservation,
         name:String)->Result<()> {
         // The enclosing preparation frame admitted construction. Transfer the
@@ -534,6 +556,7 @@ impl WorkingPosting {
 impl Drop for WorkingPosting {fn drop(&mut self) {}}
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn take_or_begin(store:&RedbPersistence,db:&redb::Database,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         stage:&ReceivedSchemaPersistenceProjection)->Result<Self> {
@@ -570,6 +593,7 @@ impl ReceivedWorkingWrite {
     /// Final projection walks the private physical order without retaining a
     /// table-sized row directory. next_row closes all Redb guards before the
     /// consumer runs; its body invoice remains alive throughout the call.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_rows(&self,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         table:&str,mut visit:impl FnMut(&VersionedRow)->Result<()>) -> Result<()> {
@@ -584,6 +608,7 @@ impl ReceivedWorkingWrite {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn spool_rows(&self,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         table:&str,records:&mut super::schema_projection::ReceivedRowRecords)->Result<()> {
@@ -592,6 +617,7 @@ impl ReceivedWorkingWrite {
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn invalidate_indexes(&self)->Result<()> {
         let mut names=self.scratch.lock();
         for entry in names.iter().filter(|entry|entry.index) {
@@ -605,6 +631,7 @@ impl ReceivedWorkingWrite {
     }
     /// Apply the existing adjudicated replacement sequence, never wire rows
     /// inferred to be accepted. The caller supplies final receiver identities.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_row_replacements(&self,store:&RedbPersistence,
         original:&crate::memory_accounting::OwnedMemoryReservation,
         metadata:&HashMap<String,TableMeta>,
@@ -648,6 +675,7 @@ impl ReceivedWorkingWrite {
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_source_overlay(&self,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str)->Result<()> {
         self.require_original(original)?;
@@ -659,6 +687,7 @@ impl ReceivedWorkingWrite {
         drop(self.transaction().open_table(definition).map_err(RedbPersistence::storage_error)?);
         self.keep_scratch_name(name,frame.into_reservation())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn mark_sync_source(&self,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str,row:RowId,
         value:Option<(Lsn,contextdb_relational::store::SyncSourceKind)>)->Result<()> {
@@ -683,6 +712,7 @@ impl ReceivedWorkingWrite {
     /// DROP followed by CREATE must preserve an empty private incarnation.
     /// Keeping the owned scratch name prevents lazy initialization from
     /// copying the old public table or its provenance back into the new one.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn clear_rows(&self,store:&RedbPersistence,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str)->Result<()> {
         self.prepare_rows(store,original,table)?;
@@ -707,6 +737,7 @@ impl ReceivedWorkingWrite {
     /// Rewrite the retained private projection with the same rename/drop and
     /// vector-lifetime rules as the existing schema stream. Public authored
     /// history remains untouched for its separate terminal custody pass.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn project_rows(&self,store:&RedbPersistence,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str,
         previous:&TableMeta,arriving:&TableMeta,ddl:&[DdlChange])->Result<()> {
@@ -756,6 +787,7 @@ impl ReceivedWorkingWrite {
     /// Install the adjudicator's complete final table into private scratch.
     /// This transitional caller accepts borrowed resident rows; the paged
     /// adjudicator uses apply_row_replacements instead of building this slice.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replace_projected_rows(&self,store:&RedbPersistence,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str,
         meta:&TableMeta,rows:&[VersionedRow])->Result<()> {
@@ -790,6 +822,7 @@ struct WorkingSchema {
     _owner:crate::memory_accounting::OwnedMemoryReservation,
 }
 impl WorkingSchema {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy(original:&crate::memory_accounting::OwnedMemoryReservation,
         table:&str,meta:&TableMeta)->Result<Self> {
         let frame=OriginalPersistenceFrame::new(original)?;
@@ -799,6 +832,7 @@ impl WorkingSchema {
     }
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_schema_slot(&self,schemas:&mut HashMap<String,WorkingSchema>)->Result<()> {
         if schemas.len()==schemas.capacity() {
             let requested=schemas.capacity().checked_mul(2).map(|value|value.max(4))
@@ -812,6 +846,7 @@ impl ReceivedWorkingWrite {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn vector_declaration_at(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         position: usize) -> Result<Option<super::OriginalDecoded<VectorIndexRef>>> {
         self.require_original(original)?;
@@ -841,6 +876,7 @@ impl ReceivedWorkingWrite {
         Ok(Some(super::OriginalDecoded { value, allocation: frame.into_reservation() }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn remember_schema(&self,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str,meta:&TableMeta)->Result<()> {
         self.require_original(original)?;
@@ -851,6 +887,7 @@ impl ReceivedWorkingWrite {
         schemas.insert(table.to_owned(),prepared);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn project_schema(&self,store:&RedbPersistence,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str,
         arriving:Option<&TableMeta>,ddl:&[DdlChange])->Result<()> {
@@ -882,6 +919,7 @@ impl ReceivedWorkingWrite {
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_provenance(&self,
         original:&crate::memory_accounting::OwnedMemoryReservation,ws:&contextdb_tx::WriteSet)->Result<()> {
         self.require_original(original)?;
@@ -898,12 +936,14 @@ impl ReceivedWorkingWrite {
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn latest_row(&self,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str,row:RowId)->Result<Option<WorkingRow>> {
         let mut lower=[0u8;24];lower[..8].copy_from_slice(&row.0.to_be_bytes());
         let mut upper=[u8::MAX;24];upper[..8].copy_from_slice(&row.0.to_be_bytes());
         self.next_row(original,table,std::ops::Bound::Included(&lower),std::ops::Bound::Included(&upper),true)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn exact_version(&self,
         original:&crate::memory_accounting::OwnedMemoryReservation,table:&str,
         row:RowId,created:TxId,lsn:Lsn)->Result<Option<WorkingRow>> {
@@ -923,6 +963,7 @@ pub(crate) struct WorkingRowIdentity<'a> {
 impl ReceivedWorkingWrite {
     /// Replace private-coordinate keys with receiver-coordinate keys before
     /// final projection. Unchanged rows retain their exact physical bytes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn rewrite_row_identities(
         &self, store: &RedbPersistence,
         original: &crate::memory_accounting::OwnedMemoryReservation,

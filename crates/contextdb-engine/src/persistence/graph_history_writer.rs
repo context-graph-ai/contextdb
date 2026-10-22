@@ -39,6 +39,7 @@ fn corrupt(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
         reason: reason.into().into(),
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn lifecycle(bytes: &[u8]) -> Result<(TxId, u64, u8)> {
     if bytes.len() != 18 || bytes[0] != 1 || bytes[17] > 1 {
         return Err(corrupt("malformed graph lifecycle receipt"));
@@ -70,6 +71,7 @@ fn digest_value(digest: [u8; 32]) -> [u8; 33] {
     value[1..].copy_from_slice(&digest);
     value
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reverse_key(p: &[u8]) -> Result<Vec<u8>> {
     parse_physical_predecessor(p)?;
     crate::read_image_memory::reserve(p.len())?;
@@ -78,6 +80,7 @@ fn reverse_key(p: &[u8]) -> Result<Vec<u8>> {
     reverse[16..32].copy_from_slice(&p[..16]);
     Ok(reverse)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn match_key(public: &[u8], position: &[u8; 16]) -> Result<Vec<u8>> {
     let n = u32::try_from(public.len()).map_err(|_| corrupt("public matching key overflow"))?;
     crate::read_image_memory::reserve(
@@ -94,6 +97,7 @@ fn match_key(public: &[u8], position: &[u8; 16]) -> Result<Vec<u8>> {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn initialize_graph_proof_tables_in_write(
         write: &redb::WriteTransaction,
     ) -> Result<()> {
@@ -108,6 +112,7 @@ impl RedbPersistence {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn require_graph_proof_tables_in_write(
         write: &redb::WriteTransaction,
     ) -> Result<()> {
@@ -131,6 +136,7 @@ impl RedbPersistence {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn original_graph_window<'a,'o>(&'a self, frame: &'a OriginalPersistenceFrame<'o>)
         -> Result<OriginalGraphWindow<'a,'o>> {
         let memory = crate::memory_accounting::image_memory_for_original_record(frame)?;
@@ -142,6 +148,7 @@ impl RedbPersistence {
         window.scope = Some(memory.enter());
         Ok(window)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn graph_writer_window<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         if let Some(memory) = ORIGINAL_GRAPH_MEMORY.with(|slot| slot.borrow().as_ref()
             .filter(|(host,_)| *host == self as *const Self as usize).map(|(_,memory)| memory.clone())) {
@@ -152,6 +159,7 @@ impl RedbPersistence {
             "Raise MEMORY_LIMIT to admit graph history publication.")?;
         memory.scope(f)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn connected_graph_end_in_write(write: &redb::WriteTransaction, lsn: Lsn) -> Result<Option<Lsn>> {
         if !write.table_exists(CONFIG_TABLE).map_err(Self::storage_error)? { return Ok(None); }
         let config = write.open_table(CONFIG_TABLE).map_err(Self::storage_error)?;
@@ -171,6 +179,7 @@ impl RedbPersistence {
         }
         Ok(Some(Lsn(end)))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn require_graph_commit_in_write(
         write: &redb::WriteTransaction,
         lsn: Lsn,
@@ -210,6 +219,7 @@ impl RedbPersistence {
     }
     /// Called with the two projection handles owned by the caller. Only C/R
     /// are opened here; there is no second acquisition of either projection.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn install_graph_creation_in_write(
         write: &redb::WriteTransaction,
         edge: &AdjEntry,
@@ -252,6 +262,7 @@ impl RedbPersistence {
             .map_err(Self::storage_error)?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reclaim_graph_creation_in_write(
         write: &redb::WriteTransaction,
         p: &[u8],
@@ -310,17 +321,20 @@ impl RedbPersistence {
     }
     /// Whole projection replacement walks its explicitly replaced physical
     /// inputs once; it never visits any predecessor's referring history.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_graph_replacement_in_write(
         &self,write: &redb::WriteTransaction,edges: &[AdjEntry],selected_types: Option<&HashSet<String>>,
     ) -> Result<()> {
         self.retire_graph_replacement_with_original(write,edges,selected_types,None,None,None)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_graph_replacement_in_write_original(
         &self,frame: &OriginalPersistenceFrame<'_>,write: &redb::WriteTransaction,
         edges: &[AdjEntry],selected_types: Option<&HashSet<String>>,
     ) -> Result<()> {
         self.retire_graph_replacement_with_original(write,edges,selected_types,Some(frame),None,None)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_working_graph_replacement_in_write_original(
         &self,
         frame: &OriginalPersistenceFrame<'_>,
@@ -331,6 +345,7 @@ impl RedbPersistence {
         write.require_original(frame.original)?;
         self.retire_graph_replacement_with_original(write, &[], Some(selected_types), Some(frame), Some(write), selection)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retire_graph_replacement_with_original(
         &self,write: &redb::WriteTransaction,edges: &[AdjEntry],selected_types: Option<&HashSet<String>>,
         original: Option<&OriginalPersistenceFrame<'_>>,
@@ -445,6 +460,7 @@ impl RedbPersistence {
         write.delete_table(FINAL).map_err(Self::storage_error)?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_present_predecessor_in_write(
         write: &redb::WriteTransaction,
         p: &[u8],
@@ -502,6 +518,7 @@ impl RedbPersistence {
         }
         Self::require_graph_commit_in_write(write, lsn, tx, true, "predecessor")
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_retired_predecessor_in_write(
         write: &redb::WriteTransaction,
         p: &[u8],
@@ -542,6 +559,7 @@ impl RedbPersistence {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn select_graph_predecessor_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -754,6 +772,7 @@ impl RedbPersistence {
         }
         Ok(winner.map(|(p, d, _)| (p, d)))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn encode_change_log_into_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -762,6 +781,7 @@ impl RedbPersistence {
     ) -> Result<()> {
         self.encode_change_log_with_selected_predecessor_in_write(write, entry, None, encoded)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn encode_change_log_with_selected_predecessor_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -842,6 +862,7 @@ impl RedbPersistence {
             Self::encode_stored_change_log_parts(entry, tag, witness.as_ref(), encoded)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn validate_graph_occurrence_in_write(
         write: &redb::WriteTransaction,
         position: &[u8; 16],
@@ -914,6 +935,7 @@ impl RedbPersistence {
     }
     /// Install NEW or relocate CARRIED using its immutable complete bytes.
     /// An existing T proves identity; matching coordinates mean idempotence.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn install_graph_occurrence_in_write(
         write: &redb::WriteTransaction,
         position: &[u8; 16],
@@ -1038,6 +1060,7 @@ impl RedbPersistence {
             .map_err(Self::storage_error)?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn remove_graph_occurrence_in_write(
         write: &redb::WriteTransaction,
         position: &[u8; 16],
@@ -1118,6 +1141,7 @@ impl RedbPersistence {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn final_graph_receipts_nonempty(write: &redb::WriteTransaction) -> Result<bool> {
         Self::require_graph_proof_tables_in_write(write)?;
         let table = write
@@ -1134,6 +1158,7 @@ impl RedbPersistence {
         );
         Ok(first.is_some())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn has_graph_creation_at_lsn(
         write: &redb::WriteTransaction,
         lsn: Lsn,
@@ -1180,6 +1205,7 @@ impl RedbPersistence {
     /// All population state lives in transaction-local disk tables. These
     /// pages use the write transaction's allocator/disk admission owner; each
     /// comparison/codec buffer has a separate admitted window.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn publish_public_change_log_in_write<'a>(
         &self,
         write: &redb::WriteTransaction,
@@ -1606,6 +1632,7 @@ impl RedbPersistence {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retired_commit_identity_mutations_in_write(
         write: &redb::WriteTransaction,
         lsns: &[Lsn],
@@ -1632,6 +1659,7 @@ impl RedbPersistence {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_old_graph_history_match(
         &self,
         write: &redb::WriteTransaction,
@@ -1691,6 +1719,7 @@ impl RedbPersistence {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn capture_graph_commit_support(
         write: &redb::WriteTransaction,
         lsn: Option<Lsn>,
@@ -1706,6 +1735,7 @@ impl RedbPersistence {
             .map_err(Self::storage_error)?
             .map(|v| (lsn, TxId(v.value()))))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn stage_graph_commit_support(
         write: &redb::WriteTransaction,
         prior: Option<(Lsn, TxId)>,
@@ -1724,6 +1754,7 @@ impl RedbPersistence {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn preserve_graph_commit_support(
         &self,
         write: &redb::WriteTransaction,
@@ -1786,6 +1817,7 @@ impl RedbPersistence {
 impl RedbPersistence {
     /// A concrete maximum authenticates its returned source's own public
     /// commit, which may differ from both the physical prefix and requester.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_maximum_in_write(write: &redb::WriteTransaction, address: Lsn) -> Result<TxId> {
         let mut low = [0; 9];
         low[0] = 1;

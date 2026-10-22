@@ -26,6 +26,7 @@ where R: Clone + Into<WriterSnapshotHandle> + std::ops::Deref<Target = WriterSna
             Self::Image(source) => source.logical_frontier,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn snapshot(
         &self,
         snapshot: SnapshotId,
@@ -62,6 +63,7 @@ where R: Clone + Into<WriterSnapshotHandle> + std::ops::Deref<Target = WriterSna
             Self::Image(source) => RetainedGraphSource(source.clone()).capture(snapshot, memory),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn cursor(
         &self,
         reverse: bool,
@@ -73,6 +75,7 @@ where R: Clone + Into<WriterSnapshotHandle> + std::ops::Deref<Target = WriterSna
 
         self.cursor_lane(reverse, false, lower, upper, memory)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn cursor_lane(
         &self,
         reverse: bool,
@@ -155,6 +158,7 @@ pub(crate) enum GraphReadCursor {
     Image(RetainedGraphCursor),
 }
 impl GraphReadCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_edge_with(
         &mut self,
         checkpoint: &dyn Fn() -> Result<()>,
@@ -211,6 +215,7 @@ impl GraphReadWindow {
 
 pub(crate) struct RetainedGraphSource(pub(crate) RetainedReadSource);
 impl GraphReadSource for RetainedGraphSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture(
         &self,
         snapshot: SnapshotId,
@@ -401,6 +406,7 @@ struct Key {
     _credit: ReadCredit,
 }
 impl Key {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new(bytes: &[u8], memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
@@ -411,6 +417,7 @@ impl Key {
         })
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn credit(memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>, bytes: usize) -> Result<ReadCredit> {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
@@ -418,6 +425,7 @@ fn credit(memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>, bytes
 }
 /// Admission for any stored page a persistence read faults in, graph or not.
 /// It names the budget that funds the read, not a graph window.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn page_credit(memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>, bytes: usize) -> Result<ReadCredit> {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
@@ -429,6 +437,7 @@ fn page_credit(memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>, 
         "Raise the memory limit that funds this read to read its stored pages.",
     )
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn owned_bound(bound: Bound<&[u8]>, memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Bound<Key>> {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
@@ -457,6 +466,7 @@ pub(crate) struct RetainedGraphCursor {
     _control: ReadCredit,
 }
 impl RetainedGraphCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new(
         source: RetainedReadSource,
         reverse: bool,
@@ -468,6 +478,7 @@ impl RetainedGraphCursor {
 
         Self::new_lane(source, reverse, false, lower, upper, memory)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new_lane(
         source: RetainedReadSource,
         reverse: bool,
@@ -504,9 +515,11 @@ impl RetainedGraphCursor {
             _control: control,
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_window(&mut self) -> Result<Option<RetainedGraphWindow>> {
         self.next_window_with(&|| Ok(()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_window_with(
         &mut self,
         checkpoint: &dyn Fn() -> Result<()>,
@@ -697,6 +710,7 @@ impl GraphEdgeWindow for RetainedGraphWindow {
 }
 
 trait GraphDiagnosis {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_corruption(&self, owner: contextdb_core::read_memory::ReadMemoryOwner)
         -> Result<PreparedGraphDiagnostic>;
     fn diagnose(&self, error: LoadReadImageError) -> Error;
@@ -746,6 +760,7 @@ impl std::fmt::Display for GraphDiagnosticReason {
     }
 }
 impl PreparedGraphDiagnostic {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new(owner: contextdb_core::read_memory::ReadMemoryOwner,
         path: contextdb_core::error::DiagnosticText, prefixed: bool) -> Result<Self> {
         let reason = contextdb_core::error::DiagnosticText::try_prepare_shared(owner,
@@ -767,6 +782,7 @@ pub(super) fn image_diagnosis(source: &RetainedReadSource, error: LoadReadImageE
     crate::database::ImageHistoryError::store(source.read_memory.clone(), source.database_path.display(), error)
     .into_engine_error()
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_edge(
     source: &(impl GraphDiagnosis + ?Sized),
     key: &[u8],
@@ -883,6 +899,7 @@ impl RetainedReadSource {
             HINT,
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_graph_edge_proof(
         &self,
         read: &redb::ReadTransaction,
@@ -898,6 +915,7 @@ impl RetainedReadSource {
         GraphProofContext::image(self, memory.clone())
             .verify_graph_edge_proof(read, key, raw, edge, reverse, memory)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn verify_stored_graph_history(
         &self,
         key: &str,
@@ -909,6 +927,7 @@ impl RetainedReadSource {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         self.with_read(|read| self.verify_stored_graph_history_in_read(read, key, bytes, memory))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn verify_stored_graph_history_in_read(
         &self,
         read: &redb::ReadTransaction,
@@ -964,12 +983,14 @@ impl<'a> GraphProofContext<'a> {
             graph_occurrence_id_floor: source.graph_occurrence_id_floor,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn content_identity_corruption(&self, reason: impl std::fmt::Display) -> Error {
         match self.image {
             Some(source) => source.content_identity_corruption(reason),
             None => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), "graph history", reason),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authenticate_mutation(
         &self,
         mutation: &content_identity::ContentIdentityMutation,
@@ -999,6 +1020,7 @@ impl<'a> GraphProofContext<'a> {
                 .clone(),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_graph_counterpart(
         &self,
         read: &redb::ReadTransaction,
@@ -1073,6 +1095,7 @@ impl<'a> GraphProofContext<'a> {
     }
     /// Shared-LSN siblings may be below the maximum. The committed metadata
     /// bound, not a scan or a fabricated per-edge equality, proves admission.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_graph_creation(&self, edge: &AdjEntry) -> Result<()> {
         if edge.lsn > self.graph_lsn_frontier
             || edge.created_tx.0 > self.logical_frontier.0
@@ -1086,6 +1109,7 @@ impl<'a> GraphProofContext<'a> {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_bytes<T>(
         &self,
         read: &redb::ReadTransaction,
@@ -1112,6 +1136,7 @@ impl<'a> GraphProofContext<'a> {
         inspect(value.as_ref().map(|v| v.value()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn connected_graph_end(&self, read: &redb::ReadTransaction, position: Lsn) -> Result<Option<Lsn>> {
         let config = match read.open_table(CONFIG_TABLE) {
             Ok(table) => table,
@@ -1140,6 +1165,7 @@ impl<'a> GraphProofContext<'a> {
         Ok(Some(Lsn(end)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_commit(
         &self,
         read: &redb::ReadTransaction,
@@ -1206,6 +1232,7 @@ impl<'a> GraphProofContext<'a> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_digest_value(&self, value: Option<&[u8]>, expected: [u8; 32]) -> Result<()> {
         match value {
             Some(v) if v.len() == 33 && v[0] == 1 && v[1..] == expected => Ok(()),
@@ -1216,6 +1243,7 @@ impl<'a> GraphProofContext<'a> {
 
     // A single backward seek resolves its concrete source and that source's J.
     // No lifecycle or recursive maximum check occurs in this source window.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_maximum(
         &self,
         read: &redb::ReadTransaction,
@@ -1362,6 +1390,7 @@ impl<'a> GraphProofContext<'a> {
         Ok(q)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_graph_occurrence_id(&self, id: u64) -> Result<()> {
         if id == 0 || id > self.graph_occurrence_id_floor {
             return Err(self.content_identity_corruption(
@@ -1371,6 +1400,7 @@ impl<'a> GraphProofContext<'a> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_location(&self, read: &redb::ReadTransaction, id: u64) -> Result<(Lsn, u64)> {
         self.graph_bytes(
             read,
@@ -1393,6 +1423,7 @@ impl<'a> GraphProofContext<'a> {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_graph_edge_proof(
         &self,
         read: &redb::ReadTransaction,
@@ -1453,6 +1484,7 @@ impl<'a> GraphProofContext<'a> {
 
     /// Validate only the supplied history window at its actual physical key.
     /// Present and Retired take at most 12 and 10 additional records.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn verify_stored_graph_history(
         &self,
         read: &redb::ReadTransaction,
@@ -1589,6 +1621,7 @@ impl<'a> GraphProofContext<'a> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn with_pages<T>(
     memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     read: impl FnOnce() -> Result<T>,
@@ -1658,6 +1691,7 @@ pub(super) fn with_pages_result<T, E>(
 }
 
 impl WriterSnapshot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_graph_proof_at_root<T>(
         &self,
         owner: &writer_source::SourceWindowOwner,
@@ -1676,6 +1710,7 @@ impl WriterSnapshot {
             verify,
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn verify_stored_graph_history_at_root(
         &self,
         key: &str,
@@ -1686,6 +1721,7 @@ impl WriterSnapshot {
             context.verify_stored_graph_history(read, key, bytes, memory)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn verify_graph_edge_at_root(
         &self,
         key: &[u8],
@@ -1702,6 +1738,7 @@ impl WriterSnapshot {
 
 /// Point proofs over the caller's already captured transaction. Both writer
 /// snapshots and the public full-history load use this exact verifier kernel.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn with_graph_proof_in_read<T>(
     read: &redb::ReadTransaction,
     logical_frontier: Option<SnapshotId>,

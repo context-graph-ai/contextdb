@@ -13,12 +13,14 @@ fn corrupt(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
         reason: reason.into(),
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode(bytes: &[u8]) -> Result<Lsn> {
     let bytes: [u8; 8] = bytes
         .try_into()
         .map_err(|_| corrupt("an erasure frontier has invalid width"))?;
     Ok(Lsn(u64::from_le_bytes(bytes)))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn initialize(write: &redb::WriteTransaction) -> Result<()> {
     write
         .open_table(TABLE)
@@ -36,6 +38,7 @@ fn binding(totals: [u8; 32], erasures: [u8; 32]) -> [u8; 32] {
     hash.update(&erasures);
     *hash.finalize().as_bytes()
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn binding_in_write(write: &redb::WriteTransaction) -> Result<[u8; 32]> {
     let totals = write
         .table_root_fingerprint(content_size::TOTALS)
@@ -47,6 +50,7 @@ pub(super) fn binding_in_write(write: &redb::WriteTransaction) -> Result<[u8; 32
         .ok_or_else(|| corrupt("canonical erasure controls are missing"))?;
     Ok(binding(totals, erasures))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn binding_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
     let totals = read
         .table_root_fingerprint(content_size::TOTALS)
@@ -58,6 +62,7 @@ pub(super) fn binding_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> 
         .ok_or_else(|| corrupt("canonical erasure controls are missing"))?;
     Ok(binding(totals, erasures))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn verify_in_write(write: &redb::WriteTransaction) -> Result<()> {
     if binding_in_write(write)? != content_identity::content_size_root_in_write(write)? {
         return Err(corrupt(
@@ -75,6 +80,7 @@ pub(super) fn verify_in_write(write: &redb::WriteTransaction) -> Result<()> {
         .ok_or_else(|| corrupt("the required global erasure frontier is missing"))?;
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn raise(write: &redb::WriteTransaction, table: &str, lsn: Lsn) -> Result<()> {
     let mut summaries = write
         .open_table(TABLE)
@@ -103,6 +109,7 @@ pub(super) fn raise(write: &redb::WriteTransaction, table: &str, lsn: Lsn) -> Re
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn fold_lineage(
     write: &redb::WriteTransaction,
     key: &str,
@@ -118,6 +125,7 @@ pub(super) fn fold_lineage(
 }
 
 // The same captured view authenticates descriptors, Configuration and selected frontiers.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn native_binding(read: &redb::NativeReadView) -> Result<[u8; 32]> {
     let totals = read
         .table_root_fingerprint(content_size::TOTALS)
@@ -129,6 +137,7 @@ fn native_binding(read: &redb::NativeReadView) -> Result<[u8; 32]> {
         .ok_or_else(|| corrupt("canonical erasure controls are missing"))?;
     Ok(binding(totals, erasures))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn native_global(read: &redb::NativeReadView) -> Result<Lsn> {
     if native_binding(read)? != content_identity::content_size_root_in_native_read(read)? {
         return Err(corrupt(
@@ -194,6 +203,7 @@ fn native_failure(failure: native_storage_admission::NativeStorageFailure) -> Er
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn global_erasure_frontier(&self, memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Lsn> {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
@@ -210,11 +220,13 @@ impl RedbPersistence {
             })
             .map_err(native_failure)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn decode_erasure_frontier_control(bytes: &[u8]) -> Result<Lsn> {
         decode(bytes)
     }
     /// Read one fresh committed view, including its authenticated absence
     /// proofs. The caller holds the table-scoped erasure publication guard.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_erasure_frontiers(
         &self,
         scope: &crate::executor::ReadPublicationScope,
@@ -260,6 +272,7 @@ impl RedbPersistence {
             })
             .map_err(native_failure)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_erasure_frontier(&self, table: &str, lsn: Lsn) -> Result<()> {
         self.with_db(|db| {
             let write = Self::begin_history_write(db)?;
@@ -278,6 +291,7 @@ impl RedbPersistence {
 impl WriterSnapshot {
     /// The source and destination preserve local LSN coordinates. Copy one
     /// admitted table name at a time, never reconstruct DISCARD from lineage.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_erasure_frontiers_into(
         &self,
         destination: &RedbPersistence,

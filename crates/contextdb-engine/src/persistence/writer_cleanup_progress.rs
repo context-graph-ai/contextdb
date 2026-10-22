@@ -27,6 +27,7 @@ fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn currency_cleanup_declaration(meta: &TableMeta) -> Result<[u8; 32]> {
         let mut hash = blake3::Hasher::new();
         bincode::serde::encode_into_std_write(meta, &mut hash, bincode::config::standard())
@@ -34,6 +35,7 @@ impl RedbPersistence {
         Ok(*hash.finalize().as_bytes())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn currency_cleanup_progress(
         root: &WriterSnapshot,
         table: &str,
@@ -97,6 +99,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn currency_cleanup_rotation(root: &WriterSnapshot) -> Result<Option<[u8; 32]>> {
         let read = root.owner_read()?;
         let table = match read.open_table(TABLE) {
@@ -122,6 +125,7 @@ impl RedbPersistence {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn write_currency_cleanup_progress(
         write: &redb::WriteTransaction,
         progress: &[(String, CurrencyCleanupProgress)],

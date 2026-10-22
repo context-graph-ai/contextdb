@@ -5,6 +5,7 @@ use crate::memory_accounting::{ContainedMemoryReservation, OwnedMemoryReservatio
 use crate::read_image_memory::ImageMemory;
 use std::ops::Bound;
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_window_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     let owner = crate::read_image_memory::active_owner()?;
@@ -38,6 +39,7 @@ pub(crate) struct WriterSnapshotHandle(contextdb_tx::native_capture::CaptureHand
 #[derive(Clone, Default)]
 pub(crate) struct WriterSnapshotWeak(contextdb_tx::native_capture::CaptureWeak);
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn from_capture(handle: contextdb_tx::native_capture::CaptureHandle) -> Result<Self> {
         if handle.downcast_ref::<WriterSnapshot>().is_none() {
             return Err(Error::Other("writer publication has an invalid durable root".into()));
@@ -92,6 +94,7 @@ impl WriterSnapshotWeak {
     fn as_ptr(&self) -> *const WriterSnapshot { self.0.data_ptr().cast() }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn native_snapshot_control_bytes() -> Result<usize> {
     contextdb_tx::native_capture::NativeCapture::allocation_bytes::<WriterSnapshot, OwnedMemoryReservation>()
         .ok_or_else(|| Error::Other("writer publication control size overflow".into()))
@@ -153,16 +156,19 @@ struct WriterTableMeta {
 }
 
 impl WriterSnapshot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn require_working_store(&self, store: &RedbPersistence) -> Result<()> {
         if !Arc::ptr_eq(&self.registry, &store.writer_snapshots) {
             return Err(Error::Other("working source root belongs to another persistence owner".into()));
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn check_working_graph_key(&self, key: &[u8], reverse: bool) -> Result<()> {
         drop(self.owner_read()?);
         self.erasure.read().check_key(if reverse { GRAPH_REV_TABLE.name() } else { GRAPH_FWD_TABLE.name() }, key)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn check_working_scope(&self,table:&str)->Result<()> {
         // Reuse the captured resource/cancellation and erasure fence without
         // asking its old declaration to describe newly created private data.
@@ -185,6 +191,7 @@ impl WriterSnapshot {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_body_bytes(
         &self,
         owner: &SourceWindowOwner,
@@ -268,6 +275,7 @@ impl RedbPersistence {
     /// operator once declared a limit below this floor, with no way back in
     /// to raise it. The limit sees the bytes, and the ordinary typed refusal
     /// fires on the next admission (the same rule as the writer page cache).
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepared_writer_schema(&self) -> Result<Arc<WriterSchema>> {
         if let Some(schema) = self.writer_schema.lock().as_ref().cloned() {
             return Ok(schema);
@@ -331,6 +339,7 @@ impl RedbPersistence {
 
     /// The caller supplies exactly the metadata its write transaction installs.
     /// This preparation can refuse; it occurs before opening that transaction.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_writer_schema_change<'a>(
         &self,
         removed: impl Iterator<Item = &'a str>,
@@ -398,6 +407,7 @@ impl RedbPersistence {
     /// The local policy publisher lends its Original explicitly. Unchanged
     /// table bodies share their old paid Arcs; the successor map and changed
     /// body each keep independent credit through their last captured reader.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_writer_policy_schema_change(
         &self,
         original: &OwnedMemoryReservation,
@@ -465,6 +475,7 @@ impl RedbPersistence {
     }
     /// Prepare capability restrictions before durability. Old descriptors retain
     /// their native image, but cannot decode erased families after publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_writer_erasure(
         &self,
         writer: crate::memory_accounting::AccountantHandle,
@@ -530,6 +541,7 @@ impl RedbPersistence {
         Ok(PreparedWriterErasure(replacements, None))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_original_discard_writer_erasure(&self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         tables: &BTreeSet<String>, history: &super::discard_history::OriginalDiscardHistory,
@@ -682,6 +694,7 @@ impl RedbPersistence {
     /// private failure through its result loan, using the funded-error route.
     /// The active queue consumer retains the producing scope across preparation,
     /// commit and retirement. Opaque Storage errors remain unqualified.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_exact_queue_root_read(
         &self,
         write: redb::PreparedReadInput,
@@ -726,6 +739,7 @@ impl RedbPersistence {
         Ok((prepared, scope))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_exact_queue_root(
         &self,
         write: redb::WriteTransaction,
@@ -786,6 +800,7 @@ impl RedbPersistence {
         }).map_err(|error| take_diagnostic().unqualified(error))?
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reserve_exact_writer_snapshot(&self, original: &OwnedMemoryReservation) -> Result<OwnedMemoryReservation> {
         self.prepare_proof_owner()?;
         let _schema = self.prepared_writer_schema()?;
@@ -804,6 +819,7 @@ impl RedbPersistence {
 
     /// Prepare the initial admitted root before constructing the manager.
     /// Pass it to new_with_directory; persistence keeps no publication slot.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn initialize_writer_snapshot(
         &self,
         snapshot: SnapshotId,
@@ -824,6 +840,7 @@ impl RedbPersistence {
 
     /// Reserve this before durable commit. Failed reservation leaves the
     /// existing root untouched and must abort commit preparation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reserve_writer_snapshot(&self) -> Result<OwnedMemoryReservation> {
         self.prepare_proof_owner()?;
         let _schema = self.prepared_writer_schema()?;
@@ -842,6 +859,7 @@ impl RedbPersistence {
     /// Called after durability, while serialized with commits. The caller
     /// must poison the writer if this fails; the durable commit cannot roll
     /// back. This deliberately does not publish the new root.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_writer_snapshot(
         &self,
         control: OwnedMemoryReservation,
@@ -897,6 +915,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_native_writer_snapshot(
         &self,
         control: OwnedMemoryReservation,
@@ -1010,6 +1029,7 @@ pub(crate) enum SourceWindowCredit {
 }
 
 impl SourceWindowOwner {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn diagnostic_budget(&self) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
         match self {
             Self::Read(owner) => Ok(owner.clone()),
@@ -1021,6 +1041,7 @@ impl SourceWindowOwner {
         let token = crate::memory_accounting::WriterUse::retain_if_writer(&writer);
         Self::Write(writer, token)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reserve_box_credit(
         &self,
         bytes: usize,
@@ -1038,6 +1059,7 @@ impl SourceWindowOwner {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reserve(
         &self,
         bytes: usize,
@@ -1062,6 +1084,7 @@ impl SourceWindowOwner {
         Ok(credit)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn endpoint(
         &self,
         parts: &[&[u8]],
@@ -1090,6 +1113,7 @@ impl SourceWindowOwner {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prefix_end(
         &self,
         prefix: &[u8],
@@ -1205,6 +1229,7 @@ impl<T> WriterWindow<T> {
             _memory: self._memory,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn boxed<U: ?Sized>(
         self,
         coerce: impl FnOnce(Box<Self>) -> Box<U>,
@@ -1224,6 +1249,7 @@ impl<T> WriterWindow<T> {
     }
 }
 impl WriterSnapshot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn adapter_control(
         &self,
         owner: &SourceWindowOwner,
@@ -1251,6 +1277,7 @@ impl WriterSnapshot {
                     .map_or(0, ContainedMemoryReservation::bytes),
             )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn content_size_totals(
         &self,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1268,6 +1295,7 @@ impl WriterSnapshot {
     /// at this root and nothing was visited. Each record is decoded under its
     /// own admission, released after `visit` returns, and checked against the
     /// table, list and prefix it was asked for.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn maintained_count_groups<E: From<Error>>(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1396,6 +1424,7 @@ impl WriterSnapshot {
         Ok(true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn owner_read(&self) -> Result<Arc<redb::ReadTransaction>> {
         if !self.active.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::Other("prepared writer root is not durable".into()));
@@ -1418,6 +1447,7 @@ impl WriterSnapshot {
         Ok(read)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn check_table_scope(&self, table: &str) -> Result<()> {
         self.erasure
             .read()
@@ -1438,6 +1468,7 @@ impl WriterSnapshot {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1450,6 +1481,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).cursor(owner, table, family, lower, upper, reverse)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1459,6 +1491,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).row_cursor(owner, table, row_id)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authored_row_cursor(
         self: &Arc<Self>, owner: SourceWindowOwner, table: &str, row: RowId,
     ) -> Result<Option<WriterReadCursor>> {
@@ -1467,12 +1500,14 @@ impl WriterSnapshot {
 
     /// Read a retired authored occurrence under the same revocable scope as
     /// its canonical row. No raw retired-root handle escapes this method.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authored_row_at(
         self: &Arc<Self>, owner: SourceWindowOwner, table: &str, key: &[u8;24],
     ) -> Result<Option<WriterWindow<VersionedRow>>> {
         WriterSnapshotHandle::from(self.clone()).authored_row_at(owner, table, key)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn exact_row(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1482,6 +1517,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).exact_row(owner, table, key)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1493,6 +1529,7 @@ impl WriterSnapshot {
 
     /// Read the canonical body named by a placement in this exact root.
     /// Placement lifetimes stay on the membership; the body keeps its own stamps.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn export_vector_body(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1503,6 +1540,7 @@ impl WriterSnapshot {
 
     /// Canonical encoded body from this exact authenticated membership root.
     /// No float hydration or quantization round trip is needed for the spool.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn export_vector_raw_for_working(
         self: &Arc<Self>, owner: SourceWindowOwner,
         membership: &VectorPartitionMembershipRecord,
@@ -1510,6 +1548,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).export_vector_raw_for_working(owner, membership)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn membership_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1521,6 +1560,7 @@ impl WriterSnapshot {
 
     /// Ordered index endpoints use the canonical index codec/comparator,
     /// including complete row/version suffixes supplied by the query planner.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn index_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1536,6 +1576,7 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1581,6 +1622,7 @@ impl WriterSnapshotHandle {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1602,6 +1644,7 @@ impl WriterSnapshotHandle {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authored_row_cursor(
         &self, owner: SourceWindowOwner, table: &str, row: RowId,
     ) -> Result<Option<WriterReadCursor>> {
@@ -1616,6 +1659,7 @@ impl WriterSnapshotHandle {
             Bound::Included(lower.as_bytes()), Bound::Excluded(upper.as_bytes()), false)?.with_table_scope(table).map(Some)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authored_row_at(
         &self, owner: SourceWindowOwner, table: &str, key: &[u8;24],
     ) -> Result<Option<WriterWindow<VersionedRow>>> {
@@ -1660,6 +1704,7 @@ impl WriterSnapshotHandle {
         Ok(Some(WriterWindow { value: row, position: Box::default(), _root: self.clone(), _memory: memory }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn exact_row(
         &self,
         owner: SourceWindowOwner,
@@ -1678,6 +1723,7 @@ impl WriterSnapshotHandle {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1701,6 +1747,7 @@ impl WriterSnapshotHandle {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn export_vector_body(
         &self,
         owner: SourceWindowOwner,
@@ -1765,6 +1812,7 @@ impl WriterSnapshotHandle {
             })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn export_vector_raw_for_working(
         &self, owner: SourceWindowOwner,
         membership: &VectorPartitionMembershipRecord,
@@ -1791,6 +1839,7 @@ impl WriterSnapshotHandle {
                 reason: "working membership lost its canonical body".into() })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn membership_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1826,6 +1875,7 @@ impl WriterSnapshotHandle {
         .with_table_scope(&index.table)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn index_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1890,6 +1940,7 @@ impl WriterErasure {
             .expect("authoritative erasure carries reason detail"),
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn check_scope(&self, logical: Option<&str>, physical: &str) -> Result<()> {
         let affected = match logical {
             Some(table) => self.tables.contains(table),
@@ -1905,9 +1956,11 @@ impl WriterErasure {
             Ok(())
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn check_key(&self, physical: &str, key: &[u8]) -> Result<()> {
         self.check_key_with_checkpoint(physical, key, None)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn check_key_with_checkpoint(&self, physical: &str, key: &[u8], checkpoint: Option<&mut dyn FnMut() -> Result<()>>) -> Result<()> {
         if (physical == GRAPH_FWD_TABLE.name() || physical == GRAPH_REV_TABLE.name())
             && (self.graph_keys.contains(key)
@@ -1921,6 +1974,7 @@ impl WriterErasure {
 }
 
 impl WriterReadCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_table_scope(mut self, table: &str) -> Result<Self> {
         let credit = self.owner.reserve(table.len(), "cursor_keys")?;
         let logical = Box::<str>::from(table);
@@ -1951,6 +2005,7 @@ impl WriterReadCursor {
 
     /// The closure decodes one record under allocation-aware serde admission.
     /// Its returned object retains that admission until the caller drops it.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next<T>(
         &mut self,
         decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
@@ -1958,6 +2013,7 @@ impl WriterReadCursor {
         self.next_before(&mut || Ok(()), decode)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_before<T>(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -1966,6 +2022,7 @@ impl WriterReadCursor {
         self.next_before_handoff(before, decode, Ok)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_before_handoff<T, H>(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -2009,6 +2066,7 @@ impl WriterReadCursor {
         Ok(Some(delivered))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_one<T>(
         &self,
         memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -2235,6 +2293,7 @@ impl WriterReadCursor {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_authored_row(&mut self, table: &str) -> Result<Option<WriterWindow<VersionedRow>>> {
         let diagnostic_owner = self.owner.clone();
         let root = self.root.clone();
@@ -2259,16 +2318,19 @@ impl WriterReadCursor {
         }, Ok)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_row(&mut self) -> Result<Option<WriterWindow<VersionedRow>>> {
         self.next_row_before(&mut || Ok(()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_row_before(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<WriterWindow<VersionedRow>>> {
         self.next_row_before_handoff(before, Ok)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn next_row_before_handoff<H>(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -2336,6 +2398,7 @@ pub(crate) struct WriterCommitCursor {
 }
 
 impl WriterSnapshot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn change_log_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2345,6 +2408,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).change_log_cursor(owner, first, last)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn config_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2355,6 +2419,7 @@ impl WriterSnapshot {
 
     /// The configuration rows under `prefix` from `start` (inclusive) on,
     /// in key order: a lower-bound seek, never a walk of the earlier rows.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn config_cursor_from(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2367,6 +2432,7 @@ impl WriterSnapshot {
     /// The complete lineage projection has a producer root witness. Seeking
     /// its pending coordinates authenticates absence and excluded prefixes
     /// without enumerating the rest of the configuration journal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn lineage_cursor_from(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2376,6 +2442,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).lineage_cursor_from(owner, prefix, start)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2388,6 +2455,7 @@ impl WriterSnapshot {
 
     /// Resolve one change coordinate against this root's authenticated
     /// commit directory, never against a newer transaction-manager view.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn transaction_at_lsn(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2396,6 +2464,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).transaction_at_lsn(owner, lsn)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_bounds(&self) -> Result<(Option<(Lsn, TxId)>, Option<(Lsn, TxId)>, u64)> {
         let read = self.owner_read()?;
         let table = read
@@ -2416,6 +2485,7 @@ impl WriterSnapshot {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn sync_source(
         &self,
         owner: SourceWindowOwner,
@@ -2449,6 +2519,7 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn change_log_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -2469,6 +2540,7 @@ impl WriterSnapshotHandle {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn config_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -2486,6 +2558,7 @@ impl WriterSnapshotHandle {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn config_cursor_from(
         &self,
         owner: SourceWindowOwner,
@@ -2504,6 +2577,7 @@ impl WriterSnapshotHandle {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn lineage_cursor_from(
         &self,
         owner: SourceWindowOwner,
@@ -2522,6 +2596,7 @@ impl WriterSnapshotHandle {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -2541,6 +2616,7 @@ impl WriterSnapshotHandle {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn transaction_at_lsn(
         &self,
         owner: SourceWindowOwner,
@@ -2585,12 +2661,14 @@ impl WriterSnapshotHandle {
 }
 
 impl WriterReadCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_index(
         &mut self,
         current: bool,
     ) -> Result<Option<WriterWindow<WriterIndexPosting>>> {
         self.next_index_before(current, &mut || Ok(()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_index_before(
         &mut self,
         current: bool,
@@ -2598,6 +2676,7 @@ impl WriterReadCursor {
     ) -> Result<Option<WriterWindow<WriterIndexPosting>>> {
         self.next_index_before_handoff(current, before, Ok)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn next_index_before_handoff<H>(
         &mut self,
         current: bool,
@@ -2653,6 +2732,7 @@ impl WriterReadCursor {
 
     /// Retain the exact authenticated physical bytes for the private working
     /// write. Re-encoding a decoded edge must not normalize its source bytes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_edge_for_working(&mut self) -> Result<Option<WriterWindow<(AdjEntry, Vec<u8>)>>> {
         let root = self.root.clone();
         let definition = if self.table.as_ref() == GRAPH_REV_TABLE.name() { GRAPH_REV_TABLE } else { GRAPH_FWD_TABLE };
@@ -2669,15 +2749,18 @@ impl WriterReadCursor {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_edge(&mut self) -> Result<Option<WriterWindow<AdjEntry>>> {
         self.next_edge_handoff(Ok)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_edge_with(
         &mut self, checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<Option<WriterWindow<AdjEntry>>> {
         self.next_edge_handoff_with(&mut || checkpoint(), Ok)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn next_row_edge_handoff<H>(
         &mut self,
         reverse: bool,
@@ -2685,6 +2768,7 @@ impl WriterReadCursor {
     ) -> Result<Option<H>> {
         self.next_row_edge_handoff_with(reverse, &mut || Ok(()), handoff)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn next_row_edge_handoff_with<H>(
         &mut self, reverse: bool, checkpoint: &mut dyn FnMut() -> Result<()>,
         handoff: impl FnOnce(WriterWindow<contextdb_tx::OwnedAdjEntry>) -> Result<H>,
@@ -2740,12 +2824,14 @@ impl WriterReadCursor {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn next_edge_handoff<H>(
         &mut self,
         handoff: impl FnOnce(WriterWindow<AdjEntry>) -> Result<H>,
     ) -> Result<Option<H>> {
         self.next_edge_handoff_with(&mut || Ok(()), handoff)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_edge_handoff_with<H>(
         &mut self,
         checkpoint: &mut dyn FnMut() -> Result<()>,
@@ -2802,6 +2888,7 @@ impl WriterReadCursor {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_membership_for_working(
         &mut self,
     ) -> Result<Option<WriterWindow<(VectorPartitionMembershipRecord, Vec<u8>)>>> {
@@ -2820,6 +2907,7 @@ impl WriterReadCursor {
         }).transpose()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_membership(
         &mut self,
     ) -> Result<Option<WriterWindow<VectorPartitionMembershipRecord>>> {
@@ -2839,12 +2927,14 @@ impl WriterReadCursor {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_change(&mut self) -> Result<Option<WriterWindow<ChangeLogEntry>>> {
         self.next_stored_change(|_, record| Ok(record.entry))
     }
 
     // Private provenance never crosses into the public change-log projection.
     // The returned window retains this cursor's authenticated root and invoice.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn next_stored_change<T>(&mut self,
         decode: impl FnOnce(&[u8], graph_history_record::StoredChangeLogEntry) -> Result<T>) -> Result<Option<WriterWindow<T>>> {
         let root = self.root.clone();
@@ -2874,6 +2964,7 @@ impl WriterReadCursor {
 }
 
 impl WriterCommitCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next(&mut self) -> Result<Option<(Lsn, TxId)>> {
         let read = self.root.owner_read()?;
         let table = read
@@ -2925,6 +3016,7 @@ impl WriterCommitCursor {
 }
 
 impl WriterSnapshot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn table_change_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2935,6 +3027,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).table_change_cursor(owner, table, first, last)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn change_log_occurrences(&self, lsn: Lsn) -> Result<u64> {
         let read = self.owner_read()?;
         let counts = match read.open_table(writer_history::CHANGE_LOG_LSN_COUNT) {
@@ -2950,6 +3043,7 @@ impl WriterSnapshot {
 
     /// Terminal lifecycle preparation uses the existing config compatibility
     /// contract and retains its exact original decode owner beyond all guards.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn config_point_original<T: serde::de::DeserializeOwned>(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -2969,6 +3063,7 @@ impl WriterSnapshot {
         RedbPersistence::decode_owned_config_value(original, value.value()).map(Some)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn config_point<T: serde::de::DeserializeOwned>(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2977,6 +3072,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).config_point(owner, key)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn lineage_point<T: serde::de::DeserializeOwned>(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2985,6 +3081,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).lineage_point(owner, key)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn config_point_in<T: serde::de::DeserializeOwned>(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2996,6 +3093,7 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn table_change_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -3032,6 +3130,7 @@ impl WriterSnapshotHandle {
         .with_table_scope(table)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn config_point<T: serde::de::DeserializeOwned>(
         &self,
         owner: SourceWindowOwner,
@@ -3040,6 +3139,7 @@ impl WriterSnapshotHandle {
         self.config_point_in(owner, key, CONFIG_TABLE.name())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn lineage_point<T: serde::de::DeserializeOwned>(
         &self,
         owner: SourceWindowOwner,
@@ -3052,6 +3152,7 @@ impl WriterSnapshotHandle {
         self.config_point_in(owner, key, READ_LINEAGE_CONFIG_TABLE.name())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn config_point_in<T: serde::de::DeserializeOwned>(
         &self,
         owner: SourceWindowOwner,
@@ -3083,6 +3184,7 @@ impl WriterSnapshotHandle {
 }
 
 impl WriterReadCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_table_change(&mut self) -> Result<Option<WriterWindow<ChangeLogEntry>>> {
         let root = self.root.clone();
         let owner = self.owner.clone();
@@ -3114,6 +3216,7 @@ impl WriterReadCursor {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reserve_redb_allocator_state(
         &self,
     ) -> Result<crate::memory_accounting::RedbAllocatorStateCharge> {
@@ -3128,6 +3231,7 @@ impl RedbPersistence {
 }
 
 impl WriterSnapshot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn exact_index_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3141,6 +3245,7 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn exact_index_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -3170,6 +3275,7 @@ impl WriterSnapshotHandle {
 impl WriterSnapshot {
     /// Build an admitted physical endpoint using the persistence codec. Query
     /// adapters need not duplicate its encoding or its row/version suffixes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn index_position_key(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3180,6 +3286,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).index_position_key(owner, tuple, row_id, created_tx)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_index_position_key_with_checkpoint(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3191,6 +3298,7 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).row_index_position_key_with_checkpoint(owner, declaration, row, created_tx, checkpoint)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn index_position_key_with_checkpoint(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3204,6 +3312,7 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn index_position_key(
         &self,
         owner: SourceWindowOwner,
@@ -3214,6 +3323,7 @@ impl WriterSnapshotHandle {
         self.index_position_key_with_checkpoint(owner, tuple, row_id, created_tx, &mut || Ok(()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_index_position_key_with_checkpoint(
         &self,
         owner: SourceWindowOwner,
@@ -3238,6 +3348,7 @@ impl WriterSnapshotHandle {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn index_position_key_with_checkpoint(
         &self,
         owner: SourceWindowOwner,
@@ -3736,6 +3847,7 @@ mod tests {
 impl WriterSnapshot {
     /// Reconcile an independently rooted retained-version range before any
     /// selected value or successful absence escapes its immutable capture.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_historical_rows(
         self: &Arc<Self>,
         table: &str,
@@ -3752,6 +3864,7 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_historical_rows(
         &self,
         table: &str,
@@ -3978,6 +4091,7 @@ impl WriterReadCursor {
     /// The manifest chooses the next physical identity independently of the
     /// surviving relation; the selected member's bounds, body and closure are
     /// proved before its value or an empty range is returned.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn next_historical_row_before_handoff<H>(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -4305,6 +4419,7 @@ pub(crate) struct NativeConfigBytes {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeConfigBytes {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn join(
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
         parts: &[&[u8]],
@@ -4378,6 +4493,7 @@ impl NativeConfigWindow {
         // Borrowed bincode String decoder validated UTF-8 before the copy.
         std::str::from_utf8(self.text.as_slice()).expect("decoded config UTF-8")
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn incarnation(
         &self,
     ) -> std::result::Result<contextdb_core::Incarnation, NativeConfigFailure> {
@@ -4409,6 +4525,7 @@ struct NativeConfigCursor<'root> {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeConfigCursor<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_text(
         &mut self,
     ) -> std::result::Result<Option<NativeConfigWindow>, NativeConfigFailure> {
@@ -4457,6 +4574,7 @@ impl NativeConfigCursor<'_> {
 }
 #[cfg(feature = "sync-orchestration")]
 impl WriterSnapshot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_config_text(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4542,6 +4660,7 @@ impl NativeRawConfigView<'_> {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeRawConfigWindow {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn view(&self) -> std::result::Result<NativeRawConfigView<'_>, NativeConfigFailure> {
         use super::native_storage_admission::NativeStorageFailure;
         self.context
@@ -4592,6 +4711,7 @@ pub(crate) struct NativeRawConfigCursor {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeRawConfigCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_next_group<T>(
         &mut self,
         visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
@@ -4668,6 +4788,7 @@ impl NativeRawConfigCursor {
 
     /// Exact persisted-byte comparison loan on this cursor's original owner,
     /// metadata and captured transaction. It never changes prefix resume state.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_exact<T>(
         &self,
         key: &str,
@@ -4714,6 +4835,7 @@ impl NativeRawConfigCursor {
 
     /// Consume one admitted raw window privately. A retained window can be the
     /// callback result; every later field borrow still checks its weak context.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_next<T>(
         &mut self,
         visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
@@ -4776,6 +4898,7 @@ impl NativeRawConfigCursor {
 }
 #[cfg(feature = "sync-orchestration")]
 impl WriterSnapshot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_raw_config_prefix(
         self: &Arc<Self>,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4787,6 +4910,7 @@ impl WriterSnapshot {
     > {
         WriterSnapshotHandle::from(self.clone()).native_raw_config_prefix(operation, context, prefix)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_raw_config_prefix_after(
         self: &Arc<Self>,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4799,6 +4923,7 @@ impl WriterSnapshot {
     > {
         WriterSnapshotHandle::from(self.clone()).native_raw_config_prefix_after(operation, context, prefix, after)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_raw_custody_group(
         self: &Arc<Self>,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4810,6 +4935,7 @@ impl WriterSnapshot {
     > {
         WriterSnapshotHandle::from(self.clone()).native_raw_custody_group(operation, context, group)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn require_native_custody_groups(
         &self,
     ) -> std::result::Result<(), NativeConfigFailure> {
@@ -4825,6 +4951,7 @@ impl WriterSnapshot {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn native_raw_cursor(
         self: &Arc<Self>,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4842,6 +4969,7 @@ impl WriterSnapshot {
 
 #[cfg(feature = "sync-orchestration")]
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_raw_config_prefix(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4854,6 +4982,7 @@ impl WriterSnapshotHandle {
         self.native_raw_config_prefix_after(operation, context, prefix, None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_raw_config_prefix_after(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4870,6 +4999,7 @@ impl WriterSnapshotHandle {
         self.native_raw_cursor(operation, context, &[prefix.as_bytes()], after, false)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_raw_custody_group(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4888,6 +5018,7 @@ impl WriterSnapshotHandle {
         self.native_raw_cursor(operation, context, &[&len, group.as_bytes()], None, true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn native_raw_cursor(
         &self,
         operation: &crate::owner_read::NativeReadRequest,

@@ -32,12 +32,14 @@ impl WorkingEdge {
 impl Drop for WorkingEdge { fn drop(&mut self) {} }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_prepared(&self) -> Result<bool> {
         if !self.graph_is_ready() { return Ok(false); }
         self.with_write(|write| Ok(write.table_exists(WORKING_GRAPH_FWD).map_err(RedbPersistence::storage_error)?
             && write.table_exists(WORKING_GRAPH_REV).map_err(RedbPersistence::storage_error)?))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_graph(
         &self,
         store: &RedbPersistence,
@@ -80,6 +82,7 @@ impl ReceivedWorkingWrite {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_graph_edge(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -96,6 +99,7 @@ struct GraphPosition {
     key: Vec<u8>,
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn original_graph_key(frame: &OriginalPersistenceFrame<'_>, edge: &AdjEntry, reverse: bool) -> Result<Vec<u8>> {
     let length = edge.edge_type.len().checked_add(49).ok_or_else(|| Error::Other("working graph key overflow".into()))?;
     frame.reserve(length)?;
@@ -108,6 +112,7 @@ fn original_graph_key(frame: &OriginalPersistenceFrame<'_>, edge: &AdjEntry, rev
     Ok(key)
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn put_working_graph_edge(&self, original: &crate::memory_accounting::OwnedMemoryReservation, edge: &AdjEntry) -> Result<()> {
         let frame = OriginalPersistenceFrame::new(original)?;
         let encoded = frame.encode(edge)?;
@@ -125,6 +130,7 @@ impl ReceivedWorkingWrite {
 
     /// Remove only versions of the exact pre-DROP row identity. The bounded
     /// prefix seek avoids rewriting or gathering unrelated graph history.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn remove_graph_identity(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -177,6 +183,7 @@ impl ReceivedWorkingWrite {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_graph_replacements(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -221,6 +228,7 @@ impl ReceivedWorkingWrite {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn next_graph_in_write(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     write: &redb::WriteTransaction,
@@ -231,6 +239,7 @@ pub(super) fn next_graph_in_write(
     next_graph_in_table(original, write, if reverse { WORKING_GRAPH_REV } else { WORKING_GRAPH_FWD }, reverse, lower, upper)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn next_graph_in_table(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     write: &redb::WriteTransaction,
@@ -258,6 +267,7 @@ fn next_graph_in_table(
 
 /// Consumer callbacks run after both native table/range guards close. Each
 /// original window retains decoded data, exact source bytes and continuation.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn visit_graph_in_write(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     write: &redb::WriteTransaction,
@@ -279,6 +289,7 @@ pub(super) fn visit_graph_in_write(
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_graph_original(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -298,6 +309,7 @@ const WORKING_GRAPH_REWRITE: TableDefinition<&[u8], &[u8]> = TableDefinition::ne
 pub(crate) enum GraphRewrite { Keep, Replace, Remove }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn rewrite_graph(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -404,6 +416,7 @@ impl WorkingGraphState {
     pub(super) fn new() -> Self {
         Self { prepared: false, generation: 0, next_occurrence: 0, dirty: false, frozen: false, undo: 0, checkpoints: 0, capturing: false, declarations_owner: None }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reset(&mut self) -> Result<()> {
         // Do not reuse an old capture even if newly empty table roots match.
         let generation = self.generation.checked_add(1)
@@ -475,6 +488,7 @@ struct WorkingGraphRecord {
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_graph_state(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<()> {
         self.require_original(original)?;
         if self.graph_state.lock().prepared { return Ok(()); }
@@ -488,6 +502,7 @@ impl ReceivedWorkingWrite {
         self.graph_state.lock().prepared = true;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn require_graph_mutable(&self) -> Result<()> {
         let state = self.graph_state.lock();
         if !state.prepared || state.frozen {
@@ -495,6 +510,7 @@ impl ReceivedWorkingWrite {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn select_graph_type(&self, original: &crate::memory_accounting::OwnedMemoryReservation, kind: &str) -> Result<()> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
@@ -504,6 +520,7 @@ impl ReceivedWorkingWrite {
         self.graph_state.lock().dirty = true;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_type_contains_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation, kind: &str) -> Result<bool> {
         self.require_original(original)?;
         self.with_write(|write| {
@@ -512,6 +529,7 @@ impl ReceivedWorkingWrite {
             Ok(found)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_graph_record(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         definition: TableDefinition<&[u8], &[u8]>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<Option<WorkingGraphRecord>> {
         self.require_original(original)?;
@@ -524,6 +542,7 @@ impl ReceivedWorkingWrite {
         })?;
         Ok(record.map(|(key, body)| WorkingGraphRecord { key, body, _owner: frame.into_reservation() }))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_graph_types_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         mut visit: impl FnMut(&str) -> Result<()>) -> Result<()> {
         self.require_original(original)?;
@@ -541,6 +560,7 @@ impl ReceivedWorkingWrite {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn allocate_graph_occurrence(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         origin: WorkingGraphOrigin) -> Result<WorkingGraphOccurrence> {
         self.require_original(original)?;
@@ -554,6 +574,7 @@ impl ReceivedWorkingWrite {
     }
     /// Creation uses its exact forward physical key. Deletion uses the affected
     /// predecessor's exact key, never the newest edge with the same identity.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn record_graph_coordinate(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         predecessor_or_creation: &AdjEntry, deletion: bool, coordinate: WorkingGraphCoordinate) -> Result<()> {
         self.require_original(original)?;
@@ -587,6 +608,7 @@ impl ReceivedWorkingWrite {
         })?;
         self.graph_record_put(original, if deletion { 2 } else { 1 }, &key, Some(&encoded))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_coordinate_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         edge: &AdjEntry, deletion: bool) -> Result<Option<WorkingGraphCoordinate>> {
         self.require_original(original)?;
@@ -596,6 +618,7 @@ impl ReceivedWorkingWrite {
             Bound::Included(key.as_slice()), Bound::Included(key.as_slice()))?;
         record.map(|record| self.decode_graph_coordinate(original, &frame, &record.body)).transpose()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn decode_graph_coordinate(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         frame: &OriginalPersistenceFrame<'_>, body: &[u8]) -> Result<WorkingGraphCoordinate> {
         self.require_original(original)?;
@@ -615,6 +638,7 @@ impl ReceivedWorkingWrite {
     }
     /// A root witness for subsequent current-prefix validation and terminal
     /// selection. It does not activate either consumer by itself.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn capture_graph(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<WorkingGraphCapture> {
         self.require_original(original)?;
         if !self.graph_prepared()? || !self.graph_state.lock().prepared {
@@ -634,12 +658,14 @@ impl ReceivedWorkingWrite {
             write_identity: self.control_identity,
             loan_identity: super::received_working_source::graph_witness_loan(self, original)?, roots, generation: state.generation, next_occurrence: state.next_occurrence, dirty: state.dirty })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn check_graph_capture(&self, original: &crate::memory_accounting::OwnedMemoryReservation, captured: &WorkingGraphCapture) -> Result<()> {
         if self.capture_graph(original)? != *captured {
             return Err(Error::Other("working graph changed after capture".into()));
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn freeze_graph_selection(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<WorkingGraphCapture> {
         if self.graph_state.lock().checkpoints != 0 { return Err(Error::Other("graph freeze retained a statement checkpoint".into())); }
         let capture = self.capture_graph(original)?;
@@ -651,6 +677,7 @@ impl ReceivedWorkingWrite {
 impl ReceivedWorkingWrite {
     /// Terminal controls retain the write and authentic Original, not a loan
     /// token whose synchronous callback scope has already ended.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn selected_graph_type_original(&self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         selection: &WorkingGraphCapture, kind: &str) -> Result<bool> {
@@ -659,6 +686,7 @@ impl ReceivedWorkingWrite {
         self.check_graph_capture(original, selection)?;
         Ok(selected)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_selected_graph_original(&self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         selection: &WorkingGraphCapture,
@@ -672,6 +700,7 @@ impl ReceivedWorkingWrite {
         })?;
         self.check_graph_capture(original, selection)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_selection_dirty(&self,
         original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<bool> {
         self.require_original(original)?;
@@ -680,6 +709,7 @@ impl ReceivedWorkingWrite {
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_graph_coordinates_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         deletion: bool, mut visit: impl FnMut(&[u8], WorkingGraphCoordinate) -> Result<()>) -> Result<()> {
         self.require_original(original)?;
@@ -715,6 +745,7 @@ pub(crate) struct WorkingGraphCheckpoint {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 struct GraphUndo { table: u8, key: Vec<u8>, body: Option<Vec<u8>> }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bookkeeping_table(index: u8) -> Result<TableDefinition<'static, &'static [u8], &'static [u8]>> {
     match index {
         0 => Ok(WORKING_GRAPH_TYPES), 1 => Ok(WORKING_GRAPH_CREATIONS),
@@ -724,6 +755,7 @@ fn bookkeeping_table(index: u8) -> Result<TableDefinition<'static, &'static [u8]
     }
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_record_put(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         index: u8, key: &[u8], body: Option<&[u8]>) -> Result<()> {
         self.require_original(original)?;
@@ -760,6 +792,7 @@ impl ReceivedWorkingWrite {
             Ok(())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn checkpoint_graph(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<WorkingGraphCheckpoint> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
@@ -768,6 +801,7 @@ impl ReceivedWorkingWrite {
         Ok(WorkingGraphCheckpoint { generation: state.generation, undo: state.undo,
             occurrence: state.next_occurrence, dirty: state.dirty })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn settle_graph_checkpoint(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         checkpoint: WorkingGraphCheckpoint, restore: bool) -> Result<()> {
         self.require_original(original)?;
@@ -805,9 +839,11 @@ impl ReceivedWorkingWrite {
         if restore { state.next_occurrence = checkpoint.occurrence; state.dirty = checkpoint.dirty; }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_graph_key(frame: &OriginalPersistenceFrame<'_>, source: NodeId, kind: &str, target: NodeId) -> Result<Vec<u8>> {
         frame.encode(&(source, kind, target))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn pending_graph_coordinate(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         edge: &AdjEntry) -> Result<Option<WorkingGraphCoordinate>> {
         let frame = OriginalPersistenceFrame::new(original)?;
@@ -821,6 +857,7 @@ impl ReceivedWorkingWrite {
         let body: AdjEntry = frame.decode(&body.body)?;
         self.graph_coordinate_original(original, &body, false)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retain_graph_mutation(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         origin: WorkingGraphOrigin, source: NodeId, kind: &str, target: NodeId,
         after: Option<&AdjEntry>, deleted_tx: TxId) -> Result<()> {
@@ -880,6 +917,7 @@ impl ReceivedWorkingWrite {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn restamp_graph_occurrences(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         receiver: TxId, mut position: impl FnMut(WorkingGraphOrigin) -> Result<Lsn>) -> Result<()> {
         self.rewrite_graph(original, |edge| {
@@ -943,12 +981,14 @@ impl ReceivedWorkingWrite {
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn begin_graph_capture(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<()> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
         self.graph_state.lock().capturing = true;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_capturing(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<bool> {
         self.require_original(original)?;
         Ok(self.graph_state.lock().capturing)
@@ -964,6 +1004,7 @@ struct WorkingGraphEvent {
     predecessor: Option<Vec<u8>>,
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retire_graph_occurrences(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         source: NodeId, kind: &str, target: NodeId) -> Result<()> {
         self.select_graph_type(original, kind)?;
@@ -982,6 +1023,7 @@ impl ReceivedWorkingWrite {
         let identity = Self::pending_graph_key(&frame, source, kind, target)?;
         self.graph_record_put(original, 4, &identity, None)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn put_graph_event(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         edge: &AdjEntry, lsn: Lsn, predecessor: Option<&[u8]>) -> Result<()> {
         let frame = OriginalPersistenceFrame::new(original)?;
@@ -1002,6 +1044,7 @@ impl ReceivedWorkingWrite {
             Ok(())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_graph_events(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         receiver: TxId) -> Result<()> {
         // Creation keys are already canonicalized. Stream occurrences and use
@@ -1031,6 +1074,7 @@ impl ReceivedWorkingWrite {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_graph_events_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         selection: &WorkingGraphCapture,
         mut visit: impl FnMut(&ChangeLogEntry, Option<&[u8]>) -> Result<()>) -> Result<()> {
@@ -1058,6 +1102,7 @@ impl ReceivedWorkingWrite {
 
 const WORKING_GRAPH_LAST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_last");
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn last_graph_coordinate_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         source: NodeId, kind: &str, target: NodeId) -> Result<Option<WorkingGraphCoordinate>> {
         let frame = OriginalPersistenceFrame::new(original)?;
@@ -1069,6 +1114,7 @@ impl ReceivedWorkingWrite {
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replace_graph_declarations_original(&self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         owner: &mut Option<crate::memory_accounting::OwnedMemoryReservation>)

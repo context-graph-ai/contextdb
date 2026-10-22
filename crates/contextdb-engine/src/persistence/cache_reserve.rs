@@ -56,6 +56,7 @@ unsafe fn finish(raw: NonNull<()>) {
 /// Preserve startup's existing retained-charge semantics for declared writers,
 /// and its process admission semantics for undeclared writers. Both receipts
 /// precede this new control's allocation; null/unwind owns their rollback.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn original(
     accountant: &AccountantHandle,
     bytes: usize,
@@ -202,6 +203,7 @@ unsafe fn admit_preparation(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn with_preparation<T>(
     accountant: &AccountantHandle,
     startup: bool,
@@ -247,6 +249,7 @@ pub(super) fn with_preparation<T>(
 /// Install only around the actual read-only native open. Every native backing
 /// retains this same invoice owner, so successful open, null and unwind all
 /// keep original source funding until the last physical backing is freed.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn direct_preparation(
     memory: &crate::read_image_memory::ImageMemory,
 ) -> Result<redb::NativeStorageAdmission> {

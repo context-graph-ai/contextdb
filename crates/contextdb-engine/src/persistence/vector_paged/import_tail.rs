@@ -13,6 +13,7 @@ pub(crate) struct NativeImportTail {
 }
 
 impl NativeImportTail {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn source(
         &self,
         meta: &PagedGenerationMeta,
@@ -47,6 +48,7 @@ impl NativeImportTail {
 }
 
 impl PagedVectorPersistence for NativeImportTail {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_batch(
         &self,
         previous: &PagedVectorProgress,
@@ -500,6 +502,7 @@ pub(super) fn source_identity_key(storage: u64, row: RowId, created: TxId, lsn: 
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn allocate_native_tail_storage(&self) -> Result<u64> {
         self.with_db(|db| {
             let write = db.begin_write().map_err(Self::storage_error)?;
@@ -524,6 +527,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_tail_entries_not_stored(
         &self,
         storage: u64,
@@ -580,6 +584,7 @@ impl RedbPersistence {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn truncate_native_tail_journal_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -709,6 +714,7 @@ impl RedbPersistence {
     /// Preserve the completed base topology while giving it a separately
     /// authenticated physical root. This is the initial serving-layout setup;
     /// subsequent native replacement builders write that layout directly.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_native_import_base(
         &self,
         expected: &VectorPartitionGenerationCatalogRecord,
@@ -866,6 +872,7 @@ impl RedbPersistence {
 
     /// One-time adoption of an existing saved change topology. Later imports
     /// append only their uncovered suffix to the same native serving storage.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_native_import_change(
         &self,
         expected: &VectorPartitionGenerationCatalogRecord,
@@ -1040,6 +1047,7 @@ impl RedbPersistence {
 
 /// A mutable storage can be referenced by successive catalog records. An old
 /// record's cleanup must never erase the graph the current catalog still serves.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn native_storage_is_selected_in_write(
     persistence: &RedbPersistence,
     write: &redb::WriteTransaction,
@@ -1155,6 +1163,7 @@ pub(super) fn native_storage_is_selected_in_write(
 
 impl RedbPersistence {
     /// Select one committed LSN cohort by a single authenticated suffix seek.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_candidate_first_uncovered_lsn(
         &self,
         partition: &VectorPartitionRef,
@@ -1205,6 +1214,7 @@ pub(crate) struct NativeImportCandidate {
 }
 
 impl PagedVectorPersistence for NativeImportCandidate {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_batch(
         &self,
         previous: &PagedVectorProgress,
@@ -1411,6 +1421,7 @@ impl PagedVectorPersistence for NativeImportCandidate {
 impl RedbPersistence {
     /// Catch-up advances serving coverage, while unconsumed journal identities
     /// still need the replacement's original retained snapshot after restart.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_candidate_retention_floor(
         &self,
         partition: &VectorPartitionRef,
@@ -1434,6 +1445,7 @@ impl RedbPersistence {
 impl NativeBatch<'_> {
     /// Track durable native bytes by changed keys, without asking redb to
     /// enumerate the table's allocation tree on each import.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn write_graph_page(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let native = u64::from_be_bytes(self.storage) & MUTABLE_STORAGE != 0;
         let previous = if native {
@@ -1484,6 +1496,7 @@ impl NativeBatch<'_> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn native_bytes_in<T: redb::ReadableTable<&'static [u8], &'static [u8]>>(
     pages: &T,
     storage: u64,
@@ -1506,6 +1519,7 @@ pub(super) fn native_bytes_in<T: redb::ReadableTable<&'static [u8], &'static [u8
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_base_meta_bytes(
         &self,
         partition: &VectorPartitionRef,
@@ -1559,6 +1573,7 @@ pub(super) struct NativeChangeBacking {
     pub(super) physical: PagedGenerationMeta,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn decode_native_change_backing(
     storage: u64,
     frame: &[u8],
@@ -1597,6 +1612,7 @@ pub(super) fn decode_native_change_backing(
     Ok(binding)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn resolve_native_change_backing(
     read: &redb::ReadTransaction,
     meta: &PagedGenerationMeta,
@@ -1625,6 +1641,7 @@ pub(crate) fn resolve_native_change_backing(
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn catalog_has_native_import_backing(
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
@@ -1649,6 +1666,7 @@ impl RedbPersistence {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn rebind_native_change_backing_in_write(
     write: &redb::WriteTransaction,
     original: &[u8],
@@ -1695,6 +1713,7 @@ pub(super) fn rebind_native_change_backing_in_write(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn encode_native_change_backing(binding: &NativeChangeBacking) -> Result<Vec<u8>> {
     RedbPersistence::encode(&(
         RedbPersistence::encode(&binding.original)?,

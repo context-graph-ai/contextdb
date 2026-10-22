@@ -4,6 +4,7 @@ use super::*;
 impl RedbPersistence {
     /// Remove the terminal lifetime using a borrowed posting guard and a single
     /// encoded scalar endpoint. Payload width never multiplies into row copies.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prune_terminal_relational_posting_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -191,6 +192,7 @@ impl RedbPersistence {
     /// The predecessor seek and at most two replacements do not depend on the
     /// number of retained row versions. The caller removes the row manifest in
     /// this same transaction, so no committed root can observe only one half.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prune_relational_posting_intervals_in_write(
         &self,
         write: &redb::WriteTransaction,

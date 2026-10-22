@@ -15,6 +15,7 @@ fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn coordinate(key: &str) -> Result<(Lsn, u32)> {
     let (lsn, ordinal) = key.split_once(':').unwrap_or((key, "000000"));
     let lsn = Lsn(lsn.parse().map_err(|_| damage("invalid occurrence LSN"))?);
@@ -33,6 +34,7 @@ fn coordinate(key: &str) -> Result<(Lsn, u32)> {
     Ok((lsn, ordinal))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_ordinal(ordinal: u32) -> Result<()> {
     if ordinal > 999_999 {
         return Err(damage(
@@ -56,6 +58,7 @@ fn state_key(at: (Lsn, u32)) -> [u8; 13] {
     bytes
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn prefix(change: &DdlChange) -> Result<Vec<u8>> {
     let (kind, name) = match change {
         DdlChange::CreateTable { name, .. } => (0, name),
@@ -105,6 +108,7 @@ struct State {
     unmarked: bool,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn config_occurrence(key: &str) -> Result<Option<(Lsn, u32)>> {
     for prefix in [GENERATION, ARRIVAL, SUPERSEDED] {
         if let Some(rest) = key.strip_prefix(prefix) {
@@ -118,14 +122,17 @@ fn config_occurrence(key: &str) -> Result<Option<(Lsn, u32)>> {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_ddl_occurrence_ordinal(ordinal: u32) -> Result<()> {
         validate_ordinal(ordinal)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ddl_config_occurrence_coordinate(key: &str) -> Result<(Lsn, u32)> {
         config_occurrence(key)?.ok_or_else(|| damage("invalid occurrence configuration namespace"))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn initialize_ddl_selectors_in_write(write: &redb::WriteTransaction) -> Result<()> {
         write.delete_table(SELECTORS).map_err(Self::storage_error)?;
         write.delete_table(COUNTS).map_err(Self::storage_error)?;
@@ -134,6 +141,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn ddl_selector_fingerprints_in_write(
         write: &redb::WriteTransaction,
     ) -> Result<[[u8; 32]; 2]> {
@@ -154,6 +162,7 @@ impl RedbPersistence {
         ])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reconcile_ddl_selectors_in_write(
         write: &redb::WriteTransaction,
         mutations: &[content_identity::ContentIdentityMutation],
@@ -357,6 +366,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_ddl_selectors_in_write(write: &redb::WriteTransaction) -> Result<()> {
         let actual = Self::ddl_selector_fingerprints_in_write(write)?;
         let expected = content_identity::ddl_selector_roots_in_write(write)?;
@@ -366,6 +376,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn validate_ddl_selectors_in_read(read: &redb::ReadTransaction) -> Result<()> {
         match read.open_table(SELECTORS) {
             Ok(_) => {}
@@ -395,6 +406,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn first_eligible_ddl_occurrence(
         root: &WriterSnapshotHandle,
         owner: writer_source::SourceWindowOwner,
@@ -495,6 +507,7 @@ impl RedbPersistence {
         Ok(Some(at))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn unmarked_ddl_occurrences(
         root: &WriterSnapshot,
         owner: writer_source::SourceWindowOwner,

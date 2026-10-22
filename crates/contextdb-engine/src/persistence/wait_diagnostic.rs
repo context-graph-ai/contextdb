@@ -43,6 +43,7 @@ impl std::fmt::Display for OpenIoDiagnostic {
     }
 }
 impl PreparedOpenDiagnostic {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn new(original: ReadMemoryOwner, path: &Path) -> Result<Self> {
         let path = DiagnosticText::try_format(original.clone(), path.display(),
             "reader_wait", "diagnostic_path",

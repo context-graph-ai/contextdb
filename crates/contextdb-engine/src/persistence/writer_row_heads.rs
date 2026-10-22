@@ -13,6 +13,7 @@ fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
         reason: reason.into(),
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode(key: &[u8], value: &[u8]) -> Result<[u8; 24]> {
     if value.len() != 56 {
         return Err(damage("invalid row head envelope"));
@@ -25,6 +26,7 @@ fn decode(key: &[u8], value: &[u8]) -> Result<[u8; 24]> {
     }
     Ok(value[..24].try_into().unwrap())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn route(key: &[u8]) -> Result<(&str, RowId)> {
     let length = key
         .get(..8)
@@ -50,6 +52,7 @@ fn route(key: &[u8]) -> Result<(&str, RowId)> {
 /// The writer admission a row-head reconciliation pass charges what it holds
 /// to: the general writer's or the owned transaction host's.
 pub(super) trait RowHeadAdmission {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_held_relations(&mut self, bytes: usize) -> Result<()>;
     fn release_held_relations(&mut self, bytes: usize);
 }
@@ -420,6 +423,7 @@ pub(super) struct HeldRelations<'name, 'txn, 'a, A: RowHeadAdmission> {
 impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
     /// A holder for one pass. It first makes registry room for the pass's
     /// own other tables, so opening them never grows the registry unfunded.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn new(write: &'txn redb::WriteTransaction, admission: &'a mut A) -> Result<Self> {
         #[cfg(any(test, feature = "test-seams"))]
         content_identity::version_manifest::commit_row_work::note_held_pass();
@@ -439,6 +443,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
 
     /// The open relation of `table`, or `None` when its family does not
     /// exist, opened on the table's first use in this pass.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn get(&mut self, table: &'name str) -> Result<Option<&HeldRelation<'txn>>> {
         let found = self.index.search(|position| {
             #[cfg(any(test, feature = "test-seams"))]
@@ -464,6 +469,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
 
     /// Admit `bytes` for `charge`, which funds `count` allocations of `size`
     /// bytes each (the witness uses this to tag them).
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit(&mut self, charge: Charge, bytes: usize, count: usize, size: usize) -> Result<()> {
         self.admission.admit_held_relations(bytes)?;
         #[cfg(test)]
@@ -489,6 +495,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
     }
 
     /// An injection point between a first use's admissions and allocations.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fault(&mut self, step: HoldStep) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if let Some(fault) = take_hold_fault(step) {
@@ -515,6 +522,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn first_use(&mut self, table: &'name str, vacancy: Vacancy) -> Result<usize> {
         self.fault(HoldStep::AdmitName)?;
         let name_len = RELATION_PREFIX
@@ -536,6 +544,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         used
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn first_use_named(
         &mut self,
         table: &'name str,
@@ -594,6 +603,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
 
     /// Make registry room for `additional` more open tables, funding any
     /// growth it needs before redb allocates it.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_registry(&mut self, additional: usize) -> Result<()> {
         self.fault(HoldStep::ProbeRegistry)?;
         let Some(growth) = self
@@ -645,6 +655,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_slot(&mut self) -> Result<()> {
         if self.slots.len() < self.slots.capacity() {
             return Ok(());
@@ -668,6 +679,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_node(&mut self) -> Result<()> {
         if self.index.len() < self.index.capacity() {
             return Ok(());
@@ -739,6 +751,7 @@ impl<A: RowHeadAdmission> Drop for HeldRelations<'_, '_, '_, A> {
 }
 
 /// The doubled capacity of a vector of `entry`-byte elements and its bytes.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn doubled(capacity: usize, entry: usize) -> Result<(usize, usize)> {
     let capacity = capacity
         .checked_mul(2)
@@ -879,6 +892,7 @@ fn rank(key: [u8; 24]) -> (u64, u64) {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn apply_writer_row_heads_in_write(
         write: &redb::WriteTransaction,
         mutations: &[content_identity::ContentIdentityMutation],
@@ -891,6 +905,7 @@ impl RedbPersistence {
         Self::apply_writer_row_heads_holding(write, mutations, &mut relations)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_writer_row_heads_holding<'name, 'txn, A: RowHeadAdmission>(
         write: &'txn redb::WriteTransaction,
         mutations: &'name [content_identity::ContentIdentityMutation],
@@ -963,6 +978,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn write_row_heads_root(write: &redb::WriteTransaction) -> Result<()> {
         {
             write.open_table(TABLE).map_err(Self::storage_error)?;
@@ -986,6 +1002,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn writer_row_head(
         root: &WriterSnapshot,
         table: &str,

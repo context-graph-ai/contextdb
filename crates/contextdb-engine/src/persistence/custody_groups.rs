@@ -8,6 +8,7 @@ const REVERSE_TABLE: TableDefinition<&str, &[u8]> =
 pub(super) const COMPLETE: &[u8] = b"";
 pub(super) const COMPLETE_VALUE: &[u8] = b"complete";
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn invalidate(write: &redb::WriteTransaction) -> Result<()> {
     // An absent table is never created by maintenance or repair.
     if write
@@ -27,6 +28,7 @@ pub(super) fn invalidate(write: &redb::WriteTransaction) -> Result<()> {
 /// Start a complete, empty index in this transaction. The caller then
 /// maintains every committed custody entry into it with funded scratch, so the
 /// marker is true again when the transaction commits.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn reset_complete(write: &redb::WriteTransaction) -> Result<()> {
     for result in [
         write.delete_table(GROUP_TABLE),
@@ -48,6 +50,7 @@ pub(super) fn reset_complete(write: &redb::WriteTransaction) -> Result<()> {
     super::custody_pending::create(write)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn initialize_empty(write: &redb::WriteTransaction) -> Result<()> {
     // Only an actual empty database can acquire the completion marker. This is
     // deliberately stronger than finding an empty custody mirror.
@@ -80,17 +83,21 @@ mod native {
     fn damage<T>(_: T) -> Error {
         invalid()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn add(a: usize, b: usize) -> Result<usize> {
         a.checked_add(b).ok_or_else(invalid)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn wide(n: usize) -> Result<[u8; 8]> {
         Ok(u64::try_from(n).map_err(damage)?.to_be_bytes())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
         let (head, tail) = bytes.split_at_checked(n).ok_or_else(invalid)?;
         *bytes = tail;
         Ok(head)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn length(bytes: &mut &[u8]) -> Result<usize> {
         usize::try_from(u64::from_be_bytes(
             take(bytes, 8)?.try_into().map_err(damage)?,
@@ -100,6 +107,7 @@ mod native {
 
     /// Flat reverse value: repeated [u64 full-key length, full-key]. One exact
     /// byte allocation; group walks, hashing, and length passes use only stack.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reverse_size(key: &str, value: &[u8]) -> Result<usize> {
         let record = decode_record(value).map_err(damage)?;
         let mut size = 0usize;
@@ -118,6 +126,7 @@ mod native {
         .map_err(damage)?;
         Ok(size)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fill_reverse(key: &str, value: &[u8], bytes: &mut [u8]) -> Result<()> {
         let record = decode_record(value).map_err(damage)?;
         let mut offset = 0usize;
@@ -155,6 +164,7 @@ mod native {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(in super::super) fn plan_bytes(key: &str, value: &[u8]) -> Result<usize> {
         if !crate::custody::records::owned_key(key) {
             return Ok(0);
@@ -169,6 +179,7 @@ mod native {
     impl GroupPlan {
         /// Exact single-occurrence sibling for the artifact's existing upfront
         /// proof admission. Both allocations remain inside that admission.
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         pub(in super::super) fn single_prepaid(key: &str, value: &[u8]) -> Result<Self> {
             let total = plan_bytes(key, value)?;
             if total == 0 {
@@ -192,6 +203,7 @@ mod native {
         }
         /// Caller has prepaid plan_bytes for each item on the exact original
         /// frame before opening its transaction. No admission occurs here.
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         pub(in super::super) fn prepaid<'a>(
             values: impl Iterator<Item = &'a (String, Vec<u8>)> + Clone,
         ) -> Result<Self> {
@@ -245,6 +257,7 @@ mod native {
             let reverse = take(&mut bytes, n).expect("prepaid group plan reverse");
             (key, hash, reverse)
         }
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn get(&self, key: &str, value: &[u8]) -> Result<Option<&[u8]>> {
             let hash = blake3::hash(value);
             let found = self.offsets.binary_search_by(|offset| {
@@ -259,6 +272,7 @@ mod native {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(in super::super) fn maintain(
         write: &redb::WriteTransaction,
         key: &str,

@@ -65,6 +65,7 @@ pub(super) struct EncodedSchemaUpdate {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn decode_persisted_schema(bytes: &[u8]) -> Result<(TableMeta, u64, Vec<u64>)> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         if let Some(payload) = bytes.strip_prefix(SCHEMA_MAGIC) {
@@ -115,6 +116,7 @@ impl RedbPersistence {
         Ok((meta, 0, Vec::new()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn decode_table_meta_versioned_original(
         frame: &OriginalPersistenceFrame<'_>, bytes: &[u8],
     ) -> Result<(TableMeta, bool)> {
@@ -142,6 +144,7 @@ impl RedbPersistence {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn encode_schema_update<'a>(
         previous: Option<&[u8]>,
         meta: &TableMeta,
@@ -160,6 +163,7 @@ impl RedbPersistence {
         Ok(bytes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn project_schema_incarnations<'a>(
         previous: Option<(TableMeta, u64, Vec<u64>)>,
         meta: &TableMeta,
@@ -258,6 +262,7 @@ impl RedbPersistence {
         Ok((last, incarnations))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn changed_vector_incarnations<'a>(
         previous: (TableMeta, u64, Vec<u64>),
         meta: &TableMeta,
@@ -288,6 +293,7 @@ impl RedbPersistence {
         Ok((changed_routes, retired_lifetimes))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn received_changed_vector_incarnations(
         &self,
         name: &str,
@@ -331,6 +337,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn received_changed_vector_lifetimes_in_memory(
         name: &str,
         previous: &TableMeta,
@@ -348,6 +355,7 @@ impl RedbPersistence {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn schema_update_in_table<'a>(
         &self,
         table: &redb::Table<'_, &str, &[u8]>,
@@ -388,6 +396,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_schema_binding(
         &self,
         index: &VectorIndexRef,
@@ -400,6 +409,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_schema_binding_in_read(
         read: &redb::ReadTransaction,
         index: &VectorIndexRef,
@@ -425,6 +435,7 @@ impl RedbPersistence {
         Self::vector_schema_binding_from_records(value.value(), generation.value(), index)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_schema_binding_in_write(
         write: &redb::WriteTransaction,
         index: &VectorIndexRef,
@@ -451,6 +462,7 @@ impl RedbPersistence {
         Self::vector_schema_binding_from_records(value.value(), generation.value(), index)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_schema_binding_from_records(
         meta_bytes: &[u8],
         generation: &[u8],
@@ -495,6 +507,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_vector_schema_binding_in_read(
         read: &redb::ReadTransaction,
         index: &VectorIndexRef,
@@ -508,6 +521,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_vector_schema_binding_in_write(
         write: &redb::WriteTransaction,
         index: &VectorIndexRef,
@@ -524,6 +538,7 @@ impl RedbPersistence {
 
 impl WriterSnapshot {
     /// Preserve the schema owner's identity counters from the checkpoint's root.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_schema_into(
         self: &Arc<Self>,
         owner: writer_source::SourceWindowOwner,
@@ -534,6 +549,7 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn copy_schema_into(
         &self,
         owner: writer_source::SourceWindowOwner,

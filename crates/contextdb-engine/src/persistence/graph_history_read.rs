@@ -3,6 +3,7 @@ use super::*;
 use contextdb_core::read_memory::ReadMemoryBudget;
 
 impl RetainedReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn check_history_directory_in_read(
         &self,
         read: &redb::ReadTransaction,
@@ -22,6 +23,7 @@ impl RetainedReadSource {
         self.history_open_control.check_directory(read)?;
         checkpoint()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn check_history_directory(
         &self,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -34,6 +36,7 @@ impl RetainedReadSource {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_history_bytes(
         &self,
         kind: content_identity::HistoryKind,
@@ -197,6 +200,7 @@ impl RetainedReadSource {
     }
 
     /// Check just this selected deletion against its captured commit directory.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn check_requested_tombstone_commit_in_read(
         &self,
         read: &redb::ReadTransaction,
@@ -229,6 +233,7 @@ impl RetainedReadSource {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_changes_since(
         &self,
         since: Lsn,
@@ -262,6 +267,7 @@ impl RetainedReadSource {
         Ok(first)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_ddl_since(
         &self,
         since: Lsn,
@@ -292,6 +298,7 @@ impl RetainedReadSource {
         Ok(first)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_entry_from(
         &self,
         bound: std::ops::Bound<Lsn>,

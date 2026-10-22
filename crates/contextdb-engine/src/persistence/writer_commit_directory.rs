@@ -69,6 +69,7 @@ impl CommitDirectoryCursor for DurableCommitCursor {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_commit_directory_control(&self) -> Result<OwnedMemoryReservation> {
         self.prepare_proof_owner()?;
         let accountant = self.proof_accountant().ok_or_else(|| {
@@ -83,6 +84,7 @@ impl RedbPersistence {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_commit_directory_identity(
         &self,
         write: &redb::WriteTransaction,
@@ -100,6 +102,7 @@ impl RedbPersistence {
 }
 
 impl CommitDirectory for RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor(
         &self,
         lower: Bound<Lsn>,
@@ -120,6 +123,7 @@ impl CommitDirectory for RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn floor(&self, upper: Bound<Lsn>) -> Result<Option<(Lsn, TxId)>> {
         let _control = self.reserve_commit_directory_control()?;
         let upper = upper.map(|lsn| lsn.0);
@@ -147,6 +151,7 @@ impl CommitDirectory for RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn census(&self) -> Result<(usize, Lsn)> {
         let _control = self.reserve_commit_directory_control()?;
         self.with_db(|db| {
@@ -170,6 +175,7 @@ impl CommitDirectory for RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn contains(&self, lsn: Lsn) -> Result<bool> {
         let _control = self.reserve_commit_directory_control()?;
         self.with_db(|db| {
@@ -188,6 +194,7 @@ impl CommitDirectory for RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn remove(&self, lsns: &[Lsn]) -> Result<u64> {
         if lsns.is_empty() {
             return Ok(0);
@@ -219,6 +226,7 @@ impl CommitDirectory for RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn replace(&self, retained: BTreeMap<Lsn, TxId>) -> Result<u64> {
         let _control = self.reserve_commit_directory_control()?;
         self.with_db(|db| {
@@ -327,6 +335,7 @@ impl<'root> ColdCommitCursor<'root> {
             finished: empty_bounds(&lower, &upper),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_unqualified(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -360,6 +369,7 @@ impl<'root> ColdCommitCursor<'root> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn cold_commit_floor(
     read: &redb::ReadTransaction,
     upper: Bound<Lsn>,
@@ -388,6 +398,7 @@ pub(crate) struct ColdCommitBounds {
     pub(crate) first: Option<(Lsn, TxId)>,
     pub(crate) last: Option<(Lsn, TxId)>,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn cold_commit_bounds(read: &redb::ReadTransaction) -> Result<ColdCommitBounds> {
     let table = read
         .open_table(COMMIT_INDEX_TABLE)
@@ -412,6 +423,7 @@ impl RedbPersistence {
     /// the caller to abort the WHOLE transaction, never publish a partial root.
     /// Lower table/control/name allocations and the durable outcome marker must
     /// be supplied by the storage owner before this can be activated.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn stage_cold_commit_directory_in_write_unqualified(
         &self,
         original: &OwnedMemoryReservation,

@@ -25,6 +25,7 @@ impl<T> SourceShared<T> {
     }
     /// The original control invoice covers this exact Layout before entry.
     /// Payload data funding follows its data; control custody is independent.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_new_prepaid(value: T, control: ControlCredit) -> Result<Self> {
         let layout = Self::layout();
         #[cfg(test)]

@@ -17,6 +17,7 @@ fn invalid() -> Error {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode_key(key: &[u8]) -> Result<VectorBodyIdentity> {
     let table_end = key.iter().position(|byte| *byte == 0).ok_or_else(invalid)?;
     let (table, rest) = key.split_at(table_end);
@@ -46,6 +47,7 @@ pub(crate) fn decode_key(key: &[u8]) -> Result<VectorBodyIdentity> {
 /// key range before any iterator read. Body payloads are neither decoded nor
 /// copied; admitted native leaf extents may contain inline body bytes.
 /// The visitor owns and admits anything it retains beyond this one window.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn visit_table<T: redb::ReadableTable<&'static [u8], &'static [u8]>>(
     table: &T,
     table_name: Option<&str>,

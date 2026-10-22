@@ -13,6 +13,7 @@ impl RedbPersistence {
     /// Called inside the caller's existing history write and graph writer
     /// admission window. The selected dropped owners were captured before DDL;
     /// no graph population scan or transport occurrence matching is needed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn apply_received_row_graph_parts_in_write(
         write: &redb::WriteTransaction,
         inserts: &[OwnedAdjEntry],

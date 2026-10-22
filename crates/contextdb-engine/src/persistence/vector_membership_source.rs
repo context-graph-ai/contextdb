@@ -77,6 +77,7 @@ impl MembershipOwner {
     pub(crate) fn historical_operation(&self) -> bool {
         operation_for(self).is_some_and(|context| context.historical)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture(&self) -> Result<MembershipRoot> {
         if let Some(context) = operation_for(self) {
             return Ok(context.root.clone());
@@ -86,6 +87,7 @@ impl MembershipOwner {
     /// A new operation has already declined same-child continuation. Capture
     /// its scoped writer publication rather than inheriting the outer vector
     /// operation's descriptor merely because both use the same store.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_fresh(&self) -> Result<MembershipRoot> {
         match self {
             Self::Writable(persistence) => MembershipRoot::capture(persistence),
@@ -103,6 +105,7 @@ impl MembershipOwner {
             }
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn latest(&self) -> Result<MembershipRoot> {
         if let Some(context) = operation_for(self) {
             return Ok(context.root.clone());
@@ -140,6 +143,7 @@ struct MembershipRoot {
 }
 
 impl MembershipRoot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture(persistence: &RedbPersistence) -> Result<Self> {
         if let Some(writer) = persistence
             .scoped_vector_root_capture
@@ -188,6 +192,7 @@ impl MembershipRoot {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn check_scope(&self, table: &str) -> Result<()> {
         if let Some(source) = &self.retained
             && self.read.storage_snapshot_identity() != source.storage_identity()
@@ -330,6 +335,7 @@ fn scan_storage_error(error: redb::StorageError) -> Error {
     RedbPersistence::storage_error(error)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn enter_read_operation(
     owner: MembershipOwner,
     snapshot: SnapshotId,
@@ -518,6 +524,7 @@ pub(crate) fn enter_read_operation(
 
 /// The operation refers to the bounded kernel's actual executing context. Plain
 /// library reads have no cancellation/deadline context to replace.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn operation_checkpoint() -> Result<()> {
     let context = OPERATION.with(|slot| slot.borrow().clone());
     #[cfg(any(test, feature = "test-seams"))]
@@ -554,6 +561,7 @@ pub(crate) fn read_memory_for_operation()
 /// Authenticate the captured producer commitments without walking retained
 /// membership history. Each consumed membership still checks its key, route,
 /// owning row and companions at this same physical root.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_captured_roots(
     read: &redb::ReadTransaction,
     copies: &mut contextdb_vector::VectorCopyAdmission,
@@ -640,6 +648,7 @@ fn validate_captured_roots(
 
 /// Visit only maintained route metadata, never historical membership records.
 /// The installed-source callback is scoped to preflight and cannot escape it.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_captured_routes(
     read: &redb::ReadTransaction,
     copies: &mut contextdb_vector::VectorCopyAdmission,
@@ -669,6 +678,7 @@ fn validate_captured_routes(
 /// Prove the consumed forward record's exact companions using borrowed values
 /// at the operation's immutable root. Only lookup keys are materialized;
 /// companion values and directory witnesses remain borrowed.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn authenticate_membership_companions(
     owner: &MembershipOwner,
     read: &redb::ReadTransaction,
@@ -762,6 +772,7 @@ fn authenticate_membership_companions(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn check_declared_routes(
     root: Option<&WriterSnapshotHandle>,
     retained_tables: Option<&HashMap<String, TableMeta>>,
@@ -865,6 +876,7 @@ pub(super) fn operation_read_for_retained(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn retained_partition_row_at_lsn(
     source: &RetainedReadSource,
     table: &str,
@@ -901,6 +913,7 @@ pub(crate) fn retained_partition_row_at_lsn(
     )
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn authenticate_retained_historical_body(
     source: &RetainedReadSource,
     read: &redb::ReadTransaction,
@@ -973,6 +986,7 @@ pub(super) fn authenticate_retained_historical_body(
     Ok(true)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn historical_memory_for_persistence(
     source: &RedbPersistence,
     read: &redb::ReadTransaction,
@@ -997,6 +1011,7 @@ pub(super) fn body_identity_for_record(
 ) -> RawVectorDirectoryEntry {
     body_identity(record)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn authenticate_row_for_persistence(
     source: &RedbPersistence,
     read: &redb::ReadTransaction,
@@ -1029,6 +1044,7 @@ pub(super) fn operation_read(owner: &MembershipOwner) -> Option<Arc<redb::ReadTr
     operation_for(owner).map(|context| context.root.read.clone())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn historical_operation_memory(
     owner: &MembershipOwner,
     read: &redb::ReadTransaction,
@@ -1044,6 +1060,7 @@ pub(super) fn historical_operation_memory(
     Ok(context.historical.then(|| context.memory.clone()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn authenticate_body_schema(
     owner: &MembershipOwner,
     read: &redb::ReadTransaction,
@@ -1106,6 +1123,7 @@ pub(super) fn authenticate_body_schema(
 
 /// Bind the placement to its independently authenticated owning row group.
 /// CURRENT intentionally performs no manifest seek/hash/proof work here.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn authenticate_owning_row(
     owner: &MembershipOwner,
     read: &redb::ReadTransaction,
@@ -1227,6 +1245,7 @@ pub(super) fn authenticate_owning_row(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn select_live_fallback(
     owner: MembershipOwner,
     row: RowId,
@@ -1331,6 +1350,7 @@ impl SelectedVectorMembership {
     pub(crate) fn record(&self) -> &VectorPartitionMembershipRecord {
         &self.record
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn read_body(
         &self,
         owner: &MembershipOwner,
@@ -1342,6 +1362,7 @@ impl SelectedVectorMembership {
             operation_checkpoint()
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn read_body_before(
         &self,
         owner: &MembershipOwner,
@@ -1405,6 +1426,7 @@ impl SelectedVectorMembership {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn read_summary(
     read: &redb::ReadTransaction,
     partition: &VectorPartitionRef,
@@ -1424,6 +1446,7 @@ pub(super) fn read_summary(
     summary_counts(&summary)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn summary_counts(
     summary: &vector_membership_pages::MembershipSummary,
 ) -> Result<RawVectorMembershipSummary> {
@@ -1473,12 +1496,14 @@ fn visible(record: &VectorPartitionMembershipRecord, snapshot: SnapshotId) -> bo
     record.visible_from.0 <= snapshot.0 && record.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_forward(
     partition: &VectorPartitionRef, key: &[u8], value: &[u8],
 ) -> Result<VectorPartitionMembershipRecord> {
     decode_forward_for_route(&partition.index, &partition.partition_key, key, value)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn decode_forward_for_route(
     index: &VectorIndexRef,
     partition_key: &VectorPartitionKey,
@@ -1571,6 +1596,7 @@ pub(crate) struct DurableMembershipSource {
 }
 
 impl DurableMembershipSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn from_owner_admitted(
         source_owner: MembershipOwner,
         published_root: Option<PublishedMembershipRoot>,
@@ -1618,6 +1644,7 @@ impl DurableMembershipSource {
 
     // Compare physical user-tree headers, independent of logical TxId and
     // of the Arc wrapper used to materialize a retained root.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn captured_catalog_required(&self, root: &MembershipRoot) -> Result<bool> {
         let Some(captured) = &root.writer else {
             return Ok(false);
@@ -1643,6 +1670,7 @@ impl DurableMembershipSource {
         Ok(captured.storage_identity().user_root != published.storage_identity().user_root)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn inspection_in_root(
         &self,
         root: &MembershipRoot,
@@ -1733,11 +1761,13 @@ impl DurableMembershipSource {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn catalog_frontier(&self, root: &MembershipRoot) -> Result<Option<TxId>> {
         let generations = self.catalog_generations(root)?;
         Ok(generations.map(|(base, change)| change.unwrap_or(base).covered_tx))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn catalog_generations(
         &self,
         root: &MembershipRoot,
@@ -1770,6 +1800,7 @@ impl DurableMembershipSource {
         membership_cursor_owned_bytes(&self.partition, prefix.saturating_add(8), prefix.saturating_add(40))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_pending_metadata(
         &self,
         root: &MembershipRoot,
@@ -1787,6 +1818,7 @@ impl DurableMembershipSource {
         Ok(summary)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_metadata_window(
         &self,
         owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -1809,6 +1841,7 @@ impl DurableMembershipSource {
         Ok(scratch)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_counts_for(
         summary: &vector_membership_pages::MembershipSummary,
         covered: Option<TxId>,
@@ -1830,6 +1863,7 @@ impl DurableMembershipSource {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_pending_counts(
         &self,
         covered: Option<TxId>,
@@ -1875,6 +1909,7 @@ impl DurableMembershipSource {
         Self::pending_counts_for(&summary, covered).map(Some)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor(&self, row: Option<RowId>) -> Result<MembershipCursor> {
         operation_checkpoint()?;
         let root = self.owner.capture()?;
@@ -1911,6 +1946,7 @@ impl DurableMembershipSource {
 
     /// Visit this partition's journal changes after `after_lsn`, in LSN
     /// order, at one captured root; `visit` returns false to stop.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn journal_suffix(
         &self,
         after_lsn: Lsn,
@@ -1992,6 +2028,7 @@ impl DurableMembershipSource {
 
     /// Walk one row prefix (or the whole partition) under a single admitted
     /// window, stopping at the first record `select` accepts.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn find_selected(
         &self,
         row: RowId,
@@ -2058,6 +2095,7 @@ impl DurableMembershipSource {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn find<T>(
         &self,
         row: Option<RowId>,
@@ -2076,6 +2114,7 @@ impl DurableMembershipSource {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn find_with_copy_admission<T>(
         &self,
         row: Option<RowId>,
@@ -2193,6 +2232,7 @@ pub(crate) struct MembershipCursor {
 }
 
 impl MembershipCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn open_body_scan(
         &self,
         owner: &MembershipOwner,
@@ -2218,6 +2258,7 @@ impl MembershipCursor {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_selected(
         &self,
         owner: &MembershipOwner,
@@ -2243,6 +2284,7 @@ impl MembershipCursor {
             .ok_or_else(|| damage("membership cursor has no selected record"))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_record(
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
@@ -2265,6 +2307,7 @@ impl MembershipCursor {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_record_attempt(
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
@@ -2698,6 +2741,7 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         self.find_selected(row, before, |record| record.vector_lsn == lsn, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_by_row(
         &self,
         row: RowId,
@@ -2818,6 +2862,7 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         true
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_counts(
         &self,
         covered: Option<TxId>,
@@ -2914,6 +2959,7 @@ pub(crate) struct DurableReverseMembershipSource {
 }
 
 impl DurableReverseMembershipSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn from_owner_admitted(
         source_owner: MembershipOwner,
         index: &VectorIndexRef,
@@ -2946,6 +2992,7 @@ impl DurableReverseMembershipSource {
         (self.index.table.len() + self.index.column.len()).saturating_mul(32) + 4096
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor_admitted(
         &self,
         row: RowId,
@@ -2957,6 +3004,7 @@ impl DurableReverseMembershipSource {
         self.cursor_reserved(row, bytes, scratch)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor_reserved(
         &self,
         row: RowId,
@@ -2994,6 +3042,7 @@ struct ReverseCursor {
 }
 
 impl ReverseCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_record(
         &mut self,
         before: &mut dyn FnMut() -> bool,
@@ -3006,6 +3055,7 @@ impl ReverseCursor {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_record_in_capture(
         &mut self,
         before: &mut dyn FnMut() -> bool,
@@ -3292,6 +3342,7 @@ struct AdmittedLayoutLoader {
     _owner: Arc<contextdb_vector::VectorCopyAdmission>,
 }
 impl AdmittedLayoutLoader {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(
         &self,
         partition: &VectorPartitionRef,
@@ -3314,6 +3365,7 @@ pub(crate) struct DurableColumnSourceFactory {
 }
 
 impl DurableColumnSourceFactory {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn column_sources(
         &self,
         index: &VectorIndexRef,
@@ -3399,6 +3451,7 @@ impl contextdb_vector::store::DurableRawColumnFactory for DurableColumnSourceFac
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn membership_partitions_in_read(
     read: &redb::ReadTransaction,
     owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -3544,6 +3597,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn durable_membership_partitions(
         &self,
         owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -3627,6 +3681,7 @@ fn canonical_partition_allocation_bounds(key: &VectorPartitionKey) -> Option<(us
     Some((len, cap))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn stream_partition_journal_tail(
     lease: &crate::database::vector_captured_serving::CapturedVectorRootLease,
     partition: &VectorPartitionRef,

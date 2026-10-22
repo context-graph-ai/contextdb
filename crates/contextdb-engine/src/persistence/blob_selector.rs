@@ -15,6 +15,7 @@ struct HashFile {
     _memory: OwnedMemoryReservation,
 }
 impl HashFile {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open(store: &RedbPersistence, original: &OwnedMemoryReservation) -> Result<Self> {
         let memory = crate::memory_accounting::reserve_preparation_from_original(original,
             redb::scratch_backend_allocation_size().checked_add(std::mem::size_of::<Self>() + std::mem::size_of::<FrozenBlobSelector>() + std::mem::size_of::<BlobSelectorBuilder>() + 4 * std::mem::size_of::<usize>())
@@ -24,6 +25,7 @@ impl HashFile {
         let backend = writer.as_ref().ok_or_else(invalid)?.scratch_backend().map_err(io)?;
         Ok(Self { backend, count: 0, _memory: memory })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append(&mut self, hash: &[u8;32]) -> Result<()> {
         let at = self.count.checked_mul(64).ok_or_else(invalid)?;
         let end = at.checked_add(64).ok_or_else(invalid)?;
@@ -39,6 +41,7 @@ impl HashFile {
         digest.update(b"contextdb-immutable-blob-selector");
         digest.update(&ordinal.to_be_bytes()); digest.update(hash); digest.finalize()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn at(&self, ordinal: u64) -> Result<[u8;32]> {
         if ordinal >= self.count { return Err(invalid()); }
         let mut record = [0u8;64];
@@ -47,6 +50,7 @@ impl HashFile {
         if Self::digest(ordinal, &hash).as_bytes() != &record[32..] { return Err(invalid()); }
         Ok(hash)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn clear(&mut self) -> Result<()> { self.backend.set_len(0).map_err(io)?; self.count=0; Ok(()) }
 }
 
@@ -61,6 +65,7 @@ pub(crate) struct BlobSelectorBuilder {
     _original_owner: OwnedEventBusHandle,
 }
 impl BlobSelectorBuilder {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn new(store: Arc<RedbPersistence>, source: writer_source::WriterSnapshotHandle,
         events: &OwnedEventBusHandle, original: &OwnedMemoryReservation) -> Result<Self> {
         source.require_working_store(&store)?;
@@ -70,13 +75,16 @@ impl BlobSelectorBuilder {
         Ok(Self { input: HashFile::open(&store,original)?, scratch: HashFile::open(&store,original)?,
             store,source,original_address:original as *const _ as usize,_original_owner:events.clone() })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push(&mut self, hash: [u8;32]) -> Result<()> { self.input.append(&hash) }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn extend(&mut self, selector: &FrozenBlobSelector) -> Result<()> {
         if !Arc::ptr_eq(&self.store,&selector.store) || self.original_address != selector.original_address {
             return Err(invalid());
         }
         for ordinal in 0..selector.len() { self.push(selector.at(ordinal)?)?; } Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn seal(mut self) -> Result<Arc<FrozenBlobSelector>> {
         // Bottom-up external merge: two current hashes and two unlinked files,
         // O(N log N) I/O, with no run directory proportional to N.
@@ -120,6 +128,7 @@ pub(crate) struct FrozenBlobSelector {
     _original_owner: OwnedEventBusHandle,
 }
 impl FrozenBlobSelector {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn registry_memory(&self, bytes:usize) -> Result<OwnedMemoryReservation> {
         self._original_owner.with_owned_persistence_original(|original| {
             self.require(&self.store,original)?;
@@ -128,7 +137,9 @@ impl FrozenBlobSelector {
         })
     }
     pub(crate) fn len(&self) -> u64 { self.file.count }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn at(&self, ordinal:u64) -> Result<[u8;32]> { self.file.at(ordinal) }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn contains(&self, hash:&[u8;32]) -> Result<bool> {
         let (mut lo,mut hi)=(0,self.len());
         while lo < hi { let mid=lo+(hi-lo)/2; match self.at(mid)?.cmp(hash) {
@@ -136,17 +147,20 @@ impl FrozenBlobSelector {
             std::cmp::Ordering::Less => lo=mid+1, std::cmp::Ordering::Greater => hi=mid,
         }} Ok(false)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn require_store(&self, store:&RedbPersistence) -> Result<()> {
         self.source.require_working_store(store)?;
         if !std::ptr::eq(self.store.as_ref(),store) {return Err(invalid());}
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn require(&self, store:&RedbPersistence, original:&OwnedMemoryReservation) -> Result<()> {
         self.require_store(store)?;
         if self.original_address != original as *const _ as usize {
             return Err(invalid());
         } Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn is_subset_of(&self, other:&Self) -> Result<bool> {
         let mut right=0;
         for left in 0..self.len() {

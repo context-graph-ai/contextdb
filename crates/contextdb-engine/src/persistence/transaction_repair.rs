@@ -8,6 +8,7 @@ impl RedbPersistence {
         dead_code,
         reason = "Full repair is never part of bounded writable startup"
     )]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn repair_current_transaction_order(
         &self,
         commit_index: &BTreeMap<Lsn, TxId>,
@@ -249,6 +250,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn transform_transaction_records(
         &self,
         write: &redb::WriteTransaction,

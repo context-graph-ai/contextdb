@@ -45,6 +45,7 @@ pub(crate) struct WorkingReadSource {
     lsn: Lsn,
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_source<R>(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -83,6 +84,7 @@ impl ReceivedWorkingWrite {
 /// Direct terminal work has no source loan. A live source must belong to the
 /// exact write and authentic Original; an unrelated nested context cannot lend
 /// its identity to a witness. No context reference escapes this call.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn graph_witness_loan(write: &ReceivedWorkingWrite,
     original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<Option<u64>> {
     write.require_original(original)?;
@@ -99,6 +101,7 @@ pub(super) fn graph_witness_loan(write: &ReceivedWorkingWrite,
     })
 }
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn current_for(host:usize)->Result<Option<Self>> {
         ACTIVE.with(|slot| {
             let pointer=slot.get();
@@ -113,6 +116,7 @@ impl WorkingReadSource {
             }))
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn current_for_relational(store: &contextdb_relational::store::RelationalStore) -> Result<Option<Self>> {
         ACTIVE.with(|slot| {
             let pointer = slot.get();
@@ -123,20 +127,24 @@ impl WorkingReadSource {
             Ok(std::ptr::eq(context.metadata, store).then(|| context.source.clone()))
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_private_graph(&self, ws: &contextdb_tx::WriteSet) -> Result<()> {
         self.context(|context| {
             if context.write.graph_capturing(context.original)? { return Ok(()); }
             context.write.apply_graph_replacements(context.original, &ws.adj_deletes, &ws.adj_inserts)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn remove_private_graph_identity(&self, source: NodeId, kind: &str, target: NodeId) -> Result<()> {
         self.context(|context| context.write.remove_graph_identity(context.original, source, kind, target))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn rewrite_private_graph(&self,
         transform: impl FnMut(&mut AdjEntry) -> Result<super::received_working_graph::GraphRewrite>,
     ) -> Result<()> {
         self.context(|context| context.write.rewrite_graph(context.original, transform))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_private_vector_plan(&self, plan: &PreparedVectorPartitionMutationBatch, ws: &contextdb_tx::WriteSet) -> Result<()> {
         self.context(|context| {
             context.write.apply_vector_partition_plan(context.original, plan, ws)?;
@@ -147,6 +155,7 @@ impl WorkingReadSource {
         self.token == other.token && self.control_identity == other.control_identity && self.root.ptr_eq(&other.root)
     }
     pub(crate) fn reader_budget(&self) -> contextdb_core::read_memory::ReadMemoryOwner { self.budget.clone() }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn rewrite_private_vectors(
         &self,
         body: impl FnMut(&OriginalPersistenceFrame<'_>, &mut super::received_working_vector::WorkingVectorIdentity<'_>) -> Result<bool>,
@@ -157,6 +166,7 @@ impl WorkingReadSource {
             context.write.refresh_vector_catalog(context.original)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn rewrite_private_row_identities(&self, table: &str,
         stamp: impl FnMut(&mut super::received_working::WorkingRowIdentity<'_>) -> Result<()>) -> Result<()> {
         self.context(|context| {
@@ -166,12 +176,14 @@ impl WorkingReadSource {
         })
     }
     pub(crate) fn root(&self)->WriterSnapshotHandle {self.root.clone()}
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_reader_memory(&self) -> Result<crate::read_image_memory::ImageMemoryHandle> {
         self.context(|context| crate::read_image_memory::ImageMemory::operation_reader(
             context.original.accountant().clone(), self.budget.clone()))
     }
 
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn context<R>(&self, use_context: impl for<'o> FnOnce(&Context<'o>) -> Result<R>) -> Result<R> {
         ACTIVE.with(|slot| {
             let pointer = slot.get();
@@ -197,10 +209,12 @@ impl WorkingReadSource {
             }
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn credit(&self, bytes:usize) -> Result<ReadCredit> {
         self.context(|_|ReadCredit::try_new(self.budget.clone(),bytes,"persistence","received_working_read",
             "Raise MEMORY_LIMIT to inspect this received unit."))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor(&self,table:&str,lower:Bound<&[u8]>,upper:Bound<&[u8]>,reverse:bool)
         -> Result<RelationalCursorOwner<VersionedRow>> {
         self.validate_table(table)?;
@@ -213,6 +227,7 @@ impl WorkingReadSource {
             after:None,reverse,examined:0,_payload_credit:payload_credit };
         Ok(RelationalCursorOwner::new(Box::new(cursor),control))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn box_row(&self,row:writer_source::WriterWindow<VersionedRow>)
         ->Result<OwnedReadBox<dyn RelationalWindow<VersionedRow>>> {
         row.boxed(|boxed|boxed as Box<dyn RelationalWindow<VersionedRow>>)
@@ -232,9 +247,11 @@ fn borrowed(bound:&Bound<Vec<u8>>) -> Bound<&[u8]> {
         Bound::Excluded(v)=>Bound::Excluded(v.as_slice()),Bound::Unbounded=>Bound::Unbounded }
 }
 impl RelationalCursor<VersionedRow> for RowCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_window(&mut self)->Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>> {
         self.next_window_before(&mut ||Ok(()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_window_before(&mut self,before:&mut dyn FnMut()->Result<()>)
         ->Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>> {
         self.source.context(|_|before())?;
@@ -254,6 +271,7 @@ impl RelationalCursor<VersionedRow> for RowCursor {
 impl RelationalReadSource for WorkingReadSource {
     fn snapshot(&self)->SnapshotId { self.snapshot }
     fn lsn(&self)->Lsn { self.lsn }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_table(&self,table:&str)->Result<()> {
         self.context(|context| {
             self.root.check_working_scope(table)?;
@@ -272,12 +290,14 @@ impl RelationalReadSource for WorkingReadSource {
         upper[8..16].copy_from_slice(&snapshot.0.to_be_bytes());
         self.cursor(table,Bound::Included(&lower),Bound::Included(&upper),true)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn exact_row(&self,table:&str,key:&[u8;24])
         ->Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>> {
         self.validate_table(table)?;
         let row=self.read_row(table,Bound::Included(key),Bound::Included(key),false)?;
         row.map(|row|self.box_row(row)).transpose()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn index_cursor(&self,table:&str,index:&str,range:RelationalIndexRange<'_>)
         ->Result<RelationalCursorOwner<RelationalPosting>> {
         self.validate_table(table)?;
@@ -307,6 +327,7 @@ impl RelationalReadSource for WorkingReadSource {
         self.index_cursor(table,index,RelationalIndexRange {current,
             lower:Bound::Included(lower.as_bytes()),upper:Bound::Included(upper.as_bytes()),reverse:false})
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn index_position_key(&self,current:bool,key:&IndexKey,row:RowId,created:TxId)
         ->Result<OwnedReadBox<dyn RelationalPositionKey>> {
         // Existing endpoint codec only; it reads no row/index from this root.
@@ -314,6 +335,7 @@ impl RelationalReadSource for WorkingReadSource {
             key,row,if current {TxId(0)}else{created})?
             .boxed(|boxed|boxed as Box<dyn RelationalPositionKey>))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_source(&self,table:&str,row:RowId)->Result<Option<(Lsn,SyncSourceKind)>> {
         self.validate_table(table)?;
         self.context(|context|context.write.sync_source(context.original,table,row))
@@ -326,9 +348,11 @@ struct PostingCursor {
     current:bool,reverse:bool,examined:u64,endpoint_credit:Option<ReadCredit>,_payload_credit:ReadCredit,
 }
 impl RelationalCursor<RelationalPosting> for PostingCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_window(&mut self)->Result<Option<OwnedReadBox<dyn RelationalWindow<RelationalPosting>>>> {
         self.next_window_before(&mut ||Ok(()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_window_before(&mut self,before:&mut dyn FnMut()->Result<()>)
         ->Result<Option<OwnedReadBox<dyn RelationalWindow<RelationalPosting>>>> {
         self.source.context(|_|before())?;
@@ -354,6 +378,7 @@ impl RelationalCursor<RelationalPosting> for PostingCursor {
 }
 
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn at_snapshot(mut self,snapshot:SnapshotId)->Result<Self> {
         if snapshot.0>self.snapshot.0 {
             return Err(Error::Other("working row snapshot exceeds its source frontier".into()));
@@ -367,6 +392,7 @@ impl WorkingReadSource {
         self.budget=budget;
         self
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_row(&self,table:&str,lower:Bound<&[u8]>,upper:Bound<&[u8]>,reverse:bool)
         ->Result<Option<writer_source::WriterWindow<VersionedRow>>> {
         self.context(|context| {
@@ -412,6 +438,7 @@ impl WorkingReadSource {
             result
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_posting(&self,table:&str,index:&str,current:bool,
         lower:Bound<&[u8]>,upper:Bound<&[u8]>,reverse:bool)
         ->Result<Option<writer_source::WriterWindow<RelationalPosting>>> {
@@ -480,6 +507,7 @@ pub(crate) struct WorkingMetadata {
 impl WorkingMetadata {pub(crate) fn value(&self)->&TableMeta {&self.value}}
 impl Drop for WorkingMetadata {fn drop(&mut self) {}}
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn metadata(&self,table:&str)->Result<WorkingMetadata> {
         self.context(|context| {
             let mut credit=ReadCredit::new(self.budget.clone());
@@ -503,6 +531,7 @@ impl WorkingReadSource {
             }
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn preflight(&self,table:&str,index:Option<&str>,snapshot:SnapshotId,
         before:&mut dyn FnMut()->Result<()>)->Result<()> {
         self.context(|_|before())?;
@@ -522,6 +551,7 @@ impl WorkingReadSource {
         }
         self.context(|_|before())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_head(&self,table:&str,row:RowId)->Result<(Lsn,[u8;24])> {
         let mut cursor=self.row_id_cursor(table,row,self.snapshot)?;
         let Some(window)=cursor.next_window()? else {
@@ -533,6 +563,7 @@ impl WorkingReadSource {
 }
 
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn project_schema(&self,table:&str,arriving:Option<&TableMeta>,ddl:&[DdlChange])->Result<()> {
         self.context(|context| {
             self.root.check_working_scope(table)?;
@@ -540,6 +571,7 @@ impl WorkingReadSource {
             context.write.refresh_vector_catalog(context.original)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_ddl(&self,ddl:&DdlChange)->Result<()> {
         let table=match ddl {
             DdlChange::CreateTable {name,..}|DdlChange::AlterTable {name,..}=>name,
@@ -553,6 +585,7 @@ impl WorkingReadSource {
 }
 
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn check(&self)->Result<()> {
         self.context(|context| {
             self.root.check_working_scope("")?;
@@ -562,6 +595,7 @@ impl WorkingReadSource {
             Ok(())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn advance_frontier(&self,snapshot:SnapshotId,lsn:Lsn)->Result<()> {
         self.context(|context| {
             let previous=context.frontier.get();
@@ -578,6 +612,7 @@ impl WorkingReadSource {
     /// Lend only the immutable original already held by this exact synchronous
     /// source. The result cannot borrow it; no registration or replacement seed
     /// is discovered. Owning constructors keep their body and invoice together.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_original<R>(&self,
         prepare:impl for<'o> FnOnce(&'o crate::memory_accounting::OwnedMemoryReservation)->Result<R>)->Result<R> {
         self.context(|context|prepare(context.original))
@@ -612,6 +647,7 @@ impl contextdb_graph::source::GraphCursor for WorkingGraphCursor {
     }
 }
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_cursor(&self, query: contextdb_graph::source::GraphQuery<'_>)
         -> Result<contextdb_graph::source::GraphCursorOwner> {
         let reverse = match query.direction {
@@ -640,6 +676,7 @@ impl WorkingReadSource {
         Ok(contextdb_graph::source::GraphCursorOwner::new(payload, control))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_graph(&self, reverse: bool, lower: Bound<&[u8]>, upper: Bound<&[u8]>)
         -> Result<Option<writer_source::WriterWindow<AdjEntry>>> {
         self.context(|context| {
@@ -695,6 +732,7 @@ pub(crate) struct WorkingVectorCapture {
     frontier: (SnapshotId, Lsn),
 }
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn capture_vector_catalog(&self) -> Result<WorkingVectorCapture> {
         use super::received_working_vector::*;
         self.context(|context| {
@@ -712,12 +750,14 @@ impl WorkingReadSource {
             Ok(WorkingVectorCapture { roots, frontier: context.frontier.get() })
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn check_vector_capture(&self, captured: &WorkingVectorCapture) -> Result<()> {
         if self.capture_vector_catalog()? != *captured {
             return self.context(|_| Err(Error::Other("working vector selection changed after its capture".into())));
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn read_vector_lineage(&self, captured: &WorkingVectorCapture,
         key: &[u8]) -> Result<Option<writer_source::WriterWindow<VectorIndexRef>>> {
         self.check_vector_capture(captured)?;
@@ -732,16 +772,19 @@ impl WorkingReadSource {
         Ok(result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn read_vector_summary(&self, captured: &WorkingVectorCapture,
         lower: Bound<&[u8]>, upper: Bound<&[u8]>)
         -> Result<Option<writer_source::WriterWindow<(VectorPartitionKey, contextdb_vector::store::RawVectorMembershipSummary, bool)>>> {
         self.read_vector_summary_from(captured, super::received_working_vector::WORKING_VECTOR_SUMMARIES, lower, upper)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn read_vector_empty_summary(&self, captured: &WorkingVectorCapture,
         lower: Bound<&[u8]>, upper: Bound<&[u8]>)
         -> Result<Option<writer_source::WriterWindow<(VectorPartitionKey, contextdb_vector::store::RawVectorMembershipSummary, bool)>>> {
         self.read_vector_summary_from(captured, super::received_working_vector::WORKING_VECTOR_EMPTY, lower, upper)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_vector_summary_from(&self, captured: &WorkingVectorCapture, definition: TableDefinition<&[u8], &[u8]>,
         lower: Bound<&[u8]>, upper: Bound<&[u8]>)
         -> Result<Option<writer_source::WriterWindow<(VectorPartitionKey, contextdb_vector::store::RawVectorMembershipSummary, bool)>>> {
@@ -752,9 +795,11 @@ impl WorkingReadSource {
         self.check_vector_capture(captured)?;
         Ok(result)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn refresh_private_vector_catalog(&self) -> Result<()> {
         self.context(|context| context.write.refresh_vector_catalog(context.original))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_summary_scalars(&self, captured: &WorkingVectorCapture, key: &[u8])
         -> Result<Option<(contextdb_vector::store::RawVectorMembershipSummary, bool)>> {
         self.check_vector_capture(captured)?;
@@ -767,9 +812,11 @@ impl WorkingReadSource {
         self.check_vector_capture(captured)?;
         Ok(result)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_partition_count(&self, captured: &WorkingVectorCapture, index_prefix: &[u8]) -> Result<usize> {
         Ok(self.vector_partition_counts(captured, index_prefix)?[0])
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_partition_counts(&self, captured: &WorkingVectorCapture, index_prefix: &[u8]) -> Result<[usize; 6]> {
         self.check_vector_capture(captured)?;
         let count = self.context(|context| context.write.with_write(|write| {
@@ -807,6 +854,7 @@ impl WorkingReadSource {
     /// Copy one physical working record with this executing reader. Reserve
     /// outside native guards; the original remains the write's custody, never
     /// relabeled into the reader's debit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_vector_record<T>(
         &self, definition: TableDefinition<&[u8], &[u8]>,
         lower: Bound<&[u8]>, upper: Bound<&[u8]>, reverse: bool,
@@ -847,6 +895,7 @@ impl WorkingReadSource {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn read_vector_membership(
         &self, lower: Bound<&[u8]>, upper: Bound<&[u8]>,
     ) -> Result<Option<writer_source::WriterWindow<VectorPartitionMembershipRecord>>> {
@@ -863,6 +912,7 @@ impl WorkingReadSource {
             })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn read_vector_reverse_membership(
         &self, lower: Bound<&[u8]>, upper: Bound<&[u8]>,
     ) -> Result<Option<writer_source::WriterWindow<VectorPartitionMembershipRecord>>> {
@@ -879,6 +929,7 @@ impl WorkingReadSource {
             })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn read_vector_body(
         &self, member: &VectorPartitionMembershipRecord,
     ) -> Result<writer_source::WriterWindow<VectorEntry>> {
@@ -908,6 +959,7 @@ pub(crate) struct WorkingGraphSelection {
     captured: super::received_working_graph::WorkingGraphCapture,
 }
 impl WorkingGraphSelection {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn contains_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation, kind: &str) -> Result<bool> {
         self.source.context(|context| {
             context.write.require_original(original)?;
@@ -917,6 +969,7 @@ impl WorkingGraphSelection {
             Ok(found)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         mut visit: impl FnMut(&str) -> Result<()>) -> Result<()> {
         self.source.context(|context| {
@@ -931,35 +984,43 @@ impl WorkingGraphSelection {
     }
 }
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn select_private_graph_type(&self, kind: &str) -> Result<()> {
         self.context(|context| context.write.select_graph_type(context.original, kind))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn allocate_private_graph_occurrence(&self, origin: super::received_working_graph::WorkingGraphOrigin)
         -> Result<super::received_working_graph::WorkingGraphOccurrence> {
         self.context(|context| context.write.allocate_graph_occurrence(context.original, origin))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn record_private_graph_coordinate(&self, edge: &AdjEntry, deletion: bool,
         coordinate: super::received_working_graph::WorkingGraphCoordinate) -> Result<()> {
         self.context(|context| context.write.record_graph_coordinate(context.original, edge, deletion, coordinate))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn private_graph_coordinate(&self, edge: &AdjEntry, deletion: bool)
         -> Result<Option<super::received_working_graph::WorkingGraphCoordinate>> {
         self.context(|context| context.write.graph_coordinate_original(context.original, edge, deletion))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn capture_private_graph(&self) -> Result<super::received_working_graph::WorkingGraphCapture> {
         self.context(|context| context.write.capture_graph(context.original))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn check_private_graph_capture(&self, captured: &super::received_working_graph::WorkingGraphCapture) -> Result<()> {
         self.context(|context| context.write.check_graph_capture(context.original, captured))
     }
     /// Call only after restamp and complete validation. Terminal consumers must
     /// keep this source loan live; no graph publication is activated here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn freeze_private_graph_selection(&self) -> Result<WorkingGraphSelection> {
         self.context(|context| Ok(WorkingGraphSelection { source: self.clone(),
             captured: context.write.freeze_graph_selection(context.original)? }))
     }
 }
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_private_graph_coordinates(&self, deletion: bool,
         visit: impl FnMut(&[u8], super::received_working_graph::WorkingGraphCoordinate) -> Result<()>) -> Result<()> {
         self.context(|context| context.write.visit_graph_coordinates_original(context.original, deletion, visit))
@@ -967,28 +1028,35 @@ impl WorkingReadSource {
 }
 
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn begin_private_graph_capture(&self) -> Result<()> {
         self.context(|context| context.write.begin_graph_capture(context.original))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retain_private_graph_mutation(&self,
         origin: super::received_working_graph::WorkingGraphOrigin,
         source: NodeId, kind: &str, target: NodeId, after: Option<&AdjEntry>, deleted: TxId) -> Result<()> {
         self.context(|context| context.write.retain_graph_mutation(context.original, origin, source, kind, target, after, deleted))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn pending_private_graph_coordinate(&self, edge: &AdjEntry)
         -> Result<Option<super::received_working_graph::WorkingGraphCoordinate>> {
         self.context(|context| context.write.pending_graph_coordinate(context.original, edge))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn private_graph_capturing(&self) -> Result<bool> {
         self.context(|context| context.write.graph_capturing(context.original))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn restamp_private_graph_occurrences(&self, receiver: TxId,
         position: impl FnMut(super::received_working_graph::WorkingGraphOrigin) -> Result<Lsn>) -> Result<()> {
         self.context(|context| context.write.restamp_graph_occurrences(context.original, receiver, position))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn checkpoint_private_graph(&self) -> Result<super::received_working_graph::WorkingGraphCheckpoint> {
         self.context(|context| context.write.checkpoint_graph(context.original))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn settle_private_graph_checkpoint(&self,
         checkpoint: super::received_working_graph::WorkingGraphCheckpoint, restore: bool) -> Result<()> {
         self.context(|context| context.write.settle_graph_checkpoint(context.original, checkpoint, restore))
@@ -996,6 +1064,7 @@ impl WorkingReadSource {
 }
 
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retire_private_graph_occurrences(&self, source: NodeId, kind: &str, target: NodeId) -> Result<()> {
         self.context(|context| context.write.retire_graph_occurrences(context.original, source, kind, target))
     }
@@ -1006,6 +1075,7 @@ pub(crate) struct OriginalGraphDeclarations {
     pub(crate) owner: Option<crate::memory_accounting::OwnedMemoryReservation>,
 }
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn current_private_graph_declarations(&self) -> Result<OriginalGraphDeclarations> {
         self.context(|context| {
             let frame = OriginalPersistenceFrame::new(context.original)?;
@@ -1035,6 +1105,7 @@ impl WorkingReadSource {
 }
 
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn last_private_graph_coordinate(&self, source: NodeId, kind: &str, target: NodeId)
         -> Result<Option<super::received_working_graph::WorkingGraphCoordinate>> {
         self.context(|context| context.write.last_graph_coordinate_original(context.original, source, kind, target))
@@ -1042,6 +1113,7 @@ impl WorkingReadSource {
 }
 
 impl WorkingReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replace_private_graph_declarations_original(&self,
         owner: &mut Option<crate::memory_accounting::OwnedMemoryReservation>)
         -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {

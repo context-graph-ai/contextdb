@@ -15,6 +15,7 @@ impl RedbPersistence {
     /// Coalesced postings need an interval subtraction only when another
     /// physical version of this row survives. Fully retired postings keep the
     /// existing manifest reconciliation path and require no payload copy.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn relational_manifest_has_successor_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -50,6 +51,7 @@ impl RedbPersistence {
         Ok(witness.table == table && witness.identity[..8] == physical[..8])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn replace_relational_manifest_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -61,6 +63,7 @@ impl RedbPersistence {
         self.replace_relational_manifest_pending_in_write(write, table, physical, old, new, None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn replace_relational_manifest_pending_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -154,6 +157,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn relational_manifest_damage(&self, reason: impl std::fmt::Display) -> Error {
         crate::funded_error::corruption_display(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), format_args!("relational version manifest: {reason}"))
     }
@@ -169,6 +173,7 @@ impl RedbPersistence {
 
     /// Authenticate every retained member and both table boundaries before
     /// retiring a whole table generation. The loop never collects a table.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_relational_manifests_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -240,6 +245,7 @@ pub(super) struct ManifestKey {
 impl RetainedReadSource {
     /// Independent authenticated expectation, including an empty seek and the
     /// first member beyond the addressed row group.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn manifest_next<E>(
         &self,
         start: Vec<u8>,
@@ -315,6 +321,7 @@ impl RetainedReadSource {
 
     /// Captured-frontier row reading preserves the existing native traversal
     /// and current-row authentication without descending the history manifest.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn current_relational_group<E: From<Error>>(
         &self,
         read: &redb::ReadTransaction,
@@ -479,6 +486,7 @@ impl RetainedReadSource {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reconcile_addressed_relational_group<E>(
         &self,
         read: &redb::ReadTransaction,
@@ -807,6 +815,7 @@ impl RetainedReadSource {
 impl CheckpointReadSource {
     /// Export validates the complete captured table before any version is
     /// filtered or copied. A directory-driven selection cannot hide a gap.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn verify_relational_version_manifests(
         &self,
         table: &str,
@@ -955,6 +964,7 @@ impl CheckpointReadSource {
 impl RedbPersistence {
     /// Stream a complete witnessed mutation source without retaining its
     /// decoded versions or a table-sized coordinate list.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_relational_rows_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -1025,6 +1035,7 @@ impl RedbPersistence {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_relational_rows_in_write_original(
         &self,
         original: &OriginalPersistenceFrame<'_>,
@@ -1097,6 +1108,7 @@ impl RedbPersistence {
     /// Predecessor selection is complete with respect to the rooted version
     /// universe, so a missing newer physical version cannot select an older
     /// authentic version for closure.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn verify_relational_group_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -1113,6 +1125,7 @@ impl RedbPersistence {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn verify_relational_group_pending_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -1197,6 +1210,7 @@ impl RedbPersistence {
 }
 
 impl RetainedReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn historical_index_preflight<E: From<Error>>(
         &self,
         table: &str,
@@ -1231,6 +1245,7 @@ impl RetainedReadSource {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn historical_index_preflight_core(
         &self,
         table: &str,
@@ -1509,6 +1524,7 @@ impl RetainedReadSource {
 }
 
 impl RetainedReadSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn decode_preflight_posting(
         &self,
         key: &[u8],
@@ -1660,6 +1676,7 @@ impl PendingManifestPublication {
             admission,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn push(&mut self, coordinate: &[u8], present: bool) -> Result<()> {
         let list = &mut self.mutations.list;
         if list.len() == list.capacity() {

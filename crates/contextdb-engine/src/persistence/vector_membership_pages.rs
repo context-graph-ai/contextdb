@@ -42,6 +42,7 @@ pub(super) struct PendingCounts {
     pub(super) tombstones: u64,
 }
 impl PendingCounts {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn transition(
         &mut self,
         previous: Option<&VectorPartitionMembershipRecord>,
@@ -80,6 +81,7 @@ impl PendingCounts {
 }
 
 impl MembershipSummary {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_transition(
         &mut self,
         previous: Option<&VectorPartitionMembershipRecord>,
@@ -97,6 +99,7 @@ impl MembershipSummary {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn update_pending_summary(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
@@ -154,6 +157,7 @@ fn update_pending_summary(
 
 /// Check the authoritative route in the same transaction before installing
 /// a generation catalog. A late candidate cannot resurrect an empty partition.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn is_empty_partitioned_route_in_write(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
@@ -194,6 +198,7 @@ pub(super) fn is_empty_partitioned_route_in_write(
 /// unpartitioned route, from this commit. Creating the relation here, in the
 /// declaring transaction, lets its producer witness record it; readers then
 /// find a physical root without any later commit having to visit it.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn ensure_declared_routes(
     write: &redb::WriteTransaction,
     table: &str,
@@ -245,6 +250,7 @@ pub(super) fn ensure_declared_routes(
 
 /// Called under the commit gate at the captured current frontier, before any
 /// later membership commit; all after-frontier counters start at zero.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn begin_pending_frontier(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
@@ -273,6 +279,7 @@ pub(super) fn begin_pending_frontier(
 /// are what that cohort retires from the maintained counters. When later
 /// changes are already committed, they stay pending at the published
 /// frontier instead of being cleared.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn publish_native_tail_frontier(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
@@ -340,6 +347,7 @@ pub(super) fn publish_native_tail_frontier(
 
 /// The complete replacement has absorbed the later upserts. Its retained
 /// tombstones still count toward the ordinary consolidation policy.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn advance_native_candidate_frontier(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
@@ -378,6 +386,7 @@ pub(super) fn advance_native_candidate_frontier(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn publish_pending_frontier(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
@@ -464,6 +473,7 @@ pub(super) fn typed_metadata_error(error: Error) -> Error {
 }
 
 /// Removing the last catalog changes the authoritative frontier in this same commit.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn reset_pending_frontier(
     write: &redb::WriteTransaction,
     partition: &VectorPartitionRef,
@@ -482,6 +492,7 @@ pub(super) fn reset_pending_frontier(
 
 /// Absence is empty only when the authoritative route has no membership or catalog.
 /// Each proof reads at most one prefix entry and one catalog key.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn read_partition_summary(
     read: &redb::ReadTransaction,
     partition: &VectorPartitionRef,
@@ -546,6 +557,7 @@ fn corruption(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn encode_summary(key: &[u8], summary: &MembershipSummary) -> Result<Vec<u8>> {
     let payload = RedbPersistence::encode(summary)?;
     let mut bytes = Vec::with_capacity(MAGIC.len() + payload.len() + 32);
@@ -558,6 +570,7 @@ fn encode_summary(key: &[u8], summary: &MembershipSummary) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn decode_summary(key: &[u8], bytes: &[u8]) -> Result<MembershipSummary> {
     if bytes.len() < MAGIC.len() + 32 || !bytes.starts_with(MAGIC) {
         return Err(corruption(
@@ -627,6 +640,7 @@ pub(super) fn reverse_key(record: &VectorPartitionMembershipRecord) -> Vec<u8> {
     key
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn component<'a>(key: &mut &'a [u8]) -> Result<&'a [u8]> {
     let (length, rest) = key
         .split_at_checked(8)
@@ -640,6 +654,7 @@ fn component<'a>(key: &mut &'a [u8]) -> Result<&'a [u8]> {
     Ok(component)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reverse_key_from_membership_key(mut key: &[u8]) -> Result<Vec<u8>> {
     let table = std::str::from_utf8(component(&mut key)?)
         .map_err(|_| corruption("membership table name is not UTF-8"))?;
@@ -664,6 +679,7 @@ fn reverse_key_from_membership_key(mut key: &[u8]) -> Result<Vec<u8>> {
     Ok(reverse)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_member(key: &[u8], encoded: &[u8]) -> Result<VectorPartitionMembershipRecord> {
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
         .map_err(|reason| corruption(reason))?;
@@ -682,6 +698,7 @@ fn decode_member(key: &[u8], encoded: &[u8]) -> Result<VectorPartitionMembership
     Ok(record)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_primary_member(
     membership_key: &[u8],
     encoded: &[u8],
@@ -703,6 +720,7 @@ fn decode_primary_member(
     Ok(record)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn adjust(
     summary: &mut MembershipSummary,
     key: &[u8],
@@ -746,6 +764,7 @@ fn adjust(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_referenced_body_count(bytes: &[u8]) -> Result<u64> {
     let bytes: [u8; 8] = bytes
         .try_into()
@@ -753,6 +772,7 @@ fn decode_referenced_body_count(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn referenced_body_count_in_read(read: &redb::ReadTransaction) -> Result<u64> {
     let metadata = read
         .open_table(CONTENT_IDENTITY_METADATA_TABLE)
@@ -765,6 +785,7 @@ pub(super) fn referenced_body_count_in_read(read: &redb::ReadTransaction) -> Res
         .map(|count| count.unwrap_or(0))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn referenced_body_count_in_write(write: &redb::WriteTransaction) -> Result<u64> {
     let metadata = write
         .open_table(CONTENT_IDENTITY_METADATA_TABLE)
@@ -810,6 +831,7 @@ pub(super) fn body_placement_validation_calls() -> u64 {
     BODY_PLACEMENT_VALIDATION_CALLS.with(std::cell::Cell::get)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_body_placement_transition<const CHECK_OVERLAP: bool>(
     write: &redb::WriteTransaction,
     reverse: &redb::Table<'_, &[u8], &[u8]>,
@@ -877,6 +899,7 @@ fn validate_body_placement_transition<const CHECK_OVERLAP: bool>(
 /// Replacement removes the old authenticated interval before installing the new
 /// one. Deletes still have its durable source companion after the forward key
 /// was removed; no body scan or resident reverse map is required.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn publish_membership(
     write: &redb::WriteTransaction,
     membership_key: &[u8],
@@ -912,6 +935,7 @@ pub(super) fn publish_corrupt_store_membership_for_test(
     )
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn publish_membership_impl<const CHECK_OVERLAP: bool>(
     write: &redb::WriteTransaction,
     membership_key: &[u8],
@@ -1164,6 +1188,7 @@ fn encode_occupancy(key: &[u8], end: u64) -> [u8; 16] {
     value
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_occupancy(route: &[u8], key: &[u8], value: &[u8]) -> Result<(u64, u64)> {
     let start = key
         .strip_prefix(route)
@@ -1185,6 +1210,7 @@ fn decode_occupancy(route: &[u8], key: &[u8], value: &[u8]) -> Result<(u64, u64)
 type OccupancyTable<'txn> = redb::Table<'txn, &'static [u8], &'static [u8]>;
 
 /// The route's row with the greatest start at or below `at`.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn occupancy_predecessor(
     table: &OccupancyTable<'_>,
     route: &[u8],
@@ -1204,6 +1230,7 @@ fn occupancy_predecessor(
 }
 
 /// The route's first row with a start strictly above `after`.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn occupancy_successor(
     table: &OccupancyTable<'_>,
     route: &[u8],
@@ -1225,6 +1252,7 @@ fn occupancy_successor(
     Ok(row)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn put_occupancy(table: &mut OccupancyTable<'_>, route: &[u8], start: u64, end: u64) -> Result<()> {
     let key = occupancy_key(route, start);
     table
@@ -1233,6 +1261,7 @@ fn put_occupancy(table: &mut OccupancyTable<'_>, route: &[u8], start: u64, end: 
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn remove_occupancy(table: &mut OccupancyTable<'_>, route: &[u8], start: u64) -> Result<()> {
     table
         .remove(occupancy_key(route, start).as_slice())
@@ -1243,6 +1272,7 @@ fn remove_occupancy(table: &mut OccupancyTable<'_>, route: &[u8], start: u64) ->
 /// Union-insert one lifetime: absorb the predecessor only if it overlaps or
 /// touches the new start, then absorb following rows while they overlap or
 /// touch the expanding merged end. Work is one descent plus absorbed rows.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn occupancy_union_insert(
     table: &mut OccupancyTable<'_>,
     route: &[u8],
@@ -1270,6 +1300,7 @@ fn occupancy_union_insert(
     put_occupancy(table, route, merged_start, merged_end)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn clear_route_occupancy(table: &mut OccupancyTable<'_>, route: &[u8]) -> Result<()> {
     loop {
         let Some((start, _)) = occupancy_successor_inclusive_first(table, route)? else {
@@ -1279,6 +1310,7 @@ fn clear_route_occupancy(table: &mut OccupancyTable<'_>, route: &[u8]) -> Result
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn occupancy_successor_inclusive_first(
     table: &OccupancyTable<'_>,
     route: &[u8],
@@ -1299,6 +1331,7 @@ fn occupancy_successor_inclusive_first(
 /// Rebuild a route in arbitrary source order with one decoded interval at a
 /// time. Durable union rows and the source cursor stay in this transaction;
 /// writer scratch depends on the route key, never its membership count.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn rebuild_route_occupancy(
     write: &redb::WriteTransaction,
     route: &[u8],
@@ -1354,6 +1387,7 @@ fn rebuild_route_occupancy(
 ///   lowered endpoint): rebuild this route from its own directory now.
 /// * Removal: an emptied route drops its rows; otherwise the route is listed
 ///   dirty and the removing pass rebuilds it once (`settle_dirty_occupancy`).
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn occupancy_transition(
     write: &redb::WriteTransaction,
     route: &[u8],
@@ -1447,6 +1481,7 @@ fn occupancy_transition(
 }
 
 /// Rebuild every route a removing pass listed dirty, once each.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn settle_dirty_occupancy(
     write: &redb::WriteTransaction,
     accountant: Option<crate::memory_accounting::AccountantHandle>,
@@ -1477,6 +1512,7 @@ pub(super) fn settle_dirty_occupancy(
 /// Whether any retained membership of `route` is visible to one of
 /// `snapshots`: one predecessor lookup per snapshot, no membership read.
 /// `None` while the route awaits a rebuild after a removal.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn occupancy_visible_at_any_in_read(
     read: &redb::ReadTransaction,
     route: &[u8],
@@ -1518,6 +1554,7 @@ pub(super) fn occupancy_visible_at_any_in_read(
 /// Explicit bulk schema/repair publication already replaces the full forward
 /// image in one transaction. Its derived companions are rebuilt in that same
 /// transaction, retaining no stale renamed/dropped route keys.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn reset_in_write(write: &redb::WriteTransaction) -> Result<()> {
     content_size::reset_memberships(write)?;
     write
@@ -1544,6 +1581,7 @@ pub(super) fn reset_in_write(write: &redb::WriteTransaction) -> Result<()> {
 /// Schema rename preserves the existing serving frontiers. Membership moves
 /// update commitments while leaving these counters untouched, then transfer
 /// them here before this transaction publishes either renamed image.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn rename_pending_routes(
     write: &redb::WriteTransaction,
     from: &VectorIndexRef,
@@ -1642,6 +1680,7 @@ pub(super) fn rename_pending_routes(
 
 /// Removed declarations retain no route summary, including declared routes
 /// that never acquired a membership. Walk one admitted key at a time.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn remove_routes_matching(
     write: &redb::WriteTransaction,
     table: &str,
@@ -1715,6 +1754,7 @@ const SUMMARY_ROOT: &str = "vector_membership_summary_pages_root_v1";
 const MEMBERSHIP_ROOT: &str = "vector_membership_authority_pages_root_v1";
 const OPEN_DIRECTORY_ROOT: &str = "vector_open_directory_pages_root_v1";
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn write_fingerprints(write: &redb::WriteTransaction) -> Result<()> {
     // Greenfield required authority: publish even the empty CURRENT table.
     drop(
@@ -1753,6 +1793,7 @@ pub(super) fn write_fingerprints(write: &redb::WriteTransaction) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
     let metadata = match read.open_table(CONTENT_IDENTITY_METADATA_TABLE) {
         Ok(table) => Some(table),
@@ -1815,6 +1856,7 @@ pub(super) fn validate_in_read(read: &redb::ReadTransaction) -> Result<()> {
 }
 
 /// Authenticated decode of one ordered source companion for the paged builder.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn decode_source_member(
     key: &[u8],
     encoded: &[u8],
@@ -1823,6 +1865,7 @@ pub(super) fn decode_source_member(
 }
 
 /// Authenticated decode of one row-ordered reverse membership companion.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn decode_reverse_member(
     key: &[u8],
     encoded: &[u8],
@@ -1845,6 +1888,7 @@ pub(super) fn decode_reverse_member(
 }
 
 /// The route named by a partition prefix (`vector_partition_prefix`).
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn partition_from_prefix(mut key: &[u8]) -> Result<VectorPartitionRef> {
     let table = std::str::from_utf8(component(&mut key)?)
         .map_err(|_| corruption("membership table name is not UTF-8"))?;
@@ -1863,6 +1907,7 @@ pub(super) fn partition_from_prefix(mut key: &[u8]) -> Result<VectorPartitionRef
 
 /// Decode one retained route only after its concrete component capacity and
 /// text payload upper bound have been admitted by the executing owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn partition_from_prefix_admitted(
     encoded: &[u8],
     owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -1902,6 +1947,7 @@ pub(super) fn partition_from_prefix_admitted(
 }
 
 /// Live membership count of one partition from its maintained summary.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn partition_live_entries(
     read: &redb::ReadTransaction,
     partition: &VectorPartitionRef,
@@ -1913,6 +1959,7 @@ pub(super) fn partition_live_entries(
 /// Authenticate the fixed-size global summary at an already fingerprint-checked
 /// captured root. Its digest covers SOURCE keys, whereas the open-directory
 /// digest covers forward keys; those two digests are deliberately not equal.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn verify_summary_projection(read: &redb::ReadTransaction, entries: u64) -> Result<()> {
     let summaries = open_optional_read_table(read, SUMMARY)?;
     let encoded = summaries

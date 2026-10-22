@@ -50,6 +50,7 @@ impl PhysicalHistoryTable {
         out.push(u8::from(self.present));
         out.extend_from_slice(&self.root);
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 33 || bytes[0] > 1 || (bytes[0] == 0 && bytes[1..] != [0; 32]) {
             return Err(history_control_damage(
@@ -84,6 +85,7 @@ impl HistoryOpenControl {
             ddl: None,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn validate(&self) -> Result<()> {
         let bad = || history_control_damage("noncanonical fixed history control");
         if self.tree == Some([0; 32]) {
@@ -135,6 +137,7 @@ impl HistoryOpenControl {
         }
         out
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
         let bad = || history_control_damage("invalid fixed history control encoding");
         if bytes.len() != 234 || bytes[0] != LogicalFamily::ChangeAndDdl as u8 || bytes[1] & !7 != 0
@@ -176,6 +179,7 @@ impl HistoryOpenControl {
         *digest.finalize().as_bytes()
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(in super::super) fn ddl_coordinate_digest(
     coordinate: &[u8],
     checkpoint: Option<&dyn Fn() -> Result<()>>,
@@ -228,6 +232,7 @@ impl ValidatedHistoryOpenControl {
     pub(in super::super) fn control(&self) -> &HistoryOpenControl {
         &self.publication.control
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(in super::super) fn check_snapshot(
         &self,
         snapshot: redb::StorageSnapshotIdentity,
@@ -239,6 +244,7 @@ impl ValidatedHistoryOpenControl {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(in super::super) fn check_endpoint(
         &self,
         lsn: Lsn,
@@ -265,6 +271,7 @@ impl ValidatedHistoryOpenControl {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(in super::super) fn check_directory(&self, read: &redb::ReadTransaction) -> Result<()> {
         self.check_snapshot(read.storage_snapshot_identity())?;
         let actual = physical_in_read(read, COMMIT_INDEX_TABLE)?;
@@ -285,6 +292,7 @@ impl ValidatedHistoryOpenControl {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(in super::super) fn check_complete_commits(
         &self,
         count: u64,
@@ -313,6 +321,7 @@ impl ValidatedHistoryOpenControl {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(in super::super) fn check_complete_ddl(
         &self,
         last: Option<(u64, Lsn, [u8; 32], [u8; 32])>,
@@ -324,6 +333,7 @@ impl ValidatedHistoryOpenControl {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(in super::super) fn check_ddl(&self, read: &redb::ReadTransaction) -> Result<()> {
         self.check_snapshot(read.storage_snapshot_identity())?;
         if physical_in_read(read, DDL_LOG_TABLE)? != self.publication.ddl {
@@ -335,6 +345,7 @@ impl ValidatedHistoryOpenControl {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn table_present_in_read(
     read: &redb::ReadTransaction,
     definition: impl redb::TableHandle,
@@ -346,6 +357,7 @@ fn table_present_in_read(
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn physical_in_read<K: redb::Key + 'static, V: redb::Value + 'static>(
     read: &redb::ReadTransaction,
     definition: redb::TableDefinition<K, V>,
@@ -360,6 +372,7 @@ fn physical_in_read<K: redb::Key + 'static, V: redb::Value + 'static>(
     Ok(PhysicalHistoryTable { present, root })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(in super::super) fn acquire(
     read: &redb::ReadTransaction,
     count: u64,
@@ -369,6 +382,7 @@ pub(in super::super) fn acquire(
     acquire_authenticated(&authenticated, count)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(in super::super) fn acquire_authenticated(
     authenticated: &super::super::writer_recovery::AuthenticatedReadBounds<'_>,
     count: u64,
@@ -416,6 +430,7 @@ pub(in super::super) fn acquire_authenticated(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(in super::super) fn finalize(write: &redb::WriteTransaction) -> Result<()> {
     // Inspect existence before any write open_table could manufacture it.
     let present = [

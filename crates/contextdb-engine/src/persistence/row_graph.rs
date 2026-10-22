@@ -13,6 +13,7 @@ fn corruption(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn validate(owned: &OwnedAdjEntry) -> Result<()> {
     if owned.owner.table.is_empty()
         || owned.owner.created_tx != owned.entry.created_tx
@@ -23,6 +24,7 @@ pub(super) fn validate(owned: &OwnedAdjEntry) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn encode_row_graph(owned: &OwnedAdjEntry) -> Result<Vec<u8>> {
     struct Size(usize);
     impl std::io::Write for Size {
@@ -55,6 +57,7 @@ pub(super) fn encode_row_graph(owned: &OwnedAdjEntry) -> Result<Vec<u8>> {
 impl RedbPersistence {
     /// The table and generation are part of ownership, even when two rows
     /// share endpoints, a transaction and an LSN.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn row_graph_key(owned: &OwnedAdjEntry, reverse: bool) -> Result<Vec<u8>> {
         validate(owned)?;
         let owner = &owned.owner;
@@ -86,12 +89,14 @@ impl RedbPersistence {
         Ok(key)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn initialize_row_graph_in_write(write: &redb::WriteTransaction) -> Result<()> {
         write.open_table(FORWARD).map_err(Self::storage_error)?;
         write.open_table(REVERSE).map_err(Self::storage_error)?;
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn apply_row_graph_in_write(
         write: &redb::WriteTransaction,
         ws: &contextdb_tx::WriteSet,
@@ -145,6 +150,7 @@ impl RedbPersistence {
         write.commit().map_err(Self::storage_error)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn append_row_graph_edge(&self, owned: &OwnedAdjEntry) -> Result<()> {
         self.prepare_proof_owner()?;
         self.graph_writer_window(|| {
@@ -180,6 +186,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_row_graph_in_write(
         write: &redb::WriteTransaction,
         selected: &[OwnedAdjEntry],
@@ -220,6 +227,7 @@ impl RedbPersistence {
 impl RedbPersistence {
     /// Retire one table's exact row owners in the caller's schema transaction.
     /// Each native window and its decode are funded until physically freed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_row_graph_table_in_write(
         &self, write: &redb::WriteTransaction, table: &str,
         original: Option<&crate::memory_accounting::OwnedMemoryReservation>,
@@ -257,6 +265,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_received_shape_losses_in_write(
         &self, write: &redb::WriteTransaction, stage: &ReceivedSchemaPersistenceProjection,
         original: Option<&crate::memory_accounting::OwnedMemoryReservation>,

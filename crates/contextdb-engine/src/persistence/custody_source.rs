@@ -89,6 +89,7 @@ impl CustodyReader {
     pub(crate) fn found_delivery(&self) -> bool {
         self.found_delivery.get()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open(read: &redb::ReadTransaction) -> Result<Self> {
         struct Fingerprint(blake3::Hasher);
         impl std::hash::Hasher for Fingerprint {
@@ -133,6 +134,7 @@ impl CustodyReader {
         })
     }
     /// Visit exactly `key`'s stored value, if committed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn get<T>(
         &self,
         key: &str,
@@ -152,6 +154,7 @@ impl CustodyReader {
         }
     }
     /// Visit every committed `(key, value)` whose key starts with `prefix`, in key order.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_prefix(
         &self,
         prefix: &str,
@@ -176,6 +179,7 @@ impl CustodyReader {
     /// Visit the member keys of exactly `group`, in key order. The group head
     /// is built on the stack; a group name longer than the stack head is
     /// admitted to `memory` before its head is allocated, and released after.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_group(
         &self,
         group: &str,
@@ -230,6 +234,7 @@ impl CustodyReader {
     /// A store without the pending index refuses as an incomplete index. A
     /// store with any submission whose exclusion evidence failed verification
     /// refuses as corruption: that root's delivery state is unknown.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_pending(
         &self,
         after: Option<[u8; 16]>,
@@ -264,6 +269,7 @@ impl CustodyReader {
     /// Visit every `(group, member key)` whose group starts with `prefix`, in
     /// group then key order. Groups of one kind share a fixed length, so the
     /// caller names the full group length it expects.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_groups_with_prefix(
         &self,
         prefix: &str,
@@ -330,6 +336,7 @@ impl Drop for AdmittedHead<'_> {
 impl RedbPersistence {
     /// Whether this store's derived custody group index is complete. Only a
     /// store created empty carries the marker; others keep the resident journal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_groups_complete(&self) -> Result<bool> {
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -363,6 +370,7 @@ impl super::writer_source::WriterSnapshot {
     /// one operation sees exactly the root it captured, however many commits,
     /// retirements or cleanups happen meanwhile. A root whose group index was
     /// incomplete answers `None`: its membership answers could be partial.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_custody_read<T>(
         &self,
         checked: Option<Arc<crate::custody::store::CompanionMemo>>,

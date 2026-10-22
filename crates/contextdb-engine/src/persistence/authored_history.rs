@@ -19,6 +19,7 @@ pub(super) fn body_key(table: &str, key: &[u8]) -> String {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retain_authored_rows_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -84,6 +85,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fill_authored_quantized_columns_in_write(
         &self, _write: &redb::WriteTransaction, table: &str, meta: &TableMeta, row: &mut VersionedRow,
     ) -> Result<()> {
@@ -130,6 +132,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_authored_row_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -158,6 +161,7 @@ impl RedbPersistence {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retain_pending_authored_rows_in_write_original(
         &self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         rows: &[(String, Arc<crate::database::AuthoredRowShape>, VersionedRow)],
@@ -174,6 +178,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retain_pending_authored_rows_in_write(&self, write: &redb::WriteTransaction,
         rows: &[(String,Arc<crate::database::AuthoredRowShape>,VersionedRow)]) -> Result<()> {
         let mut destination = write.open_table(BODIES).map_err(Self::storage_error)?;

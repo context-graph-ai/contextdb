@@ -31,6 +31,7 @@ fn prefix(table: &str) -> String {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn append_ddl_summary_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -260,6 +261,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn declared_direction_in_read(
         root: &WriterSnapshot,
         owner: &SourceWindowOwner,
@@ -322,6 +324,7 @@ impl RedbPersistence {
             .transpose()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn declared_meta_in_read(
         root: &WriterSnapshotHandle, owner: SourceWindowOwner, table: &str, lsn: Lsn,
     ) -> Result<Option<writer_source::WriterWindow<(TableMeta, Lsn, u32)>>> {
@@ -372,6 +375,7 @@ impl RedbPersistence {
     }
 
     #[cfg(feature = "sync-orchestration")]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authored_capabilities_in_read(
         root: &WriterSnapshot,
         owner: &SourceWindowOwner,

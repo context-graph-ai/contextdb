@@ -97,6 +97,7 @@ pub(crate) struct PagedDeclaration {
 }
 
 impl PagedDeclaration {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn digest(&self) -> Result<u64> {
         let bytes = RedbPersistence::encode(self)?;
         let hash = blake3::hash(&bytes);
@@ -166,6 +167,7 @@ struct InspectedProgressRecord {
     member_cursor: Option<(u64, u64, u64)>,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_image_build_record(payload: &[u8]) -> Result<PagedBuildRecord> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     type Record = (
@@ -193,6 +195,7 @@ fn decode_image_build_record(payload: &[u8]) -> Result<PagedBuildRecord> {
     Ok(record)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_image_build_record_original(frame: &OriginalPersistenceFrame<'_>, payload: &[u8]) -> Result<PagedBuildRecord> {
     type Record = (u64,u64,PagedBuildReason,PagedDeclaration,InspectedProgressRecord,VectorSchemaBinding);
     let (_,consumed) = bincode::serde::borrow_decode_from_slice::<Record,_>(payload,bincode::config::standard())
@@ -215,6 +218,7 @@ fn phase_code(phase: PagedVectorPhase) -> u8 {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn phase_from_code(code: u8) -> Result<PagedVectorPhase> {
     Ok(match code {
         0 => PagedVectorPhase::Inserting,
@@ -249,6 +253,7 @@ impl ProgressRecord {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn to_progress(&self) -> Result<PagedVectorProgress> {
         let total_points = usize::try_from(self.total_points)
             .map_err(|_| corruption("paged build point total exceeds usize"))?;
@@ -290,6 +295,7 @@ pub(crate) struct PagedBuildRecord {
 }
 
 impl PagedBuildRecord {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn progress(&self) -> Result<PagedVectorProgress> {
         if self.storage_id == 0 {
             return Err(corruption("paged build storage identity is reserved"));
@@ -337,6 +343,7 @@ impl PageSetHasher {
             bytes: 0,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn page(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.hasher.update(&(key.len() as u64).to_be_bytes());
         self.hasher.update(key);
@@ -394,6 +401,7 @@ fn route_page_corrupt() -> Error {
 
 /// Root over a published storage's final page range, read in the caller's
 /// transaction after the build's last page write.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn page_set_root_in<T: redb::ReadableTable<&'static [u8], &'static [u8]>>(
     pages: &T,
     storage_id: u64,
@@ -415,6 +423,7 @@ pub(crate) fn page_set_root_in<T: redb::ReadableTable<&'static [u8], &'static [u
 /// Walk an untrusted storage range against its committed root. The page
 /// count may never pass the committed count, and every page must fit the
 /// window admitted for it before it is hashed. Returns (pages, bytes) walked.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn verify_page_set<T: redb::ReadableTable<&'static [u8], &'static [u8]>>(
     pages: &T,
     storage: &[u8; 8],
@@ -495,6 +504,7 @@ pub(crate) struct SavedGenerationBinding {
 }
 
 impl PagedGenerationMeta {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         #[cfg(any(test, feature = "test-seams"))]
@@ -533,6 +543,7 @@ impl PagedGenerationMeta {
         Ok(meta)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn progress(&self) -> Result<PagedVectorProgress> {
         if self.storage_id == 0 {
             return Err(corruption("paged build storage identity is reserved"));
@@ -542,6 +553,7 @@ impl PagedGenerationMeta {
 }
 
 /// Read the maintained distinct-row binding from this exact page owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn row_count_in<T: redb::ReadableTable<&'static [u8], &'static [u8]>>(
     pages: &T,
     storage: &[u8; 8],
@@ -568,6 +580,7 @@ pub(super) fn row_count_in<T: redb::ReadableTable<&'static [u8], &'static [u8]>>
 
 /// A saved graph's point pages are its physical graph pages. A page that
 /// fails its keyed check is reported as such, never as a missing route.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn open_graph_page<'v>(key: &[u8], value: &'v [u8]) -> Result<&'v [u8]> {
     open_value(key, value).map_err(|_| Error::StoreCorrupted {
         path: "vector_paged_generation_pages".into(),
@@ -779,6 +792,7 @@ pub(super) fn seal_value(key: &[u8], payload: &[u8]) -> Vec<u8> {
     value
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn open_value<'v>(key: &[u8], value: &'v [u8]) -> Result<&'v [u8]> {
     #[cfg(any(test, feature = "test-seams"))]
     contextdb_vector::hnsw::observe_paged_storage_work(
@@ -826,6 +840,7 @@ fn encode_identity(identity: &PagedVectorIdentity) -> Vec<u8> {
     bytes
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_identity(bytes: &[u8]) -> Result<PagedVectorIdentity> {
     let invalid = || corruption("paged vector identity record is invalid");
     if bytes.len() < IDENTITY_HEADER_BYTES {
@@ -866,6 +881,7 @@ fn encode_point_id(id: PointId) -> [u8; 5] {
     bytes
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_point_id(bytes: &[u8]) -> Result<PointId> {
     if bytes.len() != 5 || bytes[0] >= 16 {
         return Err(corruption("paged vector row directory entry is invalid"));
@@ -898,6 +914,7 @@ fn candidate_key(edge: &PagedEdge, sequence: u64) -> [u8; 30] {
     key
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn edge_from_candidate_key(key: &[u8]) -> Result<PagedEdge> {
     if key.len() != 30 || key[0] != SCRATCH_CANDIDATE {
         return Err(corruption("paged search scratch candidate key is invalid"));
@@ -932,17 +949,20 @@ fn identity_visible(identity: &PagedVectorIdentity, snapshot: SnapshotId) -> boo
 
 /// One storage-guard-scoped admission before any native owned page copy.
 pub(super) trait PageSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admitted_page(
         &self,
         key: &[u8],
         before_copy: &mut dyn FnMut(&[u8]) -> Result<Option<VectorCopyAdmission>>,
     ) -> Result<Option<ScopedVectorCopy<Vec<u8>>>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn first_after(
         &self,
         lower: Bound<&[u8]>,
         upper: &[u8],
         before_copy: &mut dyn FnMut(&[u8], &[u8]) -> Result<Option<VectorCopyAdmission>>,
     ) -> Result<Option<ScopedVectorCopy<(Vec<u8>, Vec<u8>)>>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn last_before(
         &self,
         lower: &[u8],
@@ -1051,6 +1071,7 @@ struct DecodedNeighbourLayout {
 /// length must fit its exact bytes before serde sees a length or allocates.
 /// Three times the greater of a nonempty sequence's real length and Vec's
 /// minimum capacity bounds final capacity and overlapping reallocations.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn point_decode_window(payload: &[u8], value_bytes: usize) -> Result<usize> {
     let invalid = || corruption("paged point encoded lengths or window size are invalid");
     if payload.len() < 13
@@ -1118,12 +1139,14 @@ fn point_decode_window(payload: &[u8], value_bytes: usize) -> Result<usize> {
 }
 
 impl<S: PageSource> PagedLookup<'_, '_, S> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit(&self, bytes: usize) -> Result<Option<VectorCopyAdmission>> {
         match self.admission {
             Some(admit) => (admit.borrow_mut())(bytes),
             None => Ok(None),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn directory_admission(&self, key: &[u8], frame: &[u8]) -> Result<Option<VectorCopyAdmission>> {
         let payload = open_value(key, frame)?;
         if key.len() < 9 || key[..8] != self.storage {
@@ -1164,6 +1187,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
             .ok_or_else(|| corruption("paged directory window size overflow"))?;
         self.admit(bytes)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn load_point(&self, id: PointId) -> Result<ScopedVectorCopy<PagedVectorPoint>> {
         let key = point_key(&self.storage, id);
         let value = self
@@ -1251,6 +1275,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn identity(&self, data_id: usize) -> Result<ScopedVectorCopy<PagedVectorIdentity>> {
         let key = identity_key(&self.storage, data_id);
         let value = self
@@ -1286,6 +1311,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_entry(&self, key: &[u8], value: &[u8]) -> Result<(RowId, usize, PointId)> {
         if key.len() != 25 || key[..8] != self.storage || key[8] != KIND_ROW {
             return Err(corruption("paged row directory key is invalid"));
@@ -1302,6 +1328,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
     }
 
     /// The first row directory entry at or after `row`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn row_at_or_after(&self, row: RowId) -> Result<Option<(RowId, usize, PointId)>> {
         let lower = row_key(&self.storage, row, 0);
         let upper = self.rows_end();
@@ -1314,6 +1341,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
     }
 
     /// The first row directory entry strictly after `(row, data_id)`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn row_after(
         &self,
         row: RowId,
@@ -1329,6 +1357,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
             .transpose()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_row_at_or_after(&self, row: RowId) -> Result<Option<(RowId, usize, PointId)>> {
         let Some(mut selected) = self.row_at_or_after(row)? else {
             return Ok(None);
@@ -1346,6 +1375,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
         Ok(Some(selected))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_point_for_row(&self, row: RowId, snapshot: SnapshotId) -> Result<Option<PointId>> {
         let mut cursor = self.row_at_or_after(row)?;
         while let Some((found, data_id, point)) = cursor {
@@ -1366,6 +1396,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
         Ok(None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn exact_after(
         &self,
         exact: &[u8],
@@ -1376,6 +1407,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
 
     /// Identity-level continuation keeps later retained intervals in scope
     /// until a visible identity has been found for this exact key and row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn exact_entry_after(
         &self,
         exact: &[u8],
@@ -1430,6 +1462,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
 
     /// The next row sharing `origin`'s graph point after `after`, in row
     /// order, with its data id and the version (LSN) it stores.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn member_after(
         &self,
         origin: usize,
@@ -1464,6 +1497,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
 
     /// The next representative after `after` filed under graph-identity hash
     /// `hash`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn group_after(&self, hash: u64, after: Option<usize>) -> Result<Option<usize>> {
         let mut prefix = kind_prefix(&self.storage, KIND_GROUP).to_vec();
         prefix.extend_from_slice(&hash.to_be_bytes());
@@ -1491,6 +1525,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn exact_rows(
         &self,
         exact: &[u8],
@@ -1528,6 +1563,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
         Ok(rows)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_window(
         &self,
         snapshot: SnapshotId,
@@ -1571,6 +1607,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
         Ok(rows)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_bounds(&self, points: usize) -> Result<Option<(RowId, RowId, usize)>> {
         let lower = kind_prefix(&self.storage, KIND_ROW);
         let upper = self.rows_end();
@@ -1597,6 +1634,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
     /// generation can have several intervals per row even at its frontier.
     /// Each directory/identity probe has its own stoppable callback; only one
     /// directory entry and one admitted identity are live at a time.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_count(
         &self,
         snapshot: SnapshotId,
@@ -1666,10 +1704,12 @@ pub(crate) struct CapturedPagedRoot {
     pub(crate) holder: PagedRootHolder,
 }
 impl CapturedPagedRoot {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn from_writer(root: WriterSnapshotHandle) -> Result<Self> {
         let read = root.owner_read()?;
         Ok(Self { read, holder: PagedRootHolder::Writer(root) })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn from_image(
         read: Arc<redb::ReadTransaction>, source: RetainedReadSource,
     ) -> Result<Self> {
@@ -1679,6 +1719,7 @@ impl CapturedPagedRoot {
     }
     /// Compare against the holder's EXPECTED registered root, never an answer
     /// obtained by opening a new/latest read. No caller id mints this proof.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authenticate(&self) -> Result<(redb::StorageSnapshotIdentity, SnapshotId, Lsn)> {
         let expected = match &self.holder {
             PagedRootHolder::Writer(root) => (root.storage_identity(), root.snapshot, root.lsn),
@@ -1752,6 +1793,7 @@ impl NativePagedGeneration {
         &self.declaration
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_record(
         &self,
         builds: &redb::Table<'_, &'static [u8], &'static [u8]>,
@@ -1780,6 +1822,7 @@ impl NativePagedGeneration {
 }
 
 impl PagedGenerationPersistence for NativePagedGeneration {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn abandon_generation(
         &self,
         previous: &PagedVectorProgress,
@@ -1822,6 +1865,7 @@ impl PagedGenerationPersistence for NativePagedGeneration {
         committed.ok_or_else(|| Error::Other("paged abandon did not commit".into()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_generation_batch(
         &self,
         previous: &PagedVectorProgress,
@@ -1966,6 +2010,7 @@ pub(super) struct NativeBatch<'t> {
 
 impl<'t> NativeBatch<'t> {
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn open(
         persistence: &'t RedbPersistence,
         write: &'t redb::WriteTransaction,
@@ -2043,6 +2088,7 @@ impl<'t> NativeBatch<'t> {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn identity_count(&self) -> Result<usize> {
         self.previous
             .graph
@@ -2052,6 +2098,7 @@ impl<'t> NativeBatch<'t> {
             .ok_or_else(|| corruption("paged identity count overflow"))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn clear_scratch(&mut self) -> Result<()> {
         // Exactly the keys this search inserted; never a table-wide walk.
         while self.scratch_keys != 0 {
@@ -2067,6 +2114,7 @@ impl<'t> NativeBatch<'t> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn finish(mut self) -> Result<()> {
         self.clear_scratch()?;
         if self.scratch.len().map_err(RedbPersistence::storage_error)? != 0 {
@@ -2077,6 +2125,7 @@ impl<'t> NativeBatch<'t> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn check(&mut self) -> Result<()> {
         (self.hooks.checkpoint)()
     }
@@ -2089,6 +2138,7 @@ impl<'t> NativeBatch<'t> {
     }
 
     /// Load the original body named by one owning membership interval.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn source_values(&self, record: &VectorPartitionMembershipRecord) -> Result<PagedVectorValues> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let vectors = self
@@ -2176,6 +2226,7 @@ impl PagedVectorReader for NativeBatch<'_> {
     fn point_for_row(&mut self, row: RowId, snapshot: SnapshotId) -> Result<Option<PointId>> {
         self.lookup().visible_point_for_row(row, snapshot)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn exact_rows(
         &mut self,
         key: &[u8],
@@ -2197,6 +2248,7 @@ impl PagedVectorReader for NativeBatch<'_> {
     fn before_visit(&mut self) -> Result<()> {
         self.check()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_count(&mut self, snapshot: SnapshotId) -> Result<usize> {
         let checkpoint = Arc::clone(&self.hooks.checkpoint);
         // Retain every versioned identity, including shared members, once.
@@ -2206,6 +2258,7 @@ impl PagedVectorReader for NativeBatch<'_> {
                 checkpoint()
             })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_window(
         &mut self,
         snapshot: SnapshotId,
@@ -2649,6 +2702,7 @@ impl PagedGenerationTransaction for NativeBatch<'_> {
 }
 
 /// Remove at most `max_keys` pages of one storage identity after `after`.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reclaim_storage_keys(
     pages: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     storage: &[u8; 8],
@@ -2660,6 +2714,7 @@ fn reclaim_storage_keys(
 
 /// Admit the cursor and the old/new seek keys before copying them. The page
 /// cache separately owns the storage pages retained by each short seek.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reclaim_storage_keys_with_admission(
     pages: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     storage: &[u8; 8],
@@ -2830,6 +2885,7 @@ impl NativePagedReader {
 }
 
 impl PagedVectorReader for NativePagedReader {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_with_copy_admission(
         &mut self,
         request: PagedVectorReadRequest<'_>,
@@ -2960,6 +3016,7 @@ impl PagedVectorReader for NativePagedReader {
     fn point_for_row(&mut self, row: RowId, snapshot: SnapshotId) -> Result<Option<PointId>> {
         self.lookup().visible_point_for_row(row, snapshot)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn exact_rows(
         &mut self,
         key: &[u8],
@@ -2981,11 +3038,13 @@ impl PagedVectorReader for NativePagedReader {
     fn before_visit(&mut self) -> Result<()> {
         (self.checkpoint)()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_count(&mut self, snapshot: SnapshotId) -> Result<usize> {
         let checkpoint = Arc::clone(&self.checkpoint);
         self.lookup()
             .visible_count(snapshot, self.frontier, self.points, &mut || checkpoint())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_window(
         &mut self,
         snapshot: SnapshotId,
@@ -3024,6 +3083,7 @@ impl PagedVectorReader for NativePagedReader {
 /// Persistence entry points used by the engine's open and maintenance paths.
 impl RedbPersistence {
     /// Writer serving readers capture the published writer snapshot.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn set_paged_root_capture<R: Into<WriterSnapshotHandle> + 'static>(
         &self,
         capture: Arc<dyn Fn() -> Result<R> + Send + Sync>,
@@ -3036,6 +3096,7 @@ impl RedbPersistence {
         let _ = self.paged_root_capture.set(capture);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn paged_root_capture(&self) -> Result<PagedRootCapture> {
         self.paged_root_capture
             .get()
@@ -3062,6 +3123,7 @@ impl RedbPersistence {
     }
 
     /// Rebind the descriptor without rewriting its immutable storage pages.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn rebind_paged_generation_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -3103,6 +3165,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn rename_paged_build_bindings_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -3221,6 +3284,7 @@ impl RedbPersistence {
     /// The first durable build record after `after` (all records when None),
     /// in key order, from its own read: reopen streams build records one at a
     /// time instead of materializing the whole inventory.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_paged_build_record_after(
         &self,
         after: Option<&[u8]>,
@@ -3253,6 +3317,7 @@ impl RedbPersistence {
 
     /// The first durable construction floor after `after`, in key order,
     /// from its own read.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_construction_floor_after(
         &self,
         after: Option<&[u8]>,
@@ -3282,6 +3347,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn load_paged_build_records(
         &self,
     ) -> Result<Vec<(VectorPartitionRef, PagedBuildRecord)>> {
@@ -3306,6 +3372,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn load_paged_build_record(
         &self,
         partition: &VectorPartitionRef,
@@ -3332,6 +3399,7 @@ impl RedbPersistence {
     /// Reconcile fixed construction inputs before replacing a received image.
     /// The admitted image is already owned by this writer; each durable route
     /// owns only one control record and one authenticated source lookup at a time.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reconcile_paged_builds_for_image_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -3670,6 +3738,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn admit_vector_image_build_route(
         &self,
         key: &[u8],
@@ -3679,6 +3748,7 @@ impl RedbPersistence {
         Self::admit_vector_image_build_route_with_owner(self.proof_accountant(), key, stored_bytes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_vector_image_build_route_with_owner(
         accountant: Option<crate::memory_accounting::AccountantHandle>,
         key: &[u8],
@@ -3705,6 +3775,7 @@ impl RedbPersistence {
             .transpose()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn seed_paged_image_frontiers_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -3750,6 +3821,7 @@ impl RedbPersistence {
     /// counted too: the count is an upper bound, like the tail admission's.
     /// Returns `None` when no record lies in (covered, target], and
     /// `Some((0, first))` when the first LSN alone does not fit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_partition_journal_cohort_by_key(
         &self,
         partition: &VectorPartitionRef,
@@ -3815,6 +3887,7 @@ impl RedbPersistence {
     /// memberships a build pinned at `(frontier_tx, frontier_lsn)` sources,
     /// by the same visibility rule its source scan applies. One record is
     /// decoded at a time under the caller's decode owner.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_partition_live_membership_count_at(
         &self,
         partition: &VectorPartitionRef,
@@ -3862,6 +3935,7 @@ impl RedbPersistence {
 
     /// Live membership count of one partition, from its maintained summary.
     /// Called under the engine commit gate, so it is the frontier's count.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_partition_live_membership_count(
         &self,
         partition: &VectorPartitionRef,
@@ -3875,6 +3949,7 @@ impl RedbPersistence {
     /// Persist a new build's frontier record before any scratch page exists.
     /// The record is also the restored maintenance floor after a restart.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn begin_paged_build(
         &self,
         partition: &VectorPartitionRef,
@@ -3903,6 +3978,7 @@ impl RedbPersistence {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn begin_resident_paged_export(
         &self,
         partition: &VectorPartitionRef,
@@ -3931,6 +4007,7 @@ impl RedbPersistence {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin_paged_build_inner(
         &self,
         partition: &VectorPartitionRef,
@@ -4077,6 +4154,7 @@ impl RedbPersistence {
 
     /// Drop an unregistrable build (its route or declaration is gone) and
     /// queue its storage for finite cleanup.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn discard_paged_build(&self, partition: &VectorPartitionRef) -> Result<()> {
         let key = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
         self.with_db(|db| {
@@ -4110,6 +4188,7 @@ impl RedbPersistence {
 
     /// Queue a retired published generation's pages for finite cleanup, in
     /// the transaction that removes its base record.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn queue_paged_generation_cleanup_in_write(
         write: &redb::WriteTransaction,
         meta_bytes: &[u8],
@@ -4128,6 +4207,7 @@ impl RedbPersistence {
 
     /// One finite cleanup transaction: remove at most `max_keys` pages of the
     /// first queued storage identity. Returns the number of pages removed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn paged_cleanup_step(
         &self,
         max_keys: usize,
@@ -4236,6 +4316,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn has_paged_cleanup(&self) -> Result<bool> {
         if self.has_recoverable_saved_exports()? {
             return Ok(true);
@@ -4259,6 +4340,7 @@ impl RedbPersistence {
     /// Authoritative erasure of one partition route's paged storage, inside the
     /// purge transaction: every paged base generation's pages, any unpublished
     /// build's scratch pages and record, and its whole-build floor record.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn erase_partition_paged_storage_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -4447,6 +4529,7 @@ impl RedbPersistence {
     }
 
     /// Durably record a whole build's frontier before it builds.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn record_construction_floor(
         &self,
         partition: &VectorPartitionRef,
@@ -4469,6 +4552,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn clear_construction_floor(&self, partition: &VectorPartitionRef) -> Result<()> {
         let key = Self::vector_partition_prefix(&partition.index, &partition.partition_key);
         self.with_db(|db| {
@@ -4500,6 +4584,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn load_construction_floors(&self) -> Result<Vec<(VectorPartitionRef, TxId)>> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -4521,6 +4606,7 @@ impl RedbPersistence {
     }
 
     /// Final page-set root of a completed build's storage.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn paged_storage_page_set_root(&self, storage_id: u64) -> Result<PageSetRoot> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -4544,6 +4630,7 @@ impl RedbPersistence {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn encode_paged_generation_meta(
         storage_id: u64,
         declaration: &PagedDeclaration,
@@ -4572,6 +4659,7 @@ impl RedbPersistence {
 const REPAIR_FENCE: u64 = 0;
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn repair_fence_in_write(write: &redb::WriteTransaction) -> Result<bool> {
         match write.open_table(CLEANUP) {
             Ok(table) => Ok(table
@@ -4583,6 +4671,7 @@ impl RedbPersistence {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn has_vector_repair_fence(&self) -> Result<bool> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -4599,6 +4688,7 @@ impl RedbPersistence {
 
     /// The decoded cutoff is proof input, never evidence that the fence is absent.
     /// Malformed fence bytes force a new proof over the current allocation range.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn repair_fence_cutoff_in_read(read: &redb::ReadTransaction) -> Result<Option<(u64, bool)>> {
         let cleanup = match read.open_table(CLEANUP) {
             Ok(table) => table,
@@ -4628,6 +4718,7 @@ impl RedbPersistence {
         Ok(Some((cutoff, false)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn raise_repair_fence_in_write(write: &redb::WriteTransaction) -> Result<u64> {
         let mut counters = write.open_table(COUNTERS).map_err(Self::storage_error)?;
         let next = counters
@@ -4674,6 +4765,7 @@ impl RedbPersistence {
     /// Atomic logical retirement. No body is decoded and no storage id is
     /// guessed. Healthy retained generation records and authoritative vectors
     /// remain; bounded cleanup removes eligible records separately.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retire_broken_vector_catalog(
         &self,
         partition: &VectorPartitionRef,
@@ -4726,6 +4818,7 @@ impl RedbPersistence {
 
     /// A restart learns the retired initial-build route from existing durable
     /// facts. No volatile quarantine or new marker directory is required.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retired_vector_rebuild_pending(
         &self,
         partition: &VectorPartitionRef,
@@ -4779,6 +4872,7 @@ impl RedbPersistence {
     /// Physical generation identities remain ordered even if their payload is
     /// unusable. The caller has already retired the catalog under the fence.
     /// Last-key seeks inspect only two B-tree paths, not every retained body.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn highest_retired_vector_generation_key(
         &self,
         partition: &VectorPartitionRef,
@@ -4840,6 +4934,7 @@ impl RedbPersistence {
     /// `own_storage` names the replacement exports this erasure itself prepared:
     /// they are its staging, published in the same transaction, not unresolved
     /// ownership.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn refuse_unresolved_vector_erasure_in_write(
         write: &redb::WriteTransaction,
         own_storage: &[u64],
@@ -4878,6 +4973,7 @@ impl RedbPersistence {
 }
 
 /// Only an authenticated native metadata body may supply deletion identity.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn authenticated_native_storage_id(bytes: &[u8]) -> Result<u64> {
     // Inspect positionally, never materialize ProgressRecord's cursor Vecs.
     // Over-width authenticated metadata is UNKNOWN to the orphan proof.
@@ -4918,6 +5014,7 @@ pub(super) fn authenticated_native_storage_id(bytes: &[u8]) -> Result<u64> {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn authenticated_build_storage_id(key: &[u8], encoded: &[u8]) -> Result<u64> {
         if encoded.len() > 64 * 1024 {
             return Err(corruption(
@@ -4956,6 +5053,7 @@ impl RedbPersistence {
         Ok(id)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn queue_authenticated_native_storage_in_write(
         write: &redb::WriteTransaction,
         id: u64,
@@ -4991,6 +5089,7 @@ impl RedbPersistence {
 
     /// Borrow graph bytes, authenticate their envelope and checksum, and
     /// bound owned route metadata independently of the graph population.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn authenticated_generation_storage(
         encoded: &[u8],
         physical: &[u8],
@@ -5097,6 +5196,7 @@ pub(crate) enum RepairAuditStatus {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn repair_reference_epoch(read: &redb::ReadTransaction) -> Result<[Option<[u8; 32]>; 6]> {
         Ok([
             read.table_root_fingerprint(VECTOR_PARTITION_BASE_GENERATION_TABLE)
@@ -5114,6 +5214,7 @@ impl RedbPersistence {
         ])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn repair_audit_cursor(
         &self,
         cutoff: u64,
@@ -5148,6 +5249,7 @@ impl RedbPersistence {
 
     /// The caller holds the engine's existing maintenance publication guard
     /// and source-page admission. No root is retained across calls.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn repair_orphan_audit_step(
         &self,
         mut checkpoint: impl FnMut() -> Result<()>,
@@ -5482,6 +5584,7 @@ impl RedbPersistence {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authenticated_journal_ownership_reference(
         encoded: &[u8],
         physical: &[u8],
@@ -5529,11 +5632,13 @@ impl RedbPersistence {
 
 // Every native page mutation binds its physical root in the protected
 // Configuration root, alongside the same transaction's generation metadata.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn bind_pages_root(write: &redb::WriteTransaction) -> Result<()> {
     content_identity::bind_vector_pages_root_in_write(write)
 }
 /// The schema half of the paged binding, checked once when a read opens. A
 /// store that never bound a paged generation has no schema half to check.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn validate_schema_meta_root(read: &redb::ReadTransaction) -> Result<()> {
     if content_identity::vector_schema_meta_root_bound_in_read(read)?
         && !content_identity::vector_schema_meta_root_matches_in_read(read)?
@@ -5545,6 +5650,7 @@ pub(crate) fn validate_schema_meta_root(read: &redb::ReadTransaction) -> Result<
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn validate_pages_root(read: &redb::ReadTransaction) -> Result<()> {
     let actual = content_identity::vector_schema_pages_root_in_read(read)?;
     let expected = content_identity::vector_pages_root_in_read(read)
@@ -5561,6 +5667,7 @@ pub(crate) fn validate_pages_root(read: &redb::ReadTransaction) -> Result<()> {
 }
 
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn saved_export_recovery_cutoff(&self) -> Result<u64> {
         if let Some(cutoff) = self.saved_export_recovery_cutoff.get() {
             return Ok(*cutoff);

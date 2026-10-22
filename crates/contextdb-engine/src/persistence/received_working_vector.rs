@@ -21,9 +21,11 @@ fn summary_corruption() -> Error {
     Error::StoreCorrupted { path: "received working vector summaries".into(),
         reason: "invalid maintained partition summary".into() }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn summary_u64(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes.try_into().map_err(|_| summary_corruption())?))
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn summary_decode(bytes: &[u8]) -> Result<RawVectorMembershipSummary> {
     if bytes.len() != 32 || bytes[24] > 1 || bytes[25..].iter().any(|byte| *byte != 0) { return Err(summary_corruption()); }
     let entries = usize::try_from(summary_u64(&bytes[..8])?).map_err(|_| summary_corruption())?;
@@ -31,6 +33,7 @@ pub(super) fn summary_decode(bytes: &[u8]) -> Result<RawVectorMembershipSummary>
     if entries == 0 || live_entries > entries || (bytes[24] != 0 && live_entries != 0) { return Err(summary_corruption()); }
     Ok(RawVectorMembershipSummary { entries, live_entries, max_tx: TxId(summary_u64(&bytes[16..24])?) })
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn summary_encode(summary: RawVectorMembershipSummary, historical_only: bool) -> Result<[u8; 32]> {
     let mut bytes = [0; 32];
     bytes[..8].copy_from_slice(&u64::try_from(summary.entries).map_err(|_| summary_corruption())?.to_be_bytes());
@@ -42,6 +45,7 @@ fn summary_encode(summary: RawVectorMembershipSummary, historical_only: bool) ->
 
 /// All key allocations precede the native guards. The histogram makes max_tx
 /// exact even when replacing a previously closed interval with an earlier end.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn update_partition_summary(write: &redb::WriteTransaction, key: &[u8],
     tx_lower: &mut [u8], tx_upper: &[u8],
     before: Option<(bool, TxId)>, after: &VectorPartitionMembershipRecord, historical_hint: bool) -> Result<()> {
@@ -94,6 +98,7 @@ fn update_partition_summary(write: &redb::WriteTransaction, key: &[u8],
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn update_empty_partition(write: &redb::WriteTransaction, key: &[u8],
     summary: RawVectorMembershipSummary, historical_only: bool) -> Result<()> {
     let mut empty = write.open_table(WORKING_VECTOR_EMPTY).map_err(RedbPersistence::storage_error)?;
@@ -103,6 +108,7 @@ fn update_empty_partition(write: &redb::WriteTransaction, key: &[u8],
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn update_partition_counts(write: &redb::WriteTransaction, index: &[u8],
     previous: Option<(RawVectorMembershipSummary, bool)>, next: (RawVectorMembershipSummary, bool)) -> Result<()> {
     let mut counts = write.open_table(WORKING_VECTOR_COUNTS).map_err(RedbPersistence::storage_error)?;
@@ -135,6 +141,7 @@ fn update_partition_counts(write: &redb::WriteTransaction, index: &[u8],
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn decode_column_counts(bytes: &[u8]) -> Result<[usize; 6]> {
     if bytes.len() != 48 { return Err(summary_corruption()); }
     let mut counts = [0; 6];
@@ -144,6 +151,7 @@ pub(super) fn decode_column_counts(bytes: &[u8]) -> Result<[usize; 6]> {
     if counts[1] > counts[3] || counts[2] > counts[3] || counts[3] > counts[0] || counts[4] > counts[5] { return Err(summary_corruption()); }
     Ok(counts)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn index_prefix_original(frame: &OriginalPersistenceFrame<'_>, index: &VectorIndexRef) -> Result<Vec<u8>> {
     let length = index.table.len().checked_add(index.column.len()).and_then(|n| n.checked_add(16)).ok_or_else(summary_corruption)?;
     frame.reserve(length)?;
@@ -154,6 +162,7 @@ fn index_prefix_original(frame: &OriginalPersistenceFrame<'_>, index: &VectorInd
     Ok(key)
 }
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_column_counts_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         index: &VectorIndexRef) -> Result<[usize; 6]> {
         self.require_original(original)?;
@@ -168,6 +177,7 @@ impl ReceivedWorkingWrite {
 }
 
 /// Decode only an admitted typed summary identity, with exact framing checks.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn decode_summary_partition(mut key: &[u8]) -> Result<VectorPartitionKey> {
     use contextdb_core::VectorPartitionComponent;
     component(&mut key).ok_or_else(summary_corruption)?;
@@ -214,6 +224,7 @@ pub(super) fn decode_summary_partition(mut key: &[u8]) -> Result<VectorPartition
     Ok(VectorPartitionKey::from_components(values))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn summary_key_original(frame: &OriginalPersistenceFrame<'_>, partition: &VectorPartitionRef) -> Result<Vec<u8>> {
     let partition_length = partition_length(&partition.partition_key)?;
     let length = partition.index.table.len().checked_add(partition.index.column.len())
@@ -227,6 +238,7 @@ fn summary_key_original(frame: &OriginalPersistenceFrame<'_>, partition: &Vector
     Ok(key)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn summary_bounds(frame: &OriginalPersistenceFrame<'_>, key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let prefix = key.get(..key.len().checked_sub(32).ok_or_else(summary_corruption)?)
         .ok_or_else(summary_corruption)?;
@@ -269,6 +281,7 @@ struct VectorPosition {
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vectors_prepared(&self) -> Result<bool> {
         if !self.vector_is_ready() { return Ok(false); }
         self.with_write(|write| Ok(write.table_exists(WORKING_VECTOR_BODIES).map_err(RedbPersistence::storage_error)?
@@ -280,6 +293,7 @@ impl ReceivedWorkingWrite {
             && write.table_exists(WORKING_VECTOR_EMPTY).map_err(RedbPersistence::storage_error)?))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_vectors(
         &self, store: &RedbPersistence,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -352,6 +366,7 @@ impl ReceivedWorkingWrite {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_vector_membership(
         &self, original: &crate::memory_accounting::OwnedMemoryReservation,
         lower: Bound<&[u8]>, upper: Bound<&[u8]>,
@@ -361,6 +376,7 @@ impl ReceivedWorkingWrite {
         self.with_write(|write| next_membership_in_write(original, write, lower, upper))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_body_for_membership(
         &self, original: &crate::memory_accounting::OwnedMemoryReservation,
         member: &VectorPartitionMembershipRecord,
@@ -385,6 +401,7 @@ impl ReceivedWorkingWrite {
         Ok(body)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_vector_bodies_original(
         &self, original: &crate::memory_accounting::OwnedMemoryReservation,
         mut visit: impl FnMut(&VectorEntry, &[u8], &[u8]) -> Result<()>,
@@ -403,6 +420,7 @@ impl ReceivedWorkingWrite {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_vector_memberships_original(
         &self, original: &crate::memory_accounting::OwnedMemoryReservation,
         mut visit: impl FnMut(&VectorPartitionMembershipRecord, &[u8], &[u8]) -> Result<()>,
@@ -420,6 +438,7 @@ impl ReceivedWorkingWrite {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn next_membership_in_write(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     write: &redb::WriteTransaction,
@@ -441,6 +460,7 @@ fn next_membership_in_write(
     Ok(Some(WorkingVectorMembership { record, key, encoded, _owner: frame.into_reservation() }))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn next_body_in_write(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     write: &redb::WriteTransaction,
@@ -508,6 +528,7 @@ pub(super) fn body_key_matches(mut bytes: &[u8], body: &VectorEntry) -> bool {
         && consume(&mut bytes, &body.lsn.0.to_be_bytes()) && bytes.is_empty()
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn partition_length(key: &VectorPartitionKey) -> Result<usize> {
     use contextdb_core::VectorPartitionComponent;
     key.components().iter().try_fold(9usize, |size, value| {
@@ -536,6 +557,7 @@ fn append_partition(bytes: &mut Vec<u8>, key: &VectorPartitionKey) {
         }
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn membership_key_original(frame: &OriginalPersistenceFrame<'_>, member: &VectorPartitionMembershipRecord) -> Result<Vec<u8>> {
     let partition = partition_length(&member.partition_key)?;
     let length = member.index.table.len().checked_add(member.index.column.len())
@@ -553,6 +575,7 @@ fn membership_key_original(frame: &OriginalPersistenceFrame<'_>, member: &Vector
     if key.len() != length || key.capacity() != length { return Err(Error::Other("working membership key capacity differs from admission".into())); }
     Ok(key)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn membership_encoded_original(frame: &OriginalPersistenceFrame<'_>, member: &VectorPartitionMembershipRecord) -> Result<Vec<u8>> {
     let payload = frame.encode(member)?;
     let length = payload.len().checked_add(VECTOR_PARTITION_RECORD_MAGIC.len() + 2 + 1 + 8 + 32)
@@ -569,6 +592,7 @@ fn membership_encoded_original(frame: &OriginalPersistenceFrame<'_>, member: &Ve
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn put_vector_membership(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         member: &VectorPartitionMembershipRecord) -> Result<()> {
         let frame = OriginalPersistenceFrame::new(original)?;
@@ -591,6 +615,7 @@ impl ReceivedWorkingWrite {
     /// Exact row-family reverse probe covers every owning-row version and
     /// partition, then compares canonical coordinates. A single reverse point
     /// cannot prove that another placement of this canonical body is absent.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_body_has_live_placement(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         index: &VectorIndexRef, row: RowId, created: TxId, lsn: Lsn) -> Result<bool> {
         let bounds = OriginalPersistenceFrame::new(original)?;
@@ -642,6 +667,7 @@ impl ReceivedWorkingWrite {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn close_vector_membership(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         prepared: &VectorPartitionMembershipRecord, deleted: TxId) -> Result<()> {
         let frame = OriginalPersistenceFrame::new(original)?;
@@ -664,6 +690,7 @@ impl ReceivedWorkingWrite {
 
     /// Mirror the already-validated exact row/partition plan. The real vector
     /// store remains responsible for policy/cap validation and publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_vector_partition_plan(&self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         batch: &PreparedVectorPartitionMutationBatch,
@@ -792,6 +819,7 @@ impl Clone for WorkingVectorColumnCountsOwner {
     }
 }
 impl WorkingVectorColumnCountsOwner {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(funder: &contextdb_tx::SourceFunder, counts: [usize; 6]) -> Result<Self> {
         let control = contextdb_tx::SourceCharge::admit_funded(funder.clone(),
             contextdb_tx::staged_source::source_arc_layout::<parking_lot::RwLock<[usize; 6]>>().size())?;
@@ -827,6 +855,7 @@ impl Clone for WorkingVectorCatalogOwner {
     }
 }
 impl WorkingVectorCatalogOwner {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare(original: &crate::memory_accounting::OwnedMemoryReservation,
         funder: &contextdb_tx::SourceFunder) -> Result<Self> {
         crate::memory_accounting::validate_owned_original(original, original.accountant(), funder)?;
@@ -838,11 +867,13 @@ impl WorkingVectorCatalogOwner {
             host: std::sync::atomic::AtomicUsize::new(0), funder: funder.clone(), storage: parking_lot::Mutex::new(storage) });
         Ok(Self { catalog, control })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bind(&self, host: usize) -> Result<()> {
         self.catalog.host.compare_exchange(0, host, std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire).map(|_| ())
             .map_err(|_| Error::Other("working vector catalog is already bound".into()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ensure_column(&self, index: &VectorIndexRef, initial_counts: [usize; 6]) -> Result<WorkingVectorColumnCountsOwner> {
         if let Some(counts) = self.catalog.columns.lock().iter().find(|entry| entry.index == *index)
             .map(|entry| entry.counts.clone()) { return Ok(counts); }
@@ -883,6 +914,7 @@ impl WorkingVectorCatalogOwner {
             drop(replacement); drop(retired_backing);
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn refresh(&self, write: &ReceivedWorkingWrite,
         original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<()> {
         for entry in self.catalog.columns.lock().iter_mut() { entry.seen = false; }
@@ -905,11 +937,13 @@ impl WorkingVectorCatalogOwner {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn loan_source(&self) -> Result<super::received_working_source::WorkingReadSource> {
         let host = self.catalog.host.load(std::sync::atomic::Ordering::Acquire);
         super::received_working_source::WorkingReadSource::current_for(host)?
             .ok_or_else(|| Error::Other("working vector source is outside its owning loan".into()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn source(&self) -> Result<super::received_working_source::WorkingReadSource> {
         let source = self.loan_source()?;
         let memory = vector_membership_source::read_memory_for_operation()
@@ -917,11 +951,13 @@ impl WorkingVectorCatalogOwner {
             .ok_or_else(|| Error::Other("working vector read requires its executing reader".into()))?;
         Ok(source.for_read(memory))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy_partition(&self, index: &VectorIndexRef, partition: &VectorPartitionKey)
         -> Result<super::OriginalDecoded<VectorPartitionRef>> {
         let original = self.catalog.storage.lock();
         Self::copy_partition_original(&original, index, partition)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy_partition_original(original: &crate::memory_accounting::OwnedMemoryReservation,
         index: &VectorIndexRef, partition: &VectorPartitionKey)
         -> Result<super::OriginalDecoded<VectorPartitionRef>> {
@@ -933,6 +969,7 @@ impl WorkingVectorCatalogOwner {
         let (index, partition) = decoded.value;
         Ok(super::OriginalDecoded { value: VectorPartitionRef::new(index, partition), allocation: decoded.allocation })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn point_summary(&self, partition: &VectorPartitionRef, owner: &mut VectorCopyAdmission)
         -> Result<RawVectorMembershipSummary> {
         let source = self.loan_source()?;
@@ -949,6 +986,7 @@ impl WorkingVectorCatalogOwner {
         key.extend_from_slice(&(partition_length as u64).to_be_bytes()); append_partition(&mut key, &partition.partition_key);
         Ok(source.vector_summary_scalars(&capture, &key)?.map(|value| value.0).unwrap_or_default())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn source_control<T>(&self, index: Option<&VectorIndexRef>) -> Result<contextdb_tx::SourceCharge> {
         let names = index.map_or(0, |index| index.table.len().saturating_add(index.column.len()));
         let bytes = contextdb_tx::staged_source::source_arc_layout::<T>().size().checked_add(names)
@@ -962,6 +1000,7 @@ pub(crate) struct WorkingVectorFactoryOwner {
     control: contextdb_tx::SourceCharge,
 }
 impl WorkingVectorFactoryOwner {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare(catalog: WorkingVectorCatalogOwner) -> Result<Self> {
         let control = catalog.source_control::<WorkingVectorColumnFactory>(None)?;
         let factory = Arc::new(WorkingVectorColumnFactory { catalog, control: control.clone() });
@@ -985,6 +1024,7 @@ struct WorkingPagedVectorCatalog {
     catalog: WorkingVectorCatalogOwner,
 }
 impl WorkingVectorCatalogOwner {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn query_partition(&self, index: &VectorIndexRef, key: &VectorPartitionKey,
         source: &super::received_working_source::WorkingReadSource,
         capture: super::received_working_source::WorkingVectorCapture,
@@ -1028,6 +1068,7 @@ impl contextdb_vector::store::PagedVectorCatalog for WorkingPagedVectorCatalog {
             control: source._control.clone(),
         }))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit(&self, owner: &mut VectorCopyAdmission, before_read: &mut dyn FnMut() -> Result<()>,
         visit: &mut dyn FnMut(&VectorPartitionKey, RawVectorMembershipSummary, bool,
             Arc<dyn RawVectorMembershipSource>, Arc<dyn DormantRawVectorLoader>) -> Result<()>) -> Result<()> {
@@ -1035,6 +1076,7 @@ impl contextdb_vector::store::PagedVectorCatalog for WorkingPagedVectorCatalog {
             visit(key, summary, historical, memberships, loader)?; Ok(true)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_empty(&self, owner: &mut VectorCopyAdmission,
         visit: &mut dyn FnMut(&VectorPartitionKey, RawVectorMembershipSummary, bool,
             Arc<dyn RawVectorMembershipSource>, Arc<dyn DormantRawVectorLoader>) -> Result<bool>) -> Result<()> {
@@ -1043,6 +1085,7 @@ impl contextdb_vector::store::PagedVectorCatalog for WorkingPagedVectorCatalog {
 }
 
 impl WorkingPagedVectorCatalog {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_directory(&self, empty: bool, owner: &mut VectorCopyAdmission, before_read: &mut dyn FnMut() -> Result<()>,
         visit: &mut dyn FnMut(&VectorPartitionKey, RawVectorMembershipSummary, bool,
             Arc<dyn RawVectorMembershipSource>, Arc<dyn DormantRawVectorLoader>) -> Result<bool>) -> Result<()> {
@@ -1099,6 +1142,7 @@ struct WorkingVectorStreamedTail {
     _metadata_memory: crate::read_image_memory::ImageMemoryHandle,
 }
 impl WorkingVectorStreamedTail {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delta(&self, interval: &RawVectorDirectoryEntry, body: &RawVectorDirectoryEntry,
         snapshot: SnapshotId, owner: &mut VectorCopyAdmission,
         before: &mut dyn FnMut() -> bool) -> Result<bool> {
@@ -1280,6 +1324,7 @@ struct WorkingVectorCursor {
     _bounds: contextdb_core::read_memory::ReadCredit,
 }
 impl WorkingVectorPartitionSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn source(&self) -> Result<super::received_working_source::WorkingReadSource> {
         match &self.owner {
             WorkingPartitionOwner::Original { .. } => self.catalog.source(),
@@ -1288,6 +1333,7 @@ impl WorkingVectorPartitionSource {
             },
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_working_serving(&self, snapshot: SnapshotId, owner: &mut VectorCopyAdmission,
         before: &mut dyn FnMut() -> bool) -> Result<contextdb_vector::store::CapturedVectorServingSelection> {
         use contextdb_vector::store::{CapturedVectorStreamedTail, CapturedVectorStreamedTailHandle,
@@ -1386,6 +1432,7 @@ impl WorkingVectorPartitionSource {
         saved.with_streamed_tail(CapturedVectorStreamedTailHandle::new(Arc::new(tail), control))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor(&self, row: Option<RowId>, request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<WorkingVectorCursor> {
         if !request(DormantVectorLoadRequest::Reserve(std::mem::size_of::<WorkingVectorCursor>())) { return Err(Error::ReadCancelled); }
         let source = self.source()?;
@@ -1407,6 +1454,7 @@ impl WorkingVectorPartitionSource {
         let end = writer_source::prefix_end(&prefix);
         Ok(WorkingVectorCursor { capture, source, selected: None, prefix, end, after: None, _bounds: bounds })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn find(&self, row: Option<RowId>, before: &mut dyn FnMut() -> bool,
         owner: &mut VectorCopyAdmission,
         mut accept: impl FnMut(&VectorPartitionMembershipRecord) -> bool,
@@ -1429,6 +1477,7 @@ impl WorkingVectorPartitionSource {
     }
 }
 impl WorkingVectorCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_member(&mut self, request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool)
         -> Result<Option<writer_source::WriterWindow<VectorPartitionMembershipRecord>>> {
         self.selected = None;
@@ -1590,6 +1639,7 @@ impl RawVectorMembershipSource for WorkingVectorPartitionSource {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reverse_membership_key_original(frame: &OriginalPersistenceFrame<'_>, member: &VectorPartitionMembershipRecord) -> Result<Vec<u8>> {
     let partition = partition_length(&member.partition_key)?;
     let length = member.index.table.len().checked_add(member.index.column.len())
@@ -1626,6 +1676,7 @@ struct WorkingVectorReverseCursor {
     _bounds: contextdb_core::read_memory::ReadCredit,
 }
 impl WorkingVectorReverseSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor(&self, row: RowId) -> Result<WorkingVectorReverseCursor> {
         let source = self.catalog.source()?;
         let capture = source.capture_vector_catalog()?;
@@ -1640,6 +1691,7 @@ impl WorkingVectorReverseSource {
     }
 }
 impl WorkingVectorReverseCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_member(&mut self, before: &mut dyn FnMut() -> bool)
         -> Result<Option<writer_source::WriterWindow<VectorPartitionMembershipRecord>>> {
         if !before() { return Err(Error::ReadCancelled); }
@@ -1655,6 +1707,7 @@ impl WorkingVectorReverseCursor {
         Ok(Some(window))
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn copy_read_partition(key: &VectorPartitionKey, owner: &mut VectorCopyAdmission) -> Result<VectorPartitionKey> {
     owner.reserve(key.estimated_bytes().checked_mul(2).ok_or_else(|| Error::Other("working read partition size overflow".into()))?)?;
     let mut components = Vec::with_capacity(key.components().len());
@@ -1662,6 +1715,7 @@ fn copy_read_partition(key: &VectorPartitionKey, owner: &mut VectorCopyAdmission
     Ok(VectorPartitionKey::from_components(components))
 }
 impl contextdb_vector::store::RawVectorReverseMembershipCursor for WorkingVectorReverseCursor {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next(&mut self, before: &mut dyn FnMut() -> bool, owner: &mut VectorCopyAdmission) -> Result<Option<VectorPartitionKey>> {
         self.next_member(before)?.map(|window| copy_read_partition(&window.value.partition_key, owner)).transpose()
     }
@@ -1694,16 +1748,19 @@ impl RawVectorReverseMembershipSource for WorkingVectorReverseSource {
 }
 
 impl WorkingVectorPartitionSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn selected_member(&self, identity: &RawVectorDirectoryEntry, before: &mut dyn FnMut() -> bool,
         owner: &mut VectorCopyAdmission) -> Result<writer_source::WriterWindow<VectorPartitionMembershipRecord>> {
         self.find(Some(identity.row_id), before, owner, |member| raw_body_identity(member) == *identity)?
             .ok_or_else(|| Error::StoreCorrupted { path: "received working vectors".into(), reason: "body request lost its exact selected placement".into() })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn body_copy_bytes(body: &VectorEntry) -> Result<usize> {
         body.vector.len().checked_mul(std::mem::size_of::<f32>())
             .and_then(|n| n.checked_add(body.index.table.len())).and_then(|n| n.checked_add(body.index.column.len()))
             .ok_or_else(|| Error::Other("working vector copy size overflow".into()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn resident_budget(&self) -> Result<contextdb_vector::MemoryBudgetOwner> {
         match &self.owner {
             WorkingPartitionOwner::Query { control, .. } => Ok(control.funder()),
@@ -1711,6 +1768,7 @@ impl WorkingVectorPartitionSource {
                 crate::memory_accounting::persistence_original_projection(&self.catalog.catalog.storage.lock())?.vector_budget().map(Into::into),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn candidate_from_member(&self, source: &super::received_working_source::WorkingReadSource,
         member: &VectorPartitionMembershipRecord, caller_charged: bool,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
@@ -1830,6 +1888,7 @@ pub(crate) struct WorkingVectorIdentity<'a> {
 impl ReceivedWorkingWrite {
     /// Source and destination are distinct, so changing row/version/index
     /// coordinates cannot revisit a newly written key or skip an old one.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn rewrite_vector_image(
         &self, original: &crate::memory_accounting::OwnedMemoryReservation,
         mut body_change: impl FnMut(&OriginalPersistenceFrame<'_>, &mut WorkingVectorIdentity<'_>) -> Result<bool>,
@@ -1962,6 +2021,7 @@ impl ReceivedWorkingWrite {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn derive_partition_original(frame: &OriginalPersistenceFrame<'_>, index: &VectorIndexRef,
     meta: &TableMeta, column: &ColumnDef, row: &VersionedRow) -> Result<VectorPartitionKey> {
     let columns = column.partition_key_columns.as_deref().unwrap_or(&[]);
@@ -1979,6 +2039,7 @@ pub(crate) fn derive_partition_original(frame: &OriginalPersistenceFrame<'_>, in
 }
 
 impl ReceivedWorkingWrite {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn original_vector_lineage(&self, frame: &OriginalPersistenceFrame<'_>, key: &[u8])
         -> Result<Option<VectorIndexRef>> {
         let observed = self.with_write(|write| {
@@ -2001,6 +2062,7 @@ impl ReceivedWorkingWrite {
         frame.decode(&encoded).map(Some)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn project_vector_lineage(&self, frame: &OriginalPersistenceFrame<'_>, table_name: &str,
         previous: Option<&TableMeta>, arriving: Option<&TableMeta>, renames: &[(String, String)]) -> Result<()> {
         let Some(previous) = previous else { return Ok(()); };
@@ -2048,6 +2110,7 @@ impl ReceivedWorkingWrite {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn project_vectors_schema(
         &self, original: &crate::memory_accounting::OwnedMemoryReservation,
         table: &str, previous: Option<&TableMeta>, arriving: Option<&TableMeta>, ddl: &[DdlChange],
@@ -2096,6 +2159,7 @@ impl ReceivedWorkingWrite {
 }
 
 impl WorkingVectorCatalogOwner {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn activate(&self, store: &contextdb_vector::VectorStore, owner: &mut VectorCopyAdmission) -> Result<()> {
         // Activation creates standing original-funded handles. It requires
         // the authentic loan; actual queries separately require their reader.

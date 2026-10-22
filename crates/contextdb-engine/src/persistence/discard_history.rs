@@ -38,6 +38,7 @@ pub(crate) struct OriginalDiscardHistory {
     root: writer_source::WriterSnapshotHandle,
 }
 impl OriginalDiscardHistory {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn begin(store: &RedbPersistence, original: &crate::memory_accounting::OwnedMemoryReservation,
         root: &writer_source::WriterSnapshotHandle) -> Result<Self> {
         root.require_working_store(store)?;
@@ -78,23 +79,28 @@ impl OriginalDiscardHistory {
         }
         Ok(Self { write, sealed: None, root: root.clone() })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retain_original_owner(&mut self, events: &crate::database::event_bus::OwnedEventBusHandle) -> Result<()> {
         self.write.retain_original_owner(events)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_lsn(&self, tx: TxId) -> Result<Option<Lsn>> {
         self.write.open_table(COMMITS).map_err(RedbPersistence::storage_error)?
             .get(tx.0).map_err(RedbPersistence::storage_error).map(|value| value.map(|v| Lsn(v.value())))
     }
     pub(crate) fn write(&self) -> &redb::WriteTransaction { &self.write }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn blob_write(&self, original:&crate::memory_accounting::OwnedMemoryReservation) -> Result<(&redb::WriteTransaction,u64)> {
         self.mutable(original)?;
         Ok((&self.write,self.write.control_identity))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn mutable(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<()> {
         self.write.require_original(original)?;
         if self.sealed.is_some() { return Err(invalid()); }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push<T: serde::Serialize>(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         table: TableDefinition<'static, u64, &'static [u8]>, value: &T) -> Result<()> {
         self.mutable(original)?;
@@ -106,6 +112,7 @@ impl OriginalDiscardHistory {
         if table.insert(next, encoded.as_slice()).map_err(RedbPersistence::storage_error)?.is_some() { return Err(invalid()); }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push_row_graph(&self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         edge: &AdjEntry, owner: &contextdb_tx::RowEdgeOwner,
@@ -116,15 +123,18 @@ impl OriginalDiscardHistory {
         let owned = contextdb_tx::OwnedAdjEntry { owner: owner.clone(), entry: edge.clone() };
         self.push(original, ROW_GRAPH, &owned)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push_config(&self, original: &crate::memory_accounting::OwnedMemoryReservation, key: &str) -> Result<()> {
         self.push(original, CONFIGS, &key)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn contains_config(&self, original: &crate::memory_accounting::OwnedMemoryReservation, key: &str) -> Result<bool> {
         self.write.require_original(original)?;
         let mut found = false;
         visit::<String>(&self.write,original,CONFIGS,|selected| { found |= selected == key; Ok(()) })?;
         Ok(found)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push_edge(&self, store: &RedbPersistence,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         edge: &AdjEntry) -> Result<()> {
@@ -181,6 +191,7 @@ impl OriginalDiscardHistory {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn select_changes(&self, store: &RedbPersistence,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         mut selected: impl FnMut(&ChangeLogEntry) -> bool) -> Result<()> {
@@ -236,6 +247,7 @@ impl OriginalDiscardHistory {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn push_change(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
         position: &[u8], stored_bytes: &[u8]) -> Result<()> {
         self.mutable(original)?;
@@ -246,6 +258,7 @@ impl OriginalDiscardHistory {
             .insert(u64::from_be_bytes(position[..8].try_into().unwrap()), 0).map_err(RedbPersistence::storage_error)?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn seal(&mut self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<()> {
         self.mutable(original)?;
         if !self.write.open_table(OCCURRENCES).map_err(RedbPersistence::storage_error)?.is_empty().map_err(RedbPersistence::storage_error)? {
@@ -254,6 +267,7 @@ impl OriginalDiscardHistory {
         self.sealed = Some(roots(&self.write)?);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn into_write(self, store: &RedbPersistence,
         original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<received_working::ReceivedWorkingWrite> {
         self.write.require_store(store)?;
@@ -262,6 +276,7 @@ impl OriginalDiscardHistory {
         Ok(self.write)
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn roots(write: &redb::WriteTransaction) -> Result<[Option<Option<[u8;32]>>;14]> {
     let mut roots = [None;14];
     for (root, name) in roots.iter_mut().zip([ROWS.name(), EDGES.name(), CONFIGS.name(), EDGE_KEYS.name(),
@@ -276,6 +291,7 @@ fn roots(write: &redb::WriteTransaction) -> Result<[Option<Option<[u8;32]>>;14]>
 }
 fn invalid() -> Error { Error::Other("discard history selection lost its exact unpublished write".into()) }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn visit<T: serde::de::DeserializeOwned>(write: &redb::WriteTransaction,
     original: &crate::memory_accounting::OwnedMemoryReservation,
     table: TableDefinition<'static,u64,&'static [u8]>, mut consume: impl FnMut(&T) -> Result<()>) -> Result<()> {
@@ -285,6 +301,7 @@ pub(crate) fn visit<T: serde::de::DeserializeOwned>(write: &redb::WriteTransacti
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn with_record<T: serde::de::DeserializeOwned, R>(write: &redb::WriteTransaction,
     original: &crate::memory_accounting::OwnedMemoryReservation,
     table: TableDefinition<'static,u64,&'static [u8]>, ordinal: u64, consume: impl FnOnce(&T) -> Result<R>) -> Result<R> {
@@ -296,6 +313,7 @@ pub(crate) fn with_record<T: serde::de::DeserializeOwned, R>(write: &redb::Write
     };
     consume(&value)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn row_count(write: &redb::WriteTransaction) -> Result<u64> {
     write.open_table(ROWS).map_err(RedbPersistence::storage_error)?.len().map_err(RedbPersistence::storage_error)
 }
@@ -312,6 +330,7 @@ pub(super) struct FrozenGraphErasure {
     _memory: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl FrozenGraphErasure {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn build(store: &RedbPersistence, original: &crate::memory_accounting::OwnedMemoryReservation,
         write: &redb::WriteTransaction) -> Result<Self> {
         let memory = crate::memory_accounting::reserve_preparation_from_original(original,
@@ -357,6 +376,7 @@ impl FrozenGraphErasure {
     fn io(error: std::io::Error) -> Error {
         Error::ScratchWorkingStorageUnavailable { operation:"discard_graph_erasure".into(), io_kind:error.kind() }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn header(&self, ordinal:u64) -> Result<(u64,u64,[u8;32])> {
         if ordinal >= self.count { return Err(Self::corrupt()); }
         let mut offset = [0u8;8];
@@ -370,6 +390,7 @@ impl FrozenGraphErasure {
         if at.checked_add(40).and_then(|end|end.checked_add(len)).is_none_or(|end|end > self.end) { return Err(Self::corrupt()); }
         Ok((at,len,header[8..].try_into().unwrap()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn copy_keys(&self, original:&crate::memory_accounting::OwnedMemoryReservation,
         write:&redb::WriteTransaction) -> Result<()> {
         for ordinal in 0..self.count {
@@ -387,6 +408,7 @@ impl FrozenGraphErasure {
         Ok(())
     }
     pub(super) fn retained_memory_bytes(&self) -> usize { self._memory.bytes() }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn contains(&self, key:&[u8], mut checkpoint: Option<&mut dyn FnMut() -> Result<()>>) -> Result<bool> {
         let (mut lower,mut upper) = (0u64,self.count);
         let mut buffer = [0u8;4096];
@@ -426,6 +448,7 @@ impl FrozenGraphErasure {
 
 const TABLES: TableDefinition<&str,u8> = TableDefinition::new("__discard_tables");
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_original_discard_rows(&self, original: &OriginalPersistenceFrame<'_>,
         write: &redb::WriteTransaction, mutations: &mut schema_projection::OriginalMutationLog<'_, '_, '_>) -> Result<()> {
         let controls = OriginalPersistenceFrame::new(original.original)?;
@@ -522,6 +545,7 @@ impl RedbPersistence {
         drop(credit);
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_original_discard_graph(&self, original: &OriginalPersistenceFrame<'_>,
         write: &redb::WriteTransaction, mutations: &mut schema_projection::OriginalMutationLog<'_, '_, '_>) -> Result<()> {
         visit::<AdjEntry>(write,original.original,EDGES,|entry| {
@@ -554,6 +578,7 @@ impl RedbPersistence {
         })?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn erase_original_discard_configs(&self, original: &OriginalPersistenceFrame<'_>,
         write: &redb::WriteTransaction, mutations: &mut schema_projection::OriginalMutationLog<'_, '_, '_>) -> Result<()> {
         visit::<String>(write,original.original,CONFIGS,|key| {
@@ -563,6 +588,7 @@ impl RedbPersistence {
         })?;
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn finish_original_discard_history(&self, write: &redb::WriteTransaction) -> Result<()> {
         // No selected record or disk selector survives the one terminal commit.
         for table in [ROWS,EDGES,CONFIGS,ROW_GRAPH] { write.delete_table(table).map_err(Self::storage_error)?; }
@@ -575,6 +601,7 @@ impl RedbPersistence {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_discard_change_log(&self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         mutations: &mut schema_projection::OriginalMutationLog<'_, '_, '_>) -> Result<()> {
         if !write.open_table(SURVIVORS).map_err(Self::storage_error)?.is_empty().map_err(Self::storage_error)? { return Err(invalid()); }
@@ -663,6 +690,7 @@ impl RedbPersistence {
 const COUNT_MEMBERS: TableDefinition<&[u8],u8> = TableDefinition::new("__discard_count_members");
 type IndexHead = (RowId, IndexKey, TxId, Option<TxId>);
 impl RedbPersistence {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rebuild_discard_relational_indexes(&self, original: &OriginalPersistenceFrame<'_>,
         write: &redb::WriteTransaction, table: &str, meta: &TableMeta,
         commitments: &mut historical_index_commitment::CommitmentBatch,
@@ -771,6 +799,7 @@ impl RedbPersistence {
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn finish_discard_index_head(&self, original: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction,
         table: &str, meta: &TableMeta, declaration: &IndexDecl, current_name: &str, head: &IndexHead,
         mutations: &mut schema_projection::OriginalMutationLog<'_, '_, '_>) -> Result<()> {

@@ -24,6 +24,7 @@ use super::physical_admission::{
 };
 use contextdb_core::read_memory::{ReadCredit, ReadMemoryOwner, ReadShared};
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn wait_credit(owner: &ReadMemoryOwner, bytes: usize) -> Result<ReadCredit, WriterAcquireRefusal> {
     ReadCredit::try_new_owned(
         owner.clone(),
@@ -40,6 +41,7 @@ struct HelperAdmission {
     stack: HelperStack,
 }
 impl HelperAdmission {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new(owner: &ReadMemoryOwner) -> Result<Self, WriterAcquireRefusal> {
         let plan = wait_credit(owner, ReadShared::<HelperPlan>::layout().size())?;
         let stack = wait_credit(owner, HELPER_STACK_BYTES)?;
@@ -564,6 +566,7 @@ thread_local! {
 /// this thread holds, so if the kill is refused, giving that byte back lets
 /// the helper be granted it and exit by itself, and the reap that follows is
 /// certain. No outcome leaves a child behind.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn preflight(
     store_path: &std::path::Path,
     owner: &ReadMemoryOwner,
@@ -709,6 +712,7 @@ pub(crate) fn wait_for_shared_hold(
     )
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn wait_for_helper_mode(
     file: &File,
     offsets: &[i64],
@@ -904,6 +908,7 @@ impl contextdb_core::read_memory::NativeReadWake for WakePipe {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn park_read(
     helper: &Helper,
     pipe: &ReadShared<WakePipe>,
@@ -980,6 +985,7 @@ fn park_read(
     result
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn park(
     helper: &Helper,
     pipe: &ReadShared<WakePipe>,
