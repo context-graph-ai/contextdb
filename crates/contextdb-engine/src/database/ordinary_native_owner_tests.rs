@@ -1165,7 +1165,7 @@ fn ordinary_answer_last_clone_preserves_actual_original_controls_through_physica
 #[test]
 #[serial_test::serial]
 fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
-    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -1174,17 +1174,26 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
         }
     }
     for file in [false, true] {
-        let (_dir, db) = fixture(file);
-        sql(
-            &db,
-            "CREATE TABLE answer_points (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE EXACT)",
-        );
-        let params = HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
-        db.execute("INSERT INTO answer_points VALUES (1,$q)", &params)
-            .unwrap();
-        let query =
-            "SELECT id FROM answer_points ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 1";
-        db.execute(query, &params).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = if file {
+            Database::open_with_options(dir.path().join("retained-trace.db"), DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                memory_limit: Some(64 * 1024 * 1024),
+                ..Default::default()
+            }).unwrap()
+        } else { Database::open_memory() };
+        // Match the original retained-trace fixture's schema, four rows, SQL,
+        // binds, clock, and snapshot. Remove only its old setup trace before
+        // this independent sample so unrelated retired owners cannot move it.
+        sql(&db, "CREATE TABLE unpartitioned_items (id INT PRIMARY KEY, v VECTOR(4)) HISTORY ALL");
+        for id in 0..4 {
+            db.execute("INSERT INTO unpartitioned_items VALUES ($id,$v)", &HashMap::from([
+                ("id".into(), Value::Int64(id)),
+                ("v".into(), Value::Vector(vec![1.0, id as f32, 0.0, 0.0])),
+            ])).unwrap();
+        }
+        let params = HashMap::from([("v".into(), Value::Vector(vec![1.0, 0.0, 0.0, 0.0]))]);
+        let query = "SELECT id FROM unpartitioned_items ORDER BY v <=> $v USE VECTOR EXACT LIMIT 1";
         db.clear_last_vector_search_trace();
         let parent = db.declared_read_memory_for_test();
         let limit = parent.effective_limit_for_physical_test();
