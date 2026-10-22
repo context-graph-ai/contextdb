@@ -27514,7 +27514,7 @@ impl MaintenanceContext {
                                     phase,
                                 )
                             })
-                            .transpose()?;
+                            .flatten();
                         self.build_checkpoint()?;
                         #[cfg(any(test, feature = "test-seams"))]
                         self.vector.maybe_pause_maintenance_preparation_for_test(
@@ -27643,13 +27643,13 @@ impl MaintenanceContext {
                         let progress =
                             if partition_state_present && graph_entries.len() != live_vectors {
                                 drop(progress);
-                                Some(self.vector.begin_partition_maintenance_progress(
+                                self.vector.begin_partition_maintenance_progress(
                                     partition,
                                     reason,
                                     graph_entries.len(),
                                     covered_tx,
                                     phase,
-                                )?)
+                                )
                             } else {
                                 progress
                             };
