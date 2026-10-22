@@ -939,6 +939,7 @@ fn allocation_layout(layout: Layout) -> (Layout, usize) {
 
 unsafe impl GlobalAlloc for MeasuredAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        crate::vector_read_memory::root_observations::install_physical_observer();
         if NATIVE_REQUEST_ACTIVE
             .try_with(std::cell::Cell::get)
             .unwrap_or(false)

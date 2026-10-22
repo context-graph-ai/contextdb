@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const OVERFLOW: u64 = 1;
 pub const REENTRANT: u64 = 2;
@@ -19,9 +19,35 @@ const WATCH_CAPACITY: usize = 16;
 const FILTER_CAPACITY: usize = 16;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
+static WINDOW_THREAD: AtomicUsize = AtomicUsize::new(0);
+static START_NS: AtomicU64 = AtomicU64::new(0);
+static FIRST_REASON: AtomicU64 = AtomicU64::new(0);
+static FIRST_THREAD: AtomicUsize = AtomicUsize::new(0);
+static FIRST_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
+static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+fn monotonic_ns() -> u64 {
+    // Initialized before ACTIVE; sampling never initializes, allocates or locks.
+    EPOCH.get().map_or(0, |epoch| epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstFailure { pub reason: u64, pub caller_is_window_thread: bool, pub elapsed_ns: u64 }
+/// Read only after the recording window has closed; this is diagnostic evidence.
+pub fn first_failure() -> Option<FirstFailure> {
+    let reason = FIRST_REASON.load(Ordering::SeqCst);
+    (reason != 0).then(|| FirstFailure { reason,
+        caller_is_window_thread: FIRST_THREAD.load(Ordering::SeqCst) == 1,
+        elapsed_ns: FIRST_ELAPSED_NS.load(Ordering::SeqCst) })
+}
 thread_local! { static THREAD: Cell<u8> = const { Cell::new(0) }; }
 fn thread() -> usize { THREAD.try_with(|key| key as *const _ as usize).unwrap_or(0) }
-pub(crate) fn fail(reason: u64) { ERRORS.fetch_or(reason, Ordering::SeqCst); }
+pub(crate) fn fail(reason: u64) {
+    if FIRST_REASON.compare_exchange(0, reason, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        let caller = thread();
+        FIRST_THREAD.store(usize::from(caller != 0 && caller == WINDOW_THREAD.load(Ordering::SeqCst)), Ordering::SeqCst);
+        FIRST_ELAPSED_NS.store(monotonic_ns().saturating_sub(START_NS.load(Ordering::SeqCst)), Ordering::SeqCst);
+    }
+    ERRORS.fetch_or(reason, Ordering::SeqCst);
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Request {
@@ -83,6 +109,11 @@ static STATE: Mutex<State> = Mutex::new(State {
 });
 fn access<T>(operation: impl FnOnce(&mut State) -> T) -> Option<T> {
     if !ACTIVE.load(Ordering::SeqCst) { return None; }
+    let caller = thread();
+    if caller == 0 || caller != WINDOW_THREAD.load(Ordering::SeqCst) {
+        if ACTIVE.load(Ordering::SeqCst) { fail(FOREIGN_THREAD); }
+        return None;
+    }
     let Ok(mut state) = STATE.try_lock() else { fail(REENTRANT); return None; };
     // Cleanup can revoke recording without this lock. A caller that observed
     // ACTIVE before revocation must not enter with an abandoned watch afterward.
@@ -96,6 +127,7 @@ fn disarm_failed_cleanup() {
     // with its own cleanup. Foreign holders reject access before any raw load.
     ACTIVE.store(false, Ordering::SeqCst);
     fail(MISSING);
+    WINDOW_THREAD.store(0, Ordering::SeqCst);
 }
 fn advance(value: &mut usize) -> usize {
     match value.checked_add(1) {
@@ -103,8 +135,14 @@ fn advance(value: &mut usize) -> usize {
         None => { fail(OVERFLOW); 0 }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Unqualified { pub reasons: u64 }
+impl std::fmt::Debug for Unqualified {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Unqualified").field("reasons", &self.reasons)
+            .field("first_failure", &first_failure()).finish()
+    }
+}
 fn qualified<T>(value: T) -> Result<T, Unqualified> {
     let reasons = ERRORS.load(Ordering::SeqCst);
     if reasons == 0 { Ok(value) } else { Err(Unqualified { reasons }) }
@@ -126,6 +164,11 @@ impl Window {
             fail(REENTRANT); return Err(Unqualified { reasons: REENTRANT });
         }
         ERRORS.store(0, Ordering::SeqCst);
+        FIRST_REASON.store(0, Ordering::SeqCst);
+        FIRST_THREAD.store(0, Ordering::SeqCst);
+        FIRST_ELAPSED_NS.store(0, Ordering::SeqCst);
+        EPOCH.get_or_init(std::time::Instant::now);
+        START_NS.store(monotonic_ns(), Ordering::SeqCst);
         if layouts.len() > FILTER_CAPACITY { fail(OVERFLOW); return Err(Unqualified { reasons: OVERFLOW }); }
         state.generation = match state.generation.checked_add(1) {
             Some(next) => next,
@@ -140,6 +183,7 @@ impl Window {
         }
         for watch in &mut state.watches { *watch = EMPTY_WATCH; }
         if state.thread == 0 { fail(FOREIGN_THREAD); return Err(Unqualified { reasons: FOREIGN_THREAD }); }
+        WINDOW_THREAD.store(state.thread, Ordering::SeqCst);
         ACTIVE.store(true, Ordering::SeqCst);
         qualified(Self { generation: state.generation, finished: false, _thread: PhantomData })
     }
@@ -150,6 +194,7 @@ impl Window {
             if !self.check(state) { return false; }
             if (state.pending_constructor || state.pending_counter != 0 || state.pending_sample.is_some()) || state.watches.iter().any(|watch| watch.active) { fail(MISSING); }
             ACTIVE.store(false, Ordering::SeqCst);
+            WINDOW_THREAD.store(0, Ordering::SeqCst);
             true
         }).unwrap_or(false);
         if !ended { disarm_failed_cleanup(); }
@@ -259,6 +304,7 @@ impl Drop for Window {
             if !self.check(state) { return false; }
             if (state.pending_constructor || state.pending_counter != 0 || state.pending_sample.is_some()) || state.watches.iter().any(|watch| watch.active) { fail(MISSING); }
             ACTIVE.store(false, Ordering::SeqCst);
+            WINDOW_THREAD.store(0, Ordering::SeqCst);
             true
         }).unwrap_or(false);
         if !ended { disarm_failed_cleanup(); }
@@ -341,6 +387,7 @@ pub(crate) fn funding_next(counter: usize) {
 /// Called by the existing allocator before System.alloc/alloc_zeroed, not by
 /// the producer that supplies the expected inventory or reservation receipt.
 pub fn before_alloc(_layout: Layout) {
+    crate::vector_read_memory::root_observations::install_physical_observer();
     access(|state| {
         if state.pending_sample.is_some() { fail(MISSING); return; }
         if state.pending_counter != 0 {
@@ -355,9 +402,11 @@ pub fn before_alloc(_layout: Layout) {
 
 /// Called after the real System request, including null results.
 pub fn allocated(pointer: *mut u8, layout: Layout) {
+    crate::vector_read_memory::root_observations::install_physical_observer();
     record_request(pointer, layout, 0, 0);
 }
 pub fn reallocated(old: *mut u8, old_layout: Layout, pointer: *mut u8, layout: Layout) {
+    crate::vector_read_memory::root_observations::install_physical_observer();
     record_request(pointer, layout, old as usize, old_layout.size());
 }
 fn record_request(pointer: *mut u8, layout: Layout, previous_pointer: usize, previous_bytes: usize) {
@@ -400,6 +449,7 @@ pub struct FreeToken {
     producer: u64,
 }
 pub fn before_dealloc(pointer: *mut u8, layout: Layout) -> FreeToken {
+    crate::vector_read_memory::root_observations::install_physical_observer();
     let producer = crate::vector_read_memory::root_observations::before_physical_free(pointer as usize, layout);
     access(|state| {
         let event = advance(&mut state.event);
@@ -470,4 +520,30 @@ pub(crate) fn constructor_request(before: usize, payload: usize, layout: Layout)
         if ERRORS.load(Ordering::SeqCst) != 0 { return None; }
         Some(request)
     }).flatten()
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    #[test]
+    fn foreign_contention_and_same_thread_reentry_remain_distinct() {
+        let window = Window::begin(&[]).unwrap();
+        access(|_| {
+            // Join while holding STATE: a foreign caller must never try its lock.
+            std::thread::spawn(|| { access(|_| panic!("foreign caller entered state")); }).join().unwrap();
+        });
+        assert_eq!(window.finish().unwrap_err().reasons, FOREIGN_THREAD);
+        let failure = first_failure().unwrap();
+        assert_eq!(failure.reason, FOREIGN_THREAD);
+        assert!(!failure.caller_is_window_thread);
+        let window = Window::begin(&[]).unwrap();
+        access(|_| { access(|_| panic!("reentrant caller entered state")); });
+        assert_eq!(window.finish().unwrap_err().reasons, REENTRANT);
+        let failure = first_failure().unwrap();
+        assert_eq!(failure.reason, REENTRANT);
+        assert!(failure.caller_is_window_thread);
+        let window = Window::begin(&[]).unwrap();
+        window.finish().unwrap();
+        assert_eq!(first_failure(), None);
+    }
 }

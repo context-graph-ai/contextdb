@@ -2824,6 +2824,10 @@ pub(crate) mod root_observations {
     thread_local! {
         static LAST_ROOT_ATTEMPT: std::cell::Cell<Option<Token>> = const { std::cell::Cell::new(None) };
     }
+    // Set only by hooks called by the actual observing GlobalAlloc wrapper.
+    static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub(crate) fn install_physical_observer() { INSTALLED.store(true, Ordering::SeqCst); }
+    fn installed() -> bool { INSTALLED.load(Ordering::SeqCst) }
     static INVALID_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     #[derive(Debug, Clone, Copy)]
     pub(crate) struct Token(u64);
@@ -2863,6 +2867,7 @@ pub(crate) mod root_observations {
         }
     }
     pub(super) fn begin(bytes: usize) -> Token {
+        if !installed() { return Token(0); }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let slot = registry.slots.iter().position(Option::is_none).or_else(||
             registry.slots.iter().enumerate().filter_map(|(i, r)|
@@ -2881,6 +2886,7 @@ pub(crate) mod root_observations {
         token
     }
     pub(super) fn bind(token: Token, root: &DeclaredReadRoot) {
+        if token.0 == 0 { return; }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let record = registry.record(token);
         assert!(!record.payload_dropped && record.payload == 0);
@@ -2890,16 +2896,18 @@ pub(crate) mod root_observations {
         assert_eq!(record.block % record.alignment, 0);
         record.alive = true;
     }
-    pub(super) fn with_live<T>(token: Token, f: impl FnOnce(&DeclaredReadMemory) -> T) -> T {
+    pub(super) fn with_live<T>(token: Token, f: impl FnOnce(&DeclaredReadMemory) -> T) -> Option<T> {
+        if token.0 == 0 { return None; }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let record = registry.record(token);
         assert!(record.alive && record.payload != 0, "original root is retired");
         // SAFETY: bind records only the real projected payload. Root Drop
         // invalidates under this same mutex before its native block can free.
         // f cannot return a reference tied to this temporary root borrow.
-        f(unsafe { &*(record.payload as *const DeclaredReadMemory) })
+        Some(f(unsafe { &*(record.payload as *const DeclaredReadMemory) }))
     }
     pub(super) fn sample(token: Token) -> (bool, u64, u64) {
+        assert_ne!(token.0, 0, "physical observer not installed; no evidence");
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let record = registry.record(token);
         if record.alive {
@@ -2914,6 +2922,7 @@ pub(crate) mod root_observations {
             if record.terminal_retired { 0 } else { record.last_charged })
     }
     pub(super) fn payload_dropped(token: Token, root: &DeclaredReadMemory) {
+        if token.0 == 0 { return; }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let record = registry.record(token);
         record.last_charged = root.retained.load(Ordering::SeqCst);
@@ -2923,6 +2932,7 @@ pub(crate) mod root_observations {
         // Keep the scalar identity, but every dereference is now disabled.
     }
     pub(super) fn retire(token: Token, bytes: usize) {
+        if token.0 == 0 { return; }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         registry.event = registry.event.checked_add(1).expect("terminal event ordinal overflow");
         let event = registry.event;
@@ -2938,6 +2948,7 @@ pub(crate) mod root_observations {
     }
     #[cfg(feature = "test-seams")]
     pub(super) fn before_allocation(token: Token, root: &DeclaredReadMemory, layout: std::alloc::Layout) {
+        if token.0 == 0 { return; }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let r = registry.record(token);
         assert_eq!(r.producer, 0);
@@ -2964,6 +2975,7 @@ pub(crate) mod root_observations {
     }
     #[cfg(test)]
     pub(super) fn assert_terminal_free(token: Token) {
+        assert_ne!(token.0, 0, "physical observer not installed; no evidence");
         assert!(!INVALID_FREE.load(Ordering::SeqCst), "unqualified physical-free observation");
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let r = registry.record(token);
@@ -2987,22 +2999,34 @@ pub(crate) mod root_observations {
     pub(crate) fn producer(
         payload: usize, kind: u8, counter: usize, held: usize, payload_bytes: usize, payer: Option<usize>,
     ) -> Token {
+        if !installed() { return Token(0); }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(record) = registry.slots.iter_mut().flatten().find(|r|
             r.producer == kind && r.payload == payload && r.alive) {
+            if record.payer != payer {
+                // Panic cleanup can deallocate through the observer. Never hold
+                // its registry while reporting rejected provenance.
+                drop(registry);
+                panic!("producer cannot change its original payer");
+            }
             record.last_charged = held as u64;
             record.payload_bytes = payload_bytes;
-            assert_eq!(record.payer, payer, "producer cannot change its original payer");
             return record.token;
         }
-        assert!(!registry.slots.iter().flatten().any(|r| r.producer == kind && r.payload == payload
-            && !r.alive && !r.physical_free_returned),
-            "address reused without original physical-free evidence; observation unqualified");
+        if registry.slots.iter().flatten().any(|r| r.producer == kind && r.payload == payload
+            && !r.alive && !r.physical_free_returned) {
+            drop(registry);
+            panic!("address reused without original physical-free evidence; observation unqualified");
+        }
         let slot = registry.slots.iter().position(Option::is_none).or_else(||
             registry.slots.iter().enumerate().filter_map(|(i, r)|
                 r.filter(|r| r.terminal_retired).map(|r| (i, r.token.0)))
                 .min_by_key(|(_, generation)| *generation).map(|(i, _)| i))
-            .expect("producer observation static capacity exhausted; proof invalid");
+            ;
+        let Some(slot) = slot else {
+            drop(registry);
+            panic!("producer observation static capacity exhausted; proof invalid");
+        };
         registry.generation = registry.generation.checked_add(1).expect("producer generation overflow");
         let token = Token(registry.generation);
         registry.slots[slot] = Some(Record { token, block: 0, payload, bytes: 0,
@@ -3013,6 +3037,7 @@ pub(crate) mod root_observations {
         token
     }
     pub(crate) fn producer_update(payload: usize, kind: u8, held: usize, payload_bytes: usize) {
+        if !installed() { return; }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         for r in registry.slots.iter_mut().flatten().filter(|r|
             r.producer == kind && r.payload == payload && r.alive) {
@@ -3020,6 +3045,7 @@ pub(crate) mod root_observations {
         }
     }
     pub(crate) fn producer_used(counter: usize, used: usize) {
+        if !installed() { return; }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         for r in registry.slots.iter_mut().flatten().filter(|r|
             (r.producer == 2 || r.producer == 3) && r.counter == counter && r.alive) {
@@ -3027,6 +3053,7 @@ pub(crate) mod root_observations {
         }
     }
     pub(crate) fn producer_dropped(payload: usize, kind: u8, held: usize, payload_bytes: usize) {
+        if !installed() { return; }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         for r in registry.slots.iter_mut().flatten().filter(|r|
             r.producer == kind && r.payload == payload && !r.physical_free_returned) {
@@ -3038,6 +3065,7 @@ pub(crate) mod root_observations {
     /// matches only registered genuine typed payload identities. No dead load.
     /// The returned generation is stable across System.dealloc/address reuse.
     pub(crate) fn before_physical_free(pointer: usize, layout: std::alloc::Layout) -> u64 {
+        if !installed() { return 0; }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let Some(next) = registry.event.checked_add(1) else {
             INVALID_FREE.store(true, Ordering::SeqCst); return 0;
@@ -3081,11 +3109,53 @@ pub(crate) mod root_observations {
         if r.producer != 0 { r.alive = false; r.terminal_retired = true; }
     }
     pub(crate) fn producer_sample(token: Token) -> (bool, usize, usize, bool) {
+        assert_ne!(token.0, 0, "physical observer not installed; no evidence");
         assert!(!INVALID_FREE.load(Ordering::SeqCst), "unqualified physical-free observation");
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let r = registry.record(token);
         assert_ne!(r.producer, 0);
         (r.alive, r.last_charged as usize, r.payload_bytes, r.physical_free_returned)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn installed_provenance_rejects_reuse_and_payer_changes() {
+        use crate::read_image_memory::{ImageMemory, ImageMemoryObservation};
+        assert!(installed(), "unit GlobalAlloc must establish the installation fact");
+        let image = ImageMemory::new(None).unwrap();
+        let _observation = ImageMemoryObservation::new(&image);
+        let address = image.as_ref() as *const ImageMemory as usize;
+        let actual = {
+            let registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            *registry.slots.iter().flatten().find(|record|
+                record.payload == address && record.producer == 1 && record.alive).unwrap()
+        };
+        let token = actual.token;
+        assert!(producer_sample(token).0);
+        let wrong_payer = if actual.payer.is_some() { None }
+            else { Some(image.accountant.as_ptr() as usize) };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            producer(address, 1, actual.counter, actual.last_charged as usize,
+                actual.payload_bytes, wrong_payer))).is_err());
+        // Withhold only the observer's deallocation boundary. The real image
+        // remains pinned; a second registration cannot qualify address reuse.
+        producer_dropped(address, 1, actual.last_charged as usize, actual.payload_bytes);
+        assert!(std::panic::catch_unwind(|| producer(address, 1, actual.counter,
+            actual.last_charged as usize, actual.payload_bytes, actual.payer)).is_err());
+        assert!(!producer_sample(token).3, "a rejected reuse cannot invent a free");
+        drop(image);
+        assert!(producer_sample(token).3, "only the GlobalAlloc return qualifies free");
+        let images: Vec<_> = (0..65).map(|_| ImageMemory::new(None).unwrap()).collect();
+        let mut rejected = 0;
+        for image in &images {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                ImageMemoryObservation::new(image))).is_err() { rejected += 1; }
+        }
+        assert!(rejected > 0, "installed provenance capacity remains fail-closed");
+        drop(images);
+        after_physical_free(token.0);
+        assert!(std::panic::catch_unwind(|| producer_sample(token)).is_err(),
+            "a duplicate allocator return must invalidate evidence");
     }
 
 }
