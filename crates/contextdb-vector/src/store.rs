@@ -19325,7 +19325,6 @@ impl VectorStore {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin_partition_maintenance_progress(
         &self,
         partition: &VectorPartitionRef,
@@ -19333,9 +19332,11 @@ impl VectorStore {
         total: usize,
         checkpoint_tx: TxId,
         phase: &'static str,
-    ) -> Result<VectorMaintenanceProgressGuard> {
-        let state = self.partition_state(&partition.index, &partition.partition_key)?;
-        Ok(state.begin_maintenance_progress_at(phase, reason, total, checkpoint_tx))
+    ) -> Option<VectorMaintenanceProgressGuard> {
+        // Inspection must not make restore or import depend on a resident slot.
+        // Historical-only and not-yet-registered routes may have none.
+        self.try_partition_state(&partition.index, &partition.partition_key)
+            .map(|state| state.begin_maintenance_progress_at(phase, reason, total, checkpoint_tx))
     }
 
     #[doc(hidden)]

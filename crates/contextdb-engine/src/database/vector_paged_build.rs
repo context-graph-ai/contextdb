@@ -114,7 +114,7 @@ pub(super) fn paged_build_hooks(
         progress.total_points,
         progress.frontier_tx,
         progress_state(record.reason),
-    )?;
+    );
     let closed = Arc::clone(resource_closed);
     let interrupted = Arc::clone(publication_interrupted);
     let gate_manager = tx_mgr.downgrade();
@@ -142,7 +142,9 @@ pub(super) fn paged_build_hooks(
         // progress still advances only when its entire batch commits; the caller
         // restores that durable value after either success or abort.
         inserted: Arc::new(move |done| {
-            insertion_progress.advance(done);
+            if let Some(progress) = &insertion_progress {
+                progress.advance(done);
+            }
             #[cfg(any(test, feature = "test-seams"))]
             insertion_pause(done);
         }),
