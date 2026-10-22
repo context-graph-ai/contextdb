@@ -51,15 +51,17 @@ fails the same full result. Receipts record each exact command. Qualification on
 different SHA supplies no verdict on the PR SHA. Hardware latency qualification
 remains the existing dormant/manual path.
 
-Seven named engine assertions are temporarily declared but ignored while their rc2
+Six named engine assertions are temporarily declared but ignored while their rc2
 work lands on `dev`: the four corpus profile assertions (CDB-160), the indexed-route
-and saved-graph work assertions (CDB-161/CDB-162), and the oversized authenticated
+work assertion (CDB-161), and the oversized authenticated
 schema journey (CDB-163). They remain discoverable in their original targets and the
 full qualification receipt must show them as ignored, not executed. The CI guard
-allows only these seven declarations plus the pre-existing CDB-154 exception; it
+allows only these six declarations plus the pre-existing CDB-154 exception; it
 rejects a changed target, case, issue ID, reason, or extra quarantine. The owner
-removes all seven when rc2 lands on `dev`; pending campaign fixes are not claimed as
+removes all six when rc2 lands on `dev`; pending campaign fixes are not claimed as
 resolved by this waiver.
+The saved-graph acceleration assertion remains enabled in its required nightly target;
+the source guard rejects an added ignore or removal of that route.
 
 Normal integration has 18 slices after the certified omissions below. It substitutes the 14-case bounded schema root
 for the three original full roots and omits only the four full recall corpora.

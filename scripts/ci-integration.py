@@ -84,7 +84,6 @@ QUARANTINE_EXCEPTIONS = {
     ('crates/contextdb-engine/tests/vector_graph_recall_50000_isotropic_per_context.rs', 'selected_f32_build_switches_pass_50000_isotropic_per_context'): 'CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.',
     ('crates/contextdb-engine/tests/vector_graph_recall_50001_anisotropic_per_context.rs', 'selected_f32_build_switches_pass_50001_anisotropic_per_context'): 'CDB-160: index-acceleration bar owned by the bounded-storage-rc2 campaign (S5 search-route + S10 never-built graph 1c85c7c6); re-enabled when rc2 lands on dev.',
     ('crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs', 'indexed_route_does_less_work_than_exact'): 'CDB-161: bounded-storage-rc2 S5 AUTO calibration campaign (fix SHA pending); re-enabled when rc2 lands on dev.',
-    ('crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs', 'single_context_saved_graph_auto_and_indexed_are_faster_than_exact'): 'CDB-162: bounded-storage-rc2 S5 per-candidate walk-cost campaign (fix SHA pending); re-enabled when rc2 lands on dev.',
     ('crates/contextdb-engine/tests/sync/schema_migration_chunked_transport.rs', 'oversized_authenticated_schema_stays_invisible_until_one_commit_and_retry'): 'CDB-163: bounded-storage-rc2 S3/S4 oversized-pull funding campaign (fix SHA pending); re-enabled when rc2 lands on dev.',
 }
 BASELINE_CDB_IGNORE = ('crates/contextdb-server/tests/durable_deletion_and_purge_tests.rs', 'CDB-154: vector-sync defect on dev makes this purge test fail nondeterministically (transport timeout, false frontier corruption, 1000 vs 1001 nodes); re-enable when the storage fix lands', 'authoritative_purge_removes_every_engine_held_copy')
@@ -121,6 +120,13 @@ def quarantine_contract(root=ROOT):
         declaration = re.compile(re.escape(attribute) + r'\s*(?:#\[[^\]]+\]\s*)*(?:async\s+)?fn\s+' + re.escape(case) + r'\s*\(')
         if len(declaration.findall(text)) != 1:
             raise ValueError('missing, duplicate, or misbound approved quarantine: ' + path + '::' + case)
+    # This existing acceleration assertion stays enabled in its nightly target.
+    path = 'crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs'
+    case = 'single_context_saved_graph_auto_and_indexed_are_faster_than_exact'
+    text = (root / path).read_text()
+    attributes = re.findall(r'(?m)^((?:#\[[^\n]*\]\s*)+)fn\s+' + re.escape(case) + r'\s*\(', text)
+    if attributes != ['#[cfg(feature = "nightly-tests")]\n#[test]\n']:
+        raise ValueError('saved-graph acceleration assertion must remain enabled and nightly: ' + case)
     cdb_ignores = []
     for path in (root / 'crates').glob('*/tests/**/*.rs'):
         relative = str(path.relative_to(root))
@@ -129,7 +135,7 @@ def quarantine_contract(root=ROOT):
             cdb_ignores.append((relative, match[1], match[2]))
     expected = [(path, reason, case) for (path, case), reason in QUARANTINE_EXCEPTIONS.items()] + [BASELINE_CDB_IGNORE]
     if sorted(cdb_ignores) != sorted(expected):
-        raise ValueError('CDB ignore inventory changed; only CDB-154 and the seven approved rc2 attributes are allowed')
+        raise ValueError('CDB ignore inventory changed; only CDB-154 and the six approved rc2 attributes are allowed')
     corpus = [(path, case) for (path, case), reason in QUARANTINE_EXCEPTIONS.items() if reason.startswith('CDB-160:')]
     if len(corpus) != 4:
         raise ValueError('four corpus quarantine declarations required')
@@ -490,6 +496,10 @@ def load_manifest(root=ROOT):
     for slice_id, (family, target) in SYNC_SLICES.items():
         if by_id.get(slice_id) != dict(id=slice_id, family=family, kind='engine-tests', targets=[target]):
             raise ValueError('sync requires two separate named slices: ' + slice_id)
+    if by_id.get('indexed-search-work-latency') != dict(
+            id='indexed-search-work-latency', family='indexed-search routing and distance work',
+            kind='engine-tests', targets=['vector_indexed_route_does_less_work_than_exact']):
+        raise ValueError('saved-graph acceleration assertion must retain its required nightly slice')
     vector_profile_contract(root, by_id)
     acceptance_parts = {
         'acceptance-test': {

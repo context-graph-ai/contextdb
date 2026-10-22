@@ -175,6 +175,20 @@ i.normal_dedup_certificate = lambda *a, **k: dict(fixture_certificate, targets=f
 rows = i.load_manifest()
 i.workflow_contract()
 assert i.quarantine_contract() is None
+# The enabled saved-graph assertion cannot be ignored or lose its nightly route.
+source = ROOT / 'crates/contextdb-engine/tests/vector/indexed_route_does_less_work_than_exact.rs'
+original = source.read_text()
+read_text = Path.read_text
+case = 'single_context_saved_graph_auto_and_indexed_are_faster_than_exact'
+for mutation in [original.replace('fn ' + case, '#[ignore]\nfn ' + case),
+                 original.replace('fn ' + case, 'fn renamed_' + case)]:
+    with patch.object(Path, 'read_text', lambda p, *a, **kw: mutation if p == source else read_text(p, *a, **kw)):
+        reject(lambda: i.quarantine_contract())
+manifest = ROOT / 'scripts/ci-integration-targets.json'
+data = json.loads(manifest.read_text())
+data['slices'] = [row for row in data['slices'] if row['id'] != 'indexed-search-work-latency']
+with patch.object(Path, 'read_text', lambda p, *a, **kw: json.dumps(data) if p == manifest else read_text(p, *a, **kw)):
+    reject(lambda: i.load_manifest())
 for path, case in list(i.QUARANTINE_EXCEPTIONS)[:2]:
     source = ROOT / path
     original = source.read_text()
@@ -187,7 +201,7 @@ check_output = i.subprocess.check_output
 with patch.object(i.subprocess, 'check_output', lambda argv, *a, **kw: (_ for _ in ()).throw(AssertionError('runtime guard asked for git history')) if argv[:2] == ['git', 'show'] else check_output(argv, *a, **kw)):
     assert i.quarantine_contract() is None
     assert i.load_manifest()
-print(f'Quarantine guard PASS: CDB-154 baseline plus seven exact owner-approved rc2 attributes; {controls} mutation refusals.')
+print(f'Quarantine guard PASS: enabled saved-graph assertion and CDB-154 baseline plus six exact owner-approved rc2 attributes; {controls} mutation refusals.')
 for mode, default, count in [('normal', False, 23), ('full', False, 32), ('full', True, 36)]:
     matrix = i.matrix(rows, default, mode)
     assert len(matrix['include']) == count
