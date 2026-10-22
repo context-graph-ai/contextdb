@@ -480,6 +480,7 @@ mod tests {
         db
     }
     fn verify(db: &redb::Database) -> Result<()> {
+        let _operation = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         RedbPersistence::verify_history_root(&db.begin_read().unwrap(), "rel_fixture")
     }
     #[test]
@@ -953,7 +954,6 @@ mod tests {
         const LENGTH: usize = 8;
         assert_eq!(PAGE + CHECKSUM + LENGTH, root.len());
         assert_eq!(&root[PAGE + CHECKSUM..], &length.to_le_bytes());
-        assert!(root[..PAGE].iter().any(|byte| *byte != 0));
         assert_ne!(length, 0);
         stored
     }
@@ -989,6 +989,7 @@ mod tests {
     }
 
     fn assert_canonical_malformed(db: &redb::Database, bytes: &[u8]) {
+        let _operation = crate::read_image_memory::ImageMemory::enter_decode_call().unwrap();
         assert!(
             !valid_record(bytes),
             "producer predicate must reject this one-field record"
@@ -1034,12 +1035,83 @@ mod tests {
     }
 
     #[test]
-    fn canonical_present_zero_page_witness_is_typed_malformed() {
+    fn canonical_present_zero_page_mismatch_stays_disclosed_false() {
+        let _operation = crate::read_image_memory::ImageMemory::enter_decode_call().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
             bytes[18..26].fill(0);
         });
         assert_one_span(&original, &bytes, 18, 26);
+        assert!(valid_record(&bytes));
+        let read = db.begin_read().unwrap();
+        let physical = read
+            .normal_table_root("rel_fixture")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_ne!(&bytes[18..], &physical[..]);
+        assert!(!RedbPersistence::verify_history_root_canonical(&read, "rel_fixture").unwrap());
+        match RedbPersistence::verify_history_root(&read, "rel_fixture") {
+            Err(Error::StoreCorrupted { reason, .. }) => {
+                assert!(
+                    reason.contains("does not match the captured historical root"),
+                    "{reason}"
+                );
+            }
+            other => panic!("mismatched witness must refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_page_record_requires_positive_length_and_complete_descriptor_match() {
+        let mut root = [0; 32];
+        root[8..24].copy_from_slice(&7u128.to_le_bytes());
+        root[24..].copy_from_slice(&1u64.to_le_bytes());
+        let bytes = record(Some(root), [1; 16]);
+        assert_eq!(&bytes[18..26], &[0; 8]);
+        assert!(valid_record(&bytes));
+        assert_eq!(witnessed_length(&bytes), Some(1));
+        assert!(matches(&bytes, Some(root)));
+        assert!(!matches(&bytes, None));
+        // Every physical descriptor byte is authenticated, including the
+        // otherwise legal zero page, checksum and positive entry count.
+        for index in 0..root.len() {
+            let mut different = root;
+            different[index] ^= 2;
+            assert!(!matches(&bytes, Some(different)), "descriptor byte {index}");
+        }
+        root[24..].fill(0);
+        assert!(!valid_record(&record(Some(root), [1; 16])));
+        assert!(!valid_record(&record(Some([0; 32]), [1; 16])));
+        let mut absent = record(None, [1; 16]);
+        assert!(valid_record(&absent));
+        absent[26] = 1;
+        assert!(!valid_record(&absent));
+    }
+
+    #[test]
+    fn canonical_present_all_zero_descriptor_is_typed_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
+            bytes[18..].fill(0);
+        });
+        assert_one_span(&original, &bytes, 18, RECORD_BYTES);
+        assert_canonical_malformed(&db, &bytes);
+    }
+
+    #[test]
+    fn canonical_truncated_witness_is_typed_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seeded(&dir.path().join("witness.db"));
+        let mut bytes = generated_present_record(&db);
+        bytes.pop();
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(WITNESSES)
+            .unwrap()
+            .insert("rel_fixture", bytes.as_slice())
+            .unwrap();
+        write.commit().unwrap();
         assert_canonical_malformed(&db, &bytes);
     }
 
