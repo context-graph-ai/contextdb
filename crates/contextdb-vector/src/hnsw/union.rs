@@ -325,10 +325,11 @@ impl NavigationCache {
             neighbours: compact,
             values: None,
         };
-        // Upper-layer bodies remain optional. Do not evict the admitted new
-        // table while this entry is pending insertion; refusal is a body miss.
-        if id.0 != 0
-            && let paged_builder::PagedVectorPoint::F32(point) = value
+        // Every captured F32 point can serve its following distance request.
+        // Retain only after original-reader admission, while the native source
+        // window remains charged. Do not evict the pending table/entry here;
+        // refusal remains a body miss and mandatory source reads reclaim later.
+        if let paged_builder::PagedVectorPoint::F32(point) = value
             && let Some(body_bytes) = point.values.len().checked_mul(std::mem::size_of::<f32>())
             && self.payload_bytes.checked_add(body_bytes).is_some()
             && self.accountant.as_ref().is_some_and(|owner| {
