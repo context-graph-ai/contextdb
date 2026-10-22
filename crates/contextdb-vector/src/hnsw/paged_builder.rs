@@ -2164,10 +2164,21 @@ impl PagedGenerationBuilder {
                     "paged generation cursor exceeds its admitted key window".into()));
             }
         }
+        let mut workspace_bytes = plan.construction_workspace_bytes()?;
+        if self.progress.phase == PagedVectorPhase::Complete {
+            // Publication calls only the provider's metadata transaction; it
+            // neither constructs nor searches graph points. Keep every node,
+            // key, dirty-page and progress allowance, and release only the
+            // graph constructor scratch that this phase never allocates.
+            workspace_bytes = workspace_bytes.checked_sub(
+                PagedGraphWorkspace::exact_allocation_bound(plan.scratch_points)
+                    .ok_or_else(workspace_overflow)?,
+            ).ok_or_else(workspace_overflow)?;
+        }
         let _reservation = VectorWorkspaceReservation::try_new_static(
             self.accountant.clone(),
             Arc::clone(&self.live_workspace),
-            plan.construction_workspace_bytes()?,
+            workspace_bytes,
             "advance_paged_vector_generation",
             "reduce batch size or release idle serving pages",
         )?;
