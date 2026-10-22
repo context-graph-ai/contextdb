@@ -753,9 +753,13 @@ impl MaintenanceContext {
                     Err(error) => return Err(error),
                 };
                 if visit(&mut entry)? {
-                    if let Err(error) = self.admit_inventory_slot("catalogs", &mut memory, &mut retained) {
-                        failures.first.get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
-                        continue;
+                    match self.admit_inventory_slot("catalogs", &mut memory, &mut retained) {
+                        Ok(()) => {}
+                        Err(error @ Error::MemoryBudgetExceeded { .. }) => {
+                            failures.first.get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                     retained.push(entry);
                 }
@@ -1169,6 +1173,14 @@ impl MaintenanceContext {
                     }
                 }
             }
+            // Publish the sampled source outcomes before releasing their strong
+            // handles. The orphan scan captures its own fixed source inventory;
+            // retaining both snapshots needlessly consumes preparation credit.
+            self.apply_inventory_source_outcomes(&phase);
+            phase.sources = Vec::new();
+            phase.source_memory = OwnedMemoryReservation::new(
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            );
             // Catalog-backed routes without a live indexed state still need
             // their uncovered journal represented before physical cleanup.
             // Retired raw history is such a route, just like an absent source.
@@ -1177,8 +1189,8 @@ impl MaintenanceContext {
                 let catalog = &entry.catalog;
                 let source = self.vector.try_partition_state(&catalog.index, &catalog.partition_key);
                 if source.as_ref().is_some_and(|state| {
-                    !state.source_maintenance_metadata().historical_only
-                        || phase.sources.iter().any(|source| Arc::ptr_eq(&source.state, state) && source.failed)
+                    let metadata = state.source_maintenance_metadata();
+                    !metadata.historical_only || metadata.failure.is_some()
                 }) || !self.vector.contains_index(&catalog.index)
                 {
                     return Ok(false);
