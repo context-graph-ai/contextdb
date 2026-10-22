@@ -1230,7 +1230,7 @@ impl PaidRetainedMemoryCharge {
         let accountant: crate::memory_budget::MemoryBudgetOwner = accountant.into();
 
         let invoice = accountant.control_invoice();
-        Self { charge: RetainedMemoryCharge { bytes, accountant: accountant }, _control_invoice: invoice }
+        Self { charge: RetainedMemoryCharge { bytes, accountant }, _control_invoice: invoice }
     }
 }
 impl std::ops::Deref for PaidRetainedMemoryCharge {
@@ -3291,29 +3291,25 @@ impl Drop for VectorMaintenanceProgressGuard {
 /// Opaque captured private directory. Each visit owns one admitted identity
 /// window and releases native guards before constructing sources or callbacks.
 #[doc(hidden)]
-pub type PagedVectorCatalogVisitor<'a, T> = dyn FnMut(
-    &VectorPartitionKey,
-    RawVectorMembershipSummary,
-    bool,
-    Arc<dyn RawVectorMembershipSource>,
-    Arc<dyn DormantRawVectorLoader>,
-) -> Result<T> + 'a;
-#[doc(hidden)]
 pub trait PagedVectorCatalog: Send + Sync {
     fn counts(&self) -> [usize; 6];
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate(&self) -> Result<()>;
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(clippy::type_complexity, reason = "The captured catalog callback keeps route metadata and both original source handles together without an allocating adapter.")]
     fn visit_empty(&self, owner: &mut VectorCopyAdmission,
-        visit: &mut PagedVectorCatalogVisitor<'_, bool>) -> Result<()>;
+        visit: &mut dyn FnMut(&VectorPartitionKey, RawVectorMembershipSummary, bool,
+            Arc<dyn RawVectorMembershipSource>, Arc<dyn DormantRawVectorLoader>) -> Result<bool>) -> Result<()>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool { self.len() == 0 }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn probe(&self, key: &VectorPartitionKey, owner: &mut VectorCopyAdmission)
         -> Result<Option<PagedVectorPartitionSources>>;
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(clippy::type_complexity, reason = "The captured catalog callback keeps route metadata and both original source handles together without an allocating adapter.")]
     fn visit(&self, owner: &mut VectorCopyAdmission, before_read: &mut dyn FnMut() -> Result<()>,
-        visit: &mut PagedVectorCatalogVisitor<'_, ()>) -> Result<()>;
+        visit: &mut dyn FnMut(&VectorPartitionKey, RawVectorMembershipSummary, bool,
+            Arc<dyn RawVectorMembershipSource>, Arc<dyn DormantRawVectorLoader>) -> Result<()>) -> Result<()>;
 }
 #[doc(hidden)]
 pub struct PagedVectorPartitionSources {
