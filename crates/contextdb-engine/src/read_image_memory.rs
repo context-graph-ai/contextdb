@@ -227,6 +227,7 @@ impl ImageMemory {
             .preparation_original()
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(clippy::new_ret_no_self, reason = "Constructs the funded image handle that retains both the image owner and its control invoice.")]
     pub(crate) fn new(limit: Option<usize>) -> Result<ImageMemoryHandle> {
         let accountant = crate::memory_accounting::AccountantHandle::standalone(limit, true)?;
         Self::funded_for(accountant, "direct_read", "hydrate_owned_image",

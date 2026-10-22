@@ -3843,6 +3843,7 @@ impl OwnedMemoryReservation {
     }
     /// Transfer the already-held assembly allocation debit without refund/readmission.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(clippy::wrong_self_convention, reason = "Transfers an admitted debit from a held mutable reservation while its enclosing reservation remains live.")]
     pub(crate) fn into_source_control_charge_for(
         &mut self,
         funder: &contextdb_tx::SourceFunder,
