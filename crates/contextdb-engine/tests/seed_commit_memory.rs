@@ -10,6 +10,7 @@
 mod heap_oracle;
 
 use contextdb_core::Value;
+use contextdb_core::read_memory::ReadMemoryBudget as _;
 use contextdb_engine::{Database, MaintenancePolicy};
 use std::collections::HashMap;
 use std::process::Command;
@@ -94,7 +95,7 @@ fn a_full_vector_seed_commits_inside_its_declared_working_memory() {
 
 #[derive(Debug)]
 struct CommitReaderProbe {
-    inner: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    inner: contextdb_engine::vector_read_memory::DeclaredReadRoot,
     vector_copy_bytes: std::sync::atomic::AtomicUsize,
 }
 impl contextdb_core::read_memory::ReadMemoryBudget for CommitReaderProbe {
@@ -198,7 +199,7 @@ fn a_seed_projection_names_its_writer_owners_without_debiting_reader_copies() {
     assert_eq!(
         db.execute("SELECT COUNT(*) FROM owners", &empty)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(8)]]
     );
     db.close().unwrap();
@@ -208,7 +209,7 @@ fn a_seed_projection_names_its_writer_owners_without_debiting_reader_copies() {
         reopened
             .execute("SELECT COUNT(*) FROM owners", &empty)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(8)]]
     );
 }
@@ -288,7 +289,7 @@ fn a_seed_commit_has_an_exact_writer_boundary_and_keeps_the_prior_state_on_refus
             assert_eq!(
                 db.execute("SELECT COUNT(*) FROM boundary", &HashMap::with_hasher(seed.clone()))
                     .unwrap()
-                    .rows,
+                    .rows(),
                 vec![vec![Value::Int64(expected)]]
             );
             db.close().unwrap();
@@ -299,7 +300,7 @@ fn a_seed_commit_has_an_exact_writer_boundary_and_keeps_the_prior_state_on_refus
                 reopened
                     .execute("SELECT COUNT(*) FROM boundary", &HashMap::with_hasher(seed.clone()))
                     .unwrap()
-                    .rows,
+                    .rows(),
                 vec![vec![Value::Int64(expected)]]
             );
         });

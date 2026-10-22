@@ -147,11 +147,11 @@ fn assert_work_bounds_every_answer(
         let limits = ReadLimits { work, ..roomy() };
         match run(limits) {
             Ok(result) => {
-                assert_eq!(result.rows.len(), SMALL_RANGE as usize);
+                assert_eq!(result.rows().len(), SMALL_RANGE as usize);
                 assert!(
-                    result.trace.rows_examined <= work,
+                    result.trace().rows_examined <= work,
                     "{route}: answered under WORK {work} having examined {} entries",
-                    result.trace.rows_examined
+                    result.trace().rows_examined
                 );
                 answered_at.get_or_insert(work);
             }
@@ -227,10 +227,10 @@ fn tied_index_probes_check_the_deadline_before_each_entry() {
             Ok(result) => {
                 let looked = looks.load(Ordering::SeqCst) - opened;
                 assert!(
-                    looked >= result.trace.rows_examined,
+                    looked >= result.trace().rows_examined,
                     "answered under a {active_ms} ms deadline having examined {} entries while \
                      consulting the clock {looked} times: some entries never checked it",
-                    result.trace.rows_examined
+                    result.trace().rows_examined
                 );
                 answered = true;
             }
