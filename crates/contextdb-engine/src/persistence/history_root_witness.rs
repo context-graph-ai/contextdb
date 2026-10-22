@@ -45,9 +45,11 @@ fn valid_record(bytes: &[u8]) -> bool {
     match bytes[1] {
         0 => bytes[18..].iter().all(|b| *b == 0),
         1 => {
-            // A nonempty root needs a physical page and a positive entry count.
-            bytes[18..26].iter().any(|b| *b != 0)
-                && u64::from_le_bytes(bytes[42..50].try_into().unwrap()) != 0
+            // Redb encodes region 0, page 0, order 0 as eight zero bytes;
+            // that is a valid physical page, not the absent-root marker.
+            // The existence flag and positive entry count distinguish a
+            // nonempty root; matches() authenticates its complete descriptor.
+            u64::from_le_bytes(bytes[42..50].try_into().unwrap()) != 0
         }
         _ => false,
     }
