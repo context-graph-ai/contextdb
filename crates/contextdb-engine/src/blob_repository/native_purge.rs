@@ -244,7 +244,6 @@ fn apply_with_pages(write:&redb::WriteTransaction,projection:&BlobAuthoritativeP
     let control=write.open_table(CONTROL).map_err(RedbPersistence::storage_error)?;
     if control.get(0).map_err(RedbPersistence::storage_error)?.map(|v|v.value())!=projection.native_control {return Err(invalid());}
     drop(control);
-    let mut any=false;
     loop {
         let frame=window(original.original)?;
         let entry={
@@ -293,7 +292,6 @@ fn apply_with_pages(write:&redb::WriteTransaction,projection:&BlobAuthoritativeP
             let next=table.get(key).map_err(RedbPersistence::storage_error)?.ok_or_else(invalid)?;
             write.open_table(HASH_GENERATIONS_TABLE).map_err(RedbPersistence::storage_error)?
                 .insert(key,next.value()).map_err(RedbPersistence::storage_error)?;
-            any=true;
         } else {
             write.open_table(FAMILIES[family]).map_err(RedbPersistence::storage_error)?.remove(key).map_err(RedbPersistence::storage_error)?;
         }

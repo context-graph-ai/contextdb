@@ -24576,7 +24576,7 @@ impl DurableVectorGenerationLoader {
                 self.accountant.release(loader_reservation);
                 Err(error)
             }
-            Ok((mut graph, mut fresh_tail)) => {
+            Ok((graph, mut fresh_tail)) => {
                 // One admitted adapter follows every independently surviving graph
                 // from this invocation, including the fresh tail and a zero-byte owner.
                 let retained_accountant = match self.accountant.vector_budget() {
@@ -33521,7 +33521,7 @@ impl Database {
     pub(crate) fn open_committed_image(
         parts: crate::persistence::ReadPersistenceImageParts,
         plugin: Arc<dyn DatabasePlugin>,
-        mut accountant: crate::memory_accounting::AccountantHandle,
+        accountant: crate::memory_accounting::AccountantHandle,
         declared_read_memory: crate::vector_read_memory::DeclaredReadRoot,
     ) -> Result<Self> {
         parts.open_context.checkpoint()?;
@@ -45746,7 +45746,7 @@ impl Database {
                 Ok((affected_tables.clone(), frame.into_reservation()))
             }).transpose()?;
             let mut refused_result=None;
-            let mut prepare_attempt=|| -> Result<Option<ReceivedSchemaStage>> {
+            let prepare_attempt=|| -> Result<Option<ReceivedSchemaStage>> {
             if let Some(catalog) = &working_vectors {
                 catalog.activate(&working.vector_store, vector_copy_owner)?;
             }
@@ -110315,7 +110315,7 @@ impl Database {
         // straight to the same-write selection, one marker per window.
         let resident_arrival_count = self.sync_graph_arrivals.read().len();
         frame.array::<(GraphIdentity, DurableGraphArrival)>(resident_arrival_count)?;
-        let mut removed_graph_arrivals: Vec<(GraphIdentity, DurableGraphArrival)> = Vec::with_capacity(resident_arrival_count);
+        let removed_graph_arrivals: Vec<(GraphIdentity, DurableGraphArrival)> = Vec::with_capacity(resident_arrival_count);
         for candidate in selections {
             let mut found = false;
             self.visit_original_discard_selected_versions(&candidate.table, candidate.local_row_id, |row| {

@@ -798,13 +798,13 @@ impl ReadMemoryBudget for NativeDeclaredChild {
         #[cfg(all(test, feature = "test-seams"))]
         crate::database::retained_trace_ownership_tests::ordered_child_release(
             false, native_child_identity(&self.parent, &self.retained, self as *const Self as usize), bytes);
-        let before = self.retained
+        let _before = self.retained
             .fetch_sub(bytes as u64, std::sync::atomic::Ordering::SeqCst);
         let payload_before = self.parent.live_child_payload_bytes.fetch_sub(
             bytes as u64, std::sync::atomic::Ordering::SeqCst);
         assert!(payload_before >= bytes as u64, "reader payload observation underflow");
         #[cfg(any(test, feature = "test-seams"))]
-        self.note_reader_budget_event("", "release", bytes, before - bytes as u64);
+        self.note_reader_budget_event("", "release", bytes, _before - bytes as u64);
         #[cfg(any(test, feature = "test-seams"))]
         let _forward = _capture.forwarding();
         self.parent.release(bytes);

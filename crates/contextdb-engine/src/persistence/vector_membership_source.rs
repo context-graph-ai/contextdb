@@ -3629,7 +3629,7 @@ fn canonical_partition_allocation_bounds(key: &VectorPartitionKey) -> Option<(us
     let mut len = 0usize;
     let mut cap = 0usize;
 
-    let mut simulate_grow = |len: &mut usize, cap: &mut usize, additional: usize| -> Option<()> {
+    let simulate_grow = |len: &mut usize, cap: &mut usize, additional: usize| -> Option<()> {
         let req = len.checked_add(additional)?;
         if req > *cap {
             let doubled = cap.checked_mul(2)?;
