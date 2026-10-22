@@ -7278,6 +7278,7 @@ fn execute_plan_with_working_state(
             tx,
             vector_copy_owner,
             read_memory.clone(),
+            native_trace_refund,
         ),
         PhysicalPlan::Project { input, columns } => {
             let projected_columns = expression_columns(columns.iter().map(|column| &column.expr));
@@ -7959,16 +7960,18 @@ fn execute_materialized_cte(
     tx: Option<TxId>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
 ) -> Result<OwnedQueryResult> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-    execute_plan(
+    execute_plan_with_native_trace_refund(
         db,
         input,
         params,
         tx,
         vector_copy_owner,
         read_memory.clone(),
+        native_trace_refund,
     )
 }
 

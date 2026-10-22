@@ -317,8 +317,8 @@ impl<T> ControlArc<T> {
             0,
             &*invoice as *const ReadCredit as usize,
             ReadShared::<ReadCredit>::layout(),
-            invoice.invoice().original_payer_identity_for_test(),
-            invoice.invoice().bytes(),
+            invoice.credit().original_payer_identity_for_test(),
+            invoice.credit().bytes(),
         );
         Ok(invoice)
     }

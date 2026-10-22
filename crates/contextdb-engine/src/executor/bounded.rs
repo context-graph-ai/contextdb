@@ -671,7 +671,7 @@ impl ReadOpenContext {
 
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_commit_directory_open_funding(&read_memory);
-        RequestContext::new(
+        RequestContext::new_with_native_trace_refund(
             read_memory,
             limits,
             ReadResumption::OneShot,
@@ -770,6 +770,32 @@ impl RequestContext {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn new(
+        reader_budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        limits: ReadLimits,
+        resumption: ReadResumption,
+        clock: Arc<dyn DeadlineClock>,
+        cancellation: OwnerReadCancellation,
+        transaction: Option<TxId>,
+        #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    ) -> std::result::Result<ControlArc<Self>, BoundedExecutionError> {
+        Self::new_with_native_trace_refund(
+            reader_budget,
+            limits,
+            resumption,
+            clock,
+            cancellation,
+            transaction,
+            #[cfg(any(test, feature = "test-seams"))]
+            probe,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "The existing inline native refusal is preserved without allocating an error."
+    )]
+    fn new_with_native_trace_refund(
         reader_budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         limits: ReadLimits,
         resumption: ReadResumption,
@@ -19138,7 +19164,7 @@ pub(crate) fn drain_chosen_plan_with_native_trace_refund(
             .map_err(BoundedExecutionError::from);
     }
     let _release_proofs = StatementProofReuse { db, cache: None };
-    let context = RequestContext::new(
+    let context = RequestContext::new_with_native_trace_refund(
         read_memory.clone(),
         uncapped_ceilings(),
         ReadResumption::OneShot,
@@ -19494,7 +19520,7 @@ pub(super) fn execute_with_native_trace_refund(
     let plugin_clock = Arc::clone(&clock);
     let withdrawn = cancellation.clone();
     let execution = (|| {
-        let context = RequestContext::new(
+        let context = RequestContext::new_with_native_trace_refund(
             read_memory.clone(),
             limits,
             ReadResumption::OneShot,
@@ -20875,7 +20901,7 @@ pub(super) fn open_cursor_with_native_trace_refund(
     let plugin_started_ms = clock.now_ms();
     let withdrawn = cancellation.clone();
     let prepared = (|| {
-        let context = RequestContext::new(
+        let context = RequestContext::new_with_native_trace_refund(
             read_memory.clone(),
             limits,
             ReadResumption::AcrossFetches,
@@ -22378,7 +22404,7 @@ mod cursor_replay_budget_tests {
             work: 2,
             ..ReadLimits::default()
         };
-        let context = RequestContext::new(
+        let context = RequestContext::new_with_native_trace_refund(
             db.declared_reader_memory()
                 .expect("admit the fixture request reader"),
             limits,
@@ -22426,7 +22452,7 @@ mod cursor_replay_budget_tests {
                 cursor_lifetime_ms: lifetime_ms,
                 ..ReadLimits::default()
             };
-            let context = RequestContext::new(
+            let context = RequestContext::new_with_native_trace_refund(
                 db.declared_reader_memory()
                     .expect("admit the fixture request reader"),
                 limits,
