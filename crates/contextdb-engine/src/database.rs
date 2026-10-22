@@ -119867,3 +119867,7 @@ pub(crate) mod ef_search_metadata_contract_tests;
 #[cfg(test)]
 #[path = "database/consolidation_metadata_contract_tests.rs"]
 pub(crate) mod consolidation_metadata_contract_tests;
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "database/selected_membership_proof_tests.rs"]
+mod selected_membership_proof_tests;
