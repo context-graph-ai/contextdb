@@ -1622,10 +1622,23 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
                     "{route} physical request {slot} frees once"
                 );
                 assert_eq!(freed[slot].0, freed[slot].1);
+                let token = count - 1;
+                let payload_group = slot >= 5 && slot < token;
+                let extra = if payload_group {
+                    // These buffers share one prepaid invoice. Already freed
+                    // buffers stay charged until the entire payload retires.
+                    let all_payload = requests[5..token].iter().map(|r| r.1).sum::<usize>();
+                    assert_eq!(all_payload, invoice.prepaid_bytes);
+                    let controls_live = requests[..5].iter().map(|r| r.1).sum::<usize>();
+                    controls_live + invoice.prepaid_bytes + invoice.prepaid_control_bytes
+                        + invoice.additional_bytes + invoice.score_credit_bytes
+                } else {
+                    live[slot] + if slot == token { invoice.additional_bytes } else { 0 }
+                };
                 assert_eq!(
                     freed[slot].0,
-                    controls.baseline as usize + live[slot],
-                    "{route} keeps every actual still-live original invoice through physical free"
+                    controls.baseline as usize + extra,
+                    "{route} keeps each actual original invoice through physical free, including the grouped payload and inline credits"
                 );
             }
             assert_eq!(db.declared_read_memory.charged_bytes(), controls.baseline);
