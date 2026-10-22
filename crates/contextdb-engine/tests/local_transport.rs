@@ -1,3 +1,7 @@
+#[path = "support/wire_fixture_test_support.rs"]
+#[allow(dead_code)] // The shared wire input builders serve both integration targets.
+mod wire_fixture_test_support;
+
 #[path = "owner_cursor_test_support.rs"]
 #[allow(dead_code)] // Shared cursor wire fixtures are consumed by child test modules.
 mod owner_cursor_test_support;

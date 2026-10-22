@@ -1,3 +1,4 @@
+use super::wire_fixture_test_support::{encode_message, encode_payload_frame};
 use contextdb_core::read_contract::{
     CursorExpiryKind, DatabaseIdentity, DeadlineClock, LocalUserIdentity, MetadataItem,
     MetadataPageVocabulary, OwnerLimitExceededDetail, OwnerReadCancellation, OwnerReadLimits,
@@ -470,6 +471,7 @@ impl Harness {
                 self.handshake.clone(),
                 self.client_timeouts,
                 clock,
+                self.database.declared_reader_memory().expect("original reader owner").into(),
             ))
             .expect("connect through the production owner carrier"),
         ));
@@ -510,6 +512,7 @@ impl Harness {
             presented,
             self.client_timeouts,
             clock,
+            self.database.declared_reader_memory().expect("original reader owner").into(),
         ))?;
         block_on(client.request(LocalRequestEnvelope {
             limits: request_limits,
@@ -3992,7 +3995,7 @@ use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
 fn actual_inbound_decoder_refusal_preserves_the_authenticated_stream_and_ordinals() {
     use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
     use contextdb_engine::local_transport::{
-        encode_message, encode_payload_frame, LocalInboundKind, LocalInboundMessage,
+        LocalInboundKind, LocalInboundMessage,
         LocalOutboundMessage, LocalProtocolBoundary, LocalResponseExpectation, UnixLocalCarrier,
     };
 

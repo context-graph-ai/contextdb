@@ -7,12 +7,12 @@
 //! read-contract memory ceiling, and require the channel to refuse them with a
 //! typed transport error rather than allocate first and answer later.
 
+use super::wire_fixture_test_support::{encode_message};
 use contextdb_core::Value;
-use contextdb_core::read_contract::{CursorPage, MetadataPage, ReadLimits};
+use contextdb_core::read_contract::{MetadataPage, ReadLimits};
 use contextdb_engine::local_transport::{
     CursorPageResponse, LocalRequest, LocalRequestEnvelope, LocalResponse, LocalTransportError,
-    MAX_FRAME_BYTES, decode_message_exact, encode_message,
-};
+    MAX_FRAME_BYTES, decode_message_exact, };
 use std::collections::BTreeMap;
 use std::mem::size_of;
 
@@ -266,7 +266,7 @@ fn a_cursor_page_whose_decoded_rows_exceed_the_memory_ceiling_is_refused() {
         ReadLimits::SHIPPED_MEMORY
     );
 
-    let outcome = decode_message_exact::<CursorPage>(&page_bytes);
+    let outcome = contextdb_engine::read_contract::decode_cursor_page(&page_bytes);
     let error = match outcome {
         Ok(_) => panic!(
             "a {page_length} byte cursor page was admitted; it decodes into at least \
@@ -276,7 +276,7 @@ fn a_cursor_page_whose_decoded_rows_exceed_the_memory_ceiling_is_refused() {
         Err(error) => error,
     };
     assert!(
-        refusal_is_typed(&error),
+        matches!(error, contextdb_engine::read_contract::ReadEncodingError::MemoryCeilingExceeded { .. }),
         "an oversized cursor page must be refused with a typed transport error, observed {error:?}"
     );
 }
@@ -320,7 +320,7 @@ fn a_response_frame_carrying_that_cursor_page_is_refused_before_the_page_is_deco
 #[test]
 fn an_ordinary_cursor_page_response_is_still_admitted() {
     let page_bytes = crafted_cursor_page_bytes(100, 8);
-    let page = decode_message_exact::<CursorPage>(&page_bytes)
+    let page = contextdb_engine::read_contract::decode_cursor_page(&page_bytes)
         .expect("an ordinary cursor page stays admissible");
     assert_eq!(page.columns().len(), 8);
     assert_eq!(page.rows().len(), 100);

@@ -2849,7 +2849,11 @@ mod exact_sequence_tests {
                 1536 * 4,
                 "only the latest call's decode is still charged"
             );
-            assert_eq!(declared.retained_bytes_for_test(), before + 1536 * 4);
+            assert_eq!(
+                declared.retained_bytes_for_test(),
+                before + 1536 * 4 + ImageMemory::admitted_control_bytes() as u64,
+                "the latest call retains its exact native control as well as its decoded vector"
+            );
         }
         drop(owner);
         assert_eq!(

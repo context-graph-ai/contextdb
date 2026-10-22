@@ -18,11 +18,12 @@
 //! publish the same bytes, and a payload that really is over the declared
 //! budget still refuses by naming that budget.
 
+use super::wire_fixture_test_support::{encode_cursor_page};
 use contextdb_core::read_contract::{
     OwnerReadLimits, ReadFailureKind, ReadFailureLimit, ReadLimits, ReadRoute,
 };
 use contextdb_core::{Error, Value};
-use contextdb_engine::read_contract::encode_cursor_page;
+
 use contextdb_engine::{
     Database, DatabaseOpenOptions, MetadataBody, MetadataRequest, OwnerReadConfig, ReadSession,
     ReadSessionOptions,
@@ -206,9 +207,6 @@ fn a_cursor_page_inside_the_declared_page_budget_is_served_over_the_owner_route(
     let directory = tempfile::TempDir::new().expect("task-scoped byte-budget directory");
     let owner_runtime = secure_runtime_root(directory.path(), "owner-runtime");
     let (database, path) = served_store(directory.path(), owner_runtime.clone());
-    let page_copy_read_memory = database
-        .declared_reader_memory()
-        .expect("admit the page comparison reader");
 
     let over_the_channel = {
         let session = owner_session(&owner_runtime, &path);
@@ -216,8 +214,7 @@ fn a_cursor_page_inside_the_declared_page_budget_is_served_over_the_owner_route(
         cursor.map(|cursor| {
             cursor
                 .first_page()
-                .try_clone(page_copy_read_memory.clone())
-                .expect("copy the page under its declared reader limit")
+                .clone()
         })
     };
 
@@ -229,8 +226,7 @@ fn a_cursor_page_inside_the_declared_page_budget_is_served_over_the_owner_route(
             .open_cursor(SELECT_WIDE, &HashMap::new())
             .expect("the committed file serves the same page")
             .first_page()
-            .try_clone(page_copy_read_memory.clone())
-            .expect("copy the page under its declared reader limit")
+            .clone()
     };
 
     let file_bytes = encode_cursor_page(&from_the_file).expect("encode the file route's page");

@@ -203,6 +203,131 @@ mod native {
             let _ = self.finish();
         }
     }
+
+    #[cfg(all(test, feature = "test-seams"))]
+    mod independent_tests {
+        use super::*;
+        use crate::memory_accounting::MemoryAccountant;
+        use crate::persistence::content_identity::proof_allocation_oracle_tests as physical;
+        use contextdb_core::read_memory::{NativeRefusal, ReadMemoryBudget};
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+
+        static PHASE: AtomicUsize = AtomicUsize::new(0);
+        static STACK_PAGE: AtomicUsize = AtomicUsize::new(0);
+        static ENTERED: AtomicUsize = AtomicUsize::new(0);
+        fn page_bytes() -> usize { unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize } }
+        fn worker_body() {
+            let marker = 0_u8;
+            let page = page_bytes();
+            STACK_PAGE.store((&marker as *const u8 as usize) / page * page, Ordering::Release);
+            ENTERED.fetch_add(1, Ordering::SeqCst);
+            PHASE.store(1, Ordering::Release);
+            while PHASE.load(Ordering::Acquire) == 1 { std::hint::spin_loop(); }
+            if PHASE.load(Ordering::Acquire) == 3 { panic!("application test callback unwinds"); }
+            std::hint::black_box(marker);
+        }
+        fn threads() -> usize { std::fs::read_dir("/proc/self/task").unwrap().count() }
+        fn unmapped(address: usize) -> bool {
+            let mut residency = 0_u8;
+            let rc = unsafe { libc::mincore(address as *mut libc::c_void, page_bytes(), &mut residency) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM)
+        }
+        #[derive(Debug)]
+        struct Payer {
+            actual: Arc<MemoryAccountant>,
+            checks: AtomicUsize,
+            early: AtomicBool,
+        }
+        impl ReadMemoryBudget for Payer {
+            fn try_reserve(&self, bytes: usize, subsystem: &'static str, operation: &'static str, hint: &'static str) -> Result<()> {
+                ReadMemoryBudget::try_reserve(&*self.actual, bytes, subsystem, operation, hint)
+            }
+            fn try_reserve_native(&self, bytes: usize, subsystem: &'static str, operation: &'static str, hint: &'static str) -> std::result::Result<(), NativeRefusal> {
+                ReadMemoryBudget::try_reserve_native(&*self.actual, bytes, subsystem, operation, hint)
+            }
+            fn release(&self, bytes: usize) {
+                if bytes == STACK_BYTES + page_bytes() {
+                    let address = STACK_PAGE.load(Ordering::Acquire);
+                    if address != 0 {
+                        self.checks.fetch_add(1, Ordering::SeqCst);
+                        self.early.fetch_or(!unmapped(address), Ordering::SeqCst);
+                    }
+                }
+                ReadMemoryBudget::release(&*self.actual, bytes);
+            }
+        }
+        struct ReleaseBody;
+        impl Drop for ReleaseBody { fn drop(&mut self) { PHASE.store(2, Ordering::Release); } }
+        struct FreeWatch;
+        impl Drop for FreeWatch { fn drop(&mut self) { physical::disarm_source_free_watch(); } }
+
+        // Promise: startup refusal leaves no worker, and joined/dropped/unwound
+        // workers refund their original control/stack only after physical free.
+        // No prior mapped-worker test exists. Decisive mutants: admit the stack
+        // after mmap, refund before munmap, or forget Stack after pthread_join.
+        #[test]
+        #[serial_test::serial]
+        fn fixed_worker_startup_and_physical_release_rows() {
+            let control = ReadShared::<Body<fn()>>::layout();
+            let stack = STACK_BYTES + page_bytes();
+            let before = threads();
+            for limit in [control.size() - 1, control.size() + stack - 1] {
+                ENTERED.store(0, Ordering::SeqCst);
+                let actual = Arc::new(MemoryAccountant::with_budget(limit));
+                let error = match OwnedWorker::spawn(actual.clone().into(), worker_body as fn()) {
+                    Err(error) => error,
+                    Ok(worker) => {
+                        while PHASE.load(Ordering::Acquire) != 1 { std::thread::yield_now(); }
+                        PHASE.store(2, Ordering::Release);
+                        drop(worker);
+                        panic!("the original under-limit owner must refuse worker startup");
+                    }
+                };
+                let Error::MemoryBudgetExceeded { operation, requested_bytes, budget_limit_bytes, .. } = error else {
+                    panic!("startup denial must preserve the original memory refusal: {error:?}");
+                };
+                let (name, bytes) = if limit < control.size() { ("worker_control", control.size()) } else { ("worker_stack", stack) };
+                assert_eq!(operation.to_string(), name);
+                assert_eq!(requested_bytes, bytes);
+                assert_eq!(budget_limit_bytes, limit);
+                assert_eq!(actual.usage().used, 0);
+                assert_eq!(ENTERED.load(Ordering::SeqCst), 0);
+                assert_eq!(threads(), before);
+            }
+            for ending in ["join", "drop", "unwind"] {
+                STACK_PAGE.store(0, Ordering::SeqCst);
+                ENTERED.store(0, Ordering::SeqCst);
+                PHASE.store(0, Ordering::SeqCst);
+                let payer = Arc::new(Payer { actual: Arc::new(MemoryAccountant::with_budget(control.size() + stack)), checks: AtomicUsize::new(0), early: AtomicBool::new(false) });
+                let counter = crate::memory_accounting::AccountantHandle::from_host(payer.actual.clone()).used_counter_for_observation();
+                let (worker, requests, count) = physical::source_requests_for_test(counter, || OwnedWorker::spawn(payer.clone().into(), worker_body as fn()));
+                let worker = worker.unwrap();
+                while PHASE.load(Ordering::Acquire) != 1 { std::thread::yield_now(); }
+                let _release = ReleaseBody;
+                assert_eq!(threads(), before + 1);
+                assert_eq!(payer.actual.usage().used, control.size() + stack);
+                assert!(!unmapped(STACK_PAGE.load(Ordering::Acquire)));
+                let request = requests[..count].iter().copied().find(|(pointer, bytes, align)|
+                    *bytes == control.size() && *align == control.align()
+                        && *pointer <= worker.body as usize && (worker.body as usize) < *pointer + *bytes)
+                    .expect("actual original control allocation containing the worker body");
+                physical::watch_source_free_for_test(&[request], counter);
+                let watch = FreeWatch;
+                PHASE.store(if ending == "unwind" { 3 } else { 2 }, Ordering::Release);
+                if ending == "drop" { drop(worker); } else { assert_eq!(worker.join().is_err(), ending == "unwind"); }
+                let free = physical::source_free_for_test(1)[0];
+                assert_eq!(free.2, 1, "original body allocation physically freed once");
+                assert_eq!(free.0, control.size() + stack, "original body and stack invoices at free entry");
+                assert_eq!(free.1, free.0, "body invoice remains paid through actual System.dealloc");
+                assert_eq!(payer.checks.load(Ordering::SeqCst), 1);
+                assert!(!payer.early.load(Ordering::SeqCst), "stack invoice refunded while its actual page was still mapped");
+                assert!(unmapped(STACK_PAGE.load(Ordering::Acquire)));
+                assert_eq!(payer.actual.usage().used, 0);
+                assert_eq!(threads(), before);
+                drop(watch);
+            }
+        }
+    }
 }
 #[cfg(target_os = "linux")]
 pub(crate) use native::OwnedWorker;

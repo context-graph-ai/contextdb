@@ -838,6 +838,7 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
         handshake,
         timeouts,
         Arc::clone(&clock),
+        database.declared_reader_memory().expect("original reader owner").into(),
     ))
     .expect("connect through the observed owner carrier");
     let limits = one_row_page_reader_options().limits;
@@ -1267,6 +1268,7 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
             response_ms: 60_000,
         },
         clock,
+        database.declared_reader_memory().expect("original reader owner").into(),
     ))
     .unwrap();
     let limits = one_row_page_reader_options().limits;

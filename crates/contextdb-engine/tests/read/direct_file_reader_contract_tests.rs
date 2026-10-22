@@ -2350,25 +2350,28 @@ impl<'ast> Visit<'ast> for MacroCollector {
 }
 
 fn assert_no_use_alias_or_glob(tree: &syn::UseTree, source: &Path) {
-    match tree {
-        syn::UseTree::Path(path) => assert_no_use_alias_or_glob(&path.tree, source),
-        syn::UseTree::Group(group) => {
-            for item in &group.items {
-                assert_no_use_alias_or_glob(item, source);
+    fn inspect(tree: &syn::UseTree, source: &Path, prefix: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                inspect(&path.tree, source, prefix);
+                prefix.pop();
             }
+            syn::UseTree::Group(group) => {
+                for item in &group.items { inspect(item, source, prefix); }
+            }
+            syn::UseTree::Name(_) => {}
+            syn::UseTree::Rename(rename) => {
+                assert!(prefix == &["crate", "owned_cursor_page"]
+                    && rename.ident == "OwnedCursorPage" && rename.rename == "CursorPage",
+                    "{} aliases dependency {} as {}; direct dependencies must remain AST-visible",
+                    source.display(), rename.ident, rename.rename);
+            }
+            syn::UseTree::Glob(_) => panic!(
+                "{} uses a glob import; the direct dependency allowlist requires exact names", source.display()),
         }
-        syn::UseTree::Name(_) => {}
-        syn::UseTree::Rename(rename) => panic!(
-            "{} aliases dependency {} as {}; direct dependencies must remain AST-visible",
-            source.display(),
-            rename.ident,
-            rename.rename
-        ),
-        syn::UseTree::Glob(_) => panic!(
-            "{} uses a glob import; the direct dependency allowlist requires exact names",
-            source.display()
-        ),
     }
+    inspect(tree, source, &mut Vec::new());
 }
 
 fn item_identity(item: &Item) -> Option<String> {

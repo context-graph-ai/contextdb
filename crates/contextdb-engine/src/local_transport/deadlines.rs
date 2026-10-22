@@ -1473,3 +1473,74 @@ impl Drop for OwnedClockDriver {
         self.clock.owned_driver_wake.lock().unwrap_or_else(|p| p.into_inner()).take();
     }
 }
+
+#[cfg(all(test, feature = "test-seams", target_os = "linux"))]
+mod independent_owned_driver_tests {
+    use super::*;
+    use crate::memory_accounting::MemoryAccountant;
+    use std::sync::Arc;
+
+    fn threads() -> usize { std::fs::read_dir("/proc/self/task").unwrap().count() }
+    fn linked(clock: &MonotonicDeadlineClock) -> (usize, usize) {
+        let list = clock.owned_waits.lock().unwrap();
+        let mut count = 0;
+        let mut node = list.head;
+        unsafe {
+            while !node.is_null() {
+                count += 1;
+                assert!((*(*node).links.get()).linked);
+                node = (*(*node).links.get()).next;
+            }
+        }
+        (list.drivers, count)
+    }
+    // Promise: one real clock worker owns 1/2/4 pending waits after actual
+    // foreground driver completion and unwind. Existing integration tests
+    // cannot access this private driver's concrete pending list or lifetime.
+    // Mutant: omit permanent native_driver_started in start_owned_driver;
+    // wait_owned then takes the old per-wait std-thread path.
+    #[test]
+    #[serial_test::serial]
+    fn one_clock_worker_keeps_pending_waits_after_caller_departure_rows() {
+        let before = threads();
+        let actual = Arc::new(MemoryAccountant::with_budget(contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY as usize));
+        let owner: contextdb_core::read_memory::ReadMemoryOwner = actual.clone().into();
+        let clock = Arc::new(MonotonicDeadlineClock::new());
+        let worker = clock.start_owned_driver(owner.clone()).unwrap();
+        let dynamic: Arc<dyn DeadlineClock> = clock.clone();
+        let timer_before = timer_threads_started_for_test();
+        for size in [1, 2, 4] {
+            let mut waits = Vec::new();
+            for _ in 0..size {
+                let mut wait = clock.try_owned_wait(u64::MAX, &owner).unwrap().unwrap();
+                assert!(Pin::new(&mut wait).poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                waits.push(wait);
+            }
+            assert_eq!(linked(&clock), (1, size));
+            assert_eq!(threads(), before + 1);
+            assert_eq!(timer_threads_started_for_test(), timer_before);
+            drive_local(std::future::ready(Ok::<(), crate::owner_read::OwnerReadScaffoldError>(())), &dynamic, owner.clone()).unwrap();
+            assert_eq!(linked(&clock), (1, size), "normal departure leaves every wait with the fixed worker");
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pending = std::future::poll_fn(|_| -> Poll<crate::owner_read::OwnerReadScaffoldResult<()>> {
+                    panic!("application driver callback unwinds")
+                });
+                let _ = drive_local(pending, &dynamic, owner.clone());
+            }));
+            assert!(unwind.is_err());
+            assert_eq!(linked(&clock), (1, size), "unwind does not orphan a registered wait");
+            assert_eq!(threads(), before + 1);
+            assert_eq!(timer_threads_started_for_test(), timer_before);
+            drop(waits);
+            assert_eq!(linked(&clock), (1, 0));
+        }
+        drop(worker);
+        assert_eq!(linked(&clock), (0, 0));
+        assert_eq!(actual.usage().used, 0);
+        for _ in 0..100_000 {
+            if threads() == before { break; }
+            std::thread::yield_now();
+        }
+        assert_eq!(threads(), before);
+    }
+}
