@@ -33070,6 +33070,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
         after_commit: impl FnOnce(),
     ) -> Result<()> {
         let _decode_scope = self.writer_decode_scope()?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let phase = crate::read_image_memory::MaintenancePhase::enter("policy_metadata");
         self.prepare_proof_owner()?;
         let mut schema = match original {
             Some(original) => self.prepare_writer_policy_schema_change(original, name, meta)?,
@@ -33158,7 +33160,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
             {
                 #[cfg(any(test, feature = "test-seams"))]
                 graph_observation_checkpoint(10)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                phase.record("durable_commit_enter", 0, None);
                 let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    phase.record("durable_commit_exit", 0, None);
+                }
                 if !rebuild_indexes && graph_commit_result.is_ok() {
                     self.complete_writer_schema_change(schema.take());
                     after_commit.take().expect("prepared metadata publication")();

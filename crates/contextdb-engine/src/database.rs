@@ -36528,6 +36528,8 @@ impl Database {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _maintenance_phase = crate::read_image_memory::MaintenancePhase::enter("execute");
         #[cfg(test)]
         let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
             "Database::execute");
@@ -72830,6 +72832,9 @@ impl Database {
         params: &HashMap<String, Value>,
         snapshot: SnapshotId,
     ) -> Result<QueryResult> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _maintenance_phase =
+            crate::read_image_memory::MaintenancePhase::enter("execute_at_snapshot");
         let child = self.ordinary_read_child()?;
         crate::executor::bounded::with_native_read_memory(child, |read_memory| {
             QueryResult::publish_with(read_memory.clone(), || {
@@ -77200,6 +77205,8 @@ impl Database {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn run_maintenance_cycle(&self) -> Result<MaintenanceReport> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _maintenance_phase = crate::read_image_memory::MaintenancePhase::enter("maintenance");
         crate::memory_accounting::observe_inherited_process_ceiling();
         let read_memory = self.finalization.accountant.read_budget()?;
         self.run_maintenance_cycle_with_read_memory(read_memory)

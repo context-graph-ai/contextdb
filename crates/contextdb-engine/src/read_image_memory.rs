@@ -3793,7 +3793,7 @@ impl MaintenancePhase {
             elapsed_ns: self.start.elapsed().as_nanos(),
             rows,
             payer: image.map_or(0, |i| i.accountant.used_counter_for_observation()),
-            used: image.map_or(0, |i| i.accountant.usage().used),
+            used: image.map_or(0, |i| i.accountant.used_bytes_for_phase_observation()),
             held: image.map_or(0, ImageMemory::held),
             control: image.map_or(0, |i| {
                 i.control_bytes & !ADMITTED_TAG & !crate::memory_accounting::OPEN_RESIDUE_TAG
@@ -3808,12 +3808,22 @@ impl MaintenancePhase {
         records.0[slot] = Some(record);
         records.1 += 1;
         drop(records);
-        // Bounded formatting to the captured descriptor preserves the last
-        // phase even when the unchanged timeout terminates the process.
+        // The canonical isolated helper retains child stderr until exit;
+        // write to an explicit append file so a timeout preserves lastphase.
+        // A fixed stack record is written after releasing the record mutex.
         use std::io::Write;
-        let stderr = std::io::stderr();
-        let mut output = stderr.lock();
-        let _ = writeln!(
+        static FILE: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+        let file = FILE.get_or_init(|| {
+            let path = std::env::var_os("CONTEXTDB_MAINTENANCE_PHASE_FILE")?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        });
+        let mut buffer = [0u8; 1024];
+        let mut output = std::io::Cursor::new(buffer.as_mut_slice());
+        let formatted = writeln!(
             output,
             "maintenance_phase pid={} scope={} parent={} operation={} phase={} elapsed_ns={} rows={} payer={} used={} held={} control={} subsystem={} admission={} open_residue={}",
             record.pid,
@@ -3831,6 +3841,15 @@ impl MaintenancePhase {
             record.admission,
             record.open_residue
         );
+        let len = output.position() as usize;
+        drop(output);
+        if formatted.is_ok() {
+            if let Some(mut file) = file.as_ref() {
+                let _ = file.write_all(&buffer[..len]);
+            } else {
+                let _ = std::io::stderr().write_all(&buffer[..len]);
+            }
+        }
     }
 }
 #[cfg(any(test, feature = "test-seams"))]

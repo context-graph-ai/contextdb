@@ -352,6 +352,10 @@ const _: () = assert!(std::mem::align_of::<MemoryAccountant>() >= 8);
 pub(crate) struct AccountantHandle(NonNull<MemoryAccountant>);
 impl AccountantHandle {
     #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn used_bytes_for_phase_observation(&self) -> usize {
+        self.used.load(Ordering::SeqCst)
+    }
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn used_counter_for_observation(&self) -> usize {
         self.used.as_ptr() as usize
     }
