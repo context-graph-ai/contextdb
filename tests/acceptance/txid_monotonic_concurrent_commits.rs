@@ -65,7 +65,7 @@ fn t18_01_concurrent_committers_stamp_distinct_txids() {
     let mut stamped: Vec<TxId> = db
         .execute("SELECT recorded_at FROM evidence_log", &empty())
         .unwrap()
-        .rows
+        .rows()
         .into_iter()
         .filter_map(|row| match &row[0] {
             Value::TxId(t) => Some(*t),
@@ -122,7 +122,7 @@ fn t18_02_pagination_cursor_after_concurrent_commits_misses_no_rows() {
                 .collect(),
         )
         .unwrap()
-        .rows
+        .rows()
         .into_iter()
         .filter_map(|row| match &row[0] {
             Value::Uuid(u) => Some(*u),
@@ -187,7 +187,7 @@ fn t18_03_auto_stamped_txid_order_matches_commit_lsn_order() {
     let mut stamped: Vec<TxId> = db
         .execute("SELECT recorded_at FROM audit_log", &empty())
         .unwrap()
-        .rows
+        .rows()
         .into_iter()
         .filter_map(|row| match &row[0] {
             Value::TxId(t) => Some(*t),
@@ -296,7 +296,7 @@ fn t18_05_cron_callback_stamped_txid_matches_commit_event_lsn_resolution() {
     let stamped: Vec<TxId> = db
         .execute("SELECT recorded_at FROM cron_audit", &empty())
         .unwrap()
-        .rows
+        .rows()
         .into_iter()
         .filter_map(|row| match &row[0] {
             Value::TxId(t) => Some(*t),
@@ -353,10 +353,10 @@ fn t18_06_commit_time_upsert_rewrites_txid_post_image_to_canonical() {
         .expect("deferred UPSERT commit event");
     let expected = TxId(db.snapshot_at(update_event.lsn).0);
 
-    let rows = db
+    let rows_answer = db
         .execute("SELECT recorded_at FROM audit_log", &empty())
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows, vec![vec![Value::TxId(expected)]]);
     assert_ne!(
         expected, deferred_update_tx,
@@ -416,13 +416,13 @@ fn t18_07_commit_time_rewrites_nullable_txid_update_to_canonical() {
         .expect("deferred update commit event");
     let expected = TxId(db.snapshot_at(update_event.lsn).0);
 
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT closed_at FROM lifecycle WHERE id = $id",
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows, vec![vec![Value::TxId(expected)]]);
     assert_ne!(
         expected, deferred_update_tx,

@@ -303,7 +303,7 @@ fn hnsw_baseline_failure(
     };
     if warm
         .as_ref()
-        .map(|hits| hits.rows.is_empty())
+        .map(|hits| hits.rows().is_empty())
         .unwrap_or(true)
         || &actual != expected
     {
@@ -317,7 +317,7 @@ fn hnsw_baseline_failure(
         return Some(format!(
             "{label} raw HNSW baseline changed for {index:?}; warm_empty={}, expected={expected:?}, actual={actual:?}, raw_mismatches_sample={raw_mismatches:?}",
             warm.as_ref()
-                .map(|hits| hits.rows.is_empty())
+                .map(|hits| hits.rows().is_empty())
                 .unwrap_or(true)
         ));
     }
@@ -452,7 +452,7 @@ fn warm_hnsw_fixture(
         )
         .unwrap();
     assert!(
-        !warm.rows.is_empty(),
+        !warm.rows().is_empty(),
         "{label} HNSW warmup query must return fixture rows"
     );
     let vector_fixture_reader_3 = db
@@ -2945,7 +2945,7 @@ fn assert_sequential_vector_source_unit_credit() {
                         &empty()
                     )
                     .unwrap()
-                    .rows,
+                    .rows(),
                 expected,
                 "schema replay preserves the exact live row and vector through reopen"
             )
@@ -5909,12 +5909,14 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             host_insert_sql(),
             &insert_host_params(uuid(24), "conditional"),
         );
-        let rows = db
+        let counter_result = db
             .execute(
                 "SELECT value FROM cascade_counters WHERE id = $id",
                 &HashMap::from([("id".into(), Value::Uuid(counter_id))]),
-            )
-            .map(|result| result.rows)
+            );
+        let rows = counter_result
+            .as_ref()
+            .map(|result| result.rows())
             .unwrap_or_default();
         if result.is_err() || rows != vec![vec![Value::Int64(1)]] {
             failures.push(format!(

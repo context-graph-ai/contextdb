@@ -57,12 +57,12 @@ fn insert_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str) {
 
 fn uuid_column_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<Uuid> {
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == column || c.rsplit('.').next() == Some(column))
-        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns));
+        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns()));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[idx] {
             Value::Uuid(id) => *id,
@@ -160,8 +160,8 @@ fn ga15_context_scoped_forward_probe_reports_visible_degree_only() {
             "ctx-b target {leaked} leaked into ctx-a-scoped graph probe"
         );
     }
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(visible_examined, 4);
     match hidden_start_result {
         Err(Error::ContextScopeViolation { requested, allowed }) => {
@@ -192,10 +192,10 @@ fn ga20_file_backed_reopen_preserves_forward_probe_trace_and_accounting() {
 
     assert_eq!(uuid_column_set(&before, "t"), targets);
     assert_eq!(uuid_column_set(&after, "t"), targets);
-    assert_eq!(before.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(after.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(before.trace.index_used.as_deref(), Some("forward_adj"));
-    assert_eq!(after.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(before.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(after.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(before.trace().index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(after.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(before_examined, 5);
     assert_eq!(after_examined, 5);
 }

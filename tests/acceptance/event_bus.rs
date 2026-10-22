@@ -927,7 +927,7 @@ fn t5_11_route_scoped_to_context_excludes_other_contexts() {
         )
         .unwrap();
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![
             Value::Uuid(future_ctx_a),
             Value::Uuid(ctx_a),
@@ -941,7 +941,7 @@ fn t5_11_route_scoped_to_context_excludes_other_contexts() {
         let result = admin
             .execute("SELECT id FROM invs WHERE id = $id", &p)
             .unwrap();
-        assert_eq!(result.rows.len(), 0, "denied scoped write must not persist");
+        assert_eq!(result.rows().len(), 0, "denied scoped write must not persist");
     }
 
     let live_admin_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1017,7 +1017,7 @@ fn t5_11_route_scoped_to_context_excludes_other_contexts() {
             admin
                 .execute("SELECT id FROM invs WHERE id = $id", &p)
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             0,
             "disallowed source rows are deleted before unscoped replay; audit delivery must come from queue"
@@ -1736,7 +1736,7 @@ fn t5_24_failed_sync_event_bus_ddl_rolls_back_rows_in_same_changeset() {
     );
     let rows = db.execute("SELECT * FROM existing", &empty()).unwrap();
     assert_eq!(
-        rows.rows.len(),
+        rows.rows().len(),
         0,
         "rows in the same incoming changeset must not commit ahead of failed EventBus DDL"
     );

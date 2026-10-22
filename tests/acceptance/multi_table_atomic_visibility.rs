@@ -1058,9 +1058,9 @@ fn t21_10_snapshot_at_lsn_survives_reopen_after_later_mutations() {
             snap,
         )
         .unwrap();
-    assert_eq!(indexed_historical.trace.physical_plan, "IndexScan");
+    assert_eq!(indexed_historical.trace().physical_plan, "IndexScan");
     assert_eq!(
-        indexed_historical.rows,
+        indexed_historical.rows(),
         vec![vec![
             Value::Text("event-target".to_string()),
             Value::Vector(vec![0.0, 1.0, 0.0])
@@ -1275,8 +1275,8 @@ fn t21_12_missing_commit_directory_refuses_without_repair() {
     };
     assert!(!is_directory_refusal(
         &contextdb_core::Error::StoreCorrupted {
-            path: "rel_items".to_owned(),
-            reason: "commit directory differs from its committed root".to_owned(),
+            path: "rel_items".to_owned().into(),
+            reason: "commit directory differs from its committed root".to_owned().into(),
         }
     ));
     for _ in 0..2 {
@@ -1597,7 +1597,7 @@ fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
             healthy.snapshot_at(before_lsn),
         )
         .unwrap();
-    assert_eq!(before_lookup.rows, vec![vec![Value::Text("before".into())]]);
+    assert_eq!(before_lookup.rows(), vec![vec![Value::Text("before".into())]]);
     let after_lookup = healthy
         .execute_at_snapshot(
             "SELECT label FROM items WHERE id = $id",
@@ -1605,7 +1605,7 @@ fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
             healthy.snapshot_at(after_lsn),
         )
         .unwrap();
-    assert_eq!(after_lookup.rows, vec![vec![Value::Text("after".into())]]);
+    assert_eq!(after_lookup.rows(), vec![vec![Value::Text("after".into())]]);
     assert_eq!(
         healthy
             .execute(
@@ -1613,7 +1613,7 @@ fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
                 &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
             )
             .unwrap()
-            .rows_affected,
+            .rows_affected(),
         1,
         "healthy-store update must target the current live row version"
     );
@@ -1624,7 +1624,7 @@ fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
                 &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("final".into())]],
         "healthy-store point read must see the updated live version"
     );
@@ -1646,7 +1646,7 @@ fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
                 &HashMap::from([("id".to_string(), Value::Uuid(versioned_id))]),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("final".into())]],
         "the healthy-store update must remain durable after a second reopen"
     );

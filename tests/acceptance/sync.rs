@@ -389,7 +389,7 @@ INSERT INTO everything (id, note, count, reading, enabled, embedding) VALUES ('0
         let result = db
             .execute("SELECT * FROM everything", &empty_params())
             .expect("select from everything");
-        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows().len(), 1);
     }
 );
 
@@ -1185,23 +1185,25 @@ async fn f11_push_during_endpoint_outage_gives_a_clear_error() {
 async fn sync_e2e_value_txid_round_trip() {
     use contextdb_core::{TxId, Value};
     use contextdb_engine::Database;
-    use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
+    use contextdb_server::{SyncClient, SyncServer, peer_dial_spec};
+    use contextdb_server::transport::iroh::IrohServer;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let fabric = InProcessBroker::new();
+    let identities = TempDir::new().expect("sync identity directory");
+    let endpoint = IrohServer::bind(&format!(
+        "iroh:?identity={}",
+        identities.path().join("hub.key").display(),
+    ))
+    .await
+    .expect("bind the public authenticated sync transport");
+    let ticket = endpoint.ticket();
 
     // Three databases: edge-A, server-S, edge-B.
     let edge_a_db = Arc::new(Database::open_memory());
     let server_db = Arc::new(Database::open_memory());
     let edge_b_db = Arc::new(Database::open_memory());
-    let hub_identity = Arc::new(FabricIdentity::generate());
-    let edge_a_identity = Arc::new(FabricIdentity::generate());
-    let edge_b_identity = Arc::new(FabricIdentity::generate());
-    let hub_node_id = hub_identity.node_id();
-    let edge_a_node_id = edge_a_identity.node_id();
-    let edge_b_node_id = edge_b_identity.node_id();
 
     // The hub authors the schema once. Both edges pull that authenticated schema
     // generation before either edge writes rows, so the fixture does not create
@@ -1216,12 +1218,10 @@ async fn sync_e2e_value_txid_round_trip() {
 
     // Start the authenticated sync server for tenant "txid-e2e".
     let server = Arc::new(
-        SyncServer::with_authenticated_transport_and_identity_for_test(
+        SyncServer::new(
             server_db.clone(),
-            fabric.server_as(&hub_node_id),
+            &endpoint,
             contextdb_core::TenantId::from("txid-e2e"),
-            hub_node_id,
-            hub_identity,
         )
         .expect("construct the authenticated sync endpoint"),
     );
@@ -1229,28 +1229,17 @@ async fn sync_e2e_value_txid_round_trip() {
     let server_handle = server.clone();
     let shutdown_handle = shutdown.clone();
     let task = tokio::spawn(async move { server_handle.run_until(shutdown_handle).await });
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        fabric.wait_for_registered_route_for_test(&contextdb_server::subjects::status_subject(
-            "txid-e2e",
-        )),
-    )
-    .await
-    .expect("sync server must register its status route");
-
     // Edge clients share the same authenticated tenant route as the server.
-    let edge_a = SyncClient::with_authenticated_transport_and_identity_for_test(
+    let edge_a = SyncClient::new(
         edge_a_db.clone(),
-        fabric.client_as(&edge_a_node_id),
+        &peer_dial_spec(&ticket, &identities.path().join("edge-a.key")),
         contextdb_core::TenantId::from("txid-e2e"),
-        edge_a_identity,
     )
     .expect("construct the authenticated sync endpoint");
-    let edge_b = SyncClient::with_authenticated_transport_and_identity_for_test(
+    let edge_b = SyncClient::new(
         edge_b_db.clone(),
-        fabric.client_as(&edge_b_node_id),
+        &peer_dial_spec(&ticket, &identities.path().join("edge-b.key")),
         contextdb_core::TenantId::from("txid-e2e"),
-        edge_b_identity,
     )
     .expect("construct the authenticated sync endpoint");
     edge_a
@@ -1296,13 +1285,13 @@ async fn sync_e2e_value_txid_round_trip() {
         .execute("SELECT x FROM t WHERE pk = $pk", &select_params)
         .expect("bound select must succeed");
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "edge_b must have exactly 1 row for pk; got {}",
-        result.rows.len()
+        result.rows().len()
     );
     assert_eq!(
-        result.rows[0][0],
+        result.rows()[0][0],
         Value::TxId(tx_id_used),
         "edge_b.x must equal Value::TxId({:?}) bit-identical to sender",
         tx_id_used
@@ -1320,6 +1309,7 @@ async fn sync_e2e_value_txid_round_trip() {
     drop(edge_b);
     shutdown.store(true, Ordering::SeqCst);
     task.await.expect("sync server task");
+    endpoint.close().await;
 }
 
 // Named vector index tests: naming, isolation, and lifecycle coverage.

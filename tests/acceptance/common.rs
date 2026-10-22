@@ -475,14 +475,14 @@ pub(crate) fn query_count(db: &Database, sql: &str) -> i64 {
 }
 
 pub(crate) fn extract_i64(result: &QueryResult, row: usize, col: usize) -> i64 {
-    match &result.rows[row][col] {
+    match &result.rows()[row][col] {
         Value::Int64(value) => value.to_owned(),
         other => panic!("expected integer cell, got {other:?}"),
     }
 }
 
 pub(crate) fn extract_f64(result: &QueryResult, row: usize, col: usize) -> f64 {
-    match &result.rows[row][col] {
+    match &result.rows()[row][col] {
         Value::Float64(value) => value.to_owned(),
         other => panic!("expected float cell, got {other:?}"),
     }

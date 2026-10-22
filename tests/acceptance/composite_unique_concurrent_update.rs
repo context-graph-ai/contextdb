@@ -74,7 +74,7 @@ fn t24_01_concurrent_updates_on_composite_unique_protected_row_keep_one_visible(
         }
     });
 
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT permission FROM acl WHERE principal = $principal AND context_id = $context_id",
             &[
@@ -84,8 +84,8 @@ fn t24_01_concurrent_updates_on_composite_unique_protected_row_keep_one_visible(
             .into_iter()
             .collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows.len(), 1, "exactly one visible row per composite key");
 
     // Stable-read assertion: re-reading the row must return the same value
@@ -93,7 +93,7 @@ fn t24_01_concurrent_updates_on_composite_unique_protected_row_keep_one_visible(
     // alternately visible would break this.
     let mut seen = Vec::new();
     for _ in 0..3 {
-        let probe = db
+        let probe_answer = db
             .execute(
                 "SELECT permission FROM acl WHERE principal = $principal AND context_id = $context_id",
                 &[
@@ -103,8 +103,8 @@ fn t24_01_concurrent_updates_on_composite_unique_protected_row_keep_one_visible(
                 .into_iter()
                 .collect(),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let probe = probe_answer.rows();
         assert_eq!(probe.len(), 1);
         seen.push(probe[0][0].clone());
     }
@@ -145,15 +145,15 @@ fn t24_02_concurrent_updates_yield_one_final_value() {
         }
     });
 
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT permission FROM acl WHERE id = $id",
             &[("id".to_string(), Value::Uuid(row_id))]
                 .into_iter()
                 .collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows.len(), 1);
     match &rows[0][0] {
         Value::Text(s) => assert!(s == "write" || s == "admin"),
@@ -201,7 +201,7 @@ fn t24_03_concurrent_updates_moving_composite_key_columns_one_winner() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(staged.rows_affected, 1);
+        assert_eq!(staged.rows_affected(), 1);
     }
     db.commit(alice_tx)
         .expect("first composite-key move commits");
@@ -215,15 +215,15 @@ fn t24_03_concurrent_updates_moving_composite_key_columns_one_winner() {
         "second composite-key move must report UniqueViolation on acl.principal, got {outcome:?}"
     );
 
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT id FROM acl WHERE principal = 'carol' AND context_id = $context_id",
             &[("context_id".to_string(), Value::Uuid(ctx))]
                 .into_iter()
                 .collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows.len(), 1);
 
     let principals: Vec<String> = db
@@ -234,7 +234,7 @@ fn t24_03_concurrent_updates_moving_composite_key_columns_one_winner() {
                 .collect(),
         )
         .unwrap()
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match &row[0] {
             Value::Text(s) => s.clone(),
@@ -282,8 +282,8 @@ fn t24_04_sequential_updates_both_commit() {
                 .collect(),
         )
         .unwrap();
-    assert_eq!(first.rows_affected, 1);
-    assert_eq!(second.rows_affected, 1);
+    assert_eq!(first.rows_affected(), 1);
+    assert_eq!(second.rows_affected(), 1);
 }
 
 #[test]
@@ -327,7 +327,7 @@ fn t24_05_concurrent_updates_against_different_composite_keys_both_commit() {
                     &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
                 )
                 .unwrap()
-                .rows_affected
+                .rows_affected()
             }));
         }
         barrier.wait();

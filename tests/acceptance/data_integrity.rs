@@ -483,13 +483,13 @@ async fn f109_sync_preserves_graph_vector_relational_atomicity_end_to_end() {
             &empty_params(),
         )
         .expect("ANN query");
-    assert_eq!(ann_result.rows.len(), 1, "ANN query should return 1 row");
+    assert_eq!(ann_result.rows().len(), 1, "ANN query should return 1 row");
     let id_col_idx = ann_result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "id")
         .expect("id column in ANN result");
-    let returned_id = &ann_result.rows[0][id_col_idx];
+    let returned_id = &ann_result.rows()[0][id_col_idx];
     assert_eq!(
         *returned_id,
         Value::Uuid(Uuid::parse_str(id1).expect("uuid")),

@@ -71,13 +71,13 @@ fn t25_01_six_parallel_pk_updates_keep_one_visible_row() {
         }
     });
 
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT basis_json FROM decisions WHERE id = $id",
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert_eq!(rows.len(), 1, "PK uniqueness collapsed to one visible row");
 }
 
@@ -118,7 +118,7 @@ fn t25_02_final_value_is_one_of_proposed() {
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
         .unwrap()
-        .rows[0][0]
+        .rows()[0][0]
     {
         Value::Text(s) => s.clone(),
         other => panic!("expected text, got {other:?}"),
@@ -156,13 +156,13 @@ fn t25_03_concurrent_update_plus_delete_collapse() {
         barrier.wait();
     });
 
-    let rows = db
+    let rows_answer = db
         .execute(
             "SELECT id FROM decisions WHERE id = $id",
             &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
         )
-        .unwrap()
-        .rows;
+        .unwrap();
+    let rows = rows_answer.rows();
     assert!(rows.len() <= 1, "PK-keyed read-back must be 0 or 1");
 }
 
@@ -184,7 +184,7 @@ fn t25_04_sequential_pk_updates_both_succeed() {
                 .collect(),
             )
             .unwrap();
-        assert_eq!(outcome.rows_affected, 1);
+        assert_eq!(outcome.rows_affected(), 1);
     }
 }
 
@@ -221,7 +221,7 @@ fn t25_05_concurrent_updates_different_pks_each_keep_one_row() {
                     &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
                 )
                 .unwrap()
-                .rows_affected
+                .rows_affected()
             }));
         }
         barrier.wait();
@@ -230,13 +230,13 @@ fn t25_05_concurrent_updates_different_pks_each_keep_one_row() {
     });
 
     for id in ids {
-        let rows = db
+        let rows_answer = db
             .execute(
                 "SELECT id FROM decisions WHERE id = $id",
                 &[("id".to_string(), Value::Uuid(id))].into_iter().collect(),
             )
-            .unwrap()
-            .rows;
+            .unwrap();
+        let rows = rows_answer.rows();
         assert_eq!(rows.len(), 1);
     }
 }

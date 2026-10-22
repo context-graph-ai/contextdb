@@ -344,13 +344,13 @@ fn f05f_all_data_types_round_trip_through_persistence() {
     let result = reopened
         .execute("SELECT * FROM everything", &empty_params())
         .expect("select everything");
-    assert_eq!(result.rows.len(), 1, "expected exactly one row");
-    let row = &result.rows[0];
+    assert_eq!(result.rows().len(), 1, "expected exactly one row");
+    let row = &result.rows()[0];
 
     // Map columns to values for easier assertions
     let col_idx = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|c| c == name)
             .unwrap_or_else(|| panic!("column {name} not found"))
@@ -650,7 +650,7 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
         .execute("SELECT id, ts FROM t ORDER BY ts ASC", &Default::default())
         .expect("SELECT must succeed");
 
-    let ts_column: Vec<Value> = result.rows.iter().map(|row| row[1].clone()).collect();
+    let ts_column: Vec<Value> = result.rows().iter().map(|row| row[1].clone()).collect();
 
     let expected: Vec<Value> = recorded.iter().copied().map(Value::TxId).collect();
     assert_eq!(
@@ -658,7 +658,7 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
         "ORDER BY ts ASC must return engine-allocator order, not wall-clock order"
     );
 
-    let id_column: Vec<Value> = result.rows.iter().map(|row| row[0].clone()).collect();
+    let id_column: Vec<Value> = result.rows().iter().map(|row| row[0].clone()).collect();
     let expected_ids: Vec<Value> = ids.iter().copied().map(Value::Uuid).collect();
     assert_eq!(
         id_column, expected_ids,
@@ -813,53 +813,53 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
         "bytes",
     ] {
         assert!(
-            indexes.columns.iter().any(|c| c == *required),
+            indexes.columns().iter().any(|c| c == *required),
             "SHOW VECTOR_INDEXES must expose `{required}`; got columns {:?}",
-            indexes.columns
+            indexes.columns()
         );
     }
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
     let dim_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "dimension")
         .unwrap();
     let count_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_count")
         .unwrap();
-    let bytes_idx = indexes.columns.iter().position(|c| c == "bytes").unwrap();
+    let bytes_idx = indexes.columns().iter().position(|c| c == "bytes").unwrap();
     let quant_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "quantization")
         .unwrap();
 
     let find = |col: &str, declared_dim: i64| {
-        let row = indexes.rows.iter().find(|r| {
+        let row = indexes.rows().iter().find(|r| {
             matches!(&r[column_idx], Value::Text(s) if s == col)
                 && matches!(&r[dim_idx], Value::Int64(n) if *n == declared_dim)
         });
         assert!(
             row.is_some(),
             "SHOW VECTOR_INDEXES must list `{col}` at dim {declared_dim}; got {:?}",
-            indexes.rows
+            indexes.rows()
         );
         row.unwrap()
     };
     let durable_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "durable_vector_bytes")
         .unwrap();
     let charged_vector_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "charged_vector_bytes")
         .unwrap();
     let charged_index_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "charged_index_bytes")
         .unwrap();
@@ -959,7 +959,7 @@ fn f112c_corrupt_one_dot_zero_store_returns_distinct_error() {
                 error_path.contains("corrupt.db"),
                 "StoreCorrupted.path must identify the corrupt file; got: {error_path}"
             );
-            let lower = reason.to_lowercase();
+            let lower = reason.to_string().to_lowercase();
             assert!(
                 lower.contains("metadata")
                     || lower.contains("format")
@@ -994,9 +994,9 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
         let shown = db
             .execute("SHOW VECTOR_INDEXES", &empty_params())
             .expect("show vector indexes");
-        let at = |name: &str| shown.columns.iter().position(|c| c == name).unwrap();
+        let at = |name: &str| shown.columns().iter().position(|c| c == name).unwrap();
         let row = shown
-            .rows
+            .rows()
             .iter()
             .find(|r| matches!(&r[at("table")], Value::Text(t) if t == "recall"))
             .expect("recall.vec is listed");
@@ -1071,26 +1071,26 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
     let indexes = reopened
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
-    let table_idx = indexes.columns.iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
+    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
     let quant_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "quantization")
         .unwrap();
     let bytes_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "durable_vector_bytes")
         .unwrap();
-    let recall_row = indexes.rows.iter().find(|r| {
+    let recall_row = indexes.rows().iter().find(|r| {
         matches!(&r[table_idx], Value::Text(t) if t == "recall")
             && matches!(&r[column_idx], Value::Text(c) if c == "vec")
     });
     assert!(
         recall_row.is_some(),
         "SHOW VECTOR_INDEXES must list recall.vec; got {:?}",
-        indexes.rows
+        indexes.rows()
     );
     let recall_row = recall_row.unwrap();
     assert!(
@@ -1179,8 +1179,8 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
                 &params(vec![("q", Value::Vector(probe.clone()))]),
             )
             .expect("query");
-        let id_idx = result.columns.iter().position(|c| c == "id").unwrap();
-        if result.rows.first().map(|r| &r[id_idx]) == Some(&Value::Uuid(*expected_id)) {
+        let id_idx = result.columns().iter().position(|c| c == "id").unwrap();
+        if result.rows().first().map(|r| &r[id_idx]) == Some(&Value::Uuid(*expected_id)) {
             hits += 1;
         }
     }
@@ -1294,26 +1294,26 @@ fn f113b_sq8_cross_batch_recall_stability() {
     let indexes = db
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
-    let table_idx = indexes.columns.iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
+    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
     let quant_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "quantization")
         .unwrap();
     let bytes_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "charged_vector_bytes")
         .unwrap();
-    let crossbatch_row = indexes.rows.iter().find(|r| {
+    let crossbatch_row = indexes.rows().iter().find(|r| {
         matches!(&r[table_idx], Value::Text(t) if t == "crossbatch")
             && matches!(&r[column_idx], Value::Text(c) if c == "vec")
     });
     assert!(
         crossbatch_row.is_some(),
         "SHOW VECTOR_INDEXES must list crossbatch.vec; got {:?}",
-        indexes.rows
+        indexes.rows()
     );
     let crossbatch_row = crossbatch_row.unwrap();
     assert!(
@@ -1360,8 +1360,8 @@ fn f113b_sq8_cross_batch_recall_stability() {
                 &params(vec![("q", Value::Vector(probe.clone()))]),
             )
             .expect("probe");
-        let id_idx = result.columns.iter().position(|c| c == "id").unwrap();
-        if result.rows.first().map(|r| &r[id_idx]) == Some(&Value::Uuid(*expected_id)) {
+        let id_idx = result.columns().iter().position(|c| c == "id").unwrap();
+        if result.rows().first().map(|r| &r[id_idx]) == Some(&Value::Uuid(*expected_id)) {
             hits += 1;
         }
     }
@@ -1466,26 +1466,26 @@ fn f113c_sq4_cross_batch_recall_stability() {
     let indexes = db
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
-    let table_idx = indexes.columns.iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
+    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
     let quant_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "quantization")
         .unwrap();
     let bytes_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "charged_vector_bytes")
         .unwrap();
-    let crossbatch_row = indexes.rows.iter().find(|r| {
+    let crossbatch_row = indexes.rows().iter().find(|r| {
         matches!(&r[table_idx], Value::Text(t) if t == "crossbatch4")
             && matches!(&r[column_idx], Value::Text(c) if c == "vec")
     });
     assert!(
         crossbatch_row.is_some(),
         "SHOW VECTOR_INDEXES must list crossbatch4.vec; got {:?}",
-        indexes.rows
+        indexes.rows()
     );
     let crossbatch_row = crossbatch_row.unwrap();
     assert!(
@@ -1549,8 +1549,8 @@ fn f113c_sq4_cross_batch_recall_stability() {
                 &params(vec![("q", Value::Vector(probe.clone()))]),
             )
             .expect("probe");
-        let id_idx = r.columns.iter().position(|c| c == "id").unwrap();
-        if r.rows.first().map(|row| &row[id_idx]) == Some(&Value::Uuid(*expected_id)) {
+        let id_idx = r.columns().iter().position(|c| c == "id").unwrap();
+        if r.rows().first().map(|row| &row[id_idx]) == Some(&Value::Uuid(*expected_id)) {
             hits += 1;
         }
     }

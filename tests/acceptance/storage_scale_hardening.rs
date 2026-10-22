@@ -94,7 +94,7 @@ fn count_rows(db: &Database, table: &str) -> i64 {
     match &db
         .execute(&format!("SELECT COUNT(*) FROM {table}"), &empty_params())
         .unwrap()
-        .rows[0][0]
+        .rows()[0][0]
     {
         Value::Int64(n) => *n,
         other => panic!("expected count Int64, got {other:?}"),
@@ -222,7 +222,7 @@ fn ssa_open_locality_journey() {
         ),
     ] {
         assert_eq!(
-            reopened.execute(sql, &HashMap::new()).unwrap().rows,
+            reopened.execute(sql, &HashMap::new()).unwrap().rows(),
             expected
         );
     }
@@ -230,7 +230,7 @@ fn ssa_open_locality_journey() {
         reopened
             .execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         (0..3)
             .map(|i| vec![Value::Uuid(uuid(10 + i)), Value::Int64(i as i64)])
             .collect::<Vec<_>>()
@@ -239,7 +239,7 @@ fn ssa_open_locality_journey() {
         reopened
             .execute("SELECT id, x FROM sib ORDER BY x", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         (0..2)
             .map(|i| vec![Value::Uuid(uuid(20 + i)), Value::Int64(i as i64)])
             .collect::<Vec<_>>()
@@ -261,7 +261,7 @@ fn ssa_open_locality_journey() {
         reopened
             .execute("SELECT id FROM t WHERE col = 3", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(uuid(13))]]
     );
 }
@@ -384,7 +384,7 @@ fn ssa_crash_recovery_journey() {
         reopened
             .execute("SELECT id FROM t WHERE col = 1", &empty_params())
             .unwrap()
-            .trace
+            .trace()
             .index_used
             .as_deref(),
         Some("idx_col")
@@ -396,7 +396,7 @@ fn ssa_crash_recovery_journey() {
                 &params(vec![("s", Value::Uuid(uuid(80)))]),
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(uuid(81))]]
     );
 }

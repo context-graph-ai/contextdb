@@ -153,7 +153,7 @@ fn f63_in_with_subquery() {
             &empty_params(),
         )
         .expect("IN subquery");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 }
 
 /// I searched with LIKE 'temp%', and it found the two rows whose names start with "temp".
@@ -163,7 +163,7 @@ fn f64_like_pattern_matching() {
     let result = db
         .execute("SELECT * FROM t WHERE name LIKE 'temp%'", &empty_params())
         .expect("LIKE query");
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows().len(), 2);
 }
 
 /// I split rows by IS NULL and IS NOT NULL on a nullable column, and every row landed in exactly one bucket.
@@ -179,7 +179,7 @@ fn f66_is_null_and_is_not_null() {
             &empty_params(),
         )
         .expect("IS NOT NULL");
-    assert_eq!(is_null.rows.len() + is_not_null.rows.len(), 5);
+    assert_eq!(is_null.rows().len() + is_not_null.rows().len(), 5);
 }
 
 /// I selected a column with AS sensor_name, and the result used my alias as the column header.
@@ -189,7 +189,7 @@ fn f68_column_aliases_as() {
     let result = db
         .execute("SELECT name AS sensor_name FROM t", &empty_params())
         .expect("alias query");
-    assert_eq!(result.columns, vec!["sensor_name"]);
+    assert_eq!(result.columns(), vec!["sensor_name"]);
 }
 
 /// I ordered by two columns with mixed ASC/DESC, and the rows came back in the right order.
@@ -203,7 +203,7 @@ fn f69_multi_column_order_by_with_mixed_directions() {
         )
         .expect("order by");
     assert_eq!(
-        result.rows.first().expect("first row")[0],
+        result.rows().first().expect("first row")[0],
         Value::Text("a".into())
     );
 }
@@ -220,7 +220,7 @@ fn f70_coalesce_function() {
         .expect("coalesce query");
     assert!(
         result
-            .rows
+            .rows()
             .iter()
             .any(|row| row[0] == Value::Text("unknown".into()))
     );
@@ -235,7 +235,7 @@ fn f74_not_operator() {
         .expect("NOT query");
     assert!(
         result
-            .rows
+            .rows()
             .iter()
             .all(|row| matches!(row[3], Value::Float64(v) if v <= 20.0))
     );
@@ -248,7 +248,7 @@ fn f74c_now_function() {
     let result = db
         .execute("SELECT NOW()", &empty_params())
         .expect("now query");
-    assert!(matches!(result.rows[0][0], Value::Timestamp(_)));
+    assert!(matches!(result.rows()[0][0], Value::Timestamp(_)));
 }
 
 /// I left-joined a sensor with no readings, and the sensor still appeared with NULLs for the reading columns.
@@ -279,7 +279,7 @@ fn f74e_left_join() {
             &empty_params(),
         )
         .expect("left join");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 }
 
 /// I created an index on a column, and queries filtering by that column still returned the correct row.
@@ -291,7 +291,7 @@ fn f74f_create_index() {
     let result = db
         .execute("SELECT * FROM t WHERE name = 'alice'", &empty_params())
         .expect("select by indexed column");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 }
 
 /// I ran CREATE TABLE IF NOT EXISTS on an existing table, and it succeeded silently instead of failing.
@@ -454,7 +454,7 @@ fn graph_01_incoming_edge_direction() {
             &empty_params(),
         )
         .expect("incoming graph query");
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows().len(), 2);
 }
 
 /// I queried for edges in either direction with -[:EDGE]-, and I got all connected nodes regardless of direction.
@@ -479,7 +479,7 @@ fn graph_02_bidirectional_edge_match() {
             &empty_params(),
         )
         .expect("bidirectional graph query");
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows().len(), 2);
 }
 
 /// I filtered a graph traversal by a node property in the WHERE clause, and only the matching path came back.
@@ -499,7 +499,7 @@ fn f83_node_property_filtering_in_graph_table_where() {
             &empty_params(),
         )
         .expect("graph filter query");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 }
 
 /// I wrote a graph pattern with contradictory arrows <-[:EDGE]->, and the parser rejected it.
@@ -526,7 +526,7 @@ fn f86_pre_filtered_ann_query() {
         .expect("prefiltered ann");
     assert!(
         result
-            .rows
+            .rows()
             .iter()
             .all(|row| row[8] == Value::Text("ctx-a".into()))
     );
@@ -683,7 +683,7 @@ fn f96_upsert_user_preference_preserves_graph_and_vector_consistency() {
             &params(vec![("id", Value::Uuid(pref))]),
         )
         .expect("read updated pref");
-    assert_eq!(row.rows[0][0], Value::Text("light".into()));
+    assert_eq!(row.rows()[0][0], Value::Text("light".into()));
     assert_eq!(
         db.edge_count(user, "HAS_PREF", db.snapshot())
             .expect("edge count"),
@@ -830,15 +830,15 @@ fn f97_recall_context_across_all_three_paradigms_returns_results_under_50ms() {
 
     // Correctness: the gate decision is active and reachable from gate observations
     assert!(
-        !result.rows.is_empty(),
+        !result.rows().is_empty(),
         "combined query returned no results"
     );
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "expected exactly one active decision reachable from gate observations"
     );
-    let desc = match &result.rows[0][1] {
+    let desc = match &result.rows()[0][1] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text for description, got: {other:?}"),
     };
@@ -846,7 +846,7 @@ fn f97_recall_context_across_all_three_paradigms_returns_results_under_50ms() {
 
     // The superseded parking decision must NOT appear — it's either unreachable
     // (parking observations are far from query vector) or filtered by status = 'active'
-    for row in &result.rows {
+    for row in result.rows() {
         let d = match &row[1] {
             Value::Text(s) => s.clone(),
             _ => continue,
@@ -975,14 +975,14 @@ fn f98_graph_neighborhood_scoped_vector_search() {
     // d1, d2, d3 should appear, ordered by similarity to [1.0, 0.0, 0.0]:
     //   d1 [0.9, 0.1, 0.0] closest, then d2 [0.8, 0.2, 0.0], then d3 [0.1, 0.3, 0.9]
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         3,
         "expected 3 results (d1, d2, d3), got {}",
-        result.rows.len()
+        result.rows().len()
     );
 
     let summaries: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[1] {
             Value::Text(s) => s.clone(),
@@ -1529,14 +1529,14 @@ fn f117_blueprint_collective_intelligence() {
 
     // D1 (face recognition, active, succeeded) and D3 (plate recognition, active, succeeded)
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         2,
         "expected 2 active+successful decisions, got {}",
-        result.rows.len()
+        result.rows().len()
     );
 
     let descriptions: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[1] {
             Value::Text(s) => s.clone(),
@@ -1655,11 +1655,11 @@ fn f118_intention_lifecycle_recall() {
         )
         .expect("vector search for matching intention");
     assert_eq!(
-        vec_result.rows.len(),
+        vec_result.rows().len(),
         1,
         "should find one matching intention"
     );
-    let matched_intention = match &vec_result.rows[0][0] {
+    let matched_intention = match &vec_result.rows()[0][0] {
         Value::Uuid(id) => *id,
         other => panic!("expected Uuid, got: {other:?}"),
     };
@@ -1689,14 +1689,14 @@ fn f118_intention_lifecycle_recall() {
 
     // Both D1 (invalidated) and D2 (active) appear
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         2,
         "expected 2 decisions for I1 (full lifecycle), got {}",
-        result.rows.len()
+        result.rows().len()
     );
 
     let statuses: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[2] {
             Value::Text(s) => s.clone(),
@@ -1716,7 +1716,7 @@ fn f118_intention_lifecycle_recall() {
 
     // D3 must NOT appear (serves different intention)
     let descriptions: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[1] {
             Value::Text(s) => s.clone(),
@@ -1901,14 +1901,14 @@ fn f119_emergent_unknown_detection() {
 
     // D1 and D2 should appear (BASED_ON E1, basis us-east-1 != current eu-west-1)
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         2,
         "expected 2 stale decisions, got {}",
-        result.rows.len()
+        result.rows().len()
     );
 
     let descriptions: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[1] {
             Value::Text(s) => s.clone(),
@@ -2212,12 +2212,12 @@ fn f121_digest_provenance_retrieval() {
         .expect("vector search for digests");
 
     assert!(
-        digest_result.rows.len() >= 2,
+        digest_result.rows().len() >= 2,
         "expected at least 2 digest results"
     );
 
     // Dg1 should be first (embedding [1.0, 0.0, 0.0] — exact match)
-    let first_summary = match &digest_result.rows[0][2] {
+    let first_summary = match &digest_result.rows()[0][2] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got: {other:?}"),
     };
@@ -2228,14 +2228,14 @@ fn f121_digest_provenance_retrieval() {
     );
 
     // Dg1 source is "claude-cli"
-    let first_source = match &digest_result.rows[0][1] {
+    let first_source = match &digest_result.rows()[0][1] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got: {other:?}"),
     };
     assert_eq!(first_source, "claude-cli");
 
     // Dg2 should be second (embedding [0.8, 0.2, 0.0] — close)
-    let second_summary = match &digest_result.rows[1][2] {
+    let second_summary = match &digest_result.rows()[1][2] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got: {other:?}"),
     };
@@ -2258,10 +2258,10 @@ fn f121_digest_provenance_retrieval() {
 
     // I1 and D1 both extracted from Dg1
     assert_eq!(
-        extracted_from_dg1.rows.len(),
+        extracted_from_dg1.rows().len(),
         2,
         "expected 2 objects extracted from Dg1 (I1 and D1), got {}",
-        extracted_from_dg1.rows.len()
+        extracted_from_dg1.rows().len()
     );
 
     // Graph traversal: objects extracted from Dg2
@@ -2276,10 +2276,10 @@ fn f121_digest_provenance_retrieval() {
         .expect("extracted from Dg2");
 
     assert_eq!(
-        extracted_from_dg2.rows.len(),
+        extracted_from_dg2.rows().len(),
         1,
         "expected 1 object extracted from Dg2 (D2), got {}",
-        extracted_from_dg2.rows.len()
+        extracted_from_dg2.rows().len()
     );
 }
 
@@ -2382,14 +2382,14 @@ fn f122_decision_staleness_check() {
 
     // Obs2 (after decision) and Obs3 (after decision) appear
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         2,
         "expected 2 observations after decision time, got {}",
-        result.rows.len()
+        result.rows().len()
     );
 
     let summaries: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[1] {
             Value::Text(s) => s.clone(),
@@ -2451,10 +2451,10 @@ fn f123_relationship_idempotency() {
         )
         .expect("graph traversal after duplicate insert");
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "duplicate edge insert should be idempotent, expected 1 result, got {}",
-        result.rows.len()
+        result.rows().len()
     );
 }
 
@@ -2590,7 +2590,7 @@ fn f127_precedent_chain_traversal() {
         .expect("precedent chain traversal");
 
     let result_ids: Vec<Uuid> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Uuid(id) => *id,
@@ -2646,10 +2646,10 @@ fn f128_empty_graph_traversal() {
         .expect("empty graph traversal should succeed, not error");
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         0,
         "expected 0 rows for entity with no edges, got {}",
-        result.rows.len()
+        result.rows().len()
     );
 }
 

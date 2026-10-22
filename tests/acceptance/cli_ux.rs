@@ -1059,8 +1059,8 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     let r = reopened
         .execute("SELECT id FROM evidence", &empty_params())
         .expect("select");
-    let id_idx = r.columns.iter().position(|c| c == "id").unwrap();
-    let returned: Vec<Value> = r.rows.iter().map(|row| row[id_idx].clone()).collect();
+    let id_idx = r.columns().iter().position(|c| c == "id").unwrap();
+    let returned: Vec<Value> = r.rows().iter().map(|row| row[id_idx].clone()).collect();
     assert!(
         returned.contains(&Value::Uuid(in_flight_id)),
         "first in-flight commit must survive graceful drain"

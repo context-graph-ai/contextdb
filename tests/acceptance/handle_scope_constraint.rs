@@ -104,7 +104,7 @@ fn t6_01_edge_handle_cannot_write_server_only_table() {
         .execute("SELECT name FROM signatures", &empty())
         .unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Text("face-cluster-1".into())]],
         "denied edge write must not persist a server-labelled row"
     );
@@ -146,8 +146,8 @@ fn t6_02_split_read_gate_excludes_server_rows_for_edge_handle() {
     let r = edge
         .execute("SELECT name FROM signatures", &empty())
         .unwrap();
-    assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.rows[0][0], Value::Text("edge-readable".into()));
+    assert_eq!(r.rows().len(), 1);
+    assert_eq!(r.rows()[0][0], Value::Text("edge-readable".into()));
     let direct = edge.scan("signatures", edge.snapshot()).unwrap();
     assert_eq!(
         direct.len(),
@@ -228,7 +228,7 @@ fn t6_02_split_read_gate_excludes_server_rows_for_edge_handle() {
         )
         .unwrap();
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         0,
         "denied split-form INSERT must not persist a server-labelled row"
     );
@@ -259,7 +259,7 @@ fn t6_02_split_read_gate_excludes_server_rows_for_edge_handle() {
         .execute("SELECT name FROM admin_seeded_server_read", &empty())
         .unwrap();
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         0,
         "schema READ allow-list must hide edge-labelled rows when READ only allows server"
     );
@@ -299,11 +299,11 @@ fn t6_03_server_handle_writes_server_table() {
         )
         .unwrap();
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         1,
         "server handle must read its own write back"
     );
-    assert_eq!(r.rows[0][0], Value::Text("svr".into()));
+    assert_eq!(r.rows()[0][0], Value::Text("svr".into()));
 }
 
 /// RED — t6_04
@@ -374,20 +374,20 @@ fn t6_04_edge_graph_traversal_excludes_server_only_rows() {
     let n_edge_behind_server = Uuid::from_u128(3);
     let n_edge_allowed_neighbor = Uuid::from_u128(4);
     let saw_edge = r
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == n_edge));
     assert!(saw_edge, "edge node must be visible to edge handle");
     let saw_allowed_neighbor = r
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == n_edge_allowed_neighbor));
     assert!(
         saw_allowed_neighbor,
         "edge handle must traverse at least one allowed edge; rows={:?}",
-        r.rows
+        r.rows()
     );
-    for row in &r.rows {
+    for row in r.rows() {
         if let Value::Uuid(u) = &row[0] {
             assert_ne!(*u, n_server, "server-only node leaked into edge traversal");
             assert_ne!(
@@ -530,19 +530,19 @@ fn t6_05_edge_vector_query_excludes_server_only_rows() {
         .unwrap();
     let edge_id = Uuid::from_u128(12);
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         1,
         "scope-label vector gating must happen before LIMIT"
     );
     let saw_edge = r
-        .rows
+        .rows()
         .iter()
         .any(|r| matches!(&r[0], Value::Uuid(u) if *u == edge_id));
     assert!(
         saw_edge,
         "nearest visible edge-labeled row must be present in edge handle's vector query"
     );
-    for row in &r.rows {
+    for row in r.rows() {
         if let Value::Uuid(u) = &row[0] {
             assert!(
                 !(2..12).contains(&u.as_u128()),
@@ -678,8 +678,8 @@ fn t6_06_arbitrary_tenant_label_strings_enforced() {
     )
     .unwrap();
     let r = h.execute("SELECT id FROM t", &empty()).unwrap();
-    assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.rows[0][0], Value::Uuid(Uuid::from_u128(1)));
+    assert_eq!(r.rows().len(), 1);
+    assert_eq!(r.rows()[0][0], Value::Uuid(Uuid::from_u128(1)));
 }
 
 /// REGRESSION GUARD — t6_07
@@ -703,7 +703,7 @@ fn t6_07_admin_handle_writes_anywhere() {
         .execute("SELECT name FROM signatures", &empty())
         .unwrap();
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         2,
         "admin handle reads all rows including its own write"
     );
@@ -737,8 +737,8 @@ fn t6_08_edge_handle_writes_edge_row() {
     )
     .unwrap();
     let r = edge.execute("SELECT body FROM rows", &empty()).unwrap();
-    assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.rows[0][0], Value::Text("from-edge".into()));
+    assert_eq!(r.rows().len(), 1);
+    assert_eq!(r.rows()[0][0], Value::Text("from-edge".into()));
 }
 
 /// RED — t6_09: label-flip-attack rejected.
@@ -794,7 +794,7 @@ fn t6_09_edge_cannot_flip_label_to_server() {
     p.insert("id".into(), Value::Uuid(Uuid::from_u128(2)));
     let delete = edge.execute("DELETE FROM rows WHERE id = $id", &p).unwrap();
     assert_eq!(
-        delete.rows_affected, 0,
+        delete.rows_affected(), 0,
         "DELETE predicate targeting a server-labelled hidden row must behave as no visible match"
     );
     drop(edge);
@@ -803,18 +803,18 @@ fn t6_09_edge_cannot_flip_label_to_server() {
         .execute("SELECT id, scope_label FROM rows", &empty())
         .unwrap();
     assert!(
-        r.rows.iter().any(|row| {
+        r.rows().iter().any(|row| {
             row[0] == Value::Uuid(Uuid::from_u128(1)) && row[1] == Value::Text("edge".into())
         }),
         "denied scope-label flip must leave row 1 labelled edge; rows={:?}",
-        r.rows
+        r.rows()
     );
     assert!(
-        r.rows.iter().any(|row| {
+        r.rows().iter().any(|row| {
             row[0] == Value::Uuid(Uuid::from_u128(2)) && row[1] == Value::Text("server".into())
         }),
         "denied DELETE must leave server-labelled row 2 intact; rows={:?}",
-        r.rows
+        r.rows()
     );
 }
 
@@ -834,7 +834,7 @@ fn t6_10_simple_form_is_write_only_gate() {
         .execute("SELECT name FROM signatures", &empty())
         .unwrap();
     assert_eq!(
-        r.rows.len(),
+        r.rows().len(),
         1,
         "simple-form scope label must not gate reads"
     );
@@ -856,7 +856,7 @@ fn t6_10_simple_form_is_write_only_gate() {
         .execute("SELECT scope_label FROM unconstrained", &empty())
         .unwrap();
     assert_eq!(
-        r.rows,
+        r.rows(),
         vec![vec![Value::Text("server".into())]],
         "column name alone must not activate scope-label gating"
     );

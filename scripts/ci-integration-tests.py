@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -172,8 +173,16 @@ class IntegrationControls(unittest.TestCase):
         production = ['cargo', 'test', '--locked', '-p', 'contextdb-engine', '--features', 'nightly-tests']
         self.assertEqual(i.commands(kinds['production']), [production])
         self.assertEqual(i.commands(kinds['production-release']),
-                         [production + ['--release', '--test', target]
+                         [(production[:-1] + ['nightly-tests,test-seams']
+                           if target == 'acceptance' else production)
+                          + ['--release', '--test', target]
                           for target in i.ACCEPTANCE_TARGETS])
+        required = {row['name']: set(row.get('required-features', []))
+                    for row in tomllib.loads((ROOT / 'crates/contextdb-engine/Cargo.toml').read_text())['test']}
+        for command in i.commands(kinds['production-release']):
+            target = command[command.index('--test') + 1]
+            features = set(command[command.index('--features') + 1].split(','))
+            self.assertLessEqual(required[target], features)
         self.assertEqual(i.commands(kinds['workspace']), [['cargo', 'test', '--locked', '--workspace']])
         with patch.dict(os.environ, {'CARGO_TARGET_DIR': '/tmp/isolated-target'}):
             self.assertEqual(i.commands(kinds['redb']), [['cargo', 'test', '--manifest-path', 'crates/contextdb-redb/Cargo.toml', '--target-dir', '/tmp/isolated-target/redb', '--locked']])

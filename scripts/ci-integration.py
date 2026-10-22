@@ -615,7 +615,11 @@ def commands(row, root=ROOT, mode=None):
     if kind == 'production':
         return [base]
     if kind == 'production-release':
-        return [base + ['--release', '--test', target] for target in ACCEPTANCE_TARGETS]
+        # The mixed acceptance target requires private observation fixtures;
+        # the sync and long-running targets still prove the production layout.
+        acceptance = base[:-1] + ['nightly-tests,test-seams']
+        return [(acceptance if target == 'acceptance' else base)
+                + ['--release', '--test', target] for target in ACCEPTANCE_TARGETS]
     raise ValueError('unknown command class')
 
 

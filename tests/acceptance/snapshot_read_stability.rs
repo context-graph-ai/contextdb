@@ -211,7 +211,7 @@ fn seed_group(db: &Database, group: Uuid, writer: usize, payload: &str) {
     for slot in 0..(K as i64) {
         let result =
             insert_target_in_tx(db, tx, group, slot, writer, payload).expect("seed insert");
-        assert_eq!(result.rows_affected, 1);
+        assert_eq!(result.rows_affected(), 1);
     }
     db.commit(tx).expect("seed commit");
 }
@@ -221,7 +221,7 @@ fn seed_scoped_group(db: &Database, group: Uuid, writer: usize, payload: &str, c
     for slot in 0..(K as i64) {
         let result =
             insert_scoped_target_in_tx(db, tx, group, slot, writer, payload, ctx).expect("seed");
-        assert_eq!(result.rows_affected, 1);
+        assert_eq!(result.rows_affected(), 1);
     }
     db.commit(tx).expect("scoped seed commit");
 }
@@ -263,7 +263,7 @@ fn trigger_replace_round_logged(
         for slot in 0..(K as i64) {
             let result = insert_target_in_tx(db, tx, group, slot, writer, &format!("w{writer}"));
             match classify_query(result) {
-                Some(result) => assert_eq!(result.rows_affected, 1),
+                Some(result) => assert_eq!(result.rows_affected(), 1),
                 None => return,
             }
             yield_now();
@@ -316,7 +316,7 @@ fn replace_round_inner(
                 None => insert_target_in_tx(db, tx, group, slot, writer, &payload),
             };
             match classify_query(ins) {
-                Some(result) => assert_eq!(result.rows_affected, 1),
+                Some(result) => assert_eq!(result.rows_affected(), 1),
                 None => {
                     conflicted = true;
                     break;
@@ -337,7 +337,7 @@ fn replace_round_inner(
                 &params([("g", Value::Uuid(group))]),
             )
             .expect("read own staged replacement rows");
-        let staged_rows = parse_target_rows(staged_rows.rows);
+        let staged_rows = parse_target_rows(staged_rows.rows());
         assert_eq!(
             staged_rows.len(),
             K,
@@ -398,7 +398,7 @@ fn replace_round_inner(
                 )
                 .expect("read committed replacement marker");
             assert_eq!(
-                marker.rows,
+                marker.rows(),
                 vec![vec![
                     Value::Int64(writer as i64),
                     Value::Text(format!("w{writer}"))
@@ -413,20 +413,19 @@ fn replace_round_inner(
 }
 
 fn select_group(db: &Database, group: Uuid) -> Vec<TargetRow> {
-    let rows = must_query(
+    let answer = must_query(
         db.execute(
             "SELECT id, group_id, slot, item_ref, payload
              FROM replace_targets WHERE group_id = $g ORDER BY slot",
             &params([("g", Value::Uuid(group))]),
         ),
         "select group",
-    )
-    .rows;
-    parse_target_rows(rows)
+    );
+    parse_target_rows(answer.rows())
 }
 
-fn parse_target_rows(rows: Vec<Vec<Value>>) -> Vec<TargetRow> {
-    rows.into_iter()
+fn parse_target_rows(rows: &[Vec<Value>]) -> Vec<TargetRow> {
+    rows.iter()
         .map(|row| match row.as_slice() {
             [
                 Value::Uuid(id),
@@ -447,16 +446,15 @@ fn parse_target_rows(rows: Vec<Vec<Value>>) -> Vec<TargetRow> {
 }
 
 fn select_group_payload_refs(db: &Database, group: Uuid) -> Vec<TargetRow> {
-    let rows = must_query(
+    let answer = must_query(
         db.execute(
             "SELECT id, group_id, slot, item_ref, payload
              FROM replace_targets WHERE group_id = $g ORDER BY slot",
             &params([("g", Value::Uuid(group))]),
         ),
         "select group payload refs",
-    )
-    .rows;
-    parse_target_rows(rows)
+    );
+    parse_target_rows(answer.rows())
 }
 
 fn writer_from_payload(payload: &str) -> usize {
@@ -619,12 +617,12 @@ fn run_reader_probe_iterations(db: &Database, group: Uuid, iterations: usize) {
                 "point reader must not error",
             );
             assert_eq!(
-                result.rows.len(),
+                result.rows().len(),
                 1,
                 "point reader saw a hole or duplicate for slot {slot}: {:?}",
-                result.rows
+                result.rows()
             );
-            match result.rows[0].as_slice() {
+            match result.rows()[0].as_slice() {
                 [Value::Uuid(id), Value::Text(payload)] => {
                     assert_eq!(*id, row_id(group, slot));
                     assert!(
@@ -807,10 +805,10 @@ fn sr_04_update_replacement_race() {
                                     };
                                     if let Some(result) = result {
                                         assert!(
-                                            matches!(result.rows_affected, 0 | 1),
+                                            matches!(result.rows_affected(), 0 | 1),
                                             "UPDATE rows_affected must be 0 or 1, got {result:?}"
                                         );
-                                        if result.rows_affected == 1 {
+                                        if result.rows_affected() == 1 {
                                             update_successes.fetch_add(1, Ordering::SeqCst);
                                         }
                                     }
@@ -836,10 +834,10 @@ fn sr_04_update_replacement_race() {
                                     };
                                     if let Some(result) = result {
                                         assert!(
-                                            matches!(result.rows_affected, 0 | 1),
+                                            matches!(result.rows_affected(), 0 | 1),
                                             "UPSERT rows_affected must be 0 or 1, got {result:?}"
                                         );
-                                        if result.rows_affected == 1 {
+                                        if result.rows_affected() == 1 {
                                             upsert_successes.fetch_add(1, Ordering::SeqCst);
                                         }
                                     }
@@ -926,7 +924,7 @@ fn sr_05_same_tx_readback_under_committed_replacement() {
             &params([("g", Value::Uuid(group))]),
         )
         .expect("tx_a delete");
-    assert_eq!(del_a.rows_affected, K as u64);
+    assert_eq!(del_a.rows_affected(), K as u64);
     for slot in 0..(K as i64) {
         insert_target_in_tx(&db, tx_a, group, slot, 10, "A").expect("tx_a insert");
     }
@@ -942,7 +940,7 @@ fn sr_05_same_tx_readback_under_committed_replacement() {
     }
     must_commit(db.commit(tx_b), "tx_b commit");
 
-    let rows = must_query(
+    let answer = must_query(
         db.execute_in_tx(
             tx_a,
             "SELECT id, group_id, slot, item_ref, payload
@@ -950,9 +948,8 @@ fn sr_05_same_tx_readback_under_committed_replacement() {
             &params([("g", Value::Uuid(group))]),
         ),
         "tx_a read-your-own-writes",
-    )
-    .rows;
-    let rows = parse_target_rows(rows);
+    );
+    let rows = parse_target_rows(answer.rows());
     assert_eq!(rows.len(), K);
     for row in &rows {
         assert_eq!(row.payload, "A");
@@ -994,7 +991,7 @@ fn sr_06_stale_staged_delete_is_commit_noop() {
             &params([("gx", Value::Uuid(group_x))]),
         )
         .expect("tx_a delete");
-    assert_eq!(del_a.rows_affected, K as u64);
+    assert_eq!(del_a.rows_affected(), K as u64);
     for slot in 0..(K as i64) {
         insert_target_in_tx(&db, tx_a, group_y, slot, 10, "A").expect("tx_a insert group_y");
     }
@@ -1085,7 +1082,7 @@ fn sr_07_scoped_handle_replace_race() {
             &params([("g", Value::Uuid(group))]),
         )
         .expect("hidden list read should silently filter");
-    assert_eq!(list.rows.len(), 0);
+    assert_eq!(list.rows().len(), 0);
     assert!(winner.starts_with('w') || winner == "seed");
 }
 
@@ -1119,7 +1116,7 @@ fn sr_08_sequential_replacement_convergence() {
             &empty(),
         )
         .expect("select old rows");
-    assert_eq!(old.rows.len(), 0);
+    assert_eq!(old.rows().len(), 0);
 
     db.execute(
         "CREATE TABLE replace_targets_text (
@@ -1167,7 +1164,7 @@ fn sr_08_sequential_replacement_convergence() {
             &params([("g", Value::Uuid(group))]),
         )
         .expect("select text rows")
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.as_slice() {
             [
@@ -1261,7 +1258,7 @@ fn sr_10_trigger_callback_writes_during_race() {
                                 ("p", Value::Text(format!("s{writer}-{round}"))),
                             ]),
                         )) {
-                            assert_eq!(result.rows_affected, 1);
+                            assert_eq!(result.rows_affected(), 1);
                             signal_successes.fetch_add(1, Ordering::SeqCst);
                         }
                         yield_now();

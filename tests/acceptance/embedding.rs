@@ -29,7 +29,7 @@ fn f41_use_contextdb_engine_as_a_rust_dependency() {
     let result = db
         .execute("SELECT * FROM t", &empty_params())
         .expect("select");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 }
 
 /// I shared one Database across 10 threads doing concurrent inserts, and all 100 rows landed without panics.
@@ -221,7 +221,7 @@ fn f99_database_execute_returns_structured_results_not_just_strings() {
         .execute("SELECT * FROM typed", &empty_params())
         .expect("select typed row");
     assert_eq!(
-        result.columns,
+        result.columns(),
         vec![
             "id",
             "note",
@@ -232,13 +232,13 @@ fn f99_database_execute_returns_structured_results_not_just_strings() {
             "embedding"
         ]
     );
-    assert!(matches!(result.rows[0][0], Value::Uuid(_)));
-    assert!(matches!(result.rows[0][1], Value::Text(_)));
-    assert!(matches!(result.rows[0][2], Value::Int64(_)));
-    assert!(matches!(result.rows[0][3], Value::Float64(_)));
-    assert!(matches!(result.rows[0][4], Value::Bool(_)));
-    assert!(matches!(result.rows[0][5], Value::Timestamp(_)));
-    assert!(matches!(result.rows[0][6], Value::Vector(_)));
+    assert!(matches!(result.rows()[0][0], Value::Uuid(_)));
+    assert!(matches!(result.rows()[0][1], Value::Text(_)));
+    assert!(matches!(result.rows()[0][2], Value::Int64(_)));
+    assert!(matches!(result.rows()[0][3], Value::Float64(_)));
+    assert!(matches!(result.rows()[0][4], Value::Bool(_)));
+    assert!(matches!(result.rows()[0][5], Value::Timestamp(_)));
+    assert!(matches!(result.rows()[0][6], Value::Vector(_)));
 }
 
 /// I created a table and called table_names/table_meta, and I got back the table name and its column definitions.
@@ -318,8 +318,8 @@ fn f106_multiple_database_instances_in_one_process() {
     let b_rows = db_b
         .execute("SELECT name FROM t", &empty_params())
         .expect("select b");
-    assert_eq!(a_rows.rows[0][0], Value::Text("alpha".into()));
-    assert_eq!(b_rows.rows[0][0], Value::Text("beta".into()));
+    assert_eq!(a_rows.rows()[0][0], Value::Text("alpha".into()));
+    assert_eq!(b_rows.rows()[0][0], Value::Text("beta".into()));
 }
 
 /// I inserted a JSON object and queried it back, and the full structured payload round-tripped intact.
@@ -346,7 +346,7 @@ fn f108_agent_can_store_and_query_json_payloads() {
             &empty_params(),
         )
         .expect("query JSON row");
-    assert_eq!(result.rows[0][0], Value::Json(payload));
+    assert_eq!(result.rows()[0][0], Value::Json(payload));
 }
 
 /// I opened a database with a file path, with open_memory(), and with ":memory:", and all three worked without creating spurious files.
@@ -424,8 +424,8 @@ fn f110_single_vector_column_preserves_single_index_semantics_with_disjoint_colu
             &params(vec![("q", Value::Vector(probe.clone()))]),
         )
         .expect("search embeddings");
-    let id_idx = r1.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(r1.rows[0][id_idx], Value::Uuid(em_id));
+    let id_idx = r1.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(r1.rows()[0][id_idx], Value::Uuid(em_id));
 
     // Probing other.foo with `probe` MUST return foo_id. A no-op global store would return em_id (closer to
     // probe than opposite); this assertion is the routing-discriminator.
@@ -436,7 +436,7 @@ fn f110_single_vector_column_preserves_single_index_semantics_with_disjoint_colu
         )
         .expect("search other");
     assert_eq!(
-        r2.rows[0][id_idx],
+        r2.rows()[0][id_idx],
         Value::Uuid(foo_id),
         "search of `other.foo` must return only `other`'s row, not the closer-by-cosine row in `embeddings.embedding`"
     );
@@ -481,7 +481,7 @@ fn f114_vector_index_dimension_mismatch_carries_index_identity() {
     let count = db
         .execute("SELECT id FROM evidence", &empty_params())
         .expect("select")
-        .rows
+        .rows()
         .len();
     assert_eq!(count, 0, "rejected row must not be partially inserted");
 }

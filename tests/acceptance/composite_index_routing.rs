@@ -10,7 +10,7 @@ fn ce_uuid(n: u128) -> Uuid {
 }
 
 fn pushed(r: &QueryResult) -> Vec<&str> {
-    r.trace
+    r.trace()
         .predicates_pushed
         .iter()
         .map(|c| c.as_ref())
@@ -22,7 +22,7 @@ const FIRST: &str = "first column not in WHERE";
 const MORE_COLUMNS: &str = "more indexed columns than chosen index";
 
 fn reason<'a>(r: &'a QueryResult, name: &str) -> Option<&'a str> {
-    r.trace
+    r.trace()
         .indexes_considered
         .iter()
         .find(|c| c.name == name)
@@ -116,7 +116,7 @@ fn acceptance_explain_says_why_each_competing_composite_index_lost() {
     db.__reset_rows_examined();
     let r = db.execute(sql, &query_params).unwrap();
 
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_hop"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_hop"));
     assert_eq!(pushed(&r), vec!["source_id", "context_id", "edge_type"]);
     assert_eq!(
         reason(&r, "__unique_source_id_target_id_edge_type"),
@@ -125,7 +125,7 @@ fn acceptance_explain_says_why_each_competing_composite_index_lost() {
     assert_eq!(reason(&r, "__graph_edge_source_target_type"), Some(FEWER));
     assert_eq!(reason(&r, "idx_alt"), Some(FEWER));
     assert_eq!(reason(&r, "__pk_id"), Some(FIRST));
-    assert_eq!(r.rows.len(), 12);
+    assert_eq!(r.rows().len(), 12);
     assert_eq!(db.__rows_examined(), 12);
 
     let explain = render_explain(&db, sql, &query_params).unwrap();
@@ -176,7 +176,7 @@ fn acceptance_explain_says_why_each_competing_composite_index_lost() {
         "SELECT id FROM edges WHERE source_id IN ($s) AND context_id > $c ORDER BY id ASC";
     let tie_params = params(vec![("s", Value::Uuid(source)), ("c", Value::Uuid(cutoff))]);
     let r = tie.execute(tie_sql, &tie_params).unwrap();
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_short"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_short"));
     assert_eq!(pushed(&r), vec!["source_id"]);
     assert_eq!(reason(&r, "idx_long"), Some(MORE_COLUMNS));
 
@@ -275,8 +275,8 @@ fn acceptance_degenerate_in_queries_graceful() {
             &empty_params(),
         )
         .unwrap();
-    assert_eq!(unindexed.trace.physical_plan, "Scan");
-    assert_eq!(unindexed.rows, vec![vec![Value::Uuid(ce_uuid(2))]]);
+    assert_eq!(unindexed.trace().physical_plan, "Scan");
+    assert_eq!(unindexed.rows(), vec![vec![Value::Uuid(ce_uuid(2))]]);
 
     db.__reset_rows_examined();
     let indexed = catch_unwind(AssertUnwindSafe(|| {
@@ -290,9 +290,9 @@ fn acceptance_degenerate_in_queries_graceful() {
         "mixed-type IN on indexed TEXT column must not panic"
     );
     let indexed = indexed.unwrap().unwrap();
-    assert_eq!(indexed.trace.physical_plan, "IndexScan");
-    assert_eq!(indexed.trace.index_used.as_deref(), Some("idx_tag_score"));
+    assert_eq!(indexed.trace().physical_plan, "IndexScan");
+    assert_eq!(indexed.trace().index_used.as_deref(), Some("idx_tag_score"));
     assert_eq!(pushed(&indexed), vec!["tag", "score"]);
-    assert_eq!(indexed.rows, vec![vec![Value::Uuid(ce_uuid(1))]]);
+    assert_eq!(indexed.rows(), vec![vec![Value::Uuid(ce_uuid(1))]]);
     assert_eq!(db.__rows_examined(), 1);
 }
