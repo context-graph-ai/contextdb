@@ -1243,6 +1243,19 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
         let publication =
             publication.expect("actual public carrier was allocated before execution");
         assert_eq!(publication.1, components[2]);
+        let image_receipts = answer.image_control_receipts_for_test();
+        let image_requests = image_receipts.map(|receipt| {
+            assert_eq!(receipt.2, native.adapter.unwrap().payload);
+            let mut found = None;
+            for request in &allocations[..count.min(allocations.len())] {
+                if request.0 <= receipt.0 && receipt.0 < request.0.saturating_add(request.1) {
+                    assert!(found.replace(*request).is_none(), "one physical allocation per retained image");
+                }
+            }
+            let found = found.expect("the actual retained image was allocated before execution");
+            if receipt.1 != 0 { assert_eq!(receipt.1, found.1); }
+            found
+        });
         let requests = [
             native_requests[0],
             native_requests[1],
@@ -1250,6 +1263,8 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             trace.requests[0],
             trace.requests[1],
             publication,
+            image_requests[0],
+            image_requests[1],
         ];
         oracle::watch_exact_frees_for_test(&requests, counter);
         let retained = db.last_vector_search_trace.write().take().unwrap();
@@ -1266,7 +1281,7 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             + invoice.prepaid_control_bytes;
         drop(answer);
         let after = unsafe { &*(native.counter as *const AtomicU64) }.load(Ordering::SeqCst);
-        let frees = oracle::source_free_for_test(6);
+        let frees = oracle::source_free_for_test(8);
         let physical = frees[5];
         assert_eq!(physical.2, 1);
         assert_eq!(physical.0, physical.1);
@@ -1282,16 +1297,27 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             after, trace_due as u64,
             "remaining live child debit equals the complete captured trace invoice and control requests"
         );
-        assert!(before > after);
-        assert!(before - after >= publication.1 as u64);
+        let independent_answer_invoice = components[2] + components[3] + components[4]
+            + image_requests.iter().map(|request| request.1).sum::<usize>();
+        assert_eq!(before - after, independent_answer_invoice as u64,
+            "the released answer debit equals its payload invoices and independently captured physical controls");
+        let live = oracle::source_live_at_free_for_test(8);
+        let trace_payload = invoice.prepaid_bytes + invoice.prepaid_control_bytes
+            + invoice.additional_bytes + invoice.score_credit_bytes;
+        for slot in 5..8 {
+            assert_eq!(frees[slot].2, 1);
+            assert_eq!(frees[slot].0, frees[slot].1);
+            assert_eq!(frees[slot].0 as u64, sample.parent_before + live[slot] as u64 + trace_payload as u64,
+                "each answer control physically frees while its own actual request and the independent live trace remain paid");
+        }
         assert!(
             frees[..5].iter().all(|free| free.2 == 0),
             "the trace still owns all five original controls"
         );
         drop(retained);
-        let freed = oracle::source_free_for_test(6);
-        let live = oracle::source_live_at_free_for_test(6);
-        for i in 0..6 {
+        let freed = oracle::source_free_for_test(8);
+        let live = oracle::source_live_at_free_for_test(8);
+        for i in 0..8 {
             assert_eq!(freed[i].2, 1);
             assert_eq!(freed[i].0, freed[i].1);
             if i < 5 {
@@ -1303,7 +1329,7 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             sample.parent_before
         );
         eprintln!(
-            "actual_answer_trace_cuts file={file} sampled_return={before} after_answer_drop={after} released_by_answer={} actual_components={components:?} publication={publication:?} physical={physical:?} trace_invoice={invoice:?}",
+            "actual_answer_trace_cuts file={file} sampled_return={before} after_answer_drop={after} released_by_answer={} actual_components={components:?} publication={publication:?} images={image_requests:?} image_receipts={image_receipts:?} independent_answer_invoice={independent_answer_invoice} physical={physical:?} trace_invoice={invoice:?}",
             before - after
         );
     }

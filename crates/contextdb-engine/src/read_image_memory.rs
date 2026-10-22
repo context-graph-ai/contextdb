@@ -1598,6 +1598,19 @@ pub(crate) struct QueryImageCharge {
         crate::local_transport::query_funding::Funded<crate::read_image_memory::ImageMemoryHandle>,
 }
 impl QueryAnswerCharge {
+    /// Passive pointers and the existing invoice of the actual retained image.
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn control_receipts_for_test(&self) -> [(usize, usize, usize); 2] {
+        match self {
+            Self::Image(charge) => [
+                (&**charge as *const QueryImageCharge as usize,
+                 charge.credit().bytes(), charge.credit().original_payer_identity_for_test()),
+                (&*charge.image.value as *const ImageMemory as usize, 0,
+                 charge.image.value.reader_budget.as_ref().unwrap().accounting_identity()),
+            ],
+            _ => [(0, 0, 0); 2],
+        }
+    }
     /// Admit and allocate the retention node BEFORE execution. A nested
     /// answer's original charge moves into it without a refund or new debit.
     #[expect(
