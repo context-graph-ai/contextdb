@@ -1025,6 +1025,18 @@ fn identity_visible(identity: &PagedVectorIdentity, snapshot: SnapshotId) -> boo
 
 /// One storage-guard-scoped admission before any native owned page copy.
 pub(super) trait PageSource {
+    /// Decode while the exact immutable table guard that was authenticated is
+    /// still borrowed. The callback prepays every owned decode allocation;
+    /// neither a second fetch nor an intermediate frame copy is needed.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn read_page<T>(
+        &self,
+        key: &[u8],
+        read: &mut dyn FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>>;
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -1056,6 +1068,23 @@ pub(super) trait PageSource {
     ) -> Result<Option<ScopedVectorCopy<(Vec<u8>, Vec<u8>)>>>;
 }
 impl<T: ReadableTable<&'static [u8], &'static [u8]>> PageSource for T {
+    fn read_page<V>(
+        &self,
+        key: &[u8],
+        read: &mut dyn FnMut(&[u8]) -> Result<V>,
+    ) -> Result<Option<V>> {
+        let value = self.get(key).map_err(RedbPersistence::storage_error)?;
+        value
+            .map(|value| {
+                #[cfg(any(test, feature = "test-seams"))]
+                contextdb_vector::hnsw::observe_paged_storage_work(
+                    contextdb_vector::hnsw::PagedVectorStorageWork::SourceRead,
+                    value.value().len(),
+                );
+                read(value.value())
+            })
+            .transpose()
+    }
     fn admitted_page(
         &self,
         key: &[u8],
@@ -1287,9 +1316,8 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
     )]
     pub(super) fn load_point(&self, id: PointId) -> Result<ScopedVectorCopy<PagedVectorPoint>> {
         let key = point_key(&self.storage, id);
-        let value = self
-            .pages
-            .admitted_page(&key, &mut |frame| {
+        self.pages
+            .read_page(&key, &mut |frame| {
                 let payload = open_graph_page(&key, frame)?;
                 if payload.len() > self.node_limit {
                     return Err(corruption("HNSW point exceeds its admitted decode window"));
@@ -1307,69 +1335,68 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
                     .checked_add(decoded)
                     .and_then(|n| n.checked_add(std::mem::size_of::<Vec<u8>>()))
                     .ok_or_else(|| corruption("paged point window size overflow"))?;
-                self.admit(window)
+                let admission = self.admit(window)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                contextdb_vector::hnsw::observe_paged_storage_work(
+                    contextdb_vector::hnsw::PagedVectorStorageWork::PageRecordDecode,
+                    payload.len(),
+                );
+                let point = match self.quantization {
+                    VectorQuantization::F32 => {
+                        let point: PagedPoint<f32> = decode_paged_point(payload, self.node_limit)
+                            .map_err(|error| {
+                            corruption(format!("paged point decode failed: {error}"))
+                        })?;
+                        if point.values.len() != self.dimension {
+                            return Err(corruption(
+                                "paged point dimension disagrees with its column",
+                            ));
+                        }
+                        PagedVectorPoint::F32(point)
+                    }
+                    VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
+                        let point: PagedPoint<u8> = decode_paged_point(payload, self.node_limit)
+                            .map_err(|error| {
+                                corruption(format!("paged point decode failed: {error}"))
+                            })?;
+                        let expected = 12usize
+                            .checked_add(if self.quantization == VectorQuantization::SQ8 {
+                                self.dimension
+                            } else {
+                                self.dimension.div_ceil(2)
+                            })
+                            .ok_or_else(|| corruption("paged quantized dimension overflow"))?;
+                        if point.values.len() != expected
+                            || point.values.len() < 12
+                            || u32::from_le_bytes(point.values[..4].try_into().unwrap()) as usize
+                                != self.dimension
+                        {
+                            return Err(corruption(
+                                "paged quantized payload disagrees with its column",
+                            ));
+                        }
+                        let min = f32::from_bits(u32::from_le_bytes(
+                            point.values[4..8].try_into().unwrap(),
+                        ));
+                        let max = f32::from_bits(u32::from_le_bytes(
+                            point.values[8..12].try_into().unwrap(),
+                        ));
+                        if !min.is_finite() || !max.is_finite() || min > max {
+                            return Err(corruption("paged quantized bounds are invalid"));
+                        }
+                        PagedVectorPoint::Quantized(point)
+                    }
+                };
+                let decoded = match &point {
+                    PagedVectorPoint::F32(point) => point.id,
+                    PagedVectorPoint::Quantized(point) => point.id,
+                };
+                if decoded != id {
+                    return Err(corruption("paged point identity disagrees with its key"));
+                }
+                Ok(ScopedVectorCopy::from_admitted(point, admission))
             })?
-            .ok_or_else(|| corruption("paged vector graph names a missing point"))?;
-        value.try_map(|value| {
-            let payload = open_graph_page(&key, value)?;
-            #[cfg(any(test, feature = "test-seams"))]
-            contextdb_vector::hnsw::observe_paged_storage_work(
-                contextdb_vector::hnsw::PagedVectorStorageWork::PageRecordDecode,
-                payload.len(),
-            );
-            let point = match self.quantization {
-                VectorQuantization::F32 => {
-                    let point: PagedPoint<f32> = decode_paged_point(payload, self.node_limit)
-                        .map_err(|error| {
-                            corruption(format!("paged point decode failed: {error}"))
-                        })?;
-                    if point.values.len() != self.dimension {
-                        return Err(corruption(
-                            "paged point dimension disagrees with its column",
-                        ));
-                    }
-                    PagedVectorPoint::F32(point)
-                }
-                VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
-                    let point: PagedPoint<u8> = decode_paged_point(payload, self.node_limit)
-                        .map_err(|error| {
-                            corruption(format!("paged point decode failed: {error}"))
-                        })?;
-                    let expected = 12usize
-                        .checked_add(if self.quantization == VectorQuantization::SQ8 {
-                            self.dimension
-                        } else {
-                            self.dimension.div_ceil(2)
-                        })
-                        .ok_or_else(|| corruption("paged quantized dimension overflow"))?;
-                    if point.values.len() != expected
-                        || point.values.len() < 12
-                        || u32::from_le_bytes(point.values[..4].try_into().unwrap()) as usize
-                            != self.dimension
-                    {
-                        return Err(corruption(
-                            "paged quantized payload disagrees with its column",
-                        ));
-                    }
-                    let min =
-                        f32::from_bits(u32::from_le_bytes(point.values[4..8].try_into().unwrap()));
-                    let max =
-                        f32::from_bits(u32::from_le_bytes(point.values[8..12].try_into().unwrap()));
-                    if !min.is_finite() || !max.is_finite() || min > max {
-                        return Err(corruption("paged quantized bounds are invalid"));
-                    }
-                    PagedVectorPoint::Quantized(point)
-                }
-            };
-            let decoded = match &point {
-                PagedVectorPoint::F32(point) => point.id,
-                PagedVectorPoint::Quantized(point) => point.id,
-            };
-            if decoded != id {
-                return Err(corruption("paged point identity disagrees with its key"));
-            }
-            Ok(point)
-        })
+            .ok_or_else(|| corruption("paged vector graph names a missing point"))
     }
 
     #[expect(
@@ -1378,9 +1405,8 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
     )]
     pub(super) fn identity(&self, data_id: usize) -> Result<ScopedVectorCopy<PagedVectorIdentity>> {
         let key = identity_key(&self.storage, data_id);
-        let value = self
-            .pages
-            .admitted_page(&key, &mut |frame| {
+        self.pages
+            .read_page(&key, &mut |frame| {
                 let payload = open_value(&key, frame)?;
                 if payload.len() < IDENTITY_HEADER_BYTES {
                     return Err(corruption("paged vector identity record is invalid"));
@@ -1399,16 +1425,14 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
                     .and_then(|n| n.checked_add(std::mem::size_of::<Vec<u8>>()))
                     .and_then(|n| n.checked_add(std::mem::size_of::<PagedVectorIdentity>()))
                     .ok_or_else(|| corruption("paged identity window size overflow"))?;
-                self.admit(window)
+                let admission = self.admit(window)?;
+                let identity = decode_identity(payload)?;
+                if identity.data_id != data_id {
+                    return Err(corruption("paged identity disagrees with its key"));
+                }
+                Ok(ScopedVectorCopy::from_admitted(identity, admission))
             })?
-            .ok_or_else(|| corruption("paged vector graph names a missing identity"))?;
-        value.try_map(|value| {
-            let identity = decode_identity(open_value(&key, value)?)?;
-            if identity.data_id != data_id {
-                return Err(corruption("paged identity disagrees with its key"));
-            }
-            Ok(identity)
-        })
+            .ok_or_else(|| corruption("paged vector graph names a missing identity"))
     }
 
     #[expect(
@@ -6307,15 +6331,27 @@ use crate::persistence::writer_source::WriterSnapshotHandle;
 #[cfg(all(test, feature = "test-seams"))]
 mod single_authentication_tests {
     use super::*;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-    use contextdb_vector::hnsw::{PagedVectorObserver, PagedVectorStorageWork, with_paged_vector_observer};
+    use contextdb_vector::hnsw::{
+        PagedVectorObserver, PagedVectorStorageWork, with_paged_vector_observer,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     #[derive(Default)]
-    struct Work { reads: AtomicUsize, auth: AtomicUsize }
+    struct Work {
+        reads: AtomicUsize,
+        auth: AtomicUsize,
+    }
     impl PagedVectorObserver for Work {
         fn storage_work(&self, kind: PagedVectorStorageWork, _: usize) {
             match kind {
-                PagedVectorStorageWork::SourceRead => { self.reads.fetch_add(1, Ordering::Relaxed); }
-                PagedVectorStorageWork::Authentication => { self.auth.fetch_add(1, Ordering::Relaxed); }
+                PagedVectorStorageWork::SourceRead => {
+                    self.reads.fetch_add(1, Ordering::Relaxed);
+                }
+                PagedVectorStorageWork::Authentication => {
+                    self.auth.fetch_add(1, Ordering::Relaxed);
+                }
                 _ => {}
             }
         }
@@ -6326,20 +6362,39 @@ mod single_authentication_tests {
         let db = redb::Database::create(dir.path().join("one-auth.redb")).unwrap();
         let storage = 1u64.to_be_bytes();
         let id = PointId(0, 0);
-        let point = PagedPoint { id, origin_id: 7, values: vec![1.0f32, 0.0], neighbours: vec![vec![]] };
+        let point = PagedPoint {
+            id,
+            origin_id: 7,
+            values: vec![1.0f32, 0.0],
+            neighbours: vec![vec![]],
+        };
         let mut encoded = Vec::new();
         encode_paged_point_into(&point, &mut encoded).unwrap();
-        let identity = PagedVectorIdentity { point: id, data_id: 7, graph_origin: 7, row_id: RowId(9), lsn: Lsn(1), created_tx: TxId(1), deleted_tx: None, exact_key: vec![3; 8] };
+        let identity = PagedVectorIdentity {
+            point: id,
+            data_id: 7,
+            graph_origin: 7,
+            row_id: RowId(9),
+            lsn: Lsn(1),
+            created_tx: TxId(1),
+            deleted_tx: None,
+            exact_key: vec![3; 8],
+        };
         let pk = point_key(&storage, id);
         let ik = identity_key(&storage, 7);
-        let frames = [seal_value(&pk, &encoded), seal_value(&ik, &encode_identity(&identity))];
+        let frames = [
+            seal_value(&pk, &encoded),
+            seal_value(&ik, &encode_identity(&identity)),
+        ];
         for corrupt in [false, true] {
             let write = db.begin_write().unwrap();
             {
                 let mut table = write.open_table(PAGES).unwrap();
                 for (key, original) in [(&pk[..], &frames[0]), (&ik[..], &frames[1])] {
                     let mut bytes = original.clone();
-                    if corrupt { bytes[0] ^= 1; }
+                    if corrupt {
+                        bytes[0] ^= 1;
+                    }
                     table.insert(key, bytes.as_slice()).unwrap();
                 }
             }
@@ -6347,9 +6402,21 @@ mod single_authentication_tests {
             let read = db.begin_read().unwrap();
             let pages = read.open_table(PAGES).unwrap();
             let admits = std::cell::Cell::new(0);
-            let mut admission = |_bytes| { admits.set(admits.get() + 1); Ok(None) };
-            let admission = RefCell::new(&mut admission as &mut dyn FnMut(usize) -> Result<Option<VectorCopyAdmission>>);
-            let lookup = PagedLookup { admission: Some(&admission), pages: &pages, storage, dimension: 2, quantization: VectorQuantization::F32, node_limit: 4096 };
+            let mut admission = |_bytes| {
+                admits.set(admits.get() + 1);
+                Ok(None)
+            };
+            let admission = RefCell::new(
+                &mut admission as &mut dyn FnMut(usize) -> Result<Option<VectorCopyAdmission>>,
+            );
+            let lookup = PagedLookup {
+                admission: Some(&admission),
+                pages: &pages,
+                storage,
+                dimension: 2,
+                quantization: VectorQuantization::F32,
+                node_limit: 4096,
+            };
             let work = Arc::new(Work::default());
             with_paged_vector_observer(work.clone(), || {
                 let p = lookup.load_point(id);
@@ -6359,13 +6426,28 @@ mod single_authentication_tests {
                     assert!(matches!(i, Err(Error::StoreCorrupted { .. })));
                     assert_eq!(admits.get(), 0, "damaged frames never reach copy admission");
                 } else {
-                    match &*p.unwrap() { PagedVectorPoint::F32(p) => assert_eq!(p.origin_id, 7), _ => panic!("wrong representation") }
+                    match &*p.unwrap() {
+                        PagedVectorPoint::F32(p) => assert_eq!(p.origin_id, 7),
+                        _ => panic!("wrong representation"),
+                    }
                     assert_eq!(i.unwrap().row_id, RowId(9));
-                    assert_eq!(admits.get(), 2, "one existing admission per requested record");
+                    assert_eq!(
+                        admits.get(),
+                        2,
+                        "one existing admission per requested record"
+                    );
                 }
             });
-            assert_eq!(work.reads.load(Ordering::Relaxed), 2, "one actual table fetch per requested record");
-            assert_eq!(work.auth.load(Ordering::Relaxed), 2, "authenticate each immutable fetched frame exactly once");
+            assert_eq!(
+                work.reads.load(Ordering::Relaxed),
+                2,
+                "one actual table fetch per requested record"
+            );
+            assert_eq!(
+                work.auth.load(Ordering::Relaxed),
+                2,
+                "authenticate each immutable fetched frame exactly once"
+            );
         }
     }
 }
