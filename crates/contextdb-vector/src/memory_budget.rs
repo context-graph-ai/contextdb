@@ -322,7 +322,7 @@ pub struct VectorCopyAdmission {
     used_bytes: usize,
     historical_durable_reads: bool,
     raw_only_sources: bool,
-    control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    _control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 
 impl Debug for VectorCopyAdmission {
@@ -343,7 +343,7 @@ impl VectorCopyAdmission {
         let control_invoice = accountant.control_invoice();
         Self {
             accountant,
-            control_invoice,
+            _control_invoice: control_invoice,
             prepaid: None,
             prepaid_bytes: 0,
             prepaid_control_bytes: 0,
@@ -395,7 +395,7 @@ impl VectorCopyAdmission {
         // Box allocation retains its existing process OOM behavior.
         Ok(Self {
             accountant,
-            control_invoice,
+            _control_invoice: control_invoice,
             prepaid: Some(Box::new(charge.take().expect("pending prepaid charge"))),
             prepaid_bytes,
             prepaid_control_bytes,
@@ -412,7 +412,7 @@ impl VectorCopyAdmission {
         receipt.prepaid_bytes = self.prepaid_bytes;
         receipt.additional_bytes = self.additional_bytes;
         receipt.prepaid_control_bytes = self.prepaid_control_bytes;
-        receipt.admission_control_invoice_present = self.control_invoice.is_some();
+        receipt.admission_control_invoice_present = self._control_invoice.is_some();
         receipt.owner_payload_pointer = self.accountant.accounting_identity();
         let (payer, control_present, original) = self.accountant.original_read_payer_for_test();
         receipt.forwarding_payer = payer;

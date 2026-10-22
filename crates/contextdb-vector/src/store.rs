@@ -3367,7 +3367,7 @@ impl PagedVectorSourceSelection {
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn empty_declared_state(&self, owner: &mut VectorCopyAdmission) -> Result<Option<VectorQueryState>> {
         self.catalog.catalog.validate()?;
-        if self.partitioned || self.len() != 0 { return Ok(None); }
+        if self.partitioned || !self.is_empty() { return Ok(None); }
         let mut control = owner.scratch();
         control.reserve(contextdb_tx::staged_source::source_arc_layout::<IndexState>().size()
             .checked_add(contextdb_tx::staged_source::source_arc_layout::<RwLock<()>>().size())
@@ -6966,6 +6966,7 @@ impl IndexState {
     /// Capture durable serving metadata once, then freeze the actual registry
     /// serving chain when this is the writer's current physical publication.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn capture_serving_selection(
         &self, snapshot: SnapshotId, owner: &mut VectorCopyAdmission,
     ) -> Result<Option<Arc<CapturedVectorServingSelection>>> {
@@ -19281,7 +19282,7 @@ impl VectorStore {
     ) -> Result<Vec<VectorPartitionInfo>> {
         if let Some(selection) = self.capture_paged_partition_sources(index, owner)? {
             let layout = self.scoped_index_layout(index, owner)?;
-            if selection.len() != 0 || layout.is_partitioned() {
+            if !selection.is_empty() || layout.is_partitioned() {
                 let count = selection.counts()[3];
                 owner.reserve(count.checked_mul(std::mem::size_of::<VectorPartitionInfo>())
                     .ok_or_else(|| Error::Other("vector inspection output size overflow".into()))?)?;
