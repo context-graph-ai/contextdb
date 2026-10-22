@@ -252,3 +252,6 @@ mod reads_are_answered_while_a_maintenance_commit_holds_the_commit_gate;
 
 #[path = "engine_seams/a_reads_erasure_check_does_fixed_work_however_much_history_there_is.rs"]
 mod a_reads_erasure_check_does_fixed_work_however_much_history_there_is;
+
+#[path = "engine_seams/many_catalog_maintenance.rs"]
+mod many_catalog_maintenance;
