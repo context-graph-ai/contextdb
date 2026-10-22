@@ -6328,12 +6328,12 @@ mod admitted_navigation_body_tests {
                     used.checked_add(bytes).filter(|next| *next <= limit)
                 })
                 .map_err(|used| Error::MemoryBudgetExceeded {
-                    subsystem: subsystem.into(),
-                    operation: operation.into(),
+                    subsystem: subsystem.to_owned().into(),
+                    operation: operation.to_owned().into(),
                     requested_bytes: bytes,
                     available_bytes: limit.saturating_sub(used),
                     budget_limit_bytes: limit,
-                    hint: hint.into(),
+                    hint: hint.to_owned().into(),
                 })?;
             Ok(())
         }
