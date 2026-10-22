@@ -2869,7 +2869,11 @@ pub mod statement_child_proof {
                 let target = record.child_identity == sample.identity.target_identity;
                 let delta = held as i128 - self.context.held as i128;
                 if !self.legacy && target {
-                    sample.peak = sample.peak.max(held + self.context.control_bytes as u64);
+                    let completed_peak = held + self.context.control_bytes as u64;
+                    if completed_peak > sample.peak {
+                        PEAK_COMPLETED.with(|slot| slot.set(Some(record)));
+                        sample.peak = completed_peak;
+                    }
                     sample.final_bytes = held;
                     sample.refusals += usize::from(self.refused.get());
                     sample.single_child_parent_mismatches += usize::from(
@@ -3113,6 +3117,7 @@ pub mod statement_child_proof {
         }
     }
     thread_local! {
+        static PEAK_COMPLETED: Cell<Option<Event>> = const { Cell::new(None) };
         static CALL: Cell<Option<CallContext>> = const { Cell::new(None) };
         static FORWARD: Cell<Option<ForwardContext>> = const { Cell::new(None) };
         static ACTIVE: Cell<Option<Observation>> = const { Cell::new(None) };
@@ -3170,6 +3175,10 @@ pub mod statement_child_proof {
                 ACTIVE.with(|slot| slot.set(self.0));
             }
         }
+        static DIAGNOSTIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let diagnostic =
+            *DIAGNOSTIC.get_or_init(|| std::env::var_os("CONTEXTDB_NATIVE_PEAK_PHASES").is_some());
+        PEAK_COMPLETED.with(|slot| slot.set(None));
         CALL.with(|_| ());
         FORWARD.with(|_| ());
         let before = parent.retained.load(Ordering::SeqCst);
@@ -3190,6 +3199,18 @@ pub mod statement_child_proof {
             reconcile_parent(&mut sample, after);
         }
         drop(restore);
+        if diagnostic {
+            eprintln!(
+                "native_completed_peak pid={} limit={} parent_before={} parent_after={} control={} peak={} completed={:?}",
+                std::process::id(),
+                sample.limit,
+                sample.parent_before,
+                sample.parent_after,
+                sample.control_bytes,
+                sample.peak,
+                PEAK_COMPLETED.with(Cell::get)
+            );
+        }
         (result, sample)
     }
     pub(super) fn native_created(

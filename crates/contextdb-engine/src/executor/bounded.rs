@@ -390,6 +390,14 @@ impl TraceMemoryOwner {
             None => ControlArc::<Self>::admit(owner.clone())?,
         };
         let underlying = owner.control_invoice();
+        #[cfg(all(test, feature = "test-seams"))]
+        if native_trace_refund.is_some() {
+            crate::database::ordinary_native_owner_tests::trace_control_preallocation(
+                1,
+                invoice.original_payer_identity_for_test(),
+                invoice.bytes(),
+            );
+        }
         let control = ControlArc::from_prepaid(
             Self {
                 owner,

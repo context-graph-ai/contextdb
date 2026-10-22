@@ -311,6 +311,12 @@ impl<T> ControlArc<T> {
         crate::vector_read_memory::statement_child_proof::funding_next(
             payload.original_payer_for_test(),
         );
+        #[cfg(all(test, feature = "test-seams"))]
+        crate::database::ordinary_native_owner_tests::trace_control_preallocation(
+            0,
+            keeper.original_payer_identity_for_test(),
+            keeper.bytes(),
+        );
         let invoice = ReadShared::try_from_prepaid(payload, keeper)?;
         #[cfg(all(test, feature = "test-seams"))]
         crate::database::ordinary_native_owner_tests::trace_control_allocated(

@@ -127,6 +127,20 @@ pub(crate) fn trace_admission_begin(payer: usize) {
             unsafe { &*(c.parent_counter as *const AtomicU64) }.load(Ordering::SeqCst) as usize;
     });
 }
+// Fixed PREALLOCATIONADMIT scalar: sampled after the genuine invoice
+// admits and before its physical request. This is not the original allocator's
+// first-256 pre-System sample, which does not cover these late trace requests.
+pub(crate) fn trace_control_preallocation(stage: usize, payer: usize, invoice_bytes: usize) {
+    update(|c| {
+        if stage >= 2 || payer != c.payer || invoice_bytes == 0 {
+            c.invalid = true;
+            return;
+        }
+        c.trace_credits[stage] =
+            unsafe { &*(c.parent_counter as *const AtomicU64) }.load(Ordering::SeqCst) as usize;
+    });
+}
+
 pub(crate) fn trace_control_allocated(
     stage: usize,
     payload: usize,
@@ -381,7 +395,7 @@ impl Observation {
                 assert_eq!(c.trace_parent[stage], c.trace_before + trace_bytes);
                 assert_eq!(
                     c.trace_credits[stage], c.trace_parent[stage],
-                    "same original parent funded this actual allocation before System.alloc"
+                    "PREALLOCATIONADMIT and actual-allocation samples retain the same original parent debit"
                 );
             }
         }
@@ -468,11 +482,13 @@ fn observed<T>(db: &Database, action: impl FnOnce() -> T) -> (T, [Request; 3], u
         }
         for stage in 0..c.trace_stages {
             let ordinal = c.trace_ordinals[stage];
-            if ordinal == 0 || ordinal > count || requests[ordinal - 1] != c.trace_requests[stage] {
+            if ordinal == 0 || ordinal > count || c.trace_credits[stage] == 0 {
                 c.invalid = true;
                 return;
             }
-            c.trace_credits[stage] = credits[ordinal - 1];
+            // Pointer/Layout are independently captured from the allocator's
+            // actual last request in trace_control_allocated, not reconstructed
+            // through the original first-256 funding recorder.
         }
     });
     (value, requests[..3].try_into().unwrap(), count)
