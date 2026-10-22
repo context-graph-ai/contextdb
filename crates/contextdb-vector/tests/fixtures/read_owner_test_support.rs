@@ -1,10 +1,13 @@
 //! Vector fixture copies retain the executing request's real reader capability.
-use contextdb_core::{Result, read_memory::ReadMemoryBudget};
+use contextdb_core::{
+    Result,
+    read_memory::{ReadMemoryBudget, ReadMemoryOwner},
+};
 use contextdb_vector::MemoryBudget;
 use std::sync::Arc;
 
 #[derive(Debug)]
-struct ReadVectorBudget(Arc<dyn ReadMemoryBudget>);
+struct ReadVectorBudget(ReadMemoryOwner);
 impl MemoryBudget for ReadVectorBudget {
     fn try_allocate_for(&self, bytes: usize, _: &str, _: &str, _: &str) -> Result<()> {
         self.0.try_reserve(
@@ -19,6 +22,6 @@ impl MemoryBudget for ReadVectorBudget {
     }
 }
 
-pub fn budget(reader: Arc<dyn ReadMemoryBudget>) -> Arc<dyn MemoryBudget> {
+pub fn budget(reader: ReadMemoryOwner) -> Arc<dyn MemoryBudget> {
     Arc::new(ReadVectorBudget(reader))
 }

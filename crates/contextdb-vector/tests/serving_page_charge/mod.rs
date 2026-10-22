@@ -193,7 +193,7 @@ impl WriteSetApplicator for TestStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<()> {
         let executing_owner = read_owner_test_support::budget(read_memory);
         // Capture the exact committed body before this fixture publishes inserts.
@@ -494,7 +494,7 @@ pub fn fixture() -> Fixture {
             LoadedVectorGraphGeneration {
                 graph,
                 resident_bytes,
-                accountant: budget.clone(),
+                accountant: budget.clone().into(),
                 caller_adopted_bytes: 0,
                 fresh_tail: None,
             },

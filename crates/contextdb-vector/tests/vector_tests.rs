@@ -262,7 +262,7 @@ impl WriteSetApplicator for TestStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<()> {
         let executing_owner = read_owner_test_support::budget(read_memory);
         // Capture the exact committed body before this fixture publishes inserts.
@@ -540,7 +540,7 @@ fn search_returns_top_k_descending() {
         index(),
         RowId(1),
         vec![1.0, 0.0],
-        Arc::new(MemoryAccountant::no_limit()),
+        Arc::new(MemoryAccountant::no_limit()).into(),
     )
     .unwrap();
     exec.insert_vector(
@@ -548,7 +548,7 @@ fn search_returns_top_k_descending() {
         index(),
         RowId(2),
         vec![0.9, 0.1],
-        Arc::new(MemoryAccountant::no_limit()),
+        Arc::new(MemoryAccountant::no_limit()).into(),
     )
     .unwrap();
     exec.insert_vector(
@@ -556,7 +556,7 @@ fn search_returns_top_k_descending() {
         index(),
         RowId(3),
         vec![0.0, 1.0],
-        Arc::new(MemoryAccountant::no_limit()),
+        Arc::new(MemoryAccountant::no_limit()).into(),
     )
     .unwrap();
     tx_mgr
@@ -570,7 +570,7 @@ fn search_returns_top_k_descending() {
             2,
             None,
             tx_mgr.snapshot(),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_eq!(r.len(), 2);
@@ -602,7 +602,7 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
             3,
             None,
             SnapshotId(10_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_eq!(
@@ -632,7 +632,7 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
             8,
             None,
             SnapshotId(50_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert!(store.has_hnsw_index_for(&r));
@@ -709,7 +709,7 @@ fn public_search_ties_order_by_row_id_in_bruteforce_and_hnsw_paths() {
                 Ok(LoadedVectorGraphGeneration {
                     graph,
                     resident_bytes,
-                    accountant: self.owner.clone(),
+                    accountant: self.owner.clone().into(),
                     caller_adopted_bytes: resident_bytes,
                     fresh_tail: None,
                 })
@@ -913,7 +913,7 @@ fn hnsw_exact_duplicate_bucket_orders_by_row_id_before_search_cap() {
             8,
             None,
             SnapshotId(20_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
 
@@ -951,7 +951,7 @@ fn hnsw_allowed_exact_duplicate_bucket_orders_by_row_id_before_search_cap() {
             8,
             Some(&candidates),
             SnapshotId(20_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
 
@@ -988,7 +988,7 @@ fn zero_norm_query_uses_public_row_id_tie_order_with_materialized_hnsw() {
         8,
         None,
         SnapshotId(30_000),
-        accountant.clone(),
+        accountant.clone().into(),
     )
     .unwrap();
     assert!(store.has_hnsw_index_for(&r));
@@ -1000,7 +1000,7 @@ fn zero_norm_query_uses_public_row_id_tie_order_with_materialized_hnsw() {
             8,
             None,
             SnapshotId(30_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
 
@@ -1131,7 +1131,7 @@ fn restricted_layered_search_returns_all_current_rows_with_fixed_history_work() 
                     LoadedVectorGraphGeneration {
                         graph,
                         resident_bytes,
-                        accountant: accountant.clone(),
+                        accountant: accountant.clone().into(),
                         caller_adopted_bytes: 0,
                         fresh_tail: None,
                     },
@@ -1157,7 +1157,7 @@ fn restricted_layered_search_returns_all_current_rows_with_fixed_history_work() 
                     generation.fresh_tail = Some(LoadedVectorFreshTail {
                         graph,
                         resident_bytes,
-                        accountant: accountant.clone(),
+                        accountant: accountant.clone().into(),
                         replayed_through_lsn: Lsn(3),
                     });
                 }
@@ -1317,7 +1317,7 @@ fn candidate_prefilter_is_applied() {
         index(),
         RowId(1),
         vec![1.0, 0.0],
-        Arc::new(MemoryAccountant::no_limit()),
+        Arc::new(MemoryAccountant::no_limit()).into(),
     )
     .unwrap();
     exec.insert_vector(
@@ -1325,7 +1325,7 @@ fn candidate_prefilter_is_applied() {
         index(),
         RowId(2),
         vec![0.9, 0.1],
-        Arc::new(MemoryAccountant::no_limit()),
+        Arc::new(MemoryAccountant::no_limit()).into(),
     )
     .unwrap();
     tx_mgr
@@ -1342,7 +1342,7 @@ fn candidate_prefilter_is_applied() {
             5,
             Some(&cands),
             tx_mgr.snapshot(),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_eq!(r.len(), 1);
@@ -1360,7 +1360,7 @@ fn mvcc_snapshot_isolation() {
         index(),
         RowId(1),
         vec![1.0, 0.0],
-        Arc::new(MemoryAccountant::no_limit()),
+        Arc::new(MemoryAccountant::no_limit()).into(),
     )
     .unwrap();
     tx_mgr
@@ -1375,7 +1375,7 @@ fn mvcc_snapshot_isolation() {
         index(),
         RowId(2),
         vec![0.9, 0.1],
-        Arc::new(MemoryAccountant::no_limit()),
+        Arc::new(MemoryAccountant::no_limit()).into(),
     )
     .unwrap();
     tx_mgr
@@ -1383,7 +1383,14 @@ fn mvcc_snapshot_isolation() {
         .unwrap();
 
     let old = exec
-        .search(index(), &[1.0, 0.0], 10, None, snap1, accountant.clone())
+        .search(
+            index(),
+            &[1.0, 0.0],
+            10,
+            None,
+            snap1,
+            accountant.clone().into(),
+        )
         .unwrap();
     assert_eq!(old.len(), 1);
 
@@ -1394,7 +1401,7 @@ fn mvcc_snapshot_isolation() {
             10,
             None,
             tx_mgr.snapshot(),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_eq!(new.len(), 2);
@@ -1410,7 +1417,7 @@ fn dimension_mismatch_errors() {
         index(),
         RowId(1),
         vec![1.0, 0.0],
-        Arc::new(MemoryAccountant::no_limit()),
+        Arc::new(MemoryAccountant::no_limit()).into(),
     )
     .unwrap();
     tx_mgr
@@ -1424,7 +1431,7 @@ fn dimension_mismatch_errors() {
             index(),
             RowId(2),
             vec![1.0, 0.0, 0.0],
-            Arc::new(MemoryAccountant::no_limit()),
+            Arc::new(MemoryAccountant::no_limit()).into(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -1448,7 +1455,7 @@ fn k_zero_returns_empty_and_empty_store_returns_empty() {
             0,
             None,
             tx_mgr.snapshot(),
-            accountant.clone()
+            accountant.clone().into()
         )
         .unwrap()
         .is_empty()
@@ -1460,7 +1467,7 @@ fn k_zero_returns_empty_and_empty_store_returns_empty() {
             10,
             None,
             tx_mgr.snapshot(),
-            accountant.clone()
+            accountant.clone().into()
         )
         .unwrap()
         .is_empty()
@@ -1472,7 +1479,7 @@ fn k_zero_returns_empty_and_empty_store_returns_empty() {
             10,
             None,
             tx_mgr.snapshot(),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -1495,7 +1502,7 @@ fn float32_precision_is_preserved() {
         index(),
         RowId(1),
         vec![0.12345679, 0.9876543],
-        Arc::new(MemoryAccountant::no_limit()),
+        Arc::new(MemoryAccountant::no_limit()).into(),
     )
     .unwrap();
     tx_mgr
@@ -1509,7 +1516,7 @@ fn float32_precision_is_preserved() {
             1,
             None,
             tx_mgr.snapshot(),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_eq!(r.len(), 1);
@@ -1536,7 +1543,7 @@ fn concurrent_same_ref_updates_in_order(first_tx: u64) {
         1,
         None,
         SnapshotId(20_000),
-        accountant.clone(),
+        accountant.clone().into(),
     )
     .unwrap();
 
@@ -1632,7 +1639,7 @@ fn concurrent_same_ref_updates_in_order(first_tx: u64) {
             1,
             None,
             SnapshotId(40_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_top_row(&result, RowId(7));
@@ -1866,7 +1873,7 @@ fn same_ref_concurrent_writes_brute_force_and_hnsw_agree() {
         1,
         None,
         SnapshotId(20_000),
-        accountant.clone(),
+        accountant.clone().into(),
     )
     .unwrap();
 
@@ -1906,7 +1913,7 @@ fn same_ref_concurrent_writes_brute_force_and_hnsw_agree() {
             50,
             None,
             snapshot,
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     insert_fixture_vectors(
@@ -1923,7 +1930,7 @@ fn same_ref_concurrent_writes_brute_force_and_hnsw_agree() {
             50,
             None,
             snapshot,
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_eq!(hnsw.len(), brute.len());
@@ -1949,7 +1956,7 @@ fn same_ref_concurrent_deletes_leave_no_zombie_hnsw_entries() {
         1,
         None,
         SnapshotId(20_000),
-        accountant.clone(),
+        accountant.clone().into(),
     )
     .unwrap();
 
@@ -1988,7 +1995,7 @@ fn same_ref_concurrent_deletes_leave_no_zombie_hnsw_entries() {
             20,
             None,
             SnapshotId(40_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert!(result.iter().all(|(row, _)| row.0 > 10));
@@ -2117,7 +2124,7 @@ fn same_ref_apply_finishes_while_same_ref_hnsw_build_is_paused() {
             1,
             None,
             SnapshotId(40_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_top_row(&result, RowId(7));
@@ -2138,7 +2145,7 @@ fn insert_vector_at_wrong_dimension_returns_typed_error_for_target_ref() {
             a.clone(),
             RowId(1),
             vec![1.0, 0.0, 0.0, 0.0],
-            Arc::new(MemoryAccountant::no_limit()),
+            Arc::new(MemoryAccountant::no_limit()).into(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -2221,7 +2228,7 @@ fn run_distinct_ref_build_overlap_case(test_first_build: bool) {
             1,
             None,
             SnapshotId(50_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     let b_result = exec
@@ -2231,7 +2238,7 @@ fn run_distinct_ref_build_overlap_case(test_first_build: bool) {
             1,
             None,
             SnapshotId(50_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
 
@@ -2374,7 +2381,7 @@ fn reindex_on_index_a_does_not_block_ingest_on_index_b() {
             1,
             None,
             SnapshotId(60_000),
-            accountant_a.clone(),
+            accountant_a.clone().into(),
         );
         done_a_tx.send(result).unwrap();
     });
@@ -2405,7 +2412,7 @@ fn reindex_on_index_a_does_not_block_ingest_on_index_b() {
                     1,
                     None,
                     SnapshotId(80_000 + i),
-                    accountant_b.clone(),
+                    accountant_b.clone().into(),
                 )
                 .unwrap();
             rows.push(result[0]);
@@ -2505,7 +2512,7 @@ fn search_on_ref_a_returns_only_ref_a_vectors_under_10000_iteration_apply_storm(
                 5,
                 None,
                 SnapshotId(100_000),
-                accountant.clone(),
+                accountant.clone().into(),
             )
             .unwrap();
         assert!(result.iter().all(|(row, _)| a_rows.contains(row)));
@@ -2539,7 +2546,7 @@ fn dimension_mismatch_typed_error_with_positive_control() {
             1,
             None,
             SnapshotId(20),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -2558,7 +2565,7 @@ fn dimension_mismatch_typed_error_with_positive_control() {
                 1,
                 None,
                 SnapshotId(20),
-                accountant.clone(),
+                accountant.clone().into(),
             )
             .unwrap(),
         RowId(1),
@@ -2571,7 +2578,7 @@ fn dimension_mismatch_typed_error_with_positive_control() {
             1,
             None,
             SnapshotId(20),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -2590,7 +2597,7 @@ fn dimension_mismatch_typed_error_with_positive_control() {
                 1,
                 None,
                 SnapshotId(20),
-                accountant.clone(),
+                accountant.clone().into(),
             )
             .unwrap(),
         RowId(2),
@@ -2664,7 +2671,7 @@ fn selected_index_row_pruning_preserves_unrelated_resident_generation_and_indexe
                 LoadedVectorGraphGeneration {
                     graph,
                     resident_bytes,
-                    accountant: accountant.clone(),
+                    accountant: accountant.clone().into(),
                     caller_adopted_bytes: 0,
                     fresh_tail: None,
                 },
@@ -2856,7 +2863,7 @@ fn replace_loaded_vectors_and_clear_hnsw_post_state_correct_with_balanced_accoun
                 1,
                 None,
                 SnapshotId(70_000),
-                accountant.clone(),
+                accountant.clone().into(),
             )
             .unwrap(),
         RowId(7),
@@ -2933,7 +2940,7 @@ fn bulk_pause_blocks_unrelated_lazy_hnsw_build_then_build_completes() {
             1,
             None,
             SnapshotId(50_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_top_row(&result, RowId(100_000));
@@ -3021,7 +3028,7 @@ fn deregister_table_does_not_wait_for_unrelated_hnsw_build() {
             1,
             None,
             SnapshotId(50_000),
-            accountant.clone(),
+            accountant.clone().into(),
         )
         .unwrap();
     assert_top_row(&result, RowId(100_000));
@@ -3222,7 +3229,7 @@ fn unknown_vector_index_error_under_concurrent_multi_ref_apply_with_positive_con
                 1,
                 None,
                 SnapshotId(10_000),
-                accountant.clone(),
+                accountant.clone().into(),
             )
             .unwrap_err();
         assert!(matches!(err, Error::UnknownVectorIndex { index } if index == c));
@@ -3233,7 +3240,7 @@ fn unknown_vector_index_error_under_concurrent_multi_ref_apply_with_positive_con
                 1,
                 None,
                 SnapshotId(10_000),
-                accountant.clone(),
+                accountant.clone().into(),
             )
             .unwrap();
         assert!(!ok.is_empty());
@@ -3301,7 +3308,7 @@ fn memory_accountant_rejection_on_a_leaves_b_accountant_byte_balance_correct() {
             1,
             None,
             SnapshotId(50_000),
-            Arc::new(MemoryAccountant::no_limit()),
+            Arc::new(MemoryAccountant::no_limit()).into(),
         )
         .unwrap();
     assert_top_row(&a_result, RowId(1));
@@ -3324,7 +3331,7 @@ fn memory_accountant_rejection_on_a_leaves_b_accountant_byte_balance_correct() {
             1,
             None,
             SnapshotId(50_000),
-            Arc::new(MemoryAccountant::no_limit()),
+            Arc::new(MemoryAccountant::no_limit()).into(),
         )
         .unwrap();
     assert_top_row(&b_result, RowId(100_000));
@@ -3427,7 +3434,7 @@ fn concurrent_distinct_hnsw_builds_do_not_oversubscribe_transient_budget() {
             1,
             None,
             SnapshotId(50_000),
-            Arc::new(MemoryAccountant::no_limit()),
+            Arc::new(MemoryAccountant::no_limit()).into(),
         )
         .unwrap();
     assert_top_row(&b_result, RowId(100_000));
@@ -3526,7 +3533,7 @@ fn same_ref_concurrent_hnsw_builders_reserve_and_install_once() {
             1,
             None,
             SnapshotId(50_000),
-            Arc::new(MemoryAccountant::no_limit()),
+            Arc::new(MemoryAccountant::no_limit()).into(),
         )
         .unwrap();
     let r2 = exec
@@ -3536,7 +3543,7 @@ fn same_ref_concurrent_hnsw_builders_reserve_and_install_once() {
             1,
             None,
             SnapshotId(50_000),
-            Arc::new(MemoryAccountant::no_limit()),
+            Arc::new(MemoryAccountant::no_limit()).into(),
         )
         .unwrap();
     assert_top_row(&r1, RowId(1));
@@ -3673,7 +3680,7 @@ fn two_independent_vector_stores_do_not_share_maintenance_locks() {
             1,
             None,
             SnapshotId(70_000),
-            accountant_2.clone(),
+            accountant_2.clone().into(),
         )
         .unwrap();
     let one_still_paused = done_1_rx.try_recv();
@@ -3686,7 +3693,7 @@ fn two_independent_vector_stores_do_not_share_maintenance_locks() {
             1,
             None,
             SnapshotId(50_000),
-            accountant_1.clone(),
+            accountant_1.clone().into(),
         )
         .unwrap();
     assert_top_row(&result_2, RowId(99_999));
