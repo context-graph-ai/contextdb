@@ -15,6 +15,8 @@ type Request = (usize, usize, usize);
 struct Capture {
     active: bool,
     invalid: bool,
+    invalid_site: u32,
+    actual_constructor_requests: [(usize, usize, usize, usize); 3],
     parent: usize,
     parent_counter: usize,
     baseline: u64,
@@ -57,7 +59,7 @@ thread_local! { static ANSWER_TRACE: Cell<AnswerTraceCapture> = const { Cell::ne
 thread_local! {
     static HOOK_BUSY: Cell<bool> = const { Cell::new(false) };
     static CAPTURE: Cell<Capture> = const { Cell::new(Capture {
-        active: false, invalid: false, parent: 0, parent_counter: 0,
+        active: false, invalid: false, invalid_site: 0, actual_constructor_requests: [(0,0,0,0);3], parent: 0, parent_counter: 0,
         baseline: 0, children: 0, stages: 0, requests: [(0, 0, 0); 3],
         trace_requests: [(0,0,0); 2], trace_ordinals: [0; 2], trace_invoices: [(0,0); 2], trace_stages: 0,
         trace_before: 0, trace_parent: [0; 2], trace_credits: [0; 2],
@@ -79,6 +81,9 @@ fn update(action: impl FnOnce(&mut Capture)) {
         }
         if HOOK_BUSY.with(|busy| busy.replace(true)) {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
             slot.set(c);
             return;
         }
@@ -102,10 +107,14 @@ fn record(c: &mut Capture, stage: usize, payload: usize, expected: Layout) {
     let inventory = crate::executor::bounded::ordinary_native_control_layouts_for_test();
     if inventory.get(stage).copied() != Some(expected) {
         c.invalid = true;
+        if c.invalid_site == 0 {
+            c.invalid_site = line!();
+        }
         return;
     }
     let (bytes, align, ordinal) = oracle::last_request_for_test(false);
     let pointer = oracle::last_request_pointer_for_test();
+    c.actual_constructor_requests[stage] = (pointer, bytes, align, ordinal);
     if c.stages != stage
         || pointer == 0
         || ordinal != stage + 1
@@ -114,6 +123,9 @@ fn record(c: &mut Capture, stage: usize, payload: usize, expected: Layout) {
         || payload >= pointer.saturating_add(bytes)
     {
         c.invalid = true;
+        if c.invalid_site == 0 {
+            c.invalid_site = line!();
+        }
         return;
     }
     c.requests[stage] = (pointer, bytes, align);
@@ -132,6 +144,9 @@ pub(crate) fn trace_admission_begin(payer: usize) {
     update(|c| {
         if payer != c.payer || c.trace_stages != 0 {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
             return;
         }
         c.trace_before =
@@ -145,6 +160,9 @@ pub(crate) fn trace_control_preallocation(stage: usize, payer: usize, invoice_by
     update(|c| {
         if stage >= 2 || payer != c.payer || invoice_bytes == 0 {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
             return;
         }
         c.trace_credits[stage] =
@@ -199,6 +217,9 @@ pub(crate) fn trace_control_allocated(
             || (stage == 1 && ordinal != c.trace_ordinals[0] + 1)
         {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
             return;
         }
         if oracle::source_free_for_test(c.stages + c.trace_stages)[..c.stages + c.trace_stages]
@@ -206,6 +227,9 @@ pub(crate) fn trace_control_allocated(
             .any(|free| free.2 != 0)
         {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
             return;
         }
         c.trace_requests[stage] = (pointer, bytes, align);
@@ -231,13 +255,22 @@ pub(crate) fn child_allocated(
         c.children += 1;
         if c.parent != parent as *const _ as usize {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
         }
         if c.parent_counter != counter as *const _ as usize {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
         }
         record(c, 0, pointer, layout);
         if c.requests[0].0 != pointer {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
         }
     });
 }
@@ -252,9 +285,15 @@ pub(crate) fn child_counter(
             || (c.child_counter != 0 && c.child_counter != counter as *const _ as usize)
         {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
         }
         if c.child_limit != 0 && c.child_limit != limit {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
         }
         c.child_limit = limit;
         c.child_payload = payload;
@@ -274,6 +313,9 @@ pub(crate) fn keeper_allocated(
         c.payload_invoice_bytes = payload_bytes;
         if owner != c.requests[0].0 || payer != owner || c.child_counter == 0 {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
         } else {
             // SAFETY: construction currently borrows the live native child.
             c.child_at_keeper =
@@ -295,6 +337,9 @@ pub(crate) fn forwarding_allocated(
         c.inner_invoice_payload = inner_invoice;
         if owner != c.payer || c.child_counter == 0 {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
         } else {
             // SAFETY: this constructor still owns the native child.
             c.child_at_forwarding =
@@ -364,7 +409,13 @@ impl Observation {
         let c = CAPTURE.with(Cell::get);
         assert!(
             !c.invalid,
-            "constructor order, pointer, original payer, or observer reentry invalid"
+            "constructor receipt invalid at line {}; children={} stages={} trace_stages={} actual={:?} expected={:?}",
+            c.invalid_site,
+            c.children,
+            c.stages,
+            c.trace_stages,
+            c.actual_constructor_requests,
+            c.requests
         );
         c
     }
@@ -507,11 +558,17 @@ fn observed<T>(db: &Database, action: impl FnOnce() -> T) -> (T, [Request; 3], u
     update(|c| {
         if c.stages > 3 || count < c.stages {
             c.invalid = true;
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
             return;
         }
         for stage in 0..c.stages {
             if c.requests[stage] != requests[stage] {
                 c.invalid = true;
+                if c.invalid_site == 0 {
+                    c.invalid_site = line!();
+                }
             }
             c.allocator_funding[stage] = credits[stage];
         }
@@ -519,6 +576,9 @@ fn observed<T>(db: &Database, action: impl FnOnce() -> T) -> (T, [Request; 3], u
             let ordinal = c.trace_ordinals[stage];
             if ordinal == 0 || ordinal > count || c.trace_credits[stage] == 0 {
                 c.invalid = true;
+                if c.invalid_site == 0 {
+                    c.invalid_site = line!();
+                }
                 return;
             }
             // Pointer/Layout are independently captured from the allocator's
@@ -1419,12 +1479,18 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
         // A file-backed fixture can retain a separate setup owner. Its
         // independently captured initial control set is unchanged by freeing
         // all eight requests above; never count it as this query's dead trace.
-        let first_created = sample.identity.target_created.expect("actual first constructor");
+        let first_created = sample
+            .identity
+            .target_created
+            .expect("actual first constructor");
         assert_eq!(first_created.child_control_bytes, native_requests[0].1);
-        let standing_controls = first_created.live_controls_after
-            .checked_sub(native_requests[0].1 as u64).unwrap();
+        let standing_controls = first_created
+            .live_controls_after
+            .checked_sub(native_requests[0].1 as u64)
+            .unwrap();
         assert_eq!(
-            actual.live_controls_before, standing_controls + native_requests[0].1 as u64,
+            actual.live_controls_before,
+            standing_controls + native_requests[0].1 as u64,
             "only the preexisting fixture controls and the new actual native block remain"
         );
         assert_eq!(refusal.parent_before, stable);
