@@ -474,3 +474,124 @@ fn consolidation_transaction_rollback_does_not_publish_local_autocommit_metadata
         db.close().unwrap();
     }
 }
+
+#[test]
+fn consolidation_failure_before_and_after_durability_keeps_one_authoritative_declaration() {
+    for cut in [10, 11] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cut.db");
+        let db = Database::open(&path).unwrap();
+        let _ = seed(&db, 24);
+        let schema = canonical(&db.table_meta("breadth_rows").unwrap());
+        let rows = visible(&db);
+        let roots = physical_roots(&db);
+        let serving = graphs(&db);
+        let authored = authored_rows(&db);
+        let count = db.ddl_log_since(Lsn(0)).unwrap().len();
+        let root = db.writer_read_root().unwrap().unwrap();
+        crate::persistence::arm_currency_reclaim_fault_for_test(cut, false);
+        let error = db
+            .execute(
+                "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION NONE",
+                &empty(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error.engine_diagnostic(), Error::Other(message) if message == "injected currency cleanup failure"),
+            "the actual durability cut must refuse: {error:?}"
+        );
+        assert_eq!(column(&db).consolidation_disabled, cut == 11);
+        assert_eq!(
+            db.ddl_log_since(Lsn(0)).unwrap().len(),
+            count + usize::from(cut == 11)
+        );
+        assert_eq!(
+            canonical(root.borrow_captured_table_meta("breadth_rows").unwrap()),
+            schema
+        );
+        if cut == 10 {
+            assert_eq!(canonical(&db.table_meta("breadth_rows").unwrap()), schema);
+        }
+        assert_eq!(physical_roots(&db), roots);
+        assert_eq!(graphs(&db), serving);
+        assert_eq!(visible(&db), rows);
+        assert_eq!(authored_rows(&db), authored);
+        let authoritative = canonical(&db.table_meta("breadth_rows").unwrap());
+        let history = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
+        drop(root);
+        db.close().unwrap();
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            canonical(&reopened.table_meta("breadth_rows").unwrap()),
+            authoritative
+        );
+        assert_eq!(canonical(&reopened.ddl_log_since(Lsn(0)).unwrap()), history);
+        assert_eq!(visible(&reopened), rows);
+        assert_eq!(authored_rows(&reopened), authored);
+        reopened.close().unwrap();
+    }
+}
+
+#[test]
+fn consolidation_crash_cuts_recover_complete_metadata_and_ddl_with_unchanged_data() {
+    const CHILD: &str = "CONTEXTDB_CONSOLIDATION_CRASH_PATH";
+    const CUT: &str = "CONTEXTDB_CONSOLIDATION_CRASH_CUT";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let cut: u8 = std::env::var(CUT).unwrap().parse().unwrap();
+        let db = Database::open_with_options(
+            path,
+            DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::persistence::arm_currency_reclaim_fault_for_test(cut, true);
+        run(
+            &db,
+            "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION NONE",
+        );
+        panic!("the armed durable cut must abort the child");
+    }
+    for cut in [10u8, 11] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crash.db");
+        let db = Database::open(&path).unwrap();
+        let _ = seed(&db, 24);
+        let rows = visible(&db);
+        let authored = authored_rows(&db);
+        let roots = physical_roots(&db);
+        let history = db.ddl_log_since(Lsn(0)).unwrap().len();
+        db.close().unwrap();
+        drop(db);
+        let name = format!(
+            "{}::consolidation_crash_cuts_recover_complete_metadata_and_ddl_with_unchanged_data",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD, &path)
+            .env(CUT, cut.to_string())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("CURRENCY_RECLAIM_CRASH={cut}")),
+            "the child must reach its selected cut: {:?}",
+            output
+        );
+        let reopened = Database::open(&path).unwrap();
+        reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        assert_eq!(column(&reopened).consolidation_disabled, cut == 11);
+        assert_eq!(
+            reopened.ddl_log_since(Lsn(0)).unwrap().len(),
+            history + usize::from(cut == 11)
+        );
+        assert_eq!(visible(&reopened), rows);
+        assert_eq!(authored_rows(&reopened), authored);
+        assert_eq!(physical_roots(&reopened), roots);
+        reopened.close().unwrap();
+    }
+}
