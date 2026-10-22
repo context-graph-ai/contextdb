@@ -6303,3 +6303,69 @@ pub(crate) fn physical_identity<'a>(
 pub(crate) mod physical;
 
 use crate::persistence::writer_source::WriterSnapshotHandle;
+
+#[cfg(all(test, feature = "test-seams"))]
+mod single_authentication_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use contextdb_vector::hnsw::{PagedVectorObserver, PagedVectorStorageWork, with_paged_vector_observer};
+    #[derive(Default)]
+    struct Work { reads: AtomicUsize, auth: AtomicUsize }
+    impl PagedVectorObserver for Work {
+        fn storage_work(&self, kind: PagedVectorStorageWork, _: usize) {
+            match kind {
+                PagedVectorStorageWork::SourceRead => { self.reads.fetch_add(1, Ordering::Relaxed); }
+                PagedVectorStorageWork::Authentication => { self.auth.fetch_add(1, Ordering::Relaxed); }
+                _ => {}
+            }
+        }
+    }
+    #[test]
+    fn point_and_identity_authenticate_once_and_reject_corruption_before_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("one-auth.redb")).unwrap();
+        let storage = 1u64.to_be_bytes();
+        let id = PointId(0, 0);
+        let point = PagedPoint { id, origin_id: 7, values: vec![1.0f32, 0.0], neighbours: vec![vec![]] };
+        let mut encoded = Vec::new();
+        encode_paged_point_into(&point, &mut encoded).unwrap();
+        let identity = PagedVectorIdentity { point: id, data_id: 7, graph_origin: 7, row_id: RowId(9), lsn: Lsn(1), created_tx: TxId(1), deleted_tx: None, exact_key: vec![3; 8] };
+        let pk = point_key(&storage, id);
+        let ik = identity_key(&storage, 7);
+        let frames = [seal_value(&pk, &encoded), seal_value(&ik, &encode_identity(&identity))];
+        for corrupt in [false, true] {
+            let write = db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(PAGES).unwrap();
+                for (key, original) in [(&pk[..], &frames[0]), (&ik[..], &frames[1])] {
+                    let mut bytes = original.clone();
+                    if corrupt { bytes[0] ^= 1; }
+                    table.insert(key, bytes.as_slice()).unwrap();
+                }
+            }
+            write.commit().unwrap();
+            let read = db.begin_read().unwrap();
+            let pages = read.open_table(PAGES).unwrap();
+            let admits = std::cell::Cell::new(0);
+            let mut admission = |_bytes| { admits.set(admits.get() + 1); Ok(None) };
+            let admission = RefCell::new(&mut admission as &mut dyn FnMut(usize) -> Result<Option<VectorCopyAdmission>>);
+            let lookup = PagedLookup { admission: Some(&admission), pages: &pages, storage, dimension: 2, quantization: VectorQuantization::F32, node_limit: 4096 };
+            let work = Arc::new(Work::default());
+            with_paged_vector_observer(work.clone(), || {
+                let p = lookup.load_point(id);
+                let i = lookup.identity(7);
+                if corrupt {
+                    assert!(matches!(p, Err(Error::StoreCorrupted { .. })));
+                    assert!(matches!(i, Err(Error::StoreCorrupted { .. })));
+                    assert_eq!(admits.get(), 0, "damaged frames never reach copy admission");
+                } else {
+                    match &*p.unwrap() { PagedVectorPoint::F32(p) => assert_eq!(p.origin_id, 7), _ => panic!("wrong representation") }
+                    assert_eq!(i.unwrap().row_id, RowId(9));
+                    assert_eq!(admits.get(), 2, "one existing admission per requested record");
+                }
+            });
+            assert_eq!(work.reads.load(Ordering::Relaxed), 2, "one actual table fetch per requested record");
+            assert_eq!(work.auth.load(Ordering::Relaxed), 2, "authenticate each immutable fetched frame exactly once");
+        }
+    }
+}
