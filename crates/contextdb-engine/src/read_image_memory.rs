@@ -3782,7 +3782,11 @@ impl MaintenancePhase {
         }
         static RECORDS: std::sync::Mutex<([Option<Record>; 64], usize)> =
             std::sync::Mutex::new(([None; 64], 0));
-        let active = active_owner().ok();
+        let active = ACTIVE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|active| ImageMemoryHandle::clone(&active.owner))
+        });
         let image = image.or(active.as_deref());
         let record = Record {
             pid: std::process::id(),

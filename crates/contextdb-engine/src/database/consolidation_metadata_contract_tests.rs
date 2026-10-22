@@ -667,3 +667,103 @@ fn phase_file_is_visible_before_an_isolated_child_completes() {
     child.0.stdin.take().unwrap().write_all(&[1]).unwrap();
     assert!(child.0.wait().unwrap().success());
 }
+
+#[test]
+fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::open(directory.path().join("recheck.db")).unwrap();
+    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    run(
+        &db,
+        "CREATE TABLE recheck_rows (id INT PRIMARY KEY, scope_id TEXT NOT NULL, embedding VECTOR(3) PARTITION_KEY (scope_id) SEARCH_MODE INDEXED HNSW (M = 16, EF_CONSTRUCTION = 200, EF_SEARCH = 200) CONSOLIDATION (CHANGE_PERCENT = 100, TOMBSTONE_PERCENT = 100))",
+    );
+    for id in 0..32 {
+        db.execute(
+            "INSERT INTO recheck_rows VALUES ($id, 'scope', '[1,0,0]')",
+            &HashMap::from([("id".into(), Value::Int64(id))]),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        db.run_maintenance_cycle().unwrap().vector.built_partitions,
+        1
+    );
+    let vector = VectorIndexRef::new("recheck_rows", "embedding");
+    let key =
+        contextdb_vector::VectorPartitionKey::from_values(&[Value::Text("scope".into())]).unwrap();
+    let info = || {
+        let mut owner = crate::vector_read_memory::admission(db.declared_reader_memory().unwrap());
+        db.vector_store_for_test()
+            .partition_info(&vector, &key, &mut owner)
+            .unwrap()
+            .unwrap()
+    };
+    let initial = info().base_generation.unwrap();
+    run(
+        &db,
+        "UPDATE recheck_rows SET embedding = '[0,1,0]' WHERE id = 0",
+    );
+    let pending = info().pending_inserts;
+    assert!(pending > 0);
+    take_projected_rows();
+    run(
+        &db,
+        "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
+    );
+    assert_eq!(take_projected_rows(), 0);
+    assert_eq!(info().base_generation, Some(initial));
+    assert_eq!(info().pending_inserts, pending);
+    let report = db.run_maintenance_cycle().unwrap();
+    assert_eq!(
+        report.vector.built_partitions, 1,
+        "the metadata publisher must preserve the newly due replacement work"
+    );
+    let replacement = info().base_generation.unwrap();
+    assert_ne!(replacement, initial);
+    let original_limit = db.memory_limit();
+    db.set_memory_limit(Some(db.accountant().usage().used.saturating_add(96 * 1024)))
+        .unwrap();
+    run(
+        &db,
+        "UPDATE recheck_rows SET embedding = '[0,0,1]' WHERE id = 1",
+    );
+    assert_eq!(
+        db.run_maintenance_cycle().unwrap().vector.first_failure,
+        Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
+    );
+    assert_eq!(
+        info().maintenance_failure,
+        Some(contextdb_vector::VectorMaintenanceFailure::MemoryLimit)
+    );
+    // This new guard deliberately isolates the post-durability recheck from
+    // the separately retained, unchanged low-headroom ALTER contract test.
+    db.set_memory_limit(original_limit).unwrap();
+    take_projected_rows();
+    run(
+        &db,
+        "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION NONE",
+    );
+    assert_eq!(take_projected_rows(), 0);
+    assert_eq!(info().base_generation, Some(replacement));
+    assert_eq!(
+        info().maintenance_failure,
+        None,
+        "a successful NONE publication must clear its obsolete failure mark"
+    );
+    assert_eq!(
+        db.run_maintenance_cycle().unwrap().vector.built_partitions,
+        0
+    );
+    assert_eq!(info().base_generation, Some(replacement));
+    run(
+        &db,
+        "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
+    );
+    assert_eq!(
+        db.run_maintenance_cycle().unwrap().vector.built_partitions,
+        1,
+        "pending work must survive disabled consolidation and become eligible again"
+    );
+    assert_ne!(info().base_generation, Some(replacement));
+    db.close().unwrap();
+}
