@@ -698,7 +698,22 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
             .unwrap()
             .unwrap()
     };
-    let initial = info().base_generation.unwrap();
+    // A change-threshold publication can keep the valid base and publish
+    // a sealed change generation. Compare the actual durable serving chain,
+    // rather than incorrectly requiring every upkeep cycle to replace its base.
+    let published_generation = || {
+        let catalog = db
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_vector_partition_generation_catalog_for(&vector, &key)
+            .unwrap()
+            .unwrap();
+        catalog.change.map_or(catalog.base.generation_id, |change| {
+            change.generation_id.max(catalog.base.generation_id)
+        })
+    };
+    let initial = published_generation();
     run(
         &db,
         "UPDATE recheck_rows SET embedding = '[0,1,0]' WHERE id = 0",
@@ -717,7 +732,7 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 1, TOMBSTONE_PERCENT = 100)",
     );
     assert_eq!(take_projected_rows(), 0);
-    assert_eq!(info().base_generation, Some(initial));
+    assert_eq!(published_generation(), initial);
     assert_eq!(info().pending_inserts, pending);
     for pass in 0..8 {
         let report = db.run_maintenance_cycle().unwrap();
@@ -730,16 +745,19 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
             current.pending_inserts,
             current.tombstones
         );
-        if current.base_generation > Some(initial) {
+        if published_generation() > initial {
             break;
         }
     }
-    let replacement = info().base_generation.unwrap();
+    let replacement = published_generation();
     assert!(
         replacement > initial,
-        "newly due work must publish a complete successor base within finite maintenance passes"
+        "newly due work must publish a complete successor serving generation within finite maintenance passes"
     );
     assert_eq!(info().pending_inserts, 0);
+    assert_eq!(db.execute("SELECT id FROM recheck_rows WHERE scope_id = scope ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+        &HashMap::from([("q".into(),Value::Vector(vec![0.0,1.0,0.0]))])).unwrap().rows(),
+        vec![vec![Value::Int64(0)]], "the complete serving chain must include the newly published insert");
     let original_limit = db.memory_limit();
     db.set_memory_limit(Some(db.accountant().usage().used.saturating_add(96 * 1024)))
         .unwrap();
@@ -773,7 +791,7 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         "ALTER TABLE recheck_rows ALTER COLUMN embedding SET CONSOLIDATION NONE",
     );
     assert_eq!(take_projected_rows(), 0);
-    assert_eq!(info().base_generation, Some(replacement));
+    assert_eq!(published_generation(), replacement);
     let retained = info();
     assert_eq!(
         (retained.pending_inserts, retained.tombstones),
@@ -788,7 +806,7 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         db.run_maintenance_cycle().unwrap().vector.built_partitions,
         0
     );
-    assert_eq!(info().base_generation, Some(replacement));
+    assert_eq!(published_generation(), replacement);
     let retained = info();
     assert_eq!(
         (retained.pending_inserts, retained.tombstones),
@@ -813,15 +831,18 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
             current.pending_inserts,
             current.tombstones
         );
-        if current.base_generation > Some(replacement) {
+        if published_generation() > replacement {
             break;
         }
     }
-    assert!(info().base_generation > Some(replacement));
+    assert!(published_generation() > replacement);
     assert_eq!(
         info().pending_inserts,
         0,
         "reenabling must consume the actual retained insert work"
     );
+    assert_eq!(db.execute("SELECT id FROM recheck_rows WHERE scope_id = scope ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+        &HashMap::from([("q".into(),Value::Vector(vec![0.0,0.0,1.0]))])).unwrap().rows(),
+        vec![vec![Value::Int64(1)]], "reenabling must publish the actual retained insert in the maintained route");
     db.close().unwrap();
 }
