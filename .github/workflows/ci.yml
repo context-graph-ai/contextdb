@@ -290,6 +290,53 @@ jobs:
           path: target/ci-integration-out/
           if-no-files-found: error
           retention-days: 14
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: always() && !cancelled() && matrix.slot4 != null
+        with:
+          key: ${{ matrix.slot4.cache_key }}
+          add-job-id-key: false
+          workspaces: |
+            . -> target
+            crates/contextdb-redb -> ../../target/redb
+      - name: Install test tools for constituent 4
+        if: always() && !cancelled() && matrix.slot4.kind == 'pr'
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - id: slot4_pr
+        name: Run constituent 4 / ${{ matrix.slot4.name }}
+        if: always() && !cancelled() && matrix.slot4.kind == 'pr'
+        continue-on-error: true
+        env:
+          CI_BUNDLE: ${{ matrix.slot4.pr.constituents && matrix.slot4.pr.shard || '' }}
+          CI_CRATE: ${{ matrix.slot4.pr.crate }}
+          CI_FEATURES: ${{ matrix.slot4.pr.features }}
+          CI_SHARD: ${{ matrix.slot4.pr.shard }}
+        run: bash scripts/verify pr shard
+      - id: slot4_integration
+        name: Run constituent 4 / ${{ matrix.slot4.name }}
+        if: always() && !cancelled() && matrix.slot4.kind == 'integration'
+        continue-on-error: true
+        env:
+          CI_INTEGRATION_ENABLED: ${{ needs.impact.outputs.enabled }}
+          CI_INTEGRATION_DEFAULT: "false"
+          CI_INTEGRATION_SLICE: ${{ matrix.slot4.integration.id }}
+          CI_INTEGRATION_PLAN: ${{ toJSON(matrix.slot4.integration) }}
+        run: bash scripts/verify integration "${CI_INTEGRATION_SLICE}"
+      - name: Upload constituent 4 shard receipt
+        if: always() && !cancelled() && matrix.slot4.kind == 'pr'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-${{ matrix.slot4.pr.shard }}-${{ github.run_attempt }}
+          path: ${{ env.CARGO_TARGET_DIR || 'target' }}/ci-shard-out/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload constituent 4 integration receipt
+        if: always() && !cancelled() && matrix.slot4.kind == 'integration'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: extended-integration-${{ matrix.slot4.integration.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci-integration-out/
+          if-no-files-found: error
+          retention-days: 14
       - name: Require every bundled constituent to succeed
         if: always()
         env:
@@ -302,6 +349,9 @@ jobs:
           SLOT3_KIND: ${{ matrix.slot3.kind }}
           SLOT3_PR: ${{ steps.slot3_pr.outcome }}
           SLOT3_INTEGRATION: ${{ steps.slot3_integration.outcome }}
+          SLOT4_KIND: ${{ matrix.slot4.kind }}
+          SLOT4_PR: ${{ steps.slot4_pr.outcome }}
+          SLOT4_INTEGRATION: ${{ steps.slot4_integration.outcome }}
         run: |
           status=0
           check_slot() {
@@ -319,12 +369,13 @@ jobs:
           check_slot "$SLOT1_KIND" "$SLOT1_PR" "$SLOT1_INTEGRATION"
           check_slot "$SLOT2_KIND" "$SLOT2_PR" "$SLOT2_INTEGRATION"
           check_slot "$SLOT3_KIND" "$SLOT3_PR" "$SLOT3_INTEGRATION"
+          check_slot "$SLOT4_KIND" "$SLOT4_PR" "$SLOT4_INTEGRATION"
           exit "$status"
       - name: Remove disposable cache test scratch
         if: always() && !cancelled()
         run: bash scripts/ci-cache-post-cleanup.sh
   build:
-    needs: features
+    needs: lint
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     timeout-minutes: 30

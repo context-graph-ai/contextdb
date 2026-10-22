@@ -94,7 +94,7 @@ def integration_caller(workflow):
 
 
 def root_chain(workflow):
-    expected = {'lint': None, 'features': 'lint', 'build': 'features',
+    expected = {'lint': None, 'features': 'lint', 'build': 'lint',
                 'cross-compile': 'build', 'installed-smoke': None,
                 'lint-macos': None}
     for name, predecessor in expected.items():
