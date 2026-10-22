@@ -34810,9 +34810,19 @@ impl Database {
     ) -> Result<QueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        QueryResult::publish_with(read_memory.clone(), || {
+        #[cfg(any(test, feature = "test-seams"))]
+        let before_lsn = self.tx_mgr.capture_published_read().lsn;
+        let result = QueryResult::publish_with(read_memory.clone(), || {
             self.execute_owned_with_read_memory(sql, params, read_memory)
-        })
+        });
+        #[cfg(any(test, feature = "test-seams"))]
+        if result.is_ok() && self.tx_mgr.capture_published_read().lsn > before_lsn {
+            // Statement staging, commit callbacks and the terminal write set
+            // have physically dropped. Sample the still-live writer at this
+            // existing API boundary, before returning its answer to the caller.
+            self.emit_writer_memory_ownership_receipt_for_test("commit");
+        }
+        result
     }
 
     pub(crate) fn execute_owned_with_read_memory(
