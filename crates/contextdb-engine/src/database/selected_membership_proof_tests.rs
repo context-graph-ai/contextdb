@@ -1,7 +1,7 @@
 //! A selected membership keeps the one owning-row proof it already paid for.
 use super::*;
 use crate::persistence::vector_membership_source::{DurableMembershipSource, MembershipOwner};
-use contextdb_vector::store::{RawVectorMembershipSource, RawVectorPartitionLoader};
+use contextdb_vector::store::{RawVectorMembershipSource, DormantRawVectorLoader};
 
 #[test]
 #[serial_test::serial]
@@ -63,7 +63,7 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
             }).unwrap().unwrap().0;
             drop(first);
             drop(first_window);
-            let loader = DurableRawVectorPartitionLoader {
+            let loader = DurableDormantRawVectorLoader {
                 source: DurableRawVectorSource::Writable(persistence), accountant: db.accountant.clone(),
                 partition, dimension: 4, quantization: VectorQuantization::F32, metadata_copy_owner: None,
             };
