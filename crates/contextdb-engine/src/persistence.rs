@@ -33159,6 +33159,10 @@ graph_commit_result }.map_err(Self::storage_error)?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             {
                 #[cfg(any(test, feature = "test-seams"))]
+                if !rebuild_indexes {
+                    policy_metadata_checkpoint_for_test(10)?;
+                }
+                #[cfg(any(test, feature = "test-seams"))]
                 graph_observation_checkpoint(10)?;
                 #[cfg(any(test, feature = "test-seams"))]
                 phase.record("durable_commit_enter", 0, None);
@@ -33175,6 +33179,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 if graph_commit_result.is_ok() {
                     graph_publication_attempt.committed();
                     graph_observation_checkpoint(11)?;
+                    if !rebuild_indexes {
+                        policy_metadata_checkpoint_for_test(11)?;
+                    }
                 }
                 graph_commit_result
             }
@@ -52657,6 +52664,36 @@ fn retention_reclaim_checkpoint_for_test(boundary: u8) {
     if RETENTION_RECLAIM_CRASH.with(|armed| armed.get() == boundary) {
         eprintln!("RETENTION_RECLAIM_CRASH={boundary}");
         std::process::abort();
+    }
+}
+
+// These cuts belong only to the narrow policy publisher. The global currency
+// hook can be consumed by an earlier preparatory metadata transaction.
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static POLICY_METADATA_FAULT: std::cell::Cell<(u8, bool)> = const {
+        std::cell::Cell::new((0, false))
+    };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn arm_policy_metadata_fault_for_test(boundary: u8, crash: bool) {
+    assert!(matches!(boundary, 10 | 11));
+    POLICY_METADATA_FAULT.with(|armed| armed.set((boundary, crash)));
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn policy_metadata_checkpoint_for_test(boundary: u8) -> Result<()> {
+    let crash = POLICY_METADATA_FAULT.with(|armed| {
+        let (selected, crash) = armed.get();
+        if selected != boundary { return None; }
+        armed.set((0, false));
+        Some(crash)
+    });
+    match crash {
+        Some(true) => std::process::abort(),
+        Some(false) => Err(Error::Other("injected policy metadata publication failure".into())),
+        None => Ok(()),
     }
 }
 

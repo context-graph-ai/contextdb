@@ -492,7 +492,7 @@ fn consolidation_failure_before_and_after_durability_keeps_one_authoritative_dec
         let authored = authored_rows(&db);
         let count = db.ddl_log_since(Lsn(0)).unwrap().len();
         let root = db.writer_read_root().unwrap().unwrap();
-        crate::persistence::arm_currency_reclaim_fault_for_test(cut, false);
+        crate::persistence::arm_policy_metadata_fault_for_test(cut, false);
         let error = db
             .execute(
                 "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION NONE",
@@ -500,7 +500,7 @@ fn consolidation_failure_before_and_after_durability_keeps_one_authoritative_dec
             )
             .unwrap_err();
         assert!(
-            matches!(error.engine_diagnostic(), Error::Other(message) if message == "injected currency cleanup failure"),
+            matches!(error.engine_diagnostic(), Error::Other(message) if message == "injected policy metadata publication failure"),
             "the actual durability cut must refuse: {error:?}"
         );
         assert_eq!(column(&db).consolidation_disabled, cut == 11);
@@ -550,7 +550,7 @@ fn consolidation_crash_cuts_recover_complete_metadata_and_ddl_with_unchanged_dat
             },
         )
         .unwrap();
-        crate::persistence::arm_currency_reclaim_fault_for_test(cut, true);
+        crate::persistence::arm_policy_metadata_fault_for_test(cut, true);
         run(
             &db,
             "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION NONE",
@@ -755,8 +755,8 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         "newly due work must publish a complete successor serving generation within finite maintenance passes"
     );
     assert_eq!(info().pending_inserts, 0);
-    assert_eq!(db.execute("SELECT id FROM recheck_rows WHERE scope_id = scope ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-        &HashMap::from([("q".into(),Value::Vector(vec![0.0,1.0,0.0]))])).unwrap().rows(),
+    assert_eq!(db.execute("SELECT id FROM recheck_rows WHERE scope_id = $scope ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+        &HashMap::from([("q".into(),Value::Vector(vec![0.0,1.0,0.0])), ("scope".into(), Value::Text("scope".into()))])).unwrap().rows(),
         vec![vec![Value::Int64(0)]], "the complete serving chain must include the newly published insert");
     let original_limit = db.memory_limit();
     db.set_memory_limit(Some(db.accountant().usage().used.saturating_add(96 * 1024)))
@@ -841,8 +841,8 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
         0,
         "reenabling must consume the actual retained insert work"
     );
-    assert_eq!(db.execute("SELECT id FROM recheck_rows WHERE scope_id = scope ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-        &HashMap::from([("q".into(),Value::Vector(vec![0.0,0.0,1.0]))])).unwrap().rows(),
+    assert_eq!(db.execute("SELECT id FROM recheck_rows WHERE scope_id = $scope ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+        &HashMap::from([("q".into(),Value::Vector(vec![0.0,0.0,1.0])), ("scope".into(), Value::Text("scope".into()))])).unwrap().rows(),
         vec![vec![Value::Int64(1)]], "reenabling must publish the actual retained insert in the maintained route");
     db.close().unwrap();
 }
