@@ -14337,6 +14337,7 @@ enum DatabaseTransactionHost {
     Owned(EngineDatabaseHandle),
 }
 
+#[expect(clippy::large_enum_variant, reason = "Retain the inline write-set and terminal owners without adding a heap allocation or refund boundary solely to reduce enum size.")]
 enum ReceivedCommitTerminal {
     Legacy(WriteSet),
     Owned(OwnedDatabaseTerminal),
@@ -21786,8 +21787,7 @@ impl DurableRawVectorSource {
         {
             return original.vector_budget();
         }
-        accountant.vector_budget_for_original_reader().map(Into::into)
-    }
+        accountant.vector_budget_for_original_reader()}
 
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stream_memberships<T>(
@@ -22180,7 +22180,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
             entries,
             resident_bytes,
             workspace_owner,
-            accountant: accountant,
+            accountant,
         })
     }
 
@@ -22369,7 +22369,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
             entries,
             resident_bytes,
             workspace_owner,
-            accountant: accountant,
+            accountant,
         })
     }
 
@@ -65165,7 +65165,6 @@ impl Database {
                 for row in current.iter().filter(|row| selected.contains(&row.row_id)) { append(row)?; }
             }
         }
-        drop(append);
         // The key set is temporary; its full admitted overlap remains paid
         // until after it has physically dropped.
         drop(keys);
@@ -77409,7 +77408,7 @@ impl Database {
                 self.vector_store.publish_policy_layout_update(prepared);
             }
         };
-        let result = if let Some(persistence) = &self.persistence {
+        if let Some(persistence) = &self.persistence {
             // The durable occurrence is an admitted temporary encoding input,
             // not a resident history entry. Persistence keeps the occurrence
             // and its summary/configuration in the same durable transaction.
@@ -77431,8 +77430,7 @@ impl Database {
         } else {
             publish();
             Ok(())
-        };
-        result
+        }
     }
 
     /// Settle what a change to `table`'s INDEX SET costs -- or gives back --

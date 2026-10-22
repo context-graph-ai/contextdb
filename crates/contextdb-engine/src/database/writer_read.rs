@@ -3135,7 +3135,7 @@ pub(super) fn visit_graph_versions_for_nodes(
                     }),
                     false,
                 )?;
-                while let Some(window) = cursor.next_edge_with(&mut || Ok(()))? {
+                while let Some(window) = cursor.next_edge_with(&|| Ok(()))? {
                     consume(&window.value)?;
                 }
             } else {
@@ -3173,7 +3173,7 @@ pub(super) fn visit_graph_versions(
             std::ops::Bound::Unbounded,
             read_memory.clone(),
         )?;
-        while let Some(window) = cursor.next_edge_with(&mut || Ok(()))? {
+        while let Some(window) = cursor.next_edge_with(&|| Ok(()))? {
             visit(window.edge())?;
         }
     } else {
@@ -3225,7 +3225,7 @@ impl Database {
                 std::ops::Bound::Unbounded,
                 read_memory,
             )?;
-            while let Some(window) = cursor.next_edge_with(&mut || Ok(()))? {
+            while let Some(window) = cursor.next_edge_with(&|| Ok(()))? {
                 visit(window.edge())?;
             }
             return Ok(());
@@ -3865,7 +3865,6 @@ impl Database {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         if let Some(working)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
-            use contextdb_relational::source::RelationalReadSource;
             let working=working.at_snapshot(snapshot)?.for_read(read_memory.clone());
             return Ok(crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(root,read_memory)?.for_working(working));
         }

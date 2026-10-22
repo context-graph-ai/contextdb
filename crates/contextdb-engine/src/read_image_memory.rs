@@ -1574,8 +1574,10 @@ fn admit_output<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
 
 // An exact map visitor admits its one concrete destination before allocation.
 // Nested maps retain the ordinary accounting unless they explicitly opt in.
+type ExactMapAdmission = fn(usize) -> Result<usize>;
+
 thread_local! {
-    static EXACT_MAP: std::cell::Cell<Option<fn(usize) -> Result<usize>>> = const { std::cell::Cell::new(None) };
+    static EXACT_MAP: std::cell::Cell<Option<ExactMapAdmission>> = const { std::cell::Cell::new(None) };
     static EXACT_MAP_STRINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 pub(crate) fn with_exact_map<K, V, T>(body: impl FnOnce() -> T) -> T {

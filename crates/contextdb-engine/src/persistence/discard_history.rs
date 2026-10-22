@@ -17,6 +17,7 @@ pub(crate) type Row = (String, RowId, TxId, Lsn);
 
 // Ordinary owned commits keep their original raw transaction path and do
 // not allocate an unused received-source owner for this erasure facility.
+#[expect(clippy::large_enum_variant, reason = "Retain the inline fresh and prepared transaction owners without introducing a heap allocation or changing transaction cleanup order.")]
 pub(super) enum TerminalWrite {
     Fresh(redb::WriteTransaction),
     Prepared(received_working::ReceivedWorkingWrite),

@@ -1005,12 +1005,12 @@ fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderE
             budget_limit_bytes,
             hint,
         } => Error::MemoryBudgetExceeded {
-            subsystem: subsystem,
-            operation: operation,
+            subsystem,
+            operation,
             requested_bytes,
             available_bytes,
             budget_limit_bytes,
-            hint: hint,
+            hint,
         },
         // A store nobody can read is the one answer an operator has to act on,
         // so a reader must not hand them less than a writer does. The direct

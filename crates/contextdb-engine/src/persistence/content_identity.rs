@@ -9407,7 +9407,7 @@ pub(crate) mod original_writer {
         pub(crate) fn verification_owner(
             &self,
         ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
-            Ok(self.original.accountant().read_budget()?)
+            self.original.accountant().read_budget()
         }
         pub(crate) fn held(&self) -> usize {
             self.held
@@ -15218,4 +15218,5 @@ pub(crate) mod original_version_manifest {
     }
 }
 
+#[cfg(test)]
 use crate::persistence::writer_source::{WriterSnapshotHandle};

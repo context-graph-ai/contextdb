@@ -2031,9 +2031,9 @@ pub fn node_holds_claim_for_blob_with_read_memory(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let job_idx = column_index(&columns, "job_id")?;
-    let attempt_idx = column_index(&columns, "attempt")?;
-    let lease_idx = column_index(&columns, "lease_deadline")?;
+    let job_idx = column_index(columns, "job_id")?;
+    let attempt_idx = column_index(columns, "attempt")?;
+    let lease_idx = column_index(columns, "lease_deadline")?;
     for row in rows {
         let lease_deadline_ms = int_at(row, lease_idx, "lease_deadline")?;
         if lease_deadline_ms <= now_ms {
@@ -2094,9 +2094,9 @@ pub fn any_node_holds_claim_for_blob_with_read_memory(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let job_idx = column_index(&columns, "job_id")?;
-    let attempt_idx = column_index(&columns, "attempt")?;
-    let lease_idx = column_index(&columns, "lease_deadline")?;
+    let job_idx = column_index(columns, "job_id")?;
+    let attempt_idx = column_index(columns, "attempt")?;
+    let lease_idx = column_index(columns, "lease_deadline")?;
     for row in rows {
         let lease_deadline_ms = int_at(row, lease_idx, "lease_deadline")?;
         if lease_deadline_ms <= now_ms {
@@ -2173,9 +2173,9 @@ pub fn node_claim_permits_movement_with_read_memory(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let job_idx = column_index(&columns, "job_id")?;
-    let attempt_idx = column_index(&columns, "attempt")?;
-    let lease_idx = column_index(&columns, "lease_deadline")?;
+    let job_idx = column_index(columns, "job_id")?;
+    let attempt_idx = column_index(columns, "attempt")?;
+    let lease_idx = column_index(columns, "lease_deadline")?;
     for row in rows {
         let lease_deadline_ms = int_at(row, lease_idx, "lease_deadline")?;
         if lease_deadline_ms <= now_ms {

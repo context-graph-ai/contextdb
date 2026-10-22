@@ -7354,7 +7354,6 @@ impl OwnedEventBusHandle {
             let settle_joint = |root| (settle.borrow_mut())(root);
             let token = _claim.commit_token(&committed, &settle_joint, snapshot, lsn);
             persistence.commit_update_at_boundary(prepared, &token, &mut failure);
-            drop(settle);
             drop(metrics);
             drop(queues);
             drop(published);
@@ -7543,7 +7542,6 @@ impl OwnedEventBusHandle {
             let settle_joint = |root| (settle.borrow_mut())(root);
             let token = _claim.commit_token(&committed, &settle_joint, snapshot, lsn);
             persistence.commit_removals_at_boundary(prepared, &token, &mut failure);
-            drop(settle);
             drop(metrics);
             drop(queues);
             drop(published);

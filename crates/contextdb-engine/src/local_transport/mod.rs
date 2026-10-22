@@ -318,7 +318,7 @@ impl PartialEq for LocalTransportError {
             (OriginalAdmission(a), OriginalAdmission(b)) => std::ptr::eq(a, b),
             (MemoryAdmission { subsystem: a, operation: b, requested_bytes: c, available_bytes: d, budget_limit_bytes: e, hint: f },
              MemoryAdmission { subsystem: g, operation: h, requested_bytes: i, available_bytes: j, budget_limit_bytes: k, hint: l }) =>
-                **a == **g && &**b == &**h && c == i && d == j && e == k && **f == **l,
+                **a == **g && **b == **h && c == i && d == j && e == k && **f == **l,
             _ => false,
         }
     }

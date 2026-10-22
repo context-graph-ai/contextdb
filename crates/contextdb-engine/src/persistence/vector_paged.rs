@@ -1439,7 +1439,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
         } else {
             Bound::Included(lower.as_slice())
         };
-        let Some(entry) = self.pages.first_after(bound, &upper, &mut |key, value| {
+        let Some(entry) = self.pages.first_after(bound, upper, &mut |key, value| {
             self.directory_admission(key, value)
         })?
         else {

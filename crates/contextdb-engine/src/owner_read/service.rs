@@ -2082,6 +2082,7 @@ impl OwnerReadService {
     /// calculate stricter limits; let status bypass slots; immediately admit
     /// all other work; classify SQL before touching the database.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(clippy::too_many_arguments, reason = "Keep the authenticated connection, request, cancellation registration and executing reader owner explicit at the admission boundary.") ]
     fn handle_authenticated(
         &self,
         connection_id: [u8; 16], principal: ReadPrincipal, limits: ReadLimits,
@@ -4636,12 +4637,12 @@ impl RequestPublication<'_, '_> {
                         }
                         for response in &cancelled.value {
                             UnixLocalCarrier::send_message(
-                                &carrier,
-                                &mut publish_stream,
-                                &boundary,
+                                carrier,
+                                publish_stream,
+                                boundary,
                                 LocalOutboundMessage::Response {
                                     response,
-                                    expectation: &expectation,
+                                    expectation: expectation,
                                 },
                             )?;
                         }
@@ -4651,14 +4652,14 @@ impl RequestPublication<'_, '_> {
                 }
                 RequestOutcome::CancelApplied(named) => {
                     UnixLocalCarrier::send_message(
-                        &carrier,
-                        &mut publish_stream,
-                        &boundary,
+                        carrier,
+                        publish_stream,
+                        boundary,
                         LocalOutboundMessage::Response {
                             response: &LocalResponse::CancelApplied {
                                 request_ordinal: named,
                             },
-                            expectation: &expectation,
+                            expectation: expectation,
                         },
                     )?;
                     caller_cancelled_fetch |= cursor_fetch_request && named == request_ordinal;
@@ -4668,12 +4669,12 @@ impl RequestPublication<'_, '_> {
                 // frames below carry any of the answer.
                 RequestOutcome::Reported(progress) => {
                     UnixLocalCarrier::send_message(
-                        &carrier,
-                        &mut publish_stream,
-                        &boundary,
+                        carrier,
+                        publish_stream,
+                        boundary,
                         LocalOutboundMessage::Response {
                             response: &LocalResponse::Progress { progress },
-                            expectation: &expectation,
+                            expectation: expectation,
                         },
                     )?;
                 }
@@ -4728,12 +4729,12 @@ impl RequestPublication<'_, '_> {
                                 let response = refusal_response(error, boundary.query_funding().expect("request boundary retains its owner"))
                                     .map_err(|error| match error { OwnerReadScaffoldError::Database(error) => crate::local_transport::query_funding::transport_error(error, effective_limits.memory), _ => crate::local_transport::owner_disconnected() })?;
                                 UnixLocalCarrier::send_message(
-                                    &carrier,
-                                    &mut publish_stream,
-                                    &boundary,
+                                    carrier,
+                                    publish_stream,
+                                    boundary,
                                     LocalOutboundMessage::Response {
                                         response: &response,
-                                        expectation: &expectation,
+                                        expectation: expectation,
                                     },
                                 )?;
                                 return Ok(());
@@ -4755,12 +4756,12 @@ impl RequestPublication<'_, '_> {
                                 let response = refusal_response(error, boundary.query_funding().expect("request boundary retains its owner"))
                                     .map_err(|error| match error { OwnerReadScaffoldError::Database(error) => crate::local_transport::query_funding::transport_error(error, effective_limits.memory), _ => crate::local_transport::owner_disconnected() })?;
                                 UnixLocalCarrier::send_message(
-                                    &carrier,
-                                    &mut publish_stream,
-                                    &boundary,
+                                    carrier,
+                                    publish_stream,
+                                    boundary,
                                     LocalOutboundMessage::Response {
                                         response: &response,
-                                        expectation: &expectation,
+                                        expectation: expectation,
                                     },
                                 )?;
                                 return Ok(());
@@ -4772,9 +4773,9 @@ impl RequestPublication<'_, '_> {
                                 }
                                 for response in &completed.responses {
                                     send_authoritative_response(
-                                        &carrier,
+                                        carrier,
                                         publish_stream,
-                                        &boundary,
+                                        boundary,
                                         response,
                                         expectation,
                                         completed
@@ -4804,14 +4805,14 @@ impl RequestPublication<'_, '_> {
                             service.cancel_in_flight(connection_id);
                         }
                         UnixLocalCarrier::send_message(
-                            &carrier,
+                            carrier,
                             publish_stream,
-                            &boundary,
+                            boundary,
                             LocalOutboundMessage::Response {
                                 response: &LocalResponse::CancelApplied {
                                     request_ordinal: named,
                                 },
-                                expectation: &expectation,
+                                expectation: expectation,
                             },
                         )?;
                         if named == request_ordinal {
@@ -4837,12 +4838,12 @@ impl RequestPublication<'_, '_> {
                             }
                             for response in &cancelled.value {
                                 UnixLocalCarrier::send_message(
-                                    &carrier,
-                                    &mut publish_stream,
-                                    &boundary,
+                                    carrier,
+                                    publish_stream,
+                                    boundary,
                                     LocalOutboundMessage::Response {
                                         response,
-                                        expectation: &expectation,
+                                        expectation: expectation,
                                     },
                                 )?;
                             }
@@ -4892,8 +4893,8 @@ impl RequestPublication<'_, '_> {
             } else {
                 let response = refusal_response(error, boundary.query_funding().expect("request boundary retains its owner"))
                                     .map_err(|error| match error { OwnerReadScaffoldError::Database(error) => crate::local_transport::query_funding::transport_error(error, effective_limits.memory), _ => crate::local_transport::owner_disconnected() })?;
-                UnixLocalCarrier::send_message(carrier, &mut publish_stream, boundary,
-                    LocalOutboundMessage::Response { response: &response, expectation: expectation })?;
+                UnixLocalCarrier::send_message(carrier, publish_stream, boundary,
+                    LocalOutboundMessage::Response { response: &response, expectation })?;
             }
             return Ok(());
         }
@@ -4927,11 +4928,11 @@ impl RequestPublication<'_, '_> {
             } else {
                 UnixLocalCarrier::send_message(
                     carrier,
-                    &mut publish_stream,
+                    publish_stream,
                     boundary,
                     LocalOutboundMessage::Response {
                         response,
-                        expectation: &expectation,
+                        expectation: expectation,
                     },
                 )
             };

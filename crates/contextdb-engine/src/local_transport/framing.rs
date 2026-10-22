@@ -1972,8 +1972,7 @@ pub(crate) fn split_payload_answer_funded(
             "Reduce simultaneous query working memory or raise the declared reader limit.",
         ).map_err(|error| transport_decode_error(
             crate::read_contract::ReadEncodingError::Admission(error)))?;
-        let mut responses = Vec::with_capacity(1);
-        responses.push(terminal(payload.value));
+        let responses = vec![terminal(payload.value)];
         return Ok(Funded { value: responses, credit: payload.credit });
     }
     let capacity = MAX_FRAME_BYTES - 6;

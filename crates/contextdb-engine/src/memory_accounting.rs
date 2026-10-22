@@ -4662,11 +4662,10 @@ impl MemoryAccountant {
         let result = self.transition_reservation_local(old_bytes, new_bytes, subsystem, operation, hint);
         if result.is_ok() {
             if let Some(original) = original { original.transfer(); }
-            if new_bytes < old_bytes {
-                if let Some(original) = &self.used.1 {
+            if new_bytes < old_bytes
+                && let Some(original) = &self.used.1 {
                     contextdb_core::read_memory::ReadMemoryBudget::release(original, old_bytes - new_bytes);
                 }
-            }
         }
         result
     }
@@ -4801,11 +4800,10 @@ impl MemoryAccountant {
         let result = self.transition_reservation_local_static(old_bytes, new_bytes, subsystem, operation, hint);
         if result.is_ok() {
             if let Some(original) = original { original.transfer(); }
-            if new_bytes < old_bytes {
-                if let Some(original) = &self.used.1 {
+            if new_bytes < old_bytes
+                && let Some(original) = &self.used.1 {
                     contextdb_core::read_memory::ReadMemoryBudget::release(original, old_bytes - new_bytes);
                 }
-            }
         }
         result
     }
@@ -10999,6 +10997,7 @@ impl MemoryAccountant {
         self.try_allocate_for_provenance_native_named(bytes, subsystem, operation, hint,
             provenance, subsystem, operation)
     }
+    #[expect(clippy::too_many_arguments, reason = "Keep the same-payer provenance, allocation operation and observer labels explicit at the admission boundary.") ]
     fn try_allocate_for_provenance_native_named(
         &self,
         bytes: usize,

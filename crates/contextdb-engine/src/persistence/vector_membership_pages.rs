@@ -682,9 +682,9 @@ fn reverse_key_from_membership_key(mut key: &[u8]) -> Result<Vec<u8>> {
 #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_member(key: &[u8], encoded: &[u8]) -> Result<VectorPartitionMembershipRecord> {
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
-        .map_err(|reason| corruption(reason))?;
+        .map_err(corruption)?;
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
-        .map_err(|reason| corruption(reason))?;
+        .map_err(corruption)?;
     let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
         VectorPartitionRecordKind::Membership,
         encoded,
@@ -704,9 +704,9 @@ fn decode_primary_member(
     encoded: &[u8],
 ) -> Result<VectorPartitionMembershipRecord> {
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
-        .map_err(|reason| corruption(reason))?;
+        .map_err(corruption)?;
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
-        .map_err(|reason| corruption(reason))?;
+        .map_err(corruption)?;
     let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
         VectorPartitionRecordKind::Membership,
         encoded,
@@ -1871,9 +1871,9 @@ pub(super) fn decode_reverse_member(
     encoded: &[u8],
 ) -> Result<VectorPartitionMembershipRecord> {
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, encoded)
-        .map_err(|reason| corruption(reason))?;
+        .map_err(corruption)?;
     prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
-        .map_err(|reason| corruption(reason))?;
+        .map_err(corruption)?;
     let record: VectorPartitionMembershipRecord = decode_vector_partition_record_payload_checked(
         VectorPartitionRecordKind::Membership,
         encoded,

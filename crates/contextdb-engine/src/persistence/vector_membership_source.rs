@@ -244,7 +244,7 @@ pub(crate) fn enter_historical_read_intent(
         slot.borrow_mut().replace(HistoricalReadIntent {
             owner,
             snapshot,
-            memory: memory,
+            memory,
         })
     });
     HistoricalReadIntentScope {
@@ -319,7 +319,7 @@ fn scan_storage_error(error: redb::StorageError) -> Error {
                     }
                     NativeStorageFailure::AllocatorFailed { site, layout } => {
                         Some(NativeStorageFailure::AllocatorFailed {
-                            site: site,
+                            site,
                             layout: *layout,
                         })
                     }
@@ -498,7 +498,7 @@ pub(crate) fn enter_read_operation(
             checkpoint: checkpoint
                 .as_ref()
                 .map(|context| context.vector_checkpoint()),
-            memory: memory,
+            memory,
             scan_allowance,
         },
         credit,
@@ -1282,7 +1282,7 @@ pub(crate) fn select_live_fallback(
         )?;
         let payload =
             vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
-                .map_err(|reason| damage(reason))?;
+                .map_err(damage)?;
         prevalidate_vector_partition_metadata_routes(
             VectorPartitionRecordKind::Membership,
             payload,
@@ -3104,7 +3104,7 @@ impl ReverseCursor {
         });
         let payload =
             vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
-                .map_err(|reason| damage(reason))?;
+                .map_err(damage)?;
         prevalidate_vector_partition_metadata_routes(
             VectorPartitionRecordKind::Membership,
             payload,

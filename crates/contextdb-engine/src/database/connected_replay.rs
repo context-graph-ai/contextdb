@@ -40,14 +40,14 @@ impl ConnectedCoordinates {
             .chain(changes.vectors.iter().map(|vector| vector.lsn))
             .chain(changes.ddl_lsn.iter().copied())
         {
-            if !groups.contains_key(&source) {
+            if let std::collections::btree_map::Entry::Vacant(slot) = groups.entry(source) {
                 credit.try_grow_for(
                     2048,
                     "sync",
                     "connected_coordinates",
                     "Raise the declared memory limit to receive this unit.",
                 )?;
-                groups.insert(source, Lsn(0));
+                slot.insert(Lsn(0));
             }
         }
         if groups.len() as u64 != end.0 - start.0 + 1 {
@@ -770,12 +770,9 @@ impl Database {
             .chain(changes.vectors.iter().map(|vector| vector.lsn))
             .chain(changes.ddl_lsn.iter().copied())
         {
-            if !positions.contains_key(&source) {
+            if let std::collections::btree_map::Entry::Vacant(slot) = positions.entry(source) {
                 let membership = self.connected_membership_at(source, owner.clone())?;
-                positions.insert(
-                    source,
-                    membership.map_or((source, false), |(_, end)| (end, true)),
-                );
+                slot.insert(membership.map_or((source, false), |(_, end)| (end, true)));
             }
         }
         let mut groups = BTreeMap::<Lsn, (ChangeSet, bool)>::new();
@@ -1119,7 +1116,7 @@ impl<'a> PrivateUnitScope<'a> {
         }
         let previous = PRIVATE_UNIT.with(|slot| slot.replace(Some(PrivateUnitState {
             host: db.tx_mgr.identity(), tx, canonical_tx, end, callbacks_prepared: false, graph_origin: None, callback_config_cursor: 0, derived_shapes: HashMap::new(),
-            effects: PrivatePrefixEffects::new(owner.clone()), owner: owner,
+            effects: PrivatePrefixEffects::new(owner.clone()), owner,
         })));
         Ok(Self { db, tx, previous, active: true, _same_thread: std::marker::PhantomData })
     }

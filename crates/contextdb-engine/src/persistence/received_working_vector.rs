@@ -1206,6 +1206,7 @@ impl contextdb_vector::store::CapturedVectorStreamedTail for WorkingVectorStream
     }
 }
 
+#[expect(clippy::large_enum_variant, reason = "Retain the inline source and partition invoices without adding a heap allocation or changing their physical-free and refund boundary.")]
 enum WorkingPartitionOwner {
     Original { control: contextdb_tx::SourceCharge,
         summary: RawVectorMembershipSummary,

@@ -1,5 +1,8 @@
 #![allow(clippy::needless_range_loop)] // Existing compatibility and test seam shape.
 use super::*;
+
+type VectorRowFilter = (Box<(Expr, Option<TableMeta>)>, SourcePageCharge);
+
 use crate::database::CursorIdleWindow;
 use crate::plugin::QueryOutcome;
 use crate::read_contract::CanonicalQueryResult;
@@ -2214,7 +2217,7 @@ impl RequestContext {
         #[cfg(feature = "test-seams")]
         crate::vector_read_memory::statement_child_proof::funding_next(&self.reader_budget);
         Ok(trace.into_owned(owner.clone(), PrepaidTraceCredit {
-            owner: owner, credit, _control_invoice: owner_control.original_invoice(),
+            owner, credit, _control_invoice: owner_control.original_invoice(),
         })?)
     }
 
@@ -2317,22 +2320,22 @@ impl RequestContext {
 
 
 
-    /// Run one row-source call with every storage page it has to read
-    /// admitted against this read's memory before the page buffer exists.
-    ///
-    /// A stored row is read as the whole storage page that holds it, and the
-    /// page's length is known from the page address before any byte of it is
-    /// allocated. A value too large for the read's memory is therefore refused
-    /// at that point, with the same typed memory refusal the row's own charge
-    /// would have produced -- not after its page, its decoded copy and its
-    /// authentication encoding already exist.
-    ///
-    /// An admitted page carries its charge for as long as it lives. A page
-    /// the store's page cache keeps is paid for by the cache's own reserved
-    /// budget and gives its charge back at once; a page the cache does not
-    /// keep -- one larger than the cache -- keeps its charge until the last
-    /// thing holding it (this call, a retained scan, a cursor) drops it. Pages
-    /// served from the cache allocate nothing and are not charged.
+    // Run one row-source call with every storage page it has to read
+    // admitted against this read's memory before the page buffer exists.
+    //
+    // A stored row is read as the whole storage page that holds it, and the
+    // page's length is known from the page address before any byte of it is
+    // allocated. A value too large for the read's memory is therefore refused
+    // at that point, with the same typed memory refusal the row's own charge
+    // would have produced -- not after its page, its decoded copy and its
+    // authentication encoding already exist.
+    //
+    // An admitted page carries its charge for as long as it lives. A page
+    // the store's page cache keeps is paid for by the cache's own reserved
+    // budget and gives its charge back at once; a page the cache does not
+    // keep -- one larger than the cache -- keeps its charge until the last
+    // thing holding it (this call, a retained scan, a cursor) drops it. Pages
+    // served from the cache allocate nothing and are not charged.
 
 
     fn set_encoded_bytes(&self, bytes: u64) {
@@ -3462,7 +3465,7 @@ struct VectorState {
     /// authorization. `None` where the candidates are anything else.
     // Tuple fields drop in order: the box and all nested copies are freed
     // before their independent live charge. Cursor settlement cannot refund it.
-    row_filter: Option<(Box<(Expr, Option<TableMeta>)>, SourcePageCharge)>,
+    row_filter: Option<VectorRowFilter>,
     prepaid_construction: usize,
     /// The row checks this statement may spend (see `row_check_allowance`),
     /// once known, and those spent so far: index entries a bounded probe
@@ -6120,8 +6123,7 @@ impl Writer for CheckedCountingWriter<'_> {
             self.bytes
                 .get()
                 .checked_add(bytes.len())
-                .ok_or(bincode::error::EncodeError::Other((
-                    "bounded canonical size overflow")))?;
+                .ok_or(bincode::error::EncodeError::Other("bounded canonical size overflow"))?;
         self.bytes.set(next);
         Ok(())
     }
@@ -16056,7 +16058,7 @@ fn copy_vector_row_filter(
     filter: &Expr,
     meta: Option<&TableMeta>,
     context: &ControlArc<RequestContext>,
-) -> std::result::Result<(Box<(Expr, Option<TableMeta>)>, SourcePageCharge), BoundedExecutionError>
+) -> std::result::Result<VectorRowFilter, BoundedExecutionError>
 {
     // String/Vec clones have at most their source capacities. The transition
     // map is rebuilt with its quoted native capacity; all other fields use
@@ -21062,7 +21064,6 @@ fn window_capacity_bytes(
 // Private native control prototype. Logical strong lifetimes own T; every
 // strong or weak alias owns one physical count in the unchanged shared cell.
 // No caller is switched to this kernel until request/cursor integration exists.
-#[expect(dead_code, reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it.")]
 struct NativeControlCell<T> {
     strong: std::sync::atomic::AtomicUsize,
     payload: std::cell::UnsafeCell<Option<contextdb_core::read_memory::OwnedReadBox<T>>>,
@@ -21074,12 +21075,10 @@ struct NativeControlCell<T> {
 // borrowed T is protected by a logical strong; T handles its own shared mutation.
 unsafe impl<T: Send + Sync> Sync for NativeControlCell<T> {}
 
-#[expect(dead_code, reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it.")]
 struct NativeControlStrong<T> {
     cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
 }
 
-#[expect(dead_code, reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it.")]
 struct NativeControlWeak<T> {
     cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
 }

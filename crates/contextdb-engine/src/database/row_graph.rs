@@ -589,7 +589,7 @@ impl Database {
                 std::ops::Bound::Unbounded,
                 read_memory,
             )?;
-            while let Some(window) = cursor.next_edge_with(&mut || Ok(()))? {
+            while let Some(window) = cursor.next_edge_with(&|| Ok(()))? {
                 let owner = window
                     .row_owner()
                     .ok_or_else(|| Error::SyncError("row graph lane lost ownership".into()))?;

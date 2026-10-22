@@ -68,7 +68,7 @@ impl ReceivedWorkingWrite {
         // This projection clones precisely the lent writer use, not a current
         // registration discovered from a database accountant.
         let budget = crate::memory_accounting::persistence_original_projection(original)?.read_budget()?;
-        let source=WorkingReadSource {token,control_identity:super::received_working::next_working_control_identity()?,budget: budget,root,snapshot,lsn};
+        let source=WorkingReadSource {token,control_identity:super::received_working::next_working_control_identity()?,budget,root,snapshot,lsn};
         let context=Context {token,host,source:source.clone(),frontier:std::cell::Cell::new((snapshot,lsn)),write:self,original,store,metadata,graph_schema_scope,failure:std::cell::RefCell::new(None),failed:std::cell::Cell::new(false)};
         let previous = ACTIVE.with(|slot|slot.replace((&context as *const Context<'_>).cast()));
         let _scope = Scope { previous,_thread:std::marker::PhantomData };

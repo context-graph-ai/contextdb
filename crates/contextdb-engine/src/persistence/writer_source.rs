@@ -2916,7 +2916,7 @@ impl WriterReadCursor {
                 vector_partition_record_payload(VectorPartitionRecordKind::Membership, value)
                     .map_err(|reason| Error::StoreCorrupted {
                         path: "vector_partition_membership".into(),
-                        reason: reason,
+                        reason,
                     })?,
             )?;
             if RedbPersistence::vector_partition_membership_key(&record) != key {

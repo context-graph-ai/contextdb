@@ -516,8 +516,7 @@ impl Database {
             Ok(AdmittedMetadataBatch::Discard(batch))
         })?;
         let checkpoint = self.write_set_checkpoint_owned(host, tx)?;
-        let result = (|| {
-            host.transactions.with_transactions(|transactions| transactions.with_engine(tx, |held| {
+        let result = host.transactions.with_transactions(|transactions| transactions.with_engine(tx, |held| {
                 let removal = held.prepare_remove_rows(rows)?;
                 held.publish(removal);
                 self.remove_vector_positions_in_restricted_source(held, |entry| {
@@ -578,8 +577,7 @@ impl Database {
                 let prepared = host.metadata.prepare_metadata_append(tx, batch)?;
                 host.metadata.publish_metadata(prepared);
                 Ok(())
-            }))
-        })();
+            }));
         if result.is_err() { self.restore_write_set_checkpoint(tx, checkpoint)?; }
         else { checkpoint.settle(); }
         result

@@ -236,7 +236,7 @@ impl GraphReadSource for RetainedGraphSource {
         let control = credit(memory.clone(), std::mem::size_of::<RetainedGraphSnapshot>())?;
         Ok(Arc::new(RetainedGraphSnapshot {
             source: self.0.clone(),
-            memory: memory,
+            memory,
             _control: control,
         }))
     }

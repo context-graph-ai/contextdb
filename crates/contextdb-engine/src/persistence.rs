@@ -48229,7 +48229,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn relational_decode_error(path: &str, error: Error) -> Error {
         match error {
-            Error::Other(reason) => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &path, reason),
+            Error::Other(reason) => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), path, reason),
             other => other,
         }
     }
@@ -48238,7 +48238,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     fn relational_storage_error(path: &str, error: redb::StorageError) -> Error {
         let corrupted = matches!(&error, redb::StorageError::Corrupted(_));
         match Self::storage_error(error) {
-            Error::Other(reason) if corrupted => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &path, reason),
+            Error::Other(reason) if corrupted => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), path, reason),
             other => other,
         }
     }
@@ -48373,7 +48373,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn storage_source_error(path: &str, err: impl Into<redb::Error>) -> Error {
         match Self::storage_error(err) {
-            Error::StoreCorrupted { reason, .. } => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &path, reason),
+            Error::StoreCorrupted { reason, .. } => crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), path, reason),
             other => other,
         }
     }
