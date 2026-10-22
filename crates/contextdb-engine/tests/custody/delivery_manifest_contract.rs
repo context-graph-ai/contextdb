@@ -281,7 +281,7 @@ async fn replay_push(
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT id FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"))
-        .rows
+        .rows()
         .len()
 }
 
@@ -304,8 +304,8 @@ fn committed_row_digest(db: &Database, table: &str, id: Uuid) -> [u8; 32] {
             &HashMap::from([("id".into(), Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let mut columns: Vec<_> = result.columns.iter().zip(&result.rows[0]).collect();
+    assert_eq!(result.rows().len(), 1);
+    let mut columns: Vec<_> = result.columns().iter().zip(&result.rows()[0]).collect();
     columns.sort_by_key(|(name, _)| *name);
     let mut bytes = Vec::new();
     canonical_string(&mut bytes, "row.v1");
@@ -987,7 +987,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
                 &HashMap::from([("id".into(), Value::Uuid(ordinary))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("edge sibling".into())]]
     );
     assert_eq!(
@@ -997,7 +997,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
                 &HashMap::from([("id".into(), Value::Uuid(collision))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("hub winner".into())]]
     );
     assert_eq!(row_count(&hub.db, "record_marks"), 1);
@@ -1008,7 +1008,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
                 &HashMap::from([("id".into(), Value::Uuid(ordinary_child))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("outside the signed membership".into())]]
     );
     assert!(edge.push_watermark() >= source_frontier);
@@ -1048,11 +1048,11 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
             hub.db
                 .execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows,
+                .rows(),
             edge_db
                 .execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows
+                .rows()
         );
     }
 
@@ -1121,7 +1121,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
         hub.db
             .execute("SELECT body FROM ordinary_parents", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("winner".into())]]
     );
     assert_eq!(
@@ -1131,7 +1131,7 @@ async fn a_manifested_unit_travels_on_the_ordinary_push_and_the_oversized_stagin
                 &HashMap::from([("id".into(), Value::Uuid(sibling))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("independent".into())]]
     );
     assert_eq!(
@@ -1262,11 +1262,11 @@ async fn oversized_manifested_unit() {
             iroh_hub_db
                 .execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows,
+                .rows(),
             iroh_edge_db
                 .execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows,
+                .rows(),
             "oversized push preserves every actual row value"
         );
     }

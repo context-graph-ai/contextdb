@@ -114,11 +114,11 @@ fn shown(db: &Database, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
         .execute(sql, &p())
         .unwrap_or_else(|err| panic!("{sql} must answer: {err}"));
     let rows = result
-        .rows
+        .rows()
         .iter()
         .map(|row| row.iter().map(|cell| format!("{cell:?}")).collect())
         .collect();
-    (result.columns.clone(), rows)
+    (result.columns().clone(), rows)
 }
 
 /// Everything an inspection must leave exactly where it found it: the log
@@ -352,7 +352,7 @@ async fn the_three_show_statements_and_their_meta_commands_are_metadata_only_ref
                 &HashMap::from([("id".into(), Value::Uuid(root_key))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("root row".into())]],
         "refusal leaves the actual incumbent unchanged"
     );

@@ -159,7 +159,7 @@ fn resident_rows(db: &Database) -> Vec<Vec<Value>> {
                 ]),
             )
             .expect("resident data remains readable")
-            .rows;
+            .rows();
         if window.is_empty() {
             break;
         }
@@ -229,7 +229,7 @@ async fn identical_schema_push_commits_contact_on_the_receipt_boundary() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(contacts.rows.len(), 1);
+    assert_eq!(contacts.rows().len(), 1);
     drop(client);
     hub.stop().await;
 }
@@ -457,7 +457,7 @@ async fn affected_schema_closure_keeps_foreign_keys_propagation_and_triggers() {
         receiver
             .execute("SELECT status FROM closure_child", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("invalidated".into())]]
     );
     source.execute("INSERT INTO closure_parent (id, status) VALUES ('00000000-0000-0000-0000-000000000010', 'active')", &empty()).unwrap();
@@ -518,7 +518,7 @@ async fn ordinary_flow(kind: &str) {
             source
                 .execute("SELECT id, body FROM ordinary_items", &empty())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(1), Value::Text("pulled".into())]]
         );
         assert_eq!(
@@ -572,7 +572,7 @@ async fn ordinary_flow(kind: &str) {
             receiver
                 .execute("SELECT body FROM ordinary_items WHERE id = 2", &empty())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("authored".into())]]
         );
         use contextdb_server::protocol::{MessageType, PushRequest, decode};
@@ -596,11 +596,11 @@ async fn ordinary_flow(kind: &str) {
         source
             .execute("SELECT * FROM ordinary_items ORDER BY id", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         receiver
             .execute("SELECT * FROM ordinary_items ORDER BY id", &empty())
             .unwrap()
-            .rows
+            .rows()
     );
     assert_eq!(client.pending_push_change_count().unwrap(), 0);
     drop(client);
@@ -664,7 +664,7 @@ fn largest_affected_replay_preserves_existing_rows_vectors_and_trigger() {
         receiver
             .execute("SELECT revised FROM schema_000", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Null]],
         "the authored root alteration is actually installed"
     );
@@ -785,7 +785,7 @@ fn including_sync_stage_discovers_a_callback_written_table_beyond_its_declared_a
         receiver
             .execute("SELECT source_id FROM lazy_derived", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]],
         "the including-sync callback's write actually committed with the received row"
     );

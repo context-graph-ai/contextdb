@@ -87,7 +87,7 @@ struct ErasureTableResult {
 fn normalize_erasure(result: &QueryResult) -> BTreeMap<String, ErasureTableResult> {
     let column = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == name)
             .unwrap_or_else(|| panic!("erasure representation supplies its {name} field"))
@@ -96,11 +96,11 @@ fn normalize_erasure(result: &QueryResult) -> BTreeMap<String, ErasureTableResul
     let affected = column("rows_affected");
     let survivors = column("survivors");
     let pending_units = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "pending_units");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             let table = match &row[table] {
@@ -392,14 +392,14 @@ fn row_count(db: &Database, table: &str, batch: &str) -> usize {
         &HashMap::from([("batch".to_string(), text(batch))]),
     )
     .unwrap_or_else(|err| panic!("{table} must answer: {err}"))
-    .rows
+    .rows()
     .len()
 }
 
 fn total_rows(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT id FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} must answer: {err}"))
-        .rows
+        .rows()
         .len()
 }
 
@@ -412,7 +412,7 @@ fn whole_store(db: &Database) -> Vec<String> {
             let result = db
                 .execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap_or_else(|err| panic!("{table} must answer: {err}"));
-            format!("{table}:{:?}", result.rows)
+            format!("{table}:{:?}", result.rows())
         })
         .collect()
 }
@@ -422,12 +422,12 @@ fn outcome_words(db: &Database) -> Vec<String> {
         .execute("SHOW DELIVERY OUTCOMES FOR records", &p())
         .expect("outcomes render");
     let outcome_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "outcome")
         .expect("outcomes name their verdict column");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| format!("{:?}", row[outcome_column]))
         .collect()
@@ -977,7 +977,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
         "every selected table reports its affected count and survivors"
     );
     assert_eq!(
-        listed.rows_affected, 3,
+        listed.rows_affected(), 3,
         "the statement reports the total it destroyed"
     );
     assert_eq!(
@@ -997,7 +997,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
             &HashMap::from([("batch".to_string(), text("second"))]),
         )
         .expect("a table matching nothing does not fail the statement");
-    let mixed_rows_affected = mixed.rows_affected;
+    let mixed_rows_affected = mixed.rows_affected();
     let mixed = normalize_erasure(&mixed);
     assert_eq!(mixed["records"].affected, 1);
     assert_eq!(
@@ -1079,7 +1079,7 @@ async fn a_multi_table_purge_is_one_erasure_boundary_with_per_table_results_and_
             &HashMap::from([("batch".into(), text("edge-only"))]),
         )
         .unwrap();
-    assert_eq!(zero.rows_affected, 0);
+    assert_eq!(zero.rows_affected(), 0);
     within(client.pull_default())
         .await
         .expect("zero-match hub instruction reaches the edge");
@@ -1152,11 +1152,11 @@ async fn discard_never() {
         let discarded = edge
             .execute("DISCARD FROM unbound_notes WHERE id = 1", &p())
             .unwrap();
-        assert_eq!(discarded.rows_affected, 1);
+        assert_eq!(discarded.rows_affected(), 1);
         assert!(
             edge.execute("SELECT * FROM unbound_notes", &p())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
 
@@ -1271,11 +1271,11 @@ async fn discard_after_outcome() {
             .execute("SHOW TENANT TABLE POLICY FOR records", &p())
             .unwrap();
         let mode = policy
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "edge_discard")
             .unwrap();
-        assert_eq!(policy.rows[0][mode], text("after_outcome"));
+        assert_eq!(policy.rows()[0][mode], text("after_outcome"));
         within(client.shutdown()).await; // Enforcement below reads the persisted binding offline.
 
         // Written but not yet offered: the hub has said nothing about it.
@@ -1637,12 +1637,12 @@ async fn discard_always() {
                     reopened
                         .execute_in_tx(tx, &sql, &params)
                         .unwrap()
-                        .rows
+                        .rows()
                         .is_empty(),
                     "the erasing transaction sees its own absent {table} rows"
                 );
                 assert_eq!(
-                    reader.execute(&sql, &params).unwrap().rows.len(),
+                    reader.execute(&sql, &params).unwrap().rows().len(),
                     1,
                     "an independent reader still sees the committed {table} selection"
                 );
@@ -1651,7 +1651,7 @@ async fn discard_always() {
                 reopened
                     .execute_in_tx(tx, "SELECT id FROM local_notes", &p())
                     .unwrap()
-                    .rows
+                    .rows()
                     .len(),
                 1
             );
@@ -1659,7 +1659,7 @@ async fn discard_always() {
                 reader
                     .execute("SELECT id FROM local_notes", &p())
                     .unwrap()
-                    .rows
+                    .rows()
                     .is_empty()
             );
             assert_eq!(whole_store(&independent), committed_rows);
@@ -1691,7 +1691,7 @@ async fn discard_always() {
                     reader
                         .execute("SELECT id FROM local_notes", &p())
                         .unwrap()
-                        .rows
+                        .rows()
                         .is_empty()
                 );
                 assert_eq!(reopened.current_lsn(), committed_changes);
@@ -1706,7 +1706,7 @@ async fn discard_always() {
                         &params,
                     )
                     .unwrap()
-                    .rows
+                    .rows()
                     .is_empty(),
                 "the independent reader sees the committed {table} erasure"
             );
@@ -1715,7 +1715,7 @@ async fn discard_always() {
             reader
                 .execute("SELECT body FROM local_notes", &p())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![text("committed together")]],
             "the unrelated ordinary write becomes visible with the erasure"
         );
@@ -1798,7 +1798,7 @@ async fn discard_always() {
             committed
                 .execute("SELECT body FROM local_notes", &p())
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![text("committed together")]],
             "erasure and the unrelated ordinary write survive reopen together"
         );
@@ -1879,7 +1879,7 @@ fn discard_transaction_writes() {
     .unwrap();
     db.execute("INSERT INTO notes VALUES (1, 'original', [1.0, 0.0])", &p())
         .unwrap();
-    let original = db.execute("SELECT * FROM notes", &p()).unwrap().rows;
+    let original = db.execute("SELECT * FROM notes", &p()).unwrap().rows();
     for commit in [false, true] {
         let tx = db.begin().unwrap();
         db.execute_in_tx(
@@ -1897,15 +1897,15 @@ fn discard_transaction_writes() {
         let result = db
             .execute_in_tx(tx, "DISCARD FROM notes WHERE id IN (1, 2)", &p())
             .unwrap();
-        assert_eq!(result.rows_affected, 2);
+        assert_eq!(result.rows_affected(), 2);
         assert!(
             db.execute_in_tx(tx, "SELECT * FROM notes", &p())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
         assert_eq!(
-            db.execute("SELECT * FROM notes", &p()).unwrap().rows,
+            db.execute("SELECT * FROM notes", &p()).unwrap().rows(),
             original
         );
         if commit {
@@ -1913,7 +1913,7 @@ fn discard_transaction_writes() {
         } else {
             db.rollback(tx).unwrap();
             assert_eq!(
-                db.execute("SELECT * FROM notes", &p()).unwrap().rows,
+                db.execute("SELECT * FROM notes", &p()).unwrap().rows(),
                 original
             );
         }
@@ -1923,13 +1923,13 @@ fn discard_transaction_writes() {
     assert!(
         db.execute("SELECT * FROM notes", &p())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     db.execute("INSERT INTO notes VALUES (1, 'new life', [1.0, 0.0])", &p())
         .unwrap();
     assert_eq!(
-        db.execute("SELECT body FROM notes", &p()).unwrap().rows,
+        db.execute("SELECT body FROM notes", &p()).unwrap().rows(),
         vec![vec![Value::Text("new life".into())]]
     );
 }
@@ -1955,7 +1955,7 @@ fn insert_repeated_key(db: &Database, table: &str) {
             &repeated_key_params(),
         )
         .expect("read the repeated key")
-        .rows,
+        .rows(),
         vec![vec![text("a")]],
         "the new life at the purged key is visible"
     );
@@ -1964,7 +1964,7 @@ fn insert_repeated_key(db: &Database, table: &str) {
 fn purge_batch_a(db: &Database, table: &str) -> u64 {
     db.execute(&format!("PURGE FROM {table} WHERE batch = 'a'"), &p())
         .expect("a standalone PURGE of the batch commits")
-        .rows_affected
+        .rows_affected()
 }
 
 /// The lineage root and permanent frontier the key's current lifecycle names.
@@ -2002,7 +2002,7 @@ fn purged_at(frontier: u64) -> contextdb_engine::database::AuthoritativePurgeRoo
 fn row_total(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT id FROM {table}"), &p())
         .expect("count the table")
-        .rows
+        .rows()
         .len()
 }
 
@@ -2052,7 +2052,7 @@ fn a_purge_erases_a_row_written_again_at_a_purged_key_and_every_purged_life_stay
     assert_eq!(
         db.execute("DISCARD FROM records WHERE batch = 'a'", &p())
             .expect("DISCARD of a later life at a purged key commits")
-            .rows_affected,
+            .rows_affected(),
         1
     );
     assert_eq!(row_total(&db, "records"), 0);
@@ -2161,7 +2161,7 @@ fn an_ordinary_delete_of_a_later_life_keeps_the_purged_life_refused() {
             &repeated_key_params()
         )
         .expect("an ordinary delete of the new life commits")
-        .rows_affected,
+        .rows_affected(),
         1
     );
     assert_eq!(

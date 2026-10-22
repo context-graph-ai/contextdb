@@ -585,7 +585,7 @@ fn stage_unit(
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT id FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"))
-        .rows
+        .rows()
         .len()
 }
 
@@ -594,7 +594,7 @@ fn bodies(db: &Database, table: &str) -> BTreeSet<String> {
         .execute(&format!("SELECT body FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(text) => text.clone(),
@@ -1232,7 +1232,7 @@ async fn hub_written_incumbents_receive_terminal_outcomes() {
             hub_db
                 .execute("SHOW DELIVERY OUTCOMES FOR records", &p())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             index as usize,
             "only the preceding units have outcomes; this hub-written unit has none"
@@ -1800,7 +1800,7 @@ async fn delivery_status_reconciles_with_manifests_and_outcomes_and_only_an_outc
                 &HashMap::from([("id".into(), Value::Uuid(same_transaction_sibling))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("same transaction sibling".into())]]
     );
     // The actual reply above is deliberately not admitted at the edge.
@@ -2082,7 +2082,7 @@ async fn scoped_custody_reads_follow_visible_roots() {
         .execute("SELECT id FROM records ORDER BY id", &p())
         .unwrap();
     assert_eq!(
-        rows.rows,
+        rows.rows(),
         vec![vec![Value::Uuid(roots[0])], vec![Value::Uuid(roots[4])]],
         "the ordinary row gate independently selects the two visible roots"
     );
@@ -2193,7 +2193,7 @@ async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing
         assert!(
             db.execute("SHOW DELIVERY OUTCOMES FOR records", &p())
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty(),
             "restored authority leaves no current SHOW terminal before reoffer"
         );
@@ -2213,17 +2213,17 @@ async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing
     // Inspecting the binding after restore shows the new authority.
     let bindings = edge_db.execute("SHOW SYNC BINDINGS", &p()).unwrap();
     let life_column = bindings
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "hub_incarnation")
         .unwrap();
     let current_life = restored_db
         .sync_incarnation(&TenantId::from(tenant))
         .unwrap();
-    assert_eq!(bindings.rows.len(), 2);
+    assert_eq!(bindings.rows().len(), 2);
     assert!(
         bindings
-            .rows
+            .rows()
             .iter()
             .all(|row| row[life_column] == Value::Text(current_life.to_hex()))
     );
@@ -2297,14 +2297,14 @@ async fn restoring_an_old_hub_image_and_rebinding_revoke_credit_without_changing
     );
     let bindings = reopened.execute("SHOW SYNC BINDINGS", &p()).unwrap();
     let hub_column = bindings
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "hub_node_id")
         .unwrap();
-    assert_eq!(bindings.rows.len(), 2);
+    assert_eq!(bindings.rows().len(), 2);
     assert!(
         bindings
-            .rows
+            .rows()
             .iter()
             .all(|row| row[hub_column] == Value::Text(other.node_id.clone()))
     );
@@ -2459,7 +2459,7 @@ async fn a_refused_unit_is_terminal_the_resend_obligation_ends_status_is_clean_a
             &HashMap::from([("id".to_string(), Value::Uuid(root_id))]),
         )
         .expect("the refused root is still readable on the edge");
-    assert_eq!(located.rows.len(), 1);
+    assert_eq!(located.rows().len(), 1);
     assert_eq!(
         bodies(&loser_db, MEMBER_TABLE),
         BTreeSet::from(["losing-member".to_string()]),
@@ -2482,7 +2482,7 @@ fn whole_unit_rows(db: &Database) -> Vec<Vec<Vec<Value>>> {
         .map(|table| {
             db.execute(&format!("SELECT * FROM {table} ORDER BY id"), &p())
                 .unwrap()
-                .rows
+                .rows()
         })
         .collect()
 }
@@ -2828,7 +2828,7 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
         edge_db
             .execute("SELECT body FROM after_hidden WHERE id=1", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text(
             "reachable after hidden custody history".into()
         )]]
@@ -2924,7 +2924,7 @@ async fn restore_verification_is_bounded_and_covers_purge_gaps() {
                     &HashMap::from([("id".into(), Value::Uuid(*id))])
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("retained".into())]]
         );
     }
@@ -3127,7 +3127,7 @@ async fn mutable_manifest_rows_do_not_block_other_units() {
         !edge_db
             .execute("SHOW DELIVERY OUTCOMES FOR records", &p())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "ordinary deletion preserves historical terminal inspection"
     );
@@ -3159,7 +3159,7 @@ async fn declared_snapshot_before_first_binding_recovers() {
         hub_db
             .execute("SHOW SYNC BINDINGS", &p())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     hub_db.export_snapshot(&snapshot).unwrap();
@@ -3194,7 +3194,7 @@ async fn declared_snapshot_before_first_binding_recovers() {
         restored_db
             .execute("SHOW SYNC BINDINGS", &p())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     let restored =

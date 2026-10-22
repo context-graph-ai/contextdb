@@ -112,21 +112,21 @@ fn every_route(
     let mut answers = Vec::new();
     answers.push((
         "eager",
-        classify(narrowed.execute(sql, binds).map(|r| r.rows.len())),
+        classify(narrowed.execute(sql, binds).map(|r| r.rows().len())),
     ));
     let session = narrowed
         .read_session(roomy())
         .expect("open a bounded read view");
     answers.push((
         "bounded",
-        classify(session.execute(sql, binds).map(|r| r.rows.len())),
+        classify(session.execute(sql, binds).map(|r| r.rows().len())),
     ));
     answers.push((
         "retained cursor",
         classify(
             session
                 .open_cursor(sql, binds)
-                .map(|cursor| cursor.first_page().rows.len()),
+                .map(|cursor| cursor.first_page().rows().len()),
         ),
     ));
     let tx = narrowed.begin().expect("begin");
@@ -143,7 +143,7 @@ fn every_route(
         .expect("stage a row of the reader's own");
     answers.push((
         "transaction with staged rows",
-        classify(narrowed.execute_in_tx(tx, sql, binds).map(|r| r.rows.len())),
+        classify(narrowed.execute_in_tx(tx, sql, binds).map(|r| r.rows().len())),
     ));
     narrowed.rollback(tx).expect("rollback");
     answers
@@ -288,12 +288,12 @@ fn all_routes_answer_pairs(world: &World, sql: &str, expected: Answer, label: &s
         .read_session(roomy())
         .expect("open a bounded read view");
     assert_eq!(
-        classify(narrowed.execute(sql, &none()).map(|r| r.rows.len())),
+        classify(narrowed.execute(sql, &none()).map(|r| r.rows().len())),
         expected,
         "{label}: eager"
     );
     assert_eq!(
-        classify(session.execute(sql, &none()).map(|r| r.rows.len())),
+        classify(session.execute(sql, &none()).map(|r| r.rows().len())),
         expected,
         "{label}: bounded"
     );
@@ -301,7 +301,7 @@ fn all_routes_answer_pairs(world: &World, sql: &str, expected: Answer, label: &s
         classify(
             session
                 .open_cursor(sql, &none())
-                .map(|c| c.first_page().rows.len())
+                .map(|c| c.first_page().rows().len())
         ),
         expected,
         "{label}: retained cursor"
@@ -367,8 +367,8 @@ fn the_unique_key_is_the_chosen_plan_and_costs_one_probe_at_any_size() {
             w.db.scoped_with_contexts(contexts(&[CTX_A]))
                 .execute(sql, &binds)
                 .unwrap();
-        assert_eq!(answered.rows.len(), 1);
-        examined.push(answered.trace.rows_examined);
+        assert_eq!(answered.rows().len(), 1);
+        examined.push(answered.trace().rows_examined);
     }
     assert!(
         examined.iter().all(|n| *n <= 2),
@@ -405,7 +405,7 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
                 &none(),
             )
             .unwrap()
-            .trace
+            .trace()
             .rows_examined;
         let tx = db.begin().unwrap();
         let first = db
@@ -415,7 +415,7 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
                 &none(),
             )
             .unwrap();
-        assert_eq!(first.rows_affected, 1);
+        assert_eq!(first.rows_affected(), 1);
         let staged = db
             .execute_in_tx(
                 tx,
@@ -424,7 +424,7 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
             )
             .unwrap();
         assert_eq!(
-            staged.rows_affected, 1,
+            staged.rows_affected(), 1,
             "the unique route sees this transaction's replacement"
         );
         let read = db
@@ -434,7 +434,7 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
                 &none(),
             )
             .unwrap();
-        assert_eq!(read.rows, vec![vec![Value::Int64(101)]]);
+        assert_eq!(read.rows(), vec![vec![Value::Int64(101)]]);
         db.commit(tx).unwrap();
         let tx = db.begin().unwrap();
         assert!(
@@ -454,7 +454,7 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
                 &none(),
             )
             .unwrap();
-        assert_eq!(changed.rows_affected, 1);
+        assert_eq!(changed.rows_affected(), 1);
         db.execute(
             "UPDATE items SET body = 103 WHERE tenant = 1 AND id = 1",
             &none(),
@@ -472,7 +472,7 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
                 &none(),
             )
             .unwrap();
-        assert_eq!(replacement.rows_affected, 1);
+        assert_eq!(replacement.rows_affected(), 1);
         let deleted = db
             .execute_in_tx(
                 tx,
@@ -481,7 +481,7 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
             )
             .unwrap();
         assert_eq!(
-            deleted.rows_affected, 1,
+            deleted.rows_affected(), 1,
             "the secondary unique key sees the staged replacement"
         );
         db.commit(tx).unwrap();
@@ -491,13 +491,13 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
                 &none()
             )
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
         );
         let observed = (
-            first.trace.rows_examined,
-            staged.trace.rows_examined,
-            deleted.trace.rows_examined,
+            first.trace().rows_examined,
+            staged.trace().rows_examined,
+            deleted.trace().rows_examined,
         );
         assert_eq!(
             observed,

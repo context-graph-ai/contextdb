@@ -101,7 +101,7 @@ fn resident_digest(db: &Database, rows: u64) -> Vec<Vec<Value>> {
             &empty(),
         )
         .expect("resident data remains readable")
-        .rows;
+        .rows();
     assert_eq!(
         answer.len() as u64,
         rows,
@@ -146,10 +146,10 @@ fn reader(
                     &HashMap::from([("q".to_string(), Value::Vector(resident_vector(id)))]),
                 ) {
                     Ok(result) => (
-                        Some(result.rows.len() == 10.min(rows as usize)),
+                        Some(result.rows().len() == 10.min(rows as usize)),
                         Some(format!(
                             "{:?}",
-                            result.trace.vector_search.as_ref().and_then(|d| d.route)
+                            result.trace().vector_search.as_ref().and_then(|d| d.route)
                         )),
                     ),
                     Err(_) => (None, None),
@@ -161,9 +161,9 @@ fn reader(
             ) {
                 Ok(result) => (
                     Some(
-                        result.rows.len() == 1
-                            && result.rows[0][0] == Value::Int64(id)
-                            && result.rows[0][1] == Value::Vector(resident_vector(id)),
+                        result.rows().len() == 1
+                            && result.rows()[0][0] == Value::Int64(id)
+                            && result.rows()[0][1] == Value::Vector(resident_vector(id)),
                     ),
                     None,
                 ),
@@ -354,7 +354,7 @@ async fn largest_affected_migration(rows: u64, directory: &std::path::Path) -> s
         receiver
             .execute("SELECT revised FROM schema_000", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Null]],
         "the authored root alteration is installed"
     );

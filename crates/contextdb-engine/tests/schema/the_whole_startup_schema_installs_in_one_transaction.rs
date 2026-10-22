@@ -225,7 +225,7 @@ fn assert_schema_components_are_usable(db: &Database, phase: &str, seed: u128) {
         )
         .expect("the committed vector and rank declarations must answer a ranked query");
     assert_eq!(
-        vector.rows.len(),
+        vector.rows().len(),
         1,
         "{phase}: ranked vector query must return its row"
     );
