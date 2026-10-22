@@ -1327,10 +1327,9 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
         let independent_answer_invoice = components[2]
             + components[3]
             + components[4]
-            + image_requests
-                .iter()
-                .map(|request| request.1)
-                .sum::<usize>();
+            // The retention node's own invoice is already included in its
+            // image's held payload; the image's physical block is external.
+            + image_requests[1].1;
         assert_eq!(
             before - after,
             independent_answer_invoice as u64,
