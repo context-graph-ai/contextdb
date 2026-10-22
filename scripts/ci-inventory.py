@@ -117,7 +117,7 @@ fi'''
         if script.count(snippet) != 1:
             raise ValueError("shard runner lost split-shard target selection")
     for snippet in ['aggregate_names=()',
-                    'if [[ "$item" == custody || "$item" == vector ]]; then',
+                    'if [[ "$item" == custody || "$item" == vector || ( "$item" == custody_schema_replay_bounded_contract && "${CI_GATE_MODE:-full}" == full ) ]]; then',
                     'for aggregate_name in "${aggregate_names[@]}"; do',
                     'aggregate-skips "$aggregate_name" --aggregate-features "$features"',
                     '--test "$aggregate_name" -- "${aggregate_flags[@]}"']:

@@ -591,7 +591,8 @@ def commands(row, root=ROOT, mode=None):
     kind = row['kind']
     base = ['cargo', 'test', '--locked', '-p', 'contextdb-engine', '--features', metadata(row)['features']]
     if kind == 'engine-tests':
-        aggregates = [t for t in row['targets'] if t in {'custody', 'vector'}]
+        aggregates = [t for t in row['targets'] if t in {'custody', 'vector'}
+                      or mode == 'full' and t == 'custody_schema_replay_bounded_contract']
         ordinary = [t for t in row['targets'] if t not in aggregates]
         for target in ordinary:
             base += ['--lib', '--bins'] if target == 'lib' else ['--test', target]
@@ -1036,6 +1037,8 @@ def main():
         aggregate = aggregate_module()
         if frozenset((args.aggregate_features or '').split(',')) not in aggregate.PROFILES:
             raise ValueError('aggregate shard feature envelope changed')
+        if args.slice == aggregate.FULL_ONLY_RULE['full_skip_owner'] and mode != 'full':
+            raise ValueError('normal schema replay must retain the main namespace')
         for prefix in aggregate.skip_prefixes(ROOT, args.slice):
             print(prefix)
         return 0

@@ -6,8 +6,9 @@ from pathlib import Path
 import re
 import tomllib
 
-CERTIFICATE_SHA256 = 'f95902c3088dffc7ab0147a4281ce61c4553b6c8236565aae69a7aa72cf39c54'
+CERTIFICATE_SHA256 = '905ca74e8df2fe59d498e063df45722a492e87d1dbf4a2b791ce0f61b4474fc5'
 AGGREGATES = ('custody', 'vector')
+FULL_ONLY_RULE = {'module': 'schema_replay_is_proportional_to_affected_tables', 'source': 'crates/contextdb-engine/tests/schema/schema_replay_is_proportional_to_affected_tables.rs', 'normal_owner': 'custody_schema_replay_bounded_contract', 'full_owner': 'custody_schema_replay_is_proportional_to_affected_tables', 'full_skip_owner': 'custody_schema_replay_bounded_contract'}
 PROFILES = (frozenset(('test-seams', 'iroh')),
             frozenset(('nightly-tests', 'test-seams', 'iroh')))
 PATH_MODULE = re.compile(r'#\[path\s*=\s*"([^"]+)"\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;')
@@ -124,6 +125,14 @@ def build_certificate(root):
             proofs = {owner: semantics(root, aggregate, owner, shared, records, cache) for owner in owners}
             entries.append(dict(**shared, owners=owners, proofs=proofs))
         result['aggregates'][aggregate] = dict(wrapper=records[aggregate]['path'], modules=entries)
+    shared = next(entry for entry in result['aggregates']['custody']['modules']
+                  if entry['name'] == FULL_ONLY_RULE['module'])
+    if set(shared['owners']) != {FULL_ONLY_RULE['normal_owner'], FULL_ONLY_RULE['full_owner']}:
+        raise ValueError('schema replay standalone ownership changed')
+    shared_sources = closure(root, root / shared['path'], Path(shared['path']).stem)
+    if any('UNRELATED_RESIDENT_ROWS' in text for text in shared_sources.values()):
+        raise ValueError('schema replay wrappers now change the shared workload; review selection')
+    result['full_only_rule'] = FULL_ONLY_RULE
     used = set(AGGREGATES) | {owner for item in result['aggregates'].values()
                              for entry in item['modules'] for owner in entry['owners']}
     result['wrapper_sha256'] = {target: hashlib.sha256(wrappers[target].read_bytes()).hexdigest()
@@ -173,6 +182,8 @@ def contract(root):
         names = [entry['name'] for entry in item['modules']]
         if len(names) != len(set(names)) or not any(not entry['owners'] for entry in item['modules']):
             raise ValueError('aggregate unique coverage is missing or duplicated: ' + target)
+    if expected.get('full_only_rule') != FULL_ONLY_RULE:
+        raise ValueError('schema replay normal/full standalone ownership changed')
     routes_contract(root)
     return expected
 
@@ -215,8 +226,10 @@ def routes_contract(root):
 
 def skip_prefixes(root, target):
     data = contract(root)
+    if target == FULL_ONLY_RULE['full_skip_owner']:
+        return [FULL_ONLY_RULE['module'] + '::']
     if target not in AGGREGATES:
-        raise ValueError('unknown aggregate target: ' + target)
+        raise ValueError('unknown isolated target: ' + target)
     return [entry['name'] + '::' for entry in data['aggregates'][target]['modules'] if entry['owners']]
 
 

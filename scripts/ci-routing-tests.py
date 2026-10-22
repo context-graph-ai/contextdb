@@ -227,9 +227,14 @@ for mode, default, count in [('normal', False, 23), ('full', False, 32), ('full'
                 assert commands[1][-2:] == [i.OVERSIZED, '--exact']
                 assert commands[1][commands[1].index('--features') + 1] == 'test-seams,iroh'
         if mode == 'full' and set(row['targets']) & i.FULL_SCHEMA:
-            assert len(commands) == 2
+            bounded = 'custody_schema_replay_bounded_contract'
+            assert len(commands) == 2 + int(bounded in row['targets'])
             assert commands[1][commands[1].index('--features') + 1] == 'test-seams,iroh'
             assert '--skip' not in commands[1]
+            if bounded in row['targets']:
+                assert bounded not in commands[0] and bounded not in commands[1]
+                assert commands[2][commands[2].index('--test') + 1] == bounded
+                i.aggregate_module().validate_command(ROOT, bounded, commands[2])
     needs = dict(plan=dict(result='success', outputs=dict(enabled='true', **{k: matrix['include'][0][k] for k in i.PLAN_FIELDS}, matrix=json.dumps(matrix))),
                  slice=dict(result='success'))
     i.required(needs, rows, True, default, mode)

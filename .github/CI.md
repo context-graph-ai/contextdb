@@ -296,7 +296,7 @@ use the single bounded target:
 **schema replay contracts**, **schema replay / work limited to affected tables**, and
 **schema replay / identical schema avoids rebuilding data**. The full cases retain
 their assertions and canonical shared helpers. The existing **schema replay
-contracts** job also requires `custody_schema_replay_bounded_contract` (14 cases: 13 canonical oracles at a one-row unrelated fixture plus one unique
+contracts** job also requires `custody_schema_replay_bounded_contract` (16 cases: 15 canonical oracles at a one-row unrelated fixture plus one unique
 receipt/contact replication twin) in both PR and extended coverage; no job is added. The proposed normal mode selects only the bounded root; full mode retains all original roots. Compile/list checks do not establish gate timing.
 The hard thirty-minute end-to-end correctness budget remains unmet; full-scale qualification relocation requires owner policy approval; hosted acceptance remains pending.
 
@@ -571,3 +571,13 @@ uses exactly `contextdb-internal`. All retain the same isolated redb target
 directory, locked manifest and one test thread. Registration and ownership checks
 reject missing, duplicate or wrongly featured targets. This adds no job and does
 not establish a runtime pass.
+
+Full qualification retains one execution owner per feature tuple for the 13
+main schema replay cases: the dedicated full schema target. Its bounded sibling
+runs separately and skips only that identical namespace in full mode, retaining
+its one-row witness and its other workload-specific namespaces. Normal mode
+keeps the main namespace in the bounded target because the full target is absent.
+The main shared source hardcodes its 10,000-row fixture and does not consume the
+wrappers' different row-count constants; the other bounded modules keep those
+constants and their distinct workloads. The `maintained_search` shared module
+is a helper with no test cases and needs no additional execution selection.

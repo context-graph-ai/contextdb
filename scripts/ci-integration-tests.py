@@ -195,7 +195,7 @@ class IntegrationControls(unittest.TestCase):
             if row['kind'] == 'engine-tests':
                 expected = base.copy()
                 for target in row['targets']:
-                    if target in {'custody', 'vector'}:
+                    if target in {'custody', 'vector', 'custody_schema_replay_bounded_contract'}:
                         continue
                     expected += ['--lib', '--bins'] if target == 'lib' else ['--test', target]
                 selected = i.commands(row, mode='full')
@@ -203,8 +203,9 @@ class IntegrationControls(unittest.TestCase):
                 if set(row['targets']) & i.FULL_SCHEMA or 'sync_schema_transactions' in row['targets']:
                     self.assertEqual(selected[1][selected[1].index('--features') + 1], 'test-seams,iroh')
                 else:
-                    self.assertEqual(len(selected), 1 + len(set(row['targets']) & {'custody', 'vector'}))
-                for target, command in zip([t for t in row['targets'] if t in {'custody', 'vector'}], selected[1:]):
+                    self.assertEqual(len(selected), 1 + len(set(row['targets']) & {'custody', 'vector', 'custody_schema_replay_bounded_contract'}))
+                for target, command in zip([t for t in row['targets'] if t in {'custody', 'vector', 'custody_schema_replay_bounded_contract'}],
+                                           selected[2:] if set(row['targets']) & i.FULL_SCHEMA else selected[1:]):
                     i.aggregate_module(ROOT).validate_command(ROOT, target, command)
 
     def test_aggregate_ownership_negative_controls(self):

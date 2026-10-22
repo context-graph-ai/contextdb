@@ -75,7 +75,7 @@ while read -r name items; do
   items=${routing%%|*}
   skip_case=${routing#*|}
   for item in $items; do
-    if [[ "$item" == custody || "$item" == vector ]]; then
+    if [[ "$item" == custody || "$item" == vector || ( "$item" == custody_schema_replay_bounded_contract && "${CI_GATE_MODE:-full}" == full ) ]]; then
       aggregate_names+=("$item")
       continue
     fi
@@ -160,7 +160,7 @@ fi
 statuses=("${PIPESTATUS[@]}")
 status=${statuses[0]}
 if [[ "$status" == 0 ]]; then status=${statuses[1]}; fi
-# Aggregate filters belong only to their own binary, never the standalone owners.
+# Each filter belongs only to its isolated binary, never its execution owner.
 for aggregate_name in "${aggregate_names[@]}"; do
   if ! aggregate_plan=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" aggregate-skips "$aggregate_name" --aggregate-features "$features"); then
     if [[ "$status" == 0 ]]; then status=2; fi
