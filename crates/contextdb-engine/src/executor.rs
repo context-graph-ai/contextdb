@@ -5364,6 +5364,8 @@ fn execute_alter_table_plan(
 ) -> Result<OwnedQueryResult> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+    #[cfg(any(test, feature = "test-seams"))]
+    let _phase = crate::read_image_memory::MaintenancePhase::enter("alter");
     require_admin_for_ddl(db)?;
     db.check_disk_budget("ALTER TABLE")?;
     let store = db.relational_store();

@@ -1716,6 +1716,8 @@ impl RedbPersistence {
         config_values: &[(&str, Vec<u8>)],
     ) -> Result<bool> {
         let _decode = self.writer_decode_scope()?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let phase = crate::read_image_memory::MaintenancePhase::enter("projection");
         let Some(source) = self.scalar_schema_projection_source(name, meta)? else {
             return Ok(false);
         };
@@ -1837,7 +1839,18 @@ impl RedbPersistence {
                     ));
                 }
             }
+            #[cfg(any(test, feature = "test-seams"))]
+            phase.record("witnessed_copy_enter", 0, None);
+            #[cfg(any(test, feature = "test-seams"))]
+            let mut copied_rows = 0u64;
             self.visit_relational_rows_in_write(&write, name, |source_row| {
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    copied_rows += 1;
+                    if copied_rows.is_multiple_of(1000) {
+                        phase.record("witnessed_copy", copied_rows, None);
+                    }
+                }
                 #[cfg(test)]
                 crate::database::ef_search_metadata_contract_tests::note_projection_rows(1);
                 let mut window = self.proof_admission();
@@ -1874,6 +1887,8 @@ impl RedbPersistence {
                     .map_err(Self::storage_error)?;
                 Ok(())
             })?;
+            #[cfg(any(test, feature = "test-seams"))]
+            phase.record("witnessed_copy_exit", copied_rows, None);
             if !dropped_vectors.is_empty() {
                 self.remove_vector_partition_records_matching_all_in_write(
                     &write,
@@ -1925,11 +1940,31 @@ impl RedbPersistence {
                         historical_index_commitment::Side::Versions,
                     )?;
                 }
+                #[cfg(any(test, feature = "test-seams"))]
+                phase.record("temp_rows_enter", 0, None);
+                #[cfg(any(test, feature = "test-seams"))]
+                let mut decoded_rows = 0u64;
                 for entry in source.iter().map_err(Self::storage_error)? {
                     let (key, value) = entry.map_err(Self::storage_error)?;
                     let mut window = self.proof_admission();
                     window.admit(value.value().len().saturating_mul(8).saturating_add(1024))?;
-                    let row = Self::decode_versioned_row(value.value(), None)?;
+                    // The row and its derived keys die before their original
+                    // payer's decode owner, including refusal and unwind.
+                    let row_memory = crate::read_image_memory::ImageMemory::funded_for_original(
+                        self.require_decode_original()?,
+                        "writer_source",
+                        "decode_stored_value",
+                        "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
+                    )?;
+                    let row =
+                        row_memory.scope(|| Self::decode_versioned_row(value.value(), None))?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    {
+                        decoded_rows += 1;
+                        if decoded_rows.is_multiple_of(1000) {
+                            phase.record("temp_rows", decoded_rows, Some(&row_memory));
+                        }
+                    }
                     self.replace_relational_manifest_in_write(
                         &write,
                         name,
@@ -1950,6 +1985,8 @@ impl RedbPersistence {
                     )?;
                 }
             }
+            #[cfg(any(test, feature = "test-seams"))]
+            phase.record("temp_rows_exit", 0, None);
             Self::retire_undeclared_relational_indexes_in_write(
                 &write,
                 &self.path,
@@ -1968,8 +2005,18 @@ impl RedbPersistence {
                     content_identity::ContentIdentityMutation,
                     content_identity::OwnedProofAdmission,
                 )> = None;
+                #[cfg(any(test, feature = "test-seams"))]
+                phase.record("head_indexes_enter", 0, None);
+                #[cfg(any(test, feature = "test-seams"))]
+                let mut decoded_rows = 0u64;
                 loop {
                     let mut window = self.proof_admission();
+                    let row_memory = crate::read_image_memory::ImageMemory::funded_for_original(
+                        self.require_decode_original()?,
+                        "writer_source",
+                        "decode_stored_value",
+                        "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
+                    )?;
                     // Every fingerprint update may finalize closed table pages.
                     // End the source table and access guards before that update.
                     let selected = {
@@ -1994,7 +2041,8 @@ impl RedbPersistence {
                                         "invalid schema projection key".into(),
                                     )
                                 })?;
-                                Self::decode_versioned_row(value.value(), None)
+                                row_memory
+                                    .scope(|| Self::decode_versioned_row(value.value(), None))
                                     .map(|row| (key, row))
                             })
                             .transpose()?
@@ -2002,6 +2050,13 @@ impl RedbPersistence {
                     let Some((key, row)) = selected else {
                         break;
                     };
+                    #[cfg(any(test, feature = "test-seams"))]
+                    {
+                        decoded_rows += 1;
+                        if decoded_rows.is_multiple_of(1000) {
+                            phase.record("head_indexes", decoded_rows, Some(&row_memory));
+                        }
+                    }
                     after = Some(key);
                     indexes.push(self, &write, name, meta, &row, &mut commitments)?;
                     if head.as_ref().is_some_and(|(id, _, _, _)| *id != row.row_id) {
@@ -2025,6 +2080,8 @@ impl RedbPersistence {
                         ));
                     }
                 }
+                #[cfg(any(test, feature = "test-seams"))]
+                phase.record("head_indexes_exit", decoded_rows, None);
                 if let Some((_, _, mutation, _head_credit)) = head {
                     Self::apply_content_identity_mutations_in_write(
                         &write,
@@ -2045,7 +2102,11 @@ impl RedbPersistence {
             #[cfg(any(test, feature = "test-seams"))]
             table_meta_rewrite_checkpoint_for_test(1);
             indexes.finish(self, &write, name, meta)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            phase.record("commitments_enter", 0, None);
             let (mutations, _credit) = commitments.finish(&write)?.into_parts();
+            #[cfg(any(test, feature = "test-seams"))]
+            phase.record("commitments_exit", 0, None);
             Self::apply_content_identity_mutations_in_write(
                 &write,
                 &mutations,
@@ -2093,7 +2154,11 @@ impl RedbPersistence {
             }
             Self::raise_table_read_lsn_in_write(&write, name, lsn)?;
             Self::write_writer_recovery_bounds_in_write(&write, None)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            phase.record("durable_commit_enter", 0, None);
             write.commit().map_err(Self::storage_error)?;
+            #[cfg(any(test, feature = "test-seams"))]
+            phase.record("durable_commit_exit", 0, None);
             self.complete_writer_schema_change(schema);
             #[cfg(any(test, feature = "test-seams"))]
             table_meta_rewrite_checkpoint_for_test(3);
