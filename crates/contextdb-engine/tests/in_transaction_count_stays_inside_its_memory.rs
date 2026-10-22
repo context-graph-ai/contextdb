@@ -99,7 +99,7 @@ fn an_in_transaction_count_holds_no_memory_per_staged_row() {
         "in-tx count over {STAGED} staged rows: peak growth {peak_growth} B, answer {answer:?}"
     );
     match answer {
-        Ok(answer) => assert_eq!(answer.rows, vec![vec![Value::Int64(10)]]),
+        Ok(answer) => assert_eq!(answer.rows(), vec![vec![Value::Int64(10)]]),
         Err(error) => assert!(
             matches!(
                 error,
