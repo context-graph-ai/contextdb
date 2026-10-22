@@ -48,7 +48,7 @@ fn a_write_transaction_larger_than_a_statement_read_limit_commits_under_the_writ
     let count = db
         .execute("SELECT id FROM seeded", &HashMap::new())
         .unwrap()
-        .rows
+        .rows()
         .len();
     assert_eq!(count as i64, ROWS);
 }

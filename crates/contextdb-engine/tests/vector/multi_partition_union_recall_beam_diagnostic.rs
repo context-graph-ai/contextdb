@@ -52,7 +52,7 @@ fn cosine_distance(left: &[f32], right: &[f32]) -> f64 {
 
 fn ids(result: &QueryResult) -> HashSet<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,

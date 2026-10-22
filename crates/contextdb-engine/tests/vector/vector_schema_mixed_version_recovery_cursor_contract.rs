@@ -53,7 +53,7 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 
 fn ids(result: QueryResult) -> Vec<Uuid> {
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.into_iter().next() {
             Some(Value::Uuid(id)) => id,

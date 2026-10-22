@@ -52,12 +52,12 @@ fn axis(axis: usize) -> Vec<f32> {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
         .expect("the vector projection has id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -68,15 +68,15 @@ fn ids(result: &QueryResult) -> Vec<Uuid> {
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == name)
-        .unwrap_or_else(|| panic!("inspection omits {name}: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("inspection omits {name}: {:?}", result.columns()))
 }
 
 fn value<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a Value {
     result
-        .rows
+        .rows()
         .get(row)
         .and_then(|row| row.get(column(result, name)))
         .unwrap_or_else(|| panic!("inspection omits row {row} field {name}: {result:?}"))
@@ -103,7 +103,7 @@ fn index_row(db: &Database) -> QueryResult {
 }
 
 fn single_partition_row(result: &QueryResult) -> usize {
-    assert_eq!(result.rows.len(), 1, "one declared partition detail row");
+    assert_eq!(result.rows().len(), 1, "one declared partition detail row");
     0
 }
 
@@ -243,7 +243,7 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
 
     let summary_after_auto = index_row(&db);
     let summary_row = summary_after_auto
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             row[column(&summary_after_auto, "table")] == Value::Text("revision_docs".into())
@@ -280,7 +280,7 @@ fn online_vector_policy_revisions_keep_the_complete_graph_serving_and_reject_sta
     alter_hnsw(&db, "EF_SEARCH = 2");
     let summary_after_ef = index_row(&db);
     let summary_row = summary_after_ef
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             row[column(&summary_after_ef, "table")] == Value::Text("revision_docs".into())
@@ -786,7 +786,7 @@ fn registered_layout_checks_every_authored_policy_member_and_revision_before_ins
         assert_eq!(
             db.execute("SELECT id FROM revision_docs", &empty())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             3
         );
@@ -821,7 +821,7 @@ fn registered_layout_checks_every_authored_policy_member_and_revision_before_ins
     assert_eq!(
         db.execute("SELECT id FROM revision_docs", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         4
     );

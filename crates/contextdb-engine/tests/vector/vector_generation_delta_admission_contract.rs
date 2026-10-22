@@ -110,7 +110,7 @@ fn assert_indexed(db: &Database, id: usize, revision: usize) {
             &HashMap::from([("query".into(), Value::Vector(embedding(id, revision)))]),
         )
         .expect("the production indexed route remains usable");
-    assert_eq!(result.rows, vec![vec![Value::Int64(id as i64)]]);
+    assert_eq!(result.rows(), vec![vec![Value::Int64(id as i64)]]);
 }
 
 #[test]

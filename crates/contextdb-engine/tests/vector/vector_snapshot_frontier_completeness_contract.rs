@@ -39,12 +39,12 @@ fn route(scope: Uuid) -> VectorPartitionRef {
 
 fn ids(result: &QueryResult) -> HashSet<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("the vector query projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -156,7 +156,7 @@ fn indexed_pinned_snapshot_keeps_eligible_tail_across_newer_commits() {
         .execute_at_snapshot(&format!("{sql} INDEXED LIMIT 10"), &query, snapshot)
         .expect("a newer commit does not disable the snapshot-compatible fresh tail");
     let tail_ids = ids(&tail_result);
-    assert_eq!(tail_result.rows.len(), 10, "the sealed base fills LIMIT 10");
+    assert_eq!(tail_result.rows().len(), 10, "the sealed base fills LIMIT 10");
     assert!(
         tail_ids.contains(&inserted_after_base),
         "the bit-identical eligible tail row wins a slot even though the base can fill LIMIT"
@@ -203,7 +203,7 @@ fn indexed_pinned_snapshot_keeps_eligible_tail_across_newer_commits() {
         .execute_at_snapshot(&format!("{sql} EXACT LIMIT 64"), &query, snapshot)
         .expect("EXACT reads the authoritative pinned snapshot");
     assert_eq!(
-        exact_at_snapshot.rows.len(),
+        exact_at_snapshot.rows().len(),
         expected_at_snapshot.len(),
         "EXACT returns one result for every row visible at S"
     );
@@ -222,7 +222,7 @@ fn indexed_pinned_snapshot_keeps_eligible_tail_across_newer_commits() {
         .chain(std::iter::once(inserted_after_snapshot))
         .collect::<HashSet<_>>();
     assert_eq!(
-        current_indexed.rows.len(),
+        current_indexed.rows().len(),
         expected_current.len(),
         "the current INDEXED route returns one result for every row through N"
     );
@@ -236,7 +236,7 @@ fn indexed_pinned_snapshot_keeps_eligible_tail_across_newer_commits() {
         .execute_at_snapshot(&format!("{sql} INDEXED LIMIT 10"), &query, snapshot)
         .expect("the change graph crossing the snapshot remains visibility-filterable");
     let crossing_top_ten_ids = ids(&crossing_top_ten);
-    assert_eq!(crossing_top_ten.rows.len(), 10);
+    assert_eq!(crossing_top_ten.rows().len(), 10);
     assert!(
         crossing_top_ten_ids.contains(&inserted_after_base),
         "the crossing change graph keeps the eligible nearest row"

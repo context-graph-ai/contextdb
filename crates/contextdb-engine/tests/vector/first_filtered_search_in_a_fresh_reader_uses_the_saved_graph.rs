@@ -306,9 +306,9 @@ fn fresh_reader_child(path: &std::path::Path) {
         oracle.execute(&eight_exact_sql, &eight_params)
     })
     .expect("the full exact oracle completes");
-    assert_eq!(eight_first.result.rows, eight_warm.result.rows);
+    assert_eq!(eight_first.result.rows(), eight_warm.result.rows());
     assert_eq!(
-        eight_first.result.rows, eight_exact.rows,
+        eight_first.result.rows(), eight_exact.rows(),
         "the fresh eight-Context answer preserves exact result identities"
     );
     assert!(eight_first.work <= eight_warm.work);
@@ -326,7 +326,7 @@ fn fresh_reader_child(path: &std::path::Path) {
         eight_first.work,
         eight_first.graph_scores,
         eight_first.native_scores,
-        eight_first.result.trace,
+        eight_first.result.trace(),
         search.admission_evaluations,
         search.expansion_evaluations,
         search.budget,
@@ -334,7 +334,7 @@ fn fresh_reader_child(path: &std::path::Path) {
         eight_warm.work,
         eight_warm.graph_scores,
         eight_warm.native_scores,
-        eight_warm.result.trace,
+        eight_warm.result.trace(),
         builds.0.load(Ordering::SeqCst),
     );
     println!("{CHILD_RECEIPT}");

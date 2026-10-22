@@ -36,12 +36,12 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("vector search projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -117,14 +117,14 @@ fn hnsw_m(db: &Database) -> Vec<(Value, Value)> {
         .expect("inspect the receiver's partitions");
     let column = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == name)
             .unwrap_or_else(|| panic!("SHOW VECTOR_PARTITIONS has {name}"))
     };
     let (desired, serving) = (column("desired_hnsw_m"), column("serving_hnsw_m"));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| (row[desired].clone(), row[serving].clone()))
         .collect()

@@ -243,20 +243,20 @@ fn assert_exact_vector(
             ]),
         )
         .expect("the authoritative exact vector remains readable");
-    assert_eq!(result.rows.len(), 1, "exact lookup returns one current row");
+    assert_eq!(result.rows().len(), 1, "exact lookup returns one current row");
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("exact lookup projects id");
     let vector_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "embedding" || column.rsplit('.').next() == Some("embedding"))
         .expect("exact lookup projects embedding");
-    assert_eq!(result.rows[0][id_column], Value::Uuid(expected_id));
+    assert_eq!(result.rows()[0][id_column], Value::Uuid(expected_id));
     assert_eq!(
-        result.rows[0][vector_column],
+        result.rows()[0][vector_column],
         Value::Vector(expected_vector),
         "received-image ownership transfer cannot change or drop the stored vector"
     );
@@ -1021,19 +1021,19 @@ fn restart_churn_reconciles_each_vector_owner_once_and_final_drop_restores_the_c
             )
             .expect("the pin's own registered snapshot remains readable while it is held");
         assert_eq!(
-            pinned_snapshot_read.rows.len(),
+            pinned_snapshot_read.rows().len(),
             1,
             "the pinned snapshot still resolves exactly one row for the held id"
         );
         let pinned_embedding_column = pinned_snapshot_read
-            .columns
+            .columns()
             .iter()
             .position(|column| {
                 column == "embedding" || column.rsplit('.').next() == Some("embedding")
             })
             .expect("the pinned-snapshot read projects embedding");
         assert_eq!(
-            pinned_snapshot_read.rows[0][pinned_embedding_column],
+            pinned_snapshot_read.rows()[0][pinned_embedding_column],
             Value::Vector(vector(0)),
             "the pin's registered snapshot still resolves to the value that was live when the \
              pin was taken -- the original, never-replaced version"
@@ -1846,8 +1846,8 @@ fn graph_load_and_reconciliation_failures_restore_the_dormant_route_and_exact_re
 
     let bounded_loaded = bounded::execute(&db, &bounded_indexed_request(vector(1)))
         .expect("an admitted bounded request loads and owns the dormant generation");
-    assert_eq!(bounded_loaded.result.rows, calibration_result.rows);
-    assert_eq!(bounded_loaded.result.columns, calibration_result.columns);
+    assert_eq!(bounded_loaded.result.rows(), calibration_result.rows());
+    assert_eq!(bounded_loaded.result.columns(), calibration_result.columns());
     assert!(
         bounded_loaded
             .telemetry
@@ -1857,8 +1857,8 @@ fn graph_load_and_reconciliation_failures_restore_the_dormant_route_and_exact_re
         "the bounded receipt includes the dormant generation's pre-I/O load admission"
     );
     let ordinary_loaded = indexed_result(&db, "load_items", "alpha", vector(1));
-    assert_eq!(ordinary_loaded.rows, bounded_loaded.result.rows);
-    assert_eq!(ordinary_loaded.columns, bounded_loaded.result.columns);
+    assert_eq!(ordinary_loaded.rows(), bounded_loaded.result.rows());
+    assert_eq!(ordinary_loaded.columns(), bounded_loaded.result.columns());
     let loaded = db
         .vector_store_for_test()
         .partition_graph_generation_status(&route)
@@ -1937,8 +1937,8 @@ fn retired_graphs_release_between_partition_rebuilds_without_losing_pinned_reads
     db.run_maintenance_cycle().unwrap();
     assert!(receipt!(&db).retired_pinned_graph_bytes > 0);
     assert_eq!(
-        db.execute_at_snapshot(sql, &query, snapshot).unwrap().rows,
-        old.rows
+        db.execute_at_snapshot(sql, &query, snapshot).unwrap().rows(),
+        old.rows()
     );
     let route =
         contextdb_vector::VectorPartitionRef::new(index("rebuild_items"), partition("alpha"));
@@ -1952,7 +1952,7 @@ fn retired_graphs_release_between_partition_rebuilds_without_losing_pinned_reads
     let newer_rows = db
         .execute_at_snapshot(sql, &query, newer_snapshot)
         .unwrap()
-        .rows;
+        .rows();
     drop(pin);
     db.run_maintenance_cycle().unwrap();
     let after = receipt!(&db);
@@ -1989,7 +1989,7 @@ fn retired_graphs_release_between_partition_rebuilds_without_losing_pinned_reads
     assert_eq!(
         db.execute_at_snapshot(sql, &query, newer_snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         newer_rows
     );
     drop(newer_pin);
@@ -2165,7 +2165,7 @@ fn journal_cleanup_charges_large_keys_during_publication_refusal_and_retry() {
         !pending_cleanup.physical_record_lsns.is_empty(),
         "the injected boundary leaves a real covered journal record for retry"
     );
-    let searchable_before_refusal = indexed_result(&db, "cleanup_items", &long_key, vector(1)).rows;
+    let searchable_before_refusal = indexed_result(&db, "cleanup_items", &long_key, vector(1)).rows();
 
     let used_before_refusal = accountant.usage().used;
     let refusal_limit = used_before_refusal.saturating_add(long_key.len());
@@ -2191,7 +2191,7 @@ fn journal_cleanup_charges_large_keys_during_publication_refusal_and_retry() {
     db.set_memory_limit(Some(FINITE_CLEANUP_BUDGET))
         .expect("restore the finite startup ceiling after the typed refusal");
     assert_eq!(
-        indexed_result(&db, "cleanup_items", &long_key, vector(1)).rows,
+        indexed_result(&db, "cleanup_items", &long_key, vector(1)).rows(),
         searchable_before_refusal,
         "cleanup refusal preserves the already-usable indexed route"
     );
@@ -2383,13 +2383,13 @@ fn repair_pre_admits_snapshot_transition_and_retained_long_generation_keys() {
         )
         .expect("repair preserves indexed reads through the retained old chain");
     let id_column = old_result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("old-snapshot query projects id");
-    assert_eq!(old_result.rows.len(), 1);
+    assert_eq!(old_result.rows().len(), 1);
     assert_eq!(
-        old_result.rows[0][id_column],
+        old_result.rows()[0][id_column],
         Value::Uuid(Uuid::from_u128(0x4A2)),
         "the old snapshot still reads the row supplied by its retained change generation"
     );
@@ -3006,7 +3006,7 @@ fn retained_journey_scalar_publications_bound_unique_payloads_and_admit_a_small_
         )
         .expect("the fixed finite limit still admits indexed search after a small write");
     assert_eq!(
-        nearest.rows,
+        nearest.rows(),
         vec![vec![Value::Uuid(Uuid::from_u128(17))]],
         "indexed search returns the distinct vector committed by the small foreground write"
     );

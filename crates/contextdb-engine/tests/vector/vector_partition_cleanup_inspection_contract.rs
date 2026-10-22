@@ -112,15 +112,15 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == name)
-        .unwrap_or_else(|| panic!("inspection has {name}: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("inspection has {name}: {:?}", result.columns()))
 }
 
 fn value<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a Value {
     result
-        .rows
+        .rows()
         .get(row)
         .and_then(|row| row.get(column(result, name)))
         .unwrap_or_else(|| panic!("inspection has row {row} and {name}: {result:?}"))
@@ -144,7 +144,7 @@ fn scope_key(scope: &str) -> Value {
 }
 
 fn assert_index_presence(result: &QueryResult, table: &str, column_name: &str, expected: bool) {
-    let present = result.rows.iter().any(|row| {
+    let present = result.rows().iter().any(|row| {
         row[column(result, "table")] == Value::Text(table.to_owned())
             && row[column(result, "column")] == Value::Text(column_name.to_owned())
     });
@@ -214,7 +214,7 @@ fn held_snapshot_blocks_at_cap_key_move_then_cleanup_admits_it_and_inspects_stab
             &params(vec![("id", Value::Uuid(first))]),
         )
         .expect("read the refused row");
-    assert_eq!(unchanged.rows, vec![vec![Value::Text("alpha".to_owned())]]);
+    assert_eq!(unchanged.rows(), vec![vec![Value::Text("alpha".to_owned())]]);
     drop(pin);
 
     db.execute(
@@ -225,27 +225,27 @@ fn held_snapshot_blocks_at_cap_key_move_then_cleanup_admits_it_and_inspects_stab
 
     let partitions = partition_rows(&db, "partition_items", "embedding");
     assert_eq!(
-        partitions.columns,
+        partitions.columns(),
         PARTITION_COLUMNS
             .iter()
             .map(|name| (*name).to_owned())
             .collect::<Vec<_>>(),
         "partition inspection has one fixed public shape"
     );
-    assert_eq!(partitions.rows.len(), 2);
+    assert_eq!(partitions.rows().len(), 2);
     assert_eq!(value(&partitions, 0, "partition_key"), &scope_key("bravo"));
     assert_eq!(
         value(&partitions, 1, "partition_key"),
         &scope_key("charlie")
     );
-    for row in 0..partitions.rows.len() {
+    for row in 0..partitions.rows().len() {
         assert_eq!(value(&partitions, row, "live_rows"), &Value::Int64(1));
         assert_eq!(value(&partitions, row, "retained_rows"), &Value::Int64(0));
     }
 
     let summary = index_rows(&db);
     assert_eq!(
-        summary.columns,
+        summary.columns(),
         INDEX_COLUMNS
             .iter()
             .map(|name| (*name).to_owned())
@@ -253,7 +253,7 @@ fn held_snapshot_blocks_at_cap_key_move_then_cleanup_admits_it_and_inspects_stab
         "whole-index inspection has one fixed public shape"
     );
     let row = summary
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             row[column(&summary, "table")] == Value::Text("partition_items".to_owned())
@@ -340,15 +340,15 @@ fn concurrent_first_partitions_share_one_atomic_cap_admission() {
             &empty(),
         )
         .expect("read the one committed winner");
-    assert_eq!(rows.rows.len(), 1, "the losing row never commits");
+    assert_eq!(rows.rows().len(), 1, "the losing row never commits");
     assert!(
-        rows.rows
+        rows.rows()
             .iter()
             .all(|row| row.first() != Some(&Value::Uuid(refused.0))),
         "the typed refusal rolls back the losing relational row"
     );
     let partitions = partition_rows(&db, "concurrent_partition_items", "embedding");
-    assert_eq!(partitions.rows.len(), 1);
+    assert_eq!(partitions.rows().len(), 1);
     assert_eq!(value(&partitions, 0, "live_rows"), &Value::Int64(1));
     assert_eq!(value(&partitions, 0, "retained_rows"), &Value::Int64(0));
 }
@@ -408,14 +408,14 @@ fn second_vector_column_cap_refusal_rolls_back_the_row_and_both_columns() {
             &params(vec![("id", Value::Uuid(refused_id))]),
         )
         .unwrap()
-        .rows
+        .rows()
         .is_empty(),
         "the row is absent after vector admission fails"
     );
     for column_name in ["embedding_a", "embedding_b"] {
         let partitions = partition_rows(&db, "two_column_partition_items", column_name);
         assert_eq!(
-            partitions.rows.len(),
+            partitions.rows().len(),
             1,
             "{column_name} keeps only its original partition"
         );
@@ -531,18 +531,18 @@ fn cap_admission_keeps_every_untouched_live_partition_indexed_and_counted() {
                 ]),
             )
             .expect("the retained indexed route remains searchable");
-        assert_eq!(result.rows, vec![vec![Value::Uuid(id)]]);
+        assert_eq!(result.rows(), vec![vec![Value::Uuid(id)]]);
     }
 
     let partitions = partition_rows(&db, "live_cap_items", "embedding");
-    assert_eq!(partitions.rows.len(), 3);
-    assert!(partitions.rows.iter().all(|row| {
+    assert_eq!(partitions.rows().len(), 3);
+    assert!(partitions.rows().iter().all(|row| {
         row[column(&partitions, "live_rows")] == Value::Int64(1)
             && row[column(&partitions, "query_state")] == Value::Text("ready".to_owned())
     }));
     let indexes = index_rows(&db);
     let row = indexes
-        .rows
+        .rows()
         .iter()
         .position(|row| row[column(&indexes, "table")] == Value::Text("live_cap_items".to_owned()))
         .expect("whole-index inspection contains the cap fixture");
@@ -589,7 +589,7 @@ fn historical_only_partition_stays_inspectable_and_counted_until_unpin() {
     .expect("delete the last live vector while its old image is pinned");
 
     let retained = partition_rows(&db, "retained_partition_items", "embedding");
-    assert_eq!(retained.rows.len(), 1);
+    assert_eq!(retained.rows().len(), 1);
     assert_eq!(value(&retained, 0, "partition_key"), &scope_key("alpha"));
     assert_eq!(value(&retained, 0, "live_rows"), &Value::Int64(0));
     assert_eq!(value(&retained, 0, "retained_rows"), &Value::Int64(1));
@@ -615,7 +615,7 @@ fn historical_only_partition_stays_inspectable_and_counted_until_unpin() {
     db.run_maintenance_cycle()
         .expect("the first post-unpin maintenance pass retires historical-only state");
     let retired = partition_rows(&db, "retained_partition_items", "embedding");
-    assert_eq!(retired.rows.len(), 0);
+    assert_eq!(retired.rows().len(), 0);
     db.execute(
         "INSERT INTO retained_partition_items (id, scope, embedding) \
          VALUES ($id, 'beta', $embedding)",
@@ -626,7 +626,7 @@ fn historical_only_partition_stays_inspectable_and_counted_until_unpin() {
     )
     .expect("after unpin the retired partition releases its slot");
     let released = partition_rows(&db, "retained_partition_items", "embedding");
-    assert_eq!(released.rows.len(), 1);
+    assert_eq!(released.rows().len(), 1);
     assert_eq!(value(&released, 0, "partition_key"), &scope_key("beta"));
 }
 
@@ -687,12 +687,12 @@ fn file_backed_retirement_releases_a_snapshot_free_slot_while_a_sibling_tail_sta
     .expect("leave bravo with a live unconsolidated tail");
     let retained = partition_rows(&db, "retirement_items", "embedding");
     let alpha_row = retained
-        .rows
+        .rows()
         .iter()
         .position(|row| row[column(&retained, "partition_key")] == scope_key("alpha"))
         .expect("alpha remains visible while pinned");
     let bravo_row = retained
-        .rows
+        .rows()
         .iter()
         .position(|row| row[column(&retained, "partition_key")] == scope_key("bravo"))
         .expect("bravo remains visible");
@@ -736,7 +736,7 @@ fn file_backed_retirement_releases_a_snapshot_free_slot_while_a_sibling_tail_sta
         "bravo stays below its declared consolidation threshold"
     );
     let released = partition_rows(&db, "retirement_items", "embedding");
-    assert_eq!(released.rows.len(), 1, "alpha's inspection row is released");
+    assert_eq!(released.rows().len(), 1, "alpha's inspection row is released");
     assert_eq!(value(&released, 0, "partition_key"), &scope_key("bravo"));
     assert_eq!(value(&released, 0, "pending_inserts"), &Value::Int64(1));
     assert_eq!(
@@ -776,10 +776,10 @@ fn file_backed_retirement_releases_a_snapshot_free_slot_while_a_sibling_tail_sta
     )
     .expect("alpha's released MAX_PARTITIONS slot admits charlie");
     let reused = partition_rows(&db, "retirement_items", "embedding");
-    assert_eq!(reused.rows.len(), 2);
+    assert_eq!(reused.rows().len(), 2);
     assert!(
         reused
-            .rows
+            .rows()
             .iter()
             .any(|row| { row[column(&reused, "partition_key")] == scope_key("charlie") })
     );
@@ -838,7 +838,7 @@ fn explicit_storage_compaction_cannot_retire_the_index_needed_by_a_pinned_old_sn
     db.run_maintenance_cycle()
         .expect("the idle retirement pass consults the eviction-proof directory");
     let retained = partition_rows(&db, "snapshot_items", "embedding");
-    assert_eq!(retained.rows.len(), 1);
+    assert_eq!(retained.rows().len(), 1);
     assert_eq!(value(&retained, 0, "retained_rows"), &Value::Int64(1));
     assert!(
         !matches!(value(&retained, 0, "base_generation"), Value::Null),
@@ -852,13 +852,13 @@ fn explicit_storage_compaction_cannot_retire_the_index_needed_by_a_pinned_old_sn
             old_snapshot,
         )
         .expect("the already-open snapshot retains its compatible indexed route");
-    assert_eq!(result.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(result.rows(), vec![vec![Value::Uuid(id)]]);
     drop(old_pin);
     db.run_maintenance_cycle()
         .expect("a later unpinned pass may retire the route");
     assert!(
         partition_rows(&db, "snapshot_items", "embedding")
-            .rows
+            .rows()
             .is_empty()
     );
 }
@@ -887,7 +887,7 @@ fn inspection_names_the_lifecycle_of_a_populated_unavailable_partition() {
     .expect("create one partition waiting for its first maintained route");
 
     let partitions = partition_rows(&db, "lifecycle_inspection", "embedding");
-    assert_eq!(partitions.rows.len(), 1);
+    assert_eq!(partitions.rows().len(), 1);
     assert_eq!(
         value(&partitions, 0, "query_state"),
         &Value::Text("unavailable".to_owned())
@@ -979,7 +979,7 @@ fn rename_then_drop_removes_the_only_vector_identity_after_reopen_and_releases_m
             &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .expect("renamed vector remains searchable after reopen");
-    assert_eq!(found.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(found.rows(), vec![vec![Value::Uuid(id)]]);
     assert!(matches!(
         reopened.execute(
             "SELECT id FROM cleanup_items ORDER BY embedding <=> $query LIMIT 1",

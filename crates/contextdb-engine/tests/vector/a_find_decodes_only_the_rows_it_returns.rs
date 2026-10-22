@@ -251,10 +251,10 @@ fn try_measure_contexts(db: &Database, selected: &[usize]) -> Result<Measured, S
         .expect("the touch counter is never poisoned")
         .clone();
     Ok(Measured {
-        rows: executed.result.rows.len(),
+        rows: executed.result.rows().len(),
         returned: executed
             .result
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,
@@ -270,12 +270,12 @@ fn try_measure_contexts(db: &Database, selected: &[usize]) -> Result<Measured, S
         verified_runs_built: counters.verified_runs_built,
         verified_postings_walked: counters.verified_postings_walked,
         hashed_bytes: counters.hashed_bytes,
-        rows_examined: executed.result.trace.rows_examined,
+        rows_examined: executed.result.trace().rows_examined,
         plan: format!(
             "{} index={:?} pushed={:?}",
-            executed.result.trace.physical_plan,
-            executed.result.trace.index_used,
-            executed.result.trace.predicates_pushed,
+            executed.result.trace().physical_plan,
+            executed.result.trace().index_used,
+            executed.result.trace().predicates_pushed,
         ),
     })
 }
@@ -414,9 +414,9 @@ fn measure_reader(reader: &contextdb_engine::ReadSession, partitions: usize) -> 
     let counters = work.counters();
     drop(work);
     Measured {
-        rows: answer.rows.len(),
+        rows: answer.rows().len(),
         returned: answer
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,
@@ -431,10 +431,10 @@ fn measure_reader(reader: &contextdb_engine::ReadSession, partitions: usize) -> 
         verified_runs_built: counters.verified_runs_built,
         verified_postings_walked: counters.verified_postings_walked,
         hashed_bytes: counters.hashed_bytes,
-        rows_examined: answer.trace.rows_examined,
+        rows_examined: answer.trace().rows_examined,
         plan: format!(
             "{} index={:?} pushed={:?}",
-            answer.trace.physical_plan, answer.trace.index_used, answer.trace.predicates_pushed,
+            answer.trace().physical_plan, answer.trace().index_used, answer.trace().predicates_pushed,
         ),
     }
 }
@@ -647,12 +647,12 @@ fn a_row_that_contradicts_its_index_posting_is_reported_as_damage() {
         .execute(&sql, &params)
         .expect("the undamaged store answers");
     assert_eq!(
-        answer.rows.len(),
+        answer.rows().len(),
         LIMIT,
         "the undamaged store answers a full page"
     );
     assert_eq!(
-        answer.rows.first().and_then(|row| row.first()),
+        answer.rows().first().and_then(|row| row.first()),
         Some(&Value::Int64(PLANTED_ROW_ID)),
         "the planted row is the nearest searchable row in its partition, so it heads the answer"
     );
@@ -672,7 +672,7 @@ fn a_row_that_contradicts_its_index_posting_is_reported_as_damage() {
     match open_reader().execute(&sql, &params) {
         Ok(served) => panic!(
             "a row whose body contradicts its index posting was served in an answer of {} rows",
-            served.rows.len(),
+            served.rows().len(),
         ),
         Err(refusal) => {
             let refusal = format!("{refusal:?}");
@@ -757,7 +757,7 @@ fn a_moved_index_posting_is_reported_as_damage() {
         .execute(&sql, &params)
         .expect("the whole-pair find never reads the damaged page and answers");
     let ids = served
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(Value::Int64(id)) => Some(*id),
@@ -765,12 +765,12 @@ fn a_moved_index_posting_is_reported_as_damage() {
         })
         .collect::<Vec<_>>();
     assert!(
-        served.rows.len() == LIMIT
+        served.rows().len() == LIMIT
             && ids
                 .iter()
                 .all(|id| (1..=ROWS_PER_PARTITION as i64).contains(id)),
         "a posting filed under another Context's key was served in an answer of {} rows: {ids:?}",
-        served.rows.len(),
+        served.rows().len(),
     );
 
     // The window arm, over the same Context. Pinning only `context_id` names
@@ -785,7 +785,7 @@ fn a_moved_index_posting_is_reported_as_damage() {
     match reader.execute(&windowed, &params) {
         Ok(served) => panic!(
             "a find that reads the damaged posting page served {} rows instead of reporting it",
-            served.rows.len(),
+            served.rows().len(),
         ),
         Err(refusal) => {
             let refusal = format!("{refusal:?}");

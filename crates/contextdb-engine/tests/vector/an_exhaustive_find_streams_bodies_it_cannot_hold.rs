@@ -273,13 +273,13 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
          raw_candidate_point_loads={} answer={:?}",
         after.raw_partition_loads - before.raw_partition_loads,
         after.raw_candidate_point_loads - before.raw_candidate_point_loads,
-        answer.as_ref().map(|answer| ids(&answer.rows)),
+        answer.as_ref().map(|answer| ids(&answer.rows())),
     );
     let answer = answer.expect(
         "a find over every Context answers inside a budget that cannot hold one partition's vectors",
     );
     assert_eq!(
-        ids(&answer.rows),
+        ids(&answer.rows()),
         oracle,
         "the exhaustive route returns exactly the oracle's nearest rows from the stored vectors",
     );
@@ -309,7 +309,7 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
     let exact = damaged_reader
         .execute(&exact_sql, &params)
         .expect("EXACT reads authoritative bodies when a graph is damaged");
-    assert_eq!(ids(&exact.rows), oracle);
+    assert_eq!(ids(&exact.rows()), oracle);
     let damaged_store = damaged_reader
         .file_vector_store_for_test()
         .expect("the damaged reader still has a vector store");
@@ -317,9 +317,9 @@ fn an_exhaustive_find_over_every_context_streams_what_it_cannot_hold() {
     let auto = damaged_reader
         .execute(&sql, &params)
         .expect("AUTO can compare authoritative bodies after graph damage");
-    assert_eq!(ids(&auto.rows), oracle);
+    assert_eq!(ids(&auto.rows()), oracle);
     assert_eq!(
-        auto.trace
+        auto.trace()
             .vector_search
             .as_ref()
             .and_then(|search| search.route),

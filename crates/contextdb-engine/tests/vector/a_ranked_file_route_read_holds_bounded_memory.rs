@@ -64,16 +64,16 @@ fn query() -> HashMap<String, Value> {
 /// the most the file route's reader held above where it started while it
 /// answered.
 fn answer_on_every_route(db: Database, path: &std::path::Path) -> (Vec<Vec<Value>>, usize) {
-    let writer = db.execute(RANKED, &query()).unwrap().rows;
+    let writer = db.execute(RANKED, &query()).unwrap().rows();
     let owner = {
         let reader = read_session(path);
-        reader.execute(RANKED, &query()).unwrap().rows
+        reader.execute(RANKED, &query()).unwrap().rows()
     };
     db.close().unwrap();
     drop(db);
     let reader = read_session(path);
     watch_reader_budget_ledger_for_test();
-    let file = reader.execute(RANKED, &query()).unwrap().rows;
+    let file = reader.execute(RANKED, &query()).unwrap().rows();
     let ledger = take_reader_budget_ledger_for_test();
     let start = ledger
         .first()

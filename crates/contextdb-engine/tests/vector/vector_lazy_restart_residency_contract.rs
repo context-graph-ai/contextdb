@@ -67,12 +67,12 @@ fn axis(leading_axis: usize) -> Vec<f32> {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("vector search projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -415,7 +415,7 @@ fn reopen_keeps_saved_partitions_dormant_then_reclaims_one_least_recently_used_r
         .expect("EXACT streams stored bodies inside the same working-set ceiling");
     let ledger = take_budget_ledger_for_test();
     assert_eq!(
-        streamed.rows,
+        streamed.rows(),
         vec![vec![Value::Uuid(Uuid::from_u128(0x100_000))]]
     );
     let activity_after_stream = db.__vector_passive_activity_counters_for_test();

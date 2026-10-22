@@ -99,12 +99,12 @@ fn graph_available(db: &Database, scope: Uuid) -> bool {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("vector search projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -400,11 +400,11 @@ async fn build_quantized_erasure_fixture(
         (
             hub.execute("SELECT id FROM erasure_roots", &empty())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
             hub.execute("SELECT id FROM erasure_vectors", &empty())
                 .unwrap()
-                .rows
+                .rows()
                 .len(),
         ),
         (2, ERASURE_VECTOR_ROWS),
@@ -455,14 +455,14 @@ fn erasure_state(db: &Database, scope: Uuid, selected_root: Uuid) -> ErasureStat
             &empty(),
         )
         .expect("read all root rows")
-        .rows;
+        .rows();
     let vectors = db
         .execute(
             "SELECT id, root_id, scope_id, batch_ref FROM erasure_vectors ORDER BY id",
             &empty(),
         )
         .expect("read all vector-owner rows")
-        .rows;
+        .rows();
     let vector_fixture_reader_1 = db
         .declared_reader_memory()
         .expect("admit the vector fixture reader");
@@ -638,7 +638,7 @@ async fn multi_table_erasure_admits_every_dormant_quantized_replacement_before_m
         purge
             .execute("SELECT id FROM erasure_roots ORDER BY id", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(surviving_root)]]
     );
     assert_quantized_membership(&purge, scope, selected_vector, false);
@@ -660,7 +660,7 @@ async fn multi_table_erasure_admits_every_dormant_quantized_replacement_before_m
         discard
             .execute("SELECT id FROM erasure_roots ORDER BY id", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(surviving_root)]]
     );
     assert_quantized_membership(&discard, scope, selected_vector, false);
@@ -754,7 +754,7 @@ fn partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route
                 ])
             )
             .unwrap()
-            .rows_affected,
+            .rows_affected(),
             0
         );
         assert!(db.__statement_cache_len() > 0);
@@ -765,7 +765,7 @@ fn partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route
                 &params([("id", Value::Uuid(forgotten))]),
             )
             .expect("partial authoritative purge commits");
-        assert_eq!(purged.rows_affected, 1);
+        assert_eq!(purged.rows_affected(), 1);
         assert_eq!(
             db.execute(
                 cached_update,
@@ -775,7 +775,7 @@ fn partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route
                 ])
             )
             .unwrap()
-            .rows_affected,
+            .rows_affected(),
             0,
             "a cached predicate cannot find the purged lineage"
         );
@@ -820,7 +820,7 @@ fn partial_purge_atomically_publishes_a_survivor_generation_from_a_dormant_route
                 ]),
             )
             .unwrap()
-            .trace
+            .trace()
             .vector_search
             .unwrap();
         let serving = &disclosure.partition_hnsw[0];

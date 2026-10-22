@@ -283,7 +283,7 @@ fn measure_one_partition(path: &std::path::Path, runtime: &std::path::Path) {
                 continue;
             }
         };
-        assert_eq!(first.rows.len(), LIMIT, "{label} answers a full page");
+        assert_eq!(first.rows().len(), LIMIT, "{label} answers a full page");
         if label == "auto" {
             // The contract this cell exists for: a fresh reader's FIRST find
             // over one 10,000-vector partition, at the default settings,
@@ -309,11 +309,11 @@ fn measure_one_partition(path: &std::path::Path, runtime: &std::path::Path) {
         println!(
             "find[{label}] open_ms={open_ms:.1} cold_ms={cold_ms:.1} warm_ms={warm_ms:.1} \
              rows={} plan={} index={:?} route={:?} rows_examined={}",
-            answer.rows.len(),
-            answer.trace.physical_plan,
-            answer.trace.index_used,
-            answer.trace.vector_search,
-            answer.trace.rows_examined,
+            answer.rows().len(),
+            answer.trace().physical_plan,
+            answer.trace().index_used,
+            answer.trace().vector_search,
+            answer.trace().rows_examined,
         );
         println!(
             "find[{label}] decoded_rows={} stored_row_bytes={} decoded_vectors={} \

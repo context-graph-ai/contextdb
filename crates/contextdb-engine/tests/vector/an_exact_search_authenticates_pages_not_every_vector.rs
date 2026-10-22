@@ -192,7 +192,7 @@ fn an_exact_search_authenticates_pages_not_every_vector() {
     };
     let ids = |answer: &contextdb_engine::QueryResult| {
         answer
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,

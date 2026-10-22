@@ -247,7 +247,7 @@ fn observe(rows: usize, partitions: usize) -> Observed {
     let executed = executed.expect("the automatic find answers");
     let disclosure = executed
         .result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("a vector find discloses its route");
@@ -263,7 +263,7 @@ fn observe(rows: usize, partitions: usize) -> Observed {
     let receipt = receipts.first();
     Observed {
         routes,
-        rows: executed.result.rows.len(),
+        rows: executed.result.rows().len(),
         exhaustive_comparisons: counter.count(bounded::TestSourceTouch::BruteForceVectorCandidate),
         walk_evaluations: counter.count(bounded::TestSourceTouch::HnswCandidate),
         searches: receipts.len(),

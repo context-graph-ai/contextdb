@@ -128,7 +128,7 @@ fn find(reader: &ReadSession, scope: Uuid, query: Vec<f32>) -> contextdb_core::R
         )
         .map(|result| {
             result
-                .rows
+                .rows()
                 .into_iter()
                 .map(|row| match row.as_slice() {
                     [Value::Uuid(id)] => *id,

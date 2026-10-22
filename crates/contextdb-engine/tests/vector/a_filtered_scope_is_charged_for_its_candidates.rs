@@ -221,7 +221,7 @@ fn selected_context_snapshot(db: &Database) -> Vec<Vec<Value>> {
         ]),
     )
     .expect("read every selected-Context field that can affect search")
-    .rows
+    .rows()
 }
 
 fn query(db: &Database, partitions: usize) -> ChargedQuery {
@@ -286,13 +286,13 @@ fn honest_charge_range(query: &ChargedQuery, selected_candidates: usize) -> (u64
     let lower = query
         .result
         .result
-        .trace
+        .trace()
         .rows_examined
         .saturating_add(selected_candidates as u64)
         .saturating_add(query.distance_evaluations)
         .saturating_add(query.query_self_score_computations);
     // Publishing each returned row performs one separately charged point read.
-    let upper = lower.saturating_add(query.result.result.rows.len() as u64);
+    let upper = lower.saturating_add(query.result.result.rows().len() as u64);
     (lower, upper)
 }
 
@@ -653,7 +653,7 @@ fn a_filtered_scope_is_charged_for_its_candidates() {
         grown_db
             .execute("SELECT id FROM scoped_vectors", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         maintained_search::CORPUS_ROWS,
         "the grown arm retains the frozen 10,000-vector corpus"
@@ -662,7 +662,7 @@ fn a_filtered_scope_is_charged_for_its_candidates() {
     let small = query(&small_db, 1);
     let grown = query(&grown_db, 1);
     assert_eq!(
-        small.result.result.rows, grown.result.result.rows,
+        small.result.result.rows(), grown.result.result.rows(),
         "unrelated partitions cannot alter the selected answer"
     );
     assert_eq!(
@@ -673,12 +673,12 @@ fn a_filtered_scope_is_charged_for_its_candidates() {
     assert_independent_charge_bound("grown selected Context", &grown, CURRENT_ROWS_PER_CONTEXT);
 
     let all_contexts = query(&grown_db, 8);
-    assert_eq!(all_contexts.result.result.rows.len(), 10);
+    assert_eq!(all_contexts.result.result.rows().len(), 10);
     assert_eq!(
         all_contexts
             .result
             .result
-            .trace
+            .trace()
             .vector_search
             .as_ref()
             .and_then(|detail| detail.aggregate_allowed_vectors),
@@ -700,15 +700,15 @@ fn a_filtered_scope_is_charged_for_its_candidates() {
         small_selected.len(),
         CURRENT_ROWS_PER_CONTEXT,
         small.result.telemetry.work_units,
-        small.result.result.trace.rows_examined,
-        small.result.result.trace,
+        small.result.result.trace().rows_examined,
+        small.result.result.trace(),
         grown.result.telemetry.work_units,
-        grown.result.result.trace.rows_examined,
-        grown.result.result.trace,
+        grown.result.result.trace().rows_examined,
+        grown.result.result.trace(),
         grown.distance_evaluations,
         all_contexts.result.telemetry.work_units,
-        all_contexts.result.result.trace.rows_examined,
-        all_contexts.result.result.trace,
+        all_contexts.result.result.trace().rows_examined,
+        all_contexts.result.result.trace(),
     );
 }
 
@@ -720,7 +720,7 @@ fn one_thousand_candidates_are_grouped_once_across_eight_or_sixty_four_partition
         let eight_query = grouped_query(&eight, 8, mode);
         let sixty_four_query = grouped_query(&sixty_four, 64, mode);
         assert_eq!(
-            eight_query.result.result.rows, sixty_four_query.result.result.rows,
+            eight_query.result.result.rows(), sixty_four_query.result.result.rows(),
             "partition fanout cannot alter the fixed 1,000-candidate answer in {mode} mode"
         );
         assert_eq!(
@@ -788,11 +788,11 @@ fn graph_query_self_score_is_charged_once_per_compatible_representation() {
             "{column} INDEXED must traverse the sealed and fresh graph layers"
         );
         assert_eq!(
-            exact.result.result.rows, expected_ids,
+            exact.result.result.rows(), expected_ids,
             "{column} exact duplicates"
         );
         assert_eq!(
-            indexed.result.result.rows, exact.result.result.rows,
+            indexed.result.result.rows(), exact.result.result.rows(),
             "{quantization:?} graph duplicate correction must preserve complete recall and canonical order"
         );
         assert_eq!(
@@ -829,7 +829,7 @@ fn grouping_charge_bounds_reject_uncharged_and_repeated_candidate_work() {
         ] {
             let faulty = grouped_query_with_fault(&db, partitions, "INDEXED", Some(fault));
             assert_eq!(
-                faulty.result.result.rows, control.result.result.rows,
+                faulty.result.result.rows(), control.result.result.rows(),
                 "the {fault:?} control changes work observation, not the answer"
             );
             let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -865,7 +865,7 @@ fn historical_partition_rows(
             |snapshot| db.execute_at_snapshot(sql, &params, snapshot),
         )
         .expect("historical partition query")
-        .rows
+        .rows()
 }
 
 fn historical_deleted_rows(
@@ -881,7 +881,7 @@ fn historical_deleted_rows(
             |snapshot| db.execute_at_snapshot(sql, &params, snapshot),
         )
         .expect("historical deleted-row query")
-        .rows
+        .rows()
 }
 
 fn bounded_historical_grouping(
@@ -1072,7 +1072,7 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
     assert_eq!(receipt_after_partial_prune.temporary_workspace, 0);
 
     let (in_process, grouping) = bounded_historical_grouping(&db, old_snapshot);
-    assert_eq!(in_process.result.rows, vec![vec![Value::Int64(1)]]);
+    assert_eq!(in_process.result.rows(), vec![vec![Value::Int64(1)]]);
     assert_eq!(grouping.row_directory_lookups.load(Ordering::SeqCst), 1);
     assert_eq!(
         grouping.snapshot_visibility_probes.load(Ordering::SeqCst),
@@ -1083,7 +1083,7 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
     assert_eq!(
         in_process
             .result
-            .trace
+            .trace()
             .vector_search
             .as_ref()
             .and_then(|detail| detail.aggregate_allowed_vectors),
@@ -1131,7 +1131,7 @@ fn historical_vector_placement_survives_pruning_and_reconstruction_until_version
         "the supported file reload retains the old unpartitioned body"
     );
     let (reconstructed, reconstructed_grouping) = bounded_historical_grouping(&db, old_snapshot);
-    assert_eq!(reconstructed.result.rows, vec![vec![Value::Int64(1)]]);
+    assert_eq!(reconstructed.result.rows(), vec![vec![Value::Int64(1)]]);
     assert_eq!(
         reconstructed_grouping
             .row_directory_lookups
@@ -1293,7 +1293,7 @@ fn exhaustive_exact_scan_charges_retained_dead_and_future_versions_before_visibi
     };
 
     let baseline = run(limits()).expect("the one-entry exhaustive control succeeds");
-    assert_eq!(baseline.result.rows, vec![vec![Value::Int64(1)]]);
+    assert_eq!(baseline.result.rows(), vec![vec![Value::Int64(1)]]);
     let baseline_vector_work = baseline
         .telemetry
         .source_work
@@ -1329,7 +1329,7 @@ fn exhaustive_exact_scan_charges_retained_dead_and_future_versions_before_visibi
     );
 
     let grown = run(limits()).expect("roomy work still completes the historical scan");
-    assert_eq!(grown.result.rows, baseline.result.rows);
+    assert_eq!(grown.result.rows(), baseline.result.rows());
     let grown_vector_work = grown
         .telemetry
         .source_work

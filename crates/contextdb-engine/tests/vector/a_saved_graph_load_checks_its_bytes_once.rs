@@ -269,7 +269,7 @@ pub(crate) fn fresh_reader_within(fixture: &Fixture, memory: usize) -> ReadSessi
 }
 
 pub(crate) fn ids(result: &contextdb_engine::QueryResult) -> Vec<Value> {
-    result.rows.iter().map(|row| row[0].clone()).collect()
+    result.rows().iter().map(|row| row[0].clone()).collect()
 }
 
 pub(crate) fn since(before: LoadMeters, after: LoadMeters) -> LoadMeters {
@@ -315,7 +315,7 @@ fn a_fresh_readers_first_find_hashes_each_saved_graph_it_loads_once() {
         );
 
         assert_eq!(
-            answer.rows.len(),
+            answer.rows().len(),
             LIMIT,
             "at {selected} partitions a full page"
         );

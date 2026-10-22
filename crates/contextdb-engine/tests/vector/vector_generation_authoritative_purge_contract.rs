@@ -66,12 +66,12 @@ fn saved_generation_status(
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("vector search projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -183,7 +183,7 @@ fn authoritative_purge_retires_only_the_selected_partitions_saved_generation_aft
             )
             .expect("the public authoritative PURGE removes alpha's complete lineage");
         assert_eq!(
-            purged.rows_affected, ROWS_PER_PARTITION as u64,
+            purged.rows_affected(), ROWS_PER_PARTITION as u64,
             "the public purge selected every vector lineage in alpha and no bravo lineage"
         );
         assert_eq!(

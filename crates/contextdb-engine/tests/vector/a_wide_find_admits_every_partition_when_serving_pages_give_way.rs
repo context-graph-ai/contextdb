@@ -119,7 +119,7 @@ fn a_wide_find_answers_from_every_saved_graph_once_earlier_pages_give_way() {
     let oracle = fresh_reader_within(&fixture, ROOMY)
         .execute(&sql, &params)
         .expect("with room to spare the wide find answers");
-    assert_eq!(oracle.rows.len(), LIMIT);
+    assert_eq!(oracle.rows().len(), LIMIT);
 
     let reader = fresh_reader_within(&fixture, limit);
     // One partition alone first: its load takes the serving share a lone load
@@ -254,7 +254,7 @@ fn a_wide_find_whose_loads_filled_memory_with_pages_still_answers() {
             spent.given_back_bytes,
             answer
                 .as_ref()
-                .map(|answer| answer.rows.len())
+                .map(|answer| answer.rows().len())
                 .map_err(|error| error.to_string())
         );
         match answer {

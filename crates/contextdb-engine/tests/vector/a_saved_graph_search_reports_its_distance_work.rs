@@ -205,7 +205,7 @@ struct Observed {
 impl Observed {
     fn route(&self) -> Option<VectorSearchRoute> {
         self.answer
-            .trace
+            .trace()
             .vector_search
             .as_ref()
             .and_then(|disclosure| disclosure.route)
@@ -296,11 +296,11 @@ fn a_saved_graph_search_reports_its_distance_work() {
     );
 
     assert_eq!(
-        indexed.answer.rows.len(),
+        indexed.answer.rows().len(),
         LIMIT,
         "INDEXED answers a full page"
     );
-    assert_eq!(exact.answer.rows.len(), LIMIT, "EXACT answers a full page");
+    assert_eq!(exact.answer.rows().len(), LIMIT, "EXACT answers a full page");
     assert!(
         matches!(
             indexed.route(),

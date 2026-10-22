@@ -132,18 +132,18 @@ fn assert_answers_the_quantized_columns(result: &QueryResult, route: &str, shape
     // quietly fell back to a table scan reads the column from the row, which
     // is the one place it is never missing -- so a pass would say nothing.
     assert!(
-        result.trace.physical_plan.contains("Search"),
+        result.trace().physical_plan.contains("Search"),
         "the {shape} search on the {route} route is answered by a vector search, not by {}",
-        result.trace.physical_plan
+        result.trace().physical_plan
     );
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         SEARCH_LIMIT,
         "the {shape} search on the {route} route answers with the candidates it asked for"
     );
     let by_id: HashMap<Uuid, Vec<f32>> = fixture_rows().into_iter().collect();
 
-    for row in &result.rows {
+    for row in &result.rows() {
         let id = match row.first() {
             Some(Value::Uuid(id)) => *id,
             other => panic!("the {route} route answers with an id-leading row, got {other:?}"),
@@ -230,28 +230,28 @@ fn a_cursor_answers_the_quantized_columns_a_search_projects() {
             .execute(sql, &params(vec![("query", query_vector())]))
             .expect("the same statement is served in one shot");
         assert!(
-            traced.trace.physical_plan.contains("Search"),
+            traced.trace().physical_plan.contains("Search"),
             "the statement this cursor is opened for is answered by a vector search, not by {}",
-            traced.trace.physical_plan
+            traced.trace().physical_plan
         );
         let mut cursor = session
             .open_cursor(sql, &params(vec![("query", query_vector())]))
             .expect("open a cursor over a vector search");
-        let columns = cursor.first_page().columns.clone();
-        let mut rows = cursor.first_page().rows.clone();
-        let mut more = cursor.first_page().has_more;
+        let columns = cursor.first_page().columns().clone();
+        let mut rows = cursor.first_page().rows().clone();
+        let mut more = cursor.first_page().has_more();
         while more {
             let page = cursor.fetch(None).expect("a cursor page arrives");
-            rows.extend(page.rows.iter().cloned());
-            more = page.has_more;
+            rows.extend(page.rows().iter().cloned());
+            more = page.has_more();
         }
         {
             let mut result = QueryResult::empty();
-            result.columns = columns;
-            result.rows = rows;
-            result.rows_affected = 0;
-            result.trace = traced.trace;
-            result.cascade = None;
+            result.columns() = columns;
+            result.rows() = rows;
+            result.rows_affected() = 0;
+            result.trace() = traced.trace();
+            result.cascade() = None;
             result
         }
     });

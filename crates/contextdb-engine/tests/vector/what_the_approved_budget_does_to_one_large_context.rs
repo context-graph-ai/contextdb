@@ -85,7 +85,7 @@ fn params(query: &[f32]) -> HashMap<String, Value> {
 
 fn answer_ids(answer: &contextdb_engine::QueryResult) -> Vec<i64> {
     answer
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,
@@ -359,7 +359,7 @@ fn what_the_approved_budget_does_to_one_large_context() {
                         .count();
                     hits += found;
                     answered += 1;
-                    let disclosure = answer.trace.vector_search.as_ref();
+                    let disclosure = answer.trace().vector_search.as_ref();
                     if let Some(partition) =
                         disclosure.and_then(|disclosure| disclosure.partition_hnsw.first())
                     {

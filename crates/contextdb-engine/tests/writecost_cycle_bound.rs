@@ -73,7 +73,7 @@ fn parked_backlog() -> (tempfile::TempDir, Database) {
         .open_cursor("SELECT id FROM bulk ORDER BY id", &p())
         .unwrap();
     assert!(
-        cursor.first_page().has_more,
+        cursor.first_page().has_more(),
         "the cursor must keep a live snapshot"
     );
     for generation in 0..300 {
@@ -135,7 +135,7 @@ fn each_cycle_reports_at_most_its_cap_and_a_larger_backlog_drains_across_cycles(
         "the first cycle runs to its cap"
     );
     assert_eq!(
-        db.execute("SELECT COUNT(*) FROM bulk", &p()).unwrap().rows,
+        db.execute("SELECT COUNT(*) FROM bulk", &p()).unwrap().rows(),
         vec![vec![Value::Int64(400)]]
     );
 }

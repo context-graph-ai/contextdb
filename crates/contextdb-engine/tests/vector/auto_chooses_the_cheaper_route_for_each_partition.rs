@@ -191,14 +191,14 @@ fn run_over(
     let executed = bounded::execute(db, &request).expect("the bounded route arm succeeds");
     let route = executed
         .result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .and_then(|search| search.route);
     Answered {
         rows: executed
             .result
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,

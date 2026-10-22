@@ -78,12 +78,12 @@ fn ranked(axis: usize, ordinal: usize) -> Vec<f32> {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("vector query projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -104,11 +104,11 @@ fn assert_complete_authoritative_route(
         "{what}: every authoritative durable row remains present and canonically ranked"
     );
     let embedding_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "embedding" || column.rsplit('.').next() == Some("embedding"))
         .expect("the complete authoritative query projects each stored embedding");
-    for (ordinal, row) in result.rows.iter().enumerate() {
+    for (ordinal, row) in result.rows().iter().enumerate() {
         assert_eq!(
             row.get(embedding_column),
             Some(&Value::Vector(ranked(axis, ordinal))),
@@ -281,13 +281,13 @@ fn drive_maintenance_until_generation_after(db: &Database, scope: Uuid, prior_ge
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == name)
         .unwrap_or_else(|| {
             panic!(
                 "SHOW VECTOR_PARTITIONS exposes {name}: {:?}",
-                result.columns
+                result.columns()
             )
         })
 }
@@ -296,7 +296,7 @@ fn inspected_route(result: &QueryResult, scope: Uuid) -> &[Value] {
     let key_column = column(result, "partition_key");
     let expected_scope = scope.to_string();
     result
-        .rows
+        .rows()
         .iter()
         .find(|row| {
             matches!(
@@ -326,7 +326,7 @@ fn assert_ordinary_and_graph_reads(db: &Database, graph_start: Uuid, graph_targe
     assert_eq!(
         db.execute("SELECT body FROM ordinary_notes", &empty())
             .expect("ordinary SQL remains available")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("still-readable".to_owned())]]
     );
     assert_eq!(
@@ -336,7 +336,7 @@ fn assert_ordinary_and_graph_reads(db: &Database, graph_start: Uuid, graph_targe
             &params([("start", Value::Uuid(graph_start))]),
         )
         .expect("ordinary graph traversal remains available")
-        .rows,
+        .rows(),
         vec![vec![Value::Uuid(graph_target)]]
     );
 }
@@ -928,7 +928,7 @@ fn embedded_and_bounded_owner_reads_share_quarantine_and_resource_failure_truth(
         );
     }
     assert_eq!(
-        embedded.rows, bounded.rows,
+        embedded.rows(), bounded.rows(),
         "embedded and bounded owner reads publish one snapshot-derived lifecycle projection"
     );
 
@@ -949,7 +949,7 @@ fn embedded_and_bounded_owner_reads_share_quarantine_and_resource_failure_truth(
         assert_eq!(text_at(shown, repaired, "maintenance_reason"), "none");
         assert_eq!(text_at(shown, repaired, "recovery_action"), "none");
     }
-    assert_eq!(repaired_embedded.rows, repaired_bounded.rows);
+    assert_eq!(repaired_embedded.rows(), repaired_bounded.rows());
 }
 
 /// A physical catalog key can be unreadable even when the catalog envelope it
@@ -1150,7 +1150,7 @@ fn caller_driven_repair_replaces_the_quarantined_generation_and_survives_restart
         assert!(reached);
         assert!(
             shown
-                .rows
+                .rows()
                 .iter()
                 .any(|row| text_at(&shown, row, "maintenance_state") == "repairing")
         );

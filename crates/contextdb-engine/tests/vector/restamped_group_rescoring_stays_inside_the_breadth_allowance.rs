@@ -205,13 +205,13 @@ fn search(db: &Database, mode: &str) -> Searched {
     });
     let disclosed = result.as_ref().ok().and_then(|answer| {
         answer
-            .trace
+            .trace()
             .vector_search
             .as_ref()
             .and_then(|search| search.rescore_evaluations)
     });
     Searched {
-        ids: result.map(|answer| answer.rows.into_iter().map(|row| row[0].clone()).collect()),
+        ids: result.map(|answer| answer.rows().into_iter().map(|row| row[0].clone()).collect()),
         graph: counter.0.load(Ordering::SeqCst),
         stored: counter.1.load(Ordering::SeqCst),
         disclosed,

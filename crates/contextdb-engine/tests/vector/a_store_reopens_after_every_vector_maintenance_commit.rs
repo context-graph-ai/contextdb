@@ -228,7 +228,7 @@ fn a_store_reopens_for_writing_after_every_vector_maintenance_cycle() {
             ]),
         )
         .expect("the maintained route answers after every reopen")
-        .rows;
+        .rows();
     assert_eq!(
         rows.first(),
         Some(&vec![Value::Uuid(Uuid::from_u128(0xB000))]),

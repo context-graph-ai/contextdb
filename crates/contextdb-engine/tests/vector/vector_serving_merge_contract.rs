@@ -63,7 +63,7 @@ fn fixture(mode: &str, vectors: &[Vec<f32>]) -> Database {
 
 fn ids(result: &QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|r| match r[0] {
             Value::Int64(id) => id,
@@ -115,13 +115,13 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     )
     .unwrap();
     let first = db.execute(sql, &parameters(&query)).unwrap();
-    let initial = first.trace.vector_search.as_ref().unwrap().partition_hnsw[0].clone();
+    let initial = first.trace().vector_search.as_ref().unwrap().partition_hnsw[0].clone();
     assert_eq!(
         initial.hnsw_ef_search, 100,
         "the compatibility profile resolves graph breadth from k, independent of the 201-row physical population"
     );
     for result in [first, bounded_query(&db, sql, &query)] {
-        let disclosure = result.trace.vector_search.unwrap();
+        let disclosure = result.trace().vector_search.unwrap();
         assert_eq!(disclosure.aggregate_allowed_vectors, Some(100));
         assert_eq!(disclosure.partition_hnsw[0], initial);
     }
@@ -143,7 +143,7 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
         db.execute(sql, &parameters(&query)).unwrap(),
         bounded_query(&db, sql, &query),
     ] {
-        let serving = &result.trace.vector_search.as_ref().unwrap().partition_hnsw[0];
+        let serving = &result.trace().vector_search.as_ref().unwrap().partition_hnsw[0];
         assert_eq!(serving.hnsw_m, initial.hnsw_m);
         assert_eq!(
             serving.policy_revision, initial.policy_revision,
@@ -159,13 +159,13 @@ fn query_policy_discloses_serving_snapshot_and_full_partition_search_breadth() {
     .unwrap();
     db.run_maintenance_cycle().unwrap();
     let current = db.execute(sql, &parameters(&query)).unwrap();
-    let serving = &current.trace.vector_search.as_ref().unwrap().partition_hnsw[0];
+    let serving = &current.trace().vector_search.as_ref().unwrap().partition_hnsw[0];
     assert_eq!(serving.hnsw_m, 24);
     assert!(serving.policy_revision > initial.policy_revision);
     let old = db
         .execute_at_snapshot(sql, &parameters(&query), snapshot)
         .unwrap();
-    let serving = &old.trace.vector_search.as_ref().unwrap().partition_hnsw[0];
+    let serving = &old.trace().vector_search.as_ref().unwrap().partition_hnsw[0];
     assert_eq!(serving.hnsw_m, initial.hnsw_m);
     assert_eq!(serving.policy_revision, initial.policy_revision);
 }
@@ -251,22 +251,22 @@ fn quantized_candidates_use_the_original_query_and_native_visible_scores() {
             "SELECT id, score FROM items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10";
         let ordinary = db.execute(sql, &parameters(&query)).unwrap();
         let bounded = bounded_query(&db, sql, &query);
-        assert_eq!(ordinary.rows, bounded.rows, "reader parity for {mode}");
+        assert_eq!(ordinary.rows(), bounded.rows(), "reader parity for {mode}");
         let expected = db
             .execute(&sql.replace("INDEXED", "EXACT"), &parameters(&query))
             .unwrap();
         assert_eq!(
-            ordinary.rows, expected.rows,
+            ordinary.rows(), expected.rows(),
             "native order and scores for {mode}: {exact:?}"
         );
         if mode == "SQ4" {
             assert_eq!(ids(&ordinary), vec![1, 2]);
             assert_eq!(
-                ordinary.rows[0][1],
+                ordinary.rows()[0][1],
                 Value::Float64(f32::from_bits(0x3f61efca) as f64)
             );
             assert_eq!(
-                ordinary.rows[1][1],
+                ordinary.rows()[1][1],
                 Value::Float64(f32::from_bits(0x3f604e99) as f64)
             );
         }
@@ -288,10 +288,10 @@ fn signed_constants_and_parameters_share_the_index_route() {
         assert!(
             db.execute(&sql, &parameters(&[1., 0., 0.]))
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
-        assert!(bounded_query(&db, &sql, &[1., 0., 0.]).rows.is_empty());
+        assert!(bounded_query(&db, &sql, &[1., 0., 0.]).rows().is_empty());
     }
 }
 
@@ -305,7 +305,7 @@ fn exact_discloses_its_actual_allowed_membership() {
     ] {
         assert_eq!(
             result
-                .trace
+                .trace()
                 .vector_search
                 .unwrap()
                 .aggregate_allowed_vectors,
@@ -343,8 +343,8 @@ fn partition_key_only_update_is_visible_in_the_writing_transaction() {
                     "staged {mode} bucket {bucket}"
                 );
                 assert_eq!(
-                    bounded_query(&db, &sql, &[1., 0., 0.]).rows,
-                    result.rows,
+                    bounded_query(&db, &sql, &[1., 0., 0.]).rows(),
+                    result.rows(),
                     "bounded transaction {mode} bucket {bucket}"
                 );
             }
@@ -463,7 +463,7 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
                 );
                 let bounded = bounded_query(&db, &sql, &query);
                 assert_eq!(
-                    actual.rows, bounded.rows,
+                    actual.rows(), bounded.rows(),
                     "{mode} selectivity {selected} reader parity"
                 );
                 let expected_ids = ids(&expected);
@@ -471,9 +471,9 @@ fn held_out_filtered_graph_search_preserves_quality_at_sparse_and_broad_selectiv
                     .iter()
                     .filter(|id| expected_ids.contains(id))
                     .count();
-                for row in &actual.rows {
+                for row in &actual.rows() {
                     if let Some(reference) = expected
-                        .rows
+                        .rows()
                         .iter()
                         .find(|reference| reference[0] == row[0])
                     {
@@ -571,8 +571,8 @@ fn bounded_search_and_newer_declaration_complete_while_replacement_encoding_is_p
         )
         .unwrap();
     let value = |name: &str| {
-        &observed.rows[0][observed
-            .columns
+        &observed.rows()[0][observed
+            .columns()
             .iter()
             .position(|column| column == name)
             .unwrap()]
@@ -604,8 +604,8 @@ fn a_long_update_history_does_not_fill_indexed_result_slots_with_one_identity() 
         )
         .unwrap();
     let indexed = db.execute(sql, &parameters(&[0.7, 0.3, -0.2])).unwrap();
-    assert_eq!(indexed.rows, exact.rows);
-    assert_eq!(bounded_query(&db, sql, &[0.7, 0.3, -0.2]).rows, exact.rows);
+    assert_eq!(indexed.rows(), exact.rows());
+    assert_eq!(bounded_query(&db, sql, &[0.7, 0.3, -0.2]).rows(), exact.rows());
 }
 
 #[test]
@@ -644,8 +644,8 @@ fn quantized_partition_moves_preserve_native_scores_and_rollback() {
                 bounded_query(&db, &sql, &query),
             ] {
                 assert_eq!(
-                    result.rows.iter().find(|row| row[0] == Value::Int64(1)),
-                    before.rows.first(),
+                    result.rows().iter().find(|row| row[0] == Value::Int64(1)),
+                    before.rows().first(),
                     "native moved score {mode} {route}"
                 );
             }
@@ -716,7 +716,7 @@ fn durable_native_scores_and_unique_results_survive_updates_and_restart() {
                         bounded_query(&db, &sql, &query),
                     ] {
                         assert_eq!(
-                            result.rows, reference.rows,
+                            result.rows(), reference.rows(),
                             "native durable {mode} stage {stage} probe {probe}"
                         );
                     }
@@ -790,14 +790,14 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
             assert_eq!(
                 db.execute_at_snapshot(sql, &parameters(&query), old_snapshot)
                     .unwrap()
-                    .rows,
-                old_answer.rows,
+                    .rows(),
+                old_answer.rows(),
                 "cleanup preserves the old reader's native score"
             );
             let old_bounded = db.__with_snapshot_override_for_test(old_snapshot, || {
                 bounded_query(&db, sql, &query)
             });
-            assert_eq!(old_bounded.rows, old_answer.rows);
+            assert_eq!(old_bounded.rows(), old_answer.rows());
             drop(pin);
             let cleaned = db.compact_currency_versions().unwrap();
             assert_eq!(cleaned.pruned_versions, 1);
@@ -855,7 +855,7 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                     .unwrap();
                     assert!(trace.used_hnsw);
                     assert_eq!(trace.supplemented_row_count, 0);
-                    assert_eq!(ordinary.rows, expected.rows[..limit]);
+                    assert_eq!(ordinary.rows(), expected.rows()[..limit]);
                     db.__reset_last_query_vector_trace_for_test();
                     let bounded = bounded_query(&db, &sql, &query);
                     let trace = {
@@ -869,7 +869,7 @@ fn current_only_cleanup_keeps_native_candidate_order_across_readers_and_restart(
                     assert!(trace.used_hnsw);
                     assert_eq!(trace.supplemented_row_count, 0);
                     assert_eq!(
-                        bounded.rows, ordinary.rows,
+                        bounded.rows(), ordinary.rows(),
                         "{quantization}, partitioned={partitioned}, restart={restart}"
                     );
                 }
@@ -1032,8 +1032,8 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                 db.execute(&sql, &parameters(&query)).unwrap()
             });
             assert_eq!(
-                ordinary.rows,
-                exact.rows,
+                ordinary.rows(),
+                exact.rows(),
                 "{mode} history={} filters before top-k",
                 end - 100
             );
@@ -1067,7 +1067,7 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
                 Arc::new(Clock),
             );
             let bounded = bounded::execute(&db, &request).unwrap();
-            assert_eq!(bounded.result.rows, exact.rows);
+            assert_eq!(bounded.result.rows(), exact.rows());
             let trace = {
                 let seam_read_memory = db
                     .declared_reader_memory()
@@ -1081,7 +1081,7 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
             assert_eq!(
                 bounded
                     .result
-                    .trace
+                    .trace()
                     .vector_search
                     .as_ref()
                     .unwrap()
@@ -1154,13 +1154,13 @@ fn closer_noncurrent_rows_do_not_change_current_results_or_add_complete_entry_pa
         assert_eq!(
             db.execute_at_snapshot(&sql, &parameters(&query), snapshot)
                 .unwrap()
-                .rows,
-            exact.rows
+                .rows(),
+            exact.rows()
         );
         assert_eq!(
             db.__with_snapshot_override_for_test(snapshot, || bounded_query(&db, &sql, &query))
-                .rows,
-            exact.rows
+                .rows(),
+            exact.rows()
         );
     }
 }
@@ -1303,15 +1303,15 @@ fn global_ties_keep_internal_row_order_across_partition_load_permutations() {
                             expected,
                             "load order={order:?}, mode={mode}, scope={predicate}"
                         );
-                        assert_eq!(bounded_query(&db, &sql, &query).rows, ordinary.rows);
+                        assert_eq!(bounded_query(&db, &sql, &query).rows(), ordinary.rows());
                         assert!(
                             ordinary
-                                .rows
+                                .rows()
                                 .windows(2)
                                 .all(|pair| pair[0][1] == pair[1][1])
                         );
                         if predicate.is_empty() {
-                            assert_eq!(ordinary.rows, before_close.rows);
+                            assert_eq!(ordinary.rows(), before_close.rows());
                         }
                     }
                 }

@@ -58,7 +58,7 @@ pub fn find_sql(mode: &str, limit: usize) -> String {
 
 pub fn answer_ids(answer: &contextdb_engine::QueryResult) -> Vec<i64> {
     answer
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,

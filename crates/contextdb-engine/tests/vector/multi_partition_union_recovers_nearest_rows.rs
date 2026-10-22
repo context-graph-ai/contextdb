@@ -71,7 +71,7 @@ fn clustered_embedding(center: &[f32], seed: u64, scale: f32) -> Vec<f32> {
 
 fn ids(result: &QueryResult) -> HashSet<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,

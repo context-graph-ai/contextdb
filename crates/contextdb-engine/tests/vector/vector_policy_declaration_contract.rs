@@ -55,24 +55,24 @@ fn summary_row(db: &Database, table: &str) -> (Vec<String>, Vec<Value>) {
         .execute("SHOW VECTOR_INDEXES", &empty())
         .expect("the public vector inspection statement succeeds");
     let table_column = summary
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "table")
         .expect("vector inspection identifies its table");
     let column_column = summary
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "column")
         .expect("vector inspection identifies its column");
     let row = summary
-        .rows
+        .rows()
         .iter()
         .find(|row| {
             row[table_column] == Value::Text(table.to_owned())
                 && row[column_column] == Value::Text("embedding".to_owned())
         })
         .unwrap_or_else(|| panic!("vector inspection describes {table}.embedding: {summary:?}"));
-    (summary.columns, row.clone())
+    (summary.columns(), row.clone())
 }
 
 fn assert_declared_values_are_null_when_silent_and_exact_when_set(
@@ -177,7 +177,7 @@ fn create_and_add_column_declarations_render_inspect_and_survive_reopen_and_expo
     assert_eq!(
         db.execute("SELECT embedding FROM add_target", &empty())
             .expect("read nullable added vector")
-            .rows,
+            .rows(),
         vec![vec![Value::Null]],
         "existing rows remain NULL after a nullable vector policy declaration"
     );
@@ -373,13 +373,13 @@ fn invalid_create_and_add_policies_refuse_before_publishing_schema_or_rows() {
                 assert_eq!(
                     db.execute("SELECT id FROM add_policy", &empty())
                         .unwrap()
-                        .rows,
+                        .rows(),
                     vec![vec![Value::Int64(1)]]
                 );
                 assert!(
                     db.execute("SHOW VECTOR_INDEXES", &empty())
                         .unwrap()
-                        .rows
+                        .rows()
                         .is_empty()
                 );
             }
@@ -402,11 +402,11 @@ fn serving_hnsw_m(db: &Database, table: &str) -> Option<i64> {
         )
         .expect("inspect the maintained vector partition");
     let column = detail
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "serving_hnsw_m")
         .expect("partition inspection exposes serving_hnsw_m");
-    match detail.rows.first().and_then(|row| row.get(column)) {
+    match detail.rows().first().and_then(|row| row.get(column)) {
         Some(Value::Int64(value)) => Some(*value),
         Some(Value::Null) | None => None,
         other => panic!("serving_hnsw_m has an unexpected value: {other:?}"),
@@ -479,7 +479,7 @@ fn full_width_hnsw_m_builds_reloads_and_accounts_at_255_256_and_257() {
                 )]),
             )
             .expect("reload and search the owned full-width graph");
-        assert_eq!(rows.rows.len(), 3);
+        assert_eq!(rows.rows().len(), 3);
         assert_eq!(
             serving_hnsw_m(&reopened, &table),
             Some(m),

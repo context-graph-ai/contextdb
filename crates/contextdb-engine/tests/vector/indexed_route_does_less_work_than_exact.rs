@@ -119,7 +119,7 @@ fn native_score_observer_counts_each_exact_comparison_once() {
         &HashMap::from([("query".into(), Value::Vector(vec![1.0, 0.0]))]),
     );
     assert!(!observed.debug.used_hnsw);
-    assert_eq!(observed.result.rows.len(), 3);
+    assert_eq!(observed.result.rows().len(), 3);
     assert_eq!(observed.graph_scores, 0);
     assert_eq!(
         observed.native_scores, 3,
@@ -193,16 +193,16 @@ fn set_probe(params: &mut HashMap<String, Value>, probe: usize) {
 fn overlap_at_ten(indexed: &QueryResult, exact: &QueryResult) -> u64 {
     u64::try_from(
         indexed
-            .rows
+            .rows()
             .iter()
-            .filter(|row| exact.rows.contains(row))
+            .filter(|row| exact.rows().contains(row))
             .count(),
     )
     .unwrap()
 }
 
 fn assert_only_current_rows(result: &QueryResult) {
-    for row in &result.rows {
+    for row in &result.rows() {
         let [Value::Int64(id)] = row.as_slice() else {
             panic!("expected one integer corpus id, got {row:?}");
         };
@@ -313,7 +313,7 @@ fn single_context_fixture() -> Database {
 
 fn assert_scoped_trace(result: &QueryResult, partitions: usize) -> bool {
     let disclosure = result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("the executed search reports its resolved route");
@@ -620,7 +620,7 @@ fn run_cell(db: &Database, partitions: usize, mode: &'static str) -> CellRun {
         }
         let disclosure = searched
             .result
-            .trace
+            .trace()
             .vector_search
             .as_ref()
             .expect("the executed search reports its resolved route");
@@ -798,7 +798,7 @@ fn declared_flat_multi_context_cells_are_never_slower_than_exact() {
         let routes: Vec<_> = db
             .execute(&sql, &params)
             .expect("the declared flat INDEXED search executes")
-            .trace
+            .trace()
             .vector_search
             .expect("the executed search reports its route")
             .partition_hnsw

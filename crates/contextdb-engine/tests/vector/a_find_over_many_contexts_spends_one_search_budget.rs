@@ -291,7 +291,7 @@ fn measure_within(
     let first = reader
         .execute(&sql, &params)
         .expect("the first find answers");
-    assert_eq!(first.rows.len(), LIMIT, "every scope answers a full page");
+    assert_eq!(first.rows().len(), LIMIT, "every scope answers a full page");
 
     let counts = Arc::new(Counts::default());
     let work = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
@@ -304,10 +304,10 @@ fn measure_within(
     });
     let counters = work.counters();
     drop(work);
-    assert_eq!(answer.rows.len(), LIMIT, "every scope answers a full page");
+    assert_eq!(answer.rows().len(), LIMIT, "every scope answers a full page");
     println!(
         "budget route contexts={selected} vector_search={:?} rows_examined={}",
-        answer.trace.vector_search, answer.trace.rows_examined,
+        answer.trace().vector_search, answer.trace().rows_examined,
     );
     Observed {
         evaluations: counts.evaluations.load(Ordering::Relaxed),
@@ -472,7 +472,7 @@ fn expansion_work_does_not_grow_with_context_count() {
             .expect("the first find answers");
         let (answer, searched) =
             with_union_search_receipts(|| reader.execute(&sql, &params).expect("warm find"));
-        assert_eq!(answer.rows.len(), LIMIT, "every scope answers a full page");
+        assert_eq!(answer.rows().len(), LIMIT, "every scope answers a full page");
         assert_eq!(
             searched.len(),
             1,
@@ -562,11 +562,11 @@ fn opening_more_layers_never_shrinks_the_walk() {
         let (sql, params) = statement(selected);
         let (answer, searched) =
             with_union_search_receipts(|| reader.execute(&sql, &params).expect("the find"));
-        assert_eq!(answer.rows.len(), LIMIT);
+        assert_eq!(answer.rows().len(), LIMIT);
         let receipt = searched[0];
         println!("walk contexts={selected} receipt={receipt:?}");
         let disclosed = answer
-            .trace
+            .trace()
             .vector_search
             .as_ref()
             .expect("the executed route publishes its search budget");
@@ -667,13 +667,13 @@ fn an_exhausted_budget_refuses_and_never_truncates() {
                  answer={:?}",
                 answer
                     .as_ref()
-                    .map(|answer| answer.rows.len())
+                    .map(|answer| answer.rows().len())
                     .map_err(|error| format!("{error}").chars().take(90).collect::<String>()),
             );
             match &answer {
                 Ok(answer) => {
                     assert_eq!(
-                        answer.rows.len(),
+                        answer.rows().len(),
                         LIMIT,
                         "work={work} mode={mode}: an answer is a full page, never a short one"
                     );
@@ -774,7 +774,7 @@ fn a_short_page_exhausts_the_eligible_frontier_on_both_routes() {
         let answer = reader.execute(&indexed, &params).expect("indexed answer");
         let ids = |answer: &contextdb_engine::QueryResult| {
             answer
-                .rows
+                .rows()
                 .iter()
                 .map(|row| match row[0] {
                     Value::Int64(id) => id,
@@ -790,7 +790,7 @@ fn a_short_page_exhausts_the_eligible_frontier_on_both_routes() {
         );
         assert_eq!(
             answer
-                .trace
+                .trace()
                 .vector_search
                 .as_ref()
                 .and_then(|trace| trace.budget_terminal.as_deref()),
@@ -893,7 +893,7 @@ fn rejected_neighbours_refill_the_page_on_both_routes() {
         let answer = reader.execute(&indexed, &params).expect("indexed refill");
         let ids = |answer: &contextdb_engine::QueryResult| {
             answer
-                .rows
+                .rows()
                 .iter()
                 .map(|row| match row[0] {
                     Value::Int64(id) => id,
@@ -913,7 +913,7 @@ fn rejected_neighbours_refill_the_page_on_both_routes() {
         );
         assert_eq!(
             answer
-                .trace
+                .trace()
                 .vector_search
                 .as_ref()
                 .and_then(|trace| trace.budget_terminal.as_deref()),

@@ -65,7 +65,7 @@ fn repeated_wide_finds_stop_filling_pages_within_the_declared_memory() {
             .expect("spacious reader answers the wide find")
     });
     let saved = since(before_loads, load_meters());
-    assert_eq!(roomy_answer.rows.len(), 10);
+    assert_eq!(roomy_answer.rows().len(), 10);
     assert_eq!(saved.loads, SHAPE.partitions as u64);
     assert!(
         saved.saved_bytes <= WARM_SLACK_BYTES as u64,
@@ -110,7 +110,7 @@ fn repeated_wide_finds_stop_filling_pages_within_the_declared_memory() {
             let distances = work.distances.load(Ordering::Relaxed);
             let page_fills = work.fills.load(Ordering::Relaxed);
             assert!(distances > 0, "the query must walk a saved graph");
-            assert_eq!(answer.rows.len(), 10, "the query answers a full page");
+            assert_eq!(answer.rows().len(), 10, "the query answers a full page");
             if let Some(ids_before) = &previous {
                 assert_eq!(ids(&answer), *ids_before, "warm answers stay identical");
                 assert_eq!(

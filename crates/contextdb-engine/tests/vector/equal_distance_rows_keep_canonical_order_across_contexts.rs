@@ -28,7 +28,7 @@ fn embedding(id: usize) -> Vec<f32> {
 
 fn ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,
@@ -128,7 +128,7 @@ fn equal_distance_rows_keep_canonical_order_across_contexts() {
         assert_eq!(ids(&exact), vec![1, 2, 3]);
         assert!(matches!(
             indexed
-                .trace
+                .trace()
                 .vector_search
                 .as_ref()
                 .and_then(|search| search.route),

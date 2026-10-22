@@ -139,7 +139,7 @@ fn find(db: &Database, mode: &str, partitions: usize, query: &[f32]) -> Result<Q
 }
 
 fn ids(result: &QueryResult) -> Vec<Value> {
-    result.rows.iter().map(|row| row[0].clone()).collect()
+    result.rows().iter().map(|row| row[0].clone()).collect()
 }
 
 /// One cell: (answered, refused, mean recall over answers).
@@ -158,15 +158,15 @@ fn cell(db: &Database, shape: Shape, partitions: usize, label: &str) -> (usize, 
                     .count();
                 recall += hits as f64 / expected.len().max(1) as f64;
                 let search = indexed
-                    .trace
+                    .trace()
                     .vector_search
                     .as_ref()
                     .expect("the INDEXED find discloses its route");
                 if let Some(budget) = search.global_candidate_budget {
                     assert!(
-                        indexed.trace.rows_examined <= (budget + budget / 2 + LIMIT) as u64,
+                        indexed.trace().rows_examined <= (budget + budget / 2 + LIMIT) as u64,
                         "{label} probe {probe}: examined {} rows, past {budget} + {budget}/2 + {LIMIT}",
-                        indexed.trace.rows_examined
+                        indexed.trace().rows_examined
                     );
                 }
             }
@@ -381,7 +381,7 @@ fn search_one_context(
 /// from the flat arm, and that receipt is the flat proof.
 fn assert_one_exact_partition(result: &QueryResult, label: &str, reason: &str) {
     let search = result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .unwrap_or_else(|| panic!("{label}: the find discloses its route"));
@@ -453,12 +453,12 @@ fn indexed_flat_row_check_exhaustion_before_later_matches_is_refused() {
     // The statement-wide cost decision precedes the per-partition flat arm.
     // This healthy, small resident scope is cheaper to compare exhaustively.
     assert_one_exact_partition(&auto, "AUTO", "statement_exhaustive_cheaper_than_walk");
-    assert_eq!(auto.trace.vector_search.as_ref().unwrap().partition_hnsw.len(), 1);
+    assert_eq!(auto.trace().vector_search.as_ref().unwrap().partition_hnsw.len(), 1);
 
     match search_one_context(&db, "INDEXED", context, &query, EXHAUSTION_LIMIT) {
         Ok(indexed) => panic!(
             "INDEXED published {} rows after the row-check allowance; an empty answer is an incomplete check",
-            indexed.rows.len()
+            indexed.rows().len()
         ),
         Err(Error::VectorIndexedRouteUnavailable { .. }) => {}
         Err(error) => panic!("INDEXED refused untyped: {error:?}"),
@@ -482,7 +482,7 @@ fn completed_covered_filter_with_no_matches_returns_empty() {
         let result = search_one_context(&db, mode, context, &query, EXHAUSTION_LIMIT)
             .unwrap_or_else(|error| panic!("{mode} refused a finished empty filter: {error:?}"));
         assert!(
-            result.rows.is_empty(),
+            result.rows().is_empty(),
             "{mode} published rows for a filter that names none"
         );
     }

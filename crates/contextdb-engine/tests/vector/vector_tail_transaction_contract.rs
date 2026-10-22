@@ -51,7 +51,7 @@ fn indexed_ids(db: &Database) -> Vec<i64> {
         )
         .unwrap();
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[0] {
             Value::Int64(id) => id,
@@ -70,7 +70,7 @@ fn assert_refusal(db: &Database, error: Error) {
     assert_eq!(
         db.execute("SELECT id FROM items ORDER BY id", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
     assert_eq!(
@@ -131,7 +131,7 @@ fn local_current_identity_admission_refuses_the_complete_transaction_before_dura
         reopened
             .execute("SELECT embedding FROM items WHERE id = 1", &HashMap::new())
             .unwrap()
-            .rows[0][0],
+            .rows()[0][0],
         Value::Vector(vec![1.0, 0.01])
     );
 }
@@ -342,7 +342,7 @@ fn bounded_ids(db: &Database, sql: &str, bound: HashMap<String, Value>) -> Vec<i
     bounded::execute(db, &request)
         .unwrap()
         .result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[0] {
             Value::Int64(id) => id,
@@ -401,7 +401,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
     let indexed = db.execute(sql, &bound).unwrap();
     assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     assert_eq!(
-        indexed.rows[0][0],
+        indexed.rows()[0][0],
         Value::Int64(3),
         "declared breadth includes all three vector candidates"
     );
@@ -415,7 +415,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
     // AUTO decides once for the statement: comparing three rows costs less
     // than any walk the declared breadth could buy, so a narrower breadth
     // leaves the automatic route exhaustive and its answer unchanged.
-    assert_eq!(db.execute(sql, &bound).unwrap().rows[0][0], Value::Int64(3));
+    assert_eq!(db.execute(sql, &bound).unwrap().rows()[0][0], Value::Int64(3));
     assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     assert_eq!(bounded_ids(&db, sql, bound.clone()), vec![3]);
     assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
@@ -423,7 +423,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
     // for outright keeps one candidate and misses the distant high-weight row.
     let indexed_sql = sql.replace("USE VECTOR AUTO", "USE VECTOR INDEXED");
     assert_ne!(
-        db.execute(&indexed_sql, &bound).unwrap().rows[0][0],
+        db.execute(&indexed_sql, &bound).unwrap().rows()[0][0],
         Value::Int64(3)
     );
     assert!(db.__debug_last_query_vector_used_hnsw_for_test());
@@ -454,7 +454,7 @@ fn ranked_auto_uses_the_declared_crossover_on_ordinary_and_bounded_reads() {
         &HashMap::new(),
     )
     .unwrap();
-    assert_eq!(db.execute(sql, &bound).unwrap().rows[0][0], Value::Int64(3));
+    assert_eq!(db.execute(sql, &bound).unwrap().rows()[0][0], Value::Int64(3));
     assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     assert_eq!(
         bounded_ids(&db, sql, bound),
@@ -492,7 +492,7 @@ fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
     let pin = db.pin_snapshot(snapshot).unwrap();
     let sql = "SELECT id FROM items WHERE is_current = true ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
     let bound = HashMap::from([("q".to_owned(), Value::Vector(vec![1.0, 0.0]))]);
-    let expected = db.execute(sql, &bound).unwrap().rows;
+    let expected = db.execute(sql, &bound).unwrap().rows();
     for (start, end) in [(4, 68), (68, 1068)] {
         let tx = db.begin_or_panic();
         for id in start..end {
@@ -508,9 +508,9 @@ fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
             .unwrap();
         }
         db.commit(tx).unwrap();
-        assert_eq!(db.execute(sql, &bound).unwrap().rows, expected);
+        assert_eq!(db.execute(sql, &bound).unwrap().rows(), expected);
         assert_eq!(
-            db.execute_at_snapshot(sql, &bound, snapshot).unwrap().rows,
+            db.execute_at_snapshot(sql, &bound, snapshot).unwrap().rows(),
             expected
         );
         let request = bounded::BoundedReadRequest::new(
@@ -524,7 +524,7 @@ fn current_filtered_rows_keep_the_same_answers_as_excluded_history_grows() {
             std::sync::Arc::new(FrozenClock),
         );
         let result = bounded::execute(&db, &request).unwrap();
-        assert_eq!(result.result.rows, expected);
+        assert_eq!(result.result.rows(), expected);
         assert!(db.__debug_last_query_vector_used_hnsw_for_test());
         assert!(
             result

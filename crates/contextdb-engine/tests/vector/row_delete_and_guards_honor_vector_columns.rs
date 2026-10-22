@@ -120,7 +120,7 @@ fn searched_ids(database: &Database, column: &str, query: &[f32]) -> Vec<Uuid> {
             &params(vec![("query", Value::Vector(query.to_vec()))]),
         )
         .expect("a vector search is served")
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Uuid(id)) => *id,
@@ -134,7 +134,7 @@ fn vector_counts(database: &Database) -> HashMap<String, i64> {
     database
         .execute("SHOW VECTOR_INDEXES", &empty())
         .expect("the store describes its vector indexes")
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             let column = match row.get(1) {
@@ -178,7 +178,7 @@ fn a_row_deleted_through_the_row_api_takes_its_vectors_with_it() {
                 &params(vec![("id", Value::Uuid(doomed))]),
             )
             .expect("a keyed read is served")
-            .rows
+            .rows()
             .iter()
             .any(|_| true),
         "the deleted row is gone from an ordinary read"
@@ -347,7 +347,7 @@ fn a_quantized_vector_guard_commits_when_unchanged_and_refuses_a_competing_repla
         )
         .expect("read the row after the refused transaction");
     assert_eq!(
-        label.rows,
+        label.rows(),
         vec![vec![Value::Text("unchanged-claim".to_owned())]],
         "the typed conflict rolls the guarded overlay back instead of retrying it unconditionally"
     );

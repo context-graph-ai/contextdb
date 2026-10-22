@@ -121,7 +121,7 @@ fn multi_context_auto_route_diagnostic() {
         );
         let executed = db.execute(&sql, &params).expect("AUTO executes");
         let disclosure = executed
-            .trace
+            .trace()
             .vector_search
             .as_ref()
             .expect("route receipt");

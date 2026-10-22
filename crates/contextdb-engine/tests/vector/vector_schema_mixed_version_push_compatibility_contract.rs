@@ -39,7 +39,7 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 
 fn text_column(result: QueryResult) -> Vec<String> {
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.into_iter().next() {
             Some(Value::Text(value)) => value,
@@ -473,7 +473,7 @@ async fn newer_edge_keeps_ordinary_tables_flowing_then_resumes_the_held_table_af
     let vector_rows = hub
         .execute("SELECT id FROM partitioned_notes", &empty())
         .expect("the held row arrives with its declaration");
-    assert_eq!(vector_rows.rows, vec![vec![Value::Uuid(vector_id)]]);
+    assert_eq!(vector_rows.rows(), vec![vec![Value::Uuid(vector_id)]]);
     assert!(client.schema_sync_holdbacks().is_empty());
 
     drop(client);
@@ -641,7 +641,7 @@ async fn a_newer_edge_holds_authored_history_until_the_hub_can_replay_it() {
     assert_eq!(
         hub.execute("SELECT id FROM docs", &empty())
             .expect("the released vector row arrives")
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(doc)]]
     );
     assert_schema_converged(

@@ -81,7 +81,7 @@ fn insert_partitioned(db: &Database, id: Uuid, scope_id: Uuid) {
 
 fn one_column_uuids(result: QueryResult) -> Vec<Uuid> {
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.into_iter().next() {
             Some(Value::Uuid(value)) => value,
@@ -230,7 +230,7 @@ async fn a_held_tables_authoritative_purge_reaches_the_old_copy_after_upgrade() 
             &params([("id", Value::Uuid(erased_id))]),
         )
         .expect("authoritatively erase the row on the source");
-    assert_eq!(purge.rows_affected, 1);
+    assert_eq!(purge.rows_affected(), 1);
     client
         .pull_default()
         .await
@@ -520,14 +520,14 @@ async fn a_row_committed_during_schema_only_push_remains_pending_for_the_next_pu
 
 fn column_index(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == name)
-        .unwrap_or_else(|| panic!("column {name} not found: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column {name} not found: {:?}", result.columns()))
 }
 
 fn value_at<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a Value {
-    &result.rows[row][column_index(result, name)]
+    &result.rows()[row][column_index(result, name)]
 }
 
 fn int_or_null_at(result: &QueryResult, row: usize, name: &str) -> Option<i64> {
@@ -554,7 +554,7 @@ fn index_row_for(result: &QueryResult, table: &str, column: &str) -> usize {
     let table_col = column_index(result, "table");
     let column_col = column_index(result, "column");
     result
-        .rows
+        .rows()
         .iter()
         .position(|values| {
             values[table_col] == Value::Text(table.to_owned())
@@ -699,7 +699,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     // Leg 5 -- a replacement build is scheduled: the edge's desired revision
     // strictly advances past the baseline and past its own serving revision.
     let after_partitions = show_vector_partitions(&edge, "docs", "embedding");
-    for row in 0..after_partitions.rows.len() {
+    for row in 0..after_partitions.rows().len() {
         let desired = int_or_null_at(&after_partitions, row, "desired_policy_revision")
             .expect("desired_policy_revision is always populated");
         assert!(
@@ -838,7 +838,7 @@ async fn a_synced_vector_policy_change_reaches_the_receivers_existing_column() {
     assert_eq!(
         edge.execute("SELECT id FROM docs", &empty())
             .expect("the edge can read its rows")
-            .rows
+            .rows()
             .len(),
         3,
         "the row inserted after every ALTER must reach the edge"
@@ -872,12 +872,12 @@ async fn sibling_edge_rows_survive_replication_retry_erasure_and_a_wiped_receive
     let traverse = |db: &Database| {
         db.execute(
         "SELECT t FROM GRAPH_TABLE(edge_rows MATCH (a)-[:RELATES_TO]->(b) WHERE a.id=$start COLUMNS(b.id AS t))",
-        &params([("start",Value::Uuid(start))])).unwrap().rows
+        &params([("start",Value::Uuid(start))])).unwrap().rows()
     };
     let row_ids = |db: &Database| {
         db.execute("SELECT id FROM edge_rows ORDER BY id", &empty())
             .unwrap()
-            .rows
+            .rows()
     };
     let initial_outbound = source.changes_since(contextdb_core::Lsn(0)).unwrap();
     assert!(
@@ -946,7 +946,7 @@ async fn sibling_edge_rows_survive_replication_retry_erasure_and_a_wiped_receive
                 ]),
             )
             .unwrap()
-            .rows_affected,
+            .rows_affected(),
         1
     );
     assert!(

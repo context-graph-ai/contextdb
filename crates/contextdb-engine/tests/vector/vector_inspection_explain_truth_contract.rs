@@ -56,17 +56,17 @@ fn route(scope: &str) -> VectorPartitionRef {
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == name)
-        .unwrap_or_else(|| panic!("inspection contains {name}: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("inspection contains {name}: {:?}", result.columns()))
 }
 
 fn row_for(result: &QueryResult, table: &str, vector_column: &str) -> usize {
     let table_column = column(result, "table");
     let vector_column_index = column(result, "column");
     result
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             row[table_column] == Value::Text(table.to_owned())
@@ -78,7 +78,7 @@ fn row_for(result: &QueryResult, table: &str, vector_column: &str) -> usize {
 fn partition_row_for_scope(result: &QueryResult, scope: &str) -> usize {
     let key_column = column(result, "partition_key");
     result
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             matches!(
@@ -92,7 +92,7 @@ fn partition_row_for_scope(result: &QueryResult, scope: &str) -> usize {
 
 fn value<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a Value {
     result
-        .rows
+        .rows()
         .get(row)
         .and_then(|values| values.get(column(result, name)))
         .unwrap_or_else(|| panic!("inspection has row {row} and {name}: {result:?}"))
@@ -122,12 +122,12 @@ fn non_null(result: &QueryResult, row: usize, name: &str) {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
         .expect("vector result projects its UUID id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -206,7 +206,7 @@ fn show_partitions(db: &Database) -> QueryResult {
 fn drive_to_ready(db: &Database) {
     for _ in 0..MAX_FINITE_CYCLES {
         let partitions = show_partitions(db);
-        if (0..partitions.rows.len()).all(|row| text(&partitions, row, "query_state") == "ready") {
+        if (0..partitions.rows().len()).all(|row| text(&partitions, row, "query_state") == "ready") {
             return;
         }
         db.run_maintenance_cycle()
@@ -501,7 +501,7 @@ fn assert_explain_fact(explain: &str, name: &str, expected: &str) {
 
 fn runtime_vector_explain(result: &QueryResult) -> String {
     result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("a runtime vector query returns its own typed vector disclosure")
@@ -530,7 +530,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
     let index_row = row_for(&indexes, "vector_inspection_docs", "embedding");
     let partitions = show_partitions(&db);
     assert_eq!(
-        partitions.rows.len(),
+        partitions.rows().len(),
         2,
         "two real key tuples have two detail rows"
     );
@@ -611,7 +611,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
         );
     }
 
-    for partition_row in 0..partitions.rows.len() {
+    for partition_row in 0..partitions.rows().len() {
         assert_eq!(int(&partitions, partition_row, "live_rows"), 2);
         assert_eq!(int(&partitions, partition_row, "retained_rows"), 0);
         assert_eq!(
@@ -741,7 +741,7 @@ fn vector_inspection_is_passive_and_reports_real_pre_and_post_maintenance_facts(
     ] {
         assert_eq!(value(&ready_indexes, ready_index_row, field), &Value::Null);
     }
-    for partition_row in 0..ready_partitions.rows.len() {
+    for partition_row in 0..ready_partitions.rows().len() {
         assert_eq!(int(&ready_partitions, partition_row, "live_rows"), 2);
         assert_eq!(int(&ready_partitions, partition_row, "retained_rows"), 0);
         assert_eq!(
@@ -871,10 +871,10 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
     let partitions = show_partitions(&db);
     let indexes_again = show_indexes(&db);
     let partitions_again = show_partitions(&db);
-    assert_eq!(indexes_again.columns, indexes.columns);
-    assert_eq!(indexes_again.rows, indexes.rows);
-    assert_eq!(partitions_again.columns, partitions.columns);
-    assert_eq!(partitions_again.rows, partitions.rows);
+    assert_eq!(indexes_again.columns(), indexes.columns());
+    assert_eq!(indexes_again.rows(), indexes.rows());
+    assert_eq!(partitions_again.columns(), partitions.columns());
+    assert_eq!(partitions_again.rows(), partitions.rows());
 
     let durable_vector = int(&indexes, index_row, "durable_vector_bytes");
     let durable_index = int(&indexes, index_row, "durable_index_bytes");
@@ -899,7 +899,7 @@ fn file_backed_inspection_separates_positive_durable_bytes_from_charged_residenc
         ("charged_vector_bytes", "charged_vector_bytes"),
         ("charged_index_bytes", "charged_index_bytes"),
     ] {
-        let detail_sum: i64 = (0..partitions.rows.len())
+        let detail_sum: i64 = (0..partitions.rows().len())
             .map(|row| int(&partitions, row, partition_field))
             .sum();
         assert_eq!(
@@ -1009,8 +1009,8 @@ fn inspect_reopened_backlog_without_maintenance(backlog: usize) -> usize {
     assert_eq!(generations_after, generations_before);
     let indexes_again = show_indexes(&db);
     let partitions_again = show_partitions(&db);
-    assert_eq!(indexes_again.rows, indexes.rows);
-    assert_eq!(partitions_again.rows, partitions.rows);
+    assert_eq!(indexes_again.rows(), indexes.rows());
+    assert_eq!(partitions_again.rows(), partitions.rows());
     assert_eq!(
         db.__vector_passive_activity_counters_for_test(),
         activity_before
@@ -1190,7 +1190,7 @@ fn engine_owned_ready_inspection_reports_no_recovery_without_inspecting_into_a_b
     });
 
     let partitions = show_partitions(&db);
-    for partition_row in 0..partitions.rows.len() {
+    for partition_row in 0..partitions.rows().len() {
         assert_eq!(
             text(&partitions, partition_row, "recovery_action"),
             "none",
@@ -1238,12 +1238,12 @@ fn the_same_pending_partition_reports_the_owner_of_maintenance_on_both_show_surf
     let caller_index_row = row_for(&caller_indexes, "vector_inspection_docs", "embedding");
     assert!(
         caller_partitions
-            .rows
+            .rows()
             .iter()
             .enumerate()
             .all(|(row, _)| text(&caller_partitions, row, "query_state") == "unavailable")
     );
-    assert!(caller_partitions.rows.iter().enumerate().all(|(row, _)| {
+    assert!(caller_partitions.rows().iter().enumerate().all(|(row, _)| {
         text(&caller_partitions, row, "recovery_action") == "run_maintenance_cycle"
     }));
     assert_eq!(
@@ -1260,9 +1260,9 @@ fn the_same_pending_partition_reports_the_owner_of_maintenance_on_both_show_surf
     let engine_indexes = show_indexes(&db);
     let engine_index_row = row_for(&engine_indexes, "vector_inspection_docs", "embedding");
     assert_eq!(
-        engine_partitions.rows,
+        engine_partitions.rows(),
         caller_partitions
-            .rows
+            .rows()
             .iter()
             .cloned()
             .map(|mut row| {

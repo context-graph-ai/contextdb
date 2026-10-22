@@ -117,7 +117,7 @@ fn passage_writer_residency_has_named_owners_at_one_thousand_rows() {
         assert_eq!(
             db.execute("SELECT COUNT(*) FROM event_search_passages", &empty)
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64((first + 100) as i64)]],
             "the complete committed passage population is read from the durable store"
         );
@@ -139,7 +139,7 @@ fn passage_writer_residency_has_named_owners_at_one_thousand_rows() {
         assert_eq!(
             db.execute(&format!("SELECT COUNT(*) FROM {table}"), &empty)
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Int64(1)]],
         );
     }
@@ -278,7 +278,7 @@ fn repeated_sql_updates_release_superseded_staged_row_charges() {
             &HashMap::from([("id".into(), Value::Uuid(id)),])
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(3)]],
         "the committed durable row retains the last replacement"
     );
@@ -660,7 +660,7 @@ fn cursor_held_during_update_bounds_attribution_to_quiescent_samples() {
         Arc::new(FrozenClock),
     );
     let opened = bounded::open_cursor(db.clone(), &req).unwrap();
-    assert!(opened.first_page.has_more);
+    assert!(opened.first_page.has_more());
     let held_before = db.writer_memory_ownership_receipt_for_test();
     db.execute(
         "UPDATE held_members SET active = FALSE WHERE id = 12",

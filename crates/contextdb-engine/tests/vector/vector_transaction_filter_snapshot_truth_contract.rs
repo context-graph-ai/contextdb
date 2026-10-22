@@ -214,12 +214,12 @@ fn partition_ref(scope: Uuid) -> VectorPartitionRef {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
         .expect("the vector projection includes its UUID id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(column) {
             Some(Value::Uuid(id)) => *id,
@@ -798,9 +798,9 @@ fn filters_choose_only_allowed_work_and_name_the_same_budget_refusal_on_every_do
         .expect("SQL narrow AUTO search");
     assert_eq!(ids(&sql_narrow), vec![wanted]);
     assert!(
-        sql_narrow.trace.rows_examined <= 4,
+        sql_narrow.trace().rows_examined <= 4,
         "ordinary SQL must not evaluate the narrow predicate across the 1,002-row table: {:?}",
-        sql_narrow.trace
+        sql_narrow.trace()
     );
     assert_exact_trace(&db, "SQL narrow AUTO route");
     assert_eq!(
@@ -1561,7 +1561,7 @@ fn assert_three_current_vectors(db: &Database, expected: &[f32]) {
             .unwrap()
             .execute(&sql, &bound)
             .unwrap();
-        assert_eq!(ordinary.rows, bounded.rows);
+        assert_eq!(ordinary.rows(), bounded.rows());
         let actual_ids = ids(&ordinary);
         assert_eq!(actual_ids.len(), 3);
         assert_eq!(
@@ -1594,14 +1594,14 @@ fn assert_three_current_vectors(db: &Database, expected: &[f32]) {
         let point_rows = db.execute(&point, &point_bound).unwrap();
         assert_eq!(ids(&point_rows), vec![id(7)]);
         assert_eq!(
-            point_rows.rows,
+            point_rows.rows(),
             db.read_session(roomy_limits())
                 .unwrap()
                 .execute(&point, &point_bound)
                 .unwrap()
-                .rows
+                .rows()
         );
-        assert!(ordinary.rows.contains(&point_rows.rows[0]));
+        assert!(ordinary.rows().contains(&point_rows.rows()[0]));
     }
 }
 
@@ -1685,18 +1685,18 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
     assert!(db.snapshot() > intermediate_snapshot);
     for (resume, task, expected, sql, bound) in waiting {
         resume.send(()).unwrap();
-        assert_eq!(task.join().unwrap().rows, expected.rows);
+        assert_eq!(task.join().unwrap().rows(), expected.rows());
         assert_eq!(
             db.execute_at_snapshot(&sql, &bound, intermediate_snapshot)
                 .unwrap()
-                .rows,
-            expected.rows
+                .rows(),
+            expected.rows()
         );
         let initial = db
             .execute_at_snapshot(&sql, &bound, initial_snapshot)
             .unwrap();
         assert_eq!(ids(&initial).len(), 3);
-        assert_ne!(initial.rows, expected.rows);
+        assert_ne!(initial.rows(), expected.rows());
     }
     assert_three_current_vectors(&db, &[0.8, 0.6, 0.0]);
     let vector_fixture_reader_2 = db
@@ -1822,11 +1822,11 @@ async fn database_late_lower_commit_keeps_unique_vectors_across_snapshots_restar
             assert_three_current_vectors(&hub, &[0.0, 0.6, 0.8]);
             for (resume, task, expected, sql, bound) in waiting {
                 resume.send(()).unwrap();
-                assert_eq!(task.join().unwrap().rows, expected.rows);
+                assert_eq!(task.join().unwrap().rows(), expected.rows());
                 let old = hub.execute_at_snapshot(&sql, &bound, before).unwrap();
-                assert_eq!(old.rows, expected.rows);
+                assert_eq!(old.rows(), expected.rows());
                 assert_eq!(ids(&old), vec![id(7), id(8), id(9)]);
-                assert_ne!(hub.execute(&sql, &bound).unwrap().rows, expected.rows);
+                assert_ne!(hub.execute(&sql, &bound).unwrap().rows(), expected.rows());
             }
             drop(pin);
         }

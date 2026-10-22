@@ -118,7 +118,7 @@ fn search_labelled(
 }
 
 fn ids(result: &QueryResult) -> Vec<Value> {
-    result.rows.iter().map(|row| row[0].clone()).collect()
+    result.rows().iter().map(|row| row[0].clone()).collect()
 }
 
 fn assert_indexed_equals_exact(
@@ -288,10 +288,10 @@ fn settle_table(db: &Database, table: &str) {
         )
         .map(|shown| {
             shown
-                .columns
+                .columns()
                 .iter()
                 .cloned()
-                .zip(shown.rows.first().cloned().unwrap_or_default())
+                .zip(shown.rows().first().cloned().unwrap_or_default())
                 .collect::<Vec<_>>()
         });
     panic!(
@@ -597,12 +597,12 @@ fn a_large_shared_point_beside_a_cut_off_row_is_counted_and_given_back() {
         .execute("SHOW VECTOR_PARTITIONS FOR cut.embedding", &HashMap::new())
         .expect("show the partition");
     let state = shown
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "query_state")
         .unwrap();
     assert_eq!(
-        shown.rows[0][state],
+        shown.rows()[0][state],
         Value::Text("ready".into()),
         "nothing is set aside"
     );

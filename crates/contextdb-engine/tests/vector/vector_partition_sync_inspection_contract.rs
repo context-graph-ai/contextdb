@@ -128,7 +128,7 @@ fn inspection_refusal_violation(
     match result {
         Ok(answer) => Some(format!(
             "{statement} exposed {} whole-index row(s) through a constrained handle",
-            answer.rows.len()
+            answer.rows().len()
         )),
         Err(Error::ParseError(message)) => Some(format!(
             "{statement} returned a parse error instead of a typed inspection refusal: {message}"
@@ -145,16 +145,16 @@ fn inspection_refusal_violation(
 
 fn column_index(result: &QueryResult, column: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == column)
-        .unwrap_or_else(|| panic!("result contains column {column}: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("result contains column {column}: {:?}", result.columns()))
 }
 
 fn value_at<'a>(result: &'a QueryResult, row: usize, column: &str) -> &'a Value {
     let column = column_index(result, column);
     result
-        .rows
+        .rows()
         .get(row)
         .and_then(|values| values.get(column))
         .unwrap_or_else(|| panic!("result contains row {row} and column {column}: {result:?}"))
@@ -164,7 +164,7 @@ fn vector_index_row(result: &QueryResult, table: &str, column: &str) -> usize {
     let table_column = column_index(result, "table");
     let vector_column = column_index(result, "column");
     result
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             row[table_column] == Value::Text(table.to_owned())
@@ -273,7 +273,7 @@ fn nearest_id(database: &Database, query: Vec<f32>) -> Uuid {
             &params(vec![("query", Value::Vector(query))]),
         )
         .expect("vector search returns the nearest row");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     match value_at(&result, 0, "id") {
         Value::Uuid(id) => *id,
         other => panic!("nearest row has a UUID id, got {other:?}"),
@@ -304,7 +304,7 @@ fn assert_partition_membership(database: &Database, scopes: &[Uuid]) {
             &empty(),
         )
         .expect("the receiver describes the vector partitions");
-    assert_eq!(result.rows.len(), scopes.len());
+    assert_eq!(result.rows().len(), scopes.len());
     for (row, scope_id) in scopes.iter().copied().enumerate() {
         assert_eq!(
             value_at(&result, row, "table"),
@@ -504,12 +504,12 @@ fn received_key_only_update_moves_the_unchanged_vector() {
     assert_partitioned_summary(&receiver, 2);
     assert!(
         search_in_scope(&receiver, old_scope, moved.vector.clone())
-            .rows
+            .rows()
             .is_empty(),
         "the old partition no longer contains the moved row"
     );
     let moved_result = search_in_scope(&receiver, new_scope, moved.vector.clone());
-    assert_eq!(moved_result.rows.len(), 1);
+    assert_eq!(moved_result.rows().len(), 1);
     assert_eq!(value_at(&moved_result, 0, "id"), &Value::Uuid(moved.id));
     assert_eq!(nearest_id(&receiver, moved.vector.clone()), moved.id);
 }
@@ -532,13 +532,13 @@ fn show_vector_partitions_supports_all_sql_forms() {
         .execute("SHOW VECTOR_PARTITIONS", &empty())
         .expect("list every vector partition");
     assert_eq!(
-        all.columns,
+        all.columns(),
         VECTOR_PARTITION_COLUMNS
             .iter()
             .map(|column| (*column).to_owned())
             .collect::<Vec<_>>()
     );
-    assert_eq!(all.rows.len(), 2);
+    assert_eq!(all.rows().len(), 2);
     assert_eq!(
         value_at(&all, 0, "column"),
         &Value::Text("embedding".into())
@@ -547,7 +547,7 @@ fn show_vector_partitions_supports_all_sql_forms() {
         value_at(&all, 1, "column"),
         &Value::Text("secondary".into())
     );
-    for row in 0..all.rows.len() {
+    for row in 0..all.rows().len() {
         assert_eq!(
             value_at(&all, row, "partition_key"),
             &Value::Json(serde_json::json!({}))
@@ -568,8 +568,8 @@ fn show_vector_partitions_supports_all_sql_forms() {
             &empty(),
         )
         .expect("list one named vector index");
-    assert_eq!(selected.columns, all.columns);
-    assert_eq!(selected.rows.len(), 1);
+    assert_eq!(selected.columns(), all.columns());
+    assert_eq!(selected.rows().len(), 1);
     assert_eq!(
         value_at(&selected, 0, "column"),
         &Value::Text("embedding".to_owned())
@@ -581,8 +581,8 @@ fn show_vector_partitions_supports_all_sql_forms() {
             &empty(),
         )
         .expect("apply LIMIT and OFFSET after selecting the vector index");
-    assert_eq!(paged.columns, all.columns);
-    assert!(paged.rows.is_empty());
+    assert_eq!(paged.columns(), all.columns());
+    assert!(paged.rows().is_empty());
 }
 
 #[test]
@@ -762,14 +762,14 @@ fn a_lowered_partition_limit_arriving_over_sync_is_refused_and_changes_nothing()
     assert_partition_membership(&receiver, &[items[0].scope_id, items[1].scope_id]);
     assert_eq!(
         search_in_scope(&receiver, items[0].scope_id, items[0].vector.clone())
-            .rows
+            .rows()
             .len(),
         1,
         "a scoped search into an untouched partition must still succeed"
     );
     assert_eq!(
         search_in_scope(&receiver, items[1].scope_id, items[1].vector.clone())
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -811,7 +811,7 @@ fn a_lowered_partition_limit_arriving_over_sync_is_refused_and_changes_nothing()
         )
         .expect("the receiver still describes its vector partitions");
     assert_eq!(
-        after_delete.rows.len(),
+        after_delete.rows().len(),
         1,
         "HISTORY CURRENT ONLY must drop the deleted scope's partition rather than retain it: {after_delete:?}"
     );
@@ -1014,7 +1014,7 @@ async fn a_refused_lowered_partition_limit_holds_the_tenants_pull_until_its_use_
             &params(vec![("id", Value::Uuid(stalled_row_id))]),
         )
         .expect("select must still succeed on the edge")
-        .rows
+        .rows()
         .is_empty(),
         "the stalled-tenant journey: an unrelated row committed after the \
          refusal must not reach the edge while the refused DDL still leads the page"
@@ -1083,7 +1083,7 @@ async fn a_refused_lowered_partition_limit_holds_the_tenants_pull_until_its_use_
                 &params(vec![("id", Value::Uuid(stalled_row_id))]),
             )
             .expect("select must succeed")
-            .rows
+            .rows()
             .is_empty(),
         "the row from leg 5 must now be present"
     );
@@ -1139,7 +1139,7 @@ fn recognition_search_params(scope: &str) -> HashMap<String, Value> {
 fn recognition_result_ids(result: &QueryResult) -> Vec<Uuid> {
     let id = column_index(result, "id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[id] {
             Value::Uuid(id) => *id,
@@ -1156,7 +1156,7 @@ fn assert_recognition_partition(database: &Database) {
             &empty(),
         )
         .expect("the generic recognition table has one inspectable partition");
-    assert_eq!(partitions.rows.len(), 1);
+    assert_eq!(partitions.rows().len(), 1);
     assert_eq!(
         value_at(&partitions, 0, "partition_key"),
         &Value::Json(serde_json::json!({
@@ -1582,7 +1582,7 @@ fn a_synced_restricted_reads_disclosure_lists_only_its_own_authorized_ids() {
     let ids: Vec<Uuid> = {
         let column = column_index(&runtime, "id");
         runtime
-            .rows
+            .rows()
             .iter()
             .map(|row| match &row[column] {
                 Value::Uuid(value) => *value,
@@ -1597,7 +1597,7 @@ fn a_synced_restricted_reads_disclosure_lists_only_its_own_authorized_ids() {
          foreign Context's row that arrived over the same sync"
     );
     let disclosure = runtime
-        .trace
+        .trace()
         .vector_search
         .expect("the executed synced restricted read publishes a vector disclosure");
     assert_eq!(

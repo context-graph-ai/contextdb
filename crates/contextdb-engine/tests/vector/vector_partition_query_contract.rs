@@ -33,16 +33,16 @@ fn query_vector() -> Vec<f32> {
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == name || candidate.rsplit('.').next() == Some(name))
-        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns()))
 }
 
 fn result_ids(result: &QueryResult) -> Vec<Uuid> {
     let position = column(result, "id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(position) {
             Some(Value::Uuid(value)) => *value,
@@ -54,7 +54,7 @@ fn result_ids(result: &QueryResult) -> Vec<Uuid> {
 fn result_scores(result: &QueryResult) -> Vec<f64> {
     let position = column(result, "score");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(position) {
             Some(Value::Float64(value)) => *value,
@@ -579,7 +579,7 @@ fn missing_named_partition_tuple_is_an_empty_answer() {
         )
         .expect("a missing named tuple is a complete empty search");
     assert!(
-        result.rows.is_empty(),
+        result.rows().is_empty(),
         "a missing tuple never broadens scope"
     );
 }
@@ -799,7 +799,7 @@ fn assert_empty_mode_query(sql: &str) {
         .execute(sql, &params([("query", Value::Vector(query_vector()))]))
         .expect("the query-level vector mode parses and executes");
     assert!(
-        result.rows.is_empty(),
+        result.rows().is_empty(),
         "an empty vector column is a complete empty answer under every mode"
     );
 }
@@ -1320,7 +1320,7 @@ fn a_text_partition_key_predicate_stays_case_exact() {
         )
         .expect("an uppercase spelling must explain as a provably empty scope, not an error");
     assert!(
-        upper.rows.is_empty(),
+        upper.rows().is_empty(),
         "the TEXT partition encoder must not lowercase: 'NOTE' must not reach the stored 'note' partition"
     );
     db.explain(
@@ -1338,7 +1338,7 @@ fn both_write_spellings_of_one_instant_land_in_one_partition() {
         .execute("SHOW VECTOR_PARTITIONS FOR ts_keyed.embedding", &empty())
         .expect("SHOW VECTOR_PARTITIONS is an admin inspection surface");
     assert_eq!(
-        partitions.rows.len(),
+        partitions.rows().len(),
         2,
         "the bound-Timestamp row and the integer-written row at the same instant must \
          collapse into ONE stored partition (alongside the second, distinct instant), \
@@ -1401,7 +1401,7 @@ fn a_key_value_of_the_wrong_declared_type_is_refused_not_silently_partitioned() 
     let after = db
         .execute("SELECT id FROM text_keyed_docs", &empty())
         .expect("select must still succeed");
-    assert!(after.rows.is_empty(), "the refused row must be absent");
+    assert!(after.rows().is_empty(), "the refused row must be absent");
     let partitions = db
         .execute(
             "SHOW VECTOR_PARTITIONS FOR text_keyed_docs.embedding",
@@ -1409,7 +1409,7 @@ fn a_key_value_of_the_wrong_declared_type_is_refused_not_silently_partitioned() 
         )
         .expect("partition inspection must still succeed");
     assert!(
-        partitions.rows.is_empty(),
+        partitions.rows().is_empty(),
         "no stray partition of the wrong component type may exist: {partitions:?}"
     );
 
@@ -1458,7 +1458,7 @@ fn a_key_value_of_the_wrong_declared_type_is_refused_not_silently_partitioned() 
         )
         .expect("partition inspection must still succeed");
     assert!(
-        partitions_2.rows.is_empty(),
+        partitions_2.rows().is_empty(),
         "no stray Uuid-typed partition may exist under a declared INTEGER key: {partitions_2:?}"
     );
 }
@@ -1512,7 +1512,7 @@ fn a_partition_key_value_of_the_wrong_type_gets_its_own_typed_refusal_naming_the
     let after = db
         .execute("SELECT id FROM bucket_typed_docs", &empty())
         .expect("select must still succeed");
-    assert!(after.rows.is_empty(), "the refused row must be absent");
+    assert!(after.rows().is_empty(), "the refused row must be absent");
     let partitions = db
         .execute(
             "SHOW VECTOR_PARTITIONS FOR bucket_typed_docs.embedding",
@@ -1520,7 +1520,7 @@ fn a_partition_key_value_of_the_wrong_type_gets_its_own_typed_refusal_naming_the
         )
         .expect("partition inspection must still succeed");
     assert!(
-        partitions.rows.is_empty(),
+        partitions.rows().is_empty(),
         "no stray partition of the wrong component type may exist: {partitions:?}"
     );
 }
@@ -1605,7 +1605,7 @@ fn a_partition_key_value_of_the_wrong_type_arriving_through_sync_gets_the_same_t
         .execute("SELECT id FROM synced_bucket_typed_docs", &empty())
         .expect("select must still succeed");
     assert!(
-        after.rows.is_empty(),
+        after.rows().is_empty(),
         "the refused synced row must be absent"
     );
 }
@@ -1876,7 +1876,7 @@ mod bounded_door {
             .expect("INDEXED merges the authorized staged delta with the maintained source");
         assert_eq!(result_ids(&answer), vec![staged]);
         assert!(matches!(
-            answer.trace.vector_search.as_ref().unwrap().route,
+            answer.trace().vector_search.as_ref().unwrap().route,
             Some(
                 contextdb_engine::VectorSearchRoute::Indexed
                     | contextdb_engine::VectorSearchRoute::FilteredIndexed
@@ -2332,7 +2332,7 @@ fn candidate_intersection_matches_row_visibility_and_transaction_grant_changes()
             scoped
                 .execute_in_tx(tx, sql, &bound)
                 .unwrap()
-                .rows
+                .rows()
                 .is_empty()
         );
         let query = SemanticQuery::new("hidden_row_docs", "embedding", query_vector(), 10);
@@ -2451,7 +2451,7 @@ fn restricted_vector_access_and_route_refusal_match_file_and_owner_service() {
                         reader.route()
                     );
                     let disclosure =
-                        answer.trace.vector_search.as_ref().expect(
+                        answer.trace().vector_search.as_ref().expect(
                             "the restricted executed read publishes a vector route receipt",
                         );
                     assert_eq!(

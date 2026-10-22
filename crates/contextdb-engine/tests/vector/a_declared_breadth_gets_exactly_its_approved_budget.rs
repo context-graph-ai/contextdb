@@ -252,7 +252,7 @@ fn open_reader(
 /// admitted partition.
 fn disclosed(answer: &QueryResult) -> Vec<(usize, usize, String)> {
     answer
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("a vector find discloses its route")
@@ -347,7 +347,7 @@ fn a_declared_breadth_is_given_its_breadth_times_the_serving_degree() {
                 let (answer, receipts) =
                     with_union_search_receipts(|| reader.execute(&sql, &params));
                 let answer = answer.expect("the warm find answers");
-                assert_eq!(answer.rows.len(), LIMIT, "{cell}: a full page");
+                assert_eq!(answer.rows().len(), LIMIT, "{cell}: a full page");
                 for (hnsw_m, ef_search, source) in disclosed(&answer) {
                     assert_eq!(
                         (hnsw_m, ef_search, source.as_str()),
@@ -402,7 +402,7 @@ fn opening_and_walking_are_charged_against_the_declared_work() {
             }
         }
         if let Ok(answer) = answer {
-            assert_eq!(answer.rows.len(), LIMIT, "work={work}: never a short page");
+            assert_eq!(answer.rows().len(), LIMIT, "work={work}: never a short page");
         }
     }
     // One shared walk
@@ -464,12 +464,12 @@ fn mixed_serving_degrees_are_given_the_widest_admitted_degree() {
             )
             .expect("inspect the partitions");
         let column = observed
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "serving_hnsw_m")
             .expect("the serving degree column");
         observed
-            .rows
+            .rows()
             .iter()
             .map(|row| match &row[column] {
                 Value::Int64(degree) => *degree,

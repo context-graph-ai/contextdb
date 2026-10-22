@@ -25,14 +25,14 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == name)
-        .unwrap_or_else(|| panic!("inspection contains {name}: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("inspection contains {name}: {:?}", result.columns()))
 }
 
 fn text<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a str {
-    match result.rows[row].get(column(result, name)) {
+    match result.rows()[row].get(column(result, name)) {
         Some(Value::Text(value)) => value,
         other => panic!("inspection {name} is text, got {other:?}"),
     }
@@ -92,7 +92,7 @@ fn show_partitions(db: &Database) -> QueryResult {
 fn drive_to_ready(db: &Database) {
     for _ in 0..MAX_FINITE_CYCLES {
         let partitions = show_partitions(db);
-        if (0..partitions.rows.len()).all(|row| text(&partitions, row, "query_state") == "ready") {
+        if (0..partitions.rows().len()).all(|row| text(&partitions, row, "query_state") == "ready") {
             return;
         }
         db.run_maintenance_cycle()

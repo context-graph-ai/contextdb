@@ -39,12 +39,12 @@ fn route(scope: Uuid) -> VectorPartitionRef {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("vector query projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -218,7 +218,7 @@ fn delete_only_survivor_route_advances_its_durable_frontier_and_truncates_the_jo
         )
         .expect("commit one real delete after the captured base");
     assert_eq!(
-        deleted_rows.rows_affected, 1,
+        deleted_rows.rows_affected(), 1,
         "the fixture deleted its real vector row"
     );
     assert_eq!(
@@ -314,7 +314,7 @@ fn delete_only_final_route_truncates_covered_history_before_snapshot_release_can
         )
         .expect("commit the final real vector delete");
     assert_eq!(
-        deleted_rows.rows_affected, 1,
+        deleted_rows.rows_affected(), 1,
         "the fixture deleted its final live row"
     );
     assert_eq!(
@@ -381,7 +381,7 @@ fn delete_only_final_route_truncates_covered_history_before_snapshot_release_can
         )
         .expect("read the unrelated ordinary control row after reopen");
     assert_eq!(
-        ordinary_rows.rows.len(),
+        ordinary_rows.rows().len(),
         1,
         "ordinary control remains intact after final deletion"
     );
@@ -426,7 +426,7 @@ fn delete_only_unpinned_final_route_physically_cleans_its_journal_before_retirem
         )
         .expect("commit the unpinned final vector delete");
     assert_eq!(
-        deleted_rows.rows_affected, 1,
+        deleted_rows.rows_affected(), 1,
         "the fixture deleted its final live row without pinning a snapshot"
     );
     assert_eq!(
@@ -504,7 +504,7 @@ fn delete_only_unpinned_final_route_physically_cleans_its_journal_before_retirem
         )
         .expect("read the unrelated ordinary control row after unpinned reopen");
     assert_eq!(
-        ordinary_rows.rows.len(),
+        ordinary_rows.rows().len(),
         1,
         "ordinary control remains intact after unpinned final deletion"
     );

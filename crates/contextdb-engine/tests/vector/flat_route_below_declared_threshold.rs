@@ -124,7 +124,7 @@ fn search(db: &Database, mode: &str) -> Observed {
 /// Each partition's executed route and reason, in partition order.
 fn routes(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<String>)> {
     result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route")
@@ -166,12 +166,12 @@ fn indexed_below_a_declared_flat_threshold_compares_its_rows_exactly() {
         "the flat route compares every allowed row of each flat partition once"
     );
     assert_eq!(
-        indexed.result.rows, exact.result.rows,
+        indexed.result.rows(), exact.result.rows(),
         "the flat answer is EXACT's"
     );
     let disclosure = indexed
         .result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route");
@@ -228,7 +228,7 @@ fn an_undeclared_flat_threshold_keeps_every_partition_on_its_graph() {
     assert!(indexed.graph_scores > 0, "the default is never flat");
     let disclosure = indexed
         .result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route");
@@ -269,7 +269,7 @@ fn a_mixed_scope_serves_small_partitions_flat_and_large_ones_by_graph() {
             "the large partitions walk their graphs"
         );
         assert_eq!(
-            indexed.result.rows, exact.result.rows,
+            indexed.result.rows(), exact.result.rows(),
             "one global top-10 across flat and graph partitions ({rows:?})"
         );
         assert!(
@@ -448,7 +448,7 @@ fn routes_at(db: &Database, snapshot: contextdb_core::SnapshotId) -> Vec<Option<
             db.vector_store_for_test().hnsw_maintenance_status()
         )
     })
-    .trace
+    .trace()
     .vector_search
     .expect("the snapshot search discloses its route")
     .partition_hnsw
@@ -526,7 +526,7 @@ fn a_reader_keeps_its_captured_count_and_route_across_a_threshold_crossing() {
             below,
         )
         .expect("search before eviction")
-        .rows;
+        .rows();
     let key = contextdb_core::VectorPartitionKey::from_values(&[Value::Int64(0)])
         .expect("an integer is a partition identity");
     db.vector_store_for_test()
@@ -538,7 +538,7 @@ fn a_reader_keeps_its_captured_count_and_route_across_a_threshold_crossing() {
             below,
         )
         .expect("search after eviction")
-        .rows;
+        .rows();
     assert_eq!(after_eviction, before_eviction);
 }
 
@@ -598,7 +598,7 @@ fn refused_flat_admissions(db: &Database, flat_partitions: usize) -> BTreeSet<&'
             Ok(outcome) => {
                 answered += 1;
                 assert_eq!(
-                    outcome.result.rows, baseline.result.rows,
+                    outcome.result.rows(), baseline.result.rows(),
                     "an admitted flat search gives the whole answer (memory {memory})"
                 );
                 assert_eq!(
@@ -628,8 +628,8 @@ fn refused_flat_admissions(db: &Database, flat_partitions: usize) -> BTreeSet<&'
     }
     assert!(answered > 0, "the sweep reaches an admitted answer");
     assert_eq!(
-        search(db, "INDEXED").result.rows,
-        baseline.result.rows,
+        search(db, "INDEXED").result.rows(),
+        baseline.result.rows(),
         "no refused search left partial state"
     );
     // A budget sweep reaches only the admission whose cumulative charge peaks
@@ -649,7 +649,7 @@ fn refused_flat_admissions(db: &Database, flat_partitions: usize) -> BTreeSet<&'
         contextdb_vector::mem::refuse_vector_admission_once_for_test("");
         match outcome {
             Ok(outcome) => assert_eq!(
-                outcome.result.rows, baseline.result.rows,
+                outcome.result.rows(), baseline.result.rows(),
                 "a route that never makes the {site} admission answers whole"
             ),
             Err(bounded::TestError::Refused(failure))
@@ -676,8 +676,8 @@ fn refused_flat_admissions(db: &Database, flat_partitions: usize) -> BTreeSet<&'
             "a refused {site} admission leaves no charge on the writer"
         );
         assert_eq!(
-            search(db, "INDEXED").result.rows,
-            baseline.result.rows,
+            search(db, "INDEXED").result.rows(),
+            baseline.result.rows(),
             "a refused {site} admission left no partial state"
         );
     }
@@ -738,7 +738,7 @@ fn an_explicit_zero_flat_threshold_is_declared_and_never_flat() {
     }
     let disclosure = indexed
         .result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route");
@@ -786,7 +786,7 @@ fn assert_explain_predicts_execution(db: &Database, filter: &str) {
     let executed = db
         .execute(&sql, &empty())
         .expect("the search executes")
-        .trace
+        .trace()
         .vector_search
         .expect("the executed search discloses its route");
     assert_eq!(
@@ -972,7 +972,7 @@ fn auto_over_declared_flat_partitions_does_no_more_work_than_exact() {
         auto.native_scores,
         exact.native_scores
     );
-    assert_eq!(auto.result.rows, exact.result.rows);
+    assert_eq!(auto.result.rows(), exact.result.rows());
 }
 
 fn declared_flat_below(db: &Database) -> Option<u32> {
@@ -1168,7 +1168,7 @@ fn a_flat_partition_with_growing_replaced_history_stays_exact_and_charged() {
             vec![(VectorSearchRoute::Exact, Some(FLAT_REASON.to_owned()))],
             "120 live rows stay flat after round {round}"
         );
-        assert_eq!(indexed.result.rows, exact.result.rows, "round {round}");
+        assert_eq!(indexed.result.rows(), exact.result.rows(), "round {round}");
         assert_eq!(
             indexed.native_scores, 120,
             "only the live rows are scored, however much history is retained (round {round})"
@@ -1191,7 +1191,7 @@ fn answer_at(db: &Database, mode: &str, snapshot: contextdb_core::SnapshotId) ->
         snapshot,
     )
     .expect("the snapshot search executes")
-    .rows
+    .rows()
 }
 
 #[test]
@@ -1279,7 +1279,7 @@ fn ids_at(db: &Database, mode: &str, snapshot: contextdb_core::SnapshotId) -> Ve
         snapshot,
     )
     .unwrap_or_else(|error| panic!("the {mode} search at {snapshot:?} executes: {error:?}"))
-    .rows
+    .rows()
     .into_iter()
     .map(|row| row[0].clone())
     .collect()

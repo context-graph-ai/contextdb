@@ -137,7 +137,7 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
 
 fn answer_ids(answer: &contextdb_engine::QueryResult) -> Vec<i64> {
     answer
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,
@@ -328,7 +328,7 @@ fn what_a_declared_search_breadth_buys() {
         let first = reader.execute(&indexed_sql, &params(&queries[0]));
         let cold_ms = cold.elapsed().as_secs_f64() * 1e3;
         let cold_note = match &first {
-            Ok(answer) => format!("rows={}", answer.rows.len()),
+            Ok(answer) => format!("rows={}", answer.rows().len()),
             Err(refusal) => format!("REFUSED {refusal:?}"),
         };
 

@@ -137,12 +137,12 @@ fn nearest_ids(
         )
         .unwrap_or_else(|error| panic!("search {table}.{column}: {error}"));
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id")
         .expect("the search projection contains id");
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -172,22 +172,22 @@ fn inspected_query_state(db: &Database, vector_index: &VectorIndexRef) -> String
         .execute("SHOW VECTOR_INDEXES", &empty())
         .expect("inspect vector route state without advancing it");
     let table = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "table")
         .unwrap();
     let column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "column")
         .unwrap();
     let query_state = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "query_state")
         .unwrap();
     result
-        .rows
+        .rows()
         .iter()
         .find_map(|row| match (&row[table], &row[column], &row[query_state]) {
             (Value::Text(table), Value::Text(column), Value::Text(state))
@@ -295,7 +295,7 @@ fn engine_owned_file_maintenance_publishes_a_durable_indexed_route_for_a_reopene
     let reopened_result = reader
         .execute(indexed_sql, &query)
         .expect("the reopened reader serves the durable indexed route");
-    assert_eq!(reopened_result.rows, writer_result.rows);
+    assert_eq!(reopened_result.rows(), writer_result.rows());
     assert!(
         {
             let seam_read_memory = reader
@@ -370,9 +370,9 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
     let primary_control = db
         .execute(auto_sql, &params(vec![("query", Value::Vector(axis(0)))]))
         .expect("AUTO executes by exact fallback before maintenance");
-    assert_eq!(primary_control.rows.len(), 10);
+    assert_eq!(primary_control.rows().len(), 10);
     assert_eq!(
-        primary_control.rows[0][0],
+        primary_control.rows()[0][0],
         Value::Uuid(Uuid::from_u128(10_000))
     );
     record_contract(
@@ -416,7 +416,7 @@ fn caller_driven_vector_indexes_are_built_and_maintained_only_by_maintenance() {
             &params(vec![("query", Value::Vector(axis(0)))]),
         )
         .expect("INDEXED execution uses the maintenance-published route");
-    assert_eq!(indexed_ready.rows.len(), 10);
+    assert_eq!(indexed_ready.rows().len(), 10);
     assert!(
         {
             let seam_read_memory = db

@@ -134,12 +134,12 @@ fn bounded_request(sql: &str, bound: HashMap<String, Value>) -> bounded::Bounded
 
 fn result_ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.ends_with(".id"))
         .expect("vector result projects its id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -217,13 +217,13 @@ fn search(db: &Database, scope: Uuid, axis: usize, mode: &str) {
             ]),
         )
         .unwrap_or_else(|error| panic!("{mode} selected-partition search failed: {error}"));
-    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows().len(), 3);
     let embedding = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "embedding" || column.ends_with(".embedding"))
         .expect("projected embedding column exists");
-    assert!(result.rows.iter().all(|row| {
+    assert!(result.rows().iter().all(|row| {
         matches!(row.get(embedding), Some(Value::Vector(vector)) if vector.len() == 32)
     }));
 }
@@ -453,8 +453,8 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
     let reloaded_new_exact = db
         .execute_at_snapshot(exact_sql, &query, new_snapshot)
         .expect("exact reread preserves the current replacement body");
-    assert_eq!(reloaded_old_exact.rows, old_exact.rows);
-    assert_eq!(reloaded_new_exact.rows, new_exact.rows);
+    assert_eq!(reloaded_old_exact.rows(), old_exact.rows());
+    assert_eq!(reloaded_new_exact.rows(), new_exact.rows());
     assert_eq!(
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
@@ -483,7 +483,7 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
             .execute(exact_sql, &query))
         .expect("EXACT streams stored bodies under the same candidate ceiling");
     let streamed_ledger = take_budget_ledger_for_test();
-    assert_eq!(streamed.rows, new_exact.rows);
+    assert_eq!(streamed.rows(), new_exact.rows());
     assert_streamed_body_charges(&streamed_ledger, 1200);
     assert_score_workspace(&streamed_ledger, true);
     let activity_before = db.__vector_passive_activity_counters_for_test();
@@ -513,7 +513,7 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
                     .expect("read the admitted trace observation")
             }
             .expect("ordinary indexed route publishes a trace");
-            assert_eq!(ordinary.rows, exact.rows);
+            assert_eq!(ordinary.rows(), exact.rows());
             assert_score_workspace(&ledger, true);
             let arm_after = db.__vector_passive_activity_counters_for_test();
             let loads = arm_after.raw_candidate_point_loads - arm_before.raw_candidate_point_loads;
@@ -565,7 +565,7 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
                     .expect("read the admitted trace observation")
             }
             .expect("bounded indexed route publishes a trace");
-            assert_eq!(bounded.result.rows, exact.rows);
+            assert_eq!(bounded.result.rows(), exact.rows());
             assert_score_workspace(&ledger, false);
             let arm_after = db.__vector_passive_activity_counters_for_test();
             let loads = arm_after.raw_candidate_point_loads - arm_before.raw_candidate_point_loads;
@@ -574,7 +574,7 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
             assert_eq!(arm_after.raw_candidate_point_body_bytes - arm_before.raw_candidate_point_body_bytes,
                 loads * bytes_per_f32_body as u64);
             assert_native_scores(&bounded_scores, &bounded_trace.final_row_ids, snapshot);
-            assert_eq!(bounded.result.rows, ordinary.rows);
+            assert_eq!(bounded.result.rows(), ordinary.rows());
             assert!(
                 bounded_trace.used_hnsw,
                 "bounded {mode} must use maintained graphs"
@@ -706,7 +706,7 @@ fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
     let exact_ledger = take_budget_ledger_for_test();
     assert_streamed_body_charges(&exact_ledger, 1200);
     assert_score_workspace(&exact_ledger, true);
-    assert_eq!(streamed_exact.rows, exact.rows);
+    assert_eq!(streamed_exact.rows(), exact.rows());
     watch_budget_ledger_for_test();
 
     let auto = db.read_session(ReadLimits { memory: QUERY_WORKSPACE_BYTES as u64, ..ReadLimits::default() }).unwrap()
@@ -736,7 +736,7 @@ fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
     let ownership = db.vector_memory_ownership_receipt_for_test();
     assert_eq!(ownership.raw_vector_bodies, 0);
     assert_eq!(ownership.temporary_workspace, 0);
-    assert_eq!(auto.rows, exact.rows, "the automatic route answers exactly");
+    assert_eq!(auto.rows(), exact.rows(), "the automatic route answers exactly");
     assert_eq!(
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
@@ -1195,18 +1195,18 @@ fn id_only_candidate_route_step_1_counter_and_trace() {
         "a covering candidate route must hand off identities without materializing stored rows"
     );
 
-    assert_eq!(result.trace.physical_plan, "IndexScan -> HNSWSearch");
-    assert_eq!(result.trace.index_used.as_deref(), Some("lang_idx"));
+    assert_eq!(result.trace().physical_plan, "IndexScan -> HNSWSearch");
+    assert_eq!(result.trace().index_used.as_deref(), Some("lang_idx"));
     assert!(
-        !result.trace.predicates_pushed.is_empty(),
+        !result.trace().predicates_pushed.is_empty(),
         "the id-only route must not construct a trace with predicates_pushed blanked"
     );
     assert!(
-        !result.trace.indexes_considered.is_empty(),
+        !result.trace().indexes_considered.is_empty(),
         "the id-only route must not construct a trace with indexes_considered blanked"
     );
     assert!(
-        result.trace.rows_examined > 0,
+        result.trace().rows_examined > 0,
         "an INDEXED filtered vector search must never report zero rows examined while real \
          posting work happened"
     );
@@ -1258,20 +1258,20 @@ fn composite_covering_index_supplies_vector_candidate_identities_without_row_bod
         .expect("the bounded composite-index route answers");
     let after = db.__candidate_derivation_counters_for_test();
 
-    assert_eq!(bounded.result.rows, expected.rows);
+    assert_eq!(bounded.result.rows(), expected.rows());
     assert_eq!(
         after - before,
         0,
         "a fully pushed composite candidate index must hand off identities without row bodies"
     );
     assert_eq!(
-        bounded.result.trace.index_used.as_deref(),
+        bounded.result.trace().index_used.as_deref(),
         Some("lang_scope_idx")
     );
     assert_eq!(
         bounded
             .result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .map(|column| column.as_ref())
@@ -1540,7 +1540,7 @@ fn nullable_single_column_lower_ranges_match_exact_in_both_index_directions() {
                     .expect("the directed indexed route answers");
                 let materialized = db.__candidate_derivation_counters_for_test() - before;
                 assert_eq!(
-                    indexed.result.rows, exact.rows,
+                    indexed.result.rows(), exact.rows(),
                     "{direction} {operator} must agree with the explicit exact oracle for {table}"
                 );
                 assert!(
@@ -1815,7 +1815,7 @@ fn auto_refuses_typed_when_the_exact_score_array_cannot_fit() {
     let auto_sql = "SELECT id FROM raw_residency_items WHERE lang = 'en' \
                     ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 3";
     let exact = db.execute(&auto_sql.replace("VECTOR AUTO", "VECTOR EXACT"), &query).unwrap();
-    assert_eq!(exact.rows.len(), 3);
+    assert_eq!(exact.rows().len(), 3);
     let ceiling = (LANG_PARTITIONS * LANG_ROWS_PER_PARTITION)
         * std::mem::size_of::<(RowId, f32)>() - 1;
     let writer = db.accountant().usage().used;
@@ -1824,10 +1824,10 @@ fn auto_refuses_typed_when_the_exact_score_array_cannot_fit() {
     request.limits.memory = ceiling as u64;
     let ordinary = db.read_session(request.limits).unwrap().execute(auto_sql, &query)
         .expect("the actual reader can stream top three below the obsolete full-array floor");
-    assert_eq!(ordinary.rows, exact.rows);
+    assert_eq!(ordinary.rows(), exact.rows());
     let bounded = bounded::execute(&db, &request)
         .expect("bounded execution uses the same actual reader ceiling");
-    assert_eq!(bounded.result.rows, exact.rows);
+    assert_eq!(bounded.result.rows(), exact.rows());
     request.limits.memory = 1;
     let refused = bounded::execute(&db, &request).unwrap_err();
     assert!(matches!(&refused, bounded::TestError::Refused(failure)
@@ -1835,7 +1835,7 @@ fn auto_refuses_typed_when_the_exact_score_array_cannot_fit() {
         && matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail)
             if detail.limit == ReadFailureLimit::Memory)), "actual reader workspace refusal: {refused:?}");
     request.limits.memory = ceiling as u64;
-    assert_eq!(bounded::execute(&db, &request).unwrap().result.rows, exact.rows,
+    assert_eq!(bounded::execute(&db, &request).unwrap().result.rows(), exact.rows(),
         "releasing the refused operation restores the same complete answer");
     let indexed_sql = auto_sql.replace("VECTOR AUTO", "VECTOR INDEXED");
     let indexed_error = db.execute(&indexed_sql, &query).unwrap_err();

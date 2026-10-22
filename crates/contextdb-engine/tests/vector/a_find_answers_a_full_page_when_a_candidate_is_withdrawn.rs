@@ -86,7 +86,7 @@ fn answer(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Vec<i64>
     bounded::execute(db, &request)
         .expect("the bounded read succeeds")
         .result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,

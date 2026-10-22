@@ -173,12 +173,12 @@ fn run(db: &Database, mode: &str, unlinked: &[u64]) -> Run {
 }
 
 fn ids(result: &QueryResult) -> Vec<Value> {
-    result.rows.iter().map(|row| row[0].clone()).collect()
+    result.rows().iter().map(|row| row[0].clone()).collect()
 }
 
 fn reasons(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<String>)> {
     result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route")
@@ -202,7 +202,7 @@ fn disconnected() -> Vec<(VectorSearchRoute, Option<String>)> {
 
 /// The nearest row of the exact answer, by its internal row id.
 fn nearest_row(db: &Database, exact: &QueryResult) -> u64 {
-    let Value::Uuid(nearest) = exact.rows[0][0].clone() else {
+    let Value::Uuid(nearest) = exact.rows()[0][0].clone() else {
         panic!("the answer carries UUID ids");
     };
     row_id(db, nearest.as_u128() as usize)
@@ -393,12 +393,12 @@ fn inspected(db: &Database, name: &str) -> String {
         .execute("SHOW VECTOR_PARTITIONS FOR gaps.embedding", &HashMap::new())
         .expect("inspect the partition");
     let position = shown
-        .columns
+        .columns()
         .iter()
         .position(|column| column == name)
-        .unwrap_or_else(|| panic!("SHOW VECTOR_PARTITIONS exposes {name}: {:?}", shown.columns));
-    assert_eq!(shown.rows.len(), 1, "one partition");
-    match &shown.rows[0][position] {
+        .unwrap_or_else(|| panic!("SHOW VECTOR_PARTITIONS exposes {name}: {:?}", shown.columns()));
+    assert_eq!(shown.rows().len(), 1, "one partition");
+    match &shown.rows()[0][position] {
         Value::Text(value) => value.clone(),
         value => panic!("{name} is text: {value:?}"),
     }
@@ -628,7 +628,7 @@ fn nearest_of_first_two_partitions(db: &Database) -> Vec<u64> {
                     ]),
                 )
                 .expect("exact nearest of one partition");
-            let Value::Uuid(id) = exact.rows[0][0].clone() else {
+            let Value::Uuid(id) = exact.rows()[0][0].clone() else {
                 panic!("UUID ids");
             };
             db.scan("gaps_p", db.snapshot())

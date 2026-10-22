@@ -84,7 +84,7 @@ fn assert_first_page_refusal(fixture: &Fixture) {
             }
             Ok(answer) => {
                 assert_eq!(
-                    answer.rows.len(),
+                    answer.rows().len(),
                     10,
                     "an admitted find answers a full page"
                 );
@@ -198,7 +198,7 @@ fn paged_find(selected: usize) -> (u64, u64, u64, u64) {
     let answer = with_paged_vector_observer(fills.clone(), || reader.execute(&sql, &params))
         .expect("paged indexed find answers");
     assert_eq!(
-        answer.rows.len(),
+        answer.rows().len(),
         10,
         "the indexed graph search answers a full result page"
     );
@@ -311,7 +311,7 @@ fn paged_find_charge_growth_tracks_filled_pages_not_present_pages() {
         let answer = with_paged_vector_observer(fills.clone(), || reader.execute(&sql, &params))
             .expect("find answers");
         assert_eq!(
-            answer.rows.len(),
+            answer.rows().len(),
             10,
             "the indexed graph search answers a full result page"
         );

@@ -307,7 +307,7 @@ fn statement(contexts: &[usize], query: Vec<f32>, mode: &str) -> (String, HashMa
 
 fn ids(result: &QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[0] {
             Value::Int64(id) => id,
@@ -365,7 +365,7 @@ fn check_route(
         let answer = answer.expect("the graph find answers");
         println!(
             "{route} {cell}: route={:?} receipts={receipts:?} answer={:?} exact={exact:?}",
-            answer.trace.vector_search,
+            answer.trace().vector_search,
             ids(&answer),
         );
         if receipts.len() != 1 {
@@ -378,7 +378,7 @@ fn check_route(
         }
         let receipt = receipts[0];
         let disclosed = answer
-            .trace
+            .trace()
             .vector_search
             .as_ref()
             .expect("executed route disclosure");

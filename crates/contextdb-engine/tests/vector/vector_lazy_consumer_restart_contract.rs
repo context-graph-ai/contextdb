@@ -89,12 +89,12 @@ fn reopen(path: &Path) -> Database {
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.rsplit('.').next() == Some("id"))
         .expect("query projects id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id) {
             Some(Value::Uuid(id)) => *id,

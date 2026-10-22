@@ -107,7 +107,7 @@ fn search_sql() -> &'static str {
 fn is_maintained_route(result: &QueryResult) -> bool {
     matches!(
         result
-            .trace
+            .trace()
             .vector_search
             .as_ref()
             .and_then(|disclosure| disclosure.route),
@@ -117,7 +117,7 @@ fn is_maintained_route(result: &QueryResult) -> bool {
 
 fn visited_work(result: &QueryResult) -> u64 {
     let disclosure = result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("every vector query reports its route disclosure");

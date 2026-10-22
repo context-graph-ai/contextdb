@@ -97,7 +97,7 @@ fn a_quantized_column_reads_the_same_warm_reopened_and_through_the_file() {
     let warm = database
         .execute(&select_sql(table), &HashMap::new())
         .expect("warm writer reads its own row");
-    let (warm_compact, warm_tiny) = read_vectors(&warm.rows);
+    let (warm_compact, warm_tiny) = read_vectors(&warm.rows());
 
     // The point of the pin: the warm answer is the STORED approximation, so
     // it is not the caller's original. Without this, the three-way agreement
@@ -119,7 +119,7 @@ fn a_quantized_column_reads_the_same_warm_reopened_and_through_the_file() {
     let after_restart = reopened
         .execute(&select_sql(table), &HashMap::new())
         .expect("reopened writer reads the row");
-    let (restart_compact, restart_tiny) = read_vectors(&after_restart.rows);
+    let (restart_compact, restart_tiny) = read_vectors(&after_restart.rows());
     assert_eq!(
         restart_compact, warm_compact,
         "an SQ8 column answers the same after a restart as it did warm"
@@ -138,7 +138,7 @@ fn a_quantized_column_reads_the_same_warm_reopened_and_through_the_file() {
     let direct = reader
         .execute(&select_sql(table), &HashMap::new())
         .unwrap_or_else(|error| panic!("direct reader reads the row: {error}"));
-    let (direct_compact, direct_tiny) = read_vectors(&direct.result.rows);
+    let (direct_compact, direct_tiny) = read_vectors(&direct.result.rows());
     assert_eq!(
         direct_compact, warm_compact,
         "an SQ8 column answers the same through the file as it did warm"

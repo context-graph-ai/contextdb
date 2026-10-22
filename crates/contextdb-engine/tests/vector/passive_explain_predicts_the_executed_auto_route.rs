@@ -135,7 +135,7 @@ fn assert_passive_predicts_executed(db: &Database, filter: Option<&str>) -> Vect
     let executed = db
         .execute(&sql, &empty())
         .expect("the AUTO search executes")
-        .trace
+        .trace()
         .vector_search
         .expect("the executed search discloses its route");
     assert_eq!(executed.route_evidence, VectorSearchRouteEvidence::Executed);

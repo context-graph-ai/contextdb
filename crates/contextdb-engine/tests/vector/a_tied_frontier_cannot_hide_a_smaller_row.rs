@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 fn ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.first() {
             Some(Value::Int64(id)) => *id,
@@ -131,7 +131,7 @@ fn a_tied_frontier_cannot_hide_a_smaller_row_on_either_reader_route() {
                 "owner {table}: expected {:?}, got {:?}; trace {:?}",
                 ids(&exact),
                 ids(&indexed),
-                indexed.trace.vector_search,
+                indexed.trace().vector_search,
             )),
             Err(error) => failures.push(format!("owner {table}: {error}")),
         }
@@ -154,7 +154,7 @@ fn a_tied_frontier_cannot_hide_a_smaller_row_on_either_reader_route() {
             Ok(indexed) => failures.push(format!(
                 "file {table}: got {:?}; trace {:?}",
                 ids(&indexed),
-                indexed.trace.vector_search,
+                indexed.trace().vector_search,
             )),
             Err(error) => failures.push(format!("file {table}: {error}")),
         }

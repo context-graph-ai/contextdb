@@ -43,7 +43,7 @@ fn query(db: &Database, scope: Option<i64>) {
         .map(|s| format!("WHERE scope = {s}"))
         .unwrap_or_default();
     let result = db.execute(&format!("SELECT id FROM items {filter} ORDER BY v <=> [1.0, 0.0, 0.0] USE VECTOR INDEXED LIMIT 3"), &HashMap::new()).unwrap();
-    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows().len(), 3);
 }
 #[test]
 fn declared_topology_changes_retained_graph_charge() {
@@ -98,7 +98,7 @@ fn in_memory_construction_leaves_same_partition_vector_writes_usable() {
             &HashMap::new(),
         )
         .expect("the committed vector is exact-searchable before construction resumes");
-    assert_eq!(visible.rows, vec![vec![Value::Int64(1000)]]);
+    assert_eq!(visible.rows(), vec![vec![Value::Int64(1000)]]);
 
     pause.release();
     let first = worker
@@ -115,7 +115,7 @@ fn in_memory_construction_leaves_same_partition_vector_writes_usable() {
             &HashMap::new(),
         )
         .expect("the replacement route includes the concurrent vector");
-    assert_eq!(indexed.rows, vec![vec![Value::Int64(1000)]]);
+    assert_eq!(indexed.rows(), vec![vec![Value::Int64(1000)]]);
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn in_memory_construction_leaves_new_partition_vector_writes_usable() {
             &HashMap::new(),
         )
         .expect("the new partition is exact-searchable before construction resumes");
-    assert_eq!(visible.rows, vec![vec![Value::Int64(1000)]]);
+    assert_eq!(visible.rows(), vec![vec![Value::Int64(1000)]]);
 
     pause.release();
     assert_eq!(
@@ -180,7 +180,7 @@ fn in_memory_construction_leaves_new_partition_vector_writes_usable() {
             &HashMap::new(),
         )
         .expect("the next maintenance wake publishes the new partition's route");
-    assert_eq!(indexed.rows, vec![vec![Value::Int64(1000)]]);
+    assert_eq!(indexed.rows(), vec![vec![Value::Int64(1000)]]);
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn in_memory_consolidation_keeps_an_active_old_snapshot_on_its_indexed_route() {
     assert_eq!(
         db.execute_at_snapshot(sql, &HashMap::new(), old_snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
 
@@ -231,7 +231,7 @@ fn in_memory_consolidation_keeps_an_active_old_snapshot_on_its_indexed_route() {
     assert_eq!(
         db.execute_at_snapshot(sql, &HashMap::new(), old_snapshot)
             .expect("consolidation retains the active snapshot's indexed route")
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
     drop(old_pin);
@@ -556,7 +556,7 @@ fn dropping_a_sampled_vector_column_does_not_abort_cycle_closing() {
     assert!(
         db.execute("SHOW VECTOR_INDEXES", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "failure recording cannot recreate the dropped vector identity"
     );
@@ -564,11 +564,11 @@ fn dropping_a_sampled_vector_column_does_not_abort_cycle_closing() {
 
 fn cell_text(result: &contextdb_engine::QueryResult, row: usize, column: &str) -> String {
     let pos = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == column)
         .unwrap();
-    match &result.rows[row][pos] {
+    match &result.rows()[row][pos] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text: {other:?}"),
     }
@@ -1007,7 +1007,7 @@ fn refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition() {
     let retained = db
         .execute("SHOW VECTOR_PARTITIONS FOR items.v", &HashMap::new())
         .unwrap();
-    assert_eq!(retained.rows.len(), 3, "the held snapshot pins scope 2");
+    assert_eq!(retained.rows().len(), 3, "the held snapshot pins scope 2");
     drop(held);
     db.clear_maintenance_cycle_stamp_for_test();
     assert!(
@@ -1033,7 +1033,7 @@ fn refused_partition_still_closes_the_cycle_and_retires_a_sibling_partition() {
         .execute("SHOW VECTOR_PARTITIONS FOR items.v", &HashMap::new())
         .unwrap();
     assert_eq!(
-        shown.rows.len(),
+        shown.rows().len(),
         2,
         "the empty scope-2 partition is retired"
     );
@@ -1102,7 +1102,7 @@ fn refused_cleanup_keeps_serving_under_writes_and_publishes_when_memory_returns(
             )
             .unwrap();
         let mut ids: Vec<i64> = result
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,

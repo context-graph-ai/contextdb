@@ -102,7 +102,7 @@ fn find(db: &Database, mode: &str, probe: u64) -> QueryResult {
 }
 
 fn ids(result: &QueryResult) -> Vec<Value> {
-    result.rows.iter().map(|row| row[0].clone()).collect()
+    result.rows().iter().map(|row| row[0].clone()).collect()
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn a_broad_filter_examines_rows_within_the_breadth() {
             let indexed = find(&db, "INDEXED", probe);
             let exact = find(&db, "EXACT", probe);
             let search = indexed
-                .trace
+                .trace()
                 .vector_search
                 .as_ref()
                 .expect("the INDEXED find discloses its route");
@@ -128,10 +128,10 @@ fn a_broad_filter_examines_rows_within_the_breadth() {
             // entries; the walk checks at most one row per point its budget
             // lets it evaluate; the rows the answer outputs are read once more.
             assert!(
-                indexed.trace.rows_examined <= budget + budget / 2 + LIMIT as u64,
+                indexed.trace().rows_examined <= budget + budget / 2 + LIMIT as u64,
                 "{label} probe {probe}: the find examined {} rows, past its walk budget of \
                  {budget}, half that again for its probe, and its {LIMIT} output rows, over {ROWS} rows",
-                indexed.trace.rows_examined
+                indexed.trace().rows_examined
             );
             let expected = ids(&exact);
             hits += ids(&indexed)

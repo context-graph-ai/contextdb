@@ -57,12 +57,12 @@ fn bounded_request(sql: &str, bound: HashMap<String, Value>) -> bounded::Bounded
 
 fn ids(result: &QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
         .expect("the vector projection has id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_column) {
             Some(Value::Uuid(id)) => *id,
@@ -73,15 +73,15 @@ fn ids(result: &QueryResult) -> Vec<Uuid> {
 
 fn column(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == name)
-        .unwrap_or_else(|| panic!("inspection omits {name}: {:?}", result.columns))
+        .unwrap_or_else(|| panic!("inspection omits {name}: {:?}", result.columns()))
 }
 
 fn value<'a>(result: &'a QueryResult, row: usize, name: &str) -> &'a Value {
     result
-        .rows
+        .rows()
         .get(row)
         .and_then(|row| row.get(column(result, name)))
         .unwrap_or_else(|| panic!("inspection omits row {row} field {name}: {result:?}"))
@@ -151,7 +151,7 @@ fn assert_current_indexed_control(db: &Database) {
     );
     let bounded = bounded::execute(db, &bounded_request(CONTROL_SQL, bound))
         .expect("current bounded reader reaches the same maintained INDEXED route");
-    assert_eq!(bounded.result.rows, ordinary.rows);
+    assert_eq!(bounded.result.rows(), ordinary.rows());
 
     let mut rust = SemanticQuery::new("resolver_control", "embedding", vec![1.0, 0.0, 0.0], 3);
     rust.search_mode = Some(VectorSearchMode::Indexed);
@@ -197,7 +197,7 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
         .execute("SHOW VECTOR_INDEXES", &empty())
         .expect("inspect the resolver's declared and effective summary");
     let f32 = indexes
-        .rows
+        .rows()
         .iter()
         .position(|row| {
             row[column(&indexes, "table")] == Value::Text("resolver_policy_docs".into())
@@ -205,12 +205,12 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
         })
         .expect("one F32 index summary row");
     let sq8 = indexes
-        .rows
+        .rows()
         .iter()
         .position(|row| row[column(&indexes, "column")] == Value::Text("sq8".into()))
         .expect("one SQ8 index summary row");
     let sq4 = indexes
-        .rows
+        .rows()
         .iter()
         .position(|row| row[column(&indexes, "column")] == Value::Text("sq4".into()))
         .expect("one SQ4 index summary row");
@@ -259,7 +259,7 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
         .expect("inspect silent compatibility defaults");
     for (name, threshold) in [("f32", 1_000_i64), ("sq8", 5_001), ("sq4", 5_001)] {
         let row = defaults
-            .rows
+            .rows()
             .iter()
             .position(|row| {
                 row[column(&defaults, "table")] == Value::Text("resolver_defaults".into())
@@ -332,7 +332,7 @@ fn declared_vector_policy_resolves_consistently_at_default_and_declared_boundari
     );
     let bounded = bounded::execute(&db, &bounded_request(sql, bound.clone()))
         .expect("bounded reader honors the declared F32 threshold");
-    assert_eq!(bounded.result.rows, ordinary.rows);
+    assert_eq!(bounded.result.rows(), ordinary.rows());
     assert!(!db.__debug_last_query_vector_used_hnsw_for_test());
     let rust = db
         .semantic_search(SemanticQuery::new(
@@ -513,7 +513,7 @@ fn assert_executed_default_boundary(
         db.__reset_last_query_vector_trace_for_test();
         let bounded = bounded::execute(db, &bounded_request(&sql, bound.clone()))
             .expect("bounded reader executes the same boundary search");
-        assert_eq!(bounded.result.rows, ordinary.rows);
+        assert_eq!(bounded.result.rows(), ordinary.rows());
         assert_eq!(
             db.__debug_last_query_vector_used_hnsw_for_test(),
             indexed,

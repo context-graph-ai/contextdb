@@ -232,7 +232,7 @@ fn seed(db: &Database) {
 
 fn ids(result: &QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[0] {
             Value::Int64(id) => id,

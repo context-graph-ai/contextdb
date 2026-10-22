@@ -98,7 +98,7 @@ fn searched_vector(database: &Database, order_by: &str, column: &str) -> Vec<f32
             &params(vec![("query", Value::Vector(first_vector()))]),
         )
         .expect("a vector search over the upserted rows is served");
-    match answered.rows.first().and_then(|row| row.first()) {
+    match answered.rows().first().and_then(|row| row.first()) {
         Some(Value::Vector(vector)) => vector.clone(),
         other => panic!(
             "a search answers {column} with a vector; it answered {other:?}, and a caller told \
@@ -176,7 +176,7 @@ fn an_updating_upsert_replaces_the_vector_and_never_leaves_the_old_one() {
         )
         .expect("a search from the replaced vector is served");
     assert_eq!(
-        nearest_to_old.rows.first().and_then(|row| row.first()),
+        nearest_to_old.rows().first().and_then(|row| row.first()),
         Some(&Value::Vector(new_vector)),
         "the replaced vector is gone from the index; a search from it finds only the new one, \
          not the {old_vector:?} it replaced"

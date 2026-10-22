@@ -66,7 +66,7 @@ fn a_tied_frontier_walk_diagnostic() {
             let (result, traces) = with_union_walk_traces(0, || db.execute(&sql, &params));
             let ids: Vec<_> = result
                 .expect("indexed page")
-                .rows
+                .rows()
                 .iter()
                 .map(|row| row[0].clone())
                 .collect();

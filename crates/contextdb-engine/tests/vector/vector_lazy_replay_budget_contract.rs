@@ -261,7 +261,7 @@ fn bounded_tail_result(db: &Database, limits: ReadLimits) {
     let result = bounded::execute(db, &request(limits))
         .expect("an adequately admitted bounded indexed read loads the saved route");
     assert_eq!(
-        result.result.rows,
+        result.result.rows(),
         vec![vec![Value::Uuid(Uuid::from_u128(TAIL_ID))]],
         "the first post-restart route must replay the committed journal suffix into its fresh tail"
     );

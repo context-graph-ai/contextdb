@@ -180,7 +180,7 @@ fn assert_indexed(db: &Database, id: usize, revision: usize) {
             &HashMap::from([("query".into(), Value::Vector(embedding(id, revision)))]),
         )
         .expect("the production indexed route remains usable");
-    assert_eq!(result.rows, vec![vec![Value::Int64(id as i64)]]);
+    assert_eq!(result.rows(), vec![vec![Value::Int64(id as i64)]]);
 }
 
 fn assert_published(db: &Database, report: contextdb_engine::MaintenanceReport) {
@@ -335,7 +335,7 @@ fn retained_versions_and_tombstones_admit_base_replacement_and_serve_old_graph()
         &HashMap::from([("query".into(), Value::Vector(embedding(0, 0)))]),
         old_snapshot,
     ).unwrap();
-    assert_eq!(old_answer.rows, vec![vec![Value::Int64(0)]]);
+    assert_eq!(old_answer.rows(), vec![vec![Value::Int64(0)]]);
     pause.release();
     let report = worker.join().unwrap().unwrap();
     assert_published(&db, report);
@@ -456,7 +456,7 @@ fn indexed_at_snapshot(db: &Database, snapshot: contextdb_core::SnapshotId, revi
         &HashMap::from([("query".into(), Value::Vector(embedding(63, revision)))]),
         snapshot,
     ).unwrap();
-    assert_eq!(answer.rows, vec![vec![Value::Int64(63)]]);
+    assert_eq!(answer.rows(), vec![vec![Value::Int64(63)]]);
 }
 
 #[test]

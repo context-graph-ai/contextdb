@@ -189,12 +189,12 @@ fn ranked_query_params() -> HashMap<String, Value> {
 
 fn result_ids(result: &contextdb_engine::QueryResult) -> Vec<Uuid> {
     let id_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "id" || name.rsplit('.').next() == Some("id"))
         .expect("the projection contains id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(id_idx) {
             Some(Value::Uuid(id)) => *id,

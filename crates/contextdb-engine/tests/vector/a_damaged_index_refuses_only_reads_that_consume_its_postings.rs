@@ -141,7 +141,7 @@ fn ids(
 ) -> contextdb_core::Result<Vec<i64>> {
     result.map(|result| {
         result
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,

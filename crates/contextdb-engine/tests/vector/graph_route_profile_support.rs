@@ -85,7 +85,7 @@ fn context_id(partition: usize) -> Uuid {
 
 fn result_ids(result: &QueryResult) -> Vec<i64> {
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id)] => *id,
@@ -143,7 +143,7 @@ fn execute_and_measure(
     });
     let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let disclosure = result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("profile query publishes vector disclosure");

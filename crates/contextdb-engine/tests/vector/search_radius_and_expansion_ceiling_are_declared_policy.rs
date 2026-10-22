@@ -103,7 +103,7 @@ fn search(db: &Database, mode: &str) -> (QueryResult, u64) {
 /// The disclosed (radius millionths, source, ceiling, source).
 fn disclosed(result: &QueryResult) -> (usize, String, usize, String) {
     let disclosure = result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route");
@@ -117,7 +117,7 @@ fn disclosed(result: &QueryResult) -> (usize, String, usize, String) {
 
 fn routes(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<String>)> {
     result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("the executed search discloses its route")
@@ -133,7 +133,7 @@ fn routes(result: &QueryResult) -> Vec<(VectorSearchRoute, Option<String>)> {
 }
 
 fn ids(result: &QueryResult) -> Vec<Value> {
-    result.rows.iter().map(|row| row[0].clone()).collect()
+    result.rows().iter().map(|row| row[0].clone()).collect()
 }
 
 fn refused_issue(db: &Database, sql: &str) -> Issue {

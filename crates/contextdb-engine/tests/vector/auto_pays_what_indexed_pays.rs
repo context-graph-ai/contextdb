@@ -217,11 +217,11 @@ fn execute(db: &Database, partitions: usize, mode: Option<&str>) -> Executed {
         bounded::BoundedReadRequest::new(sql, params, limits(), Arc::new(FrozenClock));
     request.probe = Some(counter.clone());
     let executed = bounded::execute(db, &request).expect("the bounded route arm succeeds");
-    let disclosure = executed.result.trace.vector_search.as_ref();
+    let disclosure = executed.result.trace().vector_search.as_ref();
     Executed {
-        rows: executed.result.rows.clone(),
+        rows: executed.result.rows().clone(),
         work_units: executed.telemetry.work_units,
-        rows_examined: executed.result.trace.rows_examined,
+        rows_examined: executed.result.trace().rows_examined,
         source_work: executed.telemetry.source_work.clone(),
         touches: counter.snapshot(),
         resolved_mode: disclosure.map(|disclosure| disclosure.resolved_mode),

@@ -186,9 +186,9 @@ fn single_context_search_radius_work_diagnostic() {
                     }
                     work.entry(mode).or_default().push(graph + native);
                     let overlap = result
-                        .rows
+                        .rows()
                         .iter()
-                        .filter(|row| exact.rows.contains(row))
+                        .filter(|row| exact.rows().contains(row))
                         .count();
                     *matched.entry(mode).or_default() += overlap as u64;
                     if overlap < 10 {

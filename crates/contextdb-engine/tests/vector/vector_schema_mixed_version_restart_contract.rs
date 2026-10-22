@@ -44,7 +44,7 @@ fn params(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> HashMap<Str
 
 fn text_column(result: QueryResult) -> Vec<String> {
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row.into_iter().next() {
             Some(Value::Text(value)) => value,
@@ -446,7 +446,7 @@ async fn newer_hub_restart_keeps_the_holdback_and_recovers_it_in_bounded_pages()
     let recovered = receiver
         .execute("SELECT id FROM partitioned_notes", &empty())
         .expect("held table and rows arrive");
-    assert_eq!(recovered.rows.len(), RECOVERY_ROWS);
+    assert_eq!(recovered.rows().len(), RECOVERY_ROWS);
     assert!(
         page_stats.content_pages.load(Ordering::SeqCst) >= 2,
         "a 501-row held image must be paged rather than buffered into one response"
@@ -546,7 +546,7 @@ async fn newer_edge_restart_keeps_private_progress_and_does_not_resend_healthy_h
     assert_eq!(
         hub.execute("SELECT id FROM partitioned_notes", &empty())
             .expect("held row arrives")
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -624,7 +624,7 @@ async fn a_lost_held_table_reply_requires_its_authenticated_echo_beside_the_olde
     assert_eq!(
         hub.execute("SELECT id FROM partitioned_notes", &empty())
             .expect("recovered row committed before its acknowledgement was lost")
-            .rows
+            .rows()
             .len(),
         1
     );

@@ -110,7 +110,7 @@ fn ids(db: &Database, mode: &str, filter: &str, query: &[f32], label: &str) -> V
         &HashMap::from([("query".into(), Value::Vector(query.to_vec()))]),
     )
     .unwrap_or_else(|error| panic!("{label}: the {mode} search [{filter}] answers: {error}"))
-    .rows
+    .rows()
     .into_iter()
     .map(|row| row[0].clone())
     .collect()

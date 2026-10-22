@@ -282,7 +282,7 @@ fn find(reader: &ReadSession, sql: &str, params: &HashMap<String, Value>) -> Mea
     drop(work);
     Measured {
         ids: answer
-            .rows
+            .rows()
             .iter()
             .map(|row| match row.first() {
                 Some(Value::Int64(id)) => *id,
@@ -399,7 +399,7 @@ fn a_row_value_list_selects_exactly_the_listed_pairs() {
                 .execute(&sql, &params)
                 .unwrap_or_else(|error| panic!("`{sql}` answers: {error:?}"));
             let ids = answer
-                .rows
+                .rows()
                 .iter()
                 .map(|row| match row.first() {
                     Some(Value::Int64(id)) => *id,
@@ -425,7 +425,7 @@ fn a_row_value_list_selects_exactly_the_listed_pairs() {
                 .execute(&sql, &params)
                 .unwrap_or_else(|error| panic!("`{sql}` answers on the reader: {error:?}"));
             let ids = answer
-                .rows
+                .rows()
                 .iter()
                 .map(|row| match row.first() {
                     Some(Value::Int64(id)) => *id,
