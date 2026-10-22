@@ -201,6 +201,7 @@ pub enum LocalTransportError {
 }
 
 impl LocalTransportError {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn into_admission_error(self) -> Result<contextdb_core::Error, Self> {
         match self {
             Self::OriginalAdmission(error) => Ok(error),

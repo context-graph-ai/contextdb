@@ -93,6 +93,7 @@ impl crate::persistence::ReadPersistenceImage {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_committed_image(
     parts: ReadPersistenceImageParts,
     memory_limit: Option<usize>,
@@ -166,6 +167,7 @@ fn build_committed_image(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn project_owned_image(
     database: &Database,
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -398,6 +400,7 @@ pub(crate) fn answer_encoded_for_test() {
 /// the transient copies its construction admitted are gone once it returns,
 /// the answer itself is not, and it stays charged for as long as its
 /// response is held.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn settle_answer_charge(
     charge: &crate::read_image_memory::ImageMemoryHandle,
     retained: usize,
@@ -437,6 +440,7 @@ pub(crate) fn project_change_state(
         .map_err(history_answer_error)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn project_loaded_change_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
@@ -543,6 +547,7 @@ pub(crate) fn project_sync_state(
     project_loaded_sync_state(database, checkpoint, charge).map_err(history_answer_error)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn project_loaded_sync_state(
     database: &Database,
     checkpoint: &dyn Fn() -> Result<()>,
@@ -754,6 +759,7 @@ fn project_scope_label(kind: &ScopeLabelKind) -> DirectScopeLabelKind {
 /// Price the concrete schema clone before making its first allocation. The
 /// DDL and type strings use counted writers, and transitions are inserted in
 /// sorted order under the existing native map node envelope.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn project_schema_funded(
     table: &str,
     meta: &contextdb_core::TableMeta,
@@ -1577,6 +1583,7 @@ fn write_vector_search_disclosure(
     bytes.optional_text(disclosure.budget_terminal.as_deref());
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn read_vector_search_disclosure(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<
@@ -1878,6 +1885,7 @@ pub(crate) fn write_metadata_body(
 /// The exact inverse of [`write_metadata_body`]: same order, same tags, same
 /// prefixes. Kept beside the writer so the two are read together and a field
 /// added to one is visibly missing from the other.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn read_metadata_body(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectMetadataBody, crate::read_contract::ReadEncodingError> {
@@ -1988,6 +1996,7 @@ fn invalid_metadata_payload() -> crate::read_contract::ReadEncodingError {
     crate::read_contract::ReadEncodingError::InvalidPayload
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn read_image_state(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectImageState, crate::read_contract::ReadEncodingError> {
@@ -2082,6 +2091,7 @@ fn read_image_state(
 /// The change log's own entries are written as their serde rendering, so they
 /// are read back the same way. A rendering that is not the type it sits in
 /// front of is an invalid payload, not an empty entry.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn read_rendered<T: serde::de::DeserializeOwned>(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<Vec<T>, crate::read_contract::ReadEncodingError> {
@@ -2108,6 +2118,7 @@ fn read_rendered<T: serde::de::DeserializeOwned>(
     Ok(values)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn read_labels_list(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<Vec<String>, crate::read_contract::ReadEncodingError> {
@@ -2119,6 +2130,7 @@ fn read_labels_list(
     Ok(labels)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn read_schema(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectSchema, crate::read_contract::ReadEncodingError> {
@@ -2366,6 +2378,7 @@ fn read_schema(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn read_events(
     bytes: &mut crate::read_contract::CanonicalReader<'_>,
 ) -> std::result::Result<DirectEventsStatus, crate::read_contract::ReadEncodingError> {
@@ -2720,6 +2733,7 @@ fn write_events(bytes: &mut crate::read_contract::CanonicalWriter, events: &Dire
 /// Every kind a live owner can answer is answered here in the same words the
 /// file route uses; the one kind it cannot is refused by name rather than
 /// answered emptily -- see [`project_metadata`] for the image's own version.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn project_metadata_from_database(
     database: &Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -2848,6 +2862,7 @@ pub(crate) fn image_state_is_a_file_question() -> Error {
 }
 
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn project_metadata(
     target: &dyn ReadExecutionTarget,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -3118,6 +3133,7 @@ fn admit_complete(
 }
 
 /// A walk's checkpoint: cancelled, or past its active time, it refuses.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn request_checkpoint(
     cancellation: &OwnerReadCancellation,
     clock: &dyn DeadlineClock,

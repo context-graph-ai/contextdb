@@ -12,6 +12,7 @@ pub struct EncodedReadBytes {
 }
 
 impl EncodedReadBytes {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn from_funded(
         bytes: Funded<Vec<u8>>,
         memory_ceiling: u64,

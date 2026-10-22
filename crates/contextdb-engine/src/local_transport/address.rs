@@ -6,6 +6,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 /// Resolve a store pathname and derive its fixed-length local-channel key.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn derive_channel_address(store_path: &Path) -> Result<ChannelAddress, LocalTransportError> {
     let resolved = std::fs::canonicalize(store_path)
         .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
@@ -26,6 +27,7 @@ pub fn opaque_channel_basename(address: ChannelAddress) -> String {
 
 /// Place one local channel below its validated runtime directory, never below
 /// the inspected store.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn channel_socket_path(
     runtime_directory: &Path,
     address: ChannelAddress,
@@ -69,6 +71,7 @@ pub struct ChannelKernelAddress {
 #[cfg(unix)]
 impl ChannelKernelAddress {
     /// Resolve the address to hand the kernel for a channel at this pathname.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn resolve(path: &Path) -> Result<Self, LocalTransportError> {
         if validate_socket_path_length(path).is_ok() {
             return Ok(Self {
@@ -93,6 +96,7 @@ impl ChannelKernelAddress {
     }
 
     #[cfg(target_os = "linux")]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn through_a_held_directory(path: &Path) -> Result<Self, LocalTransportError> {
         use std::os::fd::AsRawFd;
 
@@ -126,6 +130,7 @@ impl ChannelKernelAddress {
 }
 
 #[cfg(all(unix, target_os = "linux"))]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn split_channel_pathname(path: &Path) -> Result<(&Path, &std::ffi::OsStr), LocalTransportError> {
     let directory = path.parent().ok_or_else(|| {
         LocalTransportError::FilesystemInspection(

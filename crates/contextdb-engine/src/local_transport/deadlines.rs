@@ -183,6 +183,7 @@ impl ManualDeadlineClock {
 }
 
 impl DeadlineClock for ManualDeadlineClock {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_owned_wait(
         &self, deadline_ms: u64, owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<Option<contextdb_core::read_memory::ReadOwnedFuture<'_, ()>>> {
@@ -201,6 +202,7 @@ impl DeadlineClock for ManualDeadlineClock {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_native_source(
         &self,
         _standing: &contextdb_core::read_memory::ReadMemoryOwner,
@@ -544,6 +546,7 @@ impl contextdb_core::read_contract::NativeDeadlineSource for MonotonicNativeSour
 }
 
 impl DeadlineClock for MonotonicDeadlineClock {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_owned_wait(
         &self, deadline_ms: u64, owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<Option<contextdb_core::read_memory::ReadOwnedFuture<'_, ()>>> {
@@ -662,6 +665,7 @@ impl DeadlineClock for MonotonicDeadlineClock {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_native_source(
         &self,
         _standing: &contextdb_core::read_memory::ReadMemoryOwner,
@@ -926,6 +930,7 @@ deadline_operation!(drain_shutdown_with_deadline, ShutdownDrain);
 
 // Concrete source erasure preserves one allocation and its original invoice.
 #[cfg(target_os = "linux")]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn native_source_with<S: contextdb_core::read_contract::NativeDeadlineSource + 'static>(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     make: impl FnOnce() -> contextdb_core::Result<S>,
@@ -997,6 +1002,7 @@ impl Future for OperationDeadlineWait<'_> {
         }
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn wait_until_owned<'a>(
     clock: &'a dyn DeadlineClock, deadline_ms: u64,
     owner: &contextdb_core::read_memory::ReadMemoryOwner,
@@ -1007,6 +1013,7 @@ pub(crate) fn wait_until_owned<'a>(
         None => Ok(OperationDeadlineWait::Host(clock.wait_until(deadline_ms))),
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn owned_shared<T>(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     make: impl FnOnce() -> contextdb_core::Result<T>,
@@ -1169,6 +1176,7 @@ impl Drop for OwnedMonotonicWait<'_> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn deadline_operation_owned<'a, T: Send + 'a>(
     clock: &'a dyn DeadlineClock, stage: DeadlineStage, deadline_ms: u64,
     operation: LocalDeadlineOperation<'a, T>,
@@ -1192,6 +1200,7 @@ impl<T> Future for DeadlineInner<'_, T> {
         }
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn deadline_operation_funded<'a, T, F>(
     clock: &'a dyn DeadlineClock, stage: DeadlineStage, deadline_ms: u64,
     owner: contextdb_core::read_memory::ReadMemoryOwner, make: impl FnOnce() -> F,
@@ -1256,6 +1265,7 @@ where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> {
 /// Drive an admitted operation on the caller's existing thread. Engine clock
 /// waits contribute their earliest deadline; host waits retain their own wake.
 #[cfg(target_os = "linux")]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn drive_local<F, T>(
     future: F, clock: &Arc<dyn DeadlineClock>,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -1285,6 +1295,7 @@ where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
 }
 
 impl MonotonicDeadlineClock {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn legacy_owned_wait(
         &self, deadline_ms: u64, owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<Option<contextdb_core::read_memory::ReadOwnedFuture<'_, ()>>> {
@@ -1426,6 +1437,7 @@ pub(crate) struct OwnedClockDriver {
 }
 #[cfg(target_os = "linux")]
 impl MonotonicDeadlineClock {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn start_owned_driver(
         self: &Arc<Self>, owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<OwnedClockDriver> {

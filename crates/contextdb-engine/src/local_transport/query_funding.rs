@@ -14,6 +14,7 @@ pub(crate) struct Funded<T> {
 impl<T> Funded<T> {
     pub(crate) fn external(value: T) -> Self { Self { value, credit: None } }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn allocate(
         owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
         bytes: usize,
@@ -27,6 +28,7 @@ impl<T> Funded<T> {
         Ok(Self { value, credit })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn allocate_owned(
         owner: Option<ReadMemoryOwner>, bytes: usize, make: impl FnOnce() -> T,
     ) -> contextdb_core::Result<Self> {
@@ -76,6 +78,7 @@ impl<T> FundedVec<T> {
         // clear retains Vec capacity, so retain its invoice too.
         self.values.clear();
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn push(&mut self, value: T) -> contextdb_core::Result<()> {
         if self.values.len() == self.values.capacity() {
             let capacity = self.values.capacity().checked_mul(2)
@@ -98,6 +101,7 @@ impl<T> FundedVec<T> {
 }
 
 impl FundedVec<Funded<super::LocalResponse>> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn into_public(mut self) -> contextdb_core::Result<Vec<super::LocalResponse>> {
         let bytes = self.values.len().checked_mul(std::mem::size_of::<super::LocalResponse>())
             .ok_or_else(|| contextdb_core::Error::Other("query handoff size overflow".into()))?;
@@ -129,6 +133,7 @@ impl Drop for DecodeCredit {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     owner: &crate::read_image_memory::ImageMemoryHandle,
@@ -286,6 +291,7 @@ impl AcquiredQueryOwner {
     /// Prepay a surrounding keeper on the same genuine child. Its native
     /// invoice must not retain an Arc to the limiter stored inside that
     /// keeper. Seed the limiter with these already-debited bytes exactly once.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepay_control(&mut self, bytes: usize) -> contextdb_core::Result<ReadCredit> {
         let total = self.control_bytes.checked_add(bytes).ok_or_else(size_error)?;
         let credit = ReadCredit::try_new_owned(self.owner.clone(), bytes, "reader", "query_ingress",
@@ -302,6 +308,7 @@ impl AcquiredQueryOwner {
     }
 
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn acquired_owner(
     provider: &crate::vector_read_memory::ReadRequestProvider,
 ) -> contextdb_core::Result<AcquiredQueryOwner> {
@@ -317,6 +324,7 @@ pub(crate) fn acquired_owner(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn query_operation(
     acquired: AcquiredQueryOwner, limit: u64,
 ) -> contextdb_core::Result<QueryBudget> {
@@ -325,6 +333,7 @@ pub(crate) fn query_operation(
 
 /// The caller keeps the acquired capability outside this fallible constructor.
 /// Failure to construct the limiter is not failure to acquire its child.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn query_operation_retained(
     acquired: &AcquiredQueryOwner, limit: u64,
 ) -> contextdb_core::Result<QueryBudget> {
@@ -353,6 +362,7 @@ pub(crate) struct QueryMemory {
     memory: crate::read_image_memory::ImageMemoryHandle,
 }
 impl QueryMemory {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn new(limit: u64) -> contextdb_core::Result<Self> {
         let root = crate::vector_read_memory::DeclaredReadMemory::query_root(limit)?;
         let provider = crate::vector_read_memory::ReadRequestProvider::from(root.root.clone());
@@ -369,6 +379,7 @@ impl QueryMemory {
     }
     /// A new request limiter forwards to the genuine supplied connection/read
     /// owner. It creates no root, independent budget, or replacement ceiling.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_original_owner(parent: ReadMemoryOwner, limit: u64) -> contextdb_core::Result<Self> {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let bytes = ReadMemoryOwner::native_layout::<QueryOperationBudget, ReadCredit>().size();
@@ -429,6 +440,7 @@ struct RetainedQueryInvoice {
     _memory: QueryMemory,
 }
 impl QueryMemory {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn publish_result(self, result: crate::database::OwnedQueryResult)
         -> contextdb_core::Result<crate::QueryResult> {
         let budget = self.memory.reader_budget().expect("query image retains its reader");
@@ -462,6 +474,7 @@ struct RetainedCursorInvoice {
     _memory: QueryMemory,
 }
 impl QueryMemory {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn into_cursor_owner(
         self,
     ) -> contextdb_core::Result<(ReadMemoryOwner, crate::read_image_memory::ImageMemoryHandle)> {
@@ -507,9 +520,11 @@ fn query_limit_error(limit: usize) -> contextdb_core::Error {
 fn size_error() -> contextdb_core::Error {
     contextdb_core::Error::Other("query allocation size overflow".into())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn add(a: usize, b: usize) -> contextdb_core::Result<usize> {
     a.checked_add(b).ok_or_else(size_error)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn mul(a: usize, b: usize) -> contextdb_core::Result<usize> {
     a.checked_mul(b).ok_or_else(size_error)
 }
@@ -518,6 +533,7 @@ fn mul(a: usize, b: usize) -> contextdb_core::Result<usize> {
 /// twelve child links, the parent/index/length header and alignment padding.
 /// The occupancy lower bound (five entries outside the root) bounds ALL live
 /// nodes, including internal nodes. This does not change a consumer limit.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn tree_bytes<K, V>(len: usize) -> contextdb_core::Result<usize> {
     if len == 0 { return Ok(0); }
     let node = add(mul(11, add(std::mem::size_of::<K>(), std::mem::size_of::<V>())?)?,
@@ -527,6 +543,7 @@ pub(crate) fn tree_bytes<K, V>(len: usize) -> contextdb_core::Result<usize> {
 
 /// The private client clones only after admitting every destination buffer.
 /// Insert explicitly to avoid collect's hidden sorting Vec overlapping nodes.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn query_request(
     statement: &str,
     params: &std::collections::HashMap<String, contextdb_core::Value>,
@@ -554,6 +571,7 @@ pub(crate) fn query_request(
 /// Only the replacement table is new: parameter strings/values move with their
 /// original inbound custody. Both the old B-tree and the full new hash table
 /// coexist until the source iterator has physically destroyed every node.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn query_params(
     params: std::collections::BTreeMap<String, contextdb_core::Value>,
     owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -615,6 +633,7 @@ pub(crate) fn query_error(
 /// Admit only allocations made by the existing move conversion. Most error
 /// classes move Strings verbatim and need no scratch. The exceptional trees
 /// and formatted Unknown class receive their own pre-allocation invoice.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn error_conversion_bytes(
     document: &super::engine_answer::ReadChannelError,
 ) -> contextdb_core::Result<usize> {
@@ -629,6 +648,7 @@ pub(crate) fn error_conversion_bytes(
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn owner_failure_responses(
     error: crate::owner_read::OwnerReadScaffoldError,
     owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -657,6 +677,7 @@ pub(crate) fn owner_failure_responses(
     };
     one_response(response, owner)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn owner_diagnostic_response(
     error: &impl std::fmt::Display, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<Funded<Vec<super::LocalResponse>>> {
@@ -673,6 +694,7 @@ fn owner_diagnostic_response(
     one_response(Funded { value: super::LocalResponse::EngineFailure { failure: failure.value },
         credit: failure.credit }, owner)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn one_response(
     mut response: Funded<super::LocalResponse>, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<Funded<Vec<super::LocalResponse>>> {
@@ -688,6 +710,7 @@ fn one_response(
     Ok(output)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn owner_panic_responses(
     payload: &(dyn std::any::Any + Send), owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<Funded<Vec<super::LocalResponse>>> {

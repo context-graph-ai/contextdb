@@ -6,6 +6,7 @@ pub(crate) struct NativeCallerWake {
 }
 
 impl NativeCallerWake {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_new_owned(owner: ReadMemoryOwner) -> contextdb_core::Result<ReadShared<Self>> {
         let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
             owner, ReadShared::<Self>::layout().size(), "reader", "local_driver_wake",
@@ -14,6 +15,7 @@ impl NativeCallerWake {
             .map_err(contextdb_core::Error::NativeEngineOther)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn park_once(&self, timeout_ms: Option<u64>) -> contextdb_core::Result<()> {
         if self.ready.swap(0, Ordering::AcqRel) != 0 {
             return Ok(());
@@ -76,6 +78,7 @@ pub(crate) struct NativeCallerPark {
     pub(crate) wake: ReadShared<NativeCallerWake>,
 }
 impl NativeCallerPark {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_new(owner: ReadMemoryOwner) -> contextdb_core::Result<Self> {
         let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
             owner, ReadShared::<NativeCallerWake>::layout().size(),

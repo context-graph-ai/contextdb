@@ -39,6 +39,7 @@ pub(crate) struct RequestPrefix {
 }
 
 impl RequestPrefix {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn read(stream: &mut impl Read) -> Result<Self, LocalTransportError> {
         let mut length = [0; 4];
         stream.read_exact(&mut length).map_err(|_| {
@@ -69,6 +70,7 @@ impl RequestPrefix {
         Ok(result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn integer(&mut self, wire: &mut Wire<'_, impl Read>, width: usize)
         -> Result<u64, LocalTransportError>
     {
@@ -84,6 +86,7 @@ impl RequestPrefix {
         Ok(u64::from_le_bytes(value))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn complete(&self, stream: &mut impl Read, output: &mut [u8])
         -> Result<(), LocalTransportError>
     {
@@ -97,6 +100,7 @@ impl RequestPrefix {
     /// The payload was completed from this prefix. A typed decoder can have
     /// stopped on admission before reaching its end; replay only this frame's
     /// body through the same full validator used before body allocation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_completed_query(&self, payload: &[u8])
         -> Result<(), LocalTransportError>
     {
@@ -105,6 +109,7 @@ impl RequestPrefix {
         self.discard_query(&mut body)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn discard_query(&self, stream: &mut impl Read)
         -> Result<(), LocalTransportError>
     {

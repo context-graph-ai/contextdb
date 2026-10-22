@@ -46,6 +46,7 @@ struct ImageControlInvoice {
     _original: crate::memory_accounting::StoreAccountantHandle,
 }
 impl ImageControlInvoice {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit(original: crate::memory_accounting::StoreAccountantHandle, bytes: usize,
         open_residue: bool, subsystem: &'static str, operation: &'static str,
         hint: &'static str) -> Result<Self> {
@@ -216,6 +217,7 @@ impl ImageMemory {
     pub(crate) fn held_for_test(&self) -> usize { self.held.load(Ordering::SeqCst) }
 
     /// Pin output provenance before constructing an escaping container.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn preparation_original(
         &self,
     ) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
@@ -224,6 +226,7 @@ impl ImageMemory {
             .ok_or_else(|| Error::Other("posting outputs require a pinned writer image".into()))?
             .preparation_original()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn new(limit: Option<usize>) -> Result<ImageMemoryHandle> {
         let accountant = crate::memory_accounting::AccountantHandle::standalone(limit, true)?;
         Self::funded_for(accountant, "direct_read", "hydrate_owned_image",
@@ -252,11 +255,13 @@ impl ImageMemory {
     }
     /// A writer/unscoped decoder keeps the same original accountant and role;
     /// its independent control invoice is settled after native physical free.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn funded_for(accountant: crate::memory_accounting::AccountantHandle,
         subsystem: &'static str, operation: &'static str, hint: &'static str)
         -> Result<ImageMemoryHandle> {
         Self::funded_writer_payload(Self::writer_payload(accountant, subsystem, operation, hint), false)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn funded_for_original(original: crate::memory_accounting::StoreAccountantHandle,
         subsystem: &'static str, operation: &'static str, hint: &'static str)
         -> Result<ImageMemoryHandle> {
@@ -271,6 +276,7 @@ impl ImageMemory {
         }
         Self::funded_writer_payload(Self::original_payload(original, subsystem, operation, hint), false)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn funded_writer_payload(mut payload: Self, open_residue: bool) -> Result<ImageMemoryHandle> {
         let original = payload._writer_custody.clone().unwrap_or_else(||
             crate::memory_accounting::StoreAccountantHandle::from_original_nonwriter(&payload.accountant));
@@ -284,6 +290,7 @@ impl ImageMemory {
     /// Direct image controls and every later accountant allocation use the
     /// already acquired original reader. The accountant counter is a mirror,
     /// not an additional allowance or a second source of credit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn new_direct_reader(
         limit: Option<usize>, original: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<ImageMemoryHandle> {
@@ -419,6 +426,7 @@ impl ImageMemory {
     /// The original fixed invoice is moved into the native allocation.
     /// Each per-call native image keeps its own invoice through all TLS and
     /// escaping aliases, independently of the private slot's lifetime.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn query_vector_per_call_prepaid(
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
@@ -446,6 +454,7 @@ impl ImageMemory {
     /// Candidate codec calls retain the already-funded query owner in place.
     /// The loader's original window covers all adopted buffers until scoring
     /// destroys them; ordinary calls keep their existing per-call owners.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_vector_body_decode<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
         let Ok(owner) = active_owner() else {
             let _scope = Self::enter_decode_call()?;
@@ -470,6 +479,7 @@ impl ImageMemory {
 
     /// Admit the exact native control layout before allocation. Its original
     /// invoice survives payload destruction and the last physical block free.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn admitted_reader_for(
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
@@ -481,6 +491,7 @@ impl ImageMemory {
     }
     /// Private query supplier. The typed native handle retains its original
     /// control invoice through every clone; no raw image Arc escapes it.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn query_reader_for(
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
@@ -506,6 +517,7 @@ impl ImageMemory {
             _writer_custody: None,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_reader_with_factory<I: Send + Sync + 'static>(
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
@@ -516,6 +528,7 @@ impl ImageMemory {
         Self::native_reader_with_checkpoint(accountant, reader_budget,
             subsystem, operation, hint, factory, None)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn native_reader_with_checkpoint<I: Send + Sync + 'static>(
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
@@ -556,6 +569,7 @@ impl ImageMemory {
 
     /// A fallible operation bridge funded by the same declared read child.
     /// The exact native control is admitted before creating the scope owner.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn operation_reader(
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
@@ -569,6 +583,7 @@ impl ImageMemory {
     /// Partition construction streams temporary decodes on the operation's
     /// already supplied capability. Each call has an admitted native owner;
     /// completing one call releases its payload before the next begins.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn operation_reader_per_call(
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
@@ -578,6 +593,7 @@ impl ImageMemory {
             "Raise MEMORY_LIMIT before inspecting this maintained route.")
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn operation_reader_per_call_for(
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
@@ -598,6 +614,7 @@ impl ImageMemory {
 
     /// Actual write-side decoding borrows the existing writer accountant;
     /// the operation owner holds and releases only its own admitted payloads.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn operation_writer(
         accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<ImageMemoryHandle> {
@@ -617,6 +634,7 @@ impl ImageMemory {
 
     /// Each call keeps its own image; the shared prepaid-output counter also
     /// owns an independent exact original invoice through its final free.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn operation_writer_per_call(
         accountant: crate::memory_accounting::AccountantHandle,
         prepaid_output_bytes: usize,
@@ -681,6 +699,7 @@ impl ImageMemory {
 
     /// A standalone call uses the engine's default open ceiling and keeps
     /// its accountant private, outside the registered Database writer domain.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn default_decode_accountant() -> Result<crate::memory_accounting::AccountantHandle> {
         if let Ok(owner) = active_owner() { return Ok(owner.accountant.clone()); }
         let limit = crate::read_session::DatabaseOpenOptions::default().memory_limit;
@@ -688,6 +707,7 @@ impl ImageMemory {
     }
 
     /// Reuse an operation's owner; otherwise admit a fresh call-local owner.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn enter_decode_call() -> Result<ImageMemoryScope> {
         if let Ok(owner) = active_owner() {
             return owner.enter_call();
@@ -697,6 +717,7 @@ impl ImageMemory {
         Self::enter_writer_operation(Self::default_decode_accountant()?)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn enter_writer_operation(
         accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<ImageMemoryScope> {
@@ -711,6 +732,7 @@ impl ImageMemory {
     /// A boxed source window's control credit can survive its payload. Keep
     /// the original explicit reader funder, or a counted writer adapter, for
     /// that escaping credit instead of borrowing the payload's source epoch.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn source_box_budget(
         &self,
     ) -> Result<ReadMemoryOwner> {
@@ -725,6 +747,7 @@ impl ImageMemory {
 
     /// Diagnostic preparation uses the existing original native writer helper,
     /// or the already captured reader. It never acquires another read request.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn diagnostic_budget(&self) -> Result<ReadMemoryOwner> {
         if let Some(reader) = &self.reader_budget { return Ok(reader.clone()); }
         match &self._writer_custody {
@@ -747,6 +770,7 @@ impl ImageMemory {
         Ok(crate::memory_accounting::ControlCredit::from_admitted(&self.accountant, bytes))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         let _sample = ImageSample(self);
@@ -781,6 +805,7 @@ impl ImageMemory {
     }
     /// The direct source's existing fixed reservation adopts a concrete
     /// control owner without refunding or admitting those bytes again.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn detach_direct_source_credit(
         &self,
         bytes: usize,
@@ -805,6 +830,7 @@ impl ImageMemory {
     }
 
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_funding(&self, bytes: usize) -> Result<()> {
         match &self.reader_budget {
             Some(budget) => budget.try_reserve(bytes, self.subsystem, self.operation, self.hint),
@@ -823,6 +849,7 @@ impl ImageMemory {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn adopt_reader_credit<B: Clone + Into<ReadMemoryOwner>>(
         &self,
         budget: &B,
@@ -858,6 +885,7 @@ impl ImageMemory {
 
     /// Move prepaid payload funding into its next owner. The native image
     /// and Arc controls remain funded until this image itself drops.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn take_retained_credit(
         &self,
         bytes: usize,
@@ -1172,6 +1200,7 @@ pub(crate) struct QueryImageCharge {
 impl QueryAnswerCharge {
     /// Admit and allocate the retention node BEFORE execution. A nested
     /// answer's original charge moves into it without a refund or new debit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn execute_with_image(
         image: crate::local_transport::query_funding::Funded<crate::read_image_memory::ImageMemoryHandle>,
         run: impl FnOnce(&crate::read_image_memory::ImageMemoryHandle) -> Result<crate::database::OwnedQueryResult>,
@@ -1197,6 +1226,7 @@ impl QueryAnswerCharge {
     }
     // The receiver's original external keeper moves into the result owner.
     pub(crate) fn holding(image: crate::read_image_memory::ImageMemoryHandle) -> Self { Self::Receiver(image) }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn holding_reader(reader: contextdb_core::read_memory::ReadCredit) -> Result<Self> {
         Ok(Self::Reader(reader))
     }
@@ -1237,6 +1267,7 @@ impl AnswerCharge {
 
     /// Consume the answer's existing credit. The shared credit allocation is
     /// admitted before allocation and remains owned by every answer clone.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn holding_reader(
         mut credit: contextdb_core::read_memory::ReadCredit,
     ) -> Result<Self> {
@@ -1472,6 +1503,7 @@ impl Drop for ImageMemoryScope {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn active_owner() -> Result<crate::read_image_memory::ImageMemoryHandle> {
     ACTIVE
         .with(|active| {
@@ -1512,6 +1544,7 @@ pub(crate) fn current_reader_budget()
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn reserve(bytes: usize) -> Result<()> {
     active_owner()?.reserve(bytes)
 }
@@ -1519,6 +1552,7 @@ pub(crate) fn reserve(bytes: usize) -> Result<()> {
 /// Admit a decoded value the caller keeps. A caller that already admitted
 /// its kept outputs (`operation_writer_per_call`) has that credit adopted;
 /// otherwise the active owner is charged, as for any other admission.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn reserve_output(bytes: usize) -> Result<()> {
     let owner = active_owner()?;
     if adopt_candidate_decode(&owner, bytes) || owner.adopt_prepaid_output(bytes) {
@@ -1545,6 +1579,7 @@ thread_local! {
     static EXACT_MAP_STRINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 pub(crate) fn with_exact_map<K, V, T>(body: impl FnOnce() -> T) -> T {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn quote<K, V>(len: usize) -> Result<usize> {
         crate::memory_accounting::native_map_plan::<K, V>(len).map(|plan|
             plan.layout.size().saturating_add(if len == 0 { 0 } else { 2 * std::mem::size_of::<usize>() }))
@@ -1824,6 +1859,7 @@ fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
     }
     Ok(())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize)> {
     decode_with_control(bytes, std::mem::size_of::<T>()
         .checked_mul(4).and_then(|bytes| bytes.checked_add(128))
@@ -1833,9 +1869,11 @@ pub(crate) fn decode<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize)
 /// Fixed-layout codecs with exact buffer visitors have no heap parser/control
 /// object: their serde seed and bincode reader are stack values. Their one
 /// destination, strings and nested payloads still admit before allocation.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode_exact_buffers<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize)> {
     decode_with_control(bytes, 0)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_with_control<T: de::DeserializeOwned>(bytes: &[u8], control: usize) -> Result<(T, usize)> {
     #[cfg(test)]
     let _capture_decode = crate::memory_accounting::compaction_admission_capture::Phase::enter(
@@ -1876,6 +1914,7 @@ fn decode_with_control<T: de::DeserializeOwned>(bytes: &[u8], control: usize) ->
 /// One rendered metadata record uses the same admitted seed and JSON owner
 /// as binary records. The native outer parser's scratch/lexical work is a
 /// record-local conservative transient, paid before parser construction.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode_json<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let _decode_scope = ImageMemory::enter_decode_call()?;
     let owner = active_owner()?;
@@ -2525,6 +2564,7 @@ pub(crate) enum RowReadAdmission<'a> {
 }
 
 impl RowReadAdmission<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retain_into_image(self, owner: &ImageMemory) -> Result<()> {
         match self {
             Self::Copy(bytes) => owner.reserve(bytes),
@@ -2549,6 +2589,7 @@ impl RowReadAdmission<'_> {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retain_into(
         self,
         credit: &mut contextdb_core::read_memory::ReadCredit,
@@ -2566,6 +2607,7 @@ impl RowReadAdmission<'_> {
 
 
 impl ImageMemoryHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn enter_call(&self) -> Result<ImageMemoryScope> {
         if CANDIDATE_DECODE.with(|slot| slot.get()).is_some_and(|credit|
             credit.decoding && candidate_reader_matches(self, credit)) {
@@ -2611,6 +2653,7 @@ impl ImageMemoryHandle {
 
     /// Admit the independent adapter control, then detach the caller's exact
     /// prepaid payload credit without refunding or admitting that payload again.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_copy(&self, prepaid_bytes: usize) -> Result<ImageVectorCopy> {
         #[cfg(any(test, feature = "test-seams"))]
         let _sample = ImageSample(self);
@@ -2642,6 +2685,7 @@ impl ImageMemoryHandle {
 
     /// Decode under this already funded image owner. Any admission failure
     /// remains the shared typed refusal instead of becoming a codec error.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn decode_msgpack<T: de::DeserializeOwned>(
         &self,
         bytes: &[u8],
@@ -2682,13 +2726,16 @@ impl ImageMemoryHandle {
     /// A decoded row transferred directly into a detached write projection
     /// is a staged write copy. It keeps the same preallocation funder and
     /// receipt shape while naming that copy's admission at the payload boundary.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn staged_row_copy_owner(&self) -> Result<ImageMemoryHandle> {
         self.row_owner_for("sync", "stage_received_unit_row_image",
             "Raise MEMORY_LIMIT to stage this received row copy.")
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_owner(&self) -> Result<ImageMemoryHandle> {
         self.row_owner_for(self.subsystem, self.operation, self.hint)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_owner_for(&self, subsystem: &'static str,
         operation: &'static str, hint: &'static str) -> Result<ImageMemoryHandle> {
         if let Self::Native(_) = self {

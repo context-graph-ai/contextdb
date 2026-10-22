@@ -17,6 +17,7 @@ pub(super) struct ControlWeak<T> {
     invoice: ReadShared<ReadCredit>,
 }
 impl<T> ControlArc<T> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn arc_layout() -> Result<std::alloc::Layout> {
         // Conditional on the pinned compiler's std Arc implementation: its
         // repr(C) header has two atomic usize counts followed by T. This is
@@ -27,17 +28,22 @@ impl<T> ControlArc<T> {
             .map(|(layout, _)| layout.pad_to_align())
             .map_err(|_| Error::Other("request control layout overflow".into()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn arc_bytes() -> Result<usize> { Self::arc_layout().map(|layout| layout.size()) }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn control_bytes() -> Result<usize> {
         Self::arc_bytes()?.checked_add(ReadShared::<ReadCredit>::layout().size())
             .ok_or_else(|| Error::Other("request control layout overflow".into()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn control_bytes_for(_: &T) -> Result<usize> { Self::control_bytes() }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn admit(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<ReadShared<ReadCredit>> {
         let owner = owner.into();
 
         Self::admit_owned(contextdb_core::read_memory::ReadMemoryOwner::from(owner))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn admit_owned(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>)
         -> Result<ReadShared<ReadCredit>> {
         let owner = owner.into();
@@ -58,6 +64,7 @@ impl<T> ControlArc<T> {
         Self { value: Arc::new(value), invoice }
     }
     pub(super) fn original_invoice(&self) -> ReadShared<ReadCredit> { self.invoice.clone() }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_new(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>, value: T) -> Result<Self> {
         let owner = owner.into();
 
@@ -65,6 +72,7 @@ impl<T> ControlArc<T> {
         let value = Arc::new(value);
         Ok(Self { value, invoice })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_new_cyclic(
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         make: impl FnOnce(&ControlWeak<T>) -> T,
@@ -122,13 +130,16 @@ pub(super) struct QueryVectorDecode {
     memory: Funded<crate::read_image_memory::ImageMemoryHandle>,
 }
 impl QueryVectorDecode {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn accountant_bytes() -> Result<usize> {
         crate::memory_accounting::AccountantHandle::reader_control_bytes()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn fixed_bytes() -> Result<usize> {
         Self::accountant_bytes()?.checked_add(ImageMemory::admitted_control_bytes())
             .ok_or_else(|| Error::Other("request decode control overflow".into()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn from_prepaid(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>, mut credit: ReadCredit)
         -> Result<Self>
     {
@@ -199,11 +210,13 @@ impl Drop for NativeKernelBudget {
     }
 }
 impl NativeKernelBudget {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_from_operation(operation: &crate::owner_read::NativeReadRequest)
         -> Result<ControlArc<Self>> {
         Self::try_from_owner(operation.owner())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_from_child(child: crate::vector_read_memory::NativeReadChildReceipt)
         -> Result<ControlArc<Self>> {
         Self::try_from_owner(child.into_owner())
@@ -211,6 +224,7 @@ impl NativeKernelBudget {
 
     // Only the native request and sealed native-child doors above reach this
     // constructor; arbitrary legacy providers cannot acquire native provenance.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_from_owner(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>)
         -> Result<ControlArc<Self>> {
         let owner = owner.into();

@@ -23,6 +23,7 @@ struct GroupedShape {
 }
 
 impl GroupedShape {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn resolve(
         table: &str,
         alias: Option<&str>,
@@ -192,6 +193,7 @@ fn unmaintained_refusal(table: &str, meta: &TableMeta, shape: &GroupedShape) -> 
 /// The one exact leading prefix the pins name, in the list's own directions,
 /// or `None` when they name none: a pin that matches nothing, a value that
 /// cannot be the column's type, an unbound parameter, two pins on one column.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn pinned_prefix(
     db: &dyn ReadExecutionTarget,
     table: &str,
@@ -253,6 +255,7 @@ fn pinned_prefix(
 /// Whether this read may answer from stored counts at all. They count every
 /// committed row, so a reader whose rows are filtered per reader, or a
 /// transaction that has staged rows of this table, needs the rows themselves.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn stored_counts_answer(
     db: &dyn ReadExecutionTarget,
     table: &str,
@@ -273,6 +276,7 @@ fn stored_counts_answer(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn key_bytes(key: &IndexKey) -> std::result::Result<usize, BoundedExecutionError> {
     let mut bytes = checked_size_mul(
         key.capacity(),
@@ -307,6 +311,7 @@ fn output_columns(columns: &[ProjectColumn]) -> Vec<String> {
 
 /// One output row per group, in the declared key order, each charged to the
 /// request before its values are cloned and carried by the row from there.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn group_rows(
     groups: impl ExactSizeIterator<Item = (IndexKey, u64)>,
     list: &[(String, contextdb_core::SortDirection)],
@@ -382,6 +387,7 @@ fn group_rows(
 /// Serve the grouped count from the stored counts, or `None` when this read
 /// cannot reach them.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn served_groups(
     database: &crate::database::Database,
     table: &str,
@@ -452,6 +458,7 @@ fn served_groups(
 /// Count the same groups from the rows the ordinary scan admits, charged per
 /// group, and say on the trace that the declared count was not served.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn counted_groups(
     db: &dyn ReadExecutionTarget,
     table: &str,
@@ -550,6 +557,7 @@ fn counted_groups(
 /// Answer a grouped `COUNT(*)` at construction: served from stored counts,
 /// counted exactly from the rows, or refused.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn build_grouped_count(
     db: &dyn ReadExecutionTarget,
     input: &PhysicalPlan,
@@ -615,6 +623,7 @@ pub(super) fn build_grouped_count(
 }
 
 /// What a planned GROUP BY column list holds.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn group_by_capacity_bytes(
     group_by: &Vec<ColumnRef>,
 ) -> std::result::Result<usize, BoundedExecutionError> {

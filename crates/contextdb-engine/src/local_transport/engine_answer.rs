@@ -1205,6 +1205,7 @@ impl From<ReadChannelError> for contextdb_core::Error {
 
 /// The request parser selects mutually exclusive conversion destinations.
 /// Price the tree OR invalid-UUID diagnostic, never their nonexistent overlap.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn query_context_conversion_bytes(
     requested: &str, allowed: usize,
 ) -> contextdb_core::Result<usize> {
@@ -1219,6 +1220,7 @@ pub(crate) fn query_context_conversion_bytes(
 
 /// Ordinary queries preserve their decoder's ORIGINAL invoice through a move
 /// conversion. The special cases avoid collect/format replacement scratch.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn convert_query_error(
     document: super::query_funding::Funded<ReadChannelError>,
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -1266,6 +1268,7 @@ pub(crate) const BLOB_SOURCE_REFUSAL_MAX_BYTES: usize = 4096;
 
 /// Encode the existing read-channel error grammar directly from borrowed
 /// source fields. No intermediate owned error document or field copy exists.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encode_read_error_into_slice(
     error: &contextdb_core::Error, output: &mut [u8],
 ) -> Result<usize, super::LocalTransportError> {
@@ -1275,6 +1278,7 @@ pub(crate) fn encode_read_error_into_slice(
 
 /// The same borrowed field writer also serves ordinary queries, whose existing
 /// frame ceiling is the only wire cap. No blob cap is imposed on a query.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encode_query_error_funded(
     error: &contextdb_core::Error,
     owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1299,6 +1303,7 @@ pub(crate) fn encode_query_error_funded(
     Ok(output)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn write_read_error<W: std::io::Write>(
     error: &contextdb_core::Error, output: &mut W,
 ) -> Result<usize, super::LocalTransportError> {
@@ -1306,6 +1311,7 @@ pub(super) fn write_read_error<W: std::io::Write>(
     use contextdb_core::Error as E;
     struct Sink<'a, W> { output: &'a mut W, offset: usize }
     impl<W: std::io::Write> Sink<'_, W> {
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), LocalTransportError> {
             let written = bincode::serde::encode_into_std_write(value, &mut *self.output,
                 bincode::config::standard())
@@ -1314,6 +1320,7 @@ pub(super) fn write_read_error<W: std::io::Write>(
                 .ok_or(LocalTransportError::Payload(PayloadViolation::Malformed))?;
             Ok(())
         }
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn display(&mut self, value: impl fmt::Display) -> Result<(), LocalTransportError> {
             struct Count(usize);
             impl fmt::Write for Count {

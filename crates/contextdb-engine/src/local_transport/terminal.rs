@@ -12,6 +12,7 @@ impl Write for Count {
     }
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn field<T: serde::Serialize + ?Sized>(value: &T, mut out: &mut dyn Write)
     -> Result<usize, LocalTransportError>
 {
@@ -19,6 +20,7 @@ fn field<T: serde::Serialize + ?Sized>(value: &T, mut out: &mut dyn Write)
         .map_err(|_| invalid_channel_data())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn write_frame(
     output: &mut impl Write,
     body: impl Fn(&mut dyn Write) -> Result<(), LocalTransportError>,
@@ -32,6 +34,7 @@ fn write_frame(
     body(output).map_err(|_| owner_disconnected())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn write_query_refusal(
     output: &mut impl Write, failure: &contextdb_core::read_contract::ReadFailure,
 ) -> Result<(), LocalTransportError> {
@@ -40,6 +43,7 @@ pub(crate) fn write_query_refusal(
     write_frame(output, |out| { field(&(9_u32, failure), out)?; Ok(()) })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn write_document(
     output: &mut impl Write,
     document: impl Fn(&mut dyn Write) -> Result<(), LocalTransportError>,
@@ -53,6 +57,7 @@ fn write_document(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn write_query_error(
     output: &mut impl Write, error: &contextdb_core::Error,
 ) -> Result<(), LocalTransportError> {
@@ -61,6 +66,7 @@ pub(crate) fn write_query_error(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn write_query_diagnostic(
     output: &mut impl Write, value: &impl std::fmt::Display,
 ) -> Result<(), LocalTransportError> {

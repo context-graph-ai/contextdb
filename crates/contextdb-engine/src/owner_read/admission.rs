@@ -23,6 +23,7 @@ pub struct OwnerAdmission {
 }
 
 impl OwnerAdmission {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new(limits: OwnerReadLimits) -> OwnerReadScaffoldResult<Arc<Self>> {
         limits.validate()?;
         Ok(Arc::new(Self {
@@ -34,6 +35,7 @@ impl OwnerAdmission {
     }
 
     /// Compute effective limits only through the shared field-by-field seam.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn effective_limits(
         requested: ReadLimits,
         owner: OwnerReadLimits,
@@ -59,6 +61,7 @@ impl OwnerAdmission {
     /// Attempt one non-blocking acquisition after authentication and effective
     /// limit calculation. A closed gate returns `OwnerNotServing`; an open gate
     /// with no free slot returns the existing typed `OwnerAtCapacity` refusal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_acquire(
         self: &Arc<Self>,
         effective_limits: ReadLimits,
@@ -67,6 +70,7 @@ impl OwnerAdmission {
         self.try_acquire_with_post_reservation(effective_limits, cancellation, || {})
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_acquire_with_post_reservation(
         self: &Arc<Self>,
         effective_limits: ReadLimits,
@@ -120,6 +124,7 @@ impl OwnerAdmission {
         self.try_acquire_with_post_reservation(effective_limits, cancellation, after_reservation)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn close_to_new_work(&self) -> OwnerReadScaffoldResult<()> {
         self.accepting.store(false, Ordering::SeqCst);
         Ok(())

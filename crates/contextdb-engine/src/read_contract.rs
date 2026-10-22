@@ -573,6 +573,7 @@ fn encoding_error_from_transport(
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn encode_query_result(
     result: &QueryResult,
     caller_owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -583,6 +584,7 @@ pub fn encode_query_result(
     let bytes = encode_transport_funded(&view, Some(owner), u64::MAX)?;
     EncodedReadBytes::from_funded(bytes, u64::MAX)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_query_view(view: &CanonicalQueryResultView<'_>) -> Result<(), ReadEncodingError> {
     for row in view.rows {
         if row.len() != view.columns.len() { return Err(ReadEncodingError::InvalidPayload); }
@@ -849,6 +851,7 @@ impl<'a> From<&'a VectorSearchDisclosure> for QueryVectorView<'a> {
 }
 
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encode_query_result_funded(
     result: &crate::database::QueryResultData,
     owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -882,6 +885,7 @@ impl Serialize for QueryParamsView<'_> {
         map.end()
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encode_request_funded(
     request: &crate::local_transport::LocalRequestEnvelope,
     owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -894,6 +898,7 @@ pub(crate) fn encode_request_funded(
     } else { encode_transport_funded(request, owner, memory_ceiling) }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encode_transport_funded<T: Serialize>(
     value: &T,
     owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -912,6 +917,7 @@ pub(crate) fn encode_transport_funded<T: Serialize>(
     Ok(output)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode_query_result_funded(
     bytes: &[u8],
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -928,6 +934,7 @@ pub(crate) fn decode_query_result_funded(
 
 /// Decode with no caller ceiling in hand. The shipped default stands in as
 /// the backstop, which is what a caller that never declared one gets.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn decode_query_result(bytes: &[u8]) -> Result<CanonicalQueryResult, ReadEncodingError> {
     decode_query_result_under_memory_ceiling(bytes, ReadLimits::SHIPPED_MEMORY)
 }
@@ -936,6 +943,7 @@ pub fn decode_query_result(bytes: &[u8]) -> Result<CanonicalQueryResult, ReadEnc
 /// A caller that declared a tighter or wider envelope is held to its own
 /// number rather than to the shipped backstop, so a decode refused here names
 /// the ceiling that caller set and can raise.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn decode_query_result_under_memory_ceiling(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -952,6 +960,7 @@ pub fn decode_query_result_under_memory_ceiling(
     Ok(result)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn query_result_encoded_size(result: &QueryResult) -> Result<usize, ReadEncodingError> {
     let view = CanonicalQueryResultView::from(result);
     validate_query_view(&view)?;
@@ -966,6 +975,7 @@ pub fn query_result_encoded_size(result: &QueryResult) -> Result<usize, ReadEnco
 /// closed over a small set of dependencies on purpose -- so the shape is
 /// written out here, field by field, length-prefixed so no two shapes can
 /// render alike.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn encode_metadata_body(
     body: &crate::direct_file_reader::DirectMetadataBody,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -986,6 +996,7 @@ pub(crate) fn encoded_metadata_body_len(
 
 /// Encode on the actual request owner; the returned allocation keeps its
 /// original credit through payload destruction, including on failed callers.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encode_metadata_body_funded(
     body: &crate::direct_file_reader::DirectMetadataBody,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -1020,6 +1031,7 @@ pub struct CanonicalWriter {
 impl CanonicalWriter {
     /// Admit the exact output capacity on the original caller owner. Writing
     /// beyond this capacity refuses at finish instead of growing uncharged.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn try_new(
         owner: contextdb_core::read_memory::ReadMemoryOwner, capacity: usize,
     ) -> Result<Self, ReadEncodingError> {
@@ -1121,11 +1133,13 @@ impl CanonicalWriter {
         self
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn finish_raw(self) -> Result<Vec<u8>, ReadEncodingError> {
         if self.overflowed { return Err(ReadEncodingError::InvalidPayload); }
         Ok(self.bytes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn finish(self) -> Result<EncodedReadBytes, ReadEncodingError> {
         if self.counting || self.overflowed { return Err(ReadEncodingError::InvalidPayload); }
         EncodedReadBytes::from_funded(crate::local_transport::query_funding::Funded {
@@ -1142,6 +1156,7 @@ impl CanonicalWriter {
 /// that is not UTF-8, trailing bytes after a complete body -- are not a
 /// metadata answer and are refused as an invalid payload rather than guessed
 /// at.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn decode_metadata_body(
     bytes: &[u8],
 ) -> Result<crate::direct_file_reader::DirectMetadataBody, ReadEncodingError> {
@@ -1150,6 +1165,7 @@ pub fn decode_metadata_body(
     decode_metadata_body_with_memory(bytes, &memory, ReadLimits::SHIPPED_MEMORY)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode_metadata_body_with_memory(
     bytes: &[u8],
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -1190,16 +1206,19 @@ impl<'a> CanonicalReader<'a> {
     pub(crate) fn with_memory(bytes: &'a [u8], memory: crate::read_image_memory::ImageMemoryHandle) -> Self {
         Self { bytes, at: 0, memory: Some(memory) }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector<T>(&self, count: usize) -> Result<Vec<T>, ReadEncodingError> {
         let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or(ReadEncodingError::InvalidPayload)?;
         self.admit(bytes)?;
         Ok(Vec::with_capacity(count))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn admit(&self, bytes: usize) -> Result<(), ReadEncodingError> {
         if let Some(memory) = &self.memory { memory.reserve(bytes).map_err(ReadEncodingError::Admission)?; }
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn take(&mut self, length: usize) -> Result<&'a [u8], ReadEncodingError> {
         let end = self
             .at
@@ -1213,10 +1232,12 @@ impl<'a> CanonicalReader<'a> {
         Ok(taken)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn tag(&mut self) -> Result<u8, ReadEncodingError> {
         Ok(self.take(1)?[0])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn count(&mut self) -> Result<u64, ReadEncodingError> {
         let bytes: [u8; 8] = self
             .take(8)?
@@ -1228,6 +1249,7 @@ impl<'a> CanonicalReader<'a> {
     /// A count that is about to become a number of elements to read. The
     /// bytes claim it; the payload has to be long enough to mean it, and the
     /// smallest element any of these documents holds is one byte.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn element_count(&mut self) -> Result<usize, ReadEncodingError> {
         let claimed =
             usize::try_from(self.count()?).map_err(|_| ReadEncodingError::InvalidPayload)?;
@@ -1237,6 +1259,7 @@ impl<'a> CanonicalReader<'a> {
         Ok(claimed)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn flag(&mut self) -> Result<bool, ReadEncodingError> {
         match self.tag()? {
             0 => Ok(false),
@@ -1245,6 +1268,7 @@ impl<'a> CanonicalReader<'a> {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn text(&mut self) -> Result<String, ReadEncodingError> {
         let length =
             usize::try_from(self.count()?).map_err(|_| ReadEncodingError::InvalidPayload)?;
@@ -1254,6 +1278,7 @@ impl<'a> CanonicalReader<'a> {
         Ok(text.to_owned())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn optional_text(&mut self) -> Result<Option<String>, ReadEncodingError> {
         match self.tag()? {
             0 => Ok(None),
@@ -1262,6 +1287,7 @@ impl<'a> CanonicalReader<'a> {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn raw(&mut self) -> Result<&'a [u8], ReadEncodingError> {
         let length =
             usize::try_from(self.count()?).map_err(|_| ReadEncodingError::InvalidPayload)?;
@@ -1270,6 +1296,7 @@ impl<'a> CanonicalReader<'a> {
 
     /// A complete document ends where the bytes end: anything after it was
     /// never part of the answer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn finish(self) -> Result<(), ReadEncodingError> {
         if self.at == self.bytes.len() {
             Ok(())
@@ -1287,6 +1314,7 @@ pub(crate) fn encode_owned_cursor_page_for_test(
     encode(page)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn encode_cursor_page(
     page: &CursorPage,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -1298,12 +1326,14 @@ pub fn encode_cursor_page(
 
 /// See [`decode_query_result`]: the shipped default is the backstop for a
 /// caller with no declared ceiling.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn decode_cursor_page(bytes: &[u8]) -> Result<CursorPage, ReadEncodingError> {
     decode_cursor_page_under_memory_ceiling(bytes, ReadLimits::SHIPPED_MEMORY)
 }
 
 /// Decode a cursor page against the memory ceiling in force for THIS
 /// exchange.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn decode_cursor_page_under_memory_ceiling(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -1336,6 +1366,7 @@ pub fn decode_cursor_page_under_memory_ceiling(
         .map_err(|error| encoding_error_from_core(error, memory_ceiling))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn cursor_page_encoded_size(page: &CursorPage) -> Result<usize, ReadEncodingError> {
     page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
     encoded_size(page)
@@ -1374,6 +1405,7 @@ impl<'a> From<&'a MetadataPage> for MetadataPageView<'a> {
             has_more: page.has_more, continuation: page.continuation.as_deref() }
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encode_metadata_page_funded(
     page: &MetadataPage,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -1383,6 +1415,7 @@ pub(crate) fn encode_metadata_page_funded(
     encode_transport_funded(&MetadataPageView::from(page), Some(owner), memory_ceiling)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn encode_metadata_page(
     page: &MetadataPage,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -1392,12 +1425,14 @@ pub fn encode_metadata_page(
 
 /// See [`decode_query_result`]: the shipped default is the backstop for a
 /// caller with no declared ceiling.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn decode_metadata_page(bytes: &[u8]) -> Result<MetadataPage, ReadEncodingError> {
     decode_metadata_page_under_memory_ceiling(bytes, ReadLimits::SHIPPED_MEMORY)
 }
 
 /// Decode a metadata page against the memory ceiling in force for THIS
 /// exchange.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn decode_metadata_page_under_memory_ceiling(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -1406,6 +1441,7 @@ pub fn decode_metadata_page_under_memory_ceiling(
     decode_metadata_page_with_memory(bytes, &memory, memory_ceiling)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode_metadata_page_with_memory(
     bytes: &[u8], memory: &crate::read_image_memory::ImageMemoryHandle, memory_ceiling: u64,
 ) -> Result<MetadataPage, ReadEncodingError> {
@@ -1415,11 +1451,13 @@ pub(crate) fn decode_metadata_page_with_memory(
     Ok(page)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn metadata_page_encoded_size(page: &MetadataPage) -> Result<usize, ReadEncodingError> {
     page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
     encoded_size(&MetadataPageView::from(page))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_query_result(result: &CanonicalQueryResult) -> Result<(), ReadEncodingError> {
     for row in &result.rows {
         if row.len() != result.columns.len() {
@@ -1429,6 +1467,7 @@ fn validate_query_result(result: &CanonicalQueryResult) -> Result<(), ReadEncodi
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn encoded_size<T: Serialize>(value: &T) -> Result<usize, ReadEncodingError> {
     let mut measured = bincode::enc::write::SizeWriter::default();
     contextdb_core::types::with_borrowed_json_wire(||
@@ -1437,6 +1476,7 @@ pub(crate) fn encoded_size<T: Serialize>(value: &T) -> Result<usize, ReadEncodin
     Ok(measured.bytes_written)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
     // Measured first and written once into a buffer of exactly that length.
     // Growing the output by doubling would reserve up to twice a large answer
@@ -1454,6 +1494,7 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
 
 /// The standalone codec retains its original factory in its typed image
 /// capability, including through escaping page and decoded-payload aliases.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decoder_memory(
     memory_ceiling: u64,
 ) -> contextdb_core::Result<crate::read_image_memory::ImageMemoryHandle> {
@@ -1478,6 +1519,7 @@ pub(crate) fn encoding_error_from_core(
 
 /// Borrowed wire input coexists with all decoded buffers. This credit is
 /// temporary; payload credit stays on the same owner until its DTO boundary.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode_exact_with_memory<T: DeserializeOwned>(
     bytes: &[u8],
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -1504,6 +1546,7 @@ pub(crate) fn decode_exact_with_memory<T: DeserializeOwned>(
     Ok(value)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn decode_query_result_with_memory(
     bytes: &[u8],
     memory: &crate::read_image_memory::ImageMemoryHandle,

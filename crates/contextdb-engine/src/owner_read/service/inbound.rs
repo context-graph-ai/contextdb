@@ -88,6 +88,7 @@ impl RequestControls {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn node_credit(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> contextdb_core::Result<ReadCredit> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
@@ -96,6 +97,7 @@ fn node_credit(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -
 }
 
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn receive(
     stream: &mut impl std::io::Read,
     boundary: &LocalProtocolBoundary,
@@ -279,6 +281,7 @@ impl OwnerReadService {
             .unwrap_or_else(CompletedOwnerRequest::terminal)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn check_serving(&self) -> OwnerReadScaffoldResult<()> {
         let draining = matches!(*self.state.lock().expect("owner service state"),
             ServiceState::DrainingGracefully | ServiceState::Draining);
@@ -290,6 +293,7 @@ impl OwnerReadService {
 }
 
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn send_terminal_error(
     stream: &mut std::os::unix::net::UnixStream, error: &OwnerReadScaffoldError,
 ) -> OwnerReadScaffoldResult<()> {
@@ -320,6 +324,7 @@ pub(super) fn send_terminal_error(
 }
 
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn send_terminal_panic(
     stream: &mut std::os::unix::net::UnixStream, payload: &(dyn std::any::Any + Send),
 ) -> OwnerReadScaffoldResult<()> {

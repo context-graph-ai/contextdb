@@ -58,6 +58,7 @@ static LIVE_OWNER_READ_SERVICES: AtomicUsize = AtomicUsize::new(0);
 /// Private cursor identifiers are allocated behind one deterministic seam so
 /// lifecycle tests can force actual reuse without manufacturing cursor state.
 pub trait CursorIdentifierAllocator: Send + Sync {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn allocate(&self, writer_run: [u8; 16]) -> OwnerReadScaffoldResult<[u8; 16]>;
 }
 
@@ -287,12 +288,14 @@ impl ValidatedOwnerListener {
         &self.facts.path
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate(&self, owner_user: LocalUserIdentity) -> OwnerReadScaffoldResult<()> {
         validate_channel_path(&self.facts, owner_user)?;
         Ok(())
     }
 
     #[cfg(unix)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind(&self) -> OwnerReadScaffoldResult<std::os::unix::net::UnixListener> {
         Ok(UnixLocalCarrier.listen(self.path())?)
     }
@@ -390,6 +393,7 @@ impl OwnerServiceSpec {
     }
 
     /// Invoke the existing validators rather than reproducing their rules.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn validate(&self) -> OwnerReadScaffoldResult<()> {
         self.config.limits.validate()?;
         self.config.timeouts.validate()?;
@@ -485,6 +489,7 @@ pub struct ConnectionState {
 }
 
 impl ConnectionState {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authenticated(
         connection_id: [u8; 16],
         principal: ReadPrincipal,
@@ -586,6 +591,7 @@ impl CursorEntry {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,
@@ -603,6 +609,7 @@ impl CursorEntry {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn page_for_publication(
         &self,
         rows: Option<NonZeroUsize>,
@@ -625,6 +632,7 @@ impl CursorEntry {
         Ok(Some((page, published_rows)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn close(mut self) -> OwnerReadScaffoldResult<()> {
         let mut cursor = self
             .cursor
@@ -645,6 +653,7 @@ impl CursorEntry {
 
     /// Exhaustion is also a production terminal transition. If publication of
     /// a non-terminal page fails, explicitly close the still-live handle.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn discard_unpublished_page(self, has_more: bool) -> OwnerReadScaffoldResult<()> {
         if has_more {
             self.close()
@@ -1232,6 +1241,7 @@ pub struct OwnerReadService {
 impl OwnerReadService {
     /// Bind the owner listener and begin answering authenticated reads.
     /// Database open starts this service once the store is claimed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn start(spec: OwnerServiceSpec) -> OwnerReadScaffoldResult<Arc<Self>> {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_owner_service_start();
@@ -1317,6 +1327,7 @@ impl OwnerReadService {
     /// runs on its own thread so `start` returns to the opening writer, and
     /// every accepted connection gets its own worker: one blocked reader may
     /// never stall another reader's request.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn start_accept_loop(self: &Arc<Self>) -> OwnerReadScaffoldResult<()> {
         #[cfg(unix)]
         {
@@ -1673,6 +1684,7 @@ impl OwnerReadService {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn request_deadline_ms(&self) -> OwnerReadScaffoldResult<u64> {
         self.spec
             .clock
@@ -2069,6 +2081,7 @@ impl OwnerReadService {
     /// The journey is fixed here: authenticate peer and every handshake field;
     /// calculate stricter limits; let status bypass slots; immediately admit
     /// all other work; classify SQL before touching the database.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn handle_authenticated(
         &self,
         connection_id: [u8; 16], principal: ReadPrincipal, limits: ReadLimits,
@@ -2140,6 +2153,7 @@ impl OwnerReadService {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_active_request(&self, connection: &ConnectionState) -> OwnerReadScaffoldResult<()> {
         self.register_active_cancellation(
             connection.connection_id(),
@@ -2147,6 +2161,7 @@ impl OwnerReadService {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_active_cancellation(
         &self,
         connection_id: [u8; 16],
@@ -2269,6 +2284,7 @@ impl OwnerReadService {
         self.stop_workers_if_drained();
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn status_response(&self) -> OwnerReadScaffoldResult<LocalOwnerStatusResponse> {
         let usage = self.spec.database.accountant().usage();
         Ok(LocalOwnerStatusResponse {
@@ -2291,6 +2307,7 @@ impl OwnerReadService {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn handle_admitted(
         &self,
         connection: ConnectionState,
@@ -2740,6 +2757,7 @@ impl OwnerReadService {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn store_cursor(
         &self,
         entry: CursorEntry,
@@ -2786,6 +2804,7 @@ impl OwnerReadService {
     /// were already represented in the fleet totals; new entries were not.
     /// The cursor itself is consumed before any drain callback reacquires the
     /// service state.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn release_unstored_cursor(
         &self,
         entry: CursorEntry,
@@ -2802,6 +2821,7 @@ impl OwnerReadService {
         close
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn take_cursor(
         &self,
         connection_id: [u8; 16],
@@ -2833,6 +2853,7 @@ impl OwnerReadService {
         Ok(entry)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fetch_cursor(
         &self,
         connection: &ConnectionState,
@@ -3085,6 +3106,7 @@ impl OwnerReadService {
     /// Commit exactly the rows whose carrier frames were selected for
     /// publication. Until this runs, the whole page remains on the cursor and
     /// a cancelled fetch can be replayed without asking the kernel twice.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn publish_cursor_page(
         &self,
         connection_id: [u8; 16],
@@ -3219,6 +3241,7 @@ impl OwnerReadService {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn close_cursor(
         &self,
         connection: &ConnectionState,
@@ -3241,6 +3264,7 @@ impl OwnerReadService {
         self.cursor_closed_response(request_owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor_page_response_with_size(
         &self,
         page: &CursorPage,
@@ -3264,6 +3288,7 @@ impl OwnerReadService {
         Ok((responses, payload_bytes))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cancelled_cursor_responses(
         &self,
         connection_id: [u8; 16],
@@ -3279,6 +3304,7 @@ impl OwnerReadService {
         ).map_err(OwnerReadScaffoldError::Database)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn empty_exhausted_cursor_page(
         &self, owner: contextdb_core::read_memory::ReadMemoryOwner, memory_ceiling: u64,
     ) -> OwnerReadScaffoldResult<crate::local_transport::query_funding::Funded<Vec<LocalResponse>>> {
@@ -3299,6 +3325,7 @@ impl OwnerReadService {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor_closed_response(
         &self, owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<crate::local_transport::query_funding::Funded<Vec<LocalResponse>>> {
@@ -3311,6 +3338,7 @@ impl OwnerReadService {
         ).map_err(OwnerReadScaffoldError::Database)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn metadata_response(
         &self,
         reading: &Database,
@@ -3362,6 +3390,7 @@ impl OwnerReadService {
     /// decides how many complete items travel, and the continuation is the
     /// last item published, so resuming can neither repeat nor skip one even
     /// though the inventory itself moved between pages.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_metadata(
         &self,
         reading: &Database,
@@ -3495,6 +3524,7 @@ impl OwnerReadService {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_metadata_payload(
         &self,
         payload: &[u8],
@@ -3522,6 +3552,7 @@ impl OwnerReadService {
     /// process. What it does share with an external caller is the shutdown
     /// contract: the request is registered while it runs, so a drain cancels
     /// it and a handler still inside sees that it was withdrawn.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn request_in_process(
         &self,
         namespace: &str,
@@ -3544,6 +3575,7 @@ impl OwnerReadService {
         answered.map_err(OwnerReadScaffoldError::Database)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn disconnect(&self, connection_id: [u8; 16]) -> OwnerReadScaffoldResult<()> {
         // The narrowed handle exists for this connection and nothing else, so
         // it goes when the connection does. It is a derived handle over the
@@ -3627,6 +3659,7 @@ impl OwnerReadService {
     ///
     /// Answers whether work was still in flight when serving stopped, so a
     /// caller that cannot wait knows not to release what that work is holding.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin_shutdown(&self) -> OwnerReadScaffoldResult<bool> {
         self.stop_serving()?;
         // "In flight" is every request this owner is still inside, not only
@@ -3643,6 +3676,7 @@ impl OwnerReadService {
 
     /// Freeze admission while the owner finishes storage cleanup. The listener
     /// remains published until the committed file is safe for direct readers.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn pause_admission_for_handoff(&self) -> OwnerReadScaffoldResult<bool> {
         let _state = self.state.lock().expect("owner service state");
         self.admission.close_to_new_work()?;
@@ -3651,6 +3685,7 @@ impl OwnerReadService {
 
     /// A dropped owner stops admitting new work immediately, while the
     /// requests it already accepted retain the store until they answer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin_graceful_shutdown_without_wait(&self) -> OwnerReadScaffoldResult<bool> {
         self.stop_accepting_gracefully()?;
         self.stop_workers_if_drained();
@@ -3659,6 +3694,7 @@ impl OwnerReadService {
 
     /// Stop admission, finish admitted owner work, and drive the shared shutdown
     /// deadline. This method never closes the database.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn shutdown_and_drain(&self) -> OwnerReadScaffoldResult<()> {
         let deadline_ms = self
             .spec
@@ -3801,6 +3837,7 @@ impl OwnerReadService {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stop_accepting_gracefully(&self) -> OwnerReadScaffoldResult<()> {
         let mut state = self.state.lock().expect("owner service state");
         if matches!(*state, ServiceState::Serving) {
@@ -3823,6 +3860,7 @@ impl OwnerReadService {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stop_serving(&self) -> OwnerReadScaffoldResult<()> {
         // Cursor publication takes these locks in the same state -> registry
         // order. Once this critical section completes, every pre-existing
@@ -4214,6 +4252,7 @@ enum PublicationAttempt<T> {
 }
 
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn send_authoritative_response(
     carrier: &UnixLocalCarrier,
     stream: &std::os::unix::net::UnixStream,
@@ -4520,6 +4559,7 @@ impl RequestPublication<'_, '_> {
         output_size(RequestPublication::run)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     async fn run(self) -> Result<(), crate::local_transport::LocalTransportError> {
         let Self { service, carrier, mut publish_stream, connection_id, request_ordinal,
             boundary, expectation, effective_limits, slot, progress, inbox, ended,
@@ -5304,6 +5344,7 @@ fn panic_reason(payload: &Box<dyn std::any::Any + Send>) -> String {
     "no reason recorded".to_owned()
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn refusal_response(
     error: OwnerReadScaffoldError, owner: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> OwnerReadScaffoldResult<LocalResponse> {
@@ -5317,6 +5358,7 @@ fn refusal_response(
 /// Failed publication must not turn an already exhausted first page into an
 /// explicit second close. A page with continuation still owns live kernel
 /// state and therefore goes through the production close seam.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn close_unpublished_open(opened: &mut BoundedCursorOpen) -> OwnerReadScaffoldResult<()> {
     if opened.first_page.has_more {
         close_bounded_cursor(&mut opened.cursor).map_err(map_bounded_error)
@@ -5325,6 +5367,7 @@ fn close_unpublished_open(opened: &mut BoundedCursorOpen) -> OwnerReadScaffoldRe
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn require_read_statement(sql: &str) -> OwnerReadScaffoldResult<()> {
     if is_read_statement(sql)? {
         return Ok(());
@@ -5335,6 +5378,7 @@ fn require_read_statement(sql: &str) -> OwnerReadScaffoldResult<()> {
 }
 
 /// Whether running this statement would change the store.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn is_read_statement(sql: &str) -> OwnerReadScaffoldResult<bool> {
     let statement = parse(sql)?;
     Ok(statement_effect(&statement) == StatementEffect::Read)

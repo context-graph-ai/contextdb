@@ -19,6 +19,7 @@ pub enum ReadPrincipal {
 
 /// Apply the fixed same-operating-system-user authorization rule after the
 /// carrier has obtained credentials.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn authenticate_peer(
     owner: LocalUserIdentity,
     observed: Result<LocalUserIdentity, LocalTransportError>,
@@ -34,6 +35,7 @@ pub fn authenticate_peer(
 }
 
 #[cfg(target_os = "linux")]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn peer_user_from_stream(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<LocalUserIdentity, LocalTransportError> {
@@ -68,6 +70,7 @@ pub fn peer_user_from_stream<T>(_: &T) -> Result<LocalUserIdentity, LocalTranspo
 /// Compose the carrier-provided Unix peer credential with the protocol
 /// handshake before a request can enter admission.
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn authenticate_stream_handshake(
     stream: &std::os::unix::net::UnixStream,
     expected: &LocalHandshake,
@@ -107,6 +110,7 @@ pub struct AdmittedReader {
 /// a byte from it, so it can neither hold the handshake deadline open nor make
 /// the channel spend a frame reader on it.
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn authenticate_framed_stream_handshake<'a>(
     stream: &'a mut std::os::unix::net::UnixStream,
     expected: &'a LocalHandshake,
@@ -150,6 +154,7 @@ pub fn authenticate_framed_stream_handshake<'a>(
 }
 
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn authenticate_framed_stream_handshake_funded<'a>(
     stream: &'a mut std::os::unix::net::UnixStream, expected: &'a LocalHandshake,
     clock: &'a dyn DeadlineClock, deadline_ms: u64,

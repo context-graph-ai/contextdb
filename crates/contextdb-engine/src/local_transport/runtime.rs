@@ -156,6 +156,7 @@ pub enum RuntimeRootViolation {
 }
 
 pub trait RuntimeDirectoryInspector {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn inspect(&self, root: &Path) -> Result<RuntimeDirectoryFacts, LocalTransportError>;
 }
 
@@ -166,12 +167,15 @@ pub trait RuntimeDirectoryEnvironment {
 
     /// Platform fallback roots are derived from the process identity, never
     /// from a caller-selected request value.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn effective_user_identity(&self) -> Result<LocalUserIdentity, LocalTransportError>;
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn linux_per_user_runtime_directory(&self) -> Result<PathBuf, LocalTransportError> {
         Ok(PathBuf::from("/run/user").join(self.effective_user_identity()?.0.to_string()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn macos_user_temporary_directory(&self) -> Result<PathBuf, LocalTransportError>;
 }
 
@@ -255,6 +259,7 @@ impl RuntimeDirectoryInspector for SystemRuntimeDirectoryInspector {
 /// caller-supplied container or the owner-only channel directory below it. A
 /// symbolic link is reported as a link rather than as a non-directory: it is
 /// the more specific refusal and the one an operator has to act on.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_runtime_root_shape(
     facts: &RuntimeDirectoryFacts,
     current_user: LocalUserIdentity,
@@ -297,6 +302,7 @@ fn validate_runtime_root_shape(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn validate_runtime_root(
     facts: &RuntimeDirectoryFacts,
     current_user: LocalUserIdentity,
@@ -317,6 +323,7 @@ pub fn validate_runtime_root(
 /// owner-only boundary is the `contextdb` child created below it and the
 /// channel socket inside that child, both of which are created and then
 /// validated against the full owner-only rule.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_runtime_container_root(
     facts: &RuntimeDirectoryFacts,
     current_user: LocalUserIdentity,
@@ -376,6 +383,7 @@ fn validate_macos_system_temporary_container(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn validate_channel_path(
     facts: &ChannelPathFacts,
     current_user: LocalUserIdentity,
@@ -424,6 +432,7 @@ pub const fn unix_socket_path_limit() -> Option<usize> {
 /// The limit applies to what is handed to the kernel, so this is checked on
 /// the address a bind or a connect actually receives -- never on a pathname
 /// the operating system is never shown.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn validate_socket_path_length(path: &Path) -> Result<(), LocalTransportError> {
     let Some(limit) = unix_socket_path_limit() else {
         return Err(LocalTransportError::PlatformUnsupported);
@@ -452,6 +461,7 @@ pub fn validate_socket_path_length(path: &Path) -> Result<(), LocalTransportErro
 /// is a short, fixed-shape address. On platforms with no equivalent -- macOS,
 /// which has no `/proc` -- the absolute pathname IS the address, so the limit
 /// still applies there and is reported the same way it always was.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn validate_channel_addressability(path: &Path) -> Result<(), LocalTransportError> {
     if unix_socket_path_limit().is_none() {
         return Err(LocalTransportError::PlatformUnsupported);
@@ -467,6 +477,7 @@ pub fn validate_channel_addressability(path: &Path) -> Result<(), LocalTransport
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn resolve_runtime_directory(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -477,6 +488,7 @@ pub fn resolve_runtime_directory(
     resolve_runtime_directory_with_environment(&authoritative_request, inspector, &environment)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn resolve_runtime_directory_with_environment(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -492,6 +504,7 @@ pub fn resolve_runtime_directory_with_environment(
 
 /// The same resolution, keeping the runtime root beside the directory it
 /// names for a caller that needs both.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn resolve_runtime_layout_with_environment(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -579,6 +592,7 @@ fn resolve_runtime_layout_with_environment(
 ///
 /// Reader coordination resolves separately and inventories every known
 /// candidate directory for the same physical database.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn runtime_directory_for_store(
     supplied: Option<&Path>,
     current_user: LocalUserIdentity,
@@ -600,6 +614,7 @@ pub fn runtime_directory_for_store(
 /// Resolve and validate the platform-native base, then create and validate
 /// its owner-only `contextdb` child. Callers cannot supply any emergency or
 /// temporary fallback path through this API.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn prepare_runtime_directory(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -610,6 +625,7 @@ pub fn prepare_runtime_directory(
     prepare_runtime_directory_with_environment(&authoritative_request, inspector, &environment)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn prepare_runtime_directory_with_environment(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -627,6 +643,7 @@ pub fn prepare_runtime_directory_with_environment(
 /// in along with it, so a caller that must name both -- the directory the
 /// channel is bound in, and the root it sits inside -- is never left deriving
 /// one from the other.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn prepare_runtime_layout(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -638,6 +655,7 @@ pub fn prepare_runtime_layout(
         .map(|(runtime, _)| runtime)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn prepare_runtime_layout_with_environment(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -793,6 +811,7 @@ fn prepare_macos_default_runtime_directory(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn create_owner_only_runtime_child(path: &Path) -> Result<(), LocalTransportError> {
     #[cfg(unix)]
     {
@@ -815,6 +834,7 @@ fn create_owner_only_runtime_child(path: &Path) -> Result<(), LocalTransportErro
 
 /// Inspect an existing channel object without opening, connecting, or
 /// removing it. The caller validates the returned facts against its owner.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn inspect_channel_path(
     path: &Path,
     runtime_directory: &Path,
@@ -823,6 +843,7 @@ pub fn inspect_channel_path(
 }
 
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn inspect_system_runtime_root(root: &Path) -> Result<RuntimeDirectoryFacts, LocalTransportError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -868,6 +889,7 @@ fn inspect_system_runtime_root(_root: &Path) -> Result<RuntimeDirectoryFacts, Lo
 }
 
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn inspect_system_channel_path(
     path: &Path,
     runtime_directory: &Path,
@@ -898,6 +920,7 @@ fn inspect_system_channel_path(
 /// privilege-dropping process, so the check evaluates the effective identity
 /// and treats every failure as not writable.
 #[cfg(unix)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn filesystem_is_writable(path: &Path) -> Result<bool, LocalTransportError> {
     let evaluated = nix::unistd::faccessat(
         nix::fcntl::AT_FDCWD,
@@ -932,6 +955,7 @@ pub const fn linux_filesystem_type_is_local(reported: i64) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn filesystem_is_local(path: &Path) -> Result<bool, LocalTransportError> {
     let filesystem = nix::sys::statfs::statfs(path)
         .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;

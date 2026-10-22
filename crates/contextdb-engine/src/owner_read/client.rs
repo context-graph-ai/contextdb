@@ -200,6 +200,7 @@ impl OwnerClient {
     /// of the carrier's own blanket collapse for unauthenticated socket
     /// peers -- this is not a live connection, so that collapse does not
     /// apply here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn read_envelope(
         reader: &mut dyn FrameReader,
         allocator: &mut dyn FrameBufferAllocator,
@@ -220,6 +221,7 @@ impl OwnerClient {
 
     /// Encode a request through the shared payload and frame codecs, via the
     /// same typed protocol boundary the carrier uses to write one.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn encode_envelope(
         envelope: &LocalRequestEnvelope, owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> OwnerReadScaffoldResult<crate::read_contract::EncodedReadBytes> {
@@ -612,6 +614,7 @@ impl OwnerClient {
 
     /// A chunk remains private to the shared terminal receiver until a
     /// `TerminalSuccess` arrives.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn receive_ordinary(
         receiver: &mut OrdinaryResultReceiver,
         response: LocalResponse,
@@ -629,6 +632,7 @@ impl OwnerClient {
     /// Create a real carrier handle that can interrupt the request already in
     /// flight while the reading thread is blocked awaiting its reply.
     #[cfg(unix)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn cancel_handle(&self) -> OwnerReadScaffoldResult<OwnerCancelHandle> {
         let stream = self.stream.try_clone().map_err(|_| {
             OwnerReadScaffoldError::unimplemented("clone selected owner carrier for cancellation")
@@ -643,6 +647,7 @@ impl OwnerClient {
     /// Create a real carrier shutdown handle before moving the client into a
     /// blocked request worker.
     #[cfg(unix)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn disconnect_handle(&self) -> OwnerReadScaffoldResult<OwnerDisconnectHandle> {
         let stream = self.stream.try_clone().map_err(|_| {
             OwnerReadScaffoldError::unimplemented("clone selected owner carrier for EOF/HUP")
@@ -653,6 +658,7 @@ impl OwnerClient {
     /// EOF/HUP discards staged result chunks and closes only the selected
     /// carrier. It cannot call a service object or choose another route.
     #[cfg(unix)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn disconnect(
         &self,
         receiver: &mut OrdinaryResultReceiver,
@@ -846,6 +852,7 @@ impl OwnerCancelHandle {
     /// there could only ever end in the deadline. It returns as soon as the
     /// interrupt is on the wire and hears the answer where it was always going
     /// to hear it -- in the read's own outcome, which is the cancellation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn cancel(
         mut self,
         limits: ReadLimits,
@@ -902,6 +909,7 @@ impl OwnerDisconnectHandle {
     /// request that was in flight with the disconnected refusal -- so the
     /// caller learns its work is over only once the owner has actually put
     /// every resource down, rather than while it is still running.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn disconnect(self) -> OwnerReadScaffoldResult<()> {
         self.stream
             .shutdown(Shutdown::Write)
@@ -909,6 +917,7 @@ impl OwnerDisconnectHandle {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn checked_deadline(clock: &dyn DeadlineClock, duration_ms: u64) -> OwnerReadScaffoldResult<u64> {
     clock
         .now_ms()
