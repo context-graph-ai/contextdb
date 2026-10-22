@@ -1792,7 +1792,7 @@ mod commit_wait_tests {
         fn apply(
             &self,
             _: &WriteSet,
-            _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+            _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
         ) -> Result<()> {
             Ok(())
         }

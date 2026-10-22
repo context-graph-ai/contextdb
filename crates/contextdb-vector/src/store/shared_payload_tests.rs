@@ -2672,7 +2672,10 @@ fn generation_price_and_admission_funder_observers_do_not_load_or_charge() {
     assert_eq!(declared.used.load(Ordering::SeqCst), before);
     let funder: Arc<dyn MemoryBudget> = executing.clone();
     let admission = VectorCopyAdmission::new(funder.clone());
-    assert!(Arc::ptr_eq(admission.accountant_for_test(), &funder));
+    assert!(std::ptr::addr_eq(
+        admission.accountant_for_test().as_ref(),
+        funder.as_ref()
+    ));
     assert_eq!(executing.used.load(Ordering::SeqCst), 0);
     drop(admission);
     drop(state);

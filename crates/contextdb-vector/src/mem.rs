@@ -9154,7 +9154,7 @@ mod indexed_row_check_empty_merge_tests {
                     index.clone(),
                     RowId((row + 1) as u64),
                     vec![1.0, row as f32 + 1.0],
-                    owner.clone(),
+                    owner.clone().into(),
                 )
                 .expect("stage a real vector insert");
         }

@@ -116,11 +116,7 @@ impl SourceFunding for Funding {
 }
 struct Store;
 impl WriteSetApplicator for Store {
-    fn apply(
-        &self,
-        _: &WriteSet,
-        _: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
-    ) -> Result<()> {
+    fn apply(&self, _: &WriteSet, _: contextdb_core::read_memory::ReadMemoryOwner) -> Result<()> {
         unreachable!("no durable commit is requested")
     }
     fn new_row_id(&self) -> RowId {

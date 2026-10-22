@@ -2340,7 +2340,7 @@ fn load_co_created_fixture_carriers(
         entries: carriers,
         resident_bytes,
         workspace_owner,
-        accountant,
+        accountant: accountant.into(),
     })
 }
 
@@ -25249,7 +25249,7 @@ mod tests {
                     .unwrap();
                 let mut reservation = RetainedMemoryCharge {
                     bytes: growth,
-                    accountant: owner.clone(),
+                    accountant: owner.clone().into(),
                 };
                 column.settle_directory_accounting(index, &mut reservation);
             }
@@ -25440,7 +25440,7 @@ mod tests {
             .unwrap();
         let mut charge = RetainedMemoryCharge {
             bytes: growth,
-            accountant: declared.clone(),
+            accountant: declared.clone().into(),
         };
         column.settle_directory_accounting(&index, &mut charge);
         drop(charge);
@@ -26067,9 +26067,9 @@ mod tests {
                     .read()
                     .bucket_charge
                     .as_ref()
-                    .filter(|charge| Arc::ptr_eq(
-                        &charge.accountant,
-                        &(declared.clone() as Arc<dyn MemoryBudget>)
+                    .filter(|charge| std::ptr::addr_eq(
+                        charge.accountant.as_ref(),
+                        (declared.clone() as Arc<dyn MemoryBudget>).as_ref()
                     ))
                     .map_or(0, |charge| charge.bytes)
         );
@@ -26081,9 +26081,9 @@ mod tests {
                     .read()
                     .bucket_charge
                     .as_ref()
-                    .filter(|charge| Arc::ptr_eq(
-                        &charge.accountant,
-                        &(unrelated_owner.clone() as Arc<dyn MemoryBudget>)
+                    .filter(|charge| std::ptr::addr_eq(
+                        charge.accountant.as_ref(),
+                        (unrelated_owner.clone() as Arc<dyn MemoryBudget>).as_ref()
                     ))
                     .map_or(0, |charge| charge.bytes)
         );
@@ -26103,9 +26103,9 @@ mod tests {
                         .read()
                         .bucket_charge
                         .as_ref()
-                        .filter(|charge| Arc::ptr_eq(
-                            &charge.accountant,
-                            &(declared.clone() as Arc<dyn MemoryBudget>)
+                        .filter(|charge| std::ptr::addr_eq(
+                            charge.accountant.as_ref(),
+                            (declared.clone() as Arc<dyn MemoryBudget>).as_ref()
                         ))
                         .map_or(0, |charge| charge.bytes)
             );
@@ -26122,9 +26122,9 @@ mod tests {
                         .read()
                         .bucket_charge
                         .as_ref()
-                        .filter(|charge| Arc::ptr_eq(
-                            &charge.accountant,
-                            &(declared.clone() as Arc<dyn MemoryBudget>)
+                        .filter(|charge| std::ptr::addr_eq(
+                            charge.accountant.as_ref(),
+                            (declared.clone() as Arc<dyn MemoryBudget>).as_ref()
                         ))
                         .map_or(0, |charge| charge.bytes)
             );
@@ -26136,9 +26136,9 @@ mod tests {
                         .read()
                         .bucket_charge
                         .as_ref()
-                        .filter(|charge| Arc::ptr_eq(
-                            &charge.accountant,
-                            &(unrelated_owner.clone() as Arc<dyn MemoryBudget>)
+                        .filter(|charge| std::ptr::addr_eq(
+                            charge.accountant.as_ref(),
+                            (unrelated_owner.clone() as Arc<dyn MemoryBudget>).as_ref()
                         ))
                         .map_or(0, |charge| charge.bytes)
             );
@@ -26147,7 +26147,10 @@ mod tests {
             .retained_column_copy_owner(&new, &VectorCopyAdmission::new(executing.clone()))
             .unwrap();
         let declared_trait: Arc<dyn MemoryBudget> = declared.clone();
-        assert!(Arc::ptr_eq(retained.accountant(), &declared_trait));
+        assert!(std::ptr::addr_eq(
+            retained.accountant().as_ref(),
+            declared_trait.as_ref()
+        ));
         drop(retained);
         drop(store);
         assert_eq!(declared.live_bytes(), 0);
@@ -27439,7 +27442,7 @@ mod tests {
                 Ok(LoadedVectorGraphGeneration {
                     graph,
                     resident_bytes,
-                    accountant: self.reader.clone(),
+                    accountant: self.reader.clone().into(),
                     caller_adopted_bytes: resident_bytes,
                     fresh_tail: None,
                 })
@@ -27579,7 +27582,7 @@ mod tests {
                         descriptor.identity,
                         graph,
                         *resident,
-                        Some(reader.clone()),
+                        Some(reader.clone().into()),
                     );
                     let slots = selection.resident.get_mut();
                     if is_base {

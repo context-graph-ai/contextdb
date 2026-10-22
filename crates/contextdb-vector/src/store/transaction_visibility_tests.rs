@@ -318,7 +318,7 @@ fn publish_base(state: &IndexState, budget: &Arc<Budget>, generation: u64) {
             LoadedVectorGraphGeneration {
                 graph,
                 resident_bytes: bytes,
-                accountant: budget.clone(),
+                accountant: budget.clone().into(),
                 caller_adopted_bytes: 0,
                 fresh_tail: None,
             },
@@ -575,12 +575,12 @@ fn a_sealed_reload_cannot_replace_a_tail_with_prepared_insertions() {
             LoadedVectorGraphGeneration {
                 graph,
                 resident_bytes: resident,
-                accountant: budget.clone(),
+                accountant: budget.clone().into(),
                 caller_adopted_bytes: 0,
                 fresh_tail: Some(LoadedVectorFreshTail {
                     graph: replay,
                     resident_bytes: 0,
-                    accountant: budget.clone(),
+                    accountant: budget.clone().into(),
                     replayed_through_lsn: Lsn(1),
                 }),
             },

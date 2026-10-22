@@ -262,20 +262,24 @@ fn received_columns_keep_distinct_funders_and_legacy_columns_in_a_mixed_batch() 
     let after_refusal_owner = legacy_state_before.raw_accountant.read();
     assert_eq!(after_refusal_owner.is_some(), prior_raw_owner.is_some());
     if let Some(prior) = &prior_raw_owner {
-        assert!(Arc::ptr_eq(after_refusal_owner.as_ref().unwrap(), prior));
+        assert!(std::ptr::addr_eq(
+            after_refusal_owner.as_ref().unwrap().as_ref(),
+            prior.as_ref()
+        ));
     }
     drop(after_refusal_owner);
     assert_eq!(legacy_state_before.raw_payload_bytes(), prior_raw_bytes);
     assert!(legacy_state_before.stored_by_row_id(RowId(2)).is_none());
     let declared: Arc<dyn MemoryBudget> = legacy_column_owner.clone();
-    assert!(Arc::ptr_eq(
-        &store
+    assert!(std::ptr::addr_eq(
+        (store
             .try_column(&legacy)
             .unwrap()
             .directory_accounting
             .lock()
-            .accountant,
-        &declared
+            .accountant)
+            .as_ref(),
+        declared.as_ref()
     ));
     legacy_column_owner.refuse.store(false, Ordering::SeqCst);
     body_admission
@@ -321,15 +325,24 @@ fn received_columns_keep_distinct_funders_and_legacy_columns_in_a_mixed_batch() 
     assert!(legacy_column_owner.used.load(Ordering::SeqCst) <= legacy_prepared_bytes);
     let legacy_column = store.try_column(&legacy).unwrap();
     let declared: Arc<dyn MemoryBudget> = legacy_column_owner.clone();
-    assert!(Arc::ptr_eq(
-        &legacy_column.directory_accounting.lock().accountant,
-        &declared
+    assert!(std::ptr::addr_eq(
+        legacy_column
+            .directory_accounting
+            .lock()
+            .accountant
+            .as_ref(),
+        declared.as_ref()
     ));
     let legacy_state = store.state(&legacy).unwrap();
     assert!(legacy_state.raw_residency_is_accounted());
-    assert!(Arc::ptr_eq(
-        legacy_state.raw_accountant.read().as_ref().unwrap(),
-        &declared
+    assert!(std::ptr::addr_eq(
+        legacy_state
+            .raw_accountant
+            .read()
+            .as_ref()
+            .unwrap()
+            .as_ref(),
+        declared.as_ref()
     ));
     assert_eq!(legacy_state.entry_count(), 2);
     assert_eq!(legacy_state.raw_payload_bytes(), 2 * body_bytes);

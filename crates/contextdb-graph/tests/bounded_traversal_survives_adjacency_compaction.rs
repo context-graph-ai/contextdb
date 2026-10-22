@@ -51,7 +51,7 @@ impl WriteSetApplicator for TestStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         self.graph.apply_inserts(ws.adj_inserts.clone());
         self.graph.apply_deletes(ws.adj_deletes.clone());
@@ -134,7 +134,7 @@ fn connect(
         target,
         "LINKS".to_string(),
         HashMap::new(),
-        Arc::new(test_read_memory::TestReadMemory::default()),
+        Arc::new(test_read_memory::TestReadMemory::default()).into(),
     )
     .expect("seed an edge");
     tx_mgr
@@ -154,7 +154,7 @@ fn withdraw(
         source,
         target,
         "LINKS",
-        Arc::new(test_read_memory::TestReadMemory::default()),
+        Arc::new(test_read_memory::TestReadMemory::default()).into(),
     )
     .expect("withdraw an edge before any traversal opens");
     tx_mgr

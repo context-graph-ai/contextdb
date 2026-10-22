@@ -947,14 +947,20 @@ mod tests {
             assert!(marked.historical_durable_reads());
             let mut scratch = marked.scratch();
             assert!(scratch.historical_durable_reads());
-            assert!(Arc::ptr_eq(scratch.accountant(), marked.accountant()));
+            assert!(std::ptr::addr_eq(
+                scratch.accountant().as_ref(),
+                marked.accountant().as_ref()
+            ));
             scratch.reserve(bytes).unwrap();
             assert_eq!(routing_budget.0.load(Ordering::SeqCst), retained + bytes);
             drop(scratch);
             assert_eq!(routing_budget.0.load(Ordering::SeqCst), retained);
             let local = marked.local_scratch().unwrap();
             assert!(local.historical_durable_reads());
-            assert!(Arc::ptr_eq(local.accountant(), marked.accountant()));
+            assert!(std::ptr::addr_eq(
+                local.accountant().as_ref(),
+                marked.accountant().as_ref()
+            ));
             drop(local);
             marked.with_historical_durable_reads(|nested| {
                 assert!(nested.historical_durable_reads());

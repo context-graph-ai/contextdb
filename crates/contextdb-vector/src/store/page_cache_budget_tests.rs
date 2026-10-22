@@ -385,7 +385,7 @@ fn prepaid_generation_and_search_directory_funders_cover_shared_controls_until_p
             },
             graph,
             actual,
-            Some(owner.clone()),
+            Some(owner.clone().into()),
         );
         let owner_identity = Arc::as_ptr(&owner) as usize;
         let query = vec![0.12345; 768];

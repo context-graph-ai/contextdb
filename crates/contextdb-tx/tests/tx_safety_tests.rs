@@ -19,7 +19,7 @@ impl WriteSetApplicator for FailingStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         if self.fail_apply.load(Ordering::SeqCst) {
             return Err(Error::Other("apply failed".to_string().into()));
@@ -62,7 +62,7 @@ impl WriteSetApplicator for BlockingStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         let mut state = self.state.lock();
         self.apply_entered.store(true, Ordering::SeqCst);

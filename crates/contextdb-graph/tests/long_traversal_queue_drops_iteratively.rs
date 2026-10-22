@@ -57,7 +57,7 @@ impl WriteSetApplicator for TestStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<()> {
         self.graph.apply_inserts(ws.adj_inserts.clone());
         self.graph.apply_deletes(ws.adj_deletes.clone());

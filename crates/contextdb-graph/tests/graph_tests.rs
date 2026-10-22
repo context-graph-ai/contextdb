@@ -15,7 +15,7 @@ impl WriteSetApplicator for TestStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<()> {
         self.graph.apply_inserts(ws.adj_inserts.clone());
         self.graph.apply_deletes(ws.adj_deletes.clone());
@@ -53,7 +53,7 @@ fn connect(
         target,
         edge_type.to_string(),
         HashMap::new(),
-        std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+        std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
     )
     .unwrap();
     tx_mgr
@@ -81,7 +81,7 @@ fn bfs_depth_bound_on_chain() {
             1,
             3,
             tx_mgr.snapshot(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     assert_eq!(r.nodes.len(), 3);
@@ -106,7 +106,7 @@ fn bfs_cycle_no_duplicates() {
             1,
             5,
             tx_mgr.snapshot(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     assert_eq!(r.nodes.len(), 2);
@@ -131,7 +131,7 @@ fn bfs_respects_mvcc_snapshot() {
             1,
             5,
             snap1,
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     assert_eq!(old.nodes.len(), 1);
@@ -144,7 +144,7 @@ fn bfs_respects_mvcc_snapshot() {
             1,
             5,
             tx_mgr.snapshot(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     assert_eq!(new.nodes.len(), 2);
@@ -168,7 +168,7 @@ fn accepts_max_depth_one() {
             1,
             1,
             tx_mgr.snapshot(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     assert_eq!(r.nodes.len(), 1);
@@ -193,7 +193,7 @@ fn bfs_visited_limit_error() {
             Uuid::new_v4(),
             "R".to_string(),
             HashMap::new(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     }
@@ -212,7 +212,7 @@ fn bfs_visited_limit_error() {
             1,
             1,
             tx_mgr.snapshot(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap_err();
     assert!(matches!(err, Error::BfsVisitedExceeded(100)));
@@ -234,7 +234,7 @@ fn direction_incoming_and_both() {
             None,
             Direction::Incoming,
             tx_mgr.snapshot(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     assert_eq!(incoming.len(), 2);
@@ -245,7 +245,7 @@ fn direction_incoming_and_both() {
             None,
             Direction::Both,
             tx_mgr.snapshot(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     assert_eq!(both.len(), 2);
@@ -265,7 +265,7 @@ fn edge_type_filtering_and_empty_graph() {
             1,
             1,
             tx_mgr.snapshot(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     assert!(empty.nodes.is_empty());
@@ -281,7 +281,7 @@ fn edge_type_filtering_and_empty_graph() {
             1,
             1,
             tx_mgr.snapshot(),
-            std::sync::Arc::new(test_read_memory::TestReadMemory::default()),
+            std::sync::Arc::new(test_read_memory::TestReadMemory::default()).into(),
         )
         .unwrap();
     assert!(r.nodes.is_empty());

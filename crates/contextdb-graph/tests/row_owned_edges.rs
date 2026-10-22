@@ -284,7 +284,7 @@ impl WriteSetApplicator for GraphApplier {
     fn apply(
         &self,
         ws: &WriteSet,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<()> {
         self.graph.apply_inserts_ref(&ws.adj_inserts);
         self.graph.apply_deletes(ws.adj_deletes.clone());
@@ -310,7 +310,7 @@ fn reached(
         1,
         3,
         snapshot,
-        Arc::new(test_read_memory::TestReadMemory::default()),
+        Arc::new(test_read_memory::TestReadMemory::default()).into(),
     )
     .unwrap()
     .nodes
@@ -411,14 +411,14 @@ enum TraversalRoute {
 
 struct WitnessSnapshot {
     entries: Arc<Vec<contextdb_graph::GraphAdjEntry>>,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
     reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct WitnessCursor {
     entries: Arc<Vec<contextdb_graph::GraphAdjEntry>>,
     position: usize,
-    memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+    memory: contextdb_core::read_memory::ReadMemoryOwner,
     reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -542,7 +542,7 @@ fn assert_owned_traversal_row(route: TraversalRoute) {
                             if matches!(route, TraversalRoute::Source) {
                                 Some(Arc::new(WitnessSnapshot {
                                     entries: entries.clone(),
-                                    memory: memory.clone(),
+                                    memory: memory.clone().into(),
                                     reads: reads.clone(),
                                 }))
                             } else {
@@ -808,7 +808,7 @@ impl contextdb_graph::GraphReadSource for WitnessSource {
     fn capture(
         &self,
         _snapshot: contextdb_core::SnapshotId,
-        memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<Arc<dyn contextdb_graph::GraphSnapshot>> {
         Ok(Arc::new(WitnessSnapshot {
             entries: self.entries.clone(),
@@ -878,7 +878,7 @@ fn logical_neighbors_use_the_first_visible_canonical_witness() {
                             None,
                             direction,
                             SnapshotId(snapshot),
-                            Arc::new(test_read_memory::TestReadMemory::default()),
+                            Arc::new(test_read_memory::TestReadMemory::default()).into(),
                         )
                         .unwrap();
                     assert_eq!(
@@ -1097,7 +1097,7 @@ fn different_length_owner_names_have_one_durable_order_in_memory_and_source() {
                 None,
                 Direction::Outgoing,
                 SnapshotId(10),
-                memory,
+                memory.into(),
             )
             .unwrap();
         assert_eq!(
@@ -1171,7 +1171,7 @@ fn mixed_committed_and_staged_streams_coalesce_only_after_canonical_merge() {
                             .then(|| {
                                 Arc::new(WitnessSnapshot {
                                     entries: Arc::new(committed),
-                                    memory,
+                                    memory: memory.into(),
                                     reads: reads.clone(),
                                 })
                                     as Arc<dyn contextdb_graph::GraphSnapshot>
@@ -1366,7 +1366,7 @@ fn mixed_lane_lookaheads_release_on_refusal_and_cursor_drop() {
             let reads = Arc::new(AtomicUsize::new(0));
             let source = Arc::new(WitnessSnapshot {
                 entries: Arc::new(committed),
-                memory,
+                memory: memory.into(),
                 reads: reads.clone(),
             });
             let mut cursor = exec

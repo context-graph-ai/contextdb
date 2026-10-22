@@ -35,7 +35,7 @@ impl WriteSetApplicator for MockStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        _read_memory: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<()> {
         self.applied.lock().push(ws.clone());
         Ok(())
