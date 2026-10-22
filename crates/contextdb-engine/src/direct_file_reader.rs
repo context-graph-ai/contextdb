@@ -1199,7 +1199,7 @@ fn execute_on_backend_neutral_target(
     crate::executor::bounded::with_request_read_memory(
         request,
         crate::read_image::history_answer_error,
-        |read_memory| {
+        |read_memory, native_trace_refund| {
             let constructed = reader.target.read_query(
                 sql,
                 params,
@@ -1207,6 +1207,7 @@ fn execute_on_backend_neutral_target(
                 reader.limits,
                 Arc::clone(&reader.clock),
                 cancellation,
+                native_trace_refund.as_ref(),
             )?;
             let result = publish_direct_result(
                 reader.retained_source.registration(),
@@ -1265,7 +1266,7 @@ fn open_cursor_on_backend_neutral_target(
     crate::executor::bounded::with_request_read_memory(
         request,
         crate::read_image::history_answer_error,
-        |read_memory| {
+        |read_memory, native_trace_refund| {
             let constructed = Arc::clone(&reader.target).open_read_cursor(
                 sql,
                 params,
@@ -1274,6 +1275,8 @@ fn open_cursor_on_backend_neutral_target(
                 Arc::clone(&reader.clock),
                 cancellation,
                 reader.image.snapshot,
+                native_trace_refund.as_ref(),
+                native_trace_refund.as_ref(),
             )?;
             let observation = reader.clock.now_ms();
             let opened = DirectCursorOpen {

@@ -36532,9 +36532,19 @@ impl Database {
         let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
             "Database::execute");
         let child = self.ordinary_read_child()?;
-        crate::executor::bounded::with_native_read_memory(child, |read_memory| {
-            self.execute_with_read_memory(sql, params, read_memory)
-        })
+        crate::executor::bounded::with_native_read_memory(
+            child,
+            |read_memory, native_trace_refund| {
+                QueryResult::publish_with(read_memory.clone(), || {
+                    self.execute_owned_with_native_trace_refund(
+                        sql,
+                        params,
+                        read_memory,
+                        Some(&native_trace_refund),
+                    )
+                })
+            },
+        )
     }
 
     /// Acquire the built-in ordinary reader before any answer or vector setup.
@@ -36616,6 +36626,20 @@ impl Database {
         params: &HashMap<String, Value>,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        self.execute_owned_with_native_trace_refund(sql, params, read_memory, None)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "The existing inline native refusal is preserved without allocating an error."
+    )]
+    pub(crate) fn execute_owned_with_native_trace_refund(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
+    ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         #[cfg(test)]
@@ -36636,6 +36660,7 @@ impl Database {
                 params,
                 &mut answer_copy.owner,
                 read_memory.clone(),
+                native_trace_refund,
             );
             scope.finish(&mut result);
             if result.is_ok() {
@@ -36655,6 +36680,7 @@ impl Database {
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -36865,6 +36891,7 @@ impl Database {
                 preopened_autocommit_tx,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             )
         });
 
@@ -37316,6 +37343,7 @@ impl Database {
         preopened_autocommit_tx: Option<TxId>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -37335,13 +37363,14 @@ impl Database {
                     let _write_gate = self.enter_sql_write_control_bypass(tx);
                     let snapshot = self.snapshot_for_read();
                     self.with_snapshot_override(snapshot, || {
-                        execute_plan(
+                        crate::executor::execute_plan_with_native_trace_refund(
                             self,
                             plan,
                             params,
                             Some(tx),
                             vector_copy_owner,
                             read_memory.clone(),
+                            native_trace_refund,
                         )
                     })
                 };
@@ -37388,6 +37417,7 @@ impl Database {
                     snapshot,
                     vector_copy_owner,
                     read_memory.clone(),
+                    native_trace_refund,
                 )
             }
         }
@@ -37414,17 +37444,19 @@ impl Database {
         snapshot: SnapshotId,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         if !crate::executor::bounded::kernel_can_answer(plan) {
-            return execute_plan(
+            return crate::executor::execute_plan_with_native_trace_refund(
                 self,
                 plan,
                 params,
                 tx,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             );
         }
         let clock: Arc<dyn contextdb_core::read_contract::DeadlineClock> =
@@ -37433,7 +37465,7 @@ impl Database {
         // Sources the kernel shares with the eager path bump it as they read,
         // so the drain contributes part of its own figure on the way through.
         let examined_before = self.this_statements_rows_examined();
-        let drained = crate::executor::bounded::drain_chosen_plan(
+        let drained = crate::executor::bounded::drain_chosen_plan_with_native_trace_refund(
             self,
             plan,
             params,
@@ -37448,6 +37480,7 @@ impl Database {
             Self::read_execution_kernel_probe_for_test()
                 .map(crate::executor::bounded_read_test_support::kernel_probe),
             read_memory.clone(),
+            native_trace_refund,
         );
         match drained {
             Ok(result) => {
@@ -38934,11 +38967,20 @@ impl Database {
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
         let child = self.ordinary_read_child()?;
-        crate::executor::bounded::with_native_read_memory(child, |read_memory| {
-            QueryResult::publish_with(read_memory.clone(), || {
-                self.execute_in_tx_with_read_memory(tx, sql, params, read_memory)
-            })
-        })
+        crate::executor::bounded::with_native_read_memory(
+            child,
+            |read_memory, native_trace_refund| {
+                QueryResult::publish_with(read_memory.clone(), || {
+                    self.execute_in_tx_with_native_trace_refund(
+                        tx,
+                        sql,
+                        params,
+                        read_memory,
+                        Some(&native_trace_refund),
+                    )
+                })
+            },
+        )
     }
 
     #[expect(
@@ -38951,6 +38993,21 @@ impl Database {
         sql: &str,
         params: &HashMap<String, Value>,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<OwnedQueryResult> {
+        self.execute_in_tx_with_native_trace_refund(tx, sql, params, read_memory, None)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "The existing inline native refusal is preserved without allocating an error."
+    )]
+    pub(crate) fn execute_in_tx_with_native_trace_refund(
+        &self,
+        tx: TxId,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -38968,6 +39025,7 @@ impl Database {
                 params,
                 &mut answer_copy.owner,
                 read_memory.clone(),
+                native_trace_refund,
             );
             scope.finish(&mut result);
             if result.is_ok() {
@@ -39019,6 +39077,7 @@ impl Database {
         params: &HashMap<String, Value>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -39143,6 +39202,7 @@ impl Database {
                 None,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             )
         })
     }
@@ -40970,6 +41030,7 @@ impl Database {
         mut preopened_autocommit_tx: Option<TxId>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -41047,6 +41108,7 @@ impl Database {
                     skip_static_dml_validation,
                     vector_copy_owner,
                     read_memory.clone(),
+                    native_trace_refund,
                 );
             }
 
@@ -41074,6 +41136,7 @@ impl Database {
                 false,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             )
         })();
         if result.is_err() {
@@ -41129,6 +41192,7 @@ impl Database {
         skip_static_dml_validation: bool,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -41180,6 +41244,7 @@ impl Database {
                         snapshot,
                         vector_copy_owner,
                         read_memory.clone(),
+                        native_trace_refund,
                     )
                 });
                 if let Some(checkpoint) = checkpoint {
@@ -41197,6 +41262,7 @@ impl Database {
                 preopened_autocommit_tx,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             ),
         };
         if result.is_ok()
@@ -68141,6 +68207,7 @@ impl Database {
                 snapshot,
                 vector_copy_owner,
                 read_memory.clone(),
+                None,
             )?;
             let row_id_column = result
                 .columns
@@ -72829,11 +72896,20 @@ impl Database {
         snapshot: SnapshotId,
     ) -> Result<QueryResult> {
         let child = self.ordinary_read_child()?;
-        crate::executor::bounded::with_native_read_memory(child, |read_memory| {
-            QueryResult::publish_with(read_memory.clone(), || {
-                self.execute_at_snapshot_with_read_memory(sql, params, snapshot, read_memory)
-            })
-        })
+        crate::executor::bounded::with_native_read_memory(
+            child,
+            |read_memory, native_trace_refund| {
+                QueryResult::publish_with(read_memory.clone(), || {
+                    self.execute_at_snapshot_with_native_trace_refund(
+                        sql,
+                        params,
+                        snapshot,
+                        read_memory,
+                        Some(&native_trace_refund),
+                    )
+                })
+            },
+        )
     }
 
     #[expect(
@@ -72847,11 +72923,31 @@ impl Database {
         snapshot: SnapshotId,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<OwnedQueryResult> {
+        self.execute_at_snapshot_with_native_trace_refund(sql, params, snapshot, read_memory, None)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "The existing inline native refusal is preserved without allocating an error."
+    )]
+    pub(crate) fn execute_at_snapshot_with_native_trace_refund(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        snapshot: SnapshotId,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
+    ) -> Result<OwnedQueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let _intent = self.vector_historical_read_intent(snapshot, read_memory.clone());
         self.with_snapshot_override(snapshot, || {
-            self.execute_owned_with_read_memory(sql, params, read_memory.clone())
+            self.execute_owned_with_native_trace_refund(
+                sql,
+                params,
+                read_memory.clone(),
+                native_trace_refund,
+            )
         })
     }
 

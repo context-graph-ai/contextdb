@@ -3263,7 +3263,8 @@ pub(crate) fn explained_statement(
             sql,
         });
     }
-    let answered = target.read_query(&sql, params, read_memory, limits, clock, cancellation)?;
+    let answered =
+        target.read_query(&sql, params, read_memory, limits, clock, cancellation, None)?;
     Ok(DirectMetadataBody::Explain {
         physical_plan: answered.0.trace.physical_plan.to_owned(),
         index: answered.0.trace.index_used.clone(),

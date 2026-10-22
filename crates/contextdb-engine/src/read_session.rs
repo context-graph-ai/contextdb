@@ -3042,19 +3042,21 @@ impl ReadSession {
                 crate::executor::bounded::with_request_read_memory(
                     request,
                     |error| error,
-                    |read_memory| {
-                        let executed = crate::executor::execute_bounded_on_target(
-                            reader.execution_target().as_ref(),
-                            sql,
-                            params,
-                            read_memory,
-                            self.options.limits,
-                            self.session_clock(),
-                            cancellation.clone(),
-                            #[cfg(any(test, feature = "test-seams"))]
-                            self.kernel_probe(ReadSessionOperation::Execute, cancellation),
-                        )
-                        .map_err(read_error)?;
+                    |read_memory, native_trace_refund| {
+                        let executed =
+                            crate::executor::execute_bounded_on_target_with_native_trace_refund(
+                                reader.execution_target().as_ref(),
+                                sql,
+                                params,
+                                read_memory,
+                                self.options.limits,
+                                self.session_clock(),
+                                cancellation.clone(),
+                                #[cfg(any(test, feature = "test-seams"))]
+                                self.kernel_probe(ReadSessionOperation::Execute, cancellation),
+                                native_trace_refund.as_ref(),
+                            )
+                            .map_err(read_error)?;
                         reader.publish_bounded_result(&executed.publication, executed.result)
                     },
                 )
@@ -3767,9 +3769,9 @@ impl ReadSession {
                 let opened = crate::executor::bounded::with_request_read_memory(
                     request,
                     |error| error,
-                    |read_memory| {
+                    |read_memory, native_trace_refund| {
                         crate::owned_cursor_page::with_public_page(|| {
-                            crate::executor::open_bounded_cursor(
+                            crate::executor::open_bounded_cursor_with_native_trace_refund(
                                 Arc::clone(database),
                                 sql,
                                 params,
@@ -3779,6 +3781,7 @@ impl ReadSession {
                                 cancellation.clone(),
                                 #[cfg(any(test, feature = "test-seams"))]
                                 self.kernel_probe(ReadSessionOperation::CursorOpen, cancellation),
+                                native_trace_refund.as_ref(),
                             )
                         })
                         .map_err(read_error)

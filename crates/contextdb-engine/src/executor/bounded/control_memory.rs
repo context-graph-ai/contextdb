@@ -254,6 +254,76 @@ impl Drop for QueryDecodeScope<'_> {
     }
 }
 
+/// Refund authority minted only from a sealed native request/adapter.
+/// Cloning retains its original child; it allocates no additional control.
+#[derive(Clone)]
+pub(crate) struct NativeTraceRefund {
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+}
+impl NativeTraceRefund {
+    pub(super) fn from_operation(operation: &crate::owner_read::NativeReadRequest) -> Self {
+        Self {
+            owner: operation.owner(),
+        }
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Keep the existing inline original refusal fields."
+    )]
+    fn admit_original(
+        &self,
+        forwarder: &contextdb_core::read_memory::ReadMemoryOwner,
+        bytes: usize,
+        operation: &'static str,
+    ) -> Result<ReadCredit> {
+        let original = self.owner.clone();
+        forwarder.try_reserve(
+            bytes,
+            "bounded_read",
+            operation,
+            "Release retained read controls or raise MEMORY_LIMIT.",
+        )?;
+        // This is the first invoice for the successful original reserve.
+        // Only this sealed capability can supply its same-counter refund.
+        Ok(ReadCredit::from_prepaid_owned(original, bytes))
+    }
+}
+impl<T> ControlArc<T> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Keep the existing inline original refusal fields."
+    )]
+    pub(super) fn admit_with_native_refund(
+        forwarder: &contextdb_core::read_memory::ReadMemoryOwner,
+        refund: &NativeTraceRefund,
+    ) -> Result<ReadShared<ReadCredit>> {
+        #[cfg(all(test, feature = "test-seams"))]
+        crate::database::ordinary_native_owner_tests::trace_admission_begin(
+            refund.owner.accounting_identity(),
+        );
+        let keeper = refund.admit_original(
+            forwarder,
+            ReadShared::<ReadCredit>::layout().size(),
+            "control_keeper",
+        )?;
+        let payload = refund.admit_original(forwarder, Self::arc_bytes()?, "request_control")?;
+        #[cfg(feature = "test-seams")]
+        crate::vector_read_memory::statement_child_proof::funding_next(
+            payload.original_payer_for_test(),
+        );
+        let invoice = ReadShared::try_from_prepaid(payload, keeper)?;
+        #[cfg(all(test, feature = "test-seams"))]
+        crate::database::ordinary_native_owner_tests::trace_control_allocated(
+            0,
+            &*invoice as *const ReadCredit as usize,
+            ReadShared::<ReadCredit>::layout(),
+            invoice.original_payer_identity_for_test(),
+            invoice.invoice().bytes(),
+        );
+        Ok(invoice)
+    }
+}
+
 /// The existing Native child, adapted only for the Arc-based kernel. This
 /// forwarding allocation never acquires an owner, token, deadline or counter.
 pub(super) struct NativeKernelBudget {
@@ -314,6 +384,11 @@ impl Drop for NativeKernelBudget {
     }
 }
 impl NativeKernelBudget {
+    pub(super) fn trace_refund(&self) -> NativeTraceRefund {
+        NativeTraceRefund {
+            owner: self.owner.clone(),
+        }
+    }
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

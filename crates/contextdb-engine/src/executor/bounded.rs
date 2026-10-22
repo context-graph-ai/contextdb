@@ -27,6 +27,7 @@ mod vector_search_receipt;
 
 mod control_memory;
 mod grouped_count;
+pub(crate) use control_memory::NativeTraceRefund;
 use control_memory::{ControlArc, ControlWeak, NativeKernelBudget, QueryVectorDecode};
 
 #[cfg(all(test, feature = "test-seams"))]
@@ -48,10 +49,11 @@ pub(crate) fn ordinary_native_control_layouts_for_test() -> [std::alloc::Layout;
 )]
 pub(crate) fn with_native_read_memory<T>(
     child: crate::vector_read_memory::NativeReadChildReceipt,
-    execute: impl FnOnce(contextdb_core::read_memory::ReadMemoryOwner) -> Result<T>,
+    execute: impl FnOnce(contextdb_core::read_memory::ReadMemoryOwner, NativeTraceRefund) -> Result<T>,
 ) -> Result<T> {
     let control = NativeKernelBudget::try_from_child(child)?;
-    execute((*control).clone().into())
+    let refund = control.trace_refund();
+    execute((*control).clone().into(), refund)
 }
 
 /// Preserve the provider's selected owner route for one ordinary query.
@@ -61,13 +63,16 @@ pub(crate) fn with_native_read_memory<T>(
 pub(crate) fn with_request_read_memory<T, E>(
     request: crate::vector_read_memory::RequestReadOwner,
     map_error: impl FnOnce(Error) -> E,
-    execute: impl FnOnce(contextdb_core::read_memory::ReadMemoryOwner) -> std::result::Result<T, E>,
+    execute: impl FnOnce(
+        contextdb_core::read_memory::ReadMemoryOwner,
+        Option<NativeTraceRefund>,
+    ) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
     match request.into_route() {
-        crate::vector_read_memory::RequestReadRoute::Legacy(owner) => execute(owner.into()),
+        crate::vector_read_memory::RequestReadRoute::Legacy(owner) => execute(owner.into(), None),
         crate::vector_read_memory::RequestReadRoute::Native(child) => {
             let control = NativeKernelBudget::try_from_child(child).map_err(map_error)?;
-            execute((*control).clone().into())
+            execute((*control).clone().into(), Some(control.trace_refund()))
         }
     }
 }
@@ -359,6 +364,17 @@ impl TraceMemoryOwner {
     pub(super) fn try_new(
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ControlArc<Self>> {
+        Self::try_new_with_native_refund(owner, None)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "The existing inline native refusal is preserved without allocating an error."
+    )]
+    pub(super) fn try_new_with_native_refund(
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
+    ) -> Result<ControlArc<Self>> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
         // The underlying provider's invoice does not price this forwarding Arc.
@@ -369,7 +385,10 @@ impl TraceMemoryOwner {
         let before = observer
             .as_ref()
             .map(|original| original.sample().charged_bytes);
-        let invoice = ControlArc::<Self>::admit(owner.clone())?;
+        let invoice = match native_trace_refund {
+            Some(refund) => ControlArc::<Self>::admit_with_native_refund(&owner, refund)?,
+            None => ControlArc::<Self>::admit(owner.clone())?,
+        };
         let underlying = owner.control_invoice();
         let control = ControlArc::from_prepaid(
             Self {
@@ -379,6 +398,16 @@ impl TraceMemoryOwner {
             },
             invoice,
         );
+        #[cfg(all(test, feature = "test-seams"))]
+        if native_trace_refund.is_some() {
+            crate::database::ordinary_native_owner_tests::trace_control_allocated(
+                1,
+                Arc::as_ptr(&*control) as usize,
+                ControlArc::<Self>::arc_layout()?,
+                control.invoice.original_payer_identity_for_test(),
+                control.invoice.bytes(),
+            );
+        }
         #[cfg(any(test, feature = "test-seams"))]
         if let Some(original) = observer {
             let layout = ControlArc::<Self>::arc_layout()?;
@@ -538,6 +567,7 @@ struct RequestContext {
     /// The caller-supplied budget retained by this executing request.
     reader_budget: contextdb_core::read_memory::ReadMemoryOwner,
     _native_budget_control: Option<contextdb_core::read_memory::ReadShared<ReadCredit>>,
+    native_trace_refund: Option<NativeTraceRefund>,
     /// Bound-range sizes of tied index candidates, probed once per request so
     /// preflight, ordering and build choose the same index.
     index_ranges: crate::executor::IndexRangeMemo,
@@ -650,6 +680,7 @@ impl ReadOpenContext {
             None,
             #[cfg(any(test, feature = "test-seams"))]
             None,
+            None,
         )
         .map(Self)
         .map_err(Self::engine_error)
@@ -746,6 +777,7 @@ impl RequestContext {
         cancellation: OwnerReadCancellation,
         transaction: Option<TxId>,
         #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> std::result::Result<ControlArc<Self>, BoundedExecutionError> {
         let reader_budget: contextdb_core::read_memory::ReadMemoryOwner = reader_budget.into();
 
@@ -760,6 +792,7 @@ impl RequestContext {
             None,
             #[cfg(any(test, feature = "test-seams"))]
             probe,
+            native_trace_refund.cloned(),
         )
     }
 
@@ -777,9 +810,15 @@ impl RequestContext {
         native_operation: Option<crate::owner_read::NativeReadRequest>,
         original_started_ms: Option<u64>,
         #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+        native_trace_refund: Option<NativeTraceRefund>,
     ) -> std::result::Result<ControlArc<Self>, BoundedExecutionError> {
         let reader_budget: contextdb_core::read_memory::ReadMemoryOwner = reader_budget.into();
 
+        let native_trace_refund = native_trace_refund.or_else(|| {
+            native_operation
+                .as_ref()
+                .map(NativeTraceRefund::from_operation)
+        });
         Self::check_effective_limits(&limits)?;
         let started_ms = original_started_ms.unwrap_or_else(|| clock.now_ms());
         let counter_bytes = ControlArc::<std::sync::atomic::AtomicUsize>::control_bytes()?;
@@ -869,6 +908,7 @@ impl RequestContext {
                 live_source_pages,
                 reader_budget,
                 _native_budget_control: native_budget_control,
+                native_trace_refund,
                 #[cfg(any(test, feature = "test-seams"))]
                 probe: Mutex::new(probe),
             }
@@ -2443,7 +2483,10 @@ impl RequestContext {
             &self.reader_budget,
             trace.allocation_invoice_for_test(),
         );
-        let owner_control = TraceMemoryOwner::try_new(self.reader_budget.clone())?;
+        let owner_control = TraceMemoryOwner::try_new_with_native_refund(
+            self.reader_budget.clone(),
+            self.native_trace_refund.as_ref(),
+        )?;
         let owner: contextdb_vector::MemoryBudgetOwner = (*owner_control).clone().into();
         #[cfg(all(test, feature = "test-seams"))]
         crate::database::retained_trace_ownership_tests::finish_owner_window(owner_window);
@@ -19048,6 +19091,35 @@ pub(crate) fn drain_chosen_plan(
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::result::Result<crate::database::OwnedQueryResult, BoundedExecutionError> {
+    drain_chosen_plan_with_native_trace_refund(
+        db,
+        plan,
+        params,
+        tx,
+        snapshot,
+        clock,
+        #[cfg(any(test, feature = "test-seams"))]
+        probe,
+        read_memory,
+        None,
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "The existing inline native refusal is preserved without allocating an error."
+)]
+pub(crate) fn drain_chosen_plan_with_native_trace_refund(
+    db: &dyn ReadExecutionTarget,
+    plan: &PhysicalPlan,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    snapshot: SnapshotId,
+    clock: Arc<dyn DeadlineClock>,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
+) -> std::result::Result<crate::database::OwnedQueryResult, BoundedExecutionError> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     // These fixed control answers remain available when the operator has
@@ -19075,6 +19147,7 @@ pub(crate) fn drain_chosen_plan(
         tx,
         #[cfg(any(test, feature = "test-seams"))]
         probe,
+        native_trace_refund,
     )?;
     let _vector_read = enter_vector_read(db, snapshot, &context, plan_needs_vector_read(plan))?;
     let params = Arc::new(params.clone());
@@ -19380,6 +19453,35 @@ pub(super) fn execute(
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
+    execute_with_native_trace_refund(
+        db,
+        sql,
+        params,
+        read_memory,
+        limits,
+        clock,
+        cancellation,
+        #[cfg(any(test, feature = "test-seams"))]
+        probe,
+        None,
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "The existing inline native refusal is preserved without allocating an error."
+)]
+pub(super) fn execute_with_native_trace_refund(
+    db: &dyn ReadExecutionTarget,
+    sql: &str,
+    params: &HashMap<String, Value>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    cancellation: OwnerReadCancellation,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
+) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut release_proofs = StatementProofReuse {
@@ -19401,6 +19503,7 @@ pub(super) fn execute(
             db.active_read_transaction(),
             #[cfg(any(test, feature = "test-seams"))]
             probe,
+            native_trace_refund,
         )?;
         let schema_capture = db.capture_read_schema();
         let membership_capture = (!db.retained_relational_membership_source())
@@ -20733,6 +20836,35 @@ pub(super) fn open_cursor(
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
+    open_cursor_with_native_trace_refund(
+        db,
+        sql,
+        params,
+        read_memory,
+        limits,
+        clock,
+        cancellation,
+        #[cfg(any(test, feature = "test-seams"))]
+        probe,
+        None,
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "The existing inline native refusal is preserved without allocating an error."
+)]
+pub(super) fn open_cursor_with_native_trace_refund(
+    db: Arc<dyn ReadExecutionTarget>,
+    sql: &str,
+    params: &HashMap<String, Value>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    cancellation: OwnerReadCancellation,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
+) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     // Consume the public door's marker before plugin/source callbacks can
@@ -20752,6 +20884,7 @@ pub(super) fn open_cursor(
             db.active_read_transaction(),
             #[cfg(any(test, feature = "test-seams"))]
             probe,
+            native_trace_refund,
         )?;
         if CAPTURE_CURSOR_OPEN_CONTEXT.with(Cell::get) {
             CURSOR_OPEN_CONTEXT.with(|slot| *slot.borrow_mut() = Some(context.clone()));
@@ -22254,6 +22387,7 @@ mod cursor_replay_budget_tests {
             OwnerReadCancellation::new(),
             None,
             None,
+            None,
         )
         .unwrap();
         with_cursor_replay_budget(limits, clock, 0, 0, 0, || {
@@ -22299,6 +22433,7 @@ mod cursor_replay_budget_tests {
                 ReadResumption::AcrossFetches,
                 clock.clone(),
                 OwnerReadCancellation::new(),
+                None,
                 None,
                 None,
             )
@@ -22576,6 +22711,7 @@ impl NativeReadExecutionEntry {
             Some(operation.share()),
             Some(started_ms),
             #[cfg(any(test, feature = "test-seams"))]
+            None,
             None,
         )
         .map_err(ReadOpenContext::engine_error)

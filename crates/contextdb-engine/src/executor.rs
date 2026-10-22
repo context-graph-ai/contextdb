@@ -1578,6 +1578,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> std::result::Result<
         (
             OwnedQueryResult,
@@ -1607,6 +1608,7 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
         snapshot: crate::direct_file_reader::DirectSnapshot,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> std::result::Result<
         (
             Arc<dyn ReadExecutionTarget>,
@@ -3137,6 +3139,7 @@ impl ReadExecutionTarget for Database {
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> std::result::Result<
         (
             OwnedQueryResult,
@@ -3148,7 +3151,7 @@ impl ReadExecutionTarget for Database {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_cancellation(crate::read_probe::CANCELLATION_EXECUTE, cancellation);
         let complete = read_answer(read_memory.clone(), || {
-            bounded::execute(
+            bounded::execute_with_native_trace_refund(
                 self,
                 sql,
                 params,
@@ -3158,6 +3161,7 @@ impl ReadExecutionTarget for Database {
                 cancellation.clone(),
                 #[cfg(any(test, feature = "test-seams"))]
                 crate::read_session::session_kernel_probe_for_test(),
+                native_trace_refund,
             )
         })?;
         let encoding_diagnostic = contextdb_core::error::DiagnosticText::try_prepare_shared::<
@@ -3192,6 +3196,7 @@ impl ReadExecutionTarget for Database {
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
         snapshot: crate::direct_file_reader::DirectSnapshot,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> std::result::Result<
         (
             Arc<dyn ReadExecutionTarget>,
@@ -3208,7 +3213,7 @@ impl ReadExecutionTarget for Database {
         );
         let store: Arc<dyn ReadExecutionTarget> = self;
         let opened = read_answer(read_memory.clone(), || {
-            bounded::open_cursor(
+            bounded::open_cursor_with_native_trace_refund(
                 Arc::clone(&store),
                 sql,
                 params,
@@ -3218,6 +3223,7 @@ impl ReadExecutionTarget for Database {
                 cancellation.clone(),
                 #[cfg(any(test, feature = "test-seams"))]
                 crate::read_session::session_kernel_probe_for_test(),
+                native_trace_refund,
             )
         })?;
         let retained = opened.cursor.retained_read_bytes();
@@ -3343,10 +3349,11 @@ fn execute_kernel_plan(
     params: &HashMap<String, Value>,
     tx: Option<TxId>,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
 ) -> Result<OwnedQueryResult> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-    bounded::drain_chosen_plan(
+    bounded::drain_chosen_plan_with_native_trace_refund(
         db,
         plan,
         params,
@@ -3356,6 +3363,7 @@ fn execute_kernel_plan(
         #[cfg(any(test, feature = "test-seams"))]
         None,
         read_memory,
+        native_trace_refund,
     )
     .map_err(|error| match error {
         BoundedExecutionError::Engine(error) => error,
@@ -3379,10 +3387,34 @@ pub(crate) fn execute_plan(
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<OwnedQueryResult> {
+    execute_plan_with_native_trace_refund(
+        db,
+        plan,
+        params,
+        tx,
+        vector_copy_owner,
+        read_memory,
+        None,
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "The existing inline native refusal is preserved without allocating an error."
+)]
+pub(crate) fn execute_plan_with_native_trace_refund(
+    db: &Database,
+    plan: &PhysicalPlan,
+    params: &HashMap<String, Value>,
+    tx: Option<TxId>,
+    vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
+) -> Result<OwnedQueryResult> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     if plan_contains_window(plan) {
-        return execute_kernel_plan(db, plan, params, tx, read_memory);
+        return execute_kernel_plan(db, plan, params, tx, read_memory, native_trace_refund);
     }
     execute_plan_with_materialized_columns(
         db,
@@ -3393,6 +3425,7 @@ pub(crate) fn execute_plan(
         None,
         vector_copy_owner,
         read_memory.clone(),
+        native_trace_refund,
     )
 }
 
@@ -3409,6 +3442,7 @@ fn execute_plan_with_materialized_columns(
     pending_sort_keys: Option<&[contextdb_planner::SortKey]>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
 ) -> Result<OwnedQueryResult> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -3422,6 +3456,7 @@ fn execute_plan_with_materialized_columns(
             pending_sort_keys,
             vector_copy_owner,
             read_memory.clone(),
+            native_trace_refund,
         ) {
             Err(Error::Other(message)) if message == RETRY_LOCAL_SCHEMA_PROJECTION => continue,
             result => return result,
@@ -3486,9 +3521,7 @@ pub(crate) fn execute_bounded_on_target(
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
-    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-    bounded::execute(
+    execute_bounded_on_target_with_native_trace_refund(
         db,
         sql,
         params,
@@ -3498,6 +3531,38 @@ pub(crate) fn execute_bounded_on_target(
         cancellation,
         #[cfg(any(test, feature = "test-seams"))]
         probe,
+        None,
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "The existing inline native refusal is preserved without allocating an error."
+)]
+pub(crate) fn execute_bounded_on_target_with_native_trace_refund(
+    db: &dyn ReadExecutionTarget,
+    sql: &str,
+    params: &HashMap<String, Value>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    cancellation: OwnerReadCancellation,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
+) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    bounded::execute_with_native_trace_refund(
+        db,
+        sql,
+        params,
+        read_memory,
+        limits,
+        clock,
+        cancellation,
+        #[cfg(any(test, feature = "test-seams"))]
+        probe,
+        native_trace_refund,
     )
 }
 
@@ -3519,9 +3584,7 @@ pub(crate) fn open_bounded_cursor(
     cancellation: OwnerReadCancellation,
     #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
 ) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
-    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-    bounded::open_cursor(
+    open_bounded_cursor_with_native_trace_refund(
         db,
         sql,
         params,
@@ -3531,6 +3594,38 @@ pub(crate) fn open_bounded_cursor(
         cancellation,
         #[cfg(any(test, feature = "test-seams"))]
         probe,
+        None,
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "The existing inline native refusal is preserved without allocating an error."
+)]
+pub(crate) fn open_bounded_cursor_with_native_trace_refund(
+    db: Arc<Database>,
+    sql: &str,
+    params: &HashMap<String, Value>,
+    read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    limits: ReadLimits,
+    clock: Arc<dyn DeadlineClock>,
+    cancellation: OwnerReadCancellation,
+    #[cfg(any(test, feature = "test-seams"))] probe: Option<Arc<dyn BoundedExecutionProbe>>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
+) -> std::result::Result<BoundedCursorOpen, BoundedExecutionError> {
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+
+    bounded::open_cursor_with_native_trace_refund(
+        db,
+        sql,
+        params,
+        read_memory,
+        limits,
+        clock,
+        cancellation,
+        #[cfg(any(test, feature = "test-seams"))]
+        probe,
+        native_trace_refund,
     )
 }
 
@@ -6527,6 +6622,7 @@ fn execute_plan_once(
     pending_sort_keys: Option<&[contextdb_planner::SortKey]>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
 ) -> Result<OwnedQueryResult> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -24261,6 +24357,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         limits: ReadLimits,
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> std::result::Result<
         (
             OwnedQueryResult,
@@ -24269,8 +24366,16 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         ),
         crate::direct_file_reader::DirectFileReaderError,
     > {
-        self.store
-            .read_query(sql, params, read_memory, limits, clock, cancellation)
+        self.store.read_query(
+            sql,
+            params,
+            read_memory,
+            limits,
+            clock,
+            cancellation,
+            native_trace_refund,
+            native_trace_refund,
+        )
     }
 
     fn open_read_cursor(
@@ -24282,6 +24387,7 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         clock: Arc<dyn DeadlineClock>,
         cancellation: &OwnerReadCancellation,
         snapshot: crate::direct_file_reader::DirectSnapshot,
+        native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
     ) -> std::result::Result<
         (
             Arc<dyn ReadExecutionTarget>,
@@ -24299,6 +24405,8 @@ impl ReadExecutionTarget for BoundedCursorTarget {
             clock,
             cancellation,
             snapshot,
+            native_trace_refund,
+            native_trace_refund,
         )
     }
 
