@@ -161,6 +161,7 @@ impl ReaderRegistry {
         self.minimum = Some(self.minimum.map_or(id, |old| old.min(id)));
         Ok(())
     }
+    #[cfg(feature = "test-seams")]
     fn get(&self, id: &TransactionId) -> Option<&u64> {
         self.map.get(id)
     }

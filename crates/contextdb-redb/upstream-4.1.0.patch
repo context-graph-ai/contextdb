@@ -5058,7 +5058,6 @@ index 0000000..dc2ea0a
 +    }
 +}
 diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
-index 84e5d06..8f946b9 100644
 --- a/src/transaction_tracker.rs
 +++ b/src/transaction_tracker.rs
 @@ -1,13 +1,29 @@
@@ -5095,7 +5094,7 @@ index 84e5d06..8f946b9 100644
  
  #[derive(Copy, Clone, Hash, Ord, PartialOrd, Eq, PartialEq, Debug)]
  pub(crate) struct TransactionId(u64);
-@@ -74,12 +90,123 @@ impl Key for SavepointId {
+@@ -74,12 +90,124 @@
      }
  }
  
@@ -5170,6 +5169,7 @@ index 84e5d06..8f946b9 100644
 +        self.minimum = Some(self.minimum.map_or(id, |old| old.min(id)));
 +        Ok(())
 +    }
++    #[cfg(feature = "test-seams")]
 +    fn get(&self, id: &TransactionId) -> Option<&u64> {
 +        self.map.get(id)
 +    }
@@ -5220,7 +5220,7 @@ index 84e5d06..8f946b9 100644
      valid_savepoints: BTreeMap<SavepointId, TransactionId>,
      // Non-durable commits that are still in-memory, and waiting for a durable commit to get flushed
      // We need to make sure that the freed-table does not get processed for these, since they are not durable yet
-@@ -89,33 +216,342 @@ struct State {
+@@ -89,33 +217,342 @@
      pending_non_durable_commits: HashMap<TransactionId, TransactionId>,
      // Non-durable commits which have NOT been processed in the freed table
      unprocessed_freed_non_durable_commits: BTreeSet<TransactionId>,
@@ -5291,6 +5291,7 @@ index 84e5d06..8f946b9 100644
 +                external_snapshot_admission_complete: false,
              }),
              live_write_transaction_available: Condvar::new(),
+-        }
 +            external_snapshot_provider,
 +            local_snapshot_provider: std::sync::OnceLock::new(),
 +            external_snapshot_refresh: Mutex::new(()),
@@ -5298,9 +5299,9 @@ index 84e5d06..8f946b9 100644
 +            keep_pace_reclaim,
 +            #[cfg(feature = "test-seams")]
 +            table_write_observer: Default::default(),
-         }
-     }
- 
++        }
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn install_local_snapshot_provider(&self, provider: ExternalSnapshotProvider) {
 +        self.local_snapshot_provider.get_or_init(|| provider);
@@ -5552,8 +5553,8 @@ index 84e5d06..8f946b9 100644
 +            .into_iter()
 +            .filter(|(snapshot, _)| !local.contains(snapshot))
 +            .collect())
-+    }
-+
+     }
+ 
      pub(crate) fn start_write_transaction(&self) -> TransactionId {
          let mut state = self.state.lock().unwrap();
          while state.live_write_transaction.is_some() {
@@ -5563,18 +5564,18 @@ index 84e5d06..8f946b9 100644
          }
          assert!(state.live_write_transaction.is_none());
          let transaction_id = state.next_transaction_id.increment();
-@@ -126,6 +562,10 @@ impl TransactionTracker {
-         transaction_id
-     }
+@@ -124,6 +561,10 @@
+         state.live_write_transaction = Some(transaction_id);
  
-+    pub(crate) fn has_waiting_write_transactions(&self) -> bool {
-+        self.state.lock().unwrap().waiting_write_transactions > 0
+         transaction_id
 +    }
 +
++    pub(crate) fn has_waiting_write_transactions(&self) -> bool {
++        self.state.lock().unwrap().waiting_write_transactions > 0
+     }
+ 
      pub(crate) fn end_write_transaction(&self, id: TransactionId) {
-         let mut state = self.state.lock().unwrap();
-         assert_eq!(state.live_write_transaction.unwrap(), id);
-@@ -146,6 +586,9 @@ impl TransactionTracker {
+@@ -146,6 +587,9 @@
                  state.live_read_transactions.remove(&durable_ancestor);
              }
          }
@@ -5584,7 +5585,7 @@ index 84e5d06..8f946b9 100644
      }
  
      pub(crate) fn is_unprocessed_non_durable_commit(&self, id: TransactionId) -> bool {
-@@ -175,9 +618,8 @@ impl TransactionTracker {
+@@ -175,9 +619,8 @@
          let mut state = self.state.lock().unwrap();
          state
              .live_read_transactions
@@ -5596,7 +5597,7 @@ index 84e5d06..8f946b9 100644
          state
              .pending_non_durable_commits
              .insert(id, durable_ancestor);
-@@ -194,29 +636,91 @@ impl TransactionTracker {
+@@ -194,12 +637,41 @@
          let mut state = self.state.lock().unwrap();
          state
              .live_read_transactions
@@ -5608,8 +5609,8 @@ index 84e5d06..8f946b9 100644
          state
              .valid_savepoints
              .insert(savepoint.get_id(), savepoint.get_transaction_id());
-     }
- 
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn register_prepared_pin(
 +        &self, identity: StorageSnapshotIdentity, guard: &Arc<TransactionGuard>,
@@ -5638,11 +5639,10 @@ index 84e5d06..8f946b9 100644
 +            link = &mut link.as_mut().unwrap().next;
 +        }
 +        // Registration itself may have refused before linking this guard.
-+    }
-+
+     }
+ 
      pub(crate) fn register_read_transaction(
-         &self,
-         mem: &TransactionalMemory,
+@@ -208,13 +680,46 @@
      ) -> Result<TransactionId> {
          let mut state = self.state.lock()?;
          let id = mem.get_last_committed_transaction_id()?;
@@ -5654,8 +5654,8 @@ index 84e5d06..8f946b9 100644
 +        state.live_read_transactions.increment(id)?;
  
          Ok(id)
-     }
- 
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn capture_native_read(
 +        &self,
@@ -5691,12 +5691,10 @@ index 84e5d06..8f946b9 100644
 +            state.live_read_transactions.increment(captured.0)?;
 +        }
 +        Ok(captured)
-+    }
-+
+     }
+ 
      pub(crate) fn deallocate_read_transaction(&self, id: TransactionId) {
-         let mut state = self.state.lock().unwrap();
-         let ref_count = state.live_read_transactions.get_mut(&id).unwrap();
-@@ -224,6 +728,9 @@ impl TransactionTracker {
+@@ -224,6 +729,9 @@
          if *ref_count == 0 {
              state.live_read_transactions.remove(&id);
          }
@@ -5706,7 +5704,7 @@ index 84e5d06..8f946b9 100644
      }
  
      pub(crate) fn any_savepoint_exists(&self) -> bool {
-@@ -293,24 +800,61 @@ impl TransactionTracker {
+@@ -293,24 +801,61 @@
      }
  
      pub(crate) fn oldest_live_read_transaction(&self) -> Option<TransactionId> {
@@ -5768,14 +5766,16 @@ index 84e5d06..8f946b9 100644
 -            }
 -        }
 -        None
+-    }
+-}
 +        state
 +            .live_read_transactions
 +            .keys()
 +            .filter(|id| state.pending_non_durable_commits.contains_key(id))
 +            .copied()
 +            .min()
-     }
- }
++    }
++}
 diff --git a/src/transactions.rs b/src/transactions.rs
 index a303c86..d417d36 100644
 --- a/src/transactions.rs
