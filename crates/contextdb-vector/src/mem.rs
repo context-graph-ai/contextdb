@@ -3368,7 +3368,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Self {
             store,
             tx_mgr: ExecutorTransactions::Owned(transactions),
-            _accountant,
+            _accountant: accountant,
         }
     }
     #[doc(hidden)]
@@ -3424,7 +3424,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Self {
             store,
             tx_mgr: ExecutorTransactions::Legacy(tx_mgr),
-            _accountant,
+            _accountant: accountant,
         }
     }
 
