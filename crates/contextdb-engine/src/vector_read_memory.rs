@@ -3175,9 +3175,13 @@ pub mod statement_child_proof {
                 ACTIVE.with(|slot| slot.set(self.0));
             }
         }
-        static DIAGNOSTIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // The allocator observes this door too. getenv only borrows its static
+        // result; copying an enabled value via var_os would add an allocation
+        // to the exact zero-allocation refusal control.
+        // SAFETY: the process environment is read only during these test runs;
+        // the pointer is checked for presence and never retained or dereferenced.
         let diagnostic =
-            *DIAGNOSTIC.get_or_init(|| std::env::var_os("CONTEXTDB_NATIVE_PEAK_PHASES").is_some());
+            unsafe { !libc::getenv(c"CONTEXTDB_NATIVE_PEAK_PHASES".as_ptr()).is_null() };
         PEAK_COMPLETED.with(|slot| slot.set(None));
         CALL.with(|_| ());
         FORWARD.with(|_| ());

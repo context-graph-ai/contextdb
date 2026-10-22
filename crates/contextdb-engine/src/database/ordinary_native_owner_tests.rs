@@ -588,6 +588,8 @@ fn ordinary_sql_and_two_snapshots_retain_the_original_native_parent() {
             assert_eq!(routes.drained.load(Ordering::SeqCst), 1);
             assert_eq!(routes.eager.load(Ordering::SeqCst), 0);
             observation.assert_admitted();
+            observation.assert_live();
+            drop(answer);
             observation.assert_freed(&db);
         }
         // Cross the actual transport row default at its smallest boundary.
@@ -1073,5 +1075,169 @@ fn ordinary_native_physical_cut_rejects_missing_duplicate_early_wrong_and_extra_
         for cut in [missing, duplicate, early, wrong_payer, extra, wrong_layout] {
             assert!(!original_control_cut_is_complete(cut));
         }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn ordinary_answer_last_clone_preserves_actual_original_controls_through_physical_free() {
+    use crate::read_work_probe::allocator_events::Window;
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    for file in [false, true] {
+        let (_dir, db) = fixture(file);
+        sql(
+            &db,
+            "CREATE TABLE answer_rows (id INT PRIMARY KEY, revision INT)",
+        );
+        sql(&db, "INSERT INTO answer_rows VALUES (1,10)");
+        let old = db.snapshot();
+        sql(&db, "UPDATE answer_rows SET revision = 20 WHERE id = 1");
+        let new = db.snapshot();
+        let query = "SELECT revision FROM answer_rows WHERE id = 1";
+        sql(&db, query);
+        for (historical, snapshot, expected) in [(false, new, 20), (true, old, 10), (true, new, 20)]
+        {
+            for original_first in [false, true] {
+                let observation = Observation::begin(&db);
+                let window = Window::begin(
+                    &crate::executor::bounded::ordinary_native_control_layouts_for_test(),
+                )
+                .unwrap();
+                let (answer, _, _) = observed(&db, || {
+                    entry(&db, historical, query, &HashMap::new(), snapshot)
+                });
+                let answer = answer.unwrap();
+                let c = observation.assert_admitted();
+                let requests = std::array::from_fn::<_, 3, _>(|i| {
+                    window.live_request(c.requests[i].0).unwrap()
+                });
+                assert_eq!(answer.rows(), vec![vec![Value::Int64(expected)]]);
+                observation.assert_live();
+                let clone = answer.clone();
+                if original_first {
+                    drop(answer);
+                    observation.assert_live();
+                    drop(clone);
+                } else {
+                    drop(clone);
+                    observation.assert_live();
+                    drop(answer);
+                }
+                observation.assert_freed(&db);
+                let order = requests.map(|request| {
+                    window
+                        .physical_free_event_for_request(request)
+                        .unwrap()
+                        .unwrap()
+                });
+                let counters = oracle::source_free_for_test(3);
+                window.finish().unwrap();
+                assert!(
+                    order[2] < order[1] && order[1] < order[0],
+                    "actual forwarder/keeper/child physical-free order: {order:?}"
+                );
+                eprintln!(
+                    "actual_answer_last_clone file={file} historical={historical} original_first={original_first} requests={requests:?} order={order:?} counters={:?}",
+                    &counters[..3]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
+    use crate::read_work_probe::allocator_events::{FundingCounter, Window};
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    for file in [false, true] {
+        let (_dir, db) = fixture(file);
+        sql(
+            &db,
+            "CREATE TABLE answer_points (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE EXACT)",
+        );
+        let params = HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
+        db.execute("INSERT INTO answer_points VALUES (1,$q)", &params)
+            .unwrap();
+        let query =
+            "SELECT id FROM answer_points ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 1";
+        db.execute(query, &params).unwrap();
+        db.clear_last_vector_search_trace();
+        let parent = db.declared_read_memory_for_test();
+        let limit = parent.effective_limit_for_physical_test();
+        let observation = Observation::begin(&db);
+        let native_layouts = crate::executor::bounded::ordinary_native_control_layouts_for_test();
+        let mut layouts = [ReadShared::<OwnedQueryResult>::layout(); 4];
+        layouts[..3].copy_from_slice(&native_layouts);
+        let window = Window::begin(&layouts).unwrap();
+        let ((answer, _, _), sample) =
+            crate::vector_read_memory::statement_child_proof::observe(&parent, limit, || {
+                observed(&db, || {
+                    db.execute_at_snapshot(query, &params, db.snapshot())
+                })
+            });
+        let answer = answer.unwrap();
+        let c = observation.assert_admitted();
+        assert_eq!(c.trace_stages, 2);
+        let components = answer.original_charge_components_for_test();
+        let publication = window.live_request(components[0]).unwrap();
+        assert_eq!(publication.bytes, components[2]);
+        assert_eq!(
+            components[1], c.forwarding_payload,
+            "actual publication invoice retains the original forwarding payer"
+        );
+        let native_requests =
+            std::array::from_fn::<_, 3, _>(|i| window.live_request(c.requests[i].0).unwrap());
+        // SAFETY: this exact parent counter was bound at child construction;
+        // the original declared parent pin remains live throughout its watch.
+        let parent_counter = unsafe {
+            FundingCounter::from_parent_pinned(c.parent_counter, db.declared_read_memory.clone())
+        };
+        let publication_watch = window.watch(publication, parent_counter).unwrap();
+        let retained = db.last_vector_search_trace.write().take().unwrap();
+        let invoice = retained.complete_invoice_for_test(|_| {});
+        // SAFETY: both the public answer and retained trace retain this actual
+        // child now; the trace still pins it after the answer is dropped.
+        let before = unsafe { &*(c.child_counter as *const AtomicU64) }.load(Ordering::SeqCst);
+        assert_eq!(sample.identity.target_last_held, before);
+        let trace_due = c.requests[1..].iter().map(|r| r.1).sum::<usize>()
+            + c.trace_requests.iter().map(|r| r.1).sum::<usize>()
+            + invoice.prepaid_bytes
+            + invoice.additional_bytes
+            + invoice.score_credit_bytes
+            + invoice.prepaid_control_bytes;
+        drop(answer);
+        let after = unsafe { &*(c.child_counter as *const AtomicU64) }.load(Ordering::SeqCst);
+        let freed_publication = publication_watch.receipt().unwrap();
+        assert_eq!(freed_publication.physical_frees, 1);
+        assert_eq!(
+            freed_publication.before_system,
+            freed_publication.after_system
+        );
+        let due = c.baseline + c.requests[0].1 as u64 + trace_due as u64 + publication.bytes as u64;
+        assert_eq!(
+            freed_publication.before_system, due,
+            "actual answer carrier remains funded through physical free alongside the independent trace"
+        );
+        assert_eq!(
+            after, trace_due as u64,
+            "the remaining child debit is the independently captured trace invoice and actual controls"
+        );
+        assert!(before > after);
+        assert!(before - after >= publication.bytes as u64);
+        drop(publication_watch);
+        drop(retained);
+        observation.assert_freed(&db);
+        let native_order = native_requests.map(|request| {
+            window
+                .physical_free_event_for_request(request)
+                .unwrap()
+                .unwrap()
+        });
+        window.finish().unwrap();
+        eprintln!(
+            "actual_answer_trace_cuts file={file} sampled_return={before} after_answer_drop={after} released_by_answer={} actual_components={components:?} publication={publication:?} physical={freed_publication:?} native_order={native_order:?} trace_invoice={invoice:?}",
+            before - after
+        );
     }
 }

@@ -67,6 +67,21 @@ impl QueryResult {
         self.encoding_owner()
             .expect("fixture supplies a funded answer")
     }
+    /// Passive actual carrier/charge receipt for an independent physical-free
+    /// control. No owner clone, admission, allocator hook or payload projection.
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(super) fn original_charge_components_for_test(&self) -> [usize; 5] {
+        match &self.inner {
+            QueryResultInner::Empty { .. } => [0; 5],
+            QueryResultInner::Shared(answer) => [
+                &**answer as *const OwnedQueryResult as usize,
+                answer.credit().original_payer_identity_for_test(),
+                answer.credit().bytes(),
+                answer.answer_charge.held(),
+                answer.vector_copy_charge.held(),
+            ],
+        }
+    }
     pub fn columns(&self) -> &[String] {
         match &self.inner {
             QueryResultInner::Empty { .. } => &[],
