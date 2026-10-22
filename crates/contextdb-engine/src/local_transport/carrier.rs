@@ -1,7 +1,7 @@
 #[cfg(unix)]
-use super::query_funding::Funded;
-#[cfg(unix)]
 use super::FinalStaleIdentityObservation;
+#[cfg(unix)]
+use super::query_funding::Funded;
 #[cfg(unix)]
 use super::stale::{observe_final_stale_identity, remove_channel_if_identity_matches};
 #[cfg(unix)]
@@ -43,7 +43,10 @@ std::thread_local! {
 #[cfg(unix)]
 #[doc(hidden)]
 pub trait StaleRemovalInterlock: Send + Sync {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn after_final_identity_inspection(
         &self,
         path: &std::path::Path,
@@ -79,7 +82,10 @@ impl UnixLocalCarrier {
         FRAME_READINESS_CREATIONS.with(std::cell::Cell::get)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn listen(
         &self,
         path: &std::path::Path,
@@ -112,18 +118,29 @@ impl UnixLocalCarrier {
     }
 
     pub(crate) fn connect_funded<'a>(
-        &'a self, path: &'a std::path::Path, clock: &'a dyn DeadlineClock, deadline_ms: u64,
+        &'a self,
+        path: &'a std::path::Path,
+        clock: &'a dyn DeadlineClock,
+        deadline_ms: u64,
         owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> DeadlineOperationWait<'a, std::os::unix::net::UnixStream> {
-        super::deadline_operation_funded(clock, super::DeadlineStage::Connect, deadline_ms, owner, || {
-            let connect = connect_readiness(path);
-            async move {
-                match connect?.await? {
-                    ConnectAttempt::Connected(stream) => Ok(stream),
-                    ConnectAttempt::NoListener | ConnectAttempt::AddressAbsent => Err(super::refusal(ReadFailureKind::OwnerNotRunning)),
+        super::deadline_operation_funded(
+            clock,
+            super::DeadlineStage::Connect,
+            deadline_ms,
+            owner,
+            || {
+                let connect = connect_readiness(path);
+                async move {
+                    match connect?.await? {
+                        ConnectAttempt::Connected(stream) => Ok(stream),
+                        ConnectAttempt::NoListener | ConnectAttempt::AddressAbsent => {
+                            Err(super::refusal(ReadFailureKind::OwnerNotRunning))
+                        }
+                    }
                 }
-            }
-        })
+            },
+        )
     }
 
     pub fn connect<'a>(
@@ -153,7 +170,10 @@ impl UnixLocalCarrier {
         connect_with_deadline(clock, deadline_ms, operation)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn send_message(
         &self,
         stream: &mut std::os::unix::net::UnixStream,
@@ -175,7 +195,10 @@ impl UnixLocalCarrier {
         result
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn send_message_async<'a>(
         &'a self,
         stream: &'a std::os::unix::net::UnixStream,
@@ -190,16 +213,25 @@ impl UnixLocalCarrier {
                 ..
             } if *expectation == LocalResponseExpectation::OrdinaryResult
         );
-        let operation = boundary.encode_frame_funded(message)
+        let operation = boundary
+            .encode_frame_funded(message)
             .and_then(|frame| guarded_write_readiness(stream, frame, allow_write));
         async move {
-            let result = match operation { Ok(operation) => operation.await, Err(error) => Err(error) };
-            if result.is_err() && ordinary_response { boundary.reset_ordinary_outbound(); }
+            let result = match operation {
+                Ok(operation) => operation.await,
+                Err(error) => Err(error),
+            };
+            if result.is_err() && ordinary_response {
+                boundary.reset_ordinary_outbound();
+            }
             result
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn receive_message(
         &self,
         stream: &mut std::os::unix::net::UnixStream,
@@ -214,7 +246,10 @@ impl UnixLocalCarrier {
             .map_err(|_| invalid_channel_data())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn write_request<'a>(
         &'a self,
         stream: &'a mut std::os::unix::net::UnixStream,
@@ -224,12 +259,18 @@ impl UnixLocalCarrier {
         deadline_ms: u64,
     ) -> DeadlineOperationWait<'a> {
         if let Some(owner) = boundary.query_funding() {
-            return super::deadline_operation_funded(clock, super::DeadlineStage::RequestWrite,
-                deadline_ms, owner, || {
-                    let operation = boundary.encode_frame_funded(LocalOutboundMessage::Request(request))
+            return super::deadline_operation_funded(
+                clock,
+                super::DeadlineStage::RequestWrite,
+                deadline_ms,
+                owner,
+                || {
+                    let operation = boundary
+                        .encode_frame_funded(LocalOutboundMessage::Request(request))
                         .and_then(|frame| write_readiness(stream, frame));
                     async move { operation?.await }
-                });
+                },
+            );
         }
         let operation = match boundary.encode_frame_funded(LocalOutboundMessage::Request(request)) {
             Ok(frame) => match write_readiness(stream, frame) {
@@ -241,7 +282,10 @@ impl UnixLocalCarrier {
         write_request_with_deadline(clock, deadline_ms, operation)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn receive_response<'a>(
         &'a self,
         stream: &'a mut std::os::unix::net::UnixStream,
@@ -251,17 +295,33 @@ impl UnixLocalCarrier {
         deadline_ms: u64,
     ) -> DeadlineOperationWait<'a, LocalResponse> {
         if let Some(owner) = boundary.query_funding() {
-            return super::deadline_operation_funded(clock, super::DeadlineStage::Response, deadline_ms, owner, || {
-                let admission_reset = OrdinaryInboundReset::new(boundary, expectation == LocalResponseExpectation::OrdinaryResult);
-                let reader = boundary.cursor_frame_allowance().and_then(|memory| frame_readiness_with_memory(stream, memory));
-                async move {
-                    let mut admission_reset = admission_reset;
-                    let payload = reader?.await.map_err(frame_read_refusal)?;
-                    let LocalInboundMessage::Response(response) = boundary.decode_payload(LocalInboundKind::Response(expectation), &payload)
-                        .map_err(response_decode_refusal)? else { return Err(invalid_channel_data()); };
-                    admission_reset.disarm(); Ok(response)
-                }
-            });
+            return super::deadline_operation_funded(
+                clock,
+                super::DeadlineStage::Response,
+                deadline_ms,
+                owner,
+                || {
+                    let admission_reset = OrdinaryInboundReset::new(
+                        boundary,
+                        expectation == LocalResponseExpectation::OrdinaryResult,
+                    );
+                    let reader = boundary
+                        .cursor_frame_allowance()
+                        .and_then(|memory| frame_readiness_with_memory(stream, memory));
+                    async move {
+                        let mut admission_reset = admission_reset;
+                        let payload = reader?.await.map_err(frame_read_refusal)?;
+                        let LocalInboundMessage::Response(response) = boundary
+                            .decode_payload(LocalInboundKind::Response(expectation), &payload)
+                            .map_err(response_decode_refusal)?
+                        else {
+                            return Err(invalid_channel_data());
+                        };
+                        admission_reset.disarm();
+                        Ok(response)
+                    }
+                },
+            );
         }
         let admission_reset = OrdinaryInboundReset::new(
             boundary,
@@ -291,29 +351,46 @@ impl UnixLocalCarrier {
         receive_response_with_deadline(clock, deadline_ms, operation)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn receive_query_response<'a>(
-        &'a self, stream: &'a mut std::os::unix::net::UnixStream,
-        boundary: &'a LocalProtocolBoundary, memory: crate::read_image_memory::ImageMemoryHandle,
-        clock: &'a dyn DeadlineClock, deadline_ms: u64,
+        &'a self,
+        stream: &'a mut std::os::unix::net::UnixStream,
+        boundary: &'a LocalProtocolBoundary,
+        memory: crate::read_image_memory::ImageMemoryHandle,
+        clock: &'a dyn DeadlineClock,
+        deadline_ms: u64,
     ) -> DeadlineOperationWait<'a, Funded<LocalResponse>> {
         let owner = memory.owner();
-        super::deadline_operation_funded(clock, super::DeadlineStage::Response, deadline_ms, owner, || {
-            let admission_reset = OrdinaryInboundReset::new(boundary, true);
-            let allocator_memory = memory.clone();
-            let ceiling = boundary.effective_limits().memory;
-            let reader = frame_readiness_allocating(stream, None, move |length| {
-                Funded::allocate_owned(Some(allocator_memory.owner()), length, || vec![0_u8; length])
+        super::deadline_operation_funded(
+            clock,
+            super::DeadlineStage::Response,
+            deadline_ms,
+            owner,
+            || {
+                let admission_reset = OrdinaryInboundReset::new(boundary, true);
+                let allocator_memory = memory.clone();
+                let ceiling = boundary.effective_limits().memory;
+                let reader = frame_readiness_allocating(stream, None, move |length| {
+                    Funded::allocate_owned(Some(allocator_memory.owner()), length, || {
+                        vec![0_u8; length]
+                    })
                     .map_err(|error| super::query_funding::transport_error(error, ceiling))
-            });
-            async move {
-                let mut admission_reset = admission_reset;
-                let payload = reader?.await.map_err(frame_read_refusal)?;
-                let response = boundary.decode_query_response(&payload.value, &memory)
-                    .map_err(response_decode_refusal)?;
-                drop(payload); admission_reset.disarm(); Ok(response)
-            }
-        })
+                });
+                async move {
+                    let mut admission_reset = admission_reset;
+                    let payload = reader?.await.map_err(frame_read_refusal)?;
+                    let response = boundary
+                        .decode_query_response(&payload.value, &memory)
+                        .map_err(response_decode_refusal)?;
+                    drop(payload);
+                    admission_reset.disarm();
+                    Ok(response)
+                }
+            },
+        )
     }
 
     pub fn retry_connect<'a>(
@@ -338,7 +415,10 @@ impl UnixLocalCarrier {
         retry_route_with_deadline(clock, deadline_ms, operation)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn probe_stale(
         &self,
         path: &std::path::Path,
@@ -406,7 +486,10 @@ impl UnixLocalCarrier {
     /// existing supplied clock owns the deadline and the native wake cell;
     /// no std Thread handle is materialized on a callback-owned pthread.
     #[cfg(target_os = "linux")]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn probe_stale_funded(
         &self,
         path: &std::path::Path,
@@ -488,7 +571,10 @@ impl UnixLocalCarrier {
         super::deadlines::drive_local(future, clock, owner)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn remove_after_proven_stale(
         &self,
         path: &std::path::Path,
@@ -498,7 +584,10 @@ impl UnixLocalCarrier {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn remove_after_proven_stale_with_interlock(
         &self,
         path: &std::path::Path,
@@ -585,7 +674,10 @@ impl<T: Send + 'static> UnixReadiness<T> {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn spawn(
         name: &'static str,
         cancellation: std::os::unix::net::UnixStream,
@@ -629,7 +721,10 @@ impl<T: Send + 'static> UnixReadiness<T> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn wait(mut self) -> Result<T, LocalTransportError> {
         let result = {
             let (state, completion) = &*self.shared;
@@ -714,7 +809,10 @@ impl<T> Drop for UnixReadiness<T> {
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn cloned_blocking_streams(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<
@@ -737,7 +835,10 @@ fn cloned_blocking_streams(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn frame_readiness(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<UnixReadiness<Vec<u8>>, LocalTransportError> {
@@ -745,7 +846,10 @@ pub(crate) fn frame_readiness(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn frame_readiness_with_memory(
     stream: &std::os::unix::net::UnixStream,
     memory: Option<u64>,
@@ -754,7 +858,10 @@ fn frame_readiness_with_memory(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn frame_readiness_allocating<T: AsMut<[u8]> + Send + 'static>(
     stream: &std::os::unix::net::UnixStream,
     memory: Option<u64>,
@@ -793,19 +900,24 @@ fn frame_readiness_allocating<T: AsMut<[u8]> + Send + 'static>(
             ));
         }
         let mut payload = allocate(length)?;
-        worker_stream.read_exact(payload.as_mut()).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                LocalTransportError::Frame(FrameViolation::TruncatedPayload)
-            } else {
-                owner_disconnected()
-            }
-        })?;
+        worker_stream
+            .read_exact(payload.as_mut())
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    LocalTransportError::Frame(FrameViolation::TruncatedPayload)
+                } else {
+                    owner_disconnected()
+                }
+            })?;
         Ok(payload)
     })
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn write_readiness(
     stream: &std::os::unix::net::UnixStream,
     frame: Funded<Vec<u8>>,
@@ -822,7 +934,10 @@ fn write_readiness(
 /// The syscall cannot wait for a slow peer; readiness waits release that guard,
 /// so deadline cancellation still interrupts a partially written frame.
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn guarded_write_readiness(
     stream: &std::os::unix::net::UnixStream,
     frame: Funded<Vec<u8>>,
@@ -920,7 +1035,10 @@ fn guarded_write_readiness(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn wait_for_write_ready(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<(), LocalTransportError> {
@@ -1023,7 +1141,10 @@ fn configure_new_socket(socket: &std::os::fd::OwnedFd) -> nix::Result<()> {
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn connect_readiness(
     path: &std::path::Path,
 ) -> Result<UnixReadiness<ConnectAttempt>, LocalTransportError> {
@@ -1070,7 +1191,10 @@ fn connect_readiness(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn wait_for_nonblocking_connect(
     stream: std::os::unix::net::UnixStream,
     cancellation: std::os::unix::net::UnixStream,
@@ -1124,7 +1248,10 @@ fn wait_for_nonblocking_connect(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn wait_for_backlog_cancellation(
     _retained_stream: std::os::unix::net::UnixStream,
     cancellation: std::os::unix::net::UnixStream,
@@ -1154,7 +1281,10 @@ fn wait_for_backlog_cancellation(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn finish_nonblocking_connect(
     stream: std::os::unix::net::UnixStream,
 ) -> Result<ConnectAttempt, LocalTransportError> {
@@ -1165,7 +1295,10 @@ fn finish_nonblocking_connect(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn pending_socket_error(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<Option<nix::errno::Errno>, LocalTransportError> {
@@ -1177,7 +1310,10 @@ fn pending_socket_error(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn verify_connected_stream(
     stream: std::os::unix::net::UnixStream,
 ) -> Result<ConnectAttempt, LocalTransportError> {
@@ -1193,7 +1329,10 @@ fn verify_connected_stream(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn classify_connect_error(error: nix::errno::Errno) -> Result<ConnectAttempt, LocalTransportError> {
     match error {
         nix::errno::Errno::ECONNREFUSED => Ok(ConnectAttempt::NoListener),

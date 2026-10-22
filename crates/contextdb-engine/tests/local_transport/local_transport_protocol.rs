@@ -1,5 +1,5 @@
 use super::wire_fixture_test_support::FixtureFrame;
-use super::wire_fixture_test_support::{encode_message};
+use super::wire_fixture_test_support::encode_message;
 use contextdb_core::read_contract::{
     DatabaseIdentity, LocalUserIdentity, OwnerReadLimits, OwnerReadStatus, OwnerServiceTimeouts,
     OwnerServingReason, OwnerServingState, ReadFailure, ReadFailureDetail, ReadFailureKind,
@@ -14,7 +14,7 @@ use contextdb_engine::local_transport::{
     LocalRequestEnvelope, LocalResponse, LocalResponseExpectation, LocalTransportError,
     MAX_FRAME_BYTES, MetadataResponse, OwnerAdmissionCounters, OwnerMemoryCounters,
     PayloadViolation, ResultChunk, TerminalSuccess, decode_handshake_exact, decode_message_exact,
-    };
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;

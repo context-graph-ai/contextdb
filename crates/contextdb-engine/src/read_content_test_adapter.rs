@@ -536,7 +536,8 @@ fn independently_reconstruct_version_records(
                 .map_err(|error| contextdb_core::Error::Other((error.to_string()).into()))?;
         if consumed != body.len() {
             return Err(contextdb_core::Error::Other(
-                "oracle row has trailing bytes".into()));
+                "oracle row has trailing bytes".into(),
+            ));
         }
         let mut identity = Vec::new();
         for value in [row.row_id.0, row.created_tx.0, row.lsn.0] {
@@ -745,11 +746,11 @@ fn project_edges(parts: &ReadPersistenceImageParts) -> Result<Vec<DirectStoredEd
     let mut cursor =
         crate::persistence::graph_read::EngineGraphReadRoot::Image(parts.retained_source.clone())
             .cursor(
-                false,
-                std::ops::Bound::Unbounded,
-                std::ops::Bound::Unbounded,
-                budget,
-            )?;
+            false,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            budget,
+        )?;
     while let Some(window) = cursor.next_edge_with(&mut || Ok(()))? {
         let edge = window.edge();
         if edge.deleted_tx.is_some() {

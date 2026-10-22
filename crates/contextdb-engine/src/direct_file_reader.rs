@@ -538,7 +538,9 @@ pub struct DirectMetadataResponse {
 }
 impl std::ops::Deref for DirectMetadataResponse {
     type Target = crate::read_session::MetadataAnswer;
-    fn deref(&self) -> &Self::Target { &self.metadata }
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
 }
 
 #[derive(Debug)]
@@ -583,7 +585,9 @@ impl DirectCursorPage {
     #[doc(hidden)]
     pub fn page_for_test(&self) -> DirectCursorPageViewForTest<'_> {
         DirectCursorPageViewForTest {
-            columns: &self.page.columns, rows: &self.page.rows, has_more: self.page.has_more,
+            columns: &self.page.columns,
+            rows: &self.page.rows,
+            has_more: self.page.has_more,
         }
     }
     /// Preserve the fixture's explicit copy request and its genuine payer.
@@ -592,38 +596,52 @@ impl DirectCursorPage {
         &self,
         owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<contextdb_core::read_contract::CursorPage> {
-        let prepared = crate::owned_cursor_page::OwnedCursorPage::try_prepare_public(owner.clone())?;
+        let prepared =
+            crate::owned_cursor_page::OwnedCursorPage::try_prepare_public(owner.clone())?;
         let mut page = self.page.try_clone(owner)?;
         page.attach_publication(prepared);
         page.into_public()
     }
     /// Move the existing prepared publication with all original invoices intact.
     #[doc(hidden)]
-    pub fn into_public_page_for_test(self) -> contextdb_core::Result<contextdb_core::read_contract::CursorPage> {
+    pub fn into_public_page_for_test(
+        self,
+    ) -> contextdb_core::Result<contextdb_core::read_contract::CursorPage> {
         self.page.into_public()
     }
 
     /// Encode the real retained private page by borrow, through the same
     /// canonical serializer; observing it never copies columns or acquires a child.
     #[doc(hidden)]
-    pub fn encode_page_for_test(&self) -> std::result::Result<Vec<u8>, crate::read_contract::ReadEncodingError> {
+    pub fn encode_page_for_test(
+        &self,
+    ) -> std::result::Result<Vec<u8>, crate::read_contract::ReadEncodingError> {
         crate::read_contract::encode_owned_cursor_page_for_test(&self.page)
     }
     /// Construct the existing empty private-page fixture from moved parts.
     #[doc(hidden)]
-    pub fn new_for_test(columns: Vec<String>, snapshot: DirectSnapshot, owner: contextdb_core::read_memory::ReadMemoryOwner) -> Self {
+    pub fn new_for_test(
+        columns: Vec<String>,
+        snapshot: DirectSnapshot,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Self {
         let page = CursorPage::from_parts(columns, Vec::new(), false);
         let canonical_bytes = crate::read_contract::EncodedReadBytes::from_funded(
             crate::read_contract::encode_transport_funded(&page, Some(owner), u64::MAX)
-                .expect("shared encoder supplies empty terminal-page bytes"), u64::MAX,
-        ).expect("retain the fixture's original encoding invoices");
+                .expect("shared encoder supplies empty terminal-page bytes"),
+            u64::MAX,
+        )
+        .expect("retain the fixture's original encoding invoices");
         Self {
             page,
             observation: crate::executor::CursorObservation {
                 trace: std::sync::Arc::new(crate::database::QueryTrace::scan()),
-                rows_examined: 0, charge: None, group_page_returns: None,
+                rows_examined: 0,
+                charge: None,
+                group_page_returns: None,
             },
-            canonical_bytes, snapshot,
+            canonical_bytes,
+            snapshot,
         }
     }
 }
@@ -907,19 +925,28 @@ struct EngineDiagnostic {
 impl fmt::Display for EngineDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.corruption_envelope
-            && let contextdb_core::Error::StoreCorrupted { path, reason } = &self.error {
-                return write!(formatter, "store {path} is corrupt: {reason}");
-            }
+            && let contextdb_core::Error::StoreCorrupted { path, reason } = &self.error
+        {
+            return write!(formatter, "store {path} is corrupt: {reason}");
+        }
         fmt::Display::fmt(&self.error, formatter)
     }
 }
 impl PreparedEngineDiagnostic {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn new(owner: contextdb_core::read_memory::ReadMemoryOwner)
-        -> contextdb_core::Result<Self> {
-        contextdb_core::error::DiagnosticText::try_prepare_shared(owner,
-            "reader", "diagnostic_receiver",
-            "Release retained diagnostics or raise the reader memory limit.").map(Self)
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn new(
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> contextdb_core::Result<Self> {
+        contextdb_core::error::DiagnosticText::try_prepare_shared(
+            owner,
+            "reader",
+            "diagnostic_receiver",
+            "Release retained diagnostics or raise the reader memory limit.",
+        )
+        .map(Self)
     }
     pub(crate) fn engine(self, error: contextdb_core::Error) -> DirectFileReaderError {
         use contextdb_core::Error;
@@ -927,14 +954,24 @@ impl PreparedEngineDiagnostic {
             Error::Other(reason) => DirectFileReaderError::Engine(reason),
             Error::FundedEngine(owner) => DirectFileReaderError::Engine(owner.into()),
             Error::NativeEngineOther(refusal) => DirectFileReaderError::Engine(refusal.into()),
-            error => DirectFileReaderError::Engine(contextdb_core::error::DiagnosticText::from_shared(
-                self.0.publish(EngineDiagnostic { error, corruption_envelope: false }))),
+            error => {
+                DirectFileReaderError::Engine(contextdb_core::error::DiagnosticText::from_shared(
+                    self.0.publish(EngineDiagnostic {
+                        error,
+                        corruption_envelope: false,
+                    }),
+                ))
+            }
         }
     }
     pub(crate) fn corruption(self, error: contextdb_core::Error) -> DirectFileReaderError {
-        DirectFileReaderError::CorruptStore(DirectStoreDiagnostic::MalformedRecord,
-            contextdb_core::error::DiagnosticText::from_shared(self.0.publish(
-                EngineDiagnostic { error, corruption_envelope: true })))
+        DirectFileReaderError::CorruptStore(
+            DirectStoreDiagnostic::MalformedRecord,
+            contextdb_core::error::DiagnosticText::from_shared(self.0.publish(EngineDiagnostic {
+                error,
+                corruption_envelope: true,
+            })),
+        )
     }
 }
 
@@ -1159,30 +1196,38 @@ fn execute_on_backend_neutral_target(
     cancellation: &OwnerReadCancellation,
 ) -> Result<DirectQuery, DirectFileReaderError> {
     let request = reader.request_query_read_owner()?;
-    crate::executor::bounded::with_request_read_memory(request,
-        crate::read_image::history_answer_error, |read_memory| {
-    let constructed = reader.target.read_query(
-        sql,
-        params,
-        read_memory,
-        reader.limits,
-        Arc::clone(&reader.clock),
-        cancellation,
-    )?;
-    let result = publish_direct_result(
-        reader.retained_source.registration(),
-        &constructed.2,
-        constructed.0,
-    )?;
-    Ok(DirectQuery {
-        result: result.into_public().map_err(crate::read_image::history_answer_error)?,
-        canonical_bytes: constructed.1,
-        snapshot: reader.image.snapshot,
-    })
-    })
+    crate::executor::bounded::with_request_read_memory(
+        request,
+        crate::read_image::history_answer_error,
+        |read_memory| {
+            let constructed = reader.target.read_query(
+                sql,
+                params,
+                read_memory,
+                reader.limits,
+                Arc::clone(&reader.clock),
+                cancellation,
+            )?;
+            let result = publish_direct_result(
+                reader.retained_source.registration(),
+                &constructed.2,
+                constructed.0,
+            )?;
+            Ok(DirectQuery {
+                result: result
+                    .into_public()
+                    .map_err(crate::read_image::history_answer_error)?,
+                canonical_bytes: constructed.1,
+                snapshot: reader.image.snapshot,
+            })
+        },
+    )
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn publish_direct_result<T>(
     registration: &Arc<crate::persistence::ReadSnapshotRegistrationGuard>,
     scope: &crate::executor::ReadPublicationScope,
@@ -1194,8 +1239,8 @@ fn publish_direct_result<T>(
             .and_then(|owner| owner.diagnostic_budget())
             .map_err(crate::read_image::history_answer_error)?,
     };
-    let diagnostic = PreparedEngineDiagnostic::new(owner)
-        .map_err(crate::read_image::history_answer_error)?;
+    let diagnostic =
+        PreparedEngineDiagnostic::new(owner).map_err(crate::read_image::history_answer_error)?;
     registration
         .publish_bounded_result(scope, value)
         .map_err(|error| match error {
@@ -1330,7 +1375,8 @@ impl DirectFileReader {
     pub(crate) fn request_query_read_owner(
         &self,
     ) -> Result<crate::vector_read_memory::RequestReadOwner, DirectFileReaderError> {
-        self.read_requests.request_budget_owner()
+        self.read_requests
+            .request_budget_owner()
             .map_err(crate::read_image::history_answer_error)
     }
 
@@ -1359,8 +1405,9 @@ impl DirectFileReader {
         if self.image_memory.accountant.has_reader_original() {
             root
         } else {
-            root.saturating_add(u64::try_from(self.image_memory.accountant.usage().used)
-                .unwrap_or(u64::MAX))
+            root.saturating_add(
+                u64::try_from(self.image_memory.accountant.usage().used).unwrap_or(u64::MAX),
+            )
         }
     }
 
@@ -1376,7 +1423,10 @@ impl DirectFileReader {
         Arc::clone(&self.target)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn publish_bounded_result<T>(
         &self,
         scope: &crate::executor::ReadPublicationScope,
@@ -1794,7 +1844,8 @@ pub mod test_seams {
         usize,
         crate::read_image_memory::ImageMemoryObservation,
     ) {
-        let observation = crate::read_image_memory::ImageMemoryObservation::new(&reader.image_memory);
+        let observation =
+            crate::read_image_memory::ImageMemoryObservation::new(&reader.image_memory);
         (
             {
                 let mut usage = reader.image_memory.accountant.usage();
@@ -1901,7 +1952,9 @@ pub mod test_seams {
     /// Bytes this reader's session accountant took through the writer's
     /// unconditional retention door, `charge_retained`.
     #[cfg(test)]
-    pub(crate) fn write_control_for_test(reader: &DirectFileReader) -> redb::CacheWriteControlForTest {
+    pub(crate) fn write_control_for_test(
+        reader: &DirectFileReader,
+    ) -> redb::CacheWriteControlForTest {
         reader.retained_source.write_control_for_test()
     }
 
@@ -1910,7 +1963,9 @@ pub mod test_seams {
         reader.retained_source.cached_header_for_test()
     }
 
-    pub fn cache_index_charge_for_test(reader: &DirectFileReader) -> crate::persistence::SourceCacheChargeForTest {
+    pub fn cache_index_charge_for_test(
+        reader: &DirectFileReader,
+    ) -> crate::persistence::SourceCacheChargeForTest {
         reader.retained_source.cache_index_charge_for_test()
     }
 

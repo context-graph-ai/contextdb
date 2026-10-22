@@ -551,12 +551,8 @@ fn select<T: Send + Sync, S: PagedPointStorage<T>, D: Distance<T>>(
             let mut accepted = true;
             for prior in &workspace.selected {
                 let previous = load(storage, prior.point_id, policy)?;
-                if measured_distance(
-                    storage,
-                    metric,
-                    &point.values,
-                    &previous.values,
-                )? <= -candidate.distance
+                if measured_distance(storage, metric, &point.values, &previous.values)?
+                    <= -candidate.distance
                 {
                     accepted = false;
                     break;

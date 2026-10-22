@@ -1,9 +1,9 @@
-#[cfg(test)]
-use crate::memory_budget::MemoryBudget;
 use crate::hnsw::{
     BoundedHnswQuerySelfScores, HnswAllowedSearchIncomplete, HnswAllowedSearchLimits,
     HnswAllowedSearchStatus,
 };
+#[cfg(test)]
+use crate::memory_budget::MemoryBudget;
 use crate::{
     HnswIndex,
     store::{VectorGraphLayerAvailability, VectorStore},
@@ -756,11 +756,18 @@ thread_local! {
 }
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
-pub fn set_trace_handoff_observer_for_test(callback: Option<fn(&'static str, usize, usize, usize)>) {
+pub fn set_trace_handoff_observer_for_test(
+    callback: Option<fn(&'static str, usize, usize, usize)>,
+) {
     TRACE_HANDOFF_CUT.with(|slot| slot.set(callback));
 }
 #[cfg(feature = "test-seams")]
-pub(crate) fn trace_handoff_cut_for_test(site: &'static str, address: usize, bytes: usize, payer: usize) {
+pub(crate) fn trace_handoff_cut_for_test(
+    site: &'static str,
+    address: usize,
+    bytes: usize,
+    payer: usize,
+) {
     if let Some(callback) = TRACE_HANDOFF_CUT.with(std::cell::Cell::get) {
         callback(site, address, bytes, payer);
     }
@@ -792,14 +799,19 @@ pub struct SearchScores {
 pub struct ScoreCredit {
     budget: crate::memory_budget::MemoryBudgetOwner,
     bytes: usize,
-    _control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    _control_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 impl ScoreCredit {
     fn holding(budget: impl Into<crate::memory_budget::MemoryBudgetOwner>, bytes: usize) -> Self {
         let budget: crate::memory_budget::MemoryBudgetOwner = budget.into();
 
         let control_invoice = budget.control_invoice();
-        Self { budget, bytes, _control_invoice: control_invoice }
+        Self {
+            budget,
+            bytes,
+            _control_invoice: control_invoice,
+        }
     }
 }
 
@@ -817,18 +829,28 @@ impl crate::PrepaidVectorCopyCharge for ScoreCredit {
 
 impl Drop for ScoreCredit {
     fn drop(&mut self) {
-// capture969 begin
+        // capture969 begin
         #[cfg(feature = "test-seams")]
-        trace_handoff_cut_for_test("score-credit-drop", self as *const Self as usize,
-            self.bytes, self.budget.stable_funder_identity());
-// capture969 end
+        trace_handoff_cut_for_test(
+            "score-credit-drop",
+            self as *const Self as usize,
+            self.bytes,
+            self.budget.stable_funder_identity(),
+        );
+        // capture969 end
         self.budget.release(self.bytes);
     }
 }
 
 impl SearchScores {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn new(index: &VectorIndexRef, budget: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Result<Self> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn new(
+        index: &VectorIndexRef,
+        budget: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+    ) -> Result<Self> {
         let budget: crate::memory_budget::MemoryBudgetOwner = budget.into();
 
         let (index, bytes) = allocate_vector_index(
@@ -853,19 +875,26 @@ impl SearchScores {
 
     /// Consume the allocation and its actual charge together. The destination
     /// must consume this charge through the matched prepaid admission bridge.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn into_prepaid(
         self,
         destination: &crate::memory_budget::MemoryBudgetOwner,
     ) -> Result<(Vec<(RowId, f32)>, ScoreCredit)> {
         if !crate::memory_budget::same_funder(destination.as_ref(), self.credit.budget.as_ref()) {
             return Err(Error::Other(
-                "vector score destination has a different accountant".into()));
+                "vector score destination has a different accountant".into(),
+            ));
         }
         Ok((self.rows, self.credit))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn from_charged(
         rows: Vec<(RowId, f32)>,
         index: &VectorIndexRef,
@@ -903,7 +932,10 @@ impl SearchScores {
         self
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn reserve(&mut self, additional: usize) -> Result<()> {
         let wanted = self
             .rows
@@ -933,7 +965,10 @@ impl SearchScores {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn charge(&mut self, bytes: usize) -> Result<()> {
         self.credit
             .budget
@@ -961,14 +996,20 @@ impl SearchScores {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_push(&mut self, row: (RowId, f32)) -> Result<()> {
         self.reserve(1)?;
         self.rows.push(row);
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_extend(&mut self, rows: impl IntoIterator<Item = (RowId, f32)>) -> Result<()> {
         let rows = rows.into_iter();
         self.reserve(rows.size_hint().0)?;
@@ -1039,17 +1080,19 @@ fn vector_score_quality(left: &(RowId, f32), right: &(RowId, f32)) -> std::cmp::
         .then_with(|| right.0.cmp(&left.0))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn push_bounded_score_heap(scores: &mut Vec<(RowId, f32)>, score: (RowId, f32)) -> Result<()> {
     scores.push(score);
     let mut child = scores.len().checked_sub(1).ok_or_else(|| {
         Error::Other(("bounded brute-force heap lost its inserted score".to_string()).into())
     })?;
     while child != 0 {
-        let parent = child
-            .checked_sub(1)
-            .ok_or_else(|| Error::Other(("bounded brute-force heap parent underflow".to_string()).into()))?
-            / 2;
+        let parent = child.checked_sub(1).ok_or_else(|| {
+            Error::Other(("bounded brute-force heap parent underflow".to_string()).into())
+        })? / 2;
         if vector_score_quality(&scores[child], &scores[parent]) != std::cmp::Ordering::Less {
             break;
         }
@@ -1059,25 +1102,30 @@ fn push_bounded_score_heap(scores: &mut Vec<(RowId, f32)>, score: (RowId, f32)) 
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn replace_bounded_score_heap_root(scores: &mut [(RowId, f32)], score: (RowId, f32)) -> Result<()> {
     let Some(root) = scores.first_mut() else {
-        return Err(Error::Other((
-            "bounded brute-force heap has no replacement root".to_string()).into()));
+        return Err(Error::Other(
+            ("bounded brute-force heap has no replacement root".to_string()).into(),
+        ));
     };
     *root = score;
     let mut parent = 0usize;
     loop {
         let Some(left) = parent.checked_mul(2).and_then(|value| value.checked_add(1)) else {
-            return Err(Error::Other((
-                "bounded brute-force heap child overflow".to_string()).into()));
+            return Err(Error::Other(
+                ("bounded brute-force heap child overflow".to_string()).into(),
+            ));
         };
         if left >= scores.len() {
             return Ok(());
         }
-        let right = left
-            .checked_add(1)
-            .ok_or_else(|| Error::Other(("bounded brute-force heap child overflow".to_string()).into()))?;
+        let right = left.checked_add(1).ok_or_else(|| {
+            Error::Other(("bounded brute-force heap child overflow".to_string()).into())
+        })?;
         let child = if right < scores.len()
             && vector_score_quality(&scores[right], &scores[left]) == std::cmp::Ordering::Less
         {
@@ -1111,8 +1159,9 @@ where
     }
     if scores.len() < k {
         let required_capacity = scores.len().checked_add(1).ok_or_else(|| {
-            E::from(Error::Other((
-                "bounded vector merge length overflow".to_string()).into()))
+            E::from(Error::Other(
+                ("bounded vector merge length overflow".to_string()).into(),
+            ))
         })?;
         admitted_at("merge_state", || {
             grow_vector_copy(
@@ -1140,7 +1189,10 @@ fn bounded_exact_merge_durable<E>(
     index: &VectorIndexRef,
     state: &crate::store::IndexState,
     memberships: &dyn crate::store::RawVectorMembershipSource,
-    streamed: Option<(&dyn crate::store::CapturedVectorStreamedTail, Option<&[u64]>)>,
+    streamed: Option<(
+        &dyn crate::store::CapturedVectorStreamedTail,
+        Option<&[u64]>,
+    )>,
     score_bodies: bool,
     query: &[f32],
     k: usize,
@@ -1219,19 +1271,30 @@ where
                 continue;
             }
             if let Some((tail, candidates)) = streamed {
-                if candidates.is_some_and(|ids| ids.binary_search(&entry.row_id.0).is_err()) { continue; }
+                if candidates.is_some_and(|ids| ids.binary_search(&entry.row_id.0).is_err()) {
+                    continue;
+                }
                 let mut interrupted = None;
                 let included = tail.includes(&entry, &body_identity, snapshot, owner, &mut || {
                     match before_source_entry() {
-                        Ok(()) => true, Err(error) => { interrupted = Some(error); false },
+                        Ok(()) => true,
+                        Err(error) => {
+                            interrupted = Some(error);
+                            false
+                        }
                     }
                 });
-                if let Some(error) = interrupted { return Err(error); }
-                if !included.map_err(E::from)? { continue; }
+                if let Some(error) = interrupted {
+                    return Err(error);
+                }
+                if !included.map_err(E::from)? {
+                    continue;
+                }
             }
             if !score_bodies {
-                compared = compared.checked_add(1).ok_or_else(|| E::from(
-                    Error::Other("streamed tail count overflow".into())))?;
+                compared = compared
+                    .checked_add(1)
+                    .ok_or_else(|| E::from(Error::Other("streamed tail count overflow".into())))?;
                 continue;
             }
             // The statement's filter, checked on this row before it competes.
@@ -1341,8 +1404,9 @@ where
                 continue;
             };
             compared = compared.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded exact vector count overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded exact vector count overflow".to_string()).into(),
+                ))
             })?;
             // The statement's filter, checked on this row before it competes.
             if let Some(ledger) = row_check
@@ -1474,8 +1538,9 @@ where
                 break;
             };
             position = position.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded exact vector position overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded exact vector position overflow".to_string()).into(),
+                ))
             })?;
             // The one exhaustive-scan charge for this directory entry; dead and
             // future versions consumed the step too.
@@ -1499,8 +1564,9 @@ where
                 continue;
             };
             compared = compared.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded exact vector count overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded exact vector count overflow".to_string()).into(),
+                ))
             })?;
             // The statement's filter, checked on this row before it competes.
             if let Some(ledger) = row_check
@@ -1533,8 +1599,9 @@ where
         before_candidate()?;
         let candidate = state.with_entries(|entries| -> std::result::Result<Option<_>, E> {
             let entry = entries.get(position).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded exact vector position changed".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded exact vector position changed".to_string()).into(),
+                ))
             })?;
             if !entry.visible_at(snapshot) {
                 return Ok(None);
@@ -1548,8 +1615,9 @@ where
             continue;
         };
         compared = compared.checked_add(1).ok_or_else(|| {
-            E::from(Error::Other((
-                "bounded exact vector count overflow".to_string()).into()))
+            E::from(Error::Other(
+                ("bounded exact vector count overflow".to_string()).into(),
+            ))
         })?;
         // The statement's filter, checked on this row before it competes.
         if let Some(ledger) = row_check
@@ -1668,14 +1736,22 @@ impl TraceInvoiceForTest {
     /// keeper are separate allocations; this partial receipt excludes them.
     /// Qualification must also reconcile their actual allocator requests.
     pub fn complete_debit(&self) -> usize {
-        self.prepaid_bytes + self.additional_bytes + self.prepaid_control_bytes + self.score_credit_bytes
+        self.prepaid_bytes
+            + self.additional_bytes
+            + self.prepaid_control_bytes
+            + self.score_credit_bytes
     }
 }
 #[cfg(feature = "test-seams")]
 fn trace_capacities_for_test(trace: &VectorSearchDebugTrace) -> [usize; 6] {
-    [trace.index.table.capacity(), trace.index.column.capacity(),
-        trace.partition_routes.capacity(), trace.hnsw_candidate_row_ids.capacity(),
-        trace.final_row_ids.capacity(), trace.selected_generations.capacity()]
+    [
+        trace.index.table.capacity(),
+        trace.index.column.capacity(),
+        trace.partition_routes.capacity(),
+        trace.hnsw_candidate_row_ids.capacity(),
+        trace.final_row_ids.capacity(),
+        trace.selected_generations.capacity(),
+    ]
 }
 #[cfg(feature = "test-seams")]
 fn trace_allocations_for_test(trace: &VectorSearchDebugTrace) -> [(usize, usize, usize); 6] {
@@ -1686,10 +1762,19 @@ fn trace_allocations_for_test(trace: &VectorSearchDebugTrace) -> [(usize, usize,
     [
         buffer(trace.index.table.as_ptr(), trace.index.table.capacity()),
         buffer(trace.index.column.as_ptr(), trace.index.column.capacity()),
-        buffer(trace.partition_routes.as_ptr(), trace.partition_routes.capacity()),
-        buffer(trace.hnsw_candidate_row_ids.as_ptr(), trace.hnsw_candidate_row_ids.capacity()),
+        buffer(
+            trace.partition_routes.as_ptr(),
+            trace.partition_routes.capacity(),
+        ),
+        buffer(
+            trace.hnsw_candidate_row_ids.as_ptr(),
+            trace.hnsw_candidate_row_ids.capacity(),
+        ),
         buffer(trace.final_row_ids.as_ptr(), trace.final_row_ids.capacity()),
-        buffer(trace.selected_generations.as_ptr(), trace.selected_generations.capacity()),
+        buffer(
+            trace.selected_generations.as_ptr(),
+            trace.selected_generations.capacity(),
+        ),
     ]
 }
 
@@ -1725,8 +1810,10 @@ impl OwnedVectorSearchTrace {
     #[doc(hidden)]
     // Visit the actual retained payer only for proofs that already pin it.
     // Scalar-only observations pass a no-op and acquire no ownership.
-    pub fn complete_invoice_for_test(&self,
-        visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner)) -> TraceInvoiceForTest {
+    pub fn complete_invoice_for_test(
+        &self,
+        visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner),
+    ) -> TraceInvoiceForTest {
         let mut receipt = TraceInvoiceForTest {
             allocations: trace_allocations_for_test(&self.trace),
             capacities: trace_capacities_for_test(&self.trace),
@@ -1734,9 +1821,10 @@ impl OwnedVectorSearchTrace {
             ..Default::default()
         };
         if let Some(admission) = self.admission.as_ref()
-            && let Some(original) = admission.complete_invoice_for_test(&mut receipt) {
-                visit(original);
-            }
+            && let Some(original) = admission.complete_invoice_for_test(&mut receipt)
+        {
+            visit(original);
+        }
         receipt
     }
 
@@ -1773,7 +1861,10 @@ impl OwnedVectorSearchTrace {
     pub fn debug_trace_for_test(&self) -> &VectorSearchDebugTrace {
         &self.trace
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn brute_force(
         index: &VectorIndexRef,
         rows: &[(RowId, f32)],
@@ -1794,7 +1885,10 @@ impl OwnedVectorSearchTrace {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn brute_force_with_owner(
         index: &VectorIndexRef,
         rows: &[(RowId, f32)],
@@ -1839,7 +1933,10 @@ impl OwnedVectorSearchTrace {
         })
     }
 
-    fn from_charged(trace: BoundedVectorSearchTrace, budget: impl Into<crate::memory_budget::MemoryBudgetOwner>) -> Self {
+    fn from_charged(
+        trace: BoundedVectorSearchTrace,
+        budget: impl Into<crate::memory_budget::MemoryBudgetOwner>,
+    ) -> Self {
         let budget: crate::memory_budget::MemoryBudgetOwner = budget.into();
 
         let bytes = trace.retained_bytes();
@@ -1850,7 +1947,10 @@ impl OwnedVectorSearchTrace {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn replace_final_rows(&mut self, rows: &[(RowId, f32)]) -> Result<()> {
         let (ids, bytes) = allocate_vector_row_ids(
             rows,
@@ -1895,14 +1995,18 @@ impl OwnedVectorSearchTrace {
 
     /// The destination consumes this charge via VectorCopyAdmission::from_prepaid
     /// against its actual owner and adopts the charge exactly once before transfer.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn into_prepaid(
         mut self,
         destination: &crate::memory_budget::MemoryBudgetOwner,
     ) -> Result<(VectorSearchDebugTrace, ScoreCredit)> {
         if !crate::memory_budget::same_funder(destination.as_ref(), self.credit.budget.as_ref()) {
             return Err(Error::Other(
-                "vector trace destination has a different accountant".into()));
+                "vector trace destination has a different accountant".into(),
+            ));
         }
         if let Some(admission) = self.admission.take() {
             self.credit.bytes += admission.retained_bytes();
@@ -1959,7 +2063,9 @@ pub struct BoundedBruteForceCursor {
     // A second full body/provenance record was a redundant boxed payload.
     pending_membership: Option<(
         crate::store::RawVectorDirectoryEntry,
-        RowId, TxId, Option<TxId>,
+        RowId,
+        TxId,
+        Option<TxId>,
     )>,
 }
 
@@ -2009,8 +2115,13 @@ impl BoundedSnapshotVectorSource {
         if selection.streamed_suffix()?.saved_inserts() == 0 {
             return None;
         }
-        Some(selection.inspection.change.or(selection.inspection.base)
-            .map_or(TxId(0), |generation| generation.covered_tx))
+        Some(
+            selection
+                .inspection
+                .change
+                .or(selection.inspection.base)
+                .map_or(TxId(0), |generation| generation.covered_tx),
+        )
     }
     fn dormant_page_bytes(&self, snapshot: SnapshotId) -> usize {
         self.serving_selection.as_ref().map_or_else(
@@ -2051,10 +2162,16 @@ impl BoundedVectorCandidateGroups {
     /// cursor and restores it here after scan-only ownership has ended.
     #[doc(hidden)]
     pub fn disclosure_metadata(&self) -> Self {
-        Self { snapshot: self.snapshot, filtered: self.filtered, row_checked: self.row_checked,
-            sources: Vec::new(), aggregate_allowed_count: self.aggregate_allowed_count,
-            auto_index_at: self.auto_index_at, every_partition_fits_base_ef: self.every_partition_fits_base_ef,
-            retained_bytes: self.retained_bytes }
+        Self {
+            snapshot: self.snapshot,
+            filtered: self.filtered,
+            row_checked: self.row_checked,
+            sources: Vec::new(),
+            aggregate_allowed_count: self.aggregate_allowed_count,
+            auto_index_at: self.auto_index_at,
+            every_partition_fits_base_ef: self.every_partition_fits_base_ef,
+            retained_bytes: self.retained_bytes,
+        }
     }
 
     pub fn is_filtered(&self) -> bool {
@@ -2194,15 +2311,27 @@ impl BoundedVectorCandidateGroups {
 
     /// Inspect only the already captured nonempty sources, one fixed
     /// metadata window at a time. This never builds a partition-info array.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn has_pending_tail_without_load(&self, owner: &mut crate::VectorCopyAdmission) -> Result<bool> {
-        for source in self.sources.iter().filter(|source| source.allowed_count != 0) {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn has_pending_tail_without_load(
+        &self,
+        owner: &mut crate::VectorCopyAdmission,
+    ) -> Result<bool> {
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| source.allowed_count != 0)
+        {
             let pending = if let Some(selection) = &source.serving_selection {
                 selection.inspection.pending_inserts != 0 || selection.inspection.tombstones != 0
             } else {
                 source.state.has_pending_work_for_read(owner)?
             };
-            if pending { return Ok(true); }
+            if pending {
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -2310,7 +2439,10 @@ impl BoundedVectorSearchTrace {
     /// Move the trace together with the actual caller's already held charge.
     /// The prepaid bridge rejects another accountant and retains the complete
     /// token until output drop or a consuming matched destination transfer.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn into_owned<C: crate::PrepaidVectorCopyCharge + 'static>(
         self,
         executing_owner: impl Into<crate::memory_budget::MemoryBudgetOwner>,
@@ -2324,27 +2456,35 @@ impl BoundedVectorSearchTrace {
             trace: BoundedVectorSearchTrace,
             charge: Option<C>,
         }
-        let mut pending = PendingTrace { trace: self, charge: Some(charge) };
-// capture969 begin
+        let mut pending = PendingTrace {
+            trace: self,
+            charge: Some(charge),
+        };
+        // capture969 begin
         #[cfg(feature = "test-seams")]
         let _pending_boundary = {
             let charge = pending.charge.as_ref().unwrap();
-            let tuple = (charge.credit_address_for_test(), charge.retained_bytes(),
-                charge.original_payer_identity_for_test());
+            let tuple = (
+                charge.credit_address_for_test(),
+                charge.retained_bytes(),
+                charge.original_payer_identity_for_test(),
+            );
             trace_handoff_cut_for_test("pending-credit", tuple.0, tuple.1, tuple.2);
             TracePendingBoundaryForTest(tuple)
         };
-// capture969 end
+        // capture969 end
         if pending.charge.as_ref().unwrap().retained_bytes() < pending.trace.retained_bytes {
             drop(pending);
             return Err(Error::Other(
-                "vector trace prepaid charge is smaller than its retained allocation".into()));
+                "vector trace prepaid charge is smaller than its retained allocation".into(),
+            ));
         }
         // Complete all provider callbacks before moving the prepaid charge.
         // A failed Box admission leaves that charge beside the live buffers.
         let credit = ScoreCredit::holding(executing_owner.clone(), 0);
         let admission = crate::VectorCopyAdmission::from_prepaid_retaining_charge(
-            executing_owner, &mut pending.charge,
+            executing_owner,
+            &mut pending.charge,
         )?;
         Ok(OwnedVectorSearchTrace {
             trace: pending.trace.trace,
@@ -2463,8 +2603,15 @@ impl BoundedBruteForceCursor {
     /// End scan-only ownership before constructing the final disclosure.
     /// Move the original source array and its invoice; no source copy occurs.
     #[doc(hidden)]
-    pub fn into_disclosure_groups(self, mut groups: BoundedVectorCandidateGroups) -> (BoundedVectorCandidateGroups, usize) {
-        let Self { snapshot_sources, retained_bytes, .. } = self;
+    pub fn into_disclosure_groups(
+        self,
+        mut groups: BoundedVectorCandidateGroups,
+    ) -> (BoundedVectorCandidateGroups, usize) {
+        let Self {
+            snapshot_sources,
+            retained_bytes,
+            ..
+        } = self;
         let scan_bytes = retained_bytes - groups.retained_bytes;
         groups.sources = snapshot_sources;
         (groups, scan_bytes)
@@ -2493,21 +2640,29 @@ impl BoundedBruteForceCursor {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn checked_vector_add(left: usize, right: usize, operation: &str) -> Result<usize> {
     left.checked_add(right).ok_or_else(|| {
-        Error::Other((format!(
-            "bounded vector {operation} memory size exceeds the native address space"
-        )).into())
+        Error::Other(
+            (format!("bounded vector {operation} memory size exceeds the native address space"))
+                .into(),
+        )
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn checked_vector_mul(left: usize, right: usize, operation: &str) -> Result<usize> {
     left.checked_mul(right).ok_or_else(|| {
-        Error::Other((format!(
-            "bounded vector {operation} memory size exceeds the native address space"
-        )).into())
+        Error::Other(
+            (format!("bounded vector {operation} memory size exceeds the native address space"))
+                .into(),
+        )
     })
 }
 
@@ -2531,8 +2686,10 @@ where
             let growth = requested_capacity
                 .checked_sub(previous_capacity)
                 .ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW capacity moved backwards before allocation".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW capacity moved backwards before allocation".to_string())
+                            .into(),
+                    ))
                 })?;
             before_retain(bytes(growth, element_bytes, "HNSW reserve")?)
         }
@@ -2545,15 +2702,17 @@ where
             actual_capacity
                 .checked_sub(requested_capacity)
                 .ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW capacity reconciliation underflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW capacity reconciliation underflow".to_string()).into(),
+                    ))
                 })?,
             element_bytes,
             "HNSW capacity reconciliation",
         )?),
         HnswSearchScratchEvent::Reconcile { .. } => Ok(()),
-        HnswSearchScratchEvent::Release { .. } => Err(E::from(Error::Other((
-            "bounded HNSW sent a release through its acquire callback".to_string()).into()))),
+        HnswSearchScratchEvent::Release { .. } => Err(E::from(Error::Other(
+            ("bounded HNSW sent a release through its acquire callback".to_string()).into(),
+        ))),
     }
 }
 
@@ -2585,8 +2744,8 @@ fn allocate_vector_slots<E, T>(
 where
     E: From<Error>,
 {
-    let requested = checked_vector_mul(capacity, std::mem::size_of::<T>(), operation)
-        .map_err(E::from)?;
+    let requested =
+        checked_vector_mul(capacity, std::mem::size_of::<T>(), operation).map_err(E::from)?;
     if requested != 0 {
         before_retain(requested)?;
     }
@@ -2594,9 +2753,9 @@ where
     if values.try_reserve_exact(capacity).is_err() {
         drop(values);
         release_retained(requested);
-        return Err(E::from(Error::Other((format!(
-            "bounded vector {operation} allocation failed"
-        )).into())));
+        return Err(E::from(Error::Other(
+            (format!("bounded vector {operation} allocation failed")).into(),
+        )));
     }
     let actual = match checked_vector_mul(values.capacity(), std::mem::size_of::<T>(), operation) {
         Ok(bytes) => bytes,
@@ -2609,9 +2768,9 @@ where
     if actual < requested {
         drop(values);
         release_retained(requested);
-        return Err(E::from(Error::Other((format!(
-            "bounded vector {operation} capacity moved backwards"
-        )).into())));
+        return Err(E::from(Error::Other(
+            (format!("bounded vector {operation} capacity moved backwards")).into(),
+        )));
     }
     if actual > requested
         && let Err(error) = before_retain(actual - requested)
@@ -2647,9 +2806,9 @@ where
             None => {
                 drop(values);
                 release_retained(actual);
-                return Err(E::from(Error::Other((format!(
-                    "bounded vector {operation} source position changed"
-                )).into())));
+                return Err(E::from(Error::Other(
+                    (format!("bounded vector {operation} source position changed")).into(),
+                )));
             }
         };
         position = match position.checked_add(1) {
@@ -2657,9 +2816,9 @@ where
             None => {
                 drop(values);
                 release_retained(actual);
-                return Err(E::from(Error::Other((format!(
-                    "bounded vector {operation} source position overflow"
-                )).into())));
+                return Err(E::from(Error::Other(
+                    (format!("bounded vector {operation} source position overflow")).into(),
+                )));
             }
         };
         values.push(value);
@@ -2685,17 +2844,17 @@ where
     if owned.try_reserve_exact(requested).is_err() {
         drop(owned);
         release_retained(requested);
-        return Err(E::from(Error::Other((format!(
-            "bounded vector {operation} allocation failed"
-        )).into())));
+        return Err(E::from(Error::Other(
+            (format!("bounded vector {operation} allocation failed")).into(),
+        )));
     }
     let actual = owned.capacity();
     if actual < requested {
         drop(owned);
         release_retained(requested);
-        return Err(E::from(Error::Other((format!(
-            "bounded vector {operation} capacity moved backwards"
-        )).into())));
+        return Err(E::from(Error::Other(
+            (format!("bounded vector {operation} capacity moved backwards")).into(),
+        )));
     }
     if actual > requested
         && let Err(error) = before_retain(actual - requested)
@@ -2748,7 +2907,10 @@ where
     Ok((VectorIndexRef { table, column }, retained_bytes))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn next_vector_capacity(current: usize, required: usize) -> Result<usize> {
     if current == 0 {
         return Ok(required);
@@ -2784,9 +2946,9 @@ where
     if replacement.try_reserve_exact(requested_capacity).is_err() {
         drop(replacement);
         release_retained(requested);
-        return Err(E::from(Error::Other((format!(
-            "bounded vector {operation} allocation failed"
-        )).into())));
+        return Err(E::from(Error::Other(
+            (format!("bounded vector {operation} allocation failed")).into(),
+        )));
     }
     let actual =
         match checked_vector_mul(replacement.capacity(), std::mem::size_of::<T>(), operation) {
@@ -2800,9 +2962,9 @@ where
     if actual < requested {
         drop(replacement);
         release_retained(requested);
-        return Err(E::from(Error::Other((format!(
-            "bounded vector {operation} capacity moved backwards"
-        )).into())));
+        return Err(E::from(Error::Other(
+            (format!("bounded vector {operation} capacity moved backwards")).into(),
+        )));
     }
     if actual > requested
         && let Err(error) = before_retain(actual - requested)
@@ -2827,9 +2989,9 @@ where
                 .checked_sub(previous)
                 .and_then(|growth| retained.checked_add(growth))
                 .ok_or_else(|| {
-                    E::from(Error::Other((format!(
-                        "bounded vector {operation} retained-memory overflow"
-                    )).into()))
+                    E::from(Error::Other(
+                        (format!("bounded vector {operation} retained-memory overflow")).into(),
+                    ))
                 })
         })
         .transpose();
@@ -2853,9 +3015,9 @@ where
             None => {
                 drop(replacement);
                 release_retained(actual);
-                return Err(E::from(Error::Other((format!(
-                    "bounded vector {operation} changed during migration"
-                )).into())));
+                return Err(E::from(Error::Other(
+                    (format!("bounded vector {operation} changed during migration")).into(),
+                )));
             }
         };
         position = match position.checked_add(1) {
@@ -2863,9 +3025,9 @@ where
             None => {
                 drop(replacement);
                 release_retained(actual);
-                return Err(E::from(Error::Other((format!(
-                    "bounded vector {operation} migration position overflow"
-                )).into())));
+                return Err(E::from(Error::Other(
+                    (format!("bounded vector {operation} migration position overflow")).into(),
+                )));
             }
         };
         replacement.push(value);
@@ -2903,9 +3065,9 @@ where
             None => {
                 drop(row_ids);
                 release_retained(actual);
-                return Err(E::from(Error::Other((format!(
-                    "bounded vector {operation} source position changed"
-                )).into())));
+                return Err(E::from(Error::Other(
+                    (format!("bounded vector {operation} source position changed")).into(),
+                )));
             }
         };
         position = match position.checked_add(1) {
@@ -2913,9 +3075,9 @@ where
             None => {
                 drop(row_ids);
                 release_retained(actual);
-                return Err(E::from(Error::Other((format!(
-                    "bounded vector {operation} source position overflow"
-                )).into())));
+                return Err(E::from(Error::Other(
+                    (format!("bounded vector {operation} source position overflow")).into(),
+                )));
             }
         };
         row_ids.push(row_id);
@@ -2924,7 +3086,10 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bounded_hnsw_trace<E>(
     index: &VectorIndexRef,
     hnsw_len: usize,
@@ -3043,9 +3208,11 @@ where
     allocate_vector_slots(
         capacity,
         "partition route receipt",
-        &mut |bytes| admitted_at("route_slots", || {
-            before_retain(admission_bytes("route_slots", bytes))
-        }),
+        &mut |bytes| {
+            admitted_at("route_slots", || {
+                before_retain(admission_bytes("route_slots", bytes))
+            })
+        },
         release_retained,
     )
 }
@@ -3176,8 +3343,9 @@ where
         Err(position) => position,
     };
     if sources.len() == sources.capacity() {
-        return Err(E::from(Error::Other((
-            "bounded vector partition scope exceeds its declared maximum".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded vector partition scope exceeds its declared maximum".to_string()).into(),
+        )));
     }
     let heap_bytes = key
         .estimated_bytes()
@@ -3193,8 +3361,9 @@ where
         Some(retained) => retained,
         None => {
             release_retained(heap_bytes);
-            return Err(E::from(Error::Other((
-                "bounded vector partition-key retained-memory overflow".to_string()).into())));
+            return Err(E::from(Error::Other(
+                ("bounded vector partition-key retained-memory overflow".to_string()).into(),
+            )));
         }
     };
     sources.insert(
@@ -3320,7 +3489,10 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
         }
     }
     // Existing standalone/public mutations retain their genuine Legacy route.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_write_set<R>(
         &self,
         tx: TxId,
@@ -3344,7 +3516,10 @@ pub struct MemVectorExecutor<S: WriteSetApplicator> {
 impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// The row checks a statement over `index` may spend checking its filter
     /// row by row: see `BoundedVectorCandidateGroups::row_check_allowance`.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bounded_row_check_allowance(
         &self,
         index: &VectorIndexRef,
@@ -3372,7 +3547,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         }
     }
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn stage_engine_vector(
         &self,
         tx: TxId,
@@ -3428,31 +3606,57 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         }
     }
 
-    fn retain_paged_snapshot_sources<E: From<Error>>(&self,
-        sources: &crate::store::PagedVectorSourceSelection, prefixes: Option<&[VectorPartitionKey]>,
+    fn retain_paged_snapshot_sources<E: From<Error>>(
+        &self,
+        sources: &crate::store::PagedVectorSourceSelection,
+        prefixes: Option<&[VectorPartitionKey]>,
         before_work: &mut impl FnMut() -> std::result::Result<(), E>,
         before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
-        release_retained: &mut impl FnMut(usize), owner: &mut crate::VectorCopyAdmission)
-        -> std::result::Result<(Vec<BoundedSnapshotVectorSource>, usize), E> {
-        let matches = |key: &VectorPartitionKey| prefixes.is_none_or(|prefixes|
-            prefixes.iter().any(|prefix| partition_key_has_prefix(key, prefix)));
-        let count = if prefixes.is_none() { sources.len() } else {
+        release_retained: &mut impl FnMut(usize),
+        owner: &mut crate::VectorCopyAdmission,
+    ) -> std::result::Result<(Vec<BoundedSnapshotVectorSource>, usize), E> {
+        let matches = |key: &VectorPartitionKey| {
+            prefixes.is_none_or(|prefixes| {
+                prefixes
+                    .iter()
+                    .any(|prefix| partition_key_has_prefix(key, prefix))
+            })
+        };
+        let count = if prefixes.is_none() {
+            sources.len()
+        } else {
             let mut count = 0usize;
             sources.visit_checked(owner, before_work, |key, _| {
-                if matches(key) { count = count.checked_add(1).ok_or_else(|| E::from(Error::Other("vector source count overflow".into())))?; }
+                if matches(key) {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        E::from(Error::Other("vector source count overflow".into()))
+                    })?;
+                }
                 Ok::<(), E>(())
             })?;
             count
         };
-        let (mut selected, mut retained_bytes) = allocate_snapshot_source_slots(count, before_retain, release_retained)?;
+        let (mut selected, mut retained_bytes) =
+            allocate_snapshot_source_slots(count, before_retain, release_retained)?;
         let result = sources.visit_checked(owner, before_work, |key, state| {
             if matches(key) {
-                retain_snapshot_source(&mut selected, key, state, &mut retained_bytes,
-                    &mut || Ok::<(), E>(()), before_retain, release_retained)?;
+                retain_snapshot_source(
+                    &mut selected,
+                    key,
+                    state,
+                    &mut retained_bytes,
+                    &mut || Ok::<(), E>(()),
+                    before_retain,
+                    release_retained,
+                )?;
             }
             Ok::<(), E>(())
         });
-        if let Err(error) = result { drop(selected); release_retained(retained_bytes); return Err(error); }
+        if let Err(error) = result {
+            drop(selected);
+            release_retained(retained_bytes);
+            return Err(error);
+        }
         Ok((selected, retained_bytes))
     }
 
@@ -3467,9 +3671,19 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     where
         E: From<Error>,
     {
-        if let Some(sources) = self.store.capture_paged_partition_sources(index, owner).map_err(E::from)? {
-            return self.retain_paged_snapshot_sources(&sources, None, before_source_entry,
-                before_retain, release_retained, owner);
+        if let Some(sources) = self
+            .store
+            .capture_paged_partition_sources(index, owner)
+            .map_err(E::from)?
+        {
+            return self.retain_paged_snapshot_sources(
+                &sources,
+                None,
+                before_source_entry,
+                before_retain,
+                release_retained,
+                owner,
+            );
         }
         self.store.with_partition_sources(index, |sources| {
             let (mut selected, mut retained_bytes) =
@@ -3495,7 +3709,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
-    #[expect(clippy::too_many_arguments, reason = "Source capture keeps layout, snapshot, selection, admission and cancellation owners explicit.")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Source capture keeps layout, snapshot, selection, admission and cancellation owners explicit."
+    )]
     fn bounded_scoped_snapshot_sources<E>(
         &self,
         index: &VectorIndexRef,
@@ -3509,24 +3726,52 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     where
         E: From<Error>,
     {
-        if let Some(sources) = self.store.capture_paged_partition_sources(index, owner).map_err(E::from)? {
-            if prefixes.iter().all(|prefix| prefix.components().len() == layout.partition_key_columns.len()) {
-                let (mut selected, mut retained_bytes) = allocate_snapshot_source_slots(prefixes.len(), before_retain, release_retained)?;
+        if let Some(sources) = self
+            .store
+            .capture_paged_partition_sources(index, owner)
+            .map_err(E::from)?
+        {
+            if prefixes
+                .iter()
+                .all(|prefix| prefix.components().len() == layout.partition_key_columns.len())
+            {
+                let (mut selected, mut retained_bytes) = allocate_snapshot_source_slots(
+                    prefixes.len(),
+                    before_retain,
+                    release_retained,
+                )?;
                 let result = (|| {
                     for prefix in prefixes {
                         before_source_entry()?;
                         if let Some(state) = sources.probe(prefix, owner).map_err(E::from)? {
-                            retain_snapshot_source(&mut selected, prefix, state, &mut retained_bytes,
-                                before_source_entry, before_retain, release_retained)?;
+                            retain_snapshot_source(
+                                &mut selected,
+                                prefix,
+                                state,
+                                &mut retained_bytes,
+                                before_source_entry,
+                                before_retain,
+                                release_retained,
+                            )?;
                         }
                     }
                     Ok::<(), E>(())
                 })();
-                if let Err(error) = result { drop(selected); release_retained(retained_bytes); return Err(error); }
+                if let Err(error) = result {
+                    drop(selected);
+                    release_retained(retained_bytes);
+                    return Err(error);
+                }
                 return Ok((selected, retained_bytes));
             }
-            return self.retain_paged_snapshot_sources(&sources, Some(prefixes), before_source_entry,
-                before_retain, release_retained, owner);
+            return self.retain_paged_snapshot_sources(
+                &sources,
+                Some(prefixes),
+                before_source_entry,
+                before_retain,
+                release_retained,
+                owner,
+            );
         }
         if prefixes
             .iter()
@@ -3637,7 +3882,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     before_retain,
                     release_retained,
                     owner,
-            );
+                );
             }
             self.all_bounded_snapshot_sources(
                 index,
@@ -3698,7 +3943,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         &mut before_retain,
                         &mut release_retained,
                         owner,
-            )?
+                    )?
                 } else if discover_sources {
                     allocate_snapshot_source_slots(
                         candidates.map_or(0, <[u64]>::len).min(
@@ -3718,7 +3963,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         &mut before_retain,
                         &mut release_retained,
                         owner,
-            )?
+                    )?
                 };
                 Ok::<_, E>((discover_sources, sources, retained_bytes))
             })?;
@@ -3727,153 +3972,167 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             bounded_candidate_grouping_repeats_global_pass_for_test();
         let suppress_placement_charge =
             bounded_candidate_grouping_suppresses_placement_charge_for_test();
-        let grouped = (|| -> std::result::Result<(), E> {
-            if let Some(candidate_ids) = candidates {
-                for raw_row_id in candidate_ids {
-                    let row_id = RowId(*raw_row_id);
-                    self.store
-                        .with_query_snapshot_visible_partition_for_row::<E, (), _>(
-                            index,
-                            row_id,
-                            snapshot,
-                            &mut before_checkpoint,
-                            |key, state, before_checkpoint, _owner| {
-                                let position = match sources
-                                    .binary_search_by(|source| source.partition_key.cmp(key))
-                                {
-                                    Ok(position) => position,
-                                    Err(_) if !discover_sources => return Ok(Some(())),
-                                    Err(_) => {
-                                        retain_snapshot_source(
-                                            &mut sources,
-                                            key,
-                                            state.clone(),
-                                            &mut retained_bytes,
-                                            before_checkpoint,
-                                            &mut before_retain,
-                                            &mut release_retained,
-                                        )?;
-                                        sources
-                                            .binary_search_by(|source| {
-                                                source.partition_key.cmp(key)
-                                            })
-                                            .map_err(|_| {
-                                                E::from(Error::Other((
+        let grouped =
+            (|| -> std::result::Result<(), E> {
+                if let Some(candidate_ids) = candidates {
+                    for raw_row_id in candidate_ids {
+                        let row_id = RowId(*raw_row_id);
+                        self.store
+                            .with_query_snapshot_visible_partition_for_row::<E, (), _>(
+                                index,
+                                row_id,
+                                snapshot,
+                                &mut before_checkpoint,
+                                |key, state, before_checkpoint, _owner| {
+                                    let position = match sources
+                                        .binary_search_by(|source| source.partition_key.cmp(key))
+                                    {
+                                        Ok(position) => position,
+                                        Err(_) if !discover_sources => return Ok(Some(())),
+                                        Err(_) => {
+                                            retain_snapshot_source(
+                                                &mut sources,
+                                                key,
+                                                state.clone(),
+                                                &mut retained_bytes,
+                                                before_checkpoint,
+                                                &mut before_retain,
+                                                &mut release_retained,
+                                            )?;
+                                            sources
+                                                .binary_search_by(|source| {
+                                                    source.partition_key.cmp(key)
+                                                })
+                                                .map_err(|_| {
+                                                    E::from(Error::Other((
                                                     "bounded vector candidate source disappeared"
                                                         .to_string()).into()))
-                                            })?
+                                                })?
+                                        }
+                                    };
+                                    if !suppress_placement_charge {
+                                        before_placement()?;
                                     }
-                                };
-                                if !suppress_placement_charge {
-                                    before_placement()?;
-                                }
-                                let source = sources.get_mut(position).ok_or_else(|| {
-                                    E::from(Error::Other((
-                                        "bounded vector candidate group changed".to_string()).into()))
-                                })?;
-                                let local = source.candidate_ids.get_or_insert_with(Vec::new);
-                                let required = local.len().checked_add(1).ok_or_else(|| {
-                                    E::from(Error::Other((
-                                        "bounded vector candidate group length overflow"
-                                            .to_string()).into()))
-                                })?;
-                                grow_vector_copy(
-                                    local,
-                                    required,
-                                    Some(&mut retained_bytes),
-                                    "partition candidate group",
-                                    before_checkpoint,
-                                    &mut before_retain,
-                                    &mut release_retained,
-                                )?;
-                                local.push(row_id.0);
-                                #[cfg(feature = "test-seams")]
-                                observe_bounded_candidate_grouping_for_test(
-                                    BoundedCandidateGroupingEventForTest::Placement,
-                                );
-                                source.allowed_count =
-                                    source.allowed_count.checked_add(1).ok_or_else(|| {
-                                        E::from(Error::Other((
+                                    let source = sources.get_mut(position).ok_or_else(|| {
+                                        E::from(Error::Other(
+                                            ("bounded vector candidate group changed".to_string())
+                                                .into(),
+                                        ))
+                                    })?;
+                                    let local = source.candidate_ids.get_or_insert_with(Vec::new);
+                                    let required = local.len().checked_add(1).ok_or_else(|| {
+                                        E::from(Error::Other(
+                                            ("bounded vector candidate group length overflow"
+                                                .to_string())
+                                            .into(),
+                                        ))
+                                    })?;
+                                    grow_vector_copy(
+                                        local,
+                                        required,
+                                        Some(&mut retained_bytes),
+                                        "partition candidate group",
+                                        before_checkpoint,
+                                        &mut before_retain,
+                                        &mut release_retained,
+                                    )?;
+                                    local.push(row_id.0);
+                                    #[cfg(feature = "test-seams")]
+                                    observe_bounded_candidate_grouping_for_test(
+                                        BoundedCandidateGroupingEventForTest::Placement,
+                                    );
+                                    source.allowed_count =
+                                        source.allowed_count.checked_add(1).ok_or_else(|| {
+                                            E::from(Error::Other((
                                             "bounded vector partition candidate count overflow"
                                                 .to_string()).into()))
-                                    })?;
-                                Ok(Some(()))
-                            },
-                            owner,
-                        )?;
-                }
-                if repeat_global_candidate_pass {
-                    let physical_partition_count = self
-                        .store
-                        .query_partition_source_count(index, owner).map_err(E::from)?;
-                    for _ in 1..physical_partition_count {
-                        for raw_row_id in candidate_ids {
-                            self.store
-                                .with_query_snapshot_visible_partition_for_row::<E, (), _>(
-                                    index,
-                                    RowId(*raw_row_id),
-                                    snapshot,
-                                    &mut before_checkpoint,
-                                    |_key, _state, _before_checkpoint, _owner| Ok(Some(())),
-                                    owner,
-                                )?;
+                                        })?;
+                                    Ok(Some(()))
+                                },
+                                owner,
+                            )?;
+                    }
+                    if repeat_global_candidate_pass {
+                        let physical_partition_count = self
+                            .store
+                            .query_partition_source_count(index, owner)
+                            .map_err(E::from)?;
+                        for _ in 1..physical_partition_count {
+                            for raw_row_id in candidate_ids {
+                                self.store
+                                    .with_query_snapshot_visible_partition_for_row::<E, (), _>(
+                                        index,
+                                        RowId(*raw_row_id),
+                                        snapshot,
+                                        &mut before_checkpoint,
+                                        |_key, _state, _before_checkpoint, _owner| Ok(Some(())),
+                                        owner,
+                                    )?;
+                            }
                         }
                     }
+                    for source in &mut sources {
+                        let candidate_ids = source.candidate_ids.get_or_insert_with(Vec::new);
+                        let candidates_are_unique_and_sorted =
+                            candidate_ids.windows(2).all(|pair| pair[0] < pair[1]);
+                        let live_count = source.state.bounded_directory_visible_entry_count(
+                            snapshot,
+                            None,
+                            &mut before_checkpoint,
+                            owner,
+                        )?;
+                        source.live_count = live_count;
+                        source.candidate_ids_cover_all_live = source.allowed_count != 0
+                            && source.allowed_count == live_count
+                            && candidates_are_unique_and_sorted;
+                    }
+                    return Ok(());
                 }
+
                 for source in &mut sources {
-                    let candidate_ids = source.candidate_ids.get_or_insert_with(Vec::new);
-                    let candidates_are_unique_and_sorted =
-                        candidate_ids.windows(2).all(|pair| pair[0] < pair[1]);
                     let live_count = source.state.bounded_directory_visible_entry_count(
                         snapshot,
                         None,
                         &mut before_checkpoint,
                         owner,
                     )?;
+                    source.allowed_count = live_count;
                     source.live_count = live_count;
-                    source.candidate_ids_cover_all_live = source.allowed_count != 0
-                        && source.allowed_count == live_count
-                        && candidates_are_unique_and_sorted;
+                    // An unrestricted partition is compared as a whole: EXACT
+                    // loads it when the declaration can hold it, and AUTO
+                    // streams one stored body at a time only after that load
+                    // is refused. Collecting every live identity here would
+                    // skip the load and never install a resident partition.
                 }
-                return Ok(());
-            }
-
-            for source in &mut sources {
-                let live_count = source.state.bounded_directory_visible_entry_count(
-                    snapshot,
-                    None,
-                    &mut before_checkpoint,
-                    owner,
-                )?;
-                source.allowed_count = live_count;
-                source.live_count = live_count;
-                // An unrestricted partition is compared as a whole: EXACT
-                // loads it when the declaration can hold it, and AUTO
-                // streams one stored body at a time only after that load
-                // is refused. Collecting every live identity here would
-                // skip the load and never install a resident partition.
-            }
-            Ok(())
-        })();
+                Ok(())
+            })();
         if let Err(error) = grouped {
             drop(sources);
             release_retained(retained_bytes);
             return Err(error);
         }
         for source in &mut sources {
-            if owner.uses_only_raw_sources() { continue; }
+            if owner.uses_only_raw_sources() {
+                continue;
+            }
             // A quarantined route serves no graph; its exact reads use the
             // raw memberships, which do not depend on the damaged catalog.
             if source.state.route_quarantine().is_some() {
                 continue;
             }
             let mut capture_interrupted = None;
-            let captured = source.state.capture_serving_selection_with_work(snapshot, owner, &mut || {
-                match before_checkpoint() {
-                    Ok(()) => true,
-                    Err(error) => { capture_interrupted = Some(error); false },
-                }
-            });
+            let captured =
+                source
+                    .state
+                    .capture_serving_selection_with_work(snapshot, owner, &mut || {
+                        match before_checkpoint() {
+                            Ok(()) => true,
+                            Err(error) => {
+                                capture_interrupted = Some(error);
+                                false
+                            }
+                        }
+                    });
             if let Some(error) = capture_interrupted {
                 drop(sources);
                 release_retained(retained_bytes);
@@ -3953,7 +4212,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// admitted candidate grouping. Query allocation is reconciled before copy;
     /// partition-local candidate slices transfer directly into the cursor.
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bounded_brute_force_cursor_grouped<E>(
         &self,
         index: VectorIndexRef,
@@ -3969,7 +4231,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         E: From<Error>,
     {
         let aggregate_allowed_count = groups.aggregate_allowed_count();
-        let (snapshot, candidate_filter, snapshot_sources, group_bytes) = groups.into_cursor_parts();
+        let (snapshot, candidate_filter, snapshot_sources, group_bytes) =
+            groups.into_cursor_parts();
         // Resolving the index handle takes the registry lock, so the control
         // runs before any source state is read or locked.
         if let Err(error) = before_source_entry() {
@@ -4128,9 +4391,18 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         E: From<Error>,
     {
         let query = std::mem::take(&mut cursor.query);
-        let result = self.bounded_brute_force_step_with_query(cursor, &query, admit_row,
-            before_source_entry, before_precharged_candidate, before_exhaustive_candidate,
-            before_distance, before_retain, release_retained, owner);
+        let result = self.bounded_brute_force_step_with_query(
+            cursor,
+            &query,
+            admit_row,
+            before_source_entry,
+            before_precharged_candidate,
+            before_exhaustive_candidate,
+            before_distance,
+            before_retain,
+            release_retained,
+            owner,
+        );
         cursor.query = query;
         result
     }
@@ -4159,8 +4431,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 return Ok(BoundedVectorStep::Exhausted);
             };
             cursor.output_position = cursor.output_position.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded vector output position overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded vector output position overflow".to_string()).into(),
+                ))
             })?;
             return Ok(BoundedVectorStep::Row(row_id, score));
         }
@@ -4217,14 +4490,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 return Ok(BoundedVectorStep::Pending);
             };
             let candidate_ids = source.candidate_ids.as_deref().ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded filtered vector source lost its candidate group".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded filtered vector source lost its candidate group".to_string()).into(),
+                ))
             })?;
             let Some(raw_row_id) = candidate_ids.get(cursor.position).copied() else {
                 cursor.source_position =
                     cursor.source_position.checked_add(1).ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded vector partition position overflow".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded vector partition position overflow".to_string()).into(),
+                        ))
                     })?;
                 cursor.position = 0;
                 return Ok(BoundedVectorStep::Pending);
@@ -4249,8 +4524,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 )?
                 .map(|score| (row_id, score));
             cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded vector candidate position overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded vector candidate position overflow".to_string()).into(),
+                ))
             })?;
             return Ok(BoundedVectorStep::Pending);
         }
@@ -4306,8 +4582,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         crate::store::DormantVectorLoadRequest::Reserve(bytes) => {
                             match reserved.checked_add(bytes) {
                                 Some(total) => before_retain(bytes).map(|()| reserved = total),
-                                None => Err(E::from(Error::Other((
-                                    "membership cursor reservation overflow".to_string()).into()))),
+                                None => Err(E::from(Error::Other(
+                                    ("membership cursor reservation overflow".to_string()).into(),
+                                ))),
                             }
                         }
                         _ => before_source_entry(),
@@ -4336,8 +4613,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     None => {
                         drop(opened);
                         release_retained(reserved);
-                        return Err(E::from(Error::Other((
-                            "membership cursor retained bytes overflow".to_string()).into())));
+                        return Err(E::from(Error::Other(
+                            ("membership cursor retained bytes overflow".to_string()).into(),
+                        )));
                     }
                 };
                 cursor.membership_reserved_bytes = reserved;
@@ -4364,8 +4642,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         if cursor.position >= cursor.state_end.unwrap_or_default() {
             cursor.historical_partition.take();
             cursor.source_position = cursor.source_position.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded vector partition position overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded vector partition position overflow".to_string()).into(),
+                ))
             })?;
             cursor.position = 0;
             cursor.state_end = None;
@@ -4395,30 +4674,44 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 let next = if let Some(entry) = cursor.pending_membership.as_ref() {
                     Ok(Some(entry.clone()))
                 } else {
-                    memberships.next_with_body_identity(&mut |request| {
-                        let result = match request {
-                            crate::store::DormantVectorLoadRequest::Reserve(bytes) => {
-                                match additional_reserved.checked_add(bytes) {
-                                    Some(total)
-                                        if retained_before.checked_add(total).is_some()
-                                            && membership_before.checked_add(total).is_some() =>
-                                    {
-                                        before_retain(bytes).map(|()| additional_reserved = total)
+                    memberships
+                        .next_with_body_identity(&mut |request| {
+                            let result = match request {
+                                crate::store::DormantVectorLoadRequest::Reserve(bytes) => {
+                                    match additional_reserved.checked_add(bytes) {
+                                        Some(total)
+                                            if retained_before.checked_add(total).is_some()
+                                                && membership_before
+                                                    .checked_add(total)
+                                                    .is_some() =>
+                                        {
+                                            before_retain(bytes)
+                                                .map(|()| additional_reserved = total)
+                                        }
+                                        _ => Err(E::from(Error::Other(
+                                            "membership window reservation overflow".into(),
+                                        ))),
                                     }
-                                    _ => Err(E::from(Error::Other(
-                                        "membership window reservation overflow".into()))),
                                 }
+                                _ => before_source_entry(),
+                            };
+                            if let Err(error) = result {
+                                interrupted = Some(error);
+                                false
+                            } else {
+                                true
                             }
-                            _ => before_source_entry(),
-                        };
-                        if let Err(error) = result {
-                            interrupted = Some(error);
-                            false
-                        } else {
-                            true
-                        }
-                    }).map(|next| next.map(|(interval, body)|
-                        (body, interval.row_id, interval.created_tx, interval.deleted_tx)))
+                        })
+                        .map(|next| {
+                            next.map(|(interval, body)| {
+                                (
+                                    body,
+                                    interval.row_id,
+                                    interval.created_tx,
+                                    interval.deleted_tx,
+                                )
+                            })
+                        })
                 };
                 cursor.retained_bytes += additional_reserved;
                 cursor.membership_reserved_bytes += additional_reserved;
@@ -4426,11 +4719,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     return Err(error);
                 }
                 cursor.pending_membership = next.map_err(E::from)?;
-                cursor.pending_membership.as_ref().map(|(_, row, visible_from, deleted)| {
-                    (visible_from.0 <= cursor.snapshot.0
-                        && deleted.is_none_or(|tx| tx.0 > cursor.snapshot.0))
-                    .then_some(*row)
-                })
+                cursor
+                    .pending_membership
+                    .as_ref()
+                    .map(|(_, row, visible_from, deleted)| {
+                        (visible_from.0 <= cursor.snapshot.0
+                            && deleted.is_none_or(|tx| tx.0 > cursor.snapshot.0))
+                        .then_some(*row)
+                    })
             } else {
                 source
                     .state
@@ -4443,8 +4739,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 release_retained(reserved);
                 cursor.source_position =
                     cursor.source_position.checked_add(1).ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded vector partition position overflow".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded vector partition position overflow".to_string()).into(),
+                        ))
                     })?;
                 cursor.position = 0;
                 cursor.state_end = None;
@@ -4454,14 +4751,17 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             // The same one exhaustive-scan charge per directory entry as the
             // resident scan below; dead and future versions consume it too.
             before_exhaustive_candidate()?;
-            if visible.is_some() && cursor.pending_membership.is_some()
+            if visible.is_some()
+                && cursor.pending_membership.is_some()
                 && let Some(memberships) = cursor.membership_cursor.as_deref()
             {
                 // The stream already authenticated this exact body identity.
                 // Bind its existing receipt to the scan at the same root and
                 // route instead of decoding a second membership for the body.
-                source.state.bind_streamed_membership(memberships,
-                    &mut cursor.body_reads, owner).map_err(E::from)?;
+                source
+                    .state
+                    .bind_streamed_membership(memberships, &mut cursor.body_reads, owner)
+                    .map_err(E::from)?;
             }
             cursor.pending_score = match visible {
                 Some(row_id) if cursor.pending_membership.is_some() => source
@@ -4498,8 +4798,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             };
             cursor.pending_membership.take();
             cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded vector candidate position overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded vector candidate position overflow".to_string()).into(),
+                ))
             })?;
             return Ok(BoundedVectorStep::Pending);
         }
@@ -4537,15 +4838,13 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     before_distance()?;
                     #[cfg(feature = "test-seams")]
                     observe_native_vector_score_for_test();
-                    Ok(Some((
-                        entry.row_id,
-                        entry.vector.cosine_similarity(query),
-                    )))
+                    Ok(Some((entry.row_id, entry.vector.cosine_similarity(query))))
                 })?
         };
         cursor.position = cursor.position.checked_add(1).ok_or_else(|| {
-            E::from(Error::Other((
-                "bounded vector candidate position overflow".to_string()).into()))
+            E::from(Error::Other(
+                ("bounded vector candidate position overflow".to_string()).into(),
+            ))
         })?;
         cursor.pending_score = scored;
         Ok(BoundedVectorStep::Pending)
@@ -4579,7 +4878,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             &mut before_retain,
             &mut release_retained,
             owner,
-            )?;
+        )?;
         let result = sources.iter().try_for_each(|source| {
             source.state.bounded_visit_visible_ids_charged(
                 snapshot,
@@ -4728,7 +5027,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// Existing public callers keep the original never-true classification.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bounded_hnsw_search_grouped_with_reader_memory_refusal<E>(
         &self,
         index: &VectorIndexRef,
@@ -4756,7 +5058,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let mut before_distance = || {
             before_distance()?;
             let spent = distance_spent.get().checked_add(1).ok_or_else(|| {
-                E::from(Error::Other("vector query evaluation count overflow".into()))
+                E::from(Error::Other(
+                    "vector query evaluation count overflow".into(),
+                ))
             })?;
             distance_spent.set(spent);
             Ok::<(), E>(())
@@ -4857,22 +5161,27 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 crate::auto_planning_test_seams::note_partition_cost();
             }
             let cost = groups.auto_statement_cost(&layout, k);
-        // A fully enumerated residual candidate set no larger than the
-        // declared search breadth is already a bounded answer domain. Compare
-        // it directly under AUTO (Policies 21/23); unrelated live/history rows
-        // must not turn those same admitted candidates into a graph walk.
-        // Row-checked filters have no complete candidate list and cannot use
-        // this decision. Explicit INDEXED keeps its maintained route.
-        if mode == VectorSearchMode::Auto && groups.filtered && !groups.row_checked
-            && aggregate_allowed_count <= statement_policy.hnsw_ef_search.max(search_policy_limit(k))
-        {
-            return bounded_uniform_exact_outcome(
-                index, groups,
-                BoundedHnswExactReason::SmallPartitionCandidateSetUsesExact,
-                "bounded_candidate_set_within_search_breadth",
-                &mut before_retain, &mut release_retained,
-            );
-        }
+            // A fully enumerated residual candidate set no larger than the
+            // declared search breadth is already a bounded answer domain. Compare
+            // it directly under AUTO (Policies 21/23); unrelated live/history rows
+            // must not turn those same admitted candidates into a graph walk.
+            // Row-checked filters have no complete candidate list and cannot use
+            // this decision. Explicit INDEXED keeps its maintained route.
+            if mode == VectorSearchMode::Auto
+                && groups.filtered
+                && !groups.row_checked
+                && aggregate_allowed_count
+                    <= statement_policy.hnsw_ef_search.max(search_policy_limit(k))
+            {
+                return bounded_uniform_exact_outcome(
+                    index,
+                    groups,
+                    BoundedHnswExactReason::SmallPartitionCandidateSetUsesExact,
+                    "bounded_candidate_set_within_search_breadth",
+                    &mut before_retain,
+                    &mut release_retained,
+                );
+            }
             let walk_budget = cost.walk_budget;
             contextdb_core::find_attribution::count(
                 "auto_statement_walk_budget",
@@ -4895,8 +5204,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         // not searching -- never one it is about to search, which would make a
         // find over several Contexts re-read every graph it had already read.
         let mut statement_admission = owner.scratch();
-        statement_admission.reserve(checked_vector_mul(snapshot_sources.len(),
-            2 * std::mem::size_of::<usize>(), "statement partition identities").map_err(E::from)?)
+        statement_admission
+            .reserve(
+                checked_vector_mul(
+                    snapshot_sources.len(),
+                    2 * std::mem::size_of::<usize>(),
+                    "statement partition identities",
+                )
+                .map_err(E::from)?,
+            )
             .map_err(E::from)?;
         let admitted = snapshot_sources
             .iter()
@@ -5007,17 +5323,23 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             // Pay the actual Vec capacity before allocation, rather than one
             // element at each push into an amortized multi-element allocation.
             (union_partitions, union_storage_bytes) = allocate_vector_slots(
-                snapshot_sources.len(), "union partitions", &mut before_retain, &mut release_retained)?;
+                snapshot_sources.len(),
+                "union partitions",
+                &mut before_retain,
+                &mut release_retained,
+            )?;
             let mut partition_position = 0usize;
             while partition_position < snapshot_sources.len() {
                 before_source_entry()?;
                 let source = snapshot_sources.get(partition_position).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW partition position changed".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW partition position changed".to_string()).into(),
+                    ))
                 })?;
                 partition_position = partition_position.checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW partition position overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW partition position overflow".to_string()).into(),
+                    ))
                 })?;
                 let state = &source.state;
                 let partition_started = std::time::Instant::now();
@@ -5046,7 +5368,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 before_source_entry()?;
                 let eligibility = crate::store::BoundedIndexEligibility {
                     entry_count: source.serving_selection.as_ref().map_or_else(
-                        || state.entry_count(), |selection| selection.inspection.summary.entries),
+                        || state.entry_count(),
+                        |selection| selection.inspection.summary.entries,
+                    ),
                     live_count: source.live_count,
                 };
                 let ef_search = statement_policy.hnsw_ef_search;
@@ -5066,8 +5390,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 // charged path EXACT uses, and no graph is loaded for it.
                 if layout.serves_flat(eligibility.live_count) {
                     let scores = merged.as_mut().ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded HNSW merge state was already consumed".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded HNSW merge state was already consumed".to_string()).into(),
+                        ))
                     })?;
                     // AUTO compares rows under the request's own limits; INDEXED
                     // compares a FLAT_BELOW partition within the walk's allowance.
@@ -5211,7 +5536,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 };
                 if availability == VectorGraphLayerAvailability::Ready
                     && (!owned_layers.is_empty()
-                        || source.serving_selection.as_ref()
+                        || source
+                            .serving_selection
+                            .as_ref()
                             .is_some_and(|selection| selection.streamed_tail.is_some())
                         || source
                             .streamed_suffix()
@@ -5219,51 +5546,115 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 {
                     self.store.mark_sealed_graph_used(state);
                     let counted = (|| -> std::result::Result<(usize, usize), E> {
-                    Ok(if let Some(tail) = source
-                        .serving_selection.as_ref().and_then(|selection| selection.streamed_tail.as_ref()) {
-                        tail.validate().map_err(E::from)?;
-                        let memberships = state.durable_membership_source().ok_or_else(|| E::from(
-                            Error::Other("streamed working tail has no captured directory".into())))?;
-                        let mut unused_scores = Vec::new();
-                        let mut unused_bytes = 0usize;
-                        let mut count = |scope| bounded_exact_merge_durable(index, state,
-                            memberships.as_ref(), Some((&**tail, scope)), false, query, k, snapshot,
-                            &mut unused_scores, &mut unused_bytes, &mut body_reads,
-                            &mut before_source_entry, &mut before_exact_candidate, &mut before_distance,
-                            &mut before_retain, &mut release_retained, owner,
-                            partition_position - 1, row_check_ledger.as_ref(), None);
-                        let allowed_tail = count(candidates)?;
-                        let live_tail = if candidates.is_some() { count(None)? } else { allowed_tail };
-                        (allowed_count.checked_sub(allowed_tail).ok_or_else(|| E::from(
-                            Error::Other("streamed tail exceeds captured allowed count".into())))?,
-                         eligibility.live_count.checked_sub(live_tail).ok_or_else(|| E::from(
-                            Error::Other("streamed tail exceeds captured live count".into())))?)
-                    } else if let Some(covered_tx) = source.journal_suffix_frontier() {
-                        // The graph owns only the frontier's memberships. Newer
-                        // visible memberships are scored from the authenticated
-                        // journal after the walk; counting them as graph members
-                        // falsely reports a connected saved graph as disconnected.
-                        // The bound suffix authenticates the live pending count
-                        // at this exact root/frontier. A filtered scope needs only
-                        // point probes for its candidates, never a partition scan.
-                        let live_tail = source.streamed_suffix().expect("journal frontier has a suffix").saved_inserts();
-                        let allowed_tail = if let Some(candidates) = candidates {
-                            let mut count = 0usize;
-                            for row in candidates {
-                                let entry = state.bounded_visible_directory_entry_by_row_with_copy_admission(
+                        Ok(
+                            if let Some(tail) = source
+                                .serving_selection
+                                .as_ref()
+                                .and_then(|selection| selection.streamed_tail.as_ref())
+                            {
+                                tail.validate().map_err(E::from)?;
+                                let memberships =
+                                    state.durable_membership_source().ok_or_else(|| {
+                                        E::from(Error::Other(
+                                            "streamed working tail has no captured directory"
+                                                .into(),
+                                        ))
+                                    })?;
+                                let mut unused_scores = Vec::new();
+                                let mut unused_bytes = 0usize;
+                                let mut count = |scope| {
+                                    bounded_exact_merge_durable(
+                                        index,
+                                        state,
+                                        memberships.as_ref(),
+                                        Some((&**tail, scope)),
+                                        false,
+                                        query,
+                                        k,
+                                        snapshot,
+                                        &mut unused_scores,
+                                        &mut unused_bytes,
+                                        &mut body_reads,
+                                        &mut before_source_entry,
+                                        &mut before_exact_candidate,
+                                        &mut before_distance,
+                                        &mut before_retain,
+                                        &mut release_retained,
+                                        owner,
+                                        partition_position - 1,
+                                        row_check_ledger.as_ref(),
+                                        None,
+                                    )
+                                };
+                                let allowed_tail = count(candidates)?;
+                                let live_tail = if candidates.is_some() {
+                                    count(None)?
+                                } else {
+                                    allowed_tail
+                                };
+                                (
+                                    allowed_count.checked_sub(allowed_tail).ok_or_else(|| {
+                                        E::from(Error::Other(
+                                            "streamed tail exceeds captured allowed count".into(),
+                                        ))
+                                    })?,
+                                    eligibility.live_count.checked_sub(live_tail).ok_or_else(
+                                        || {
+                                            E::from(Error::Other(
+                                                "streamed tail exceeds captured live count".into(),
+                                            ))
+                                        },
+                                    )?,
+                                )
+                            } else if let Some(covered_tx) = source.journal_suffix_frontier() {
+                                // The graph owns only the frontier's memberships. Newer
+                                // visible memberships are scored from the authenticated
+                                // journal after the walk; counting them as graph members
+                                // falsely reports a connected saved graph as disconnected.
+                                // The bound suffix authenticates the live pending count
+                                // at this exact root/frontier. A filtered scope needs only
+                                // point probes for its candidates, never a partition scan.
+                                let live_tail = source
+                                    .streamed_suffix()
+                                    .expect("journal frontier has a suffix")
+                                    .saved_inserts();
+                                let allowed_tail = if let Some(candidates) = candidates {
+                                    let mut count = 0usize;
+                                    for row in candidates {
+                                        let entry = state.bounded_visible_directory_entry_by_row_with_copy_admission(
                                     RowId(*row), snapshot, &mut before_source_entry, owner, None)?;
-                                if entry.is_some_and(|entry| entry.membership.visible_from > covered_tx) {
-                                    count = count.checked_add(1).ok_or_else(|| E::from(
-                                        Error::Other("journal suffix allowed count overflow".into())))?;
-                                }
-                            }
-                            count
-                        } else { live_tail };
-                        (allowed_count.checked_sub(allowed_tail).ok_or_else(|| E::from(
-                            Error::Other("journal suffix exceeds captured allowed count".into())))?,
-                         eligibility.live_count.checked_sub(live_tail).ok_or_else(|| E::from(
-                            Error::Other("journal suffix exceeds captured live count".into())))?)
-                    } else { (allowed_count, eligibility.live_count) })
+                                        if entry.is_some_and(|entry| {
+                                            entry.membership.visible_from > covered_tx
+                                        }) {
+                                            count = count.checked_add(1).ok_or_else(|| {
+                                                E::from(Error::Other(
+                                                    "journal suffix allowed count overflow".into(),
+                                                ))
+                                            })?;
+                                        }
+                                    }
+                                    count
+                                } else {
+                                    live_tail
+                                };
+                                (
+                                    allowed_count.checked_sub(allowed_tail).ok_or_else(|| {
+                                        E::from(Error::Other(
+                                            "journal suffix exceeds captured allowed count".into(),
+                                        ))
+                                    })?,
+                                    eligibility.live_count.checked_sub(live_tail).ok_or_else(
+                                        || {
+                                            E::from(Error::Other(
+                                                "journal suffix exceeds captured live count".into(),
+                                            ))
+                                        },
+                                    )?,
+                                )
+                            } else {
+                                (allowed_count, eligibility.live_count)
+                            },
+                        )
                     })();
                     let (graph_allowed_count, graph_live_count) = match counted {
                         Ok(counts) => counts,
@@ -5274,9 +5665,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         }
                     };
 
-                    let charged_bytes = owned_layers.capacity().saturating_mul(std::mem::size_of::<
-                        crate::store::SnapshotCompatibleLayer<'_>,
-                    >());
+                    let charged_bytes =
+                        owned_layers.capacity().saturating_mul(std::mem::size_of::<
+                            crate::store::SnapshotCompatibleLayer<'_>,
+                        >());
                     let layer_bytes =
                         owned_layers.capacity().saturating_mul(std::mem::size_of::<
                             crate::store::SnapshotCompatibleLayer<'_>,
@@ -5332,8 +5724,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     "maintained_graph_unavailable"
                 };
                 let scores = merged.as_mut().ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW merge state was already consumed".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW merge state was already consumed".to_string()).into(),
+                    ))
                 })?;
                 // AUTO compares rows under the request's own limits; INDEXED
                 // compares a FLAT_BELOW partition within the walk's allowance.
@@ -5426,29 +5819,32 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 let outcome = if crossover_to_exact {
                     None
                 } else {
-                    Some(self.bounded_union_search(
-                        index,
-                        query,
-                        k,
-                        snapshot,
-                        snapshot_sources,
-                        &mut union_partitions,
-                        statement_policy.hnsw_ef_search,
-                        layout.resolve_search_radius(),
-                        HnswAllowedSearchLimits {
-                            max_vector_evaluations: allowed_search_limits
-                                .max_vector_evaluations.saturating_sub(distance_spent.get()),
-                            ..allowed_search_limits
-                        },
-                        &mut query_self_scores,
-                        &mut before_source_entry,
-                        &mut before_exact_candidate,
-                        &mut before_distance,
-                        &mut before_retain,
-                        &mut release_retained,
-                        owner,
-                        row_check_ledger.as_ref(),
-                    )?)
+                    Some(
+                        self.bounded_union_search(
+                            index,
+                            query,
+                            k,
+                            snapshot,
+                            snapshot_sources,
+                            &mut union_partitions,
+                            statement_policy.hnsw_ef_search,
+                            layout.resolve_search_radius(),
+                            HnswAllowedSearchLimits {
+                                max_vector_evaluations: allowed_search_limits
+                                    .max_vector_evaluations
+                                    .saturating_sub(distance_spent.get()),
+                                ..allowed_search_limits
+                            },
+                            &mut query_self_scores,
+                            &mut before_source_entry,
+                            &mut before_exact_candidate,
+                            &mut before_distance,
+                            &mut before_retain,
+                            &mut release_retained,
+                            owner,
+                            row_check_ledger.as_ref(),
+                        )?,
+                    )
                 };
                 let resolved = match outcome {
                     None => None,
@@ -5497,16 +5893,21 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         let merge = (|| -> std::result::Result<(), E> {
                             let trace_candidates =
                                 graph_trace_candidates.as_mut().ok_or_else(|| {
-                                    E::from(Error::Other((
-                                        "bounded HNSW trace candidate state was already consumed"
-                                            .to_string()).into()))
+                                    E::from(Error::Other(
+                                        ("bounded HNSW trace candidate state was already consumed"
+                                            .to_string())
+                                        .into(),
+                                    ))
                                 })?;
                             let required_capacity = trace_candidates
                                 .len()
                                 .checked_add(walked.len())
                                 .ok_or_else(|| {
-                                    E::from(Error::Other((
-                                        "bounded HNSW trace candidate length overflow".to_string()).into()))
+                                    E::from(Error::Other(
+                                        ("bounded HNSW trace candidate length overflow"
+                                            .to_string())
+                                        .into(),
+                                    ))
                                 })?;
                             grow_vector_copy(
                                 trace_candidates,
@@ -5519,8 +5920,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             )?;
                             trace_candidates.extend(walked.iter().copied());
                             let scores = merged.as_mut().ok_or_else(|| {
-                                E::from(Error::Other((
-                                    "bounded HNSW merge state was already consumed".to_string()).into()))
+                                E::from(Error::Other(
+                                    ("bounded HNSW merge state was already consumed".to_string())
+                                        .into(),
+                                ))
                             })?;
                             for candidate in accepted.iter().copied() {
                                 merge_bounded_vector_score(
@@ -5586,11 +5989,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                                     "bounded HNSW union partition position changed"
                                                         .to_string()).into()))
                                             })?;
-                                        let scores = merged.as_mut().ok_or_else(|| {
-                                            E::from(Error::Other((
+                                        let scores =
+                                            merged.as_mut().ok_or_else(|| {
+                                                E::from(Error::Other((
                                                 "bounded HNSW merge state was already consumed"
                                                     .to_string()).into()))
-                                        })?;
+                                            })?;
                                         // AUTO compares rows under the request's own limits; INDEXED
                                         // compares a FLAT_BELOW partition within the walk's allowance.
                                         if mode == VectorSearchMode::Auto
@@ -5716,12 +6120,17 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                             let source = snapshot_sources
                                 .get(partition.source_position)
                                 .ok_or_else(|| {
-                                    E::from(Error::Other((
-                                        "bounded HNSW union partition position changed".to_string()).into()))
+                                    E::from(Error::Other(
+                                        ("bounded HNSW union partition position changed"
+                                            .to_string())
+                                        .into(),
+                                    ))
                                 })?;
                             let scores = merged.as_mut().ok_or_else(|| {
-                                E::from(Error::Other((
-                                    "bounded HNSW merge state was already consumed".to_string()).into()))
+                                E::from(Error::Other(
+                                    ("bounded HNSW merge state was already consumed".to_string())
+                                        .into(),
+                                ))
                             })?;
                             // AUTO compares rows under the request's own limits; INDEXED
                             // compares a FLAT_BELOW partition within the walk's allowance.
@@ -5779,8 +6188,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             }
 
             let Some(rows) = merged.as_mut() else {
-                return Err(E::from(Error::Other((
-                    "bounded HNSW merge state was consumed before publication".to_string()).into())));
+                return Err(E::from(Error::Other(
+                    ("bounded HNSW merge state was consumed before publication".to_string()).into(),
+                )));
             };
             if rows.is_empty() {
                 return Ok(BoundedHnswOutcome::CompleteEmpty);
@@ -5790,9 +6200,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 &[][..]
             } else {
                 graph_trace_candidates.as_deref().ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW trace candidates disappeared before publication".to_string()
-                    ).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW trace candidates disappeared before publication"
+                            .to_string())
+                        .into(),
+                    ))
                 })?
             };
             let trace_generations = std::mem::take(&mut selected_generations);
@@ -5857,8 +6269,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 None => {
                     drop(trace);
                     release_retained(trace_bytes);
-                    return Err(E::from(Error::Other((
-                        "bounded HNSW merge state disappeared at publication".to_string()).into())));
+                    return Err(E::from(Error::Other(
+                        ("bounded HNSW merge state disappeared at publication".to_string()).into(),
+                    )));
                 }
             };
             // The published result owns this credit now; error cleanup below
@@ -5942,7 +6355,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// their own partition's stored vector. The request work limit is shared.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::drop_non_drop)] // Explicitly end callback borrows before partition publication.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn bounded_union_search<E>(
         &self,
         index: &VectorIndexRef,
@@ -5988,20 +6404,28 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             },
             max_vector_evaluations: allowed_search_limits.max_vector_evaluations,
         };
-        let layer_count = partitions.iter().try_fold(0usize, |count, partition| {
-            checked_vector_add(count, partition.layers.len(), "union layer count")
-        }).map_err(E::from)?;
+        let layer_count = partitions
+            .iter()
+            .try_fold(0usize, |count, partition| {
+                checked_vector_add(count, partition.layers.len(), "union layer count")
+            })
+            .map_err(E::from)?;
         // The graph walk already represents layer ordinals as u32. Retain
         // the same checked representation in its owner directory, avoiding
         // two pointer-sized indices per layer on 64-bit readers.
         if u32::try_from(layer_count).is_err() || u32::try_from(partitions.len()).is_err() {
-            return Err(E::from(Error::Other("union layer directory exceeds native ordinal range".into())));
+            return Err(E::from(Error::Other(
+                "union layer directory exceeds native ordinal range".into(),
+            )));
         }
         let mut partition_runs = Vec::<(usize, usize)>::new();
         let mut partition_run_bytes = 0usize;
         let prepared = (|| -> std::result::Result<(), E> {
             (partition_runs, partition_run_bytes) = allocate_vector_slots(
-                partitions.len(), "union partition runs", before_retain, release_retained,
+                partitions.len(),
+                "union partition runs",
+                before_retain,
+                release_retained,
             )?;
             Ok(())
         })();
@@ -6016,8 +6440,12 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         // A row that shares another row's graph point (a graph-identity
         // member) was reached at that point's distance, not its own: its score
         // is certified from its stored vector too.
-        let f32_graph_identities = matches!(self.store.with_index_layout(index, |layout| layout.quantization)
-            .map_err(E::from)?, VectorQuantization::F32);
+        let f32_graph_identities = matches!(
+            self.store
+                .with_index_layout(index, |layout| layout.quantization)
+                .map_err(E::from)?,
+            VectorQuantization::F32
+        );
         let started = std::time::Instant::now();
         // One flag per partition for a walk that finds live rows its graph
         // does not connect, admitted before any walk can report one, so the
@@ -6025,14 +6453,16 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         let (mut disconnected, slot_bytes) = match allocate_vector_slots(
             partitions.len(),
             "union disconnected slots",
-            &mut |bytes| admitted_at("disconnected_slots", || {
-                before_retain(admission_bytes("disconnected_slots", bytes))
-            }),
+            &mut |bytes| {
+                admitted_at("disconnected_slots", || {
+                    before_retain(admission_bytes("disconnected_slots", bytes))
+                })
+            },
             release_retained,
         ) {
             Ok(slots) => slots,
             Err(error) => {
-                                drop(partition_runs);
+                drop(partition_runs);
                 release_retained(partition_run_bytes);
                 return Err(error);
             }
@@ -6068,7 +6498,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 // A separate empty session cannot release the retained pages.
                 // Keep the session per slice: layer ordinals restart at zero
                 // for another partition and must never alias its cached root.
-                let navigation_session = crate::hnsw::union::NavigationSession::new(Some(funder.clone()));
+                let navigation_session =
+                    crate::hnsw::union::NavigationSession::new(Some(funder.clone()));
                 crate::hnsw::union::search_union_allowed_bounded_with_navigation(
                     slice,
                     query,
@@ -6078,9 +6509,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     // The declared work limit is one too: what earlier partitions
                     // spent is gone from it; the per-index cap is funded separately.
                     HnswAllowedSearchLimits {
-                        max_vector_evaluations: limits
-                            .max_vector_evaluations
-                            .saturating_sub(spent),
+                        max_vector_evaluations: limits.max_vector_evaluations.saturating_sub(spent),
                         ..limits
                     },
                     // Currentness is a fact of this admitted partition, not
@@ -6090,7 +6519,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         let partition = &partitions[layer.partition];
                         partition.entry_count == partition.live_count
                             && (f32_graph_identities || !partition.has_graph_members())
-                            && sources.get(partition.source_position)
+                            && sources
+                                .get(partition.source_position)
                                 .and_then(|source| source.serving_selection.as_ref())
                                 .is_none_or(|selection| selection.streamed_tail.is_none())
                     }),
@@ -6106,20 +6536,32 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                     if membership_error.borrow().is_some() {
                                         return false;
                                     }
-                                    if let Some(tail) = source.serving_selection.as_ref()
-                                        .and_then(|selection| selection.streamed_tail.as_ref()) {
-                                        match tail.includes_row(row_id, snapshot, &mut admitted_owner.borrow_mut(), &mut || {
-                                            match (*source_checkpoints.borrow_mut())() {
+                                    if let Some(tail) = source
+                                        .serving_selection
+                                        .as_ref()
+                                        .and_then(|selection| selection.streamed_tail.as_ref())
+                                    {
+                                        match tail.includes_row(
+                                            row_id,
+                                            snapshot,
+                                            &mut admitted_owner.borrow_mut(),
+                                            &mut || match (*source_checkpoints.borrow_mut())() {
                                                 Ok(()) => true,
-                                                Err(error) => { source_work_error.replace(Some(error)); false },
-                                            }
-                                        }) {
+                                                Err(error) => {
+                                                    source_work_error.replace(Some(error));
+                                                    false
+                                                }
+                                            },
+                                        ) {
                                             Ok(true) => {
                                                 last_visible.set(Some((position, row_id, None)));
                                                 return false;
-                                            },
-                                            Ok(false) => {},
-                                            Err(error) => { membership_error.replace(Some(error)); return false; },
+                                            }
+                                            Ok(false) => {}
+                                            Err(error) => {
+                                                membership_error.replace(Some(error));
+                                                return false;
+                                            }
                                         }
                                     }
                                     if let Some((_, _, visible)) = last_visible
@@ -6130,10 +6572,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                     }
                                     if let Some(covered_tx) = source.journal_suffix_frontier() {
                                         match source.state.try_visible_directory_entry_by_row(
-                                            row_id, snapshot, &mut admitted_owner.borrow_mut()) {
+                                            row_id,
+                                            snapshot,
+                                            &mut admitted_owner.borrow_mut(),
+                                        ) {
                                             Ok(entry) => {
                                                 let visible = entry
-                                                    .filter(|entry| entry.membership.visible_from <= covered_tx)
+                                                    .filter(|entry| {
+                                                        entry.membership.visible_from <= covered_tx
+                                                    })
                                                     .map(|entry| entry.lsn);
                                                 last_visible.set(Some((position, row_id, visible)));
                                                 return visible.is_some();
@@ -6288,7 +6735,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 let (position, offset) = partition_runs[run];
                 let partition = &partitions[position];
                 let (mut layers, descriptor_bytes) = allocate_vector_slots(
-                    partition.layers.len(), "active union layer descriptors",
+                    partition.layers.len(),
+                    "active union layer descriptors",
                     &mut |bytes| (*retained.borrow_mut())(bytes),
                     &mut |bytes| (*released.borrow_mut())(bytes),
                 )?;
@@ -6296,13 +6744,18 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     let Some(graph) = layer.graph() else {
                         drop(layers);
                         (*released.borrow_mut())(descriptor_bytes);
-                        return Err(E::from(Error::Other("a captured union layer was released".into())));
+                        return Err(E::from(Error::Other(
+                            "a captured union layer was released".into(),
+                        )));
                     };
                     layers.push(crate::hnsw::HnswUnionLayer {
-                        graph, partition: position,
+                        graph,
+                        partition: position,
                         allowed_count: partition.graph_allowed_count,
                         live_count: partition.graph_live_count,
-                        seed_rows: partition.candidates.map(crate::hnsw::union::UnionSeedRows::Slice),
+                        seed_rows: partition
+                            .candidates
+                            .map(crate::hnsw::union::UnionSeedRows::Slice),
                         covered_lsn: layer.identity.map(|identity| identity.covered_lsn),
                     });
                 }
@@ -6386,7 +6839,8 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         drop(navigation_copy_owner);
         drop(navigation_session);
         let disconnected_slots = disconnected_slots.into_inner();
-        let membership_error = source_work_error.into_inner()
+        let membership_error = source_work_error
+            .into_inner()
             .or_else(|| membership_error.into_inner().map(E::from));
         if let Some(error) = membership_error {
             // A bool visibility callback can record an error while the walk
@@ -6406,7 +6860,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             Err(error) => {
                 drop(disconnected_slots);
                 release_retained(slot_bytes);
-                        return Err(error);
+                return Err(error);
             }
         };
         // The walk alone: final candidate scoring is counted, not timed, here.
@@ -6525,7 +6979,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// than its walk distance promised, and the next row is scored in its
     /// place instead of the page going out short or out of order.
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn resolve_union_candidates<E>(
         &self,
         index: &VectorIndexRef,
@@ -6702,8 +7159,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     scoring_open = false;
                 }
                 let required_capacity = walked.len().checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW union walked-row count overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW union walked-row count overflow".to_string()).into(),
+                    ))
                 })?;
                 grow_vector_copy(
                     &mut walked,
@@ -6725,12 +7183,14 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     continue;
                 }
                 let partition = partitions.get(candidate.partition).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW union partition position changed".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW union partition position changed".to_string()).into(),
+                    ))
                 })?;
                 let source = sources.get(partition.source_position).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW union partition position changed".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW union partition position changed".to_string()).into(),
+                    ))
                 })?;
                 let state = &source.state;
                 let (page_scoring, considered) = &mut scoring[candidate.partition];
@@ -6754,15 +7214,25 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 // A changed/current private body belongs to the streamed
                 // delta. Do not score it once from a saved layer and again
                 // from that delta, even when the graph still names its RowId.
-                if let Some(tail) = source.serving_selection.as_ref()
-                    .and_then(|selection| selection.streamed_tail.as_ref()) {
+                if let Some(tail) = source
+                    .serving_selection
+                    .as_ref()
+                    .and_then(|selection| selection.streamed_tail.as_ref())
+                {
                     let mut interrupted = None;
-                    let included = tail.includes_row(candidate.row_id, snapshot, owner, &mut || {
-                        match before_source_entry() {
-                            Ok(()) => true, Err(error) => { interrupted = Some(error); false },
-                        }
-                    });
-                    if let Some(error) = interrupted { return Err(error); }
+                    let included =
+                        tail.includes_row(candidate.row_id, snapshot, owner, &mut || {
+                            match before_source_entry() {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    interrupted = Some(error);
+                                    false
+                                }
+                            }
+                        });
+                    if let Some(error) = interrupted {
+                        return Err(error);
+                    }
                     if included.map_err(E::from)? {
                         continue;
                     }
@@ -6780,15 +7250,21 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 // never populate resolved_score and still require a load.
                 let resolved_score = candidate.resolved_score;
                 let score_checked = candidate.score_checked;
-                if walk_distance_is_score && !score_checked
+                if walk_distance_is_score
+                    && !score_checked
                     && let Some(origin) = candidate.origin
                     && let Some((layer, previous_origin, score)) = last_stored_identity
-                    && layer == candidate.layer && previous_origin == origin
-                    && accepted.iter().filter(|(row, accepted_score)| {
-                        accepted_score.total_cmp(&score) == std::cmp::Ordering::Greater
-                            || (accepted_score.total_cmp(&score) == std::cmp::Ordering::Equal
-                                && *row <= candidate.row_id)
-                    }).count() >= required
+                    && layer == candidate.layer
+                    && previous_origin == origin
+                    && accepted
+                        .iter()
+                        .filter(|(row, accepted_score)| {
+                            accepted_score.total_cmp(&score) == std::cmp::Ordering::Greater
+                                || (accepted_score.total_cmp(&score) == std::cmp::Ordering::Equal
+                                    && *row <= candidate.row_id)
+                        })
+                        .count()
+                        >= required
                 {
                     // Membership/currentness was authenticated above and in
                     // keep_reached/keep_members. This row cannot enter; do not
@@ -6797,10 +7273,7 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     continue;
                 }
 
-                if !owner.historical_durable_reads()
-                    && page_scoring.is_none()
-                    && !score_checked
-                {
+                if !owner.historical_durable_reads() && page_scoring.is_none() && !score_checked {
                     *page_scoring = Some(state.sealed_page_scoring(
                         snapshot,
                         source.serving_selection.as_deref(),
@@ -6864,15 +7337,17 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     walked.push((candidate.row_id, walk_score));
                     continue;
                 };
-                if walk_distance_is_score && !score_checked
+                if walk_distance_is_score
+                    && !score_checked
                     && let Some(origin) = candidate.origin
                 {
                     last_stored_identity = Some((candidate.layer, origin, score));
                 }
                 walked.push((candidate.row_id, score));
                 let required_capacity = accepted.len().checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW union accepted-row count overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW union accepted-row count overflow".to_string()).into(),
+                    ))
                 })?;
                 grow_vector_copy(
                     &mut accepted,
@@ -6885,15 +7360,24 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 )?;
                 accepted.push((candidate.row_id, score));
                 let mut ordinal = candidate.layer;
-                let owner = partitions.iter().enumerate().find_map(|(position, partition)| {
-                    if ordinal < partition.layers.len() { Some((position, ordinal)) }
-                    else { ordinal -= partition.layers.len(); None }
-                });
+                let owner = partitions
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, partition)| {
+                        if ordinal < partition.layers.len() {
+                            Some((position, ordinal))
+                        } else {
+                            ordinal -= partition.layers.len();
+                            None
+                        }
+                    });
                 if let Some(owner) = owner
                     && !contributing.contains(&owner)
                 {
                     let required_capacity = contributing.len().checked_add(1).ok_or_else(|| {
-                        E::from(Error::Other("union contributing-layer count overflow".into()))
+                        E::from(Error::Other(
+                            "union contributing-layer count overflow".into(),
+                        ))
                     })?;
                     grow_vector_copy(
                         &mut contributing,
@@ -6916,13 +7400,19 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     continue;
                 }
                 let source = sources.get(partition.source_position).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW union partition position changed".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW union partition position changed".to_string()).into(),
+                    ))
                 })?;
                 let Some(streamed) = source.streamed_suffix() else {
                     continue;
                 };
-                if source.serving_selection.as_ref().map_or(0, |s| s.suffix_saved_inserts()) == 0 {
+                if source
+                    .serving_selection
+                    .as_ref()
+                    .map_or(0, |s| s.suffix_saved_inserts())
+                    == 0
+                {
                     continue;
                 }
                 let partition_required = partition.allowed_count.min(k);
@@ -7065,8 +7555,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     }
                     for (row_id, score) in suffix_heap.iter().copied() {
                         let required_capacity = walked.len().checked_add(1).ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded HNSW union walked-row count overflow".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded HNSW union walked-row count overflow".to_string()).into(),
+                            ))
                         })?;
                         grow_vector_copy(
                             &mut walked,
@@ -7080,8 +7571,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         walked.push((row_id, score));
 
                         let required_capacity = accepted.len().checked_add(1).ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded HNSW union accepted-row count overflow".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded HNSW union accepted-row count overflow".to_string())
+                                    .into(),
+                            ))
                         })?;
                         grow_vector_copy(
                             &mut accepted,
@@ -7103,23 +7596,40 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                     break;
                 }
             }
-            if partitions.iter().any(|partition| sources.get(partition.source_position)
-                .and_then(|source| source.serving_selection.as_ref())
-                .is_some_and(|selection| selection.streamed_tail.is_some())) {
+            if partitions.iter().any(|partition| {
+                sources
+                    .get(partition.source_position)
+                    .and_then(|source| source.serving_selection.as_ref())
+                    .is_some_and(|selection| selection.streamed_tail.is_some())
+            }) {
                 // Reuse the already-admitted candidate allocation as a K heap.
                 // Sorted ascending quality is also a valid worst-first heap.
                 accepted.sort_unstable_by(|left, right| vector_score_quality(right, left));
                 accepted.truncate(k);
                 accepted.reverse();
                 for (position, partition) in partitions.iter().enumerate() {
-                    if short.get(position).copied().flatten().is_some() { continue; }
-                    let source = sources.get(partition.source_position).ok_or_else(|| E::from(
-                        Error::Other("streamed tail lost its captured source".into())))?;
-                    let Some(tail) = source.serving_selection.as_ref()
-                        .and_then(|selection| selection.streamed_tail.as_ref()) else { continue; };
+                    if short.get(position).copied().flatten().is_some() {
+                        continue;
+                    }
+                    let source = sources.get(partition.source_position).ok_or_else(|| {
+                        E::from(Error::Other(
+                            "streamed tail lost its captured source".into(),
+                        ))
+                    })?;
+                    let Some(tail) = source
+                        .serving_selection
+                        .as_ref()
+                        .and_then(|selection| selection.streamed_tail.as_ref())
+                    else {
+                        continue;
+                    };
                     tail.validate().map_err(E::from)?;
-                    let memberships = source.state.durable_membership_source().ok_or_else(|| E::from(
-                        Error::Other("streamed working tail has no captured directory".into())))?;
+                    let memberships =
+                        source.state.durable_membership_source().ok_or_else(|| {
+                            E::from(Error::Other(
+                                "streamed working tail has no captured directory".into(),
+                            ))
+                        })?;
                     let credit = if partition.layers.is_empty() {
                         evaluation_credit
                     } else {
@@ -7130,17 +7640,37 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                         before_streamed_candidate()?;
                         evaluation_credit -= 1;
                         if !partition.layers.is_empty() {
-                            partition.rescore_credit.set(partition.rescore_credit.get() - 1);
+                            partition
+                                .rescore_credit
+                                .set(partition.rescore_credit.get() - 1);
                         }
-                        partition.rescore_spent.set(partition.rescore_spent.get() + 1);
+                        partition
+                            .rescore_spent
+                            .set(partition.rescore_spent.get() + 1);
                         Ok(())
                     };
-                    bounded_exact_merge_durable(index, &source.state, memberships.as_ref(),
-                        Some((&**tail, partition.candidates)), true, query, k, snapshot,
-                        &mut accepted, &mut accepted_bytes, &mut crate::store::RawVectorBodyReads::default(),
-                        before_source_entry, &mut candidate, before_distance, before_retain,
-                        release_retained, owner, partition.source_position, row_check,
-                        Some((credit, &exhausted)))?;
+                    bounded_exact_merge_durable(
+                        index,
+                        &source.state,
+                        memberships.as_ref(),
+                        Some((&**tail, partition.candidates)),
+                        true,
+                        query,
+                        k,
+                        snapshot,
+                        &mut accepted,
+                        &mut accepted_bytes,
+                        &mut crate::store::RawVectorBodyReads::default(),
+                        before_source_entry,
+                        &mut candidate,
+                        before_distance,
+                        before_retain,
+                        release_retained,
+                        owner,
+                        partition.source_position,
+                        row_check,
+                        Some((credit, &exhausted)),
+                    )?;
                     if exhausted.get() {
                         rescore_exhausted = true;
                         break;
@@ -7177,17 +7707,18 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             ));
         }
         if let Some(ledger) = row_check
-            && let Some(error) = ledger.borrow_mut().error.take() {
-                drop(accepted);
-                release_retained(accepted_bytes);
-                drop(walked);
-                release_retained(walked_bytes);
-                drop(contributing);
-                release_retained(contributing_bytes);
-                drop(short);
-                release_retained(short_bytes);
-                return Err(error);
-            }
+            && let Some(error) = ledger.borrow_mut().error.take()
+        {
+            drop(accepted);
+            release_retained(accepted_bytes);
+            drop(walked);
+            release_retained(walked_bytes);
+            drop(contributing);
+            release_retained(contributing_bytes);
+            drop(short);
+            release_retained(short_bytes);
+            return Err(error);
+        }
         if accepted.len() < required {
             drop(accepted);
             release_retained(accepted_bytes);
@@ -7218,7 +7749,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     /// Narrow through the captured reverse and forward membership at this snapshot.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn selected_partition_sources(
         &self,
         index: &VectorIndexRef,
@@ -7301,23 +7835,43 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 })
             };
             let mut count = 0usize;
-            self.store.visit_query_partition_sources(index, owner, |key, _, _| {
-                if selected(key) { count = count.checked_add(1).ok_or_else(|| Error::Other("vector source capacity overflow".into()))?; }
-                Ok::<(), Error>(())
-            })?;
-            owner.reserve(count.checked_mul(std::mem::size_of::<BoundedSnapshotVectorSource>())
-                .ok_or_else(|| Error::Other("vector source capacity overflow".into()))?)?;
+            self.store
+                .visit_query_partition_sources(index, owner, |key, _, _| {
+                    if selected(key) {
+                        count = count.checked_add(1).ok_or_else(|| {
+                            Error::Other("vector source capacity overflow".into())
+                        })?;
+                    }
+                    Ok::<(), Error>(())
+                })?;
+            owner.reserve(
+                count
+                    .checked_mul(std::mem::size_of::<BoundedSnapshotVectorSource>())
+                    .ok_or_else(|| Error::Other("vector source capacity overflow".into()))?,
+            )?;
             let mut result = Vec::with_capacity(count);
-            self.store.visit_query_partition_sources(index, owner, |key, state, owner| {
-                if selected(key) {
-                    if result.len() == count { return Err(Error::Other("vector source selection changed after its admitted count".into())); }
-                    owner.reserve(key.estimated_bytes())?;
-                    result.push(BoundedSnapshotVectorSource { partition_key: key.clone(), state,
-                        serving_selection: None, candidate_ids: None, point_load: false,
-                        candidate_ids_cover_all_live: false, allowed_count: 0, live_count: 0 });
-                }
-                Ok::<(), Error>(())
-            })?;
+            self.store
+                .visit_query_partition_sources(index, owner, |key, state, owner| {
+                    if selected(key) {
+                        if result.len() == count {
+                            return Err(Error::Other(
+                                "vector source selection changed after its admitted count".into(),
+                            ));
+                        }
+                        owner.reserve(key.estimated_bytes())?;
+                        result.push(BoundedSnapshotVectorSource {
+                            partition_key: key.clone(),
+                            state,
+                            serving_selection: None,
+                            candidate_ids: None,
+                            point_load: false,
+                            candidate_ids_cover_all_live: false,
+                            allowed_count: 0,
+                            live_count: 0,
+                        });
+                    }
+                    Ok::<(), Error>(())
+                })?;
             Ok(result)
         })
     }
@@ -7329,7 +7883,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// at a time. AUTO may also stream a resident loader when bulk admission
     /// refuses; explicit EXACT preserves that loader's typed refusal.
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn brute_force_search_sources(
         &self,
         index: &VectorIndexRef,
@@ -7479,7 +8036,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// against the database's memory before it is read and returning it
     /// straight after, so the comparison never needs room for the partition.
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn stream_source_bodies(
         &self,
         index: &VectorIndexRef,
@@ -7576,9 +8136,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         }
         let mut position = 0usize;
         while let Some(visible) = source.state.visible_directory_row_at(position, snapshot) {
-            position = position
-                .checked_add(1)
-                .ok_or_else(|| Error::Other(("exhaustive vector position overflow".to_string()).into()))?;
+            position = position.checked_add(1).ok_or_else(|| {
+                Error::Other(("exhaustive vector position overflow".to_string()).into())
+            })?;
             let Some(row_id) = visible else {
                 continue;
             };
@@ -7603,7 +8163,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn aggregate_authorized_source_count(
         sources: &[BoundedSnapshotVectorSource],
         candidates: Option<&RoaringTreemap>,
@@ -7640,7 +8203,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// the already-resident raw directories and honors the same authorization
     /// bitmap and selected partition prefixes as execution; it never loads a
     /// vector body or graph and never builds a route.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn authorized_visible_count_without_build(
         &self,
         index: &VectorIndexRef,
@@ -7701,20 +8267,34 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                 }
                 // Query source windows are read without directory guards;
                 // each retained state keeps its actual reader control invoice.
-                let states = crate::ScopedVectorCopy::new(metadata.as_mut().unwrap_or(owner), |copies| {
-                    let capacity = self.store.query_partition_source_count(index, copies)?;
-                    copies.reserve(capacity.checked_mul(std::mem::size_of::<crate::store::VectorQueryState>())
-                        .ok_or_else(|| Error::Other("vector source capacity overflow".into()))?)?;
-                    let mut states = Vec::with_capacity(capacity);
-                    self.store.visit_query_partition_sources(index, copies, |key, state, _| {
-                        if selected(key) {
-                            if states.len() == capacity { return Err(Error::Other("vector source count changed after admission".into())); }
-                            states.push(state);
-                        }
-                        Ok::<(), Error>(())
+                let states =
+                    crate::ScopedVectorCopy::new(metadata.as_mut().unwrap_or(owner), |copies| {
+                        let capacity = self.store.query_partition_source_count(index, copies)?;
+                        copies.reserve(
+                            capacity
+                                .checked_mul(std::mem::size_of::<crate::store::VectorQueryState>())
+                                .ok_or_else(|| {
+                                    Error::Other("vector source capacity overflow".into())
+                                })?,
+                        )?;
+                        let mut states = Vec::with_capacity(capacity);
+                        self.store.visit_query_partition_sources(
+                            index,
+                            copies,
+                            |key, state, _| {
+                                if selected(key) {
+                                    if states.len() == capacity {
+                                        return Err(Error::Other(
+                                            "vector source count changed after admission".into(),
+                                        ));
+                                    }
+                                    states.push(state);
+                                }
+                                Ok::<(), Error>(())
+                            },
+                        )?;
+                        Ok(states)
                     })?;
-                    Ok(states)
-                })?;
                 let mut count = 0usize;
                 if let Some(ids) = candidates {
                     for id in ids.iter() {
@@ -7828,7 +8408,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn search_with_mode(
         &self,
         index: VectorIndexRef,
@@ -7845,7 +8428,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn search_with_mode_owned(
         &self,
         index: VectorIndexRef,
@@ -7872,7 +8458,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// Preserve the search ladder while inheriting the executing route's
     /// durable-read preference and its actual temporary-capacity funder.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn search_with_mode_admission(
         &self,
         index: VectorIndexRef,
@@ -7892,7 +8481,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn search_with_mode_route(
         &self,
         index: VectorIndexRef,
@@ -7900,7 +8492,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         k: usize,
         candidates: Option<&RoaringTreemap>,
         snapshot_mode: (SnapshotId, contextdb_core::VectorSearchMode),
-        owners: (crate::memory_budget::MemoryBudgetOwner, crate::VectorCopyAdmission),
+        owners: (
+            crate::memory_budget::MemoryBudgetOwner,
+            crate::VectorCopyAdmission,
+        ),
     ) -> Result<(SearchScores, OwnedVectorSearchTrace)> {
         let (snapshot, mode) = snapshot_mode;
         let (executing_owner, mut route_owner) = owners;
@@ -8068,8 +8663,9 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
             // grouping places into partitions, charged while it is held.
             let candidate_ids = match candidates {
                 Some(candidates) => {
-                    let len = usize::try_from(candidates.len())
-                        .map_err(|_| Error::Other(("vector candidate count overflow".to_string()).into()))?;
+                    let len = usize::try_from(candidates.len()).map_err(|_| {
+                        Error::Other(("vector candidate count overflow".to_string()).into())
+                    })?;
                     let bytes = len
                         .checked_mul(std::mem::size_of::<u64>())
                         .ok_or_else(|| Error::Other("vector candidate count overflow".into()))?;
@@ -8210,7 +8806,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// Compatibility route for existing lower-level callers. Their published
     /// behavior is the column-default automatic ladder; engine query surfaces
     /// that resolve an explicit mode call [`Self::search_with_mode`] instead.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn search_with_strategy(
         &self,
         index: VectorIndexRef,
@@ -8234,7 +8833,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn search_with_strategy_for_test(
         &self,
         index: VectorIndexRef,
@@ -8251,7 +8853,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
 
     /// Compatibility availability probe. Despite its retained name, this is
     /// now an observer: only explicit store maintenance may build a graph.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn ensure_hnsw_built(&self, index: &VectorIndexRef, snapshot: SnapshotId) -> Result<bool> {
         self.store.with_bulk_read(|| {
             let snapshot_tx = TxId::from_snapshot(snapshot);
@@ -8270,7 +8875,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn hnsw_eligible_without_build(
         &self,
         index: &VectorIndexRef,
@@ -8285,7 +8893,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_hnsw_eligible_without_build(
         &self,
         index: &VectorIndexRef,
@@ -8319,7 +8930,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// caller supplies the already-authorized candidate set and may install a
     /// partition-prefix scope with `with_selected_partition_prefixes`, exactly
     /// as execution does.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn graph_layer_presence_without_load(
         &self,
         index: &VectorIndexRef,
@@ -8357,7 +8971,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     /// pull kernel's already-sorted authorized candidate list. Reusing that
     /// list keeps route disclosure from rescanning the relational table just
     /// to reconstruct authorization the query has already applied.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn graph_layer_presence_without_load_for_sorted_ids(
         &self,
         index: &VectorIndexRef,
@@ -8394,7 +9011,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_hnsw_search_covers_all_without_build(
         &self,
         index: &VectorIndexRef,
@@ -8433,7 +9053,10 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn hnsw_search_covers_all_without_build(
         &self,
         index: &VectorIndexRef,
@@ -8730,18 +9353,35 @@ impl NativeVectorScoreEvent {
     pub fn identity(&self) -> (RowId, contextdb_core::TxId, contextdb_core::Lsn) {
         (self.row_id, self.created_tx, self.lsn)
     }
-    pub fn snapshot(&self) -> SnapshotId { self.snapshot }
-    pub fn score(&self) -> f32 { self.score }
-    pub fn body_allocation(&self) -> Option<(usize, usize, usize)> { self.body_allocation }
+    pub fn snapshot(&self) -> SnapshotId {
+        self.snapshot
+    }
+    pub fn score(&self) -> f32 {
+        self.score
+    }
+    pub fn body_allocation(&self) -> Option<(usize, usize, usize)> {
+        self.body_allocation
+    }
 }
 #[cfg(feature = "test-seams")]
-pub(crate) fn observe_native_score_identity_for_test(row_id: RowId,
-    created_tx: contextdb_core::TxId, lsn: contextdb_core::Lsn, snapshot: SnapshotId, score: f32,
-    body_allocation: Option<(usize, usize, usize)>) {
+pub(crate) fn observe_native_score_identity_for_test(
+    row_id: RowId,
+    created_tx: contextdb_core::TxId,
+    lsn: contextdb_core::Lsn,
+    snapshot: SnapshotId,
+    score: f32,
+    body_allocation: Option<(usize, usize, usize)>,
+) {
     let observer = NATIVE_VECTOR_SCORE_OBSERVER.with(|slot| slot.borrow().clone());
     if let Some(observer) = observer {
         observer.after_native_vector_score(NativeVectorScoreEvent {
-            row_id, created_tx, lsn, snapshot, score, body_allocation, _producer: (),
+            row_id,
+            created_tx,
+            lsn,
+            snapshot,
+            score,
+            body_allocation,
+            _producer: (),
         });
     }
 }
@@ -9040,8 +9680,8 @@ mod route_cost_tests {
 mod indexed_row_check_empty_merge_tests {
     use super::*;
     use crate::store::VectorIndexLayout;
-    use contextdb_core::read_memory::ReadMemoryBudget;
     use contextdb_core::VectorExecutor;
+    use contextdb_core::read_memory::ReadMemoryBudget;
     use contextdb_tx::WriteSet;
 
     #[derive(Debug)]
@@ -9091,9 +9731,14 @@ mod indexed_row_check_empty_merge_tests {
             let admission = crate::VectorCopyAdmission::new(owner);
             let mut bodies = Vec::new();
             for entry in &writes.vector_inserts {
-                let mut body = self.store.retained_column_copy_owner(&entry.index, &admission)?;
+                let mut body = self
+                    .store
+                    .retained_column_copy_owner(&entry.index, &admission)?;
                 body.reserve_for(
-                    entry.vector.len().saturating_mul(std::mem::size_of::<f32>()),
+                    entry
+                        .vector
+                        .len()
+                        .saturating_mul(std::mem::size_of::<f32>()),
                     "test",
                     "caller_vector_body",
                     "test",
@@ -9108,7 +9753,10 @@ mod indexed_row_check_empty_merge_tests {
             for body in bodies {
                 body.transfer();
             }
-            assert!(writes.vector_deletes.is_empty(), "fixture stages inserts only");
+            assert!(
+                writes.vector_deletes.is_empty(),
+                "fixture stages inserts only"
+            );
             Ok(())
         }
 
@@ -9235,9 +9883,15 @@ mod indexed_row_check_empty_merge_tests {
         assert!(declared >= 2, "the production walk budget is positive");
         let (executor, index, snapshot, mut owner) = fixture(declared + 1);
         let groups = grouped(&executor, &index, snapshot, &mut owner);
-        let layout = executor.store.scoped_index_layout(&index, &mut owner).unwrap();
+        let layout = executor
+            .store
+            .scoped_index_layout(&index, &mut owner)
+            .unwrap();
         let allowance = groups.row_check_allowance(&layout, 1);
-        assert_eq!(allowance, declared, "fixture uses the resolved production allowance");
+        assert_eq!(
+            allowance, declared,
+            "fixture uses the resolved production allowance"
+        );
         let outcome = rejected_flat_outcome(&executor, &index, &groups, allowance, &mut owner);
         assert!(
             matches!(
@@ -9258,9 +9912,15 @@ mod indexed_row_check_empty_merge_tests {
         assert!(declared >= 2, "the production walk budget is positive");
         let (executor, index, snapshot, mut owner) = fixture(declared - 1);
         let groups = grouped(&executor, &index, snapshot, &mut owner);
-        let layout = executor.store.scoped_index_layout(&index, &mut owner).unwrap();
+        let layout = executor
+            .store
+            .scoped_index_layout(&index, &mut owner)
+            .unwrap();
         let allowance = groups.row_check_allowance(&layout, 1);
-        assert_eq!(allowance, declared, "control uses the same resolved allowance");
+        assert_eq!(
+            allowance, declared,
+            "control uses the same resolved allowance"
+        );
         let outcome = rejected_flat_outcome(&executor, &index, &groups, allowance, &mut owner);
         assert!(
             matches!(outcome, BoundedHnswOutcome::CompleteEmpty),

@@ -471,7 +471,10 @@ impl Harness {
                 self.handshake.clone(),
                 self.client_timeouts,
                 clock,
-                self.database.declared_reader_memory().expect("original reader owner").into(),
+                self.database
+                    .declared_reader_memory()
+                    .expect("original reader owner")
+                    .into(),
             ))
             .expect("connect through the production owner carrier"),
         ));
@@ -512,7 +515,10 @@ impl Harness {
             presented,
             self.client_timeouts,
             clock,
-            self.database.declared_reader_memory().expect("original reader owner").into(),
+            self.database
+                .declared_reader_memory()
+                .expect("original reader owner")
+                .into(),
         ))?;
         block_on(client.request(LocalRequestEnvelope {
             limits: request_limits,
@@ -1638,15 +1644,28 @@ fn prove_request_and_response_deadline_jump(jump_to_ms: u64) {
     let completed = harness.service.resources();
     assert_eq!(completed.active_slots, baseline.active_slots);
     assert_eq!(completed.cursor_count, baseline.cursor_count);
-    assert_eq!(completed.cursor_retained_bytes, baseline.cursor_retained_bytes);
+    assert_eq!(
+        completed.cursor_retained_bytes,
+        baseline.cursor_retained_bytes
+    );
     assert_eq!(completed.buffered_bytes, baseline.buffered_bytes);
-    assert_eq!(completed.active_cancellations, baseline.active_cancellations);
-    assert_eq!(completed.accountant_used_bytes, baseline.accountant_used_bytes);
+    assert_eq!(
+        completed.active_cancellations,
+        baseline.active_cancellations
+    );
+    assert_eq!(
+        completed.accountant_used_bytes,
+        baseline.accountant_used_bytes
+    );
     assert!(completed.reader_used_bytes <= live_request.reader_used_bytes);
     assert!(completed.reader_control_bytes <= live_request.reader_control_bytes);
     assert_eq!(harness.service.cancellation_signal_count(), 1);
     drop(client);
-    harness.clients.lock().expect("owner client registry").clear();
+    harness
+        .clients
+        .lock()
+        .expect("owner client registry")
+        .clear();
     // The carrier future has returned and disconnect has released this
     // connection's storage. Service teardown must not be needed to refund it.
     observer.wait_for_released_connections(1);
@@ -3876,10 +3895,14 @@ fn remote_explain_of_a_bound_partition_key_reports_the_bound_scopes_count_and_ro
                 Vec::new()
             };
             assert_eq!(
-                page.rows(), expected,
+                page.rows(),
+                expected,
                 "nonempty and empty Contexts keep their exact session answers"
             );
-            assert!(!page.has_more(), "the one-row and empty answers are complete");
+            assert!(
+                !page.has_more(),
+                "the one-row and empty answers are complete"
+            );
             let responses = harness
                 .request(connection, limits(), query("SELECT 1"))
                 .expect("the same owner connection remains usable after the ranked answer");
@@ -4039,8 +4062,8 @@ use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
 fn actual_inbound_decoder_refusal_preserves_the_authenticated_stream_and_ordinals() {
     use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
     use contextdb_engine::local_transport::{
-        LocalInboundKind, LocalInboundMessage,
-        LocalOutboundMessage, LocalProtocolBoundary, LocalResponseExpectation, UnixLocalCarrier,
+        LocalInboundKind, LocalInboundMessage, LocalOutboundMessage, LocalProtocolBoundary,
+        LocalResponseExpectation, UnixLocalCarrier,
     };
 
     #[derive(Default)]
@@ -4059,96 +4082,195 @@ fn actual_inbound_decoder_refusal_preserves_the_authenticated_stream_and_ordinal
         let harness = Harness::new_with_publication_observer(limits(), 2, None, ordinals.clone());
         let carrier = UnixLocalCarrier;
         let boundary = LocalProtocolBoundary::with_effective_limits(limits());
-        let mut stream = block_on(carrier.connect(harness.service.channel_path(),
-            &harness.clock, harness.clock.now_ms() + 1_000)).expect("same real carrier as OwnerClient");
-        carrier.send_message(&mut stream, &boundary,
-            LocalOutboundMessage::Handshake(&harness.handshake)).unwrap();
-        carrier.send_message(&mut stream, &boundary,
-            LocalOutboundMessage::Request(&LocalRequestEnvelope {
-                limits: limits(), request: LocalRequest::OwnerStatus,
-            })).unwrap();
-        assert!(matches!(carrier.receive_message(&mut stream, &boundary,
-            LocalInboundKind::Response(LocalResponseExpectation::OwnerStatus)).unwrap(),
-            LocalInboundMessage::Response(LocalResponse::OwnerStatus { .. })));
+        let mut stream = block_on(carrier.connect(
+            harness.service.channel_path(),
+            &harness.clock,
+            harness.clock.now_ms() + 1_000,
+        ))
+        .expect("same real carrier as OwnerClient");
+        carrier
+            .send_message(
+                &mut stream,
+                &boundary,
+                LocalOutboundMessage::Handshake(&harness.handshake),
+            )
+            .unwrap();
+        carrier
+            .send_message(
+                &mut stream,
+                &boundary,
+                LocalOutboundMessage::Request(&LocalRequestEnvelope {
+                    limits: limits(),
+                    request: LocalRequest::OwnerStatus,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            carrier
+                .receive_message(
+                    &mut stream,
+                    &boundary,
+                    LocalInboundKind::Response(LocalResponseExpectation::OwnerStatus)
+                )
+                .unwrap(),
+            LocalInboundMessage::Response(LocalResponse::OwnerStatus { .. })
+        ));
 
         let parent = harness.database.declared_read_memory_for_test();
         let pressure = if refusal_source != "request limit" {
-            let available = ReadLimits::SHIPPED_MEMORY - parent.retained_bytes_for_test()
-                - 64 * 1024;
+            let available =
+                ReadLimits::SHIPPED_MEMORY - parent.retained_bytes_for_test() - 64 * 1024;
             let budget = parent.original_owner_for_test();
-            Some(ReadCredit::try_new_owned(budget, available as usize,
-                "reader", "test_pressure", "test pressure").unwrap())
-        } else { None };
+            Some(
+                ReadCredit::try_new_owned(
+                    budget,
+                    available as usize,
+                    "reader",
+                    "test_pressure",
+                    "test pressure",
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
         let request = LocalRequestEnvelope {
-            limits: ReadLimits { memory: if refusal_source == "request limit" { 64 * 1024 } else { limits().memory }, ..limits() },
+            limits: ReadLimits {
+                memory: if refusal_source == "request limit" {
+                    64 * 1024
+                } else {
+                    limits().memory
+                },
+                ..limits()
+            },
             request: LocalRequest::Query {
                 statement: "SELECT 1".into(),
-                params: BTreeMap::from([("a".into(), Value::Json(
-                    serde_json::Value::Array(vec![serde_json::json!(0); 8192])))]),
+                params: BTreeMap::from([(
+                    "a".into(),
+                    Value::Json(serde_json::Value::Array(vec![serde_json::json!(0); 8192])),
+                )]),
             },
         };
         // Use the real serializer and frame codec; the ordinary OwnerClient
         // would perform its own narrow-budget admission before sending.
         let frame = encode_payload_frame(&encode_message(&request).unwrap()).unwrap();
         std::io::Write::write_all(&mut stream, &frame).unwrap();
-        let response = carrier.receive_message(&mut stream, &boundary,
-            LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult))
+        let response = carrier
+            .receive_message(
+                &mut stream,
+                &boundary,
+                LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult),
+            )
             .expect("completed valid request earns a terminal refusal, never Ended");
-            let LocalInboundMessage::Response(LocalResponse::Failure { failure }) = response
-                else { panic!("actual decoder retains transport Failure, not EngineFailure") };
-            assert_eq!(failure, ReadFailure::owner_limit_exceeded(OwnerLimitExceededDetail {
-                limit: ReadFailureLimit::Memory, value: limits().memory,
-                required: None, statement: None,
-            }));
+        let LocalInboundMessage::Response(LocalResponse::Failure { failure }) = response else {
+            panic!("actual decoder retains transport Failure, not EngineFailure")
+        };
+        assert_eq!(
+            failure,
+            ReadFailure::owner_limit_exceeded(OwnerLimitExceededDetail {
+                limit: ReadFailureLimit::Memory,
+                value: limits().memory,
+                required: None,
+                statement: None,
+            })
+        );
         drop(pressure);
         // Two requests are deliberately pipelined onto the SAME authenticated
         // stream. Distinct answers and exact publication ordinals expose
         // reordering, reset, duplicate consumption and hidden reconnects.
         for sql in ["SELECT 17 AS answer", "SELECT 29 AS answer"] {
-            carrier.send_message(&mut stream, &boundary,
-                LocalOutboundMessage::Request(&LocalRequestEnvelope {
-                    limits: limits(), request: query(sql),
-                })).unwrap();
+            carrier
+                .send_message(
+                    &mut stream,
+                    &boundary,
+                    LocalOutboundMessage::Request(&LocalRequestEnvelope {
+                        limits: limits(),
+                        request: query(sql),
+                    }),
+                )
+                .unwrap();
         }
         for expected in [17, 29] {
             let mut responses = Vec::new();
             loop {
-                let LocalInboundMessage::Response(response) = carrier.receive_message(
-                    &mut stream, &boundary,
-                    LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult)).unwrap()
-                    else { panic!("ordinary response") };
+                let LocalInboundMessage::Response(response) = carrier
+                    .receive_message(
+                        &mut stream,
+                        &boundary,
+                        LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult),
+                    )
+                    .unwrap()
+                else {
+                    panic!("ordinary response")
+                };
                 let terminal = matches!(&response, LocalResponse::TerminalSuccess { .. });
                 responses.push(response);
-                if terminal { break; }
+                if terminal {
+                    break;
+                }
             }
             let result = published_result(responses);
             assert_eq!(result.rows, vec![vec![Value::Int64(expected)]]);
         }
-        assert_eq!(*ordinals.0.lock().unwrap(), vec![3, 4],
-            "status is ordinal 1, refused query is 2, following queries remain 3 and 4");
+        assert_eq!(
+            *ordinals.0.lock().unwrap(),
+            vec![3, 4],
+            "status is ordinal 1, refused query is 2, following queries remain 3 and 4"
+        );
         // A late interrupt keeps the existing acknowledgement contract; this
         // does not claim cancellation of an active deferred refusal.
-        carrier.send_message(&mut stream, &boundary,
-            LocalOutboundMessage::Request(&LocalRequestEnvelope {
-                limits: limits(), request: LocalRequest::CancelInFlight { request_ordinal: 2 },
-            })).unwrap();
-        assert!(matches!(carrier.receive_message(&mut stream, &boundary,
-            LocalInboundKind::Response(LocalResponseExpectation::Custom)).unwrap(),
-            LocalInboundMessage::Response(LocalResponse::CancelApplied { request_ordinal: 2 })));
-        carrier.send_message(&mut stream, &boundary,
-            LocalOutboundMessage::Request(&LocalRequestEnvelope {
-                limits: limits(), request: query("SELECT 41 AS answer"),
-            })).unwrap();
+        carrier
+            .send_message(
+                &mut stream,
+                &boundary,
+                LocalOutboundMessage::Request(&LocalRequestEnvelope {
+                    limits: limits(),
+                    request: LocalRequest::CancelInFlight { request_ordinal: 2 },
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            carrier
+                .receive_message(
+                    &mut stream,
+                    &boundary,
+                    LocalInboundKind::Response(LocalResponseExpectation::Custom)
+                )
+                .unwrap(),
+            LocalInboundMessage::Response(LocalResponse::CancelApplied { request_ordinal: 2 })
+        ));
+        carrier
+            .send_message(
+                &mut stream,
+                &boundary,
+                LocalOutboundMessage::Request(&LocalRequestEnvelope {
+                    limits: limits(),
+                    request: query("SELECT 41 AS answer"),
+                }),
+            )
+            .unwrap();
         let mut responses = Vec::new();
         loop {
-            let LocalInboundMessage::Response(response) = carrier.receive_message(&mut stream, &boundary,
-                LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult)).unwrap()
-                else { panic!("final query response") };
+            let LocalInboundMessage::Response(response) = carrier
+                .receive_message(
+                    &mut stream,
+                    &boundary,
+                    LocalInboundKind::Response(LocalResponseExpectation::OrdinaryResult),
+                )
+                .unwrap()
+            else {
+                panic!("final query response")
+            };
             let terminal = matches!(&response, LocalResponse::TerminalSuccess { .. });
             responses.push(response);
-            if terminal { break; }
+            if terminal {
+                break;
+            }
         }
-        assert_eq!(published_result(responses).rows, vec![vec![Value::Int64(41)]]);
+        assert_eq!(
+            published_result(responses).rows,
+            vec![vec![Value::Int64(41)]]
+        );
         assert_eq!(*ordinals.0.lock().unwrap(), vec![3, 4, 5]);
     }
 }

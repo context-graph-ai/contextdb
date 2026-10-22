@@ -24,12 +24,19 @@ impl Clone for TriggerCallback {
 }
 impl std::ops::Deref for TriggerCallback {
     type Target = CallbackFn;
-    fn deref(&self) -> &Self::Target { self.body.as_ref() }
+    fn deref(&self) -> &Self::Target {
+        self.body.as_ref()
+    }
 }
 impl TriggerCallback {
     pub(super) fn legacy<F>(callback: F) -> Self
-    where F: Fn(&Database, &TriggerContext) -> Result<()> + Send + Sync + 'static {
-        Self { body: Arc::new(callback), original: None }
+    where
+        F: Fn(&Database, &TriggerContext) -> Result<()> + Send + Sync + 'static,
+    {
+        Self {
+            body: Arc::new(callback),
+            original: None,
+        }
     }
 }
 type TriggerRowKey = (String, RowId);
@@ -130,21 +137,52 @@ pub(super) struct TriggerDispatchRun {
 }
 impl TriggerDispatchRun {
     pub(super) fn owned(database: &Database) -> Result<Self> {
-        Ok(Self { initial_targets: None, initial_len: 0, processed: HashSet::new(), pending: Vec::new(),
-            active_guards: Vec::new(), _private_key_credit: None, _native_memory: Some(database.reserve_owned_preparation(0)?) })
+        Ok(Self {
+            initial_targets: None,
+            initial_len: 0,
+            processed: HashSet::new(),
+            pending: Vec::new(),
+            active_guards: Vec::new(),
+            _private_key_credit: None,
+            _native_memory: Some(database.reserve_owned_preparation(0)?),
+        })
     }
-    fn admit_slot<T>(original: &mut Option<OwnedMemoryReservation>, values: &mut Vec<T>, extra: usize) -> Result<()> {
+    fn admit_slot<T>(
+        original: &mut Option<OwnedMemoryReservation>,
+        values: &mut Vec<T>,
+        extra: usize,
+    ) -> Result<()> {
         if let Some(original) = original.as_mut() {
-            let target = if values.len() == values.capacity() { values.capacity().checked_mul(2).map(|n| n.max(4))
-                .ok_or_else(EngineMetadataJournal::identity_error)? } else { values.capacity() };
-            let controls = if target > values.capacity() { std::alloc::Layout::array::<T>(target)
-                .map_err(|_| EngineMetadataJournal::identity_error())?.size() } else { 0 };
-            crate::memory_accounting::grow_preparation_from_original(original, controls.checked_add(extra)
-                .ok_or_else(EngineMetadataJournal::identity_error)?, "trigger", "dispatch_storage",
-                "Raise MEMORY_LIMIT to retain this trigger dispatch.")?;
+            let target = if values.len() == values.capacity() {
+                values
+                    .capacity()
+                    .checked_mul(2)
+                    .map(|n| n.max(4))
+                    .ok_or_else(EngineMetadataJournal::identity_error)?
+            } else {
+                values.capacity()
+            };
+            let controls = if target > values.capacity() {
+                std::alloc::Layout::array::<T>(target)
+                    .map_err(|_| EngineMetadataJournal::identity_error())?
+                    .size()
+            } else {
+                0
+            };
+            crate::memory_accounting::grow_preparation_from_original(
+                original,
+                controls
+                    .checked_add(extra)
+                    .ok_or_else(EngineMetadataJournal::identity_error)?,
+                "trigger",
+                "dispatch_storage",
+                "Raise MEMORY_LIMIT to retain this trigger dispatch.",
+            )?;
             if target > values.capacity() {
                 values.reserve_exact(target - values.len());
-                if values.capacity() != target { return Err(EngineMetadataJournal::identity_error()); }
+                if values.capacity() != target {
+                    return Err(EngineMetadataJournal::identity_error());
+                }
             }
         }
         Ok(())
@@ -154,28 +192,56 @@ impl TriggerDispatchRun {
     }
     fn push_owned_pending(&mut self, name: &str, depth: u32, cascade_row_count: u32) -> Result<()> {
         Self::admit_slot(&mut self._native_memory, &mut self.pending, name.len())?;
-        self.pending.push(PendingTriggerAudit { trigger_name: crate::memory_accounting::preparation_copy_string(name)?, depth, cascade_row_count });
+        self.pending.push(PendingTriggerAudit {
+            trigger_name: crate::memory_accounting::preparation_copy_string(name)?,
+            depth,
+            cascade_row_count,
+        });
         Ok(())
     }
     fn mark_firing(&mut self, table: &str, row: RowId, trigger: &str) -> Result<bool> {
-        if self._native_memory.is_some() && self.processed.iter().any(|(name, id, registered)| name == table && *id == row && registered == trigger) {
+        if self._native_memory.is_some()
+            && self
+                .processed
+                .iter()
+                .any(|(name, id, registered)| name == table && *id == row && registered == trigger)
+        {
             return Ok(false);
         }
         if let Some(original) = self._native_memory.as_mut() {
             let controls = if self.processed.len() == self.processed.capacity() {
-                crate::memory_accounting::preparation_native_map_bytes::<(String, RowId, String), ()>(self.processed.len().saturating_add(1))?
-            } else { 0 };
-            crate::memory_accounting::grow_preparation_from_original(original,
-                table.len().checked_add(trigger.len()).and_then(|n| n.checked_add(controls))
+                crate::memory_accounting::preparation_native_map_bytes::<(String, RowId, String), ()>(
+                    self.processed.len().saturating_add(1),
+                )?
+            } else {
+                0
+            };
+            crate::memory_accounting::grow_preparation_from_original(
+                original,
+                table
+                    .len()
+                    .checked_add(trigger.len())
+                    .and_then(|n| n.checked_add(controls))
                     .ok_or_else(EngineMetadataJournal::identity_error)?,
-                "trigger", "dispatch_processed_identity", "Raise MEMORY_LIMIT to dispatch these trigger identities.")?;
+                "trigger",
+                "dispatch_processed_identity",
+                "Raise MEMORY_LIMIT to dispatch these trigger identities.",
+            )?;
         }
         if let Some(credit) = self._private_key_credit.as_mut() {
-            credit.try_grow_for(table.len().saturating_add(trigger.len()).saturating_add(512),
-                "sync","connected_trigger_processed_key",
-                "Raise the declared memory limit to retain callback dispatch keys.")?;
+            credit.try_grow_for(
+                table
+                    .len()
+                    .saturating_add(trigger.len())
+                    .saturating_add(512),
+                "sync",
+                "connected_trigger_processed_key",
+                "Raise the declared memory limit to retain callback dispatch keys.",
+            )?;
         }
-        Ok(self.processed.insert((table.to_owned(),row,trigger.to_owned())))
+        Ok(self
+            .processed
+            .insert((table.to_owned(), row, trigger.to_owned())))
     }
 }
 
@@ -193,7 +259,9 @@ struct OwnedTriggerDispatchSnapshot {
 }
 impl std::ops::Deref for OwnedTriggerDispatchSnapshot {
     type Target = TriggerDispatchSnapshot;
-    fn deref(&self) -> &Self::Target { &self.snapshot }
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
 }
 
 struct TriggerFiring<'a> {
@@ -227,7 +295,9 @@ struct OriginalCallbackNode {
     next: Option<OriginalCallbackLink>,
 }
 impl OriginalCallbackLink {
-    fn id(&self) -> usize { (&*self.node as *const OriginalCallbackNode) as usize }
+    fn id(&self) -> usize {
+        (&*self.node as *const OriginalCallbackNode) as usize
+    }
 }
 
 pub(super) struct TriggerCallbackThreadGuard {
@@ -329,7 +399,10 @@ impl TriggerState {
                 current_native |= link.node.owner == current_id;
                 cursor = link.node.next.as_ref();
             }
-            if (!owners.is_empty() || has_native) && !owners.contains_key(&current_id) && !current_native {
+            if (!owners.is_empty() || has_native)
+                && !owners.contains_key(&current_id)
+                && !current_native
+            {
                 return TriggerContention::SameDb;
             }
         }
@@ -340,7 +413,9 @@ impl TriggerState {
         let native = self.native_callbacks.lock();
         let mut cursor = native.as_ref();
         while let Some(link) = cursor {
-            if link.node.visible_name { return link.node.name.clone(); }
+            if link.node.visible_name {
+                return link.node.name.clone();
+            }
             cursor = link.node.next.as_ref();
         }
         drop(native);
@@ -352,11 +427,15 @@ impl TriggerState {
     }
 
     pub(super) fn callback_tx_active(&self, tx: TxId) -> bool {
-        if self.callback_active_txs.lock().contains_key(&tx) { return true; }
+        if self.callback_active_txs.lock().contains_key(&tx) {
+            return true;
+        }
         let native = self.native_callbacks.lock();
         let mut cursor = native.as_ref();
         while let Some(link) = cursor {
-            if link.node.tx == tx { return true; }
+            if link.node.tx == tx {
+                return true;
+            }
             cursor = link.node.next.as_ref();
         }
         false
@@ -372,30 +451,57 @@ impl TriggerState {
             let mut previous = native.as_ref();
             let mut already = owners.contains_key(&link.node.owner);
             while let Some(prior) = previous {
-                if prior.id() == link.id() { break; }
+                if prior.id() == link.id() {
+                    break;
+                }
                 already |= prior.node.owner == link.node.owner;
                 previous = prior.node.next.as_ref();
             }
-            if !already { count += 1; }
+            if !already {
+                count += 1;
+            }
             cursor = link.node.next.as_ref();
         }
         count
     }
 
-    fn enter_callback_thread_scope_owned(trigger: &Arc<Self>, trigger_name: &str, tx: TxId,
-        original: &OwnedMemoryReservation) -> Result<TriggerCallbackThreadGuard> {
-        let bytes = std::alloc::Layout::new::<OriginalCallbackNode>().size()
-            .checked_add(trigger_name.len()).ok_or_else(EngineMetadataJournal::identity_error)?;
-        let memory = crate::memory_accounting::reserve_preparation_from_original(original, bytes,
-            "trigger", "callback_registration", "Raise MEMORY_LIMIT to retain this callback registration.")?;
+    fn enter_callback_thread_scope_owned(
+        trigger: &Arc<Self>,
+        trigger_name: &str,
+        tx: TxId,
+        original: &OwnedMemoryReservation,
+    ) -> Result<TriggerCallbackThreadGuard> {
+        let bytes = std::alloc::Layout::new::<OriginalCallbackNode>()
+            .size()
+            .checked_add(trigger_name.len())
+            .ok_or_else(EngineMetadataJournal::identity_error)?;
+        let memory = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            bytes,
+            "trigger",
+            "callback_registration",
+            "Raise MEMORY_LIMIT to retain this callback registration.",
+        )?;
         let name = crate::memory_accounting::preparation_copy_string(trigger_name)?;
         let owner = crate::owned_worker::current_thread_id();
-        let mut link = OriginalCallbackLink { node: Box::new(OriginalCallbackNode {
-            owner, tx, name, visible_name: true, next: None,
-        }), _memory: memory };
+        let mut link = OriginalCallbackLink {
+            node: Box::new(OriginalCallbackNode {
+                owner,
+                tx,
+                name,
+                visible_name: true,
+                next: None,
+            }),
+            _memory: memory,
+        };
         let id = link.id();
-        let guard = TriggerCallbackThreadGuard { native_id: Some(id), trigger: trigger.clone(),
-            owner, tx, trigger_name: String::new() };
+        let guard = TriggerCallbackThreadGuard {
+            native_id: Some(id),
+            trigger: trigger.clone(),
+            owner,
+            tx,
+            trigger_name: String::new(),
+        };
         let mut head = trigger.native_callbacks.lock();
         link.node.next = head.take();
         *head = Some(link);
@@ -473,14 +579,24 @@ impl TriggerState {
     }
 
     pub(crate) fn take_staged_persistence_audits(&self, lsn: Lsn) -> PreparedPersistenceAudits {
-        if let Some(batch) = self.take_original_staged_audits(lsn) { return batch; }
-        PreparedPersistenceAudits { entries: self.staged_persistence_audits.lock().remove(&lsn).unwrap_or_default(), _memory: None }
+        if let Some(batch) = self.take_original_staged_audits(lsn) {
+            return batch;
+        }
+        PreparedPersistenceAudits {
+            entries: self
+                .staged_persistence_audits
+                .lock()
+                .remove(&lsn)
+                .unwrap_or_default(),
+            _memory: None,
+        }
     }
 
     pub(crate) fn discard_staged_persistence_audits(&self, lsn: Lsn) {
         let legacy = self.staged_persistence_audits.lock().remove(&lsn);
         let native = self.take_original_staged_audits(lsn);
-        drop(legacy); drop(native);
+        drop(legacy);
+        drop(native);
     }
 
     pub(crate) fn staged_trigger_persistence_commit(
@@ -521,16 +637,25 @@ impl Drop for TriggerCallbackThreadGuard {
                 loop {
                     match slot.as_ref() {
                         Some(link) if link.id() == id => {
-                            let mut removed = slot.take().expect("addressed original callback link");
+                            let mut removed =
+                                slot.take().expect("addressed original callback link");
                             *slot = removed.node.next.take();
                             break Some(removed);
                         }
-                        Some(_) => { slot = &mut slot.as_mut().expect("live original callback link").node.next; }
+                        Some(_) => {
+                            slot = &mut slot
+                                .as_mut()
+                                .expect("live original callback link")
+                                .node
+                                .next;
+                        }
                         None => break None,
                     }
                 }
             };
-            self.trigger.callback_active_count.fetch_sub(1, Ordering::SeqCst);
+            self.trigger
+                .callback_active_count
+                .fetch_sub(1, Ordering::SeqCst);
             global_trigger_callback_active_count().fetch_sub(1, Ordering::SeqCst);
             global_callback_active_count().fetch_sub(1, Ordering::SeqCst);
             drop(_wait_guard);
@@ -845,9 +970,10 @@ impl Database {
                     if existing == &incoming {
                         return Ok(());
                     }
-                    return Err(Error::Other((format!(
-                        "trigger already exists with a different definition: {name}"
-                    )).into()));
+                    return Err(Error::Other(
+                        (format!("trigger already exists with a different definition: {name}"))
+                            .into(),
+                    ));
                 }
                 projected.insert(name.clone(), incoming);
                 Ok(())
@@ -1027,9 +1153,12 @@ impl Database {
                     };
                     if let Some(existing) = projected.get(name) {
                         if existing != &incoming {
-                            return Err(Error::Other((format!(
-                                "trigger already exists with a different definition: {name}"
-                            )).into()));
+                            return Err(Error::Other(
+                                (format!(
+                                    "trigger already exists with a different definition: {name}"
+                                ))
+                                .into(),
+                            ));
                         }
                     } else {
                         projected.insert(name.clone(), incoming);
@@ -1152,9 +1281,10 @@ impl Database {
                     if existing == &incoming {
                         return Ok(());
                     }
-                    return Err(Error::Other((format!(
-                        "trigger already exists with a different definition: {name}"
-                    )).into()));
+                    return Err(Error::Other(
+                        (format!("trigger already exists with a different definition: {name}"))
+                            .into(),
+                    ));
                 }
                 declarations.insert(
                     name.clone(),
@@ -1301,30 +1431,71 @@ impl Database {
     }
 
     pub(super) fn dispatch_private_sync_trigger_rows_for_tx(
-        &self, tx: TxId, targets: super::connected_replay::PrivateChangedRows,
+        &self,
+        tx: TxId,
+        targets: super::connected_replay::PrivateChangedRows,
         declarations: &BTreeMap<String, TriggerDeclaration>,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> std::result::Result<(TriggerDispatchOutcome, super::connected_replay::PrivateChangedRows, usize), Box<TriggerDispatchFailure>> {
+    ) -> std::result::Result<
+        (
+            TriggerDispatchOutcome,
+            super::connected_replay::PrivateChangedRows,
+            usize,
+        ),
+        Box<TriggerDispatchFailure>,
+    > {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let initial_len = self.tx_mgr.with_write_set(tx, |ws| ws.relational_inserts.len())
-            .map_err(|error| Box::new(TriggerDispatchFailure { error, active_guards: Vec::new() }))?;
+        let initial_len = self
+            .tx_mgr
+            .with_write_set(tx, |ws| ws.relational_inserts.len())
+            .map_err(|error| {
+                Box::new(TriggerDispatchFailure {
+                    error,
+                    active_guards: Vec::new(),
+                })
+            })?;
         let mut run = TriggerDispatchRun {
-            initial_targets: Some(targets), initial_len,
-            processed: HashSet::new(), pending: Vec::new(), active_guards: Vec::new(),
-            _private_key_credit: self.private_replay_owner(tx).map(contextdb_core::read_memory::ReadCredit::new),
+            initial_targets: Some(targets),
+            initial_len,
+            processed: HashSet::new(),
+            pending: Vec::new(),
+            active_guards: Vec::new(),
+            _private_key_credit: self
+                .private_replay_owner(tx)
+                .map(contextdb_core::read_memory::ReadCredit::new),
             _native_memory: None,
         };
         if let Err(error) = self.dispatch_trigger_range(
-            tx, 0, initial_len, 1, &mut run, Some(declarations),
-            TriggerDispatchMode::IncludingSync, vector_copy_owner, read_memory,
+            tx,
+            0,
+            initial_len,
+            1,
+            &mut run,
+            Some(declarations),
+            TriggerDispatchMode::IncludingSync,
+            vector_copy_owner,
+            read_memory,
         ) {
             let _ = self.append_rolled_back_trigger_audits(&run.pending, tx, &error);
-            return Err(Box::new(TriggerDispatchFailure { error, active_guards: run.active_guards }));
+            return Err(Box::new(TriggerDispatchFailure {
+                error,
+                active_guards: run.active_guards,
+            }));
         }
-        let targets = run.initial_targets.take().expect("private dispatch owns its target set");
-        Ok((TriggerDispatchOutcome { pending: run.pending, active_guards: run.active_guards }, targets, initial_len))
+        let targets = run
+            .initial_targets
+            .take()
+            .expect("private dispatch owns its target set");
+        Ok((
+            TriggerDispatchOutcome {
+                pending: run.pending,
+                active_guards: run.active_guards,
+            },
+            targets,
+            initial_len,
+        ))
     }
 
     /// Keep the ordinary received-write commit path byte-for-byte quiet unless
@@ -1337,15 +1508,28 @@ impl Database {
         tx: TxId,
         declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
     ) -> Result<bool> {
-        if self.private_callbacks_already_prepared(tx) { return Ok(false); }
+        if self.private_callbacks_already_prepared(tx) {
+            return Ok(false);
+        }
         if matches!(self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
             let check = |declarations: &BTreeMap<String, TriggerDeclaration>| {
-                self.tx_mgr.with_read(tx, |ws| declarations.values().any(|declaration|
-                    declaration.including_sync && declaration.on_events.iter().any(|event|
-                        matches!(event, TriggerEvent::Insert | TriggerEvent::Update))
-                        && ws.relational_inserts.iter().any(|(table, _)| table == &declaration.table)))
+                self.tx_mgr.with_read(tx, |ws| {
+                    declarations.values().any(|declaration| {
+                        declaration.including_sync
+                            && declaration.on_events.iter().any(|event| {
+                                matches!(event, TriggerEvent::Insert | TriggerEvent::Update)
+                            })
+                            && ws
+                                .relational_inserts
+                                .iter()
+                                .any(|(table, _)| table == &declaration.table)
+                    })
+                })
             };
-            return match declarations { Some(declarations) => check(declarations), None => check(&self.trigger.declarations.lock()) };
+            return match declarations {
+                Some(declarations) => check(declarations),
+                None => check(&self.trigger.declarations.lock()),
+            };
         }
         let tables = self.tx_mgr.with_write_set(tx, |ws| {
             ws.relational_inserts
@@ -1376,23 +1560,50 @@ impl Database {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         if matches!(self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
-            let snapshot = self.trigger_dispatch_snapshot_owned(tx, None, TriggerDispatchMode::Local)?;
+            let snapshot =
+                self.trigger_dispatch_snapshot_owned(tx, None, TriggerDispatchMode::Local)?;
             for ((table, row_id), index) in &snapshot.latest_insert_index {
-                if !snapshot.triggered_tables.contains(table) { continue; }
-                let present = self.tx_mgr.with_read(tx, |ws| ws.relational_inserts.get(*index)
-                    .is_some_and(|(name, row)| name == table && row.row_id == *row_id && row.deleted_tx.is_none()))?;
-                if !present { continue; }
+                if !snapshot.triggered_tables.contains(table) {
+                    continue;
+                }
+                let present = self.tx_mgr.with_read(tx, |ws| {
+                    ws.relational_inserts
+                        .get(*index)
+                        .is_some_and(|(name, row)| {
+                            name == table && row.row_id == *row_id && row.deleted_tx.is_none()
+                        })
+                })?;
+                if !present {
+                    continue;
+                }
                 let (insert, update) = {
                     let declarations = self.trigger.declarations.lock();
-                    (declarations.values().any(|declaration| declaration.table == *table
-                        && declaration.on_events.contains(&TriggerEvent::Insert)),
-                     declarations.values().any(|declaration| declaration.table == *table
-                        && declaration.on_events.contains(&TriggerEvent::Update)))
+                    (
+                        declarations.values().any(|declaration| {
+                            declaration.table == *table
+                                && declaration.on_events.contains(&TriggerEvent::Insert)
+                        }),
+                        declarations.values().any(|declaration| {
+                            declaration.table == *table
+                                && declaration.on_events.contains(&TriggerEvent::Update)
+                        }),
+                    )
                 };
-                if !insert && !update { continue; }
-                let is_update = snapshot.deleted_rows.iter().any(|(name, id)| name == table && id == row_id)
-                    && self.committed_row_exists_at_current_frontier(table, *row_id, read_memory.clone())?;
-                if if is_update { update } else { insert } { return Ok(true); }
+                if !insert && !update {
+                    continue;
+                }
+                let is_update = snapshot
+                    .deleted_rows
+                    .iter()
+                    .any(|(name, id)| name == table && id == row_id)
+                    && self.committed_row_exists_at_current_frontier(
+                        table,
+                        *row_id,
+                        read_memory.clone(),
+                    )?;
+                if if is_update { update } else { insert } {
+                    return Ok(true);
+                }
             }
             return Ok(false);
         }
@@ -1481,7 +1692,9 @@ impl Database {
             processed: HashSet::new(),
             pending: Vec::new(),
             active_guards: Vec::new(),
-            _private_key_credit: self.private_replay_owner(tx).map(contextdb_core::read_memory::ReadCredit::new),
+            _private_key_credit: self
+                .private_replay_owner(tx)
+                .map(contextdb_core::read_memory::ReadCredit::new),
             _native_memory: None,
         };
         let initial_len = self
@@ -1594,27 +1807,35 @@ impl Database {
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let mut private_snapshot_credit = self.private_replay_owner(tx)
+        let mut private_snapshot_credit = self
+            .private_replay_owner(tx)
             .map(contextdb_core::read_memory::ReadCredit::new);
-        self.admit_private_trigger_snapshot(tx,declarations,private_snapshot_credit.as_mut())?;
+        self.admit_private_trigger_snapshot(tx, declarations, private_snapshot_credit.as_mut())?;
         let mut snapshot = self.trigger_dispatch_snapshot(tx, declarations, mode)?;
         let mut index = start;
         while index < end {
             let mut private_row_credit = None;
             let maybe_row = self.tx_mgr.with_write_set(tx, |ws| -> Result<_> {
-                ws.relational_inserts.get(index).map(|(table,row)| {
-                    private_row_credit = self.private_trigger_row_copy_credit(tx,table,row)?;
-                    let copied = if private_row_credit.is_some() {
-                        crate::memory_accounting::preparation_copy_row(row)?
-                    } else { row.clone() };
-                    Ok((table.clone(),copied))
-                }).transpose()
+                ws.relational_inserts
+                    .get(index)
+                    .map(|(table, row)| {
+                        private_row_credit =
+                            self.private_trigger_row_copy_credit(tx, table, row)?;
+                        let copied = if private_row_credit.is_some() {
+                            crate::memory_accounting::preparation_copy_row(row)?
+                        } else {
+                            row.clone()
+                        };
+                        Ok((table.clone(), copied))
+                    })
+                    .transpose()
             })??;
             let Some((table, row)) = maybe_row else {
                 break;
             };
-            if run.initial_targets.as_ref().is_some_and(|targets|
-                index < run.initial_len && !targets.contains(&table, row.row_id)) {
+            if run.initial_targets.as_ref().is_some_and(|targets| {
+                index < run.initial_len && !targets.contains(&table, row.row_id)
+            }) {
                 index += 1;
                 continue;
             }
@@ -1630,14 +1851,16 @@ impl Database {
                 index += 1;
                 continue;
             }
-            let prefix_update = run.initial_targets.as_ref().is_some_and(|targets|
-                index < run.initial_len && targets.is_update(&table, row.row_id));
-            let event = if prefix_update || (snapshot.deleted_rows.contains(&(table.clone(), row.row_id))
-                && self.committed_row_exists_at_current_frontier(
-                    &table,
-                    row.row_id,
-                    read_memory.clone(),
-                )?) {
+            let prefix_update = run.initial_targets.as_ref().is_some_and(|targets| {
+                index < run.initial_len && targets.is_update(&table, row.row_id)
+            });
+            let event = if prefix_update
+                || (snapshot.deleted_rows.contains(&(table.clone(), row.row_id))
+                    && self.committed_row_exists_at_current_frontier(
+                        &table,
+                        row.row_id,
+                        read_memory.clone(),
+                    )?) {
                 TriggerEvent::Update
             } else {
                 TriggerEvent::Insert
@@ -1645,14 +1868,13 @@ impl Database {
             for declaration in
                 self.triggers_for_table_event_for_dispatch(declarations, &table, event, mode)
             {
-                if !run.mark_firing(&table,row.row_id,&declaration.name)? { continue; }
+                if !run.mark_firing(&table, row.row_id, &declaration.name)? {
+                    continue;
+                }
                 self.fire_trigger(
                     tx,
                     declaration,
-                    TriggerFiring {
-                        event,
-                        row: &row,
-                    },
+                    TriggerFiring { event, row: &row },
                     depth,
                     run,
                     &snapshot.triggered_tables,
@@ -1662,7 +1884,11 @@ impl Database {
                     read_memory.clone(),
                 )?;
                 if index.saturating_add(1) < end {
-                    self.admit_private_trigger_snapshot(tx,declarations,private_snapshot_credit.as_mut())?;
+                    self.admit_private_trigger_snapshot(
+                        tx,
+                        declarations,
+                        private_snapshot_credit.as_mut(),
+                    )?;
                     snapshot = self.trigger_dispatch_snapshot(tx, declarations, mode)?;
                 }
             }
@@ -1747,13 +1973,22 @@ impl Database {
         let before = self.write_set_counts(tx)?;
         let private_baseline = if mode == TriggerDispatchMode::IncludingSync {
             self.capture_private_trigger_baseline(tx)?
-        } else { None };
-        let before_write_set = (mode == TriggerDispatchMode::IncludingSync && private_baseline.is_none())
-            .then(|| self.tx_mgr.cloned_write_set(tx)).transpose()?;
-        let before_write_set = private_baseline.as_ref().map(|baseline| &baseline.write_set)
+        } else {
+            None
+        };
+        let before_write_set = (mode == TriggerDispatchMode::IncludingSync
+            && private_baseline.is_none())
+        .then(|| self.tx_mgr.cloned_write_set(tx))
+        .transpose()?;
+        let before_write_set = private_baseline
+            .as_ref()
+            .map(|baseline| &baseline.write_set)
             .or(before_write_set.as_ref());
         let _private_context_credit = self.private_callback_copy_credit(
-            tx, &declaration.name, &declaration.table, &firing.row.values,
+            tx,
+            &declaration.name,
+            &declaration.table,
+            &firing.row.values,
         )?;
         let ctx = TriggerContext {
             trigger_name: declaration.name.clone(),
@@ -1763,7 +1998,7 @@ impl Database {
             depth,
             row_values: firing.row.values.clone(),
         };
-        self.admit_private_trigger_guard(tx,&ctx.trigger_name)?;
+        self.admit_private_trigger_guard(tx, &ctx.trigger_name)?;
         let callback_thread =
             TriggerState::enter_callback_thread_scope(&self.trigger, &ctx.trigger_name, tx);
         run.active_guards.push(callback_thread);
@@ -2062,7 +2297,12 @@ impl Database {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         self.committed_sync_pull_trigger_audits_with_source_order(
-            ws, lsn, projected_declarations, None, None, read_memory,
+            ws,
+            lsn,
+            projected_declarations,
+            None,
+            None,
+            read_memory,
         )
     }
 
@@ -2080,7 +2320,11 @@ impl Database {
         if ws.relational_inserts.is_empty() && additional.is_none() {
             return Ok(Vec::new());
         }
-        let Some(firing_tx) = write_set_visibility_tx(ws).or_else(|| additional.and_then(|firings| firings.first()).map(|firing| firing.tx)) else {
+        let Some(firing_tx) = write_set_visibility_tx(ws).or_else(|| {
+            additional
+                .and_then(|firings| firings.first())
+                .map(|firing| firing.tx)
+        }) else {
             return Ok(Vec::new());
         };
         let inserted_tables = ws
@@ -2095,9 +2339,14 @@ impl Database {
             .map(|declaration| declaration.table)
             .collect::<HashSet<_>>();
         if connected.is_some() {
-            candidate_trigger_tables.extend(self.trigger.declarations.lock().values()
-                .filter(|declaration| inserted_tables.contains(&declaration.table))
-                .map(|declaration| declaration.table.clone()));
+            candidate_trigger_tables.extend(
+                self.trigger
+                    .declarations
+                    .lock()
+                    .values()
+                    .filter(|declaration| inserted_tables.contains(&declaration.table))
+                    .map(|declaration| declaration.table.clone()),
+            );
         }
         if candidate_trigger_tables.is_empty() && additional.is_none() {
             return Ok(Vec::new());
@@ -2121,28 +2370,49 @@ impl Database {
         let mut source_projection = if let Some((changes, coordinates)) = connected {
             let declarations = self.trigger.declarations.lock();
             let declaration_bytes = declarations.values().fold(0usize, |bytes, declaration| {
-                bytes.saturating_add(declaration.name.len())
+                bytes
+                    .saturating_add(declaration.name.len())
                     .saturating_add(declaration.table.len())
                     .saturating_add(declaration.on_events.len().saturating_mul(32))
                     .saturating_add(512)
             });
             order_credit.try_grow_for(
-                declaration_bytes.saturating_mul(3)
-                    .saturating_add(changes.ddl.iter().map(DdlChange::estimated_bytes)
-                        .fold(0usize, usize::saturating_add).saturating_mul(8))
+                declaration_bytes
+                    .saturating_mul(3)
+                    .saturating_add(
+                        changes
+                            .ddl
+                            .iter()
+                            .map(DdlChange::estimated_bytes)
+                            .fold(0usize, usize::saturating_add)
+                            .saturating_mul(8),
+                    )
                     .saturating_add(changes.ddl.len().saturating_mul(128))
                     .saturating_add(ws.relational_inserts.len().saturating_mul(64)),
-                "sync", "connected_trigger_audit_prefix",
+                "sync",
+                "connected_trigger_audit_prefix",
                 "Raise MEMORY_LIMIT to prepare connected trigger audits.",
             )?;
             let prefix = declarations.clone();
             drop(declarations);
-            let (catalog_credit, tables) = self.selected_received_catalog(changes, std::iter::empty())?;
-            let mut ddl = changes.ddl.iter().zip(&changes.ddl_lsn)
+            let (catalog_credit, tables) =
+                self.selected_received_catalog(changes, std::iter::empty())?;
+            let mut ddl = changes
+                .ddl
+                .iter()
+                .zip(&changes.ddl_lsn)
                 .map(|(change, position)| Ok((coordinates.local(*position)?, change)))
                 .collect::<Result<Vec<_>>>()?;
             ddl.sort_by_key(|(position, _)| *position);
-            Some((tables, prefix, BTreeMap::new(), ddl, 0usize, None, catalog_credit))
+            Some((
+                tables,
+                prefix,
+                BTreeMap::new(),
+                ddl,
+                0usize,
+                None,
+                catalog_credit,
+            ))
         } else {
             None
         };
@@ -2151,12 +2421,14 @@ impl Database {
             rows.extend(ws.relational_inserts.iter());
             rows.sort_by_key(|(_, row)| row.lsn);
         }
-        let rows = rows.into_iter().chain(
-            ws.relational_inserts.iter().filter(|_| connected.is_none()),
-        );
+        let rows = rows
+            .into_iter()
+            .chain(ws.relational_inserts.iter().filter(|_| connected.is_none()));
         for (table, row) in rows {
             let mut row_declarations = projected_declarations;
-            if let Some((tables, prefix, current, ddl, next, current_position, _)) = source_projection.as_mut() {
+            if let Some((tables, prefix, current, ddl, next, current_position, _)) =
+                source_projection.as_mut()
+            {
                 while *next < ddl.len() && ddl[*next].0 <= row.lsn {
                     let position = ddl[*next].0;
                     *current = prefix.clone();
@@ -2166,7 +2438,8 @@ impl Database {
                         Self::apply_sync_table_ddl_to_projected_meta(tables, change);
                         self.apply_sync_trigger_ddl_to_projection(prefix, change, tables)?;
                         if let DdlChange::CreateTrigger { name, .. }
-                            | DdlChange::CreateTriggerIncludingSync { name, .. } = change {
+                        | DdlChange::CreateTriggerIncludingSync { name, .. } = change
+                        {
                             // A same-group DROP/CREATE may reuse a trigger name.
                             // The validated last declaration keeps the ordinary
                             // one-source transaction's existing audit behavior.
@@ -2176,15 +2449,18 @@ impl Database {
                         *next += 1;
                     }
                 }
-                row_declarations = Some(if *current_position == Some(row.lsn) { current } else { prefix });
+                row_declarations = Some(if *current_position == Some(row.lsn) {
+                    current
+                } else {
+                    prefix
+                });
             }
             let event = if paired_inserts.contains(&(table.clone(), row.row_id)) {
                 TriggerEvent::Update
             } else {
                 TriggerEvent::Insert
             };
-            let declarations =
-                self.triggers_for_table_event_from(row_declarations, table, event);
+            let declarations = self.triggers_for_table_event_from(row_declarations, table, event);
             if declarations.is_empty() {
                 continue;
             }
@@ -2215,8 +2491,14 @@ impl Database {
             // The established unit-wide cascade calculation stays unchanged.
             audits.clear();
             for firing in prefix {
-                audits.push(TriggerAuditEntry { trigger_name: firing.trigger_name.clone(),firing_tx: firing.tx,
-                    firing_lsn: firing.lsn,depth: 1,cascade_row_count,status: TriggerAuditStatus::Fired });
+                audits.push(TriggerAuditEntry {
+                    trigger_name: firing.trigger_name.clone(),
+                    firing_tx: firing.tx,
+                    firing_lsn: firing.lsn,
+                    depth: 1,
+                    cascade_row_count,
+                    status: TriggerAuditStatus::Fired,
+                });
             }
         }
         Ok(audits)
@@ -2411,7 +2693,12 @@ impl Database {
             generation_sidecars,
             start_ordinal,
         };
-        let memory_history = self.prepare_staged_memory_schema_history(lsn, start_ordinal, ddl, &persistence.generation_sidecars)?;
+        let memory_history = self.prepare_staged_memory_schema_history(
+            lsn,
+            start_ordinal,
+            ddl,
+            &persistence.generation_sidecars,
+        )?;
         self.trigger
             .stage_trigger_ddl_commit(lsn, projected, persistence, memory_history);
         Ok(())
@@ -2503,8 +2790,13 @@ impl Database {
         let row_graph_edges =
             self.row_graph_witnesses_for_table_drop(table, read_memory.clone())?;
         let history = if self.persistence.is_none() {
-            Some(self.relational_store.prepare_schema_generation(std::iter::once(table), self.engine_sync_read_memory()?)?)
-        } else { None };
+            Some(self.relational_store.prepare_schema_generation(
+                std::iter::once(table),
+                self.engine_sync_read_memory()?,
+            )?)
+        } else {
+            None
+        };
         let memory_history = self.prepare_memory_ddl_append(lsn, &ddl, read_memory.clone())?;
         if let Some(persistence) = &self.persistence {
             persistence.remove_table_rewrite_aux_with_config_values_and_ddl_log(
@@ -2518,10 +2810,15 @@ impl Database {
         self.apply_graph_edges_after_table_drop(graph_edges);
         self.remove_rank_formulas_for_table(table);
         self.vector_store_deregister_table(table);
-        if let Some(source)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
-            source.project_schema(table,None,&ddl)?;
+        if let Some(source) =
+            crate::persistence::received_working_source::WorkingReadSource::current_for(
+                self.tx_mgr.identity(),
+            )?
+        {
+            source.project_schema(table, None, &ddl)?;
         }
-        self.relational_store().drop_table_with_generation(table, history);
+        self.relational_store()
+            .drop_table_with_generation(table, history);
         if current != projected {
             self.apply_trigger_declarations_to_memory(projected);
         }
@@ -2557,7 +2854,9 @@ impl Database {
     ) -> Result<()> {
         // No trigger ran: do not format or copy the primary error, or enter
         // audit preparation, after the failed operation.
-        if pending.is_empty() { return Ok(()); }
+        if pending.is_empty() {
+            return Ok(());
+        }
         // Pending-audit diagnostic/copy admission still needs the producing
         // formatter and publication custody; this does not claim it is funded.
         let reason = error.to_string();
@@ -2579,14 +2878,17 @@ impl Database {
 
     fn append_trigger_audit(&self, entry: TriggerAuditEntry) -> Result<()> {
         if matches!(self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
-            let publication = self.with_preparation_original(|original|
-                self.prepare_original_audit_memory(original, std::slice::from_ref(&entry)))?;
+            let publication = self.with_preparation_original(|original| {
+                self.prepare_original_audit_memory(original, std::slice::from_ref(&entry))
+            })?;
             if let Some(persistence) = &self.persistence {
                 self.tx_mgr.with_deferred_metadata_write(|| {
                     let index = self.trigger.next_audit_index.fetch_add(1, Ordering::SeqCst);
                     persistence.append_trigger_audit(index, &entry)
                 })?;
-            } else { self.trigger.next_audit_index.fetch_add(1, Ordering::SeqCst); }
+            } else {
+                self.trigger.next_audit_index.fetch_add(1, Ordering::SeqCst);
+            }
             self.publish_original_audit_memory(publication);
             return Ok(());
         }
@@ -2840,29 +3142,40 @@ impl Database {
             let _row_memory;
             let maybe_row;
             loop {
-                let bytes = self.tx_mgr.with_read(tx, |ws| {
-                    ws.relational_inserts.get(index).map_or(Ok(0), |(table, row)| {
-                        crate::memory_accounting::preparation_row_copy_bytes(row)?
-                            .checked_add(table.len())
-                            .ok_or_else(EngineMetadataJournal::identity_error)
+                let bytes = self
+                    .tx_mgr
+                    .with_read(tx, |ws| {
+                        ws.relational_inserts
+                            .get(index)
+                            .map_or(Ok(0), |(table, row)| {
+                                crate::memory_accounting::preparation_row_copy_bytes(row)?
+                                    .checked_add(table.len())
+                                    .ok_or_else(EngineMetadataJournal::identity_error)
+                            })
                     })
-                }).map_err(TemporaryFailure::from_error)?
+                    .map_err(TemporaryFailure::from_error)?
                     .map_err(TemporaryFailure::from_error)?;
-                let memory = self.reserve_owned_preparation(bytes)
+                let memory = self
+                    .reserve_owned_preparation(bytes)
                     .map_err(TemporaryFailure::from_error)?;
-                let copied = self.tx_mgr.with_read(tx, |ws| {
-                    let Some((table, row)) = ws.relational_inserts.get(index) else {
-                        return Ok(Some(None));
-                    };
-                    let needed = crate::memory_accounting::preparation_row_copy_bytes(row)?
-                        .checked_add(table.len())
-                        .ok_or_else(EngineMetadataJournal::identity_error)?;
-                    if needed > bytes { return Ok(None); }
-                    Ok(Some(Some((
-                        crate::memory_accounting::preparation_copy_string(table)?,
-                        crate::memory_accounting::preparation_copy_row(row)?,
-                    ))))
-                }).map_err(TemporaryFailure::from_error)?
+                let copied = self
+                    .tx_mgr
+                    .with_read(tx, |ws| {
+                        let Some((table, row)) = ws.relational_inserts.get(index) else {
+                            return Ok(Some(None));
+                        };
+                        let needed = crate::memory_accounting::preparation_row_copy_bytes(row)?
+                            .checked_add(table.len())
+                            .ok_or_else(EngineMetadataJournal::identity_error)?;
+                        if needed > bytes {
+                            return Ok(None);
+                        }
+                        Ok(Some(Some((
+                            crate::memory_accounting::preparation_copy_string(table)?,
+                            crate::memory_accounting::preparation_copy_row(row)?,
+                        ))))
+                    })
+                    .map_err(TemporaryFailure::from_error)?
                     .map_err(TemporaryFailure::from_error)?;
                 if let Some(row) = copied {
                     // These locals are deliberately declared in this order:
@@ -2876,8 +3189,9 @@ impl Database {
             let Some((table, row)) = maybe_row else {
                 break;
             };
-            if run.initial_targets.as_ref().is_some_and(|targets|
-                index < run.initial_len && !targets.contains(&table, row.row_id)) {
+            if run.initial_targets.as_ref().is_some_and(|targets| {
+                index < run.initial_len && !targets.contains(&table, row.row_id)
+            }) {
                 index += 1;
                 continue;
             }
@@ -2885,41 +3199,52 @@ impl Database {
                 index += 1;
                 continue;
             }
-            if snapshot.latest_insert_index.iter().find_map(|((name, id), index)|
-                    (name == &table && *id == row.row_id).then_some(index))
+            if snapshot
+                .latest_insert_index
+                .iter()
+                .find_map(|((name, id), index)| {
+                    (name == &table && *id == row.row_id).then_some(index)
+                })
                 != Some(&index)
             {
                 index += 1;
                 continue;
             }
-            let prefix_update = run.initial_targets.as_ref().is_some_and(|targets|
-                index < run.initial_len && targets.is_update(&table, row.row_id));
-            let event = if prefix_update || (snapshot.deleted_rows.iter().any(|(name, id)| name == &table && *id == row.row_id)
-                && self
-                    .committed_row_exists_at_current_frontier(
-                        &table,
-                        row.row_id,
-                        read_memory.clone(),
-                    )
-                    .map_err(TemporaryFailure::from_error)?)
+            let prefix_update = run.initial_targets.as_ref().is_some_and(|targets| {
+                index < run.initial_len && targets.is_update(&table, row.row_id)
+            });
+            let event = if prefix_update
+                || (snapshot
+                    .deleted_rows
+                    .iter()
+                    .any(|(name, id)| name == &table && *id == row.row_id)
+                    && self
+                        .committed_row_exists_at_current_frontier(
+                            &table,
+                            row.row_id,
+                            read_memory.clone(),
+                        )
+                        .map_err(TemporaryFailure::from_error)?)
             {
                 TriggerEvent::Update
             } else {
                 TriggerEvent::Insert
             };
-            let (_declaration_memory, selected) = self.owned_trigger_declarations_for_dispatch(
-                declarations, &table, event, mode).map_err(TemporaryFailure::from_error)?;
+            let (_declaration_memory, selected) = self
+                .owned_trigger_declarations_for_dispatch(declarations, &table, event, mode)
+                .map_err(TemporaryFailure::from_error)?;
             for declaration in selected {
-                if !run.mark_firing(&table,row.row_id,&declaration.name)
-                    .map_err(TemporaryFailure::from_error)? { continue; }
+                if !run
+                    .mark_firing(&table, row.row_id, &declaration.name)
+                    .map_err(TemporaryFailure::from_error)?
+                {
+                    continue;
+                }
                 self.fire_trigger_owned(
                     scope,
                     tx,
                     declaration,
-                    TriggerFiring {
-                        event,
-                        row: &row,
-                    },
+                    TriggerFiring { event, row: &row },
                     depth,
                     run,
                     &snapshot.triggered_tables,
@@ -2940,23 +3265,42 @@ impl Database {
     }
 
     fn owned_trigger_declarations_for_dispatch(
-        &self, declarations: Option<&BTreeMap<String, TriggerDeclaration>>, table: &str,
-        event: TriggerEvent, mode: TriggerDispatchMode,
+        &self,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        table: &str,
+        event: TriggerEvent,
+        mode: TriggerDispatchMode,
     ) -> Result<(OwnedMemoryReservation, Vec<TriggerDeclaration>)> {
-        let selected = |declaration: &&TriggerDeclaration| declaration.table == table
-            && declaration.on_events.contains(&event) && mode.includes(declaration);
-        let quote = |declarations: &BTreeMap<String, TriggerDeclaration>| -> Result<(usize, usize)> {
-            let count = declarations.values().filter(selected).count();
-            let controls = std::alloc::Layout::array::<TriggerDeclaration>(count)
-                .map_err(|_| EngineMetadataJournal::identity_error())?.size();
-            let bytes = declarations.values().filter(selected).try_fold(controls, |bytes, declaration|
-                bytes.checked_add(crate::persistence::content_identity::original_record_work_bytes(declaration)?)
-                    .ok_or_else(EngineMetadataJournal::identity_error))?;
-            Ok((count, bytes))
+        let selected = |declaration: &&TriggerDeclaration| {
+            declaration.table == table
+                && declaration.on_events.contains(&event)
+                && mode.includes(declaration)
         };
+        let quote =
+            |declarations: &BTreeMap<String, TriggerDeclaration>| -> Result<(usize, usize)> {
+                let count = declarations.values().filter(selected).count();
+                let controls = std::alloc::Layout::array::<TriggerDeclaration>(count)
+                    .map_err(|_| EngineMetadataJournal::identity_error())?
+                    .size();
+                let bytes = declarations.values().filter(selected).try_fold(
+                    controls,
+                    |bytes, declaration| {
+                        bytes
+                            .checked_add(
+                                crate::persistence::content_identity::original_record_work_bytes(
+                                    declaration,
+                                )?,
+                            )
+                            .ok_or_else(EngineMetadataJournal::identity_error)
+                    },
+                )?;
+                Ok((count, bytes))
+            };
         loop {
-            let (count, bytes) = match declarations { Some(declarations) => quote(declarations)?,
-                None => quote(&self.trigger.declarations.lock())? };
+            let (count, bytes) = match declarations {
+                Some(declarations) => quote(declarations)?,
+                None => quote(&self.trigger.declarations.lock())?,
+            };
             let memory = self.reserve_owned_preparation(bytes)?;
             let copy = |declarations: &BTreeMap<String, TriggerDeclaration>| -> Result<Option<Vec<TriggerDeclaration>>> {
                 let (current, needed) = quote(declarations)?;
@@ -2966,9 +3310,13 @@ impl Database {
                 if copied.capacity() != current { return Err(EngineMetadataJournal::identity_error()); }
                 Ok(Some(copied))
             };
-            let copied = match declarations { Some(declarations) => copy(declarations)?,
-                None => copy(&self.trigger.declarations.lock())? };
-            if let Some(copied) = copied { return Ok((memory, copied)); }
+            let copied = match declarations {
+                Some(declarations) => copy(declarations)?,
+                None => copy(&self.trigger.declarations.lock())?,
+            };
+            if let Some(copied) = copied {
+                return Ok((memory, copied));
+            }
         }
     }
 
@@ -2984,55 +3332,107 @@ impl Database {
             ws: &contextdb_tx::manager::EngineRead<'_>,
         ) -> Result<usize> {
             use crate::memory_accounting::preparation_native_map_bytes;
-            let selected = declarations.values().filter(|declaration| mode.includes(declaration));
+            let selected = declarations
+                .values()
+                .filter(|declaration| mode.includes(declaration));
             let count = selected.clone().count();
             let mut bytes = preparation_native_map_bytes::<String, ()>(count)?
-                .checked_add(preparation_native_map_bytes::<TriggerRowKey, usize>(ws.relational_inserts.len())?)
-                .and_then(|bytes| bytes.checked_add(
-                    preparation_native_map_bytes::<TriggerRowKey, ()>(ws.relational_deletes.len()).ok()?))
+                .checked_add(preparation_native_map_bytes::<TriggerRowKey, usize>(
+                    ws.relational_inserts.len(),
+                )?)
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        preparation_native_map_bytes::<TriggerRowKey, ()>(
+                            ws.relational_deletes.len(),
+                        )
+                        .ok()?,
+                    )
+                })
                 .ok_or_else(EngineMetadataJournal::identity_error)?;
-            for table in selected.map(|declaration| declaration.table.as_str())
-                .chain(ws.relational_inserts.iter().map(|(table, _)| table.as_str()))
-                .chain(ws.relational_deletes.iter().map(|(table, _, _)| table.as_str())) {
-                bytes = bytes.checked_add(table.len()).ok_or_else(EngineMetadataJournal::identity_error)?;
+            for table in selected
+                .map(|declaration| declaration.table.as_str())
+                .chain(
+                    ws.relational_inserts
+                        .iter()
+                        .map(|(table, _)| table.as_str()),
+                )
+                .chain(
+                    ws.relational_deletes
+                        .iter()
+                        .map(|(table, _, _)| table.as_str()),
+                )
+            {
+                bytes = bytes
+                    .checked_add(table.len())
+                    .ok_or_else(EngineMetadataJournal::identity_error)?;
             }
             Ok(bytes)
         }
-        let with_declarations = |f: &mut dyn FnMut(&BTreeMap<String, TriggerDeclaration>) -> Result<usize>| {
-            match declarations {
-                Some(declarations) => f(declarations),
-                None => f(&self.trigger.declarations.lock()),
-            }
-        };
+        let with_declarations =
+            |f: &mut dyn FnMut(&BTreeMap<String, TriggerDeclaration>) -> Result<usize>| {
+                match declarations {
+                    Some(declarations) => f(declarations),
+                    None => f(&self.trigger.declarations.lock()),
+                }
+            };
         loop {
             // No declaration/active-tx guard is held across original admission.
             let bytes = with_declarations(&mut |declarations| {
-                self.tx_mgr.with_read(tx, |ws| quote(declarations, mode, &ws))?
+                self.tx_mgr
+                    .with_read(tx, |ws| quote(declarations, mode, &ws))?
             })?;
             let memory = self.reserve_owned_preparation(bytes)?;
             let mut copied = None;
             with_declarations(&mut |declarations| {
                 self.tx_mgr.with_read(tx, |ws| -> Result<usize> {
-                    if quote(declarations, mode, &ws)? > bytes { return Ok(0); }
-                    let mut triggered_tables = HashSet::with_capacity(declarations.values()
-                        .filter(|declaration| mode.includes(declaration)).count());
-                    for declaration in declarations.values().filter(|declaration| mode.includes(declaration)) {
-                        triggered_tables.insert(crate::memory_accounting::preparation_copy_string(&declaration.table)?);
+                    if quote(declarations, mode, &ws)? > bytes {
+                        return Ok(0);
                     }
-                    let mut latest_insert_index = HashMap::with_capacity(ws.relational_inserts.len());
+                    let mut triggered_tables = HashSet::with_capacity(
+                        declarations
+                            .values()
+                            .filter(|declaration| mode.includes(declaration))
+                            .count(),
+                    );
+                    for declaration in declarations
+                        .values()
+                        .filter(|declaration| mode.includes(declaration))
+                    {
+                        triggered_tables.insert(crate::memory_accounting::preparation_copy_string(
+                            &declaration.table,
+                        )?);
+                    }
+                    let mut latest_insert_index =
+                        HashMap::with_capacity(ws.relational_inserts.len());
                     for (index, (table, row)) in ws.relational_inserts.iter().enumerate() {
-                        latest_insert_index.insert((crate::memory_accounting::preparation_copy_string(table)?, row.row_id), index);
+                        latest_insert_index.insert(
+                            (
+                                crate::memory_accounting::preparation_copy_string(table)?,
+                                row.row_id,
+                            ),
+                            index,
+                        );
                     }
                     let mut deleted_rows = HashSet::with_capacity(ws.relational_deletes.len());
                     for (table, row, _) in ws.relational_deletes {
-                        deleted_rows.insert((crate::memory_accounting::preparation_copy_string(table)?, *row));
+                        deleted_rows.insert((
+                            crate::memory_accounting::preparation_copy_string(table)?,
+                            *row,
+                        ));
                     }
-                    copied = Some(TriggerDispatchSnapshot { triggered_tables, latest_insert_index, deleted_rows });
+                    copied = Some(TriggerDispatchSnapshot {
+                        triggered_tables,
+                        latest_insert_index,
+                        deleted_rows,
+                    });
                     Ok(bytes)
                 })?
             })?;
             if let Some(snapshot) = copied {
-                return Ok(OwnedTriggerDispatchSnapshot { snapshot, _memory: memory });
+                return Ok(OwnedTriggerDispatchSnapshot {
+                    snapshot,
+                    _memory: memory,
+                });
             }
             // A concurrent larger staged image needs another admitted quote.
             // The empty attempted image dies before this debit is retired.
@@ -3101,21 +3501,38 @@ impl Database {
                 &firing.row.values,
             )
             .map_err(TemporaryFailure::from_error)?;
-        let _context_memory = self.reserve_owned_preparation(
-            crate::memory_accounting::preparation_values_copy_bytes(&firing.row.values).map_err(TemporaryFailure::from_error)?
-                .checked_add(declaration.name.len()).and_then(|n| n.checked_add(declaration.table.len()))
-                .ok_or_else(EngineMetadataJournal::identity_error).map_err(TemporaryFailure::from_error)?).map_err(TemporaryFailure::from_error)?;
+        let _context_memory = self
+            .reserve_owned_preparation(
+                crate::memory_accounting::preparation_values_copy_bytes(&firing.row.values)
+                    .map_err(TemporaryFailure::from_error)?
+                    .checked_add(declaration.name.len())
+                    .and_then(|n| n.checked_add(declaration.table.len()))
+                    .ok_or_else(EngineMetadataJournal::identity_error)
+                    .map_err(TemporaryFailure::from_error)?,
+            )
+            .map_err(TemporaryFailure::from_error)?;
         let ctx = TriggerContext {
-            trigger_name: crate::memory_accounting::preparation_copy_string(&declaration.name).map_err(TemporaryFailure::from_error)?,
-            table: crate::memory_accounting::preparation_copy_string(&declaration.table).map_err(TemporaryFailure::from_error)?,
+            trigger_name: crate::memory_accounting::preparation_copy_string(&declaration.name)
+                .map_err(TemporaryFailure::from_error)?,
+            table: crate::memory_accounting::preparation_copy_string(&declaration.table)
+                .map_err(TemporaryFailure::from_error)?,
             event: firing.event,
             tx,
             depth,
-            row_values: crate::memory_accounting::preparation_copy_values(&firing.row.values).map_err(TemporaryFailure::from_error)?,
+            row_values: crate::memory_accounting::preparation_copy_values(&firing.row.values)
+                .map_err(TemporaryFailure::from_error)?,
         };
-        run.admit_guard(&ctx.trigger_name).map_err(TemporaryFailure::from_error)?;
-        let callback_thread = self.with_preparation_original(|original|
-            TriggerState::enter_callback_thread_scope_owned(&self.trigger, &ctx.trigger_name, tx, original))
+        run.admit_guard(&ctx.trigger_name)
+            .map_err(TemporaryFailure::from_error)?;
+        let callback_thread = self
+            .with_preparation_original(|original| {
+                TriggerState::enter_callback_thread_scope_owned(
+                    &self.trigger,
+                    &ctx.trigger_name,
+                    tx,
+                    original,
+                )
+            })
             .map_err(TemporaryFailure::from_error)?;
         run.active_guards.push(callback_thread);
         let callback_result = self
@@ -3377,7 +3794,8 @@ impl Database {
             })?,
             DatabaseTransactionHost::Legacy(_) => {
                 return Err(Error::Other(
-                    "owning table drop requires its actual native database host".into()));
+                    "owning table drop requires its actual native database host".into(),
+                ));
             }
         }
         let definitions = events.prepare_owned_event_bus_without_table(table)?;
@@ -3446,25 +3864,54 @@ mod sync_effect_tests {
 }
 
 impl Database {
-    pub(super) fn retain_private_plain_trigger_firings(&self, tx: TxId,
-        targets: &super::connected_replay::PrivateChangedRows,initial_len: usize,lsn: Lsn,
-        declarations: &BTreeMap<String,TriggerDeclaration>,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+    pub(super) fn retain_private_plain_trigger_firings(
+        &self,
+        tx: TxId,
+        targets: &super::connected_replay::PrivateChangedRows,
+        initial_len: usize,
+        lsn: Lsn,
+        declarations: &BTreeMap<String, TriggerDeclaration>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        self.tx_mgr.with_write_set(tx,|ws| -> Result<()> {
-            for (position,(table,row)) in ws.relational_inserts.iter().enumerate() {
-                if position < initial_len && !targets.contains(table,row.row_id) { continue; }
-                if ws.relational_inserts[position + 1..].iter().any(|(later_table,later)|
-                    later_table == table && later.row_id == row.row_id) { continue; }
-                let event = if (position < initial_len && targets.is_update(table,row.row_id))
-                    || (ws.relational_deletes.iter().any(|(name,id,_)| name == table && *id == row.row_id)
-                        && self.committed_row_exists_at_current_frontier(table,row.row_id,read_memory.clone())?) {
+        self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
+            for (position, (table, row)) in ws.relational_inserts.iter().enumerate() {
+                if position < initial_len && !targets.contains(table, row.row_id) {
+                    continue;
+                }
+                if ws.relational_inserts[position + 1..]
+                    .iter()
+                    .any(|(later_table, later)| later_table == table && later.row_id == row.row_id)
+                {
+                    continue;
+                }
+                let event = if (position < initial_len && targets.is_update(table, row.row_id))
+                    || (ws
+                        .relational_deletes
+                        .iter()
+                        .any(|(name, id, _)| name == table && *id == row.row_id)
+                        && self.committed_row_exists_at_current_frontier(
+                            table,
+                            row.row_id,
+                            read_memory.clone(),
+                        )?) {
                     TriggerEvent::Update
-                } else { TriggerEvent::Insert };
-                for declaration in declarations.values().filter(|declaration|
-                    !declaration.including_sync && declaration.table == *table && declaration.on_events.contains(&event)) {
-                    self.retain_private_synthetic_firing(tx,table,row.row_id,&declaration.name,lsn)?;
+                } else {
+                    TriggerEvent::Insert
+                };
+                for declaration in declarations.values().filter(|declaration| {
+                    !declaration.including_sync
+                        && declaration.table == *table
+                        && declaration.on_events.contains(&event)
+                }) {
+                    self.retain_private_synthetic_firing(
+                        tx,
+                        table,
+                        row.row_id,
+                        &declaration.name,
+                        lsn,
+                    )?;
                 }
             }
             Ok(())
@@ -3476,74 +3923,150 @@ impl Database {
     /// The ordinary Native coordinator owns `run` through terminal cleanup;
     /// active callbacks never move its paid audit/name buffers out of that owner.
     pub(super) fn dispatch_triggers_for_tx_owned(
-        &self, scope: &DatabaseCommitScope<'_, '_, '_>, tx: TxId,
-        declarations: Option<&BTreeMap<String, TriggerDeclaration>>, including_sync: bool,
+        &self,
+        scope: &DatabaseCommitScope<'_, '_, '_>,
+        tx: TxId,
+        declarations: Option<&BTreeMap<String, TriggerDeclaration>>,
+        including_sync: bool,
         run: &mut TriggerDispatchRun,
         vectors: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> PreparationResult<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let mode = if including_sync { TriggerDispatchMode::IncludingSync } else { TriggerDispatchMode::Local };
-        let count = self.tx_mgr.with_read(tx, |ws| ws.relational_inserts.len()).map_err(TemporaryFailure::from_error)?;
-        self.dispatch_trigger_range_owned(scope, tx, 0, count, 1, run, declarations, mode, vectors, read_memory)
+        let mode = if including_sync {
+            TriggerDispatchMode::IncludingSync
+        } else {
+            TriggerDispatchMode::Local
+        };
+        let count = self
+            .tx_mgr
+            .with_read(tx, |ws| ws.relational_inserts.len())
+            .map_err(TemporaryFailure::from_error)?;
+        self.dispatch_trigger_range_owned(
+            scope,
+            tx,
+            0,
+            count,
+            1,
+            run,
+            declarations,
+            mode,
+            vectors,
+            read_memory,
+        )
     }
 }
-
 
 pub(super) struct OriginalOrdinaryAudits {
     pub(super) entries: Vec<TriggerAuditEntry>,
     _memory: OwnedMemoryReservation,
 }
 impl Database {
-    pub(super) fn prepare_original_ordinary_audits(&self, original: &OwnedMemoryReservation,
-        ws: &WriteSet, source: CommitSource, lsn: Lsn, pending: &[PendingTriggerAudit],
+    pub(super) fn prepare_original_ordinary_audits(
+        &self,
+        original: &OwnedMemoryReservation,
+        ws: &WriteSet,
+        source: CommitSource,
+        lsn: Lsn,
+        pending: &[PendingTriggerAudit],
         projected: Option<&BTreeMap<String, TriggerDeclaration>>,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<OriginalOrdinaryAudits> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<OriginalOrdinaryAudits> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         if let Some(projected) = projected {
-            return self.prepare_original_ordinary_audits_from(original, ws, source, lsn, pending, projected, read_memory);
+            return self.prepare_original_ordinary_audits_from(
+                original,
+                ws,
+                source,
+                lsn,
+                pending,
+                projected,
+                read_memory,
+            );
         }
         if let Some(staged) = self.trigger.pin_original_trigger_stage(lsn) {
-            return self.prepare_original_ordinary_audits_from(original, ws, source, lsn, pending,
-                &staged.publication.publication.declarations, read_memory);
+            return self.prepare_original_ordinary_audits_from(
+                original,
+                ws,
+                source,
+                lsn,
+                pending,
+                &staged.publication.publication.declarations,
+                read_memory,
+            );
         }
         let staged = self.trigger.staged_ddl_for_persistence.lock();
         if let Some(staged) = staged.get(&lsn) {
-            return self.prepare_original_ordinary_audits_from(original, ws, source, lsn, pending, &staged.declarations, read_memory);
+            return self.prepare_original_ordinary_audits_from(
+                original,
+                ws,
+                source,
+                lsn,
+                pending,
+                &staged.declarations,
+                read_memory,
+            );
         }
         drop(staged);
         let declarations = self.trigger.declarations.lock();
-        self.prepare_original_ordinary_audits_from(original, ws, source, lsn, pending, &declarations, read_memory)
+        self.prepare_original_ordinary_audits_from(
+            original,
+            ws,
+            source,
+            lsn,
+            pending,
+            &declarations,
+            read_memory,
+        )
     }
 
-    fn prepare_original_ordinary_audits_from(&self, original: &OwnedMemoryReservation,
-        ws: &WriteSet, source: CommitSource, lsn: Lsn, pending: &[PendingTriggerAudit],
+    fn prepare_original_ordinary_audits_from(
+        &self,
+        original: &OwnedMemoryReservation,
+        ws: &WriteSet,
+        source: CommitSource,
+        lsn: Lsn,
+        pending: &[PendingTriggerAudit],
         declarations: &BTreeMap<String, TriggerDeclaration>,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<OriginalOrdinaryAudits> {
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<OriginalOrdinaryAudits> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
         let Some(firing_tx) = write_set_visibility_tx(ws) else {
-            return Ok(OriginalOrdinaryAudits { entries: Vec::new(), _memory: frame.into_reservation() });
+            return Ok(OriginalOrdinaryAudits {
+                entries: Vec::new(),
+                _memory: frame.into_reservation(),
+            });
         };
         let sync = source == CommitSource::SyncPull;
         let mut capacity = pending.len();
-        for audit in pending { frame.reserve(audit.trigger_name.len())?; }
+        for audit in pending {
+            frame.reserve(audit.trigger_name.len())?;
+        }
         if sync {
             for (table, _) in &ws.relational_inserts {
-                for declaration in declarations.values().filter(|declaration| declaration.table == *table
-                    && !declaration.including_sync && declaration.on_events.iter().any(|event|
-                        matches!(event, TriggerEvent::Insert | TriggerEvent::Update))) {
-                    capacity = capacity.checked_add(1).ok_or_else(EngineMetadataJournal::identity_error)?;
+                for declaration in declarations.values().filter(|declaration| {
+                    declaration.table == *table
+                        && !declaration.including_sync
+                        && declaration.on_events.iter().any(|event| {
+                            matches!(event, TriggerEvent::Insert | TriggerEvent::Update)
+                        })
+                }) {
+                    capacity = capacity
+                        .checked_add(1)
+                        .ok_or_else(EngineMetadataJournal::identity_error)?;
                     frame.reserve(declaration.name.len())?;
                 }
             }
         }
         frame.array::<TriggerAuditEntry>(capacity)?;
         let mut entries = Vec::with_capacity(capacity);
-        if entries.capacity() != capacity { return Err(EngineMetadataJournal::identity_error()); }
+        if entries.capacity() != capacity {
+            return Err(EngineMetadataJournal::identity_error());
+        }
         if sync && !ws.relational_inserts.is_empty() {
             frame.array::<usize>(ws.relational_deletes.len())?;
             frame.array::<bool>(ws.relational_deletes.len())?;
@@ -3551,84 +4074,170 @@ impl Database {
             let mut deletes = Vec::with_capacity(ws.relational_deletes.len());
             deletes.extend(0..ws.relational_deletes.len());
             deletes.sort_unstable_by(|a, b| {
-                let left = &ws.relational_deletes[*a]; let right = &ws.relational_deletes[*b];
+                let left = &ws.relational_deletes[*a];
+                let right = &ws.relational_deletes[*b];
                 (&left.0, left.1).cmp(&(&right.0, right.1))
             });
             let mut used = vec![false; ws.relational_deletes.len()];
             let mut paired = vec![None; ws.relational_inserts.len()];
-            if deletes.capacity() != ws.relational_deletes.len() || used.capacity() != ws.relational_deletes.len()
-                || paired.capacity() != ws.relational_inserts.len() { return Err(EngineMetadataJournal::identity_error()); }
+            if deletes.capacity() != ws.relational_deletes.len()
+                || used.capacity() != ws.relational_deletes.len()
+                || paired.capacity() != ws.relational_inserts.len()
+            {
+                return Err(EngineMetadataJournal::identity_error());
+            }
             let published = self.tx_mgr.capture_published_read();
             let snapshot = published.snapshot;
-            let _writer_read = self.enter_writer_read(super::writer_read::durable_root(published.handle)?, read_memory.clone());
+            let _writer_read = self.enter_writer_read(
+                super::writer_read::durable_root(published.handle)?,
+                read_memory.clone(),
+            );
             for (position, (table, inserted)) in ws.relational_inserts.iter().enumerate() {
-                if !declarations.values().any(|declaration| declaration.table == *table) { continue; }
+                if !declarations
+                    .values()
+                    .any(|declaration| declaration.table == *table)
+                {
+                    continue;
+                }
                 for (sorted, candidate) in deletes.iter().copied().enumerate() {
                     let (deleted_table, row_id, _) = &ws.relational_deletes[candidate];
-                    if deleted_table != table || used[candidate] { continue; }
+                    if deleted_table != table || used[candidate] {
+                        continue;
+                    }
                     if sorted != 0 {
                         let previous = &ws.relational_deletes[deletes[sorted - 1]];
-                        if previous.0 == *deleted_table && previous.1 == *row_id { continue; }
+                        if previous.0 == *deleted_table && previous.1 == *row_id {
+                            continue;
+                        }
                     }
                     // The old gather sorted unique deleted row ids for each
                     // table. Preserve that order while retaining one body only.
-                    let mut credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
-                    let Some(deleted) = self.committed_row_at_admitted(table, *row_id, snapshot,
-                        &mut credit, read_memory.clone())? else { continue; };
+                    let mut credit =
+                        contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+                    let Some(deleted) = self.committed_row_at_admitted(
+                        table,
+                        *row_id,
+                        snapshot,
+                        &mut credit,
+                        read_memory.clone(),
+                    )?
+                    else {
+                        continue;
+                    };
                     if self.sync_pull_rows_share_identity_borrowed(table, inserted, &deleted)? {
-                        used[candidate] = true; paired[position] = Some(candidate); break;
+                        used[candidate] = true;
+                        paired[position] = Some(candidate);
+                        break;
                     }
                 }
             }
-            let total_changes = ws.relational_inserts.len().saturating_add(ws.relational_deletes.len())
+            let total_changes = ws
+                .relational_inserts
+                .len()
+                .saturating_add(ws.relational_deletes.len())
                 .saturating_sub(used.iter().filter(|used| **used).count())
-                .saturating_add(ws.adj_inserts.len()).saturating_add(ws.adj_deletes.len())
-                .saturating_add(ws.vector_inserts.len()).saturating_add(ws.vector_deletes.len())
+                .saturating_add(ws.adj_inserts.len())
+                .saturating_add(ws.adj_deletes.len())
+                .saturating_add(ws.vector_inserts.len())
+                .saturating_add(ws.vector_deletes.len())
                 .saturating_add(ws.vector_moves.len());
             let mut firing_rows = 0usize;
             for (position, (table, _)) in ws.relational_inserts.iter().enumerate() {
-                let event = if paired[position].is_some() { TriggerEvent::Update } else { TriggerEvent::Insert };
+                let event = if paired[position].is_some() {
+                    TriggerEvent::Update
+                } else {
+                    TriggerEvent::Insert
+                };
                 let mut fired = false;
-                for declaration in declarations.values().filter(|declaration|
-                    declaration.table == *table && declaration.on_events.contains(&event)) {
+                for declaration in declarations.values().filter(|declaration| {
+                    declaration.table == *table && declaration.on_events.contains(&event)
+                }) {
                     fired = true;
-                    if declaration.including_sync { continue; }
-                    entries.push(TriggerAuditEntry { trigger_name: crate::memory_accounting::preparation_copy_string(&declaration.name)?,
-                        firing_tx, firing_lsn: lsn, depth: 1, cascade_row_count: 0, status: TriggerAuditStatus::Fired });
+                    if declaration.including_sync {
+                        continue;
+                    }
+                    entries.push(TriggerAuditEntry {
+                        trigger_name: crate::memory_accounting::preparation_copy_string(
+                            &declaration.name,
+                        )?,
+                        firing_tx,
+                        firing_lsn: lsn,
+                        depth: 1,
+                        cascade_row_count: 0,
+                        status: TriggerAuditStatus::Fired,
+                    });
                 }
-                if fired { firing_rows += 1; }
+                if fired {
+                    firing_rows += 1;
+                }
             }
             let cascade_row_count = total_changes.saturating_sub(firing_rows) as u32;
-            for entry in &mut entries { entry.cascade_row_count = cascade_row_count; }
+            for entry in &mut entries {
+                entry.cascade_row_count = cascade_row_count;
+            }
         }
         for audit in pending {
-            entries.push(TriggerAuditEntry { trigger_name: crate::memory_accounting::preparation_copy_string(&audit.trigger_name)?,
-                firing_tx, firing_lsn: lsn, depth: audit.depth, cascade_row_count: audit.cascade_row_count,
-                status: TriggerAuditStatus::Fired });
+            entries.push(TriggerAuditEntry {
+                trigger_name: crate::memory_accounting::preparation_copy_string(
+                    &audit.trigger_name,
+                )?,
+                firing_tx,
+                firing_lsn: lsn,
+                depth: audit.depth,
+                cascade_row_count: audit.cascade_row_count,
+                status: TriggerAuditStatus::Fired,
+            });
         }
-        Ok(OriginalOrdinaryAudits { entries, _memory: frame.into_reservation() })
+        Ok(OriginalOrdinaryAudits {
+            entries,
+            _memory: frame.into_reservation(),
+        })
     }
 
-    fn sync_pull_rows_share_identity_borrowed(&self, table: &str,
-        inserted: &VersionedRow, deleted: &VersionedRow) -> Result<bool> {
-        if inserted.row_id == deleted.row_id { return Ok(true); }
-        let single = |name: &str| inserted.values.get(name).is_some_and(|value| deleted.values.get(name) == Some(value));
-        let identity = self.with_owned_delivery_meta_if_present(table, |meta| {
-            let mut declared = false;
-            if let Some(name) = &meta.natural_key_column { declared = true; if single(name) { return Ok((true, declared)); } }
-            for column in &meta.columns {
-                if column.primary_key || column.unique { declared = true; if single(&column.name) { return Ok((true, declared)); } }
-            }
-            for columns in &meta.unique_constraints {
-                declared = true;
-                if !columns.is_empty() && columns.iter().all(|name| single(name)) { return Ok((true, declared)); }
-            }
-            Ok((false, declared))
-        })?.unwrap_or((false, false));
+    fn sync_pull_rows_share_identity_borrowed(
+        &self,
+        table: &str,
+        inserted: &VersionedRow,
+        deleted: &VersionedRow,
+    ) -> Result<bool> {
+        if inserted.row_id == deleted.row_id {
+            return Ok(true);
+        }
+        let single = |name: &str| {
+            inserted
+                .values
+                .get(name)
+                .is_some_and(|value| deleted.values.get(name) == Some(value))
+        };
+        let identity = self
+            .with_owned_delivery_meta_if_present(table, |meta| {
+                let mut declared = false;
+                if let Some(name) = &meta.natural_key_column {
+                    declared = true;
+                    if single(name) {
+                        return Ok((true, declared));
+                    }
+                }
+                for column in &meta.columns {
+                    if column.primary_key || column.unique {
+                        declared = true;
+                        if single(&column.name) {
+                            return Ok((true, declared));
+                        }
+                    }
+                }
+                for columns in &meta.unique_constraints {
+                    declared = true;
+                    if !columns.is_empty() && columns.iter().all(|name| single(name)) {
+                        return Ok((true, declared));
+                    }
+                }
+                Ok((false, declared))
+            })?
+            .unwrap_or((false, false));
         Ok(identity.0 || (!identity.1 && single("id")))
     }
 }
-
 
 #[derive(Default)]
 pub(crate) struct PreparedPersistenceAudits {
@@ -3637,7 +4246,9 @@ pub(crate) struct PreparedPersistenceAudits {
 }
 impl std::ops::Deref for PreparedPersistenceAudits {
     type Target = [(u64, TriggerAuditEntry)];
-    fn deref(&self) -> &Self::Target { &self.entries }
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
 }
 struct OriginalStagedAuditLink {
     node: Box<OriginalStagedAuditNode>,
@@ -3649,20 +4260,30 @@ struct OriginalStagedAuditNode {
     next: Option<OriginalStagedAuditLink>,
 }
 fn audit_dynamic_bytes(entry: &TriggerAuditEntry) -> Result<usize> {
-    entry.trigger_name.len().checked_add(match &entry.status {
-        TriggerAuditStatus::RolledBack { reason } => reason.len(), _ => 0,
-    }).ok_or_else(EngineMetadataJournal::identity_error)
+    entry
+        .trigger_name
+        .len()
+        .checked_add(match &entry.status {
+            TriggerAuditStatus::RolledBack { reason } => reason.len(),
+            _ => 0,
+        })
+        .ok_or_else(EngineMetadataJournal::identity_error)
 }
 fn copy_original_audit_entry(entry: &TriggerAuditEntry) -> Result<TriggerAuditEntry> {
-    Ok(TriggerAuditEntry { trigger_name: crate::memory_accounting::preparation_copy_string(&entry.trigger_name)?,
-        firing_tx: entry.firing_tx, firing_lsn: entry.firing_lsn, depth: entry.depth,
-        cascade_row_count: entry.cascade_row_count, status: match &entry.status {
+    Ok(TriggerAuditEntry {
+        trigger_name: crate::memory_accounting::preparation_copy_string(&entry.trigger_name)?,
+        firing_tx: entry.firing_tx,
+        firing_lsn: entry.firing_lsn,
+        depth: entry.depth,
+        cascade_row_count: entry.cascade_row_count,
+        status: match &entry.status {
             TriggerAuditStatus::Fired => TriggerAuditStatus::Fired,
             TriggerAuditStatus::DepthExceeded => TriggerAuditStatus::DepthExceeded,
             TriggerAuditStatus::RolledBack { reason } => TriggerAuditStatus::RolledBack {
                 reason: crate::memory_accounting::preparation_copy_string(reason)?,
             },
-        } })
+        },
+    })
 }
 impl TriggerState {
     fn take_original_staged_audits(&self, lsn: Lsn) -> Option<PreparedPersistenceAudits> {
@@ -3676,13 +4297,18 @@ impl TriggerState {
                         *slot = removed.node.next.take();
                         break Some(removed);
                     }
-                    Some(_) => { slot = &mut slot.as_mut().expect("live original audit stage").node.next; }
+                    Some(_) => {
+                        slot = &mut slot.as_mut().expect("live original audit stage").node.next;
+                    }
                     None => break None,
                 }
             }
         }?;
         let (control, batch) = {
-            let OriginalStagedAuditLink { node, _control: control } = removed;
+            let OriginalStagedAuditLink {
+                node,
+                _control: control,
+            } = removed;
             let OriginalStagedAuditNode { batch, .. } = *node;
             // The partially moved Box's allocation deallocates at this block
             // exit while its exact control moves to the enclosing owner.
@@ -3691,22 +4317,61 @@ impl TriggerState {
         drop(control);
         Some(batch)
     }
-    pub(super) fn stage_original_persistence_audits(&self, original: &OwnedMemoryReservation,
-        lsn: Lsn, entries: &[TriggerAuditEntry]) -> Result<()> {
-        if entries.is_empty() { return Ok(()); }
-        let control = crate::memory_accounting::reserve_preparation_from_original(original,
-            std::alloc::Layout::new::<OriginalStagedAuditNode>().size(), "trigger", "audit_stage_control",
-            "Raise MEMORY_LIMIT to stage trigger audits.")?;
-        let bytes = entries.iter().try_fold(crate::custody::preparation::preparation_array_bytes::<(u64, TriggerAuditEntry)>(entries.len())?,
-            |bytes, entry| bytes.checked_add(audit_dynamic_bytes(entry)?).ok_or_else(EngineMetadataJournal::identity_error))?;
-        let memory = crate::memory_accounting::reserve_preparation_from_original(original, bytes,
-            "trigger", "audit_stage_entries", "Raise MEMORY_LIMIT to stage trigger audits.")?;
+    pub(super) fn stage_original_persistence_audits(
+        &self,
+        original: &OwnedMemoryReservation,
+        lsn: Lsn,
+        entries: &[TriggerAuditEntry],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let control = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            std::alloc::Layout::new::<OriginalStagedAuditNode>().size(),
+            "trigger",
+            "audit_stage_control",
+            "Raise MEMORY_LIMIT to stage trigger audits.",
+        )?;
+        let bytes = entries.iter().try_fold(
+            crate::custody::preparation::preparation_array_bytes::<(u64, TriggerAuditEntry)>(
+                entries.len(),
+            )?,
+            |bytes, entry| {
+                bytes
+                    .checked_add(audit_dynamic_bytes(entry)?)
+                    .ok_or_else(EngineMetadataJournal::identity_error)
+            },
+        )?;
+        let memory = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            bytes,
+            "trigger",
+            "audit_stage_entries",
+            "Raise MEMORY_LIMIT to stage trigger audits.",
+        )?;
         let mut indexed = Vec::with_capacity(entries.len());
-        if indexed.capacity() != entries.len() { return Err(EngineMetadataJournal::identity_error()); }
-        for entry in entries { indexed.push((0, copy_original_audit_entry(entry)?)); }
-        for (index, _) in &mut indexed { *index = self.next_audit_index.fetch_add(1, Ordering::SeqCst); }
-        let batch = PreparedPersistenceAudits { entries: indexed, _memory: Some(memory) };
-        let mut link = OriginalStagedAuditLink { node: Box::new(OriginalStagedAuditNode { lsn, batch, next: None }), _control: control };
+        if indexed.capacity() != entries.len() {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        for entry in entries {
+            indexed.push((0, copy_original_audit_entry(entry)?));
+        }
+        for (index, _) in &mut indexed {
+            *index = self.next_audit_index.fetch_add(1, Ordering::SeqCst);
+        }
+        let batch = PreparedPersistenceAudits {
+            entries: indexed,
+            _memory: Some(memory),
+        };
+        let mut link = OriginalStagedAuditLink {
+            node: Box::new(OriginalStagedAuditNode {
+                lsn,
+                batch,
+                next: None,
+            }),
+            _control: control,
+        };
         let previous = self.take_original_staged_audits(lsn);
         drop(previous);
         let mut head = self.native_staged_audits.lock();
@@ -3715,7 +4380,6 @@ impl TriggerState {
         Ok(())
     }
 }
-
 
 struct OriginalTriggerAuditRing {
     entries: Option<OriginalAuditHistoryLink>,
@@ -3745,46 +4409,99 @@ pub(super) struct OriginalAuditMemoryPublication {
     history: Option<OriginalAuditHistoryLink>,
 }
 impl Database {
-    pub(super) fn prepare_original_audit_memory(&self, original: &OwnedMemoryReservation,
-        entries: &[TriggerAuditEntry]) -> Result<OriginalAuditMemoryPublication> {
+    pub(super) fn prepare_original_audit_memory(
+        &self,
+        original: &OwnedMemoryReservation,
+        entries: &[TriggerAuditEntry],
+    ) -> Result<OriginalAuditMemoryPublication> {
         self.prepare_original_audit_memory_iter(original, entries.iter())
     }
-    pub(super) fn prepare_original_audit_memory_iter<'a>(&self, original: &OwnedMemoryReservation,
-        entries: impl DoubleEndedIterator<Item = &'a TriggerAuditEntry> + Clone) -> Result<OriginalAuditMemoryPublication> {
+    pub(super) fn prepare_original_audit_memory_iter<'a>(
+        &self,
+        original: &OwnedMemoryReservation,
+        entries: impl DoubleEndedIterator<Item = &'a TriggerAuditEntry> + Clone,
+    ) -> Result<OriginalAuditMemoryPublication> {
         let incoming = Self::prepare_original_audit_chain(original, entries.clone())?;
-        let history = if self.persistence.is_none() { Self::prepare_original_audit_chain(original, entries)? } else { None };
+        let history = if self.persistence.is_none() {
+            Self::prepare_original_audit_chain(original, entries)?
+        } else {
+            None
+        };
         let import = if self.trigger.native_audit_ring.lock().is_none() {
             let legacy = self.trigger.audit_ring.lock();
-            let entries = Self::prepare_original_audit_chain(original, legacy.iter().skip(legacy.len().saturating_sub(TRIGGER_AUDIT_RING_CAPACITY)))?;
-            Some(OriginalTriggerAuditRing { entries, len: legacy.len().min(TRIGGER_AUDIT_RING_CAPACITY) })
-        } else { None };
-        Ok(OriginalAuditMemoryPublication { import, incoming, history })
+            let entries = Self::prepare_original_audit_chain(
+                original,
+                legacy
+                    .iter()
+                    .skip(legacy.len().saturating_sub(TRIGGER_AUDIT_RING_CAPACITY)),
+            )?;
+            Some(OriginalTriggerAuditRing {
+                entries,
+                len: legacy.len().min(TRIGGER_AUDIT_RING_CAPACITY),
+            })
+        } else {
+            None
+        };
+        Ok(OriginalAuditMemoryPublication {
+            import,
+            incoming,
+            history,
+        })
     }
-    fn prepare_original_audit_chain<'a>(original: &OwnedMemoryReservation,
-        entries: impl DoubleEndedIterator<Item = &'a TriggerAuditEntry>) -> Result<Option<OriginalAuditHistoryLink>> {
+    fn prepare_original_audit_chain<'a>(
+        original: &OwnedMemoryReservation,
+        entries: impl DoubleEndedIterator<Item = &'a TriggerAuditEntry>,
+    ) -> Result<Option<OriginalAuditHistoryLink>> {
         let mut next = None;
         for entry in entries.rev() {
-            let bytes = std::alloc::Layout::new::<OriginalAuditHistoryNode>().size()
-                .checked_add(audit_dynamic_bytes(entry)?).ok_or_else(EngineMetadataJournal::identity_error)?;
-            let memory = crate::memory_accounting::reserve_preparation_from_original(original, bytes,
-                "trigger", "audit_memory_entry", "Raise MEMORY_LIMIT to retain trigger audits.")?;
+            let bytes = std::alloc::Layout::new::<OriginalAuditHistoryNode>()
+                .size()
+                .checked_add(audit_dynamic_bytes(entry)?)
+                .ok_or_else(EngineMetadataJournal::identity_error)?;
+            let memory = crate::memory_accounting::reserve_preparation_from_original(
+                original,
+                bytes,
+                "trigger",
+                "audit_memory_entry",
+                "Raise MEMORY_LIMIT to retain trigger audits.",
+            )?;
             let entry = copy_original_audit_entry(entry)?;
-            next = Some(OriginalAuditHistoryLink { node: Box::new(OriginalAuditHistoryNode {
-                stamped_at: Wallclock(0), entry, next,
-            }), _memory: memory });
+            next = Some(OriginalAuditHistoryLink {
+                node: Box::new(OriginalAuditHistoryNode {
+                    stamped_at: Wallclock(0),
+                    entry,
+                    next,
+                }),
+                _memory: memory,
+            });
         }
         Ok(next)
     }
-    pub(super) fn publish_original_audit_memory(&self, mut publication: OriginalAuditMemoryPublication) {
+    pub(super) fn publish_original_audit_memory(
+        &self,
+        mut publication: OriginalAuditMemoryPublication,
+    ) {
         let mut incoming_count = 0usize;
         let mut cursor = publication.incoming.as_ref();
-        while let Some(link) = cursor { incoming_count += 1; cursor = link.node.next.as_ref(); }
+        while let Some(link) = cursor {
+            incoming_count += 1;
+            cursor = link.node.next.as_ref();
+        }
         let evicted = {
             let mut target = self.trigger.native_audit_ring.lock();
-            let ring = target.get_or_insert_with(|| publication.import.take()
-                .unwrap_or(OriginalTriggerAuditRing { entries: None, len: 0 }));
+            let ring = target.get_or_insert_with(|| {
+                publication
+                    .import
+                    .take()
+                    .unwrap_or(OriginalTriggerAuditRing {
+                        entries: None,
+                        len: 0,
+                    })
+            });
             let mut tail = &mut ring.entries;
-            while let Some(link) = tail { tail = &mut link.node.next; }
+            while let Some(link) = tail {
+                tail = &mut link.node.next;
+            }
             *tail = publication.incoming.take();
             ring.len = ring.len.saturating_add(incoming_count);
             let mut evicted = None;
@@ -3802,14 +4519,20 @@ impl Database {
         // nodes and any unused Legacy import retire outside registry locks.
         drop(evicted);
         let legacy = std::mem::take(&mut *self.trigger.audit_ring.lock());
-        drop(legacy); drop(publication.import.take());
+        drop(legacy);
+        drop(publication.import.take());
         if publication.history.is_some() {
             let stamped_at = Wallclock::now();
             let mut cursor = publication.history.as_mut();
-            while let Some(link) = cursor { link.node.stamped_at = stamped_at; cursor = link.node.next.as_mut(); }
+            while let Some(link) = cursor {
+                link.node.stamped_at = stamped_at;
+                cursor = link.node.next.as_mut();
+            }
             let mut head = self.trigger.native_audit_history.lock();
             let mut tail = &mut *head;
-            while let Some(link) = tail { tail = &mut link.node.next; }
+            while let Some(link) = tail {
+                tail = &mut link.node.next;
+            }
             *tail = publication.history.take();
         }
     }
@@ -3818,24 +4541,34 @@ impl Database {
         let ring = native.as_ref()?;
         let mut entries = Vec::with_capacity(ring.len);
         let mut cursor = ring.entries.as_ref();
-        while let Some(link) = cursor { entries.push(link.node.entry.clone()); cursor = link.node.next.as_ref(); }
+        while let Some(link) = cursor {
+            entries.push(link.node.entry.clone());
+            cursor = link.node.next.as_ref();
+        }
         Some(entries)
     }
-    pub(super) fn append_original_audit_history_to_read(&self,
-        entries: &mut Vec<TriggerAuditEntry>, credit: &mut contextdb_core::read_memory::ReadCredit) -> Result<()> {
+    pub(super) fn append_original_audit_history_to_read(
+        &self,
+        entries: &mut Vec<TriggerAuditEntry>,
+        credit: &mut contextdb_core::read_memory::ReadCredit,
+    ) -> Result<()> {
         let history = self.trigger.native_audit_history.lock();
         let mut cursor = history.as_ref();
         while let Some(link) = cursor {
-            credit.try_grow_for(std::mem::size_of::<TriggerAuditEntry>().saturating_add(audit_dynamic_bytes(&link.node.entry)?).saturating_add(96),
-                "reader", "trigger_audit_history", "Reduce the selected audit history or raise the declared read memory limit.")?;
+            credit.try_grow_for(
+                std::mem::size_of::<TriggerAuditEntry>()
+                    .saturating_add(audit_dynamic_bytes(&link.node.entry)?)
+                    .saturating_add(96),
+                "reader",
+                "trigger_audit_history",
+                "Reduce the selected audit history or raise the declared read memory limit.",
+            )?;
             entries.push(copy_original_audit_entry(&link.node.entry)?);
             cursor = link.node.next.as_ref();
         }
         Ok(())
     }
-
 }
-
 
 pub(super) struct OriginalPreparedTriggerPublication {
     pub(super) publication: PreparedTriggerPublication,
@@ -3845,102 +4578,195 @@ pub(super) struct OriginalPreparedTriggerPublication {
 }
 impl PreparedTriggerPublication {
     pub(super) fn empty_placeholder() -> Self {
-        Self { declarations: BTreeMap::new(), callbacks: HashMap::new(), active_trigger_names: Vec::new(),
-            ready: true, config_values: Vec::new() }
+        Self {
+            declarations: BTreeMap::new(),
+            callbacks: HashMap::new(),
+            active_trigger_names: Vec::new(),
+            ready: true,
+            config_values: Vec::new(),
+        }
     }
 }
 impl Database {
     pub(super) fn register_original_trigger_callback<F>(
-        &self, host: &EngineDatabaseTransactions, original: &OwnedMemoryReservation,
-        name: &str, callback: F,
+        &self,
+        host: &EngineDatabaseTransactions,
+        original: &OwnedMemoryReservation,
+        name: &str,
+        callback: F,
     ) -> Result<()>
-    where F: Fn(&Database, &TriggerContext) -> Result<()> + Send + Sync + 'static {
-        crate::memory_accounting::validate_owned_original(original, original.accountant(), &host.funder)?;
+    where
+        F: Fn(&Database, &TriggerContext) -> Result<()> + Send + Sync + 'static,
+    {
+        crate::memory_accounting::validate_owned_original(
+            original,
+            original.accountant(),
+            &host.funder,
+        )?;
         let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
         let retired = {
             let declarations = self.trigger.declarations.lock();
             if !declarations.contains_key(name) {
-                return Err(Error::TriggerNotDeclared { trigger_name: name.to_owned() });
+                return Err(Error::TriggerNotDeclared {
+                    trigger_name: name.to_owned(),
+                });
             }
             let mut callbacks = self.trigger.callbacks.write();
             if callbacks.contains_key(name) {
-                return Err(Error::TriggerAlreadyRegistered { trigger_name: name.to_owned() });
+                return Err(Error::TriggerAlreadyRegistered {
+                    trigger_name: name.to_owned(),
+                });
             }
-            let count = callbacks.len().checked_add(1).ok_or_else(EngineMetadataJournal::identity_error)?;
+            let count = callbacks
+                .len()
+                .checked_add(1)
+                .ok_or_else(EngineMetadataJournal::identity_error)?;
             frame.map::<String, TriggerCallback>(count)?;
             frame.reserve(name.len())?;
-            for key in callbacks.keys() { frame.reserve(key.len())?; }
+            for key in callbacks.keys() {
+                frame.reserve(key.len())?;
+            }
             let mut next = HashMap::with_capacity(count);
             for (key, callback) in callbacks.iter() {
-                next.insert(crate::memory_accounting::preparation_copy_string(key)?, callback.clone());
+                next.insert(
+                    crate::memory_accounting::preparation_copy_string(key)?,
+                    callback.clone(),
+                );
             }
             let key = crate::memory_accounting::preparation_copy_string(name)?;
-            let new_bytes = crate::memory_accounting::preparation_native_map_bytes::<String, TriggerCallback>(count)?
-                .checked_add(name.len()).and_then(|n| n.checked_add(callbacks.keys().map(String::len).sum::<usize>()))
-                .ok_or_else(EngineMetadataJournal::identity_error)?;
-            let control = contextdb_tx::SourceCharge::admit_funded(host.funder.clone(),
-                contextdb_tx::staged_source::source_arc_layout::<F>().size())?;
+            let new_bytes = crate::memory_accounting::preparation_native_map_bytes::<
+                String,
+                TriggerCallback,
+            >(count)?
+            .checked_add(name.len())
+            .and_then(|n| n.checked_add(callbacks.keys().map(String::len).sum::<usize>()))
+            .ok_or_else(EngineMetadataJournal::identity_error)?;
+            let control = contextdb_tx::SourceCharge::admit_funded(
+                host.funder.clone(),
+                contextdb_tx::staged_source::source_arc_layout::<F>().size(),
+            )?;
             let mut publication_original = self.trigger.native_publication_memory.lock();
             let mut map_original = self.trigger.native_callback_map_memory.lock();
-            let old_bytes = self.trigger.native_callback_map_bytes.load(Ordering::SeqCst);
+            let old_bytes = self
+                .trigger
+                .native_callback_map_bytes
+                .load(Ordering::SeqCst);
             // Detach the old physical map's exact already-held debit; do not
             // refund it until that old allocation has been destroyed.
-            let old_original = if map_original.is_some() { map_original.take() }
-                else if let Some(publication) = publication_original.as_mut() {
-                    Some(crate::memory_accounting::detach_preparation_original(publication, old_bytes)?)
-                } else if old_bytes == 0 { None }
-                else { return Err(EngineMetadataJournal::identity_error()); };
+            let old_original = if map_original.is_some() {
+                map_original.take()
+            } else if let Some(publication) = publication_original.as_mut() {
+                Some(crate::memory_accounting::detach_preparation_original(
+                    publication,
+                    old_bytes,
+                )?)
+            } else if old_bytes == 0 {
+                None
+            } else {
+                return Err(EngineMetadataJournal::identity_error());
+            };
             // No fallible work follows moving the opaque host callback. Its
             // destructor can therefore never run under these guards on refusal.
-            next.insert(key, TriggerCallback { body: Arc::new(callback), original: Some(control) });
+            next.insert(
+                key,
+                TriggerCallback {
+                    body: Arc::new(callback),
+                    original: Some(control),
+                },
+            );
             let old = std::mem::replace(&mut *callbacks, next);
             *map_original = Some(frame.into_reservation());
-            self.trigger.native_callback_map_bytes.store(new_bytes, Ordering::SeqCst);
-            RetiredOriginalCallbackMap { callbacks: old, _original: old_original }
+            self.trigger
+                .native_callback_map_bytes
+                .store(new_bytes, Ordering::SeqCst);
+            RetiredOriginalCallbackMap {
+                callbacks: old,
+                _original: old_original,
+            }
         };
         drop(retired);
         Ok(())
     }
 
-    pub(super) fn prepare_original_trigger_publication(&self, original: &OwnedMemoryReservation,
-        source: &BTreeMap<String, TriggerDeclaration>) -> Result<OriginalPreparedTriggerPublication> {
+    pub(super) fn prepare_original_trigger_publication(
+        &self,
+        original: &OwnedMemoryReservation,
+        source: &BTreeMap<String, TriggerDeclaration>,
+    ) -> Result<OriginalPreparedTriggerPublication> {
         let standing = crate::persistence::OriginalPersistenceFrame::new(original)?;
         standing.tree::<String, TriggerDeclaration>(source.len())?;
         for (key, declaration) in source {
-            standing.reserve(key.len().checked_add(declaration.name.len()).and_then(|n| n.checked_add(declaration.table.len()))
-                .ok_or_else(EngineMetadataJournal::identity_error)?)?;
+            standing.reserve(
+                key.len()
+                    .checked_add(declaration.name.len())
+                    .and_then(|n| n.checked_add(declaration.table.len()))
+                    .ok_or_else(EngineMetadataJournal::identity_error)?,
+            )?;
             standing.array::<TriggerEvent>(declaration.on_events.len())?;
         }
         let mut declarations = BTreeMap::new();
         for (key, declaration) in source {
             let mut on_events = Vec::with_capacity(declaration.on_events.len());
-            if on_events.capacity() != declaration.on_events.len() { return Err(EngineMetadataJournal::identity_error()); }
+            if on_events.capacity() != declaration.on_events.len() {
+                return Err(EngineMetadataJournal::identity_error());
+            }
             on_events.extend_from_slice(&declaration.on_events);
-            declarations.insert(crate::memory_accounting::preparation_copy_string(key)?, TriggerDeclaration {
-                name: crate::memory_accounting::preparation_copy_string(&declaration.name)?,
-                table: crate::memory_accounting::preparation_copy_string(&declaration.table)?,
-                on_events, including_sync: declaration.including_sync,
-            });
+            declarations.insert(
+                crate::memory_accounting::preparation_copy_string(key)?,
+                TriggerDeclaration {
+                    name: crate::memory_accounting::preparation_copy_string(&declaration.name)?,
+                    table: crate::memory_accounting::preparation_copy_string(&declaration.table)?,
+                    on_events,
+                    including_sync: declaration.including_sync,
+                },
+            );
         }
         let callbacks = {
             let source = self.trigger.callbacks.read();
-            let count = source.keys().filter(|name| declarations.contains_key(*name)).count();
+            let count = source
+                .keys()
+                .filter(|name| declarations.contains_key(*name))
+                .count();
             standing.map::<String, TriggerCallback>(count)?;
-            for name in source.keys().filter(|name| declarations.contains_key(*name)) { standing.reserve(name.len())?; }
+            for name in source
+                .keys()
+                .filter(|name| declarations.contains_key(*name))
+            {
+                standing.reserve(name.len())?;
+            }
             let mut callbacks = HashMap::with_capacity(count);
-            for (name, callback) in source.iter().filter(|(name, _)| declarations.contains_key(*name)) {
-                callbacks.insert(crate::memory_accounting::preparation_copy_string(name)?, callback.clone());
+            for (name, callback) in source
+                .iter()
+                .filter(|(name, _)| declarations.contains_key(*name))
+            {
+                callbacks.insert(
+                    crate::memory_accounting::preparation_copy_string(name)?,
+                    callback.clone(),
+                );
             }
             callbacks
         };
         let active_trigger_names = {
             let source = self.trigger.active_trigger_names.lock();
-            let count = source.iter().filter(|name| declarations.contains_key(*name)).count();
+            let count = source
+                .iter()
+                .filter(|name| declarations.contains_key(*name))
+                .count();
             standing.array::<String>(count)?;
-            for name in source.iter().filter(|name| declarations.contains_key(*name)) { standing.reserve(name.len())?; }
+            for name in source
+                .iter()
+                .filter(|name| declarations.contains_key(*name))
+            {
+                standing.reserve(name.len())?;
+            }
             let mut names = Vec::with_capacity(count);
-            if names.capacity() != count { return Err(EngineMetadataJournal::identity_error()); }
-            for name in source.iter().filter(|name| declarations.contains_key(*name)) {
+            if names.capacity() != count {
+                return Err(EngineMetadataJournal::identity_error());
+            }
+            for name in source
+                .iter()
+                .filter(|name| declarations.contains_key(*name))
+            {
                 names.push(crate::memory_accounting::preparation_copy_string(name)?);
             }
             names
@@ -3949,29 +4775,71 @@ impl Database {
             let current = self.trigger.declarations.lock();
             declarations.keys().any(|name| !current.contains_key(name))
         };
-        let ready = declarations.is_empty() || (self.trigger.ready.load(Ordering::SeqCst) && !adds_trigger);
+        let ready =
+            declarations.is_empty() || (self.trigger.ready.load(Ordering::SeqCst) && !adds_trigger);
         let config = crate::persistence::OriginalPersistenceFrame::new(original)?;
         config.array::<&TriggerDeclaration>(declarations.len())?;
-        config.tree::<&str, ()>(declarations.values().filter(|declaration| declaration.including_sync).count())?;
+        config.tree::<&str, ()>(
+            declarations
+                .values()
+                .filter(|declaration| declaration.including_sync)
+                .count(),
+        )?;
         let values = declarations.values().collect::<Vec<_>>();
-        let including_sync = declarations.values().filter(|declaration| declaration.including_sync)
-            .map(|declaration| declaration.name.as_str()).collect::<BTreeSet<_>>();
+        let including_sync = declarations
+            .values()
+            .filter(|declaration| declaration.including_sync)
+            .map(|declaration| declaration.name.as_str())
+            .collect::<BTreeSet<_>>();
         config.array::<(String, Vec<u8>)>(2)?;
-        config.reserve(TRIGGER_DECLARATIONS_CONFIG_KEY.len().saturating_add(TRIGGER_INCLUDING_SYNC_CONFIG_KEY.len()))?;
+        config.reserve(
+            TRIGGER_DECLARATIONS_CONFIG_KEY
+                .len()
+                .saturating_add(TRIGGER_INCLUDING_SYNC_CONFIG_KEY.len()),
+        )?;
         let mut config_values = Vec::with_capacity(2);
-        if config_values.capacity() != 2 { return Err(EngineMetadataJournal::identity_error()); }
-        config_values.push((crate::memory_accounting::preparation_copy_string(TRIGGER_DECLARATIONS_CONFIG_KEY)?, config.encode(&values)?));
-        config_values.push((crate::memory_accounting::preparation_copy_string(TRIGGER_INCLUDING_SYNC_CONFIG_KEY)?, config.encode(&including_sync)?));
-        drop(values); drop(including_sync);
-        let callback_map_bytes = crate::memory_accounting::preparation_native_map_bytes::<String, TriggerCallback>(callbacks.len())?
-            .checked_add(callbacks.keys().map(String::len).sum::<usize>())
-            .ok_or_else(EngineMetadataJournal::identity_error)?;
-        Ok(OriginalPreparedTriggerPublication { publication: PreparedTriggerPublication {
-            declarations, callbacks, active_trigger_names, ready, config_values,
-        }, standing: standing.into_reservation(), config: config.into_reservation(), callback_map_bytes })
+        if config_values.capacity() != 2 {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        config_values.push((
+            crate::memory_accounting::preparation_copy_string(TRIGGER_DECLARATIONS_CONFIG_KEY)?,
+            config.encode(&values)?,
+        ));
+        config_values.push((
+            crate::memory_accounting::preparation_copy_string(TRIGGER_INCLUDING_SYNC_CONFIG_KEY)?,
+            config.encode(&including_sync)?,
+        ));
+        drop(values);
+        drop(including_sync);
+        let callback_map_bytes = crate::memory_accounting::preparation_native_map_bytes::<
+            String,
+            TriggerCallback,
+        >(callbacks.len())?
+        .checked_add(callbacks.keys().map(String::len).sum::<usize>())
+        .ok_or_else(EngineMetadataJournal::identity_error)?;
+        Ok(OriginalPreparedTriggerPublication {
+            publication: PreparedTriggerPublication {
+                declarations,
+                callbacks,
+                active_trigger_names,
+                ready,
+                config_values,
+            },
+            standing: standing.into_reservation(),
+            config: config.into_reservation(),
+            callback_map_bytes,
+        })
     }
-    pub(super) fn publish_original_trigger_publication(&self, publication: OriginalPreparedTriggerPublication) {
-        let OriginalPreparedTriggerPublication { publication, standing, config, callback_map_bytes } = publication;
+    pub(super) fn publish_original_trigger_publication(
+        &self,
+        publication: OriginalPreparedTriggerPublication,
+    ) {
+        let OriginalPreparedTriggerPublication {
+            publication,
+            standing,
+            config,
+            callback_map_bytes,
+        } = publication;
         {
             let mut native = self.trigger.native_callbacks.lock();
             let mut cursor = native.as_mut();
@@ -3986,7 +4854,9 @@ impl Database {
             let mut names = self.trigger.active_trigger_names.lock();
             let mut original = self.trigger.native_publication_memory.lock();
             let mut callback_original = self.trigger.native_callback_map_memory.lock();
-            self.trigger.native_callback_map_bytes.store(callback_map_bytes, Ordering::SeqCst);
+            self.trigger
+                .native_callback_map_bytes
+                .store(callback_map_bytes, Ordering::SeqCst);
             RetiredOriginalTriggerState {
                 declarations: std::mem::replace(&mut *declarations, publication.declarations),
                 callbacks: std::mem::replace(&mut *callbacks, publication.callbacks),
@@ -3995,7 +4865,9 @@ impl Database {
                 _original: original.replace(standing),
             }
         };
-        self.trigger.ready.store(publication.ready, Ordering::SeqCst);
+        self.trigger
+            .ready
+            .store(publication.ready, Ordering::SeqCst);
         // Native originals are installed with their targets before any old
         // callback destructor can unwind. The retired carrier frees every old
         // map/name allocation before its final original, outside all locks.
@@ -4005,66 +4877,130 @@ impl Database {
     }
 }
 
-
 pub(super) struct OriginalTriggerProjection {
     pub(super) declarations: BTreeMap<String, TriggerDeclaration>,
     _memory: OwnedMemoryReservation,
 }
 impl Database {
-    pub(super) fn prepare_original_trigger_projection(&self, original: &OwnedMemoryReservation,
-        ddl: &[DdlChange]) -> Result<OriginalTriggerProjection> {
+    pub(super) fn prepare_original_trigger_projection(
+        &self,
+        original: &OwnedMemoryReservation,
+        ddl: &[DdlChange],
+    ) -> Result<OriginalTriggerProjection> {
         let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
         let mut projected = {
             let current = self.trigger.declarations.lock();
-            frame.tree::<String, TriggerDeclaration>(current.len().checked_add(ddl.len())
-                .ok_or_else(EngineMetadataJournal::identity_error)?)?;
-            for (name, declaration) in current.iter() { frame.reserve(name.len())?; frame.record(declaration)?; }
+            frame.tree::<String, TriggerDeclaration>(
+                current
+                    .len()
+                    .checked_add(ddl.len())
+                    .ok_or_else(EngineMetadataJournal::identity_error)?,
+            )?;
+            for (name, declaration) in current.iter() {
+                frame.reserve(name.len())?;
+                frame.record(declaration)?;
+            }
             current.clone()
         };
         for (position, change) in ddl.iter().enumerate() {
             match change {
-                change @ (DdlChange::CreateTrigger { name, table, on_events }
-                    | DdlChange::CreateTriggerIncludingSync { name, table, on_events }) => {
-                    let exists = self.with_owned_delivery_meta_if_present(table, |_| Ok(()))?.is_some();
-                    if !exists && !ddl.iter().skip(position + 1).any(|later| match later {
-                        DdlChange::DropTrigger { name: removed } => removed == name,
-                        DdlChange::DropTable { name: removed } => removed == table,
-                        _ => false,
-                    }) { return Err(Error::TableNotFound(table.clone())); }
-                    frame.reserve(name.len().checked_mul(2).and_then(|n| n.checked_add(table.len()))
-                        .ok_or_else(EngineMetadataJournal::identity_error)?)?;
-                    frame.array::<TriggerEvent>(on_events.len())?;
-                    for event in on_events { frame.reserve(event.len())?; }
-                    let events = on_events.iter().map(|event| TriggerEvent::from_ddl_str(event)).collect::<Result<Vec<_>>>()?;
-                    let incoming = TriggerDeclaration { name: crate::memory_accounting::preparation_copy_string(name)?,
-                        table: crate::memory_accounting::preparation_copy_string(table)?, on_events: events,
-                        including_sync: matches!(change, DdlChange::CreateTriggerIncludingSync { .. }) };
-                    if let Some(existing) = projected.get(name) {
-                        if existing != &incoming { return Err(Error::Other((format!("trigger already exists with a different definition: {name}")).into())); }
-                    } else { projected.insert(crate::memory_accounting::preparation_copy_string(name)?, incoming); }
+                change @ (DdlChange::CreateTrigger {
+                    name,
+                    table,
+                    on_events,
                 }
-                DdlChange::DropTrigger { name } => { projected.remove(name); }
+                | DdlChange::CreateTriggerIncludingSync {
+                    name,
+                    table,
+                    on_events,
+                }) => {
+                    let exists = self
+                        .with_owned_delivery_meta_if_present(table, |_| Ok(()))?
+                        .is_some();
+                    if !exists
+                        && !ddl.iter().skip(position + 1).any(|later| match later {
+                            DdlChange::DropTrigger { name: removed } => removed == name,
+                            DdlChange::DropTable { name: removed } => removed == table,
+                            _ => false,
+                        })
+                    {
+                        return Err(Error::TableNotFound(table.clone()));
+                    }
+                    frame.reserve(
+                        name.len()
+                            .checked_mul(2)
+                            .and_then(|n| n.checked_add(table.len()))
+                            .ok_or_else(EngineMetadataJournal::identity_error)?,
+                    )?;
+                    frame.array::<TriggerEvent>(on_events.len())?;
+                    for event in on_events {
+                        frame.reserve(event.len())?;
+                    }
+                    let events = on_events
+                        .iter()
+                        .map(|event| TriggerEvent::from_ddl_str(event))
+                        .collect::<Result<Vec<_>>>()?;
+                    let incoming = TriggerDeclaration {
+                        name: crate::memory_accounting::preparation_copy_string(name)?,
+                        table: crate::memory_accounting::preparation_copy_string(table)?,
+                        on_events: events,
+                        including_sync: matches!(
+                            change,
+                            DdlChange::CreateTriggerIncludingSync { .. }
+                        ),
+                    };
+                    if let Some(existing) = projected.get(name) {
+                        if existing != &incoming {
+                            return Err(Error::Other(
+                                (format!(
+                                    "trigger already exists with a different definition: {name}"
+                                ))
+                                .into(),
+                            ));
+                        }
+                    } else {
+                        projected.insert(
+                            crate::memory_accounting::preparation_copy_string(name)?,
+                            incoming,
+                        );
+                    }
+                }
+                DdlChange::DropTrigger { name } => {
+                    projected.remove(name);
+                }
                 // Keep the existing ordinary trigger-batch vocabulary. The
                 // chronological schema projector owns table-drop cascades.
                 _ => (),
             }
         }
-        Ok(OriginalTriggerProjection { declarations: projected, _memory: frame.into_reservation() })
+        Ok(OriginalTriggerProjection {
+            declarations: projected,
+            _memory: frame.into_reservation(),
+        })
     }
 
-    fn apply_original_trigger_ddl_batch(&self, ddl: &[DdlChange],
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+    fn apply_original_trigger_ddl_batch(
+        &self,
+        ddl: &[DdlChange],
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         self.with_preparation_original(|original| {
             self.allocate_ddl_lsn_maybe(|lsn| {
                 let published = self.tx_mgr.capture_published_read();
-                let _writer_read = self.enter_writer_read(super::writer_read::durable_root(published.handle)?, read_memory.clone());
+                let _writer_read = self.enter_writer_read(
+                    super::writer_read::durable_root(published.handle)?,
+                    read_memory.clone(),
+                );
                 let projection = self.prepare_original_trigger_projection(original, ddl)?;
-                if projection.declarations == *self.trigger.declarations.lock() && !Self::trigger_ddl_has_transient_lifecycle(ddl) {
+                if projection.declarations == *self.trigger.declarations.lock()
+                    && !Self::trigger_ddl_has_transient_lifecycle(ddl)
+                {
                     return Ok(None);
                 }
-                let publication = self.prepare_original_trigger_publication(original, &projection.declarations)?;
+                let publication =
+                    self.prepare_original_trigger_publication(original, &projection.declarations)?;
                 let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
                 frame.array::<(String, Vec<u8>)>(ddl.len())?;
                 for change in ddl {
@@ -4073,12 +5009,22 @@ impl Database {
                         self.with_owned_delivery_meta_if_present(table, |meta| frame.record(meta))?;
                     }
                 }
-                let provenance = self.ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?;
-                let memory_history = self.prepare_memory_ddl_append(lsn, ddl, read_memory.clone())?;
+                let provenance =
+                    self.ddl_generation_sidecar_values(lsn, ddl, 0, read_memory.clone())?;
+                let memory_history =
+                    self.prepare_memory_ddl_append(lsn, ddl, read_memory.clone())?;
                 if let Some(persistence) = &self.persistence {
-                    persistence.flush_original_encoded_config_and_ddl(original,
-                        publication.publication.config_values.iter().chain(&provenance)
-                            .map(|(key, bytes)| (key.as_str(), bytes.as_slice())), lsn, ddl)?;
+                    persistence.flush_original_encoded_config_and_ddl(
+                        original,
+                        publication
+                            .publication
+                            .config_values
+                            .iter()
+                            .chain(&provenance)
+                            .map(|(key, bytes)| (key.as_str(), bytes.as_slice())),
+                        lsn,
+                        ddl,
+                    )?;
                 }
                 self.publish_original_trigger_publication(publication);
                 self.publish_memory_schema_history(memory_history);
@@ -4088,7 +5034,6 @@ impl Database {
         })
     }
 }
-
 
 pub(super) struct OriginalTriggerDdlStage {
     memory_history: Option<super::PreparedSchemaHistory>,
@@ -4114,29 +5059,42 @@ impl OriginalTriggerDdlRegistration {
 }
 impl Drop for OriginalTriggerDdlRegistration {
     fn drop(&mut self) {
-        if self.armed { let retired = self.state.take_original_trigger_stage(&self.installed); drop(retired); }
+        if self.armed {
+            let retired = self.state.take_original_trigger_stage(&self.installed);
+            drop(retired);
+        }
     }
 }
 impl TriggerState {
-    fn pin_original_trigger_stage(&self, lsn: Lsn) -> Option<event_bus::OwnedEventShared<OriginalTriggerDdlStage>> {
+    fn pin_original_trigger_stage(
+        &self,
+        lsn: Lsn,
+    ) -> Option<event_bus::OwnedEventShared<OriginalTriggerDdlStage>> {
         let head = self.native_staged_ddl.lock();
         let mut cursor = head.clone();
         while let Some(stage) = cursor {
-            if stage.lsn == lsn { return Some(stage); }
+            if stage.lsn == lsn {
+                return Some(stage);
+            }
             cursor = stage.next.lock().clone();
         }
         None
     }
-    fn take_original_trigger_stage(&self, expected: &event_bus::OwnedEventShared<OriginalTriggerDdlStage>)
-        -> Option<event_bus::OwnedEventShared<OriginalTriggerDdlStage>> {
+    fn take_original_trigger_stage(
+        &self,
+        expected: &event_bus::OwnedEventShared<OriginalTriggerDdlStage>,
+    ) -> Option<event_bus::OwnedEventShared<OriginalTriggerDdlStage>> {
         let mut head = self.native_staged_ddl.lock();
         let mut previous: Option<event_bus::OwnedEventShared<OriginalTriggerDdlStage>> = None;
         let mut cursor = head.clone();
         while let Some(stage) = cursor {
             if std::ptr::eq(stage.get(), expected.get()) {
                 let next = stage.next.lock().take();
-                let removed = if let Some(previous) = previous { std::mem::replace(&mut *previous.next.lock(), next) }
-                    else { std::mem::replace(&mut *head, next) };
+                let removed = if let Some(previous) = previous {
+                    std::mem::replace(&mut *previous.next.lock(), next)
+                } else {
+                    std::mem::replace(&mut *head, next)
+                };
                 drop(head);
                 return removed;
             }
@@ -4145,10 +5103,16 @@ impl TriggerState {
         }
         None
     }
-    pub(crate) fn original_trigger_persistence_commit(&self, lsn: Lsn,
-        identity: contextdb_tx::manager::EngineTerminalIdentity) -> Result<Option<OriginalTriggerPersistencePin>> {
+    pub(crate) fn original_trigger_persistence_commit(
+        &self,
+        lsn: Lsn,
+        identity: contextdb_tx::manager::EngineTerminalIdentity,
+    ) -> Result<Option<OriginalTriggerPersistencePin>> {
         let stage = self.pin_original_trigger_stage(lsn);
-        if stage.as_ref().is_some_and(|stage| stage.identity != identity) {
+        if stage
+            .as_ref()
+            .is_some_and(|stage| stage.identity != identity)
+        {
             return Err(EngineMetadataJournal::identity_error());
         }
         Ok(stage.map(|stage| OriginalTriggerPersistencePin { stage }))
@@ -4158,19 +5122,34 @@ pub(crate) struct OriginalTriggerPersistencePin {
     stage: event_bus::OwnedEventShared<OriginalTriggerDdlStage>,
 }
 impl OriginalTriggerPersistencePin {
-    pub(crate) fn persistence(&self) -> &TriggerPersistenceCommit { &self.stage.persistence }
+    pub(crate) fn persistence(&self) -> &TriggerPersistenceCommit {
+        &self.stage.persistence
+    }
 }
 impl Database {
-    pub(super) fn stage_original_trigger_ddl(&self, host: &EngineDatabaseTransactions,
-        original: &OwnedMemoryReservation, identity: contextdb_tx::manager::EngineTerminalIdentity,
-        lsn: Lsn, ddl: &[DdlChange], start_ordinal: u32,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Option<OriginalTriggerDdlRegistration>> {
+    pub(super) fn stage_original_trigger_ddl(
+        &self,
+        host: &EngineDatabaseTransactions,
+        original: &OwnedMemoryReservation,
+        identity: contextdb_tx::manager::EngineTerminalIdentity,
+        lsn: Lsn,
+        ddl: &[DdlChange],
+        start_ordinal: u32,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Option<OriginalTriggerDdlRegistration>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        if ddl.is_empty() { return Ok(None); }
+        if ddl.is_empty() {
+            return Ok(None);
+        }
         let projection = self.prepare_original_trigger_projection(original, ddl)?;
-        if projection.declarations == *self.trigger.declarations.lock() && !Self::trigger_ddl_has_transient_lifecycle(ddl) { return Ok(None); }
-        let publication = self.prepare_original_trigger_publication(original, &projection.declarations)?;
+        if projection.declarations == *self.trigger.declarations.lock()
+            && !Self::trigger_ddl_has_transient_lifecycle(ddl)
+        {
+            return Ok(None);
+        }
+        let publication =
+            self.prepare_original_trigger_publication(original, &projection.declarations)?;
         let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
         frame.array::<(String, Vec<u8>)>(ddl.len())?;
         frame.array::<DdlChange>(ddl.len())?;
@@ -4181,28 +5160,69 @@ impl Database {
                 self.with_owned_delivery_meta_if_present(table, |meta| frame.record(meta))?;
             }
         }
-        for (key, bytes) in &publication.publication.config_values { frame.reserve(key.len().saturating_add(bytes.len()))?; }
+        for (key, bytes) in &publication.publication.config_values {
+            frame.reserve(key.len().saturating_add(bytes.len()))?;
+        }
         let generation_sidecars = self.ddl_generation_sidecars(ddl, read_memory.clone())?;
-        let provenance = self.ddl_generation_sidecar_values(lsn, ddl, start_ordinal, read_memory)?;
-        let count = publication.publication.config_values.len().checked_add(provenance.len())
+        let provenance =
+            self.ddl_generation_sidecar_values(lsn, ddl, start_ordinal, read_memory)?;
+        let count = publication
+            .publication
+            .config_values
+            .len()
+            .checked_add(provenance.len())
             .ok_or_else(EngineMetadataJournal::identity_error)?;
         frame.array::<(String, Vec<u8>)>(count)?;
         let mut config_values = Vec::with_capacity(count);
-        if config_values.capacity() != count { return Err(EngineMetadataJournal::identity_error()); }
+        if config_values.capacity() != count {
+            return Err(EngineMetadataJournal::identity_error());
+        }
         config_values.extend(publication.publication.config_values.iter().cloned());
         config_values.extend(provenance);
-        let persistence = TriggerPersistenceCommit { config_values, ddl: ddl.to_vec(), generation_sidecars, start_ordinal };
-        let memory_history = self.prepare_staged_memory_schema_history(lsn, start_ordinal, ddl, &persistence.generation_sidecars)?;
-        let stage = event_bus::OwnedEventShared::try_new(OriginalTriggerDdlStage { lsn, identity, memory_history,
-            publication, persistence, next: Mutex::new(None), _memory: frame.into_reservation() }, original, &host.funder)?;
-        let control = crate::memory_accounting::reserve_preparation_from_original(original,
-            std::mem::size_of::<OriginalTriggerDdlRegistration>(), "trigger", "ddl_stage_registration",
-            "Raise MEMORY_LIMIT to retain the trigger DDL stage.")?;
-        let mut registration = OriginalTriggerDdlRegistration { state: self.trigger.clone(), installed: stage.clone(), armed: false, _memory: control };
+        let persistence = TriggerPersistenceCommit {
+            config_values,
+            ddl: ddl.to_vec(),
+            generation_sidecars,
+            start_ordinal,
+        };
+        let memory_history = self.prepare_staged_memory_schema_history(
+            lsn,
+            start_ordinal,
+            ddl,
+            &persistence.generation_sidecars,
+        )?;
+        let stage = event_bus::OwnedEventShared::try_new(
+            OriginalTriggerDdlStage {
+                lsn,
+                identity,
+                memory_history,
+                publication,
+                persistence,
+                next: Mutex::new(None),
+                _memory: frame.into_reservation(),
+            },
+            original,
+            &host.funder,
+        )?;
+        let control = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            std::mem::size_of::<OriginalTriggerDdlRegistration>(),
+            "trigger",
+            "ddl_stage_registration",
+            "Raise MEMORY_LIMIT to retain the trigger DDL stage.",
+        )?;
+        let mut registration = OriginalTriggerDdlRegistration {
+            state: self.trigger.clone(),
+            installed: stage.clone(),
+            armed: false,
+            _memory: control,
+        };
         let mut head = self.trigger.native_staged_ddl.lock();
         let mut cursor = head.clone();
         while let Some(existing) = cursor {
-            if existing.lsn == lsn { return Err(EngineMetadataJournal::identity_error()); }
+            if existing.lsn == lsn {
+                return Err(EngineMetadataJournal::identity_error());
+            }
             cursor = existing.next.lock().clone();
         }
         *stage.next.lock() = head.take();
@@ -4210,16 +5230,30 @@ impl Database {
         registration.armed = true;
         Ok(Some(registration))
     }
-    pub(super) fn publish_original_trigger_ddl(&self, registration: OriginalTriggerDdlRegistration) {
-        let stage = registration.take().expect("committed original trigger stage retained");
+    pub(super) fn publish_original_trigger_ddl(
+        &self,
+        registration: OriginalTriggerDdlRegistration,
+    ) {
+        let stage = registration
+            .take()
+            .expect("committed original trigger stage retained");
         let stage = match stage.try_into_inner() {
             Ok(stage) => stage,
             Err(_) => panic!("committed trigger stage borrowed after immutable flush"),
         };
-        let OriginalTriggerDdlStage { publication, persistence, next, _memory, memory_history, .. } = stage;
+        let OriginalTriggerDdlStage {
+            publication,
+            persistence,
+            next,
+            _memory,
+            memory_history,
+            ..
+        } = stage;
         self.publish_original_trigger_publication(publication);
         self.publish_memory_schema_history(memory_history);
-        drop(persistence); drop(next); drop(_memory);
+        drop(persistence);
+        drop(next);
+        drop(_memory);
     }
 }
 
@@ -4233,20 +5267,30 @@ impl TriggerState {
                 loop {
                     match slot.as_ref() {
                         Some(link) if link.node.stamped_at.0 < cutoff => {
-                            let mut removed = slot.take().expect("expired original audit history entry");
-                            *slot = removed.node.next.take(); break Some(removed);
+                            let mut removed =
+                                slot.take().expect("expired original audit history entry");
+                            *slot = removed.node.next.take();
+                            break Some(removed);
                         }
-                        Some(_) => { slot = &mut slot.as_mut().expect("live original history entry").node.next; }
+                        Some(_) => {
+                            slot = &mut slot
+                                .as_mut()
+                                .expect("live original history entry")
+                                .node
+                                .next;
+                        }
                         None => break None,
                     }
                 }
             };
-            if removed.is_none() { return removed_count; }
-            drop(removed); removed_count += 1;
+            if removed.is_none() {
+                return removed_count;
+            }
+            drop(removed);
+            removed_count += 1;
         }
     }
 }
-
 
 #[allow(dead_code)]
 struct RetiredOriginalTriggerState {

@@ -1661,7 +1661,8 @@ fn answer_maintenance_status(
         publish_metadata(&answer, input);
         return MetaCommandOutcome::done();
     };
-    let settings: Vec<(String, String, String)> = compaction.rows()
+    let settings: Vec<(String, String, String)> = compaction
+        .rows()
         .iter()
         .map(|row| {
             let text = |value: &contextdb_core::Value| match value {
@@ -1973,7 +1974,11 @@ fn publish_cursor_page(
             let cells: Vec<String> = row.iter().map(crate::formatter::render_value).collect();
             println!("{}", cells.join(" | "));
         }
-        println!("({} rows, has_more: {})", page.rows().len(), page.has_more());
+        println!(
+            "({} rows, has_more: {})",
+            page.rows().len(),
+            page.has_more()
+        );
     }
     MetaCommandOutcome::done()
 }
@@ -2534,7 +2539,7 @@ fn pull_with_progress(
     client: &SyncClient,
     rt: &tokio::runtime::Runtime,
 ) -> Result<contextdb_engine::sync_types::ApplyResult, contextdb_core::Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let json = json_output_mode();
     let interactive_terminal = std::io::stdin().is_terminal();

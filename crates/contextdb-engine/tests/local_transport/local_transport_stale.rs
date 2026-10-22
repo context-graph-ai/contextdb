@@ -30,7 +30,8 @@ use contextdb_core::read_contract::{
 #[cfg(unix)]
 use contextdb_engine::local_transport::{
     FinalStaleIdentityObservation, LocalHandshake, LocalTransportError, ManualDeadlineClock,
-    StaleRemovalInterlock, UnixLocalCarrier, channel_filesystem_identity, };
+    StaleRemovalInterlock, UnixLocalCarrier, channel_filesystem_identity,
+};
 
 fn filesystem() -> StaleFilesystemEvidence {
     StaleFilesystemEvidence::Exact(ChannelFilesystemIdentity {

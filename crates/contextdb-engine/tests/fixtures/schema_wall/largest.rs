@@ -76,7 +76,8 @@ pub fn rows_and_vectors(db: &Database) -> Vec<Vec<Vec<Value>>> {
                     &empty(),
                 )
                 .unwrap()
-                .rows().to_vec();
+                .rows()
+                .to_vec();
             assert_eq!(
                 result,
                 vec![vec![

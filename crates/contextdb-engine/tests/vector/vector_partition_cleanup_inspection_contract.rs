@@ -214,7 +214,10 @@ fn held_snapshot_blocks_at_cap_key_move_then_cleanup_admits_it_and_inspects_stab
             &params(vec![("id", Value::Uuid(first))]),
         )
         .expect("read the refused row");
-    assert_eq!(unchanged.rows(), vec![vec![Value::Text("alpha".to_owned())]]);
+    assert_eq!(
+        unchanged.rows(),
+        vec![vec![Value::Text("alpha".to_owned())]]
+    );
     drop(pin);
 
     db.execute(
@@ -736,7 +739,11 @@ fn file_backed_retirement_releases_a_snapshot_free_slot_while_a_sibling_tail_sta
         "bravo stays below its declared consolidation threshold"
     );
     let released = partition_rows(&db, "retirement_items", "embedding");
-    assert_eq!(released.rows().len(), 1, "alpha's inspection row is released");
+    assert_eq!(
+        released.rows().len(),
+        1,
+        "alpha's inspection row is released"
+    );
     assert_eq!(value(&released, 0, "partition_key"), &scope_key("bravo"));
     assert_eq!(value(&released, 0, "pending_inserts"), &Value::Int64(1));
     assert_eq!(

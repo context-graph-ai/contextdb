@@ -20,7 +20,10 @@ pub(crate) struct Checkpoint {
     pub signature: Vec<u8>,
 }
 impl Checkpoint {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn bytes(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::domain("delivery-prefix-checkpoint.v1");
         self.namespace.encode(&mut e)?;
@@ -28,7 +31,10 @@ impl Checkpoint {
         e.raw(&self.digest);
         Ok(e.0)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn verify(&self) -> Result<()> {
         if self.count == 0 {
             return Err(invalid());
@@ -46,7 +52,10 @@ pub(crate) struct Frontier {
     pub peaks: Vec<Option<Digest>>,
 }
 impl Frontier {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn verify(&self) -> Result<()> {
         self.checkpoint.verify()?;
         if prefix_digest(self.checkpoint.count, &self.peaks)? != self.checkpoint.digest {
@@ -64,11 +73,17 @@ pub(crate) struct Node {
     pub checksum: Digest,
 }
 impl Node {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn key(&self) -> Result<String> {
         node_key(&self.namespace, self.height, self.start)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn checksum(&self) -> Result<Digest> {
         let mut e = Encoder::domain("delivery-prefix-node.v1");
         self.namespace.encode(&mut e)?;
@@ -77,7 +92,10 @@ impl Node {
         e.raw(&self.digest);
         Ok(e.digest())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn verify(&self) -> Result<()> {
         if self.height >= 64
             || self.start & ((1u64 << self.height) - 1) != 0
@@ -88,18 +106,27 @@ impl Node {
         Ok(())
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn node_key(ns: &Namespace, height: u8, start: u64) -> Result<String> {
     Ok(format!(
         "delivery_prefix_node.v1.{}.{height:02x}.{start:016x}",
         ns.key()?
     ))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn frontier_key(ns: &Namespace) -> Result<String> {
     Ok(format!("delivery_prefix_frontier.v1.{}", ns.key()?))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn prefix_digest(count: u64, peaks: &[Option<Digest>]) -> Result<Digest> {
     if peaks.len() != 64 {
         return Err(invalid());
@@ -117,14 +144,17 @@ fn prefix_digest(count: u64, peaks: &[Option<Digest>]) -> Result<Digest> {
     }
     Ok(e.digest())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read(
     db: &Database,
     key: &str,
     ws: Option<&dyn super::preparation::CommitWriteSource>,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Record>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -138,13 +168,16 @@ fn read(
         .into_iter()
         .find(|r| r.key().ok().as_deref() == Some(key)))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn current(
     db: &Database,
     ns: &Namespace,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Checkpoint>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     match read(db, &frontier_key(ns)?, None, read_memory.clone())? {
         Some(Record::CheckpointFrontier(f)) => Ok(Some(f.checkpoint)),
@@ -154,7 +187,10 @@ pub(crate) fn current(
 }
 // The writes join the exact terminal transaction, including several terminals
 // sharing a source transaction in the existing private test adapter.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn append(
     db: &Database,
     ws: &mut dyn super::preparation::CommitWriteSource,
@@ -162,7 +198,7 @@ pub(crate) fn append(
     signer: &LineageSigner,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let key = frontier_key(ns)?;
     let (old_count, mut peaks) = match read(db, &key, Some(ws), read_memory.clone())? {
@@ -210,13 +246,16 @@ pub(crate) fn append(
 // Owned append uses a fixed stack frontier. Every emitted native namespace,
 // signature, encoder and source ConfigWrite has its own original admission.
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn held(
     db: &Database,
     checkpoint: &Checkpoint,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<bool> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let Some(current) = current(db, &checkpoint.namespace, read_memory.clone())? else {
         return Ok(false);
@@ -249,17 +288,23 @@ pub(crate) fn held(
     }
     Ok(prefix_digest(checkpoint.count, &peaks)? == checkpoint.digest)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn edge_key(ns: &Namespace) -> Result<String> {
     Ok(format!("delivery_edge_checkpoint.v1.{}", ns.key()?))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn admission(
     db: &Database,
     checkpoint: &Checkpoint,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Record>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     checkpoint.verify()?;
     if let Some(Record::EdgeCheckpoint(old)) = read(

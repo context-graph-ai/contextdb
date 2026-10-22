@@ -1,5 +1,5 @@
-use std::alloc::Layout;
 use contextdb_core::read_memory::{ReadCredit, ReadMemoryOwner, ReadShared};
+use std::alloc::Layout;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -19,7 +19,10 @@ static PROCESS_WRITER_AGGREGATE: AtomicUsize = AtomicUsize::new(0);
 // the inherited control layouts (writer decode 232 B; received registry 104 B).
 pub(crate) const OPEN_RESIDUE_TAG: usize = 1 << (usize::BITS - 1);
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn admit_open_residue(bytes: usize, operation: &str) -> contextdb_core::Result<()> {
     assert!(bytes < OPEN_RESIDUE_TAG);
     let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
@@ -31,7 +34,8 @@ pub(crate) fn admit_open_residue(bytes: usize, operation: &str) -> contextdb_cor
             requested_bytes: bytes,
             available_bytes: available,
             budget_limit_bytes: ceiling,
-            hint: ("The inherited process ceiling funds fixed writer open residue.".to_string()).into(),
+            hint: ("The inherited process ceiling funds fixed writer open residue.".to_string())
+                .into(),
         }
     })
 }
@@ -102,7 +106,9 @@ struct UsedSample<'a>(&'a WriterCounter);
 impl Drop for UsedSample<'_> {
     fn drop(&mut self) {
         crate::vector_read_memory::root_observations::producer_used(
-            self.0 as *const _ as usize, self.0.used.load(Ordering::SeqCst));
+            self.0 as *const _ as usize,
+            self.0.used.load(Ordering::SeqCst),
+        );
     }
 }
 impl WriterCounter {
@@ -192,8 +198,14 @@ impl Drop for WriterCounter {
         // Residual payload credit leaves with this counter. Its own fixed
         // terminal debit remains in the external invoice through physical free.
         if *self.aggregate_member.get_mut() {
-            let residual = self.used.get_mut().checked_sub(self.terminal_bytes)
-                .unwrap_or_else(|| { refund_invariant_broken("terminal counter debit is owned"); 0 });
+            let residual = self
+                .used
+                .get_mut()
+                .checked_sub(self.terminal_bytes)
+                .unwrap_or_else(|| {
+                    refund_invariant_broken("terminal counter debit is owned");
+                    0
+                });
             aggregate_refund(residual);
         }
     }
@@ -221,26 +233,37 @@ impl Drop for ReaderCounter {
         // counter invoice still survives this destructor and physical free.
         if let Some(original) = &self.original {
             contextdb_core::read_memory::ReadMemoryBudget::release(
-                original, self.counter.used.load(Ordering::SeqCst));
+                original,
+                self.counter.used.load(Ordering::SeqCst),
+            );
         }
     }
 }
 #[derive(Debug, Clone)]
-pub(crate) struct WriterCounterHandle(
-    CounterBacking,
-    Option<ReadMemoryOwner>,
-);
+pub(crate) struct WriterCounterHandle(CounterBacking, Option<ReadMemoryOwner>);
 impl WriterCounterHandle {
     fn new(counter: WriterCounter) -> Self {
-        Self(CounterBacking::Writer(ManuallyDrop::new(Arc::new(ManuallyDrop::new(counter)))), None)
+        Self(
+            CounterBacking::Writer(ManuallyDrop::new(Arc::new(ManuallyDrop::new(counter)))),
+            None,
+        )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn reader(original: Option<ReadMemoryOwner>, invoice: ReadCredit)
-        -> contextdb_core::Result<Self>
-    {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn reader(
+        original: Option<ReadMemoryOwner>,
+        invoice: ReadCredit,
+    ) -> contextdb_core::Result<Self> {
         let counter = ReadShared::try_from_prepaid_native(
-            ReaderCounter { counter: WriterCounter::default(), original: original.clone() }, invoice)
-            .map_err(contextdb_core::Error::NativeEngineOther)?;
+            ReaderCounter {
+                counter: WriterCounter::default(),
+                original: original.clone(),
+            },
+            invoice,
+        )
+        .map_err(contextdb_core::Error::NativeEngineOther)?;
         Ok(Self(CounterBacking::Reader(counter), original))
     }
     pub(crate) fn release_owned(&self, bytes: usize) -> Result<(), usize> {
@@ -257,7 +280,9 @@ impl WriterCounterHandle {
         }
         before
     }
-    pub(crate) fn as_ptr(&self) -> *const WriterCounter { &**self }
+    pub(crate) fn as_ptr(&self) -> *const WriterCounter {
+        &**self
+    }
 }
 impl std::ops::Deref for WriterCounterHandle {
     type Target = WriterCounter;
@@ -294,16 +319,26 @@ enum LimitBacking {
     Native(ReadShared<AtomicUsize, WriterControlInvoice>),
 }
 impl From<Arc<AtomicUsize>> for LimitHandle {
-    fn from(limit: Arc<AtomicUsize>) -> Self { Self { backing: LimitBacking::Legacy(limit) } }
+    fn from(limit: Arc<AtomicUsize>) -> Self {
+        Self {
+            backing: LimitBacking::Legacy(limit),
+        }
+    }
 }
 impl std::ops::Deref for LimitHandle {
     type Target = AtomicUsize;
     fn deref(&self) -> &AtomicUsize {
-        match &self.backing { LimitBacking::Legacy(limit) => limit, LimitBacking::Reader(limit) => limit, LimitBacking::Native(limit) => limit }
+        match &self.backing {
+            LimitBacking::Legacy(limit) => limit,
+            LimitBacking::Reader(limit) => limit,
+            LimitBacking::Native(limit) => limit,
+        }
     }
 }
 impl LimitHandle {
-    fn same_control(&self, other: &Self) -> bool { std::ptr::eq(&**self, &**other) }
+    fn same_control(&self, other: &Self) -> bool {
+        std::ptr::eq(&**self, &**other)
+    }
 }
 
 const ACCOUNTANT_ORIGIN: usize = 0b100;
@@ -317,7 +352,9 @@ const _: () = assert!(std::mem::align_of::<MemoryAccountant>() >= 8);
 pub(crate) struct AccountantHandle(NonNull<MemoryAccountant>);
 impl AccountantHandle {
     #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn used_counter_for_observation(&self) -> usize { self.used.as_ptr() as usize }
+    pub(crate) fn used_counter_for_observation(&self) -> usize {
+        self.used.as_ptr() as usize
+    }
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn control_payer_for_observation(&self) -> Option<usize> {
         #[cfg(feature = "test-seams")]
@@ -330,10 +367,13 @@ impl AccountantHandle {
         None
     }
     #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn observation_kind(&self) -> u8 { if self.is_engine() { 3 } else { 2 } }
+    pub(crate) fn observation_kind(&self) -> u8 {
+        if self.is_engine() { 3 } else { 2 }
+    }
     #[cfg(any(test, feature = "test-seams"))]
-    pub(crate) fn original_reader_for_observation(&self) -> Option<&ReadMemoryOwner> { self.used.1.as_ref() }
-
+    pub(crate) fn original_reader_for_observation(&self) -> Option<&ReadMemoryOwner> {
+        self.used.1.as_ref()
+    }
 
     pub(crate) fn from_host(accountant: Arc<MemoryAccountant>) -> Self {
         Self::from_standard(accountant)
@@ -350,8 +390,7 @@ impl AccountantHandle {
         // The existing origin bit survives packed StoreAccountantHandle and
         // proof-slot transfers. Bit 1 belongs to the proof slot's READY state;
         // distinguish native backing by immutable payload metadata instead.
-        self.0.addr().get() & ACCOUNTANT_ORIGIN != 0
-            && unsafe { (*self.as_ptr()).reader_controls }
+        self.0.addr().get() & ACCOUNTANT_ORIGIN != 0 && unsafe { (*self.as_ptr()).reader_controls }
     }
     pub(crate) fn as_ptr(&self) -> *const MemoryAccountant {
         self.0
@@ -395,88 +434,146 @@ impl AccountantHandle {
             [
                 (
                     self.as_ptr() as usize,
-                    if self.is_engine() { ReadShared::<MemoryAccountant, WriterControlInvoice>::layout() } else { writer_adapter_type_layout::<MemoryAccountant>() },
+                    if self.is_engine() {
+                        ReadShared::<MemoryAccountant, WriterControlInvoice>::layout()
+                    } else {
+                        writer_adapter_type_layout::<MemoryAccountant>()
+                    },
                 ),
                 (
                     &*self.limit as *const AtomicUsize as usize,
-                    if self.is_engine() { ReadShared::<AtomicUsize, WriterControlInvoice>::layout() } else { writer_adapter_type_layout::<AtomicUsize>() },
+                    if self.is_engine() {
+                        ReadShared::<AtomicUsize, WriterControlInvoice>::layout()
+                    } else {
+                        writer_adapter_type_layout::<AtomicUsize>()
+                    },
                 ),
                 (
                     self.used.as_ptr() as usize,
-                    if self.is_engine() { ReadShared::<WriterCounter, WriterCounterInvoice>::layout() } else { writer_adapter_type_layout::<WriterCounter>() },
+                    if self.is_engine() {
+                        ReadShared::<WriterCounter, WriterCounterInvoice>::layout()
+                    } else {
+                        writer_adapter_type_layout::<WriterCounter>()
+                    },
                 ),
             ],
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reader_control_bytes() -> contextdb_core::Result<usize> {
-        ReadShared::<MemoryAccountant>::layout().size()
+        ReadShared::<MemoryAccountant>::layout()
+            .size()
             .checked_add(ReadShared::<AtomicUsize>::layout().size())
             .and_then(|bytes| bytes.checked_add(ReadShared::<ReaderCounter>::layout().size()))
             .ok_or_else(|| contextdb_core::Error::Other("reader control layout overflow".into()))
     }
     /// Pre-admit the complete exact family on the same original reader, then
     /// split its debit into each actual cell without refunding or re-billing.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reader(
-        limit: Option<usize>, original: ReadMemoryOwner, mirror_payload: bool,
+        limit: Option<usize>,
+        original: ReadMemoryOwner,
+        mirror_payload: bool,
     ) -> contextdb_core::Result<Self> {
         let bytes = Self::reader_control_bytes()?;
         let invoice = if mirror_payload {
-            ReadCredit::try_new_owned_native(original.clone(), bytes,
-                "direct_read", "hydrate_owned_image",
-                "Raise MEMORY_LIMIT to admit the complete committed read image.")
-                .map_err(contextdb_core::Error::NativeEngineOther)?
+            ReadCredit::try_new_owned_native(
+                original.clone(),
+                bytes,
+                "direct_read",
+                "hydrate_owned_image",
+                "Raise MEMORY_LIMIT to admit the complete committed read image.",
+            )
+            .map_err(contextdb_core::Error::NativeEngineOther)?
         } else {
             // Query admission keeps the existing checkpoint/refusal kernel.
             // Native allocation does not require changing its Error vocabulary
             // or invoking scalar-only admission on an app's Legacy provider.
-            ReadCredit::try_new_owned(original.clone(), bytes,
-                "reader", "query_buffer",
-                "Reduce simultaneous query working memory or raise the declared reader limit.")?
+            ReadCredit::try_new_owned(
+                original.clone(),
+                bytes,
+                "reader",
+                "query_buffer",
+                "Reduce simultaneous query working memory or raise the declared reader limit.",
+            )?
         };
         Self::reader_from_prepaid(limit, mirror_payload.then_some(original), invoice)
     }
     /// The executing kernel already admitted these controls. Move its exact
     /// original credit into the actual cells; do not reserve or refund here.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reader_from_prepaid(
-        limit: Option<usize>, mirror: Option<ReadMemoryOwner>, mut invoice: ReadCredit,
+        limit: Option<usize>,
+        mirror: Option<ReadMemoryOwner>,
+        mut invoice: ReadCredit,
     ) -> contextdb_core::Result<Self> {
         if invoice.bytes() != Self::reader_control_bytes()? {
-            return Err(contextdb_core::Error::Other("reader controls differ from prepaid layout".into()));
+            return Err(contextdb_core::Error::Other(
+                "reader controls differ from prepaid layout".into(),
+            ));
         }
         let limit_bytes = ReadShared::<AtomicUsize>::layout().size();
         let counter_bytes = ReadShared::<ReaderCounter>::layout().size();
-        let limit_invoice = invoice.try_split_off_native(limit_bytes)
+        let limit_invoice = invoice
+            .try_split_off_native(limit_bytes)
             .map_err(contextdb_core::Error::NativeEngineOther)?;
-        let counter_invoice = invoice.try_split_off_native(counter_bytes)
+        let counter_invoice = invoice
+            .try_split_off_native(counter_bytes)
             .map_err(contextdb_core::Error::NativeEngineOther)?;
-        let limit_control = LimitHandle { backing: LimitBacking::Reader(
-            ReadShared::try_from_prepaid_native(AtomicUsize::new(limit.unwrap_or(0)), limit_invoice)
-                .map_err(contextdb_core::Error::NativeEngineOther)?) };
+        let limit_control = LimitHandle {
+            backing: LimitBacking::Reader(
+                ReadShared::try_from_prepaid_native(
+                    AtomicUsize::new(limit.unwrap_or(0)),
+                    limit_invoice,
+                )
+                .map_err(contextdb_core::Error::NativeEngineOther)?,
+            ),
+        };
         let used = WriterCounterHandle::reader(mirror, counter_invoice)?;
         let mut accountant = MemoryAccountant::with_controls(limit_control, used, limit);
         accountant.reader_controls = true;
         let owner = ReadShared::try_from_prepaid_native(accountant, invoice)
             .map_err(contextdb_core::Error::NativeEngineOther)?;
-        let raw = owner.into_raw().cast_mut().map_addr(|address| address | ACCOUNTANT_ORIGIN);
+        let raw = owner
+            .into_raw()
+            .cast_mut()
+            .map_addr(|address| address | ACCOUNTANT_ORIGIN);
         Ok(Self(NonNull::new(raw).expect("native reader accountant")))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn engine(limit: Option<usize>) -> contextdb_core::Result<Self> {
         Self::original_root(limit, true, true)
     }
     /// An engine-created decoder root preserves its actual scalar declaration,
     /// including runtime-only and unbounded settings. It is never a host Arc.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn standalone(limit: Option<usize>, startup: bool)
-        -> contextdb_core::Result<Self> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn standalone(limit: Option<usize>, startup: bool) -> contextdb_core::Result<Self> {
         Self::original_root(limit, startup, false)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn original_root(limit: Option<usize>, startup: bool, retained_startup: bool)
-        -> contextdb_core::Result<Self> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn original_root(
+        limit: Option<usize>,
+        startup: bool,
+        retained_startup: bool,
+    ) -> contextdb_core::Result<Self> {
         let backing_bytes = engine_writer_backing_bytes();
         let mut counter = WriterCounter::default();
         // Bootstrap on the actual stack counter before any of its three cells.
@@ -484,8 +581,10 @@ impl AccountantHandle {
         // their existing finite scalar limit (zero retains its unbounded meaning).
         if !retained_startup && limit.is_some_and(|limit| limit != 0 && backing_bytes > limit) {
             return Err(contextdb_core::Error::MemoryBudgetExceeded {
-                subsystem: "decoder".into(), operation: "original_controls".into(),
-                requested_bytes: backing_bytes, available_bytes: limit.unwrap_or(0),
+                subsystem: "decoder".into(),
+                operation: "original_controls".into(),
+                requested_bytes: backing_bytes,
+                available_bytes: limit.unwrap_or(0),
                 budget_limit_bytes: limit.unwrap_or(0),
                 hint: "Raise MEMORY_LIMIT to admit decoder controls.".into(),
             });
@@ -498,8 +597,10 @@ impl AccountantHandle {
             let ceiling = effective_ceiling(domain.ceiling);
             aggregate_try_reserve(backing_bytes, ceiling).map_err(|available| {
                 contextdb_core::Error::MemoryBudgetExceeded {
-                    subsystem: "process_native_ceiling".into(), operation: "original_controls".into(),
-                    requested_bytes: backing_bytes, available_bytes: available,
+                    subsystem: "process_native_ceiling".into(),
+                    operation: "original_controls".into(),
+                    requested_bytes: backing_bytes,
+                    available_bytes: available,
                     budget_limit_bytes: ceiling,
                     hint: "The inherited process ceiling funds original decoder controls.".into(),
                 }
@@ -511,32 +612,61 @@ impl AccountantHandle {
         drop(domain);
         let counter_bytes = ReadShared::<WriterCounter, WriterCounterInvoice>::layout().size();
         counter.terminal_bytes = counter_bytes;
-        let used = WriterCounterHandle(CounterBacking::Native(
-            ReadShared::try_from_invoice_native(counter, WriterCounterInvoice { bytes: counter_bytes })
-                .map_err(contextdb_core::Error::NativeEngineOther)?), None);
+        let used = WriterCounterHandle(
+            CounterBacking::Native(
+                ReadShared::try_from_invoice_native(
+                    counter,
+                    WriterCounterInvoice {
+                        bytes: counter_bytes,
+                    },
+                )
+                .map_err(contextdb_core::Error::NativeEngineOther)?,
+            ),
+            None,
+        );
         // The stack invoice rolls back all unallocated sibling controls too.
-        let mut pending = WriterControlInvoice { counter: used.clone(),
-            bytes: backing_bytes - counter_bytes };
+        let mut pending = WriterControlInvoice {
+            counter: used.clone(),
+            bytes: backing_bytes - counter_bytes,
+        };
         let limit_bytes = ReadShared::<AtomicUsize, WriterControlInvoice>::layout().size();
-        let limit_invoice = WriterControlInvoice { counter: used.clone(), bytes: limit_bytes };
+        let limit_invoice = WriterControlInvoice {
+            counter: used.clone(),
+            bytes: limit_bytes,
+        };
         pending.bytes -= limit_bytes;
-        let limit_control = LimitHandle { backing: LimitBacking::Native(
-            ReadShared::try_from_invoice_native(AtomicUsize::new(limit.unwrap_or(0)), limit_invoice)
-                .map_err(contextdb_core::Error::NativeEngineOther)?) };
-        let accountant = MemoryAccountant::with_controls(limit_control, used,
-            limit.filter(|_| startup));
+        let limit_control = LimitHandle {
+            backing: LimitBacking::Native(
+                ReadShared::try_from_invoice_native(
+                    AtomicUsize::new(limit.unwrap_or(0)),
+                    limit_invoice,
+                )
+                .map_err(contextdb_core::Error::NativeEngineOther)?,
+            ),
+        };
+        let accountant =
+            MemoryAccountant::with_controls(limit_control, used, limit.filter(|_| startup));
         #[cfg(any(test, feature = "test-seams"))]
         {
-            accountant.high_water_for_test.store(backing_bytes, Ordering::SeqCst);
-            accountant.admitted_bytes_for_test.store(backing_bytes, Ordering::SeqCst);
+            accountant
+                .high_water_for_test
+                .store(backing_bytes, Ordering::SeqCst);
+            accountant
+                .admitted_bytes_for_test
+                .store(backing_bytes, Ordering::SeqCst);
             if retained_startup {
-                accountant.retained_charge_bytes_for_test.store(backing_bytes, Ordering::SeqCst);
+                accountant
+                    .retained_charge_bytes_for_test
+                    .store(backing_bytes, Ordering::SeqCst);
                 note_budget_ledger("charge_retained", backing_bytes, backing_bytes);
             }
         }
         let owner = ReadShared::try_from_invoice_native(accountant, pending)
             .map_err(contextdb_core::Error::NativeEngineOther)?;
-        let raw = owner.into_raw().cast_mut().map_addr(|address| address | ACCOUNTANT_ORIGIN);
+        let raw = owner
+            .into_raw()
+            .cast_mut()
+            .map_addr(|address| address | ACCOUNTANT_ORIGIN);
         Ok(Self(NonNull::new(raw).expect("native accountant")))
     }
 }
@@ -560,16 +690,21 @@ impl Clone for AccountantHandle {
     fn clone(&self) -> Self {
         if self.is_reader() {
             // Borrow this live count; transfer only the newly cloned count.
-            let reader = ManuallyDrop::new(unsafe { ReadShared::<MemoryAccountant>::from_raw(self.as_ptr()) });
+            let reader = ManuallyDrop::new(unsafe {
+                ReadShared::<MemoryAccountant>::from_raw(self.as_ptr())
+            });
             let _owned = ReadShared::clone(&reader).into_raw();
             return Self(self.0);
         }
         if self.is_engine() {
             let owner = ManuallyDrop::new(unsafe {
-                ReadShared::<MemoryAccountant, WriterControlInvoice>::from_raw(self.as_ptr()) });
+                ReadShared::<MemoryAccountant, WriterControlInvoice>::from_raw(self.as_ptr())
+            });
             let _owned = ReadShared::clone(&owner).into_raw();
         } else {
-            unsafe { Arc::increment_strong_count(self.as_ptr()); }
+            unsafe {
+                Arc::increment_strong_count(self.as_ptr());
+            }
         }
         Self(self.0)
     }
@@ -588,7 +723,9 @@ impl Drop for AccountantHandle {
             }
             return;
         }
-        drop(unsafe { ReadShared::<MemoryAccountant, WriterControlInvoice>::from_raw(self.as_ptr()) });
+        drop(unsafe {
+            ReadShared::<MemoryAccountant, WriterControlInvoice>::from_raw(self.as_ptr())
+        });
     }
 }
 // SAFETY: immutable ownership tags; Arc and ReadShared enforce Send/Sync
@@ -708,12 +845,16 @@ impl Drop for WriterControlInvoice {
     fn drop(&mut self) {
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
         let released = self.counter.release_owned(self.bytes);
-        if !std::thread::panicking() { released.expect("original control refund is owned"); }
+        if !std::thread::panicking() {
+            released.expect("original control refund is owned");
+        }
         drop(domain);
     }
 }
 #[derive(Debug)]
-struct WriterCounterInvoice { bytes: usize }
+struct WriterCounterInvoice {
+    bytes: usize,
+}
 impl Drop for WriterCounterInvoice {
     fn drop(&mut self) {
         // The counter has physically gone. Retire its sole terminal debit,
@@ -1916,7 +2057,10 @@ impl StoreAccountantHandle {
     }
     // A resident cache carries this original role in its existing word;
     // admission and escaping chunk clones must never rediscover a later role.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_allocate_for_original(
         &self,
         bytes: usize,
@@ -1928,11 +2072,15 @@ impl StoreAccountantHandle {
     }
     /// Derive an empty original reservation from this already-pinned role.
     /// No lookup chooses a new epoch: original_writer_use retains this tag.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn preparation_original(&self) -> contextdb_core::Result<OwnedMemoryReservation> {
         if !self.is_writer() {
             return Err(contextdb_core::Error::Other(
-                "preparation requires a pinned writer owner".into()));
+                "preparation requires a pinned writer owner".into(),
+            ));
         }
         let accountant = self.as_handle();
         let writer = self.original_writer_use(&accountant);
@@ -1953,7 +2101,10 @@ impl StoreAccountantHandle {
         });
         AccountantHandle::clone(&original)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn vector_budget(
         &self,
     ) -> contextdb_core::Result<contextdb_vector::MemoryBudgetOwner> {
@@ -2014,10 +2165,11 @@ impl StoreAccountantHandle {
         ReadMemoryOwner::try_native_result(payload, invoice)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn read_budget(
-        &self,
-    ) -> contextdb_core::Result<ReadMemoryOwner> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn read_budget(&self) -> contextdb_core::Result<ReadMemoryOwner> {
         let accountant = self.as_handle();
         let writer_use = self
             .is_writer()
@@ -2050,7 +2202,12 @@ impl contextdb_core::read_memory::ReadMemoryBudget for WriterWaitMemory {
         hint: &'static str,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         self.0.as_handle().try_adapter_reserve_native(
-            bytes, subsystem, operation, hint, Some(&self.0))
+            bytes,
+            subsystem,
+            operation,
+            hint,
+            Some(&self.0),
+        )
     }
     fn try_reserve(
         &self,
@@ -2059,8 +2216,9 @@ impl contextdb_core::read_memory::ReadMemoryBudget for WriterWaitMemory {
         operation: &'static str,
         hint: &'static str,
     ) -> contextdb_core::Result<()> {
-        self.0.as_handle().try_adapter_reserve(
-            bytes, subsystem, operation, hint, Some(&self.0))
+        self.0
+            .as_handle()
+            .try_adapter_reserve(bytes, subsystem, operation, hint, Some(&self.0))
     }
     fn release(&self, bytes: usize) {
         self.0.as_handle().release_adapter_payload(bytes);
@@ -2140,31 +2298,48 @@ pub(crate) struct WriterBudget {
 impl WriterBudget {
     /// Initial owning assembly mints its one companion seed from the writer
     /// already selected by open, never by accountant registration discovery.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve_assembly_original(
         &self,
         funder: &contextdb_tx::SourceFunder,
     ) -> contextdb_core::Result<OwnedMemoryReservation> {
         reserve_preparation_from_writer_use(
-            &self.writer_use, &self.accountant, funder, 0,
-            "writer_source", "assembly_original",
+            &self.writer_use,
+            &self.accountant,
+            funder,
+            0,
+            "writer_source",
+            "assembly_original",
             "Raise MEMORY_LIMIT to admit writer assembly.",
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn from_original(original:&OwnedMemoryReservation)->contextdb_core::Result<Self> {
-        let writer_use=preparation_original_writer(original)?.clone();
-        let accountant=writer_use.accountant.clone();
-        let projection=StoreAccountantHandle::from_writer_use(&writer_use);
-        let vector_accountant=projection.vector_budget()?;
-        Ok(Self {accountant,writer_use,vector_accountant})
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn from_original(original: &OwnedMemoryReservation) -> contextdb_core::Result<Self> {
+        let writer_use = preparation_original_writer(original)?.clone();
+        let accountant = writer_use.accountant.clone();
+        let projection = StoreAccountantHandle::from_writer_use(&writer_use);
+        let vector_accountant = projection.vector_budget()?;
+        Ok(Self {
+            accountant,
+            writer_use,
+            vector_accountant,
+        })
     }
     #[allow(
         dead_code,
         reason = "native delivery code is staged ahead of its first non-test caller"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_source_funder(
         &self,
     ) -> contextdb_core::Result<contextdb_tx::SourceFunder> {
@@ -2198,13 +2373,19 @@ impl WriterBudget {
         // paired count; it never makes Weak or exposes a permanent raw count.
         Ok(unsafe { contextdb_tx::SourceFunder::from_prepared_native(provider, origin) })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn from_accountant(
         accountant: Arc<MemoryAccountant>,
     ) -> contextdb_core::Result<Self> {
         Self::from_handle(AccountantHandle::from_host(accountant))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn from_handle(accountant: AccountantHandle) -> contextdb_core::Result<Self> {
         let engine_backing_bytes = accountant.backing_bytes();
         let mut domain = PROCESS_WRITER_BUDGET_DOMAIN.write();
@@ -2426,7 +2607,10 @@ pub(crate) fn with_vector_load_reservation_transfer<T>(
     operation()
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn adopt_vector_load_reservation(
     accountant: &MemoryAccountant,
     bytes: usize,
@@ -2576,7 +2760,10 @@ pub(crate) mod compaction_admission_capture {
     use std::sync::atomic::Ordering;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum GroupingApply { Borrowed, Owned }
+    pub(crate) enum GroupingApply {
+        Borrowed,
+        Owned,
+    }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct Grouping {
         variant: GroupingApply,
@@ -2608,7 +2795,15 @@ pub(crate) mod compaction_admission_capture {
         grouping: Option<Grouping>,
     }
     const OUTSIDE: Context = Context {
-        phase: "non-group", operation: "memory/allocate", operation_bytes: [0; 128], operation_len: 0, apply: 0, site: "MemoryAccountant", decode_type: "", family: None, grouping: None,
+        phase: "non-group",
+        operation: "memory/allocate",
+        operation_bytes: [0; 128],
+        operation_len: 0,
+        apply: 0,
+        site: "MemoryAccountant",
+        decode_type: "",
+        family: None,
+        grouping: None,
     };
     #[derive(Clone, Copy, Debug)]
     struct Entry {
@@ -2674,15 +2869,22 @@ pub(crate) mod compaction_admission_capture {
             CAPTURE.with(|slot| {
                 let mut c = slot.borrow_mut();
                 let previous = c.context;
-                let required = subsystem.len().saturating_add(1).saturating_add(operation.len());
+                let required = subsystem
+                    .len()
+                    .saturating_add(1)
+                    .saturating_add(operation.len());
                 if required > c.context.operation_bytes.len() {
-                    if c.enabled { c.bound = false; }
+                    if c.enabled {
+                        c.bound = false;
+                    }
                     c.context.operation = "UNBOUND_OPERATION";
                     c.context.operation_len = 0;
                 } else {
-                    c.context.operation_bytes[..subsystem.len()].copy_from_slice(subsystem.as_bytes());
+                    c.context.operation_bytes[..subsystem.len()]
+                        .copy_from_slice(subsystem.as_bytes());
                     c.context.operation_bytes[subsystem.len()] = b'/';
-                    c.context.operation_bytes[subsystem.len()+1..required].copy_from_slice(operation.as_bytes());
+                    c.context.operation_bytes[subsystem.len() + 1..required]
+                        .copy_from_slice(operation.as_bytes());
                     c.context.operation_len = required;
                 }
                 Self(previous)
@@ -2697,22 +2899,34 @@ pub(crate) mod compaction_admission_capture {
                 Self(previous)
             })
         }
-        pub(crate) fn enter(phase: &'static str, site: &'static str,
-                            decode_type: &'static str, family: Option<usize>) -> Self {
+        pub(crate) fn enter(
+            phase: &'static str,
+            site: &'static str,
+            decode_type: &'static str,
+            family: Option<usize>,
+        ) -> Self {
             CAPTURE.with(|slot| {
                 let mut c = slot.borrow_mut();
                 let previous = c.context;
                 c.context.phase = phase;
                 c.context.site = site;
-                if !decode_type.is_empty() { c.context.decode_type = decode_type; }
-                if family.is_some() { c.context.family = family; }
+                if !decode_type.is_empty() {
+                    c.context.decode_type = decode_type;
+                }
+                if family.is_some() {
+                    c.context.family = family;
+                }
                 Self(previous)
             })
         }
         // Called only at the two actual Layout-derived tuple-slice admissions.
         // This observer copies fixed scalars; the existing accountant hook runs
         // the fixture callback after releasing its admission gate.
-        pub(crate) fn grouping(variant: GroupingApply, family_counts: [usize; 11], bytes: usize) -> Self {
+        pub(crate) fn grouping(
+            variant: GroupingApply,
+            family_counts: [usize; 11],
+            bytes: usize,
+        ) -> Self {
             CAPTURE.with(|slot| {
                 let mut c = slot.borrow_mut();
                 let previous = c.context;
@@ -2721,7 +2935,11 @@ pub(crate) mod compaction_admission_capture {
                     GroupingApply::Borrowed => "borrowed grouped tuple slices",
                     GroupingApply::Owned => "owned grouped tuple slices",
                 };
-                c.context.grouping = Some(Grouping { variant, family_counts, bytes });
+                c.context.grouping = Some(Grouping {
+                    variant,
+                    family_counts,
+                    bytes,
+                });
                 Self(previous)
             })
         }
@@ -2738,7 +2956,9 @@ pub(crate) mod compaction_admission_capture {
         }
     }
     impl Drop for Phase {
-        fn drop(&mut self) { CAPTURE.with(|slot| slot.borrow_mut().context = self.0); }
+        fn drop(&mut self) {
+            CAPTURE.with(|slot| slot.borrow_mut().context = self.0);
+        }
     }
     // Read only from the already-recorded real request, never from a guessed
     // ledger ordinal or an operation reason alone. No allocation or owner call.
@@ -2755,30 +2975,52 @@ pub(crate) mod compaction_admission_capture {
                 return None;
             }
             Some(GroupingRequest {
-                variant: group.variant, family_counts: group.family_counts,
-                bytes: group.bytes, payer, held: entry.held,
-                apply: c.context.apply, phase: c.context.phase,
-                site: c.context.site, family: c.context.family,
+                variant: group.variant,
+                family_counts: group.family_counts,
+                bytes: group.bytes,
+                payer,
+                held: entry.held,
+                apply: c.context.apply,
+                phase: c.context.phase,
+                site: c.context.site,
+                family: c.context.family,
             })
         })
     }
     pub(crate) fn assert_exact_group_refusal(target: GroupingRequest) {
         CAPTURE.with(|slot| {
             let c = slot.borrow();
-            assert!(c.bound && !c.overflow, "the original counter/payer ledger must reconcile");
+            assert!(
+                c.bound && !c.overflow,
+                "the original counter/payer ledger must reconcile"
+            );
             let entries = &c.entries.as_ref().expect("capture storage prepared")[..c.len];
-            assert_eq!(entries.iter().flatten().filter(|e| e.event == "cut").count(), 1);
+            assert_eq!(
+                entries
+                    .iter()
+                    .flatten()
+                    .filter(|e| e.event == "cut")
+                    .count(),
+                1
+            );
             let refusal = entries.last().unwrap().as_ref().unwrap();
             assert_eq!(refusal.event, "refuse");
-            assert_eq!(refusal.context.grouping, Some(Grouping {
-                variant: target.variant, family_counts: target.family_counts, bytes: target.bytes,
-            }));
+            assert_eq!(
+                refusal.context.grouping,
+                Some(Grouping {
+                    variant: target.variant,
+                    family_counts: target.family_counts,
+                    bytes: target.bytes,
+                })
+            );
             assert_eq!(refusal.context.apply, target.apply);
             assert_eq!(refusal.context.phase, target.phase);
             assert_eq!(refusal.context.site, target.site);
             assert_eq!(refusal.context.family, target.family);
-            assert_eq!(&refusal.context.operation_bytes[..refusal.context.operation_len],
-                b"content_identity/maintain_committed_proof");
+            assert_eq!(
+                &refusal.context.operation_bytes[..refusal.context.operation_len],
+                b"content_identity/maintain_committed_proof"
+            );
             assert_eq!(refusal.payer, target.payer);
             assert_eq!(refusal.bytes, target.bytes);
             assert_eq!(refusal.held, target.held);
@@ -2789,7 +3031,10 @@ pub(crate) mod compaction_admission_capture {
     pub(crate) fn start(owner: &MemoryAccountant) {
         CAPTURE.with(|slot| {
             let mut c = slot.borrow_mut();
-            c.entries.as_mut().expect("capture storage prepared").fill(None);
+            c.entries
+                .as_mut()
+                .expect("capture storage prepared")
+                .fill(None);
             c.len = 0;
             c.enabled = true;
             c.stopped = false;
@@ -2808,7 +3053,9 @@ pub(crate) mod compaction_admission_capture {
     pub(crate) fn note(owner: &MemoryAccountant, event: &'static str, bytes: usize) {
         CAPTURE.with(|slot| {
             let mut c = slot.borrow_mut();
-            if !c.enabled || c.stopped { return; }
+            if !c.enabled || c.stopped {
+                return;
+            }
             let payer = owner as *const _ as usize;
             let counter = owner.used.as_ptr() as usize;
             let held = owner.used.load(Ordering::SeqCst);
@@ -2826,17 +3073,44 @@ pub(crate) mod compaction_admission_capture {
     pub(super) fn note_owned_refund(counter: &WriterCounter, bytes: usize) {
         CAPTURE.with(|slot| {
             let mut c = slot.borrow_mut();
-            if !c.enabled || c.stopped { return; }
+            if !c.enabled || c.stopped {
+                return;
+            }
             let payer = c.payer;
             let held = counter.load(Ordering::SeqCst);
-            record(&mut c, "release", bytes, payer, counter as *const _ as usize, held, None);
+            record(
+                &mut c,
+                "release",
+                bytes,
+                payer,
+                counter as *const _ as usize,
+                held,
+                None,
+            );
         });
     }
-    fn record(c: &mut Capture, event: &'static str, bytes: usize,
-              payer: usize, counter: usize, held: usize, cap: Option<usize>) {
-        if c.len == c.entries.as_ref().expect("capture storage prepared").len() { c.overflow = true; c.stopped = true; return; }
-        if event == "request" { c.pending_request = bytes; }
-        let bytes = if event == "cut" { c.pending_request } else { bytes };
+    fn record(
+        c: &mut Capture,
+        event: &'static str,
+        bytes: usize,
+        payer: usize,
+        counter: usize,
+        held: usize,
+        cap: Option<usize>,
+    ) {
+        if c.len == c.entries.as_ref().expect("capture storage prepared").len() {
+            c.overflow = true;
+            c.stopped = true;
+            return;
+        }
+        if event == "request" {
+            c.pending_request = bytes;
+        }
+        let bytes = if event == "cut" {
+            c.pending_request
+        } else {
+            bytes
+        };
         // A missing path, foreign payer/counter, concurrent debit, or release
         // makes this trace UNQUALIFIED rather than pretending it is complete.
         c.bound &= payer == c.payer && counter == c.counter;
@@ -2846,8 +3120,19 @@ pub(crate) mod compaction_admission_capture {
             _ => c.expected_held,
         };
         c.bound &= held == c.expected_held;
-        let entry = Entry { event, context: c.context, payer, bytes, held,
-            available: if event == "refuse" { None } else { cap.map(|cap| cap.saturating_sub(held)) }, cap };
+        let entry = Entry {
+            event,
+            context: c.context,
+            payer,
+            bytes,
+            held,
+            available: if event == "refuse" {
+                None
+            } else {
+                cap.map(|cap| cap.saturating_sub(held))
+            },
+            cap,
+        };
         let index = c.len;
         c.entries.as_mut().expect("capture storage prepared")[index] = Some(entry);
         c.len += 1;
@@ -2864,7 +3149,9 @@ pub(crate) mod compaction_admission_capture {
             // Never overwrite an earlier refusal or an overflowed trace.
             if c.enabled && !c.overflow && c.len != 0 {
                 let index = c.len - 1;
-                if let Some(entry) = c.entries.as_mut().expect("capture storage prepared")[index].as_mut() {
+                if let Some(entry) =
+                    c.entries.as_mut().expect("capture storage prepared")[index].as_mut()
+                {
                     if entry.event == "refuse" && entry.available.is_none() {
                         entry.available = Some(available);
                         entry.cap = Some(cap);
@@ -3040,7 +3327,13 @@ pub struct MemoryUsage {
 // control allocation. Construct the identical observation only for a live
 // explicitly scoped ledger; this seam is absent without test-seams.
 #[cfg(any(test, feature = "test-seams"))]
-fn note_budget_admission(owner_identity: usize, subsystem: &str, operation: &str, bytes: usize, used_after: usize) {
+fn note_budget_admission(
+    owner_identity: usize,
+    subsystem: &str,
+    operation: &str,
+    bytes: usize,
+    used_after: usize,
+) {
     BUDGET_LEDGER.with(|ledger| {
         if let Some(entries) = ledger.borrow_mut().as_mut() {
             entries.push(BudgetLedgerEntry {
@@ -3069,10 +3362,18 @@ pub(crate) struct ControlCredit {
 impl ControlCredit {
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn observation_for_test(&self) -> (usize, usize) {
-        (self.accountant.as_ref().map_or(0, |a| std::ptr::from_ref(a.as_ref()) as usize), self.bytes)
+        (
+            self.accountant
+                .as_ref()
+                .map_or(0, |a| std::ptr::from_ref(a.as_ref()) as usize),
+            self.bytes,
+        )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit_for_use(
         original: &WriterUse,
         bytes: usize,
@@ -3090,7 +3391,10 @@ impl ControlCredit {
     // CDB127 private static-map extension: registry controls inherit the
     // creating handle's provenance and the existing family's refusal door.
     // An untagged reader never acquires a later writer's receipt/epoch.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit_from_handle(
         accountant: &StoreAccountantHandle,
         bytes: usize,
@@ -3130,7 +3434,10 @@ impl ControlCredit {
             registration,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit_open_residue(
         accountant: &StoreAccountantHandle,
         bytes: usize,
@@ -3152,12 +3459,21 @@ impl ControlCredit {
         assert!(bytes < OPEN_RESIDUE_TAG);
         let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
         let ceiling = effective_ceiling(domain.ceiling);
-        aggregate_try_reserve(bytes, ceiling).map_err(|available| NativeRefusal::MemoryBudgetExceeded {
-            subsystem: "process_native_ceiling", operation, requested_bytes: bytes,
-            available_bytes: available, budget_limit_bytes: ceiling,
-            hint: "The inherited process ceiling funds fixed writer open residue.",
+        aggregate_try_reserve(bytes, ceiling).map_err(|available| {
+            NativeRefusal::MemoryBudgetExceeded {
+                subsystem: "process_native_ceiling",
+                operation,
+                requested_bytes: bytes,
+                available_bytes: available,
+                budget_limit_bytes: ceiling,
+                hint: "The inherited process ceiling funds fixed writer open residue.",
+            }
         })?;
-        Ok(Self { accountant: Some(accountant.clone()), bytes: bytes | OPEN_RESIDUE_TAG, registration: None })
+        Ok(Self {
+            accountant: Some(accountant.clone()),
+            bytes: bytes | OPEN_RESIDUE_TAG,
+            registration: None,
+        })
     }
 
     /// Extend an ordinary direct-source invoice under its original accountant.
@@ -3167,11 +3483,21 @@ impl ControlCredit {
         bytes: usize,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         use contextdb_core::read_memory::NativeRefusal;
-        let next = self.bytes.checked_add(bytes).filter(|n| *n < OPEN_RESIDUE_TAG)
+        let next = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|n| *n < OPEN_RESIDUE_TAG)
             .ok_or(NativeRefusal::Other("direct source invoice overflow"))?;
-        let accountant = self.accountant.as_ref().expect("live direct source invoice");
-        accountant.try_allocate_for_native(bytes, "direct_read", "hydrate_owned_image",
-            "Raise MEMORY_LIMIT to admit the complete committed read image.")?;
+        let accountant = self
+            .accountant
+            .as_ref()
+            .expect("live direct source invoice");
+        accountant.try_allocate_for_native(
+            bytes,
+            "direct_read",
+            "hydrate_owned_image",
+            "Raise MEMORY_LIMIT to admit the complete committed read image.",
+        )?;
         accountant.change_adapter_control_receipt(bytes, true);
         self.bytes = next;
         Ok(())
@@ -3183,13 +3509,21 @@ impl ControlCredit {
         startup: bool,
     ) -> std::result::Result<Self, contextdb_core::read_memory::NativeRefusal> {
         if accountant.usage().limit.is_some() {
-            if startup { return Ok(Self::retained_startup(accountant, bytes)); }
-            accountant.try_allocate_for_native(bytes, "redb", "writer_cache_preparation",
-                "Raise MEMORY_LIMIT for simultaneous cache reconstruction backing.")?;
+            if startup {
+                return Ok(Self::retained_startup(accountant, bytes));
+            }
+            accountant.try_allocate_for_native(
+                bytes,
+                "redb",
+                "writer_cache_preparation",
+                "Raise MEMORY_LIMIT for simultaneous cache reconstruction backing.",
+            )?;
             return Ok(Self::from_admitted(accountant, bytes));
         }
         let mut credit = Self {
-            accountant: Some(accountant.clone()), bytes: OPEN_RESIDUE_TAG, registration: None,
+            accountant: Some(accountant.clone()),
+            bytes: OPEN_RESIDUE_TAG,
+            registration: None,
         };
         credit.grow_cache_preparation_native(bytes, startup)?;
         Ok(credit)
@@ -3206,24 +3540,38 @@ impl ControlCredit {
         use contextdb_core::read_memory::NativeRefusal;
         let residue = self.bytes & OPEN_RESIDUE_TAG != 0;
         let held = self.bytes & !OPEN_RESIDUE_TAG;
-        let next = held.checked_add(bytes).filter(|n| *n < OPEN_RESIDUE_TAG)
+        let next = held
+            .checked_add(bytes)
+            .filter(|n| *n < OPEN_RESIDUE_TAG)
             .ok_or(NativeRefusal::Other("cache preparation size overflow"))?;
         if residue {
             let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
             let ceiling = effective_ceiling(domain.ceiling);
-            aggregate_try_reserve(bytes, ceiling).map_err(|available| NativeRefusal::MemoryBudgetExceeded {
-                subsystem: "process_native_ceiling", operation: "writer_cache_preparation",
-                requested_bytes: bytes, available_bytes: available, budget_limit_bytes: ceiling,
-                hint: "The inherited process ceiling funds fixed writer open residue.",
+            aggregate_try_reserve(bytes, ceiling).map_err(|available| {
+                NativeRefusal::MemoryBudgetExceeded {
+                    subsystem: "process_native_ceiling",
+                    operation: "writer_cache_preparation",
+                    requested_bytes: bytes,
+                    available_bytes: available,
+                    budget_limit_bytes: ceiling,
+                    hint: "The inherited process ceiling funds fixed writer open residue.",
+                }
             })?;
             self.bytes = next | OPEN_RESIDUE_TAG;
         } else {
-            let accountant = self.accountant.as_ref().expect("live cache preparation invoice");
+            let accountant = self
+                .accountant
+                .as_ref()
+                .expect("live cache preparation invoice");
             if startup {
                 accountant.charge_retained(bytes);
             } else {
-                accountant.try_allocate_for_native(bytes, "redb", "writer_cache_preparation",
-                    "Raise MEMORY_LIMIT for simultaneous cache reconstruction backing.")?;
+                accountant.try_allocate_for_native(
+                    bytes,
+                    "redb",
+                    "writer_cache_preparation",
+                    "Raise MEMORY_LIMIT for simultaneous cache reconstruction backing.",
+                )?;
             }
             accountant.change_adapter_control_receipt(bytes, true);
             self.bytes = next;
@@ -3233,7 +3581,10 @@ impl ControlCredit {
 
     // Only constant per-assembly controls call this door. Growing write
     // payloads, including staged posting charges, retain ordinary admission.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit_assembly(
         accountant: &AccountantHandle,
         bytes: usize,
@@ -3246,7 +3597,10 @@ impl ControlCredit {
             Self::admit(accountant, bytes, operation)
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit(
         accountant: &AccountantHandle,
         bytes: usize,
@@ -3484,7 +3838,10 @@ impl TransferredRowReservation {
     pub(crate) fn adopt(&self, bytes: usize) {
         self.bytes.store(bytes, Ordering::Relaxed);
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_control(
         accountant: &AccountantHandle,
     ) -> contextdb_core::Result<ControlCredit> {
@@ -3506,7 +3863,10 @@ impl TransferredRowReservation {
             own_control: Some(control),
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_from_admitted(
         accountant: AccountantHandle,
         bytes: usize,
@@ -3547,7 +3907,10 @@ pub(crate) struct ScopedMemoryReservation<'a> {
 }
 
 impl<'a> ScopedMemoryReservation<'a> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new_for(
         accountant: &'a MemoryAccountant,
         bytes: usize,
@@ -3664,7 +4027,10 @@ impl OwnedMemoryReservation {
     }
     /// Actual original reservation kernel: header control first, payload next,
     /// concrete allocation last. No epoch discovery follows payload admission.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new_arc_for_original(
         original: &WriterUse,
         bytes: usize,
@@ -3687,7 +4053,8 @@ impl OwnedMemoryReservation {
                 .is_none_or(|owner| owner.as_ptr() != writer.accountant.as_ptr())
         {
             return Err(contextdb_core::Error::Other(
-                "original reservation control origin mismatch".into()));
+                "original reservation control origin mismatch".into(),
+            ));
         }
         let accountant = projection.as_handle();
         projection.try_allocate_for_original(bytes, subsystem, operation, hint)?;
@@ -3699,7 +4066,10 @@ impl OwnedMemoryReservation {
         };
         Ok(Arc::new(value))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_new_arc_for_nonwriter(
         original: &AccountantHandle,
         bytes: usize,
@@ -3723,7 +4093,8 @@ impl OwnedMemoryReservation {
                 .is_none_or(|owner| owner.as_ptr() != original.as_ptr())
         {
             return Err(contextdb_core::Error::Other(
-                "nonwriter reservation control origin mismatch".into()));
+                "nonwriter reservation control origin mismatch".into(),
+            ));
         }
         let accountant = projection.as_handle();
         projection.try_allocate_for_original(bytes, subsystem, operation, hint)?;
@@ -3736,7 +4107,10 @@ impl OwnedMemoryReservation {
         Ok(Arc::new(value))
     }
     /// Only the genuine original reservation can supply an opaque native O grant.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve_original_grant(
         &self,
         bytes: usize,
@@ -3753,7 +4127,8 @@ impl OwnedMemoryReservation {
             || writer.epoch == 0
         {
             return Err(contextdb_core::Error::Other(
-                "native original copy origin mismatch".into()));
+                "native original copy origin mismatch".into(),
+            ));
         }
         let origin = contextdb_tx::NativeSourceOrigin::new(
             self.accountant().as_ptr() as usize,
@@ -3773,14 +4148,18 @@ impl OwnedMemoryReservation {
         // header, allocates exactly Self, and returns its sole private count.
         Ok(unsafe { contextdb_tx::OriginalCopyGrant::from_native(receiver, origin) })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn source_invoice_for(
         &mut self,
         funder: &contextdb_tx::SourceFunder,
     ) -> contextdb_core::Result<contextdb_tx::SourceCharge> {
         let writer = self._writer_use.as_ref().ok_or_else(|| {
             contextdb_core::Error::Other(
-                "native source transfer requires its held writer use".into())
+                "native source transfer requires its held writer use".into(),
+            )
         })?;
         let lease = contextdb_tx::SourceLease {
             identity: writer.stable_identity,
@@ -3793,7 +4172,8 @@ impl OwnedMemoryReservation {
             || !funder.matches_native_origin(self.accountant().as_ptr() as usize, lease)
         {
             return Err(contextdb_core::Error::Other(
-                "native source transfer origin mismatch".into()));
+                "native source transfer origin mismatch".into(),
+            ));
         }
         let charge = contextdb_tx::SourceCharge::adopt_funded(funder.clone(), self.bytes, lease)?;
         self.bytes = 0;
@@ -3803,7 +4183,10 @@ impl OwnedMemoryReservation {
         clippy::wrong_self_convention,
         reason = "the method consumes funding held behind &mut self and cannot take self by value"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_source_row_invoice_for(
         &mut self,
         funder: &contextdb_tx::SourceFunder,
@@ -3819,7 +4202,10 @@ impl OwnedMemoryReservation {
         dead_code,
         reason = "native delivery code is staged ahead of its first non-test caller"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_source_vector_invoice_for(
         &mut self,
         funder: &contextdb_tx::SourceFunder,
@@ -3833,7 +4219,10 @@ impl OwnedMemoryReservation {
         clippy::wrong_self_convention,
         reason = "the method consumes funding held behind &mut self and cannot take self by value"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_source_aux_invoice_for(
         &mut self,
         funder: &contextdb_tx::SourceFunder,
@@ -3842,8 +4231,14 @@ impl OwnedMemoryReservation {
             .map(contextdb_tx::OriginalAuxInvoice::from_charge)
     }
     /// Transfer the already-held assembly allocation debit without refund/readmission.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    #[expect(clippy::wrong_self_convention, reason = "Transfers an admitted debit from a held mutable reservation while its enclosing reservation remains live.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "Transfers an admitted debit from a held mutable reservation while its enclosing reservation remains live."
+    )]
     pub(crate) fn into_source_control_charge_for(
         &mut self,
         funder: &contextdb_tx::SourceFunder,
@@ -3857,7 +4252,10 @@ impl OwnedMemoryReservation {
     }
     /// Admit an enclosing captured-schema Arc from this held Original. The
     /// control must not rediscover a writer registration through the accountant.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn with_enclosing_arc_control_original<T>(mut self) -> contextdb_core::Result<Self> {
         assert!(
             self.own_control.is_none(),
@@ -3873,7 +4271,10 @@ impl OwnedMemoryReservation {
         Ok(self)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn with_enclosing_arc_control<T>(
         mut self,
         retained_startup: bool,
@@ -3890,7 +4291,10 @@ impl OwnedMemoryReservation {
         });
         Ok(self)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_admitted_arc(mut self) -> contextdb_core::Result<Arc<Self>> {
         let layout = writer_adapter_layout(&self);
         self.own_control = Some(ControlCredit::admit(
@@ -3900,7 +4304,10 @@ impl OwnedMemoryReservation {
         )?);
         Ok(Arc::new(self))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_admitted_mutex_arc(
         self,
     ) -> contextdb_core::Result<Arc<parking_lot::Mutex<Self>>> {
@@ -3940,7 +4347,10 @@ impl OwnedMemoryReservation {
     /// The unlabelled `try_grow` below reports a refusal as the bounded read's
     /// own retain; a reservation held on behalf of one named piece of work
     /// grows here instead, so a refusal names that work.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_grow_for(
         &mut self,
         bytes: usize,
@@ -3968,7 +4378,10 @@ impl OwnedMemoryReservation {
         self.bytes
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_shrink(&mut self, bytes: usize) -> contextdb_core::Result<()> {
         let remaining = self.bytes.checked_sub(bytes).ok_or_else(|| {
             contextdb_core::Error::MemoryBudgetExceeded {
@@ -3988,7 +4401,10 @@ impl OwnedMemoryReservation {
     /// Transfer an existing charge to a store owner. The shared accountant
     /// total is deliberately unchanged; only this request stops owning it.
     #[allow(dead_code)] // Keep the explicit transfer operation beside reservation release.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_transfer_to_store(&mut self, bytes: usize) -> contextdb_core::Result<()> {
         self.bytes = self.bytes.checked_sub(bytes).ok_or_else(|| {
             contextdb_core::Error::MemoryBudgetExceeded {
@@ -3998,7 +4414,8 @@ impl OwnedMemoryReservation {
                 available_bytes: self.bytes,
                 budget_limit_bytes: self.bytes,
                 hint: ("The vector load cannot transfer more memory than its request reserved."
-                    .to_string()).into(),
+                    .to_string())
+                .into(),
             }
         })?;
         Ok(())
@@ -4015,18 +4432,29 @@ impl OwnedMemoryReservation {
     /// of one named operation reserves it here instead, so the refusal carries
     /// that operation's name the way the same work reports it on any other
     /// path.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new_for_label(
-        accountant: AccountantHandle, bytes: usize, subsystem: &'static str,
-        operation: contextdb_core::error::DiagnosticLabel, hint: &'static str,
+        accountant: AccountantHandle,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: contextdb_core::error::DiagnosticLabel,
+        hint: &'static str,
     ) -> contextdb_core::Result<Self> {
         accountant.try_allocate_for_label(bytes, subsystem, operation, hint)?;
         Ok(Self {
             _writer_use: WriterUse::retain_if_writer(&accountant),
-            accountant: Some(accountant), bytes, own_control: None,
+            accountant: Some(accountant),
+            bytes,
+            own_control: None,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new_for(
         accountant: AccountantHandle,
         bytes: usize,
@@ -4061,7 +4489,10 @@ impl MemoryAccountant {
     /// Hand loaded graph residency from an operation to its retention owner.
     /// Admit first so the live graph is never unfunded. A failed source split
     /// rolls back this destination admission and leaves the source untouched.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn transfer_vector_load_reservation(
         &self,
         source: &ReadMemoryOwner,
@@ -4072,10 +4503,13 @@ impl MemoryAccountant {
         // executing reader. Its payload has already been admitted by source:
         // move that credit, admitting only the codec counter, never root again.
         let query_original = self.query_payload_original();
-        let prepaid = query_original.as_ref().is_some_and(|owner| owner.same_owner(source));
+        let prepaid = query_original
+            .as_ref()
+            .is_some_and(|owner| owner.same_owner(source));
         if query_original.is_some() && !prepaid {
             return Err(contextdb_core::Error::Other(
-                "query vector adoption has a different original reader".into()));
+                "query vector adoption has a different original reader".into(),
+            ));
         }
         self.try_allocate_for(
             bytes,
@@ -4084,33 +4518,46 @@ impl MemoryAccountant {
             "Raise MEMORY_LIMIT to retain the loaded vector generation.",
         )?;
         struct Pending<'a> {
-            accountant: &'a MemoryAccountant, bytes: usize,
-            original: Option<ReadMemoryOwner>, moved: bool,
+            accountant: &'a MemoryAccountant,
+            bytes: usize,
+            original: Option<ReadMemoryOwner>,
+            moved: bool,
         }
         impl Drop for Pending<'_> {
             fn drop(&mut self) {
-                if self.bytes == 0 { return; }
+                if self.bytes == 0 {
+                    return;
+                }
                 self.accountant.release(self.bytes);
                 // A callback may unwind after disarming the source token.
                 // Only then does this tentative destination own its root debit.
                 if self.moved
-                    && let Some(original) = &self.original {
-                        contextdb_core::read_memory::ReadMemoryBudget::release(original, self.bytes);
-                    }
+                    && let Some(original) = &self.original
+                {
+                    contextdb_core::read_memory::ReadMemoryBudget::release(original, self.bytes);
+                }
             }
         }
-        let mut pending = Pending { accountant: self, bytes, original: query_original, moved: false };
+        let mut pending = Pending {
+            accountant: self,
+            bytes,
+            original: query_original,
+            moved: false,
+        };
         transfer_reader(prepaid, &mut pending.moved)?;
         pending.bytes = 0;
         Ok(())
     }
 
     fn query_payload_original(&self) -> Option<ReadMemoryOwner> {
-        if !self.reader_controls || self.has_reader_original() { return None; }
+        if !self.reader_controls || self.has_reader_original() {
+            return None;
+        }
         // reader_controls is set only by reader_from_prepaid, whose payload
         // lives in this exact ReadShared. Borrow the live count, never consume it.
         let shared = ManuallyDrop::new(unsafe {
-            ReadShared::<MemoryAccountant>::from_raw(self as *const Self) });
+            ReadShared::<MemoryAccountant>::from_raw(self as *const Self)
+        });
         Some(shared.credit().owner())
     }
 
@@ -4129,14 +4576,29 @@ impl MemoryAccountant {
         Self::with_initial_budget(Some(bytes), false)
     }
 
-    pub(crate) fn has_reader_original(&self) -> bool { self.used.1.is_some() }
-    fn admit_reader_original_native(&self, bytes: usize)
-        -> Result<Option<contextdb_core::read_memory::ReadCredit>, contextdb_core::read_memory::NativeRefusal>
-    {
-        self.used.1.as_ref().map(|owner|
-            contextdb_core::read_memory::ReadCredit::try_new_owned_native(owner.clone(), bytes,
-                "direct_read", "hydrate_owned_image",
-                "Raise MEMORY_LIMIT to admit the complete committed read image.")).transpose()
+    pub(crate) fn has_reader_original(&self) -> bool {
+        self.used.1.is_some()
+    }
+    fn admit_reader_original_native(
+        &self,
+        bytes: usize,
+    ) -> Result<
+        Option<contextdb_core::read_memory::ReadCredit>,
+        contextdb_core::read_memory::NativeRefusal,
+    > {
+        self.used
+            .1
+            .as_ref()
+            .map(|owner| {
+                contextdb_core::read_memory::ReadCredit::try_new_owned_native(
+                    owner.clone(),
+                    bytes,
+                    "direct_read",
+                    "hydrate_owned_image",
+                    "Raise MEMORY_LIMIT to admit the complete committed read image.",
+                )
+            })
+            .transpose()
     }
     fn with_initial_budget(limit: Option<usize>, startup: bool) -> Self {
         Self::with_controls(
@@ -4203,15 +4665,24 @@ impl MemoryAccountant {
             .unwrap_or(0)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_budget(bytes: usize) -> contextdb_core::Result<WriterBudget> {
         Self::new_engine_writer(Some(bytes))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_no_limit() -> contextdb_core::Result<WriterBudget> {
         Self::new_engine_writer(None)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn new_engine_writer(limit: Option<usize>) -> contextdb_core::Result<WriterBudget> {
         WriterBudget::from_handle(AccountantHandle::engine(limit)?)
     }
@@ -4277,7 +4748,10 @@ impl MemoryAccountant {
         self.change_adapter_control_receipt(bytes, false);
         self.used.clone()
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit_box_control(
         &self,
         bytes: usize,
@@ -4370,7 +4844,10 @@ impl MemoryAccountant {
     // Exclusive activation validates ALL live records and admits the requesting
     // build's complete local peak before publishing the one permanent owner.
     // The closure only changes the existing workspace token/counters.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn activate_resident_insertion_runtime(
         &self,
         width: usize,
@@ -4474,7 +4951,10 @@ impl MemoryAccountant {
     /// once a ceiling is recorded, they must fit it. A failed aggregate CAS
     /// rolls back ONLY the local counter: those bytes never entered the
     /// aggregate, the one member decrement that does not refund it.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn admit_to_process_aggregate(
         &self,
         admission: &WriterAdmission,
@@ -4501,28 +4981,45 @@ impl MemoryAccountant {
                 budget_limit_bytes: ceiling,
                 hint: (format!(
                     "The process memory ceiling also holds the resident insertion runtime. {hint}"
-                )).into(),
+                ))
+                .into(),
             });
         }
         Ok(())
     }
 
     /// Attempt to allocate bytes. CAS-based, no TOCTOU.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_allocate(&self, bytes: usize) -> contextdb_core::Result<()> {
         self.try_allocate_with_provenance(bytes, None)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_allocate_with_provenance(
-        &self, bytes: usize, provenance: Option<&StoreAccountantHandle>,
+        &self,
+        bytes: usize,
+        provenance: Option<&StoreAccountantHandle>,
     ) -> contextdb_core::Result<()> {
-        let original = self.admit_reader_original_native(bytes).map_err(contextdb_core::Error::NativeEngineOther)?;
+        let original = self
+            .admit_reader_original_native(bytes)
+            .map_err(contextdb_core::Error::NativeEngineOther)?;
         let result = self.try_allocate_with_provenance_local(bytes, provenance);
         if result.is_ok()
-            && let Some(original) = original { original.transfer(); }
+            && let Some(original) = original
+        {
+            original.transfer();
+        }
         result
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_allocate_with_provenance_local(
         &self,
         bytes: usize,
@@ -4575,7 +5072,8 @@ impl MemoryAccountant {
                         budget_limit_bytes: limit,
                         hint:
                             ("Reduce retained data, lower working-set size, or raise MEMORY_LIMIT."
-                                .to_string()).into(),
+                                .to_string())
+                            .into(),
                     });
                 }
             }
@@ -4653,24 +5151,42 @@ impl MemoryAccountant {
     /// Replace one caller-owned reservation without releasing its protected
     /// capacity or charging both phases. The caller retains `old_bytes` on
     /// refusal and changes its ownership token only after success.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn transition_reservation(
-        &self, old_bytes: usize, new_bytes: usize,
-        subsystem: &str, operation: &str, hint: &str,
+        &self,
+        old_bytes: usize,
+        new_bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
     ) -> contextdb_core::Result<()> {
-        let original = self.admit_reader_original_native(new_bytes.saturating_sub(old_bytes))
+        let original = self
+            .admit_reader_original_native(new_bytes.saturating_sub(old_bytes))
             .map_err(contextdb_core::Error::NativeEngineOther)?;
-        let result = self.transition_reservation_local(old_bytes, new_bytes, subsystem, operation, hint);
+        let result =
+            self.transition_reservation_local(old_bytes, new_bytes, subsystem, operation, hint);
         if result.is_ok() {
-            if let Some(original) = original { original.transfer(); }
+            if let Some(original) = original {
+                original.transfer();
+            }
             if new_bytes < old_bytes
-                && let Some(original) = &self.used.1 {
-                    contextdb_core::read_memory::ReadMemoryBudget::release(original, old_bytes - new_bytes);
-                }
+                && let Some(original) = &self.used.1
+            {
+                contextdb_core::read_memory::ReadMemoryBudget::release(
+                    original,
+                    old_bytes - new_bytes,
+                );
+            }
         }
         result
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn transition_reservation_local(
         &self,
         old_bytes: usize,
@@ -4680,13 +5196,18 @@ impl MemoryAccountant {
         hint: &str,
     ) -> contextdb_core::Result<()> {
         #[cfg(test)]
-        let _capture_operation = compaction_admission_capture::Phase::operation(subsystem, operation);
+        let _capture_operation =
+            compaction_admission_capture::Phase::operation(subsystem, operation);
         let admission = self.writer_admission();
         #[cfg(test)]
         let mut admission = admission;
         loop {
             #[cfg(test)]
-            compaction_admission_capture::note(self, "request", new_bytes.saturating_sub(old_bytes));
+            compaction_admission_capture::note(
+                self,
+                "request",
+                new_bytes.saturating_sub(old_bytes),
+            );
             let used = self.used.load(Ordering::SeqCst);
             let others = used
                 .checked_sub(old_bytes)
@@ -4711,9 +5232,14 @@ impl MemoryAccountant {
                     continue;
                 }
                 #[cfg(test)]
-                compaction_admission_capture::refusal(self, new_bytes - old_bytes,
-                    writer_headroom(limit, used, 0, 0).available.unwrap_or(usize::MAX - used),
-                    if limit == 0 { usize::MAX } else { limit });
+                compaction_admission_capture::refusal(
+                    self,
+                    new_bytes - old_bytes,
+                    writer_headroom(limit, used, 0, 0)
+                        .available
+                        .unwrap_or(usize::MAX - used),
+                    if limit == 0 { usize::MAX } else { limit },
+                );
                 return Err(contextdb_core::Error::MemoryBudgetExceeded {
                     subsystem: (subsystem.to_owned()).into(),
                     operation: (operation.to_owned()).into(),
@@ -4727,7 +5253,12 @@ impl MemoryAccountant {
             }
             let next = others.checked_add(new_bytes).ok_or_else(|| {
                 #[cfg(test)]
-                compaction_admission_capture::refusal(self, new_bytes.saturating_sub(old_bytes), usize::MAX - used, usize::MAX);
+                compaction_admission_capture::refusal(
+                    self,
+                    new_bytes.saturating_sub(old_bytes),
+                    usize::MAX - used,
+                    usize::MAX,
+                );
                 contextdb_core::Error::MemoryBudgetExceeded {
                     subsystem: (subsystem.to_owned()).into(),
                     operation: (operation.to_owned()).into(),
@@ -4780,35 +5311,65 @@ impl MemoryAccountant {
                 if new_bytes < old_bytes {
                     note_budget_ledger("release", old_bytes - new_bytes, next);
                 } else {
-                    note_budget_admission(self as *const Self as usize, subsystem, operation, new_bytes - old_bytes, next);
+                    note_budget_admission(
+                        self as *const Self as usize,
+                        subsystem,
+                        operation,
+                        new_bytes - old_bytes,
+                        next,
+                    );
                 }
             }
             #[cfg(test)]
-            compaction_admission_capture::note(self,
-                if new_bytes < old_bytes { "release" } else { "admit" },
-                new_bytes.abs_diff(old_bytes));
+            compaction_admission_capture::note(
+                self,
+                if new_bytes < old_bytes {
+                    "release"
+                } else {
+                    "admit"
+                },
+                new_bytes.abs_diff(old_bytes),
+            );
             return Ok(());
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn transition_reservation_static(
-        &self, old_bytes: usize, new_bytes: usize,
-        subsystem: &'static str, operation: &'static str, hint: &'static str,
+        &self,
+        old_bytes: usize,
+        new_bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
-        let original = self.admit_reader_original_native(new_bytes.saturating_sub(old_bytes))
+        let original = self
+            .admit_reader_original_native(new_bytes.saturating_sub(old_bytes))
             .map_err(contextdb_core::Error::NativeEngineOther)?;
-        let result = self.transition_reservation_local_static(old_bytes, new_bytes, subsystem, operation, hint);
+        let result = self
+            .transition_reservation_local_static(old_bytes, new_bytes, subsystem, operation, hint);
         if result.is_ok() {
-            if let Some(original) = original { original.transfer(); }
+            if let Some(original) = original {
+                original.transfer();
+            }
             if new_bytes < old_bytes
-                && let Some(original) = &self.used.1 {
-                    contextdb_core::read_memory::ReadMemoryBudget::release(original, old_bytes - new_bytes);
-                }
+                && let Some(original) = &self.used.1
+            {
+                contextdb_core::read_memory::ReadMemoryBudget::release(
+                    original,
+                    old_bytes - new_bytes,
+                );
+            }
         }
         result
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn transition_reservation_local_static(
         &self,
         old_bytes: usize,
@@ -4818,13 +5379,18 @@ impl MemoryAccountant {
         hint: &'static str,
     ) -> contextdb_core::Result<()> {
         #[cfg(test)]
-        let _capture_operation = compaction_admission_capture::Phase::operation(subsystem, operation);
+        let _capture_operation =
+            compaction_admission_capture::Phase::operation(subsystem, operation);
         let admission = self.writer_admission();
         #[cfg(test)]
         let mut admission = admission;
         loop {
             #[cfg(test)]
-            compaction_admission_capture::note(self, "request", new_bytes.saturating_sub(old_bytes));
+            compaction_admission_capture::note(
+                self,
+                "request",
+                new_bytes.saturating_sub(old_bytes),
+            );
             let used = self.used.load(Ordering::SeqCst);
             let others = used
                 .checked_sub(old_bytes)
@@ -4849,9 +5415,14 @@ impl MemoryAccountant {
                     continue;
                 }
                 #[cfg(test)]
-                compaction_admission_capture::refusal(self, new_bytes - old_bytes,
-                    writer_headroom(limit, used, 0, 0).available.unwrap_or(usize::MAX - used),
-                    if limit == 0 { usize::MAX } else { limit });
+                compaction_admission_capture::refusal(
+                    self,
+                    new_bytes - old_bytes,
+                    writer_headroom(limit, used, 0, 0)
+                        .available
+                        .unwrap_or(usize::MAX - used),
+                    if limit == 0 { usize::MAX } else { limit },
+                );
                 return Err(contextdb_core::Error::MemoryBudgetExceeded {
                     subsystem: subsystem.into(),
                     operation: operation.into(),
@@ -4865,7 +5436,12 @@ impl MemoryAccountant {
             }
             let next = others.checked_add(new_bytes).ok_or_else(|| {
                 #[cfg(test)]
-                compaction_admission_capture::refusal(self, new_bytes.saturating_sub(old_bytes), usize::MAX - used, usize::MAX);
+                compaction_admission_capture::refusal(
+                    self,
+                    new_bytes.saturating_sub(old_bytes),
+                    usize::MAX - used,
+                    usize::MAX,
+                );
                 contextdb_core::Error::MemoryBudgetExceeded {
                     subsystem: subsystem.into(),
                     operation: operation.into(),
@@ -4906,8 +5482,14 @@ impl MemoryAccountant {
                     new_bytes - old_bytes,
                     operation,
                     hint,
-                ).map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)))?;
+                )
+                .map_err(|error| {
+                    crate::persistence::native_storage_admission::original_storage_error(
+                        crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                            error,
+                        ),
+                    )
+                })?;
             } else if self.used.is_member() {
                 aggregate_refund(old_bytes - new_bytes);
             }
@@ -4919,13 +5501,25 @@ impl MemoryAccountant {
                 if new_bytes < old_bytes {
                     note_budget_ledger("release", old_bytes - new_bytes, next);
                 } else {
-                    note_budget_admission(self as *const Self as usize, subsystem, operation, new_bytes - old_bytes, next);
+                    note_budget_admission(
+                        self as *const Self as usize,
+                        subsystem,
+                        operation,
+                        new_bytes - old_bytes,
+                        next,
+                    );
                 }
             }
             #[cfg(test)]
-            compaction_admission_capture::note(self,
-                if new_bytes < old_bytes { "release" } else { "admit" },
-                new_bytes.abs_diff(old_bytes));
+            compaction_admission_capture::note(
+                self,
+                if new_bytes < old_bytes {
+                    "release"
+                } else {
+                    "admit"
+                },
+                new_bytes.abs_diff(old_bytes),
+            );
             return Ok(());
         }
     }
@@ -5032,20 +5626,25 @@ impl MemoryAccountant {
 
     /// Runtime budget adjustment. None removes limit.
     /// Returns Err if new limit exceeds startup ceiling.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn set_budget(&self, limit: Option<usize>) -> contextdb_core::Result<()> {
         let _admission = self.writer_admission();
         if self.has_ceiling.load(Ordering::SeqCst) {
             let ceiling = self.startup_ceiling.load(Ordering::SeqCst);
             match limit {
                 Some(bytes) if bytes > ceiling => {
-                    return Err(contextdb_core::Error::Other((format!(
-                        "memory limit {bytes} exceeds startup ceiling {ceiling}"
-                    )).into()));
+                    return Err(contextdb_core::Error::Other(
+                        (format!("memory limit {bytes} exceeds startup ceiling {ceiling}")).into(),
+                    ));
                 }
                 None => {
-                    return Err(contextdb_core::Error::Other((
-                        "cannot remove memory limit when a startup ceiling is set".to_string()).into()));
+                    return Err(contextdb_core::Error::Other(
+                        ("cannot remove memory limit when a startup ceiling is set".to_string())
+                            .into(),
+                    ));
                 }
                 _ => {}
             }
@@ -5096,7 +5695,10 @@ impl MemoryAccountant {
         self.retained_charge_bytes_for_test.load(Ordering::SeqCst)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_envelope_usage(&self) -> contextdb_core::Result<(usize, usize, usize)> {
         // Report-only: this writer's bytes, the process runtime reservation,
         // and their sum. The reservation is owned by the process, not by
@@ -5176,56 +5778,125 @@ impl MemoryAccountant {
             .map_or(0, |vector| vector.make_room_for_graph_load(short))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_allocate_for_labels(
-        &self, bytes: usize, subsystem: contextdb_core::error::DiagnosticLabel,
+        &self,
+        bytes: usize,
+        subsystem: contextdb_core::error::DiagnosticLabel,
         operation: contextdb_core::error::DiagnosticLabel,
         hint: contextdb_core::error::DiagnosticLabel,
     ) -> contextdb_core::Result<()> {
-        let result = self.try_allocate_for_provenance_native_named(bytes,
-            "vector_index", "diagnostic_label",
-            "Release retained diagnostics or raise MEMORY_LIMIT.", None,
-            subsystem.as_ref(), operation.as_ref())
-            .map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)));
+        let result = self
+            .try_allocate_for_provenance_native_named(
+                bytes,
+                "vector_index",
+                "diagnostic_label",
+                "Release retained diagnostics or raise MEMORY_LIMIT.",
+                None,
+                subsystem.as_ref(),
+                operation.as_ref(),
+            )
+            .map_err(|error| {
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                        error,
+                    ),
+                )
+            });
         result.map_err(|error| match error {
-                contextdb_core::Error::MemoryBudgetExceeded { requested_bytes,
-                    available_bytes, budget_limit_bytes, .. } =>
-                    contextdb_core::Error::MemoryBudgetExceeded { subsystem, operation,
-                        requested_bytes, available_bytes, budget_limit_bytes, hint },
-                other => other,
-            })
+            contextdb_core::Error::MemoryBudgetExceeded {
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                ..
+            } => contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            },
+            other => other,
+        })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_allocate_for_label(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: contextdb_core::error::DiagnosticLabel, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: contextdb_core::error::DiagnosticLabel,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
-        let result = self.try_allocate_for_provenance_native_named(bytes,
-            subsystem, "diagnostic_label", hint, None, subsystem, operation.as_ref())
-            .map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)));
+        let result = self
+            .try_allocate_for_provenance_native_named(
+                bytes,
+                subsystem,
+                "diagnostic_label",
+                hint,
+                None,
+                subsystem,
+                operation.as_ref(),
+            )
+            .map_err(|error| {
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                        error,
+                    ),
+                )
+            });
         result.map_err(|error| match error {
-                contextdb_core::Error::MemoryBudgetExceeded { subsystem, requested_bytes,
-                    available_bytes, budget_limit_bytes, hint, .. } =>
-                    contextdb_core::Error::MemoryBudgetExceeded { subsystem, operation,
-                        requested_bytes, available_bytes, budget_limit_bytes, hint },
-                other => other,
-            })
+            contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+                ..
+            } => contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            },
+            other => other,
+        })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_allocate_for_static(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
         self.try_allocate_for_native(bytes, subsystem, operation, hint)
-            .map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)))
+            .map_err(|error| {
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                        error,
+                    ),
+                )
+            })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_allocate_for(
         &self,
         bytes: usize,
@@ -5251,7 +5922,10 @@ impl MemoryAccountant {
             admission.process_available(),
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_allocate_for_provenance(
         &self,
         bytes: usize,
@@ -5261,7 +5935,8 @@ impl MemoryAccountant {
         provenance: Option<&StoreAccountantHandle>,
     ) -> contextdb_core::Result<()> {
         #[cfg(test)]
-        let _capture_operation = compaction_admission_capture::Phase::operation(subsystem, operation);
+        let _capture_operation =
+            compaction_admission_capture::Phase::operation(subsystem, operation);
         #[cfg(any(test, feature = "test-seams"))]
         if operation == "current_identity_delta"
             && self
@@ -5276,7 +5951,8 @@ impl MemoryAccountant {
                 available_bytes: 0,
                 budget_limit_bytes: self.used.load(Ordering::SeqCst),
                 hint: ("Injected current vector identity publication admission exhaustion."
-                    .to_owned()).into(),
+                    .to_owned())
+                .into(),
             });
         }
         #[cfg(any(test, feature = "test-seams"))]
@@ -5452,26 +6128,40 @@ impl contextdb_core::read_memory::ReadMemoryBudget for WriterVectorBudget {
 }
 impl contextdb_vector::MemoryBudget for WriterVectorBudget {
     fn transition_reservation_for_static(
-        &self, old_bytes: usize, new_bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        old_bytes: usize,
+        new_bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
         if new_bytes > old_bytes {
             self.try_allocate_for_static(new_bytes - old_bytes, subsystem, operation, hint)?;
-        } else if new_bytes < old_bytes { self.release(old_bytes - new_bytes); }
+        } else if new_bytes < old_bytes {
+            self.release(old_bytes - new_bytes);
+        }
         Ok(())
     }
 
     fn try_allocate_for_label(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: contextdb_core::error::DiagnosticLabel, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: contextdb_core::error::DiagnosticLabel,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
-        self.accountant().try_adapter_allocate_label(bytes, subsystem, operation, hint)
+        self.accountant()
+            .try_adapter_allocate_label(bytes, subsystem, operation, hint)
     }
     fn try_allocate_for_static(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
-        self.accountant().try_adapter_allocate_static(bytes, subsystem, operation, hint, None)
+        self.accountant()
+            .try_adapter_allocate_static(bytes, subsystem, operation, hint, None)
     }
     fn stable_funder_identity(&self) -> usize {
         self.accountant().as_ptr() as usize
@@ -5484,15 +6174,29 @@ impl contextdb_vector::MemoryBudget for WriterVectorBudget {
         operation: &str,
         hint: &str,
     ) -> contextdb_core::Result<()> {
-        let original = self.accountant().adapter_payload_credit(new.saturating_sub(old), subsystem, operation, hint)?;
+        let original = self.accountant().adapter_payload_credit(
+            new.saturating_sub(old),
+            subsystem,
+            operation,
+            hint,
+        )?;
         let result = contextdb_vector::MemoryBudget::transition_reservation_for(
-            &**self.accountant(), old, new, subsystem, operation, hint);
+            &**self.accountant(),
+            old,
+            new,
+            subsystem,
+            operation,
+            hint,
+        );
         if result.is_ok() {
-            if let Some(original) = original { original.transfer(); }
+            if let Some(original) = original {
+                original.transfer();
+            }
             if new < old
-                && let Some(owner) = self.accountant().query_reader_original() {
-                    contextdb_core::read_memory::ReadMemoryBudget::release(&owner, old - new);
-                }
+                && let Some(owner) = self.accountant().query_reader_original()
+            {
+                contextdb_core::read_memory::ReadMemoryBudget::release(&owner, old - new);
+            }
         }
         result
     }
@@ -5555,7 +6259,10 @@ struct WriterAdapterInvoice {
 
 impl AccountantHandle {
     /// Hold this unit's admitted bytes until it installs or refuses.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve_schema_unit(
         &self,
         bytes: usize,
@@ -5593,131 +6300,287 @@ impl AccountantHandle {
     /// successful admission transfers it to the adapter's existing release path.
     fn adapter_native_supported(&self) -> bool {
         use contextdb_core::read_memory::ReadMemoryBudget;
-        self.query_reader_original().or_else(|| self.used.1.clone())
+        self.query_reader_original()
+            .or_else(|| self.used.1.clone())
             .is_none_or(|owner| owner.native_reserve_supported())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn adapter_payload_credit(
-        &self, bytes: usize, subsystem: &str, operation: &str, hint: &str,
+        &self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
     ) -> contextdb_core::Result<Option<ReadCredit>> {
         // Shrink/equal transitions and zero reservations never run an original
         // admission checkpoint: returning owned capacity must remain infallible.
-        if bytes == 0 { return Ok(None); }
-        self.query_reader_original().map(|owner|
-            ReadCredit::try_new_owned(owner, bytes, "reader", "query_buffer",
-                "Reduce simultaneous query working memory or raise the declared reader limit.")
+        if bytes == 0 {
+            return Ok(None);
+        }
+        self.query_reader_original()
+            .map(|owner| {
+                ReadCredit::try_new_owned(
+                    owner,
+                    bytes,
+                    "reader",
+                    "query_buffer",
+                    "Reduce simultaneous query working memory or raise the declared reader limit.",
+                )
                 .map_err(|error| match error {
                     // Preserve the vector caller's complete refusal labels.
-                    contextdb_core::Error::MemoryBudgetExceeded { requested_bytes,
-                        available_bytes, budget_limit_bytes, .. } => contextdb_core::Error::MemoryBudgetExceeded {
-                        subsystem: subsystem.to_owned().into(), operation: operation.to_owned().into(),
-                        requested_bytes, available_bytes, budget_limit_bytes, hint: hint.to_owned().into(),
+                    contextdb_core::Error::MemoryBudgetExceeded {
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        ..
+                    } => contextdb_core::Error::MemoryBudgetExceeded {
+                        subsystem: subsystem.to_owned().into(),
+                        operation: operation.to_owned().into(),
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        hint: hint.to_owned().into(),
                     },
                     other => other,
-                })).transpose()
+                })
+            })
+            .transpose()
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn prepare_operation_label(&self, value: impl std::fmt::Display)
-        -> contextdb_core::Result<contextdb_core::error::DiagnosticLabel> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn prepare_operation_label(
+        &self,
+        value: impl std::fmt::Display,
+    ) -> contextdb_core::Result<contextdb_core::error::DiagnosticLabel> {
         let owner = self.read_budget()?;
         contextdb_core::error::DiagnosticLabel::try_format_with_invoice(value, |bytes| {
-            ReadCredit::try_new_owned(owner, bytes, "vector_index", "diagnostic_label",
-                "Release retained diagnostics or raise MEMORY_LIMIT.")
+            ReadCredit::try_new_owned(
+                owner,
+                bytes,
+                "vector_index",
+                "diagnostic_label",
+                "Release retained diagnostics or raise MEMORY_LIMIT.",
+            )
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn adapter_payload_credit_static(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> contextdb_core::Result<Option<ReadCredit>> {
-        if bytes == 0 { return Ok(None); }
-        self.query_reader_original().map(|owner|
-            ReadCredit::try_new_owned(owner, bytes, "reader", "query_buffer",
-                "Reduce simultaneous query working memory or raise the declared reader limit.")
+        if bytes == 0 {
+            return Ok(None);
+        }
+        self.query_reader_original()
+            .map(|owner| {
+                ReadCredit::try_new_owned(
+                    owner,
+                    bytes,
+                    "reader",
+                    "query_buffer",
+                    "Reduce simultaneous query working memory or raise the declared reader limit.",
+                )
                 .map_err(|error| match error {
-                    contextdb_core::Error::MemoryBudgetExceeded { requested_bytes,
-                        available_bytes, budget_limit_bytes, .. } => contextdb_core::Error::MemoryBudgetExceeded {
-                        subsystem: subsystem.into(), operation: operation.into(),
-                        requested_bytes, available_bytes, budget_limit_bytes, hint: hint.into(),
+                    contextdb_core::Error::MemoryBudgetExceeded {
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        ..
+                    } => contextdb_core::Error::MemoryBudgetExceeded {
+                        subsystem: subsystem.into(),
+                        operation: operation.into(),
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        hint: hint.into(),
                     },
                     other => other,
-                })).transpose()
+                })
+            })
+            .transpose()
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_adapter_allocate_label(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: contextdb_core::error::DiagnosticLabel, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: contextdb_core::error::DiagnosticLabel,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
-        let original = match self.adapter_payload_credit_static(bytes, subsystem, "diagnostic_label", hint) {
-            Ok(original) => original,
-            Err(contextdb_core::Error::MemoryBudgetExceeded { requested_bytes,
-                available_bytes, budget_limit_bytes, .. }) => return Err(contextdb_core::Error::MemoryBudgetExceeded {
-                subsystem: subsystem.into(), operation, requested_bytes,
-                available_bytes, budget_limit_bytes, hint: hint.into(),
-            }),
-            Err(other) => return Err(other),
-        };
-        let result = self.try_allocate_for_provenance_native_named(bytes,
-            subsystem, "diagnostic_label", hint, None, subsystem, operation.as_ref())
-            .map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)));
+        let original =
+            match self.adapter_payload_credit_static(bytes, subsystem, "diagnostic_label", hint) {
+                Ok(original) => original,
+                Err(contextdb_core::Error::MemoryBudgetExceeded {
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    ..
+                }) => {
+                    return Err(contextdb_core::Error::MemoryBudgetExceeded {
+                        subsystem: subsystem.into(),
+                        operation,
+                        requested_bytes,
+                        available_bytes,
+                        budget_limit_bytes,
+                        hint: hint.into(),
+                    });
+                }
+                Err(other) => return Err(other),
+            };
+        let result = self
+            .try_allocate_for_provenance_native_named(
+                bytes,
+                subsystem,
+                "diagnostic_label",
+                hint,
+                None,
+                subsystem,
+                operation.as_ref(),
+            )
+            .map_err(|error| {
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                        error,
+                    ),
+                )
+            });
         let result = result.map_err(|error| match error {
-            contextdb_core::Error::MemoryBudgetExceeded { subsystem, requested_bytes,
-                available_bytes, budget_limit_bytes, hint, .. } =>
-                contextdb_core::Error::MemoryBudgetExceeded { subsystem, operation,
-                    requested_bytes, available_bytes, budget_limit_bytes, hint },
+            contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+                ..
+            } => contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            },
             other => other,
         });
-        if result.is_ok() && let Some(original) = original { original.transfer(); }
+        if result.is_ok()
+            && let Some(original) = original
+        {
+            original.transfer();
+        }
         result
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_adapter_allocate_static(
-        &self, bytes: usize, subsystem: &'static str, operation: &'static str,
-        hint: &'static str, provenance: Option<&StoreAccountantHandle>,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+        provenance: Option<&StoreAccountantHandle>,
     ) -> contextdb_core::Result<()> {
         let original = self.adapter_payload_credit_static(bytes, subsystem, operation, hint)?;
         self.try_allocate_for_provenance_native(bytes, subsystem, operation, hint, provenance)
-            .map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)))?;
-        if let Some(original) = original { original.transfer(); }
+            .map_err(|error| {
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                        error,
+                    ),
+                )
+            })?;
+        if let Some(original) = original {
+            original.transfer();
+        }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_adapter_reserve(
-        &self, bytes: usize, subsystem: &'static str, operation: &'static str,
-        hint: &'static str, provenance: Option<&StoreAccountantHandle>,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+        provenance: Option<&StoreAccountantHandle>,
     ) -> contextdb_core::Result<()> {
-        let original = if bytes == 0 { None } else {
-            self.query_reader_original().map(|owner|
-                ReadCredit::try_new_owned(owner, bytes, subsystem, operation, hint)).transpose()?
+        let original = if bytes == 0 {
+            None
+        } else {
+            self.query_reader_original()
+                .map(|owner| ReadCredit::try_new_owned(owner, bytes, subsystem, operation, hint))
+                .transpose()?
         };
         self.try_allocate_for_provenance_native(bytes, subsystem, operation, hint, provenance)
-            .map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)))?;
-        if let Some(original) = original { original.transfer(); }
+            .map_err(|error| {
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                        error,
+                    ),
+                )
+            })?;
+        if let Some(original) = original {
+            original.transfer();
+        }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_adapter_allocate(
-        &self, bytes: usize, subsystem: &str, operation: &str, hint: &str,
+        &self,
+        bytes: usize,
+        subsystem: &str,
+        operation: &str,
+        hint: &str,
         provenance: Option<&StoreAccountantHandle>,
     ) -> contextdb_core::Result<()> {
         let original = self.adapter_payload_credit(bytes, subsystem, operation, hint)?;
         self.try_allocate_for_provenance(bytes, subsystem, operation, hint, provenance)?;
-        if let Some(original) = original { original.transfer(); }
+        if let Some(original) = original {
+            original.transfer();
+        }
         Ok(())
     }
     fn try_adapter_reserve_native(
-        &self, bytes: usize, subsystem: &'static str, operation: &'static str,
-        hint: &'static str, provenance: Option<&StoreAccountantHandle>,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+        provenance: Option<&StoreAccountantHandle>,
     ) -> Result<(), contextdb_core::read_memory::NativeRefusal> {
-        let original = if bytes == 0 { None } else {
-            self.query_reader_original().map(|owner|
-                ReadCredit::try_new_owned_native(owner, bytes, subsystem, operation, hint)).transpose()?
+        let original = if bytes == 0 {
+            None
+        } else {
+            self.query_reader_original()
+                .map(|owner| {
+                    ReadCredit::try_new_owned_native(owner, bytes, subsystem, operation, hint)
+                })
+                .transpose()?
         };
         self.try_allocate_for_provenance_native(bytes, subsystem, operation, hint, provenance)?;
-        if let Some(original) = original { original.transfer(); }
+        if let Some(original) = original {
+            original.transfer();
+        }
         Ok(())
     }
     fn release_adapter_payload(&self, bytes: usize) {
@@ -5735,11 +6598,22 @@ impl AccountantHandle {
             self.release(bytes);
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn adapter_reader_invoice(&self, bytes: usize) -> contextdb_core::Result<Option<ReadCredit>> {
-        self.query_reader_original().map(|owner|
-            ReadCredit::try_new_owned(owner, bytes, "reader", "adapter_control",
-                "Release retained reader controls or raise the declared memory limit.")).transpose()
+        self.query_reader_original()
+            .map(|owner| {
+                ReadCredit::try_new_owned(
+                    owner,
+                    bytes,
+                    "reader",
+                    "adapter_control",
+                    "Release retained reader controls or raise the declared memory limit.",
+                )
+            })
+            .transpose()
     }
     fn original_for_adapter(&self, writer_use: Option<&WriterUse>) -> StoreAccountantHandle {
         match writer_use {
@@ -5747,7 +6621,10 @@ impl AccountantHandle {
             None => StoreAccountantHandle::from_original_nonwriter(self),
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn budget_adapter(
         &self,
         writer_use: Option<WriterUse>,
@@ -5755,44 +6632,90 @@ impl AccountantHandle {
     ) -> contextdb_core::Result<contextdb_vector::MemoryBudgetOwner> {
         let original = self.original_for_adapter(writer_use.as_ref());
         let adapter = WriterVectorBudget {
-            accountant: Some(self.clone()), _layout: Layout::new::<()>(),
+            accountant: Some(self.clone()),
+            _layout: Layout::new::<()>(),
             _writer_use: writer_use,
         };
-        let bytes = writer_adapter_layout(&adapter).size().checked_add(
-            ReadMemoryOwner::native_layout::<WriterWaitMemory, WriterAdapterInvoice>().size())
+        let bytes = writer_adapter_layout(&adapter)
+            .size()
+            .checked_add(
+                ReadMemoryOwner::native_layout::<WriterWaitMemory, WriterAdapterInvoice>().size(),
+            )
             .ok_or_else(|| contextdb_core::Error::Other("writer adapter layout overflow".into()))?;
         let reader = self.adapter_reader_invoice(bytes)?;
         let credit = if open_residue {
-            ControlCredit::admit_open_residue(&original, bytes, "assembly_budget_adapter_open_residue")?
+            ControlCredit::admit_open_residue(
+                &original,
+                bytes,
+                "assembly_budget_adapter_open_residue",
+            )?
         } else {
-            ControlCredit::admit_from_handle(&original, bytes, "writer", "adapter_control",
-                "Raise MEMORY_LIMIT for the writer adapter.")?
+            ControlCredit::admit_from_handle(
+                &original,
+                bytes,
+                "writer",
+                "adapter_control",
+                "Raise MEMORY_LIMIT for the writer adapter.",
+            )?
         };
         // The existing native free guard holds the sole combined fixed debit
         // through both blocks. The Arc is destroyed first by MemoryBudgetOwner.
-        let invoice = ReadMemoryOwner::try_native_result(WriterWaitMemory(original.clone()),
-            WriterAdapterInvoice { _credit: credit, _reader: reader, _original: original })
-            .map_err(contextdb_core::Error::NativeEngineOther)?;
-        Ok(contextdb_vector::MemoryBudgetOwner::from_funded(Arc::new(adapter), invoice))
+        let invoice = ReadMemoryOwner::try_native_result(
+            WriterWaitMemory(original.clone()),
+            WriterAdapterInvoice {
+                _credit: credit,
+                _reader: reader,
+                _original: original,
+            },
+        )
+        .map_err(contextdb_core::Error::NativeEngineOther)?;
+        Ok(contextdb_vector::MemoryBudgetOwner::from_funded(
+            Arc::new(adapter),
+            invoice,
+        ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_adapter(
-        &self, writer_use: Option<WriterUse>, open_residue: bool,
+        &self,
+        writer_use: Option<WriterUse>,
+        open_residue: bool,
     ) -> contextdb_core::Result<ReadMemoryOwner> {
         let original = self.original_for_adapter(writer_use.as_ref());
-        let bytes = ReadMemoryOwner::native_layout::<WriterWaitMemory, WriterAdapterInvoice>().size();
+        let bytes =
+            ReadMemoryOwner::native_layout::<WriterWaitMemory, WriterAdapterInvoice>().size();
         let reader = self.adapter_reader_invoice(bytes)?;
         let credit = if open_residue {
-            ControlCredit::admit_open_residue(&original, bytes, "assembly_budget_adapter_open_residue")?
+            ControlCredit::admit_open_residue(
+                &original,
+                bytes,
+                "assembly_budget_adapter_open_residue",
+            )?
         } else {
-            ControlCredit::admit_from_handle(&original, bytes, "writer", "adapter_control",
-                "Raise MEMORY_LIMIT for the writer adapter.")?
+            ControlCredit::admit_from_handle(
+                &original,
+                bytes,
+                "writer",
+                "adapter_control",
+                "Raise MEMORY_LIMIT for the writer adapter.",
+            )?
         };
-        ReadMemoryOwner::try_native_result(WriterWaitMemory(original.clone()),
-            WriterAdapterInvoice { _credit: credit, _reader: reader, _original: original })
-            .map_err(contextdb_core::Error::NativeEngineOther)
+        ReadMemoryOwner::try_native_result(
+            WriterWaitMemory(original.clone()),
+            WriterAdapterInvoice {
+                _credit: credit,
+                _reader: reader,
+                _original: original,
+            },
+        )
+        .map_err(contextdb_core::Error::NativeEngineOther)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn vector_budget_for_original_reader(
         &self,
     ) -> contextdb_core::Result<contextdb_vector::MemoryBudgetOwner> {
@@ -5801,7 +6724,10 @@ impl AccountantHandle {
             None => self.budget_adapter(None, false),
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn vector_budget_for_startup(
         &self,
     ) -> contextdb_core::Result<contextdb_vector::MemoryBudgetOwner> {
@@ -5809,7 +6735,10 @@ impl AccountantHandle {
             WriterUse::retain_if_writer(self).expect("construction root retains the writer epoch");
         self.budget_adapter(Some(writer_use), true)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn vector_budget(
         &self,
     ) -> contextdb_core::Result<contextdb_vector::MemoryBudgetOwner> {
@@ -5818,23 +6747,35 @@ impl AccountantHandle {
             None => self.vector_budget_for_original_reader(),
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn assembly_read_budget(&self) -> contextdb_core::Result<ReadMemoryOwner> {
         match WriterUse::retain_if_writer(self) {
             Some(writer_use) => self.read_adapter(Some(writer_use), true),
             None => self.read_budget_for_original(None),
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn read_budget_for_original(
-        &self, writer_use: Option<WriterUse>,
+        &self,
+        writer_use: Option<WriterUse>,
     ) -> contextdb_core::Result<ReadMemoryOwner> {
-        if writer_use.is_none() && let Some(arc) = self.standard_arc() {
+        if writer_use.is_none()
+            && let Some(arc) = self.standard_arc()
+        {
             return Ok(arc.into());
         }
         self.read_adapter(writer_use, false)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn read_budget(&self) -> contextdb_core::Result<ReadMemoryOwner> {
         self.read_budget_for_original(WriterUse::retain_if_writer(self))
     }
@@ -5842,36 +6783,61 @@ impl AccountantHandle {
 
 impl contextdb_vector::MemoryBudget for MemoryAccountant {
     fn transition_reservation_for_static(
-        &self, old_bytes: usize, new_bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        old_bytes: usize,
+        new_bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
-        let mut transition = self.transition_reservation_static(old_bytes, new_bytes, subsystem, operation, hint);
-        if self.exclusive_activation().is_some() { return transition; }
+        let mut transition =
+            self.transition_reservation_static(old_bytes, new_bytes, subsystem, operation, hint);
+        if self.exclusive_activation().is_some() {
+            return transition;
+        }
         if transition.is_err() {
-            let vector = self.idle_graph_reclaimer.lock().as_ref().and_then(std::sync::Weak::upgrade);
-            let short = new_bytes.saturating_sub(old_bytes)
+            let vector = self
+                .idle_graph_reclaimer
+                .lock()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            let short = new_bytes
+                .saturating_sub(old_bytes)
                 .saturating_sub(self.usage().available.unwrap_or(usize::MAX));
             if vector.is_some_and(|vector| vector.give_back_serving_pages_native(short) != 0) {
-                transition = self.transition_reservation_static(old_bytes, new_bytes, subsystem, operation, hint);
+                transition = self.transition_reservation_static(
+                    old_bytes, new_bytes, subsystem, operation, hint,
+                );
             }
         }
         transition
     }
 
     fn try_allocate_for_label(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: contextdb_core::error::DiagnosticLabel, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: contextdb_core::error::DiagnosticLabel,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
         MemoryAccountant::try_allocate_for_label(self, bytes, subsystem, operation, hint)
     }
 
     fn try_allocate_for_static(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> contextdb_core::Result<()> {
         self.try_allocate_for_native(bytes, subsystem, operation, hint)
-            .map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)))
+            .map_err(|error| {
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                        error,
+                    ),
+                )
+            })
     }
     fn transition_reservation_for(
         &self,
@@ -5949,8 +6915,13 @@ impl contextdb_core::read_memory::ReadMemoryBudget for MemoryAccountant {
         hint: &'static str,
     ) -> contextdb_core::Result<()> {
         self.try_allocate_for_native(bytes, subsystem, operation, hint)
-            .map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)))
+            .map_err(|error| {
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                        error,
+                    ),
+                )
+            })
     }
     fn release(&self, bytes: usize) {
         MemoryAccountant::release(self, bytes);
@@ -6302,7 +7273,10 @@ impl RedbAllocatorStateCharge {
     /// The caller supplies capacities from the allocator, never file size or
     /// logical page counts. Growth refuses before the corresponding allocation;
     /// shrinking follows release of the old allocation.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn resize(
         &mut self,
         resident_bytes: usize,
@@ -6381,7 +7355,10 @@ struct NativeSourceProvider {
     reason = "native delivery code is staged ahead of its first non-test caller"
 )]
 impl NativeSourceProvider {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn native_origin(&self) -> contextdb_core::Result<contextdb_tx::NativeSourceOrigin> {
         let accountant = self
             .accountant
@@ -6402,7 +7379,8 @@ impl NativeSourceProvider {
             || control.registration != Some((writer.stable_identity, writer.epoch))
         {
             return Err(contextdb_core::Error::Other(
-                "native source provider origin mismatch".into()));
+                "native source provider origin mismatch".into(),
+            ));
         }
         Ok(contextdb_tx::NativeSourceOrigin::new(
             accountant.as_ptr() as usize,
@@ -6412,7 +7390,10 @@ impl NativeSourceProvider {
             },
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn paired_receiver(self: &Arc<Self>) -> contextdb_core::Result<contextdb_tx::SourceFunder> {
         let origin = self.native_origin()?;
         // SAFETY: the synchronous dispatch's paired guard dominates this
@@ -6509,7 +7490,10 @@ impl contextdb_tx::SourceFunding for NativeSourceProvider {
             .write()
             .release_in(accountant, lease.identity, lease.epoch);
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_row(
         self: Arc<Self>,
         row: &contextdb_core::VersionedRow,
@@ -6557,7 +7541,10 @@ impl contextdb_tx::SourceFunding for NativeSourceProvider {
             contextdb_tx::staged_source::OriginalRowInvoice::from_charge(charge),
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_eager_row(
         self: Arc<Self>,
         row: &contextdb_core::VersionedRow,
@@ -6647,7 +7634,8 @@ impl contextdb_tx::SourceFunding for NativeSourceProvider {
         {
             drop(copied);
             return Err(contextdb_core::Error::Other(
-                "source native capacity mismatch".into()));
+                "source native capacity mismatch".into(),
+            ));
         }
         Ok(contextdb_tx::staged_source::AdmittedSourceVector::new(
             copied,
@@ -6685,7 +7673,10 @@ impl contextdb_tx::SourceFunding for NativeSourceProvider {
             copied, invoice, bridge,
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_key(
         self: Arc<Self>,
         key: &contextdb_core::IndexKey,
@@ -6737,7 +7728,8 @@ impl contextdb_tx::SourceFunding for NativeSourceProvider {
         if copied.capacity() != copied.len() {
             drop(copied);
             return Err(contextdb_core::Error::Other(
-                "source native capacity mismatch".into()));
+                "source native capacity mismatch".into(),
+            ));
         }
         Ok(contextdb_tx::staged_source::AdmittedSourceKey::new(
             copied, charge,
@@ -6811,7 +7803,10 @@ impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
                 .release_in(self, lease.identity, lease.epoch);
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_row(
         self: Arc<Self>,
         row: &contextdb_core::VersionedRow,
@@ -6868,7 +7863,10 @@ impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
             contextdb_tx::staged_source::OriginalRowInvoice::from_charge(charge),
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_eager_row(
         self: Arc<Self>,
         row: &contextdb_core::VersionedRow,
@@ -6978,7 +7976,8 @@ impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
         {
             drop(copied);
             return Err(contextdb_core::Error::Other(
-                "source native capacity mismatch".into()));
+                "source native capacity mismatch".into(),
+            ));
         }
         Ok(contextdb_tx::staged_source::AdmittedSourceVector::new(
             copied,
@@ -7025,7 +8024,10 @@ impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
             copied, invoice, bridge,
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_key(
         self: Arc<Self>,
         key: &contextdb_core::IndexKey,
@@ -7086,7 +8088,8 @@ impl contextdb_tx::staged_source::SourceFunding for MemoryAccountant {
         if copied.capacity() != copied.len() {
             drop(copied);
             return Err(contextdb_core::Error::Other(
-                "source native capacity mismatch".into()));
+                "source native capacity mismatch".into(),
+            ));
         }
         Ok(contextdb_tx::staged_source::AdmittedSourceKey::new(
             copied, charge,
@@ -7099,7 +8102,10 @@ impl OwnedMemoryReservation {
         clippy::wrong_self_convention,
         reason = "the method consumes funding held behind &mut self and cannot take self by value"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_source_invoice(
         &mut self,
     ) -> contextdb_core::Result<contextdb_tx::OriginalRowInvoice> {
@@ -7110,7 +8116,10 @@ impl OwnedMemoryReservation {
         clippy::wrong_self_convention,
         reason = "the method consumes funding held behind &mut self and cannot take self by value"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn into_source_charge(&mut self) -> contextdb_core::Result<contextdb_tx::SourceCharge> {
         let receiver = self.accountant().standard_arc().ok_or_else(|| {
             contextdb_core::Error::Other("native source transfer requires an opaque funder".into())
@@ -7239,14 +8248,18 @@ fn source_copy_vector(entry: &contextdb_core::VectorEntry) -> contextdb_core::Ve
         lsn: entry.lsn,
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_check_vector_capacity(entry: &contextdb_core::VectorEntry) -> contextdb_core::Result<()> {
     if entry.vector.capacity() != entry.vector.len()
         || entry.index.table.capacity() != entry.index.table.len()
         || entry.index.column.capacity() != entry.index.column.len()
     {
         return Err(contextdb_core::Error::Other(
-            "source native capacity mismatch".into()));
+            "source native capacity mismatch".into(),
+        ));
     }
     Ok(())
 }
@@ -7270,13 +8283,19 @@ struct SourceJsonInternal {
 fn source_size_overflow() -> contextdb_core::Error {
     contextdb_core::Error::Other("source allocation size overflow".into())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_add(a: usize, b: usize) -> contextdb_core::Result<usize> {
     a.checked_add(b).ok_or_else(source_size_overflow)
 }
 // Private preparation copies use the same native layout and exact copy kernels
 // as source funding. A caller must admit the returned plan BEFORE this copy.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_row_copy_bytes(
     row: &contextdb_core::VersionedRow,
 ) -> contextdb_core::Result<usize> {
@@ -7290,7 +8309,10 @@ pub(crate) fn preparation_row_copy_bytes(
         },
     )
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_copy_row(
     row: &contextdb_core::VersionedRow,
 ) -> contextdb_core::Result<contextdb_core::VersionedRow> {
@@ -7309,32 +8331,58 @@ pub(crate) fn preparation_copy_row(
     source_check_row_capacity(&copied)?;
     Ok(copied)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_vector_values_copy_bytes(
-    table: &str, column: &str, length: usize,
+    table: &str,
+    column: &str,
+    length: usize,
 ) -> contextdb_core::Result<usize> {
-    source_add(source_add(table.len(), column.len())?, source_array::<f32>(length)?)
+    source_add(
+        source_add(table.len(), column.len())?,
+        source_array::<f32>(length)?,
+    )
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_copy_vector_values(
-    table: &str, column: &str, row: contextdb_core::RowId,
-    values: &[f32], tx: contextdb_core::TxId,
+    table: &str,
+    column: &str,
+    row: contextdb_core::RowId,
+    values: &[f32],
+    tx: contextdb_core::TxId,
 ) -> contextdb_core::Result<contextdb_core::VectorEntry> {
     let entry = contextdb_core::VectorEntry {
-        index: contextdb_core::VectorIndexRef::new(table, column), row_id: row,
-        vector: values.to_vec(), created_tx: tx, deleted_tx: None, lsn: contextdb_core::Lsn(0),
+        index: contextdb_core::VectorIndexRef::new(table, column),
+        row_id: row,
+        vector: values.to_vec(),
+        created_tx: tx,
+        deleted_tx: None,
+        lsn: contextdb_core::Lsn(0),
     };
     source_check_vector_capacity(&entry)?;
     Ok(entry)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_vector_copy_bytes(
     entry: &contextdb_core::VectorEntry,
 ) -> contextdb_core::Result<usize> {
-    source_add(source_add(entry.index.table.len(), entry.index.column.len())?,
-        source_array::<f32>(entry.vector.len())?)
+    source_add(
+        source_add(entry.index.table.len(), entry.index.column.len())?,
+        source_array::<f32>(entry.vector.len())?,
+    )
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_copy_vector(
     entry: &contextdb_core::VectorEntry,
 ) -> contextdb_core::Result<contextdb_core::VectorEntry> {
@@ -7342,14 +8390,20 @@ pub(crate) fn preparation_copy_vector(
     source_check_vector_capacity(&copied)?;
     Ok(copied)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_row_map_bytes(members: usize) -> contextdb_core::Result<usize> {
     source_row_map_bytes(members)
 }
 
 /// Quote the same pinned native table layout used by original source sidecars.
 /// Callers still admit before constructing the table and retain that debit.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_native_map_bytes<K, V>(members: usize) -> contextdb_core::Result<usize> {
     source_native_map_bytes::<K, V>(members)
 }
@@ -7358,20 +8412,29 @@ pub(crate) fn preparation_native_map_bytes<K, V>(members: usize) -> contextdb_co
     dead_code,
     reason = "native delivery code is staged ahead of its first non-test caller"
 )]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_check_row_capacity(
     row: &contextdb_core::VersionedRow,
 ) -> contextdb_core::Result<()> {
     source_check_row_capacity(row)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_array<T>(len: usize) -> contextdb_core::Result<usize> {
     Layout::array::<T>(len)
         .map(|layout| layout.size())
         .map_err(|_| source_size_overflow())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_json_map_bytes(members: usize) -> contextdb_core::Result<usize> {
     if members == 0 {
         return Ok(0);
@@ -7412,7 +8475,10 @@ fn source_json_map_bytes(members: usize) -> contextdb_core::Result<usize> {
         source_array::<SourceJsonInternal>(internal_nodes)?,
     )
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_json_copy_bytes(value: &serde_json::Value) -> contextdb_core::Result<usize> {
     match value {
         serde_json::Value::String(text) => Ok(text.len()),
@@ -7437,38 +8503,66 @@ fn source_json_copy_bytes(value: &serde_json::Value) -> contextdb_core::Result<u
 // serde_json 1.0.149 to_string -> to_vec starts at capacity 128; geometric
 // growth plus the old/new allocation overlap is bounded by three times the
 // final length (including a large append).
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_json_work_bytes<'a>(
     values: impl IntoIterator<Item = &'a contextdb_core::Value>,
 ) -> contextdb_core::Result<(usize, usize)> {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
-                std::io::Error::other("JSON serialization length overflow")
-            })?;
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("JSON serialization length overflow"))?;
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    values.into_iter().try_fold((0usize, 0usize), |(scratch, copies), value| {
-        let contextdb_core::Value::Json(json) = value else { return Ok((scratch, copies)); };
-        let mut count = Count(0);
-        serde_json::to_writer(&mut count, json)
-            .map_err(|error| contextdb_core::Error::Other((format!("cannot measure JSON preparation: {error}")).into()))?;
-        let capacity = count.0.checked_mul(3).ok_or_else(source_size_overflow)?.max(128);
-        Ok((scratch.max(capacity), source_add(copies, source_json_copy_bytes(json)?)?))
-    })
+    values
+        .into_iter()
+        .try_fold((0usize, 0usize), |(scratch, copies), value| {
+            let contextdb_core::Value::Json(json) = value else {
+                return Ok((scratch, copies));
+            };
+            let mut count = Count(0);
+            serde_json::to_writer(&mut count, json).map_err(|error| {
+                contextdb_core::Error::Other(
+                    (format!("cannot measure JSON preparation: {error}")).into(),
+                )
+            })?;
+            let capacity = count
+                .0
+                .checked_mul(3)
+                .ok_or_else(source_size_overflow)?
+                .max(128);
+            Ok((
+                scratch.max(capacity),
+                source_add(copies, source_json_copy_bytes(json)?)?,
+            ))
+        })
 }
 // Use the identical lexical JSON copy kernel whose BTree shape is quoted above.
 pub(crate) fn preparation_copy_value(value: &contextdb_core::Value) -> contextdb_core::Value {
     source_copy_value(value)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-pub(crate) fn preparation_value_copy_bytes(value: &contextdb_core::Value) -> contextdb_core::Result<usize> {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn preparation_value_copy_bytes(
+    value: &contextdb_core::Value,
+) -> contextdb_core::Result<usize> {
     source_value_copy_bytes(value)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_value_copy_bytes(value: &contextdb_core::Value) -> contextdb_core::Result<usize> {
     match value {
         contextdb_core::Value::Text(text) => Ok(text.len()),
@@ -7509,7 +8603,10 @@ fn source_copy_value(value: &contextdb_core::Value) -> contextdb_core::Value {
         _ => value.clone(),
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_row_map_bytes(members: usize) -> contextdb_core::Result<usize> {
     if members == 0 {
         return Ok(0);
@@ -7555,7 +8652,10 @@ fn source_row_map_bytes(members: usize) -> contextdb_core::Result<usize> {
         .map_err(|_| source_size_overflow())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_check_value_capacity(value: &contextdb_core::Value) -> contextdb_core::Result<()> {
     let valid = match value {
         contextdb_core::Value::Text(text) => text.capacity() == text.len(),
@@ -7567,10 +8667,14 @@ fn source_check_value_capacity(value: &contextdb_core::Value) -> contextdb_core:
         Ok(())
     } else {
         Err(contextdb_core::Error::Other(
-            "source native capacity mismatch".into()))
+            "source native capacity mismatch".into(),
+        ))
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_check_json_capacity(json: &serde_json::Value) -> contextdb_core::Result<()> {
     match json {
         serde_json::Value::String(text) if text.capacity() != text.len() => Err(
@@ -7579,7 +8683,8 @@ fn source_check_json_capacity(json: &serde_json::Value) -> contextdb_core::Resul
         serde_json::Value::Array(items) => {
             if items.capacity() != items.len() {
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             for value in items {
                 source_check_json_capacity(value)?;
@@ -7590,7 +8695,8 @@ fn source_check_json_capacity(json: &serde_json::Value) -> contextdb_core::Resul
             for (name, value) in members {
                 if name.capacity() != name.len() {
                     return Err(contextdb_core::Error::Other(
-                        "source native capacity mismatch".into()));
+                        "source native capacity mismatch".into(),
+                    ));
                 }
                 source_check_json_capacity(value)?;
             }
@@ -7599,7 +8705,10 @@ fn source_check_json_capacity(json: &serde_json::Value) -> contextdb_core::Resul
         _ => Ok(()),
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_check_row_capacity(row: &contextdb_core::VersionedRow) -> contextdb_core::Result<()> {
     let members = row.values.len();
     let expected = if members == 0 {
@@ -7615,19 +8724,24 @@ fn source_check_row_capacity(row: &contextdb_core::VersionedRow) -> contextdb_co
     };
     if row.values.capacity() != expected {
         return Err(contextdb_core::Error::Other(
-            "source native capacity mismatch".into()));
+            "source native capacity mismatch".into(),
+        ));
     }
     for (name, value) in &row.values {
         if name.capacity() != name.len() {
             return Err(contextdb_core::Error::Other(
-                "source native capacity mismatch".into()));
+                "source native capacity mismatch".into(),
+            ));
         }
         source_check_value_capacity(value)?;
     }
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_owned_adj_copy_bytes(
     body: &contextdb_tx::OwnedAdjEntry,
 ) -> contextdb_core::Result<usize> {
@@ -7670,7 +8784,10 @@ fn source_copy_owned_adj(body: &contextdb_tx::OwnedAdjEntry) -> contextdb_tx::Ow
         },
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_check_owned_adj(body: &contextdb_tx::OwnedAdjEntry) -> contextdb_core::Result<()> {
     source_check_aux_string(&body.owner.table)?;
     source_check_aux_string(&body.entry.edge_type)?;
@@ -7684,7 +8801,10 @@ fn source_check_owned_adj(body: &contextdb_tx::OwnedAdjEntry) -> contextdb_core:
 
 // Copy only private auxiliary bodies. All native arrays/keys/recursive values
 // are priced under the actual receiver before their respective allocation.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_copy_aux(
     input: contextdb_tx::staged_source::AuxBorrow<'_>,
     funder: contextdb_tx::SourceFunder,
@@ -7725,7 +8845,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::RelationalDeletes(bodies),
@@ -7793,7 +8914,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::Predicates(bodies),
@@ -7825,7 +8947,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::RowAdjInserts(bodies),
@@ -7861,7 +8984,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::RowAdjDeletes(bodies),
@@ -7933,7 +9057,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::AdjInserts(bodies),
@@ -7974,7 +9099,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::AdjDeletes(bodies),
@@ -8025,7 +9151,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::VectorDeletes(bodies),
@@ -8078,7 +9205,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::VectorMoves(bodies),
@@ -8119,7 +9247,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::Provenance(bodies),
@@ -8161,7 +9290,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::ConfigWrites(bodies),
@@ -8197,7 +9327,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::ConfigDeletes(bodies),
@@ -8233,7 +9364,8 @@ fn source_copy_aux(
                 drop(bodies);
                 drop(invoices);
                 return Err(contextdb_core::Error::Other(
-                    "source native capacity mismatch".into()));
+                    "source native capacity mismatch".into(),
+                ));
             }
             Ok(AdmittedAuxBatch::from_parts(
                 AuxBodies::ConfigMaxU64Keys(bodies),
@@ -8245,7 +9377,10 @@ fn source_copy_aux(
 }
 // The same pinned hashbrown layout as the existing row builder, parameterized
 // by the actual sidecar bucket type. No reported admission value is a credit.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_native_map_bytes<K, V>(members: usize) -> contextdb_core::Result<usize> {
     if members == 0 {
         return Ok(0);
@@ -8287,7 +9422,10 @@ fn source_native_map_bytes<K, V>(members: usize) -> contextdb_core::Result<usize
         .map(|l| l.size())
         .map_err(|_| source_size_overflow())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_sidecar_count<V>(
     map: &std::collections::HashMap<contextdb_core::RowId, V>,
     change: Option<(contextdb_core::RowId, Option<V>)>,
@@ -8304,7 +9442,10 @@ fn source_sidecar_count<V>(
             .ok_or_else(source_size_overflow),
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_sidecar_price<V: Copy>(
     maps: &std::collections::HashMap<String, std::collections::HashMap<contextdb_core::RowId, V>>,
     change: Option<(&str, contextdb_core::RowId, Option<V>)>,
@@ -8397,7 +9538,10 @@ type SourceCopyChange<'a> = (
     Option<(contextdb_core::Lsn, u8)>,
     Option<usize>,
 );
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_copy_sidecars(
     maps: contextdb_tx::staged_source::SidecarsBorrow<'_>,
     change: Option<SourceCopyChange<'_>>,
@@ -8434,7 +9578,10 @@ fn source_copy_sidecars(
 fn source_native_capacity_error() -> contextdb_core::Error {
     contextdb_core::Error::Other("source native capacity mismatch".into())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_check_aux_string(text: &String) -> contextdb_core::Result<()> {
     if text.capacity() == text.len() {
         Ok(())
@@ -8442,7 +9589,10 @@ fn source_check_aux_string(text: &String) -> contextdb_core::Result<()> {
         Err(source_native_capacity_error())
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_check_aux_map<K, V>(map: &std::collections::HashMap<K, V>) -> contextdb_core::Result<()> {
     let members = map.len();
     let expected = if members == 0 {
@@ -8470,7 +9620,10 @@ fn source_check_aux_map<K, V>(map: &std::collections::HashMap<K, V>) -> contextd
         Err(source_native_capacity_error())
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn source_check_sidecars<V>(
     maps: &std::collections::HashMap<String, std::collections::HashMap<contextdb_core::RowId, V>>,
 ) -> contextdb_core::Result<()> {
@@ -9513,7 +10666,10 @@ mod general_checkpoint_native_fixture {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_copy_values(
     values: &HashMap<String, contextdb_core::Value>,
 ) -> contextdb_core::Result<HashMap<String, contextdb_core::Value>> {
@@ -9543,12 +10699,14 @@ pub(crate) fn preparation_copy_values(
     };
     if copied.capacity() != expected {
         return Err(contextdb_core::Error::Other(
-            "source native capacity mismatch".into()));
+            "source native capacity mismatch".into(),
+        ));
     }
     for (name, value) in &copied {
         if name.capacity() != name.len() {
             return Err(contextdb_core::Error::Other(
-                "source native capacity mismatch".into()));
+                "source native capacity mismatch".into(),
+            ));
         }
         source_check_value_capacity(value)?;
     }
@@ -9556,7 +10714,10 @@ pub(crate) fn preparation_copy_values(
 }
 
 impl OwnedMemoryReservation {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_retained_original_row_for(
         &self,
         row: &contextdb_core::VersionedRow,
@@ -9567,7 +10728,8 @@ impl OwnedMemoryReservation {
         }
         let writer = self._writer_use.as_ref().ok_or_else(|| {
             contextdb_core::Error::Other(
-                "native source transfer requires its held writer use".into())
+                "native source transfer requires its held writer use".into(),
+            )
         })?;
         let lease = contextdb_tx::SourceLease {
             identity: writer.stable_identity,
@@ -9580,7 +10742,8 @@ impl OwnedMemoryReservation {
             || !funder.matches_native_origin(self.accountant().as_ptr() as usize, lease)
         {
             return Err(contextdb_core::Error::Other(
-                "native source transfer origin mismatch".into()));
+                "native source transfer origin mismatch".into(),
+            ));
         }
         let bytes = contextdb_tx::OriginalRowInvoice::original_copy_allocation_bytes(
             preparation_row_copy_bytes(row)?,
@@ -9620,7 +10783,10 @@ impl OwnedMemoryReservation {
 
 impl OwnedMemoryReservation {
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_retained_original_vector_parts_for(
         &self,
         table: &str,
@@ -9639,7 +10805,8 @@ impl OwnedMemoryReservation {
         }
         let writer = self._writer_use.as_ref().ok_or_else(|| {
             contextdb_core::Error::Other(
-                "native source transfer requires its held writer use".into())
+                "native source transfer requires its held writer use".into(),
+            )
         })?;
         let lease = contextdb_tx::SourceLease {
             identity: writer.stable_identity,
@@ -9652,7 +10819,8 @@ impl OwnedMemoryReservation {
             || !funder.matches_native_origin(self.accountant().as_ptr() as usize, lease)
         {
             return Err(contextdb_core::Error::Other(
-                "native source transfer origin mismatch".into()));
+                "native source transfer origin mismatch".into(),
+            ));
         }
         let payload = source_add(
             source_add(table.len(), column.len())?,
@@ -9700,7 +10868,8 @@ impl OwnedMemoryReservation {
         {
             drop(copied);
             return Err(contextdb_core::Error::Other(
-                "source native capacity mismatch".into()));
+                "source native capacity mismatch".into(),
+            ));
         }
         Ok(contextdb_tx::AdmittedSourceVector::new(copied, invoice))
     }
@@ -9708,7 +10877,10 @@ impl OwnedMemoryReservation {
 
 // Count borrowed debug projections without building a String. Each field,
 // element and escaped payload contributes to the conservative clone envelope.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_debug_len<T: std::fmt::Debug + ?Sized>(
     value: &T,
 ) -> contextdb_core::Result<usize> {
@@ -9727,7 +10899,10 @@ pub(crate) fn preparation_debug_len<T: std::fmt::Debug + ?Sized>(
     Ok(count.bytes)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_debug_native_bound<T: std::fmt::Debug + ?Sized>(
     value: &T,
 ) -> contextdb_core::Result<usize> {
@@ -9742,59 +10917,105 @@ pub(crate) fn preparation_debug_native_bound<T: std::fmt::Debug + ?Sized>(
         .ok_or_else(source_size_overflow)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_names_copy_bytes(names: &[String]) -> contextdb_core::Result<usize> {
-    names.iter().try_fold(source_array::<String>(names.len())?,
-        |bytes,name| source_add(bytes,name.len()))
+    names
+        .iter()
+        .try_fold(source_array::<String>(names.len())?, |bytes, name| {
+            source_add(bytes, name.len())
+        })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_copy_names(names: &[String]) -> contextdb_core::Result<Vec<String>> {
     let mut copied = Vec::with_capacity(names.len());
-    if copied.capacity() != names.len() { return Err(source_native_capacity_error()); }
-    for name in names { copied.push(copy_prepaid_native_string(name)?); }
-    Ok(copied)
-}
-
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-pub(crate) fn preparation_assignments_copy_bytes(
-    assignments: &[(String, contextdb_parser::ast::Expr)],
-) -> contextdb_core::Result<usize> {
-    assignments.iter().try_fold(source_array::<(String,contextdb_parser::ast::Expr)>(assignments.len())?,
-        |bytes,(name,expr)| source_add(source_add(bytes,name.len())?,preparation_debug_native_bound(expr)?))
-}
-
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-pub(crate) fn preparation_copy_assignments(
-    assignments: &[(String, contextdb_parser::ast::Expr)],
-) -> contextdb_core::Result<Vec<(String, contextdb_parser::ast::Expr)>> {
-    let mut copied = Vec::with_capacity(assignments.len());
-    if copied.capacity() != assignments.len() { return Err(source_native_capacity_error()); }
-    for (name,expr) in assignments {
-        copied.push((copy_prepaid_native_string(name)?,expr.clone()));
+    if copied.capacity() != names.len() {
+        return Err(source_native_capacity_error());
+    }
+    for name in names {
+        copied.push(copy_prepaid_native_string(name)?);
     }
     Ok(copied)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn preparation_assignments_copy_bytes(
+    assignments: &[(String, contextdb_parser::ast::Expr)],
+) -> contextdb_core::Result<usize> {
+    assignments.iter().try_fold(
+        source_array::<(String, contextdb_parser::ast::Expr)>(assignments.len())?,
+        |bytes, (name, expr)| {
+            source_add(
+                source_add(bytes, name.len())?,
+                preparation_debug_native_bound(expr)?,
+            )
+        },
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn preparation_copy_assignments(
+    assignments: &[(String, contextdb_parser::ast::Expr)],
+) -> contextdb_core::Result<Vec<(String, contextdb_parser::ast::Expr)>> {
+    let mut copied = Vec::with_capacity(assignments.len());
+    if copied.capacity() != assignments.len() {
+        return Err(source_native_capacity_error());
+    }
+    for (name, expr) in assignments {
+        copied.push((copy_prepaid_native_string(name)?, expr.clone()));
+    }
+    Ok(copied)
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_copy_string(source: &str) -> contextdb_core::Result<String> {
     copy_prepaid_native_string(source)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_predicates_copy_bytes(
     values: &[(String, contextdb_core::Value)],
 ) -> contextdb_core::Result<usize> {
-    values.iter().try_fold(source_array::<(String, contextdb_core::Value)>(values.len())?,
-        |bytes, (name, value)| source_add(source_add(bytes, name.len())?, source_value_copy_bytes(value)?))
+    values.iter().try_fold(
+        source_array::<(String, contextdb_core::Value)>(values.len())?,
+        |bytes, (name, value)| {
+            source_add(
+                source_add(bytes, name.len())?,
+                source_value_copy_bytes(value)?,
+            )
+        },
+    )
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_copy_predicates(
     source: &[(String, contextdb_core::Value)],
 ) -> contextdb_core::Result<Vec<(String, contextdb_core::Value)>> {
     let mut values = Vec::with_capacity(source.len());
-    if values.capacity() != source.len() { return Err(source_native_capacity_error()); }
+    if values.capacity() != source.len() {
+        return Err(source_native_capacity_error());
+    }
     for (name, value) in source {
         let name = copy_prepaid_native_string(name)?;
         let value = copy_prepaid_native_value(value)?;
@@ -9804,7 +11025,10 @@ pub(crate) fn preparation_copy_predicates(
     Ok(values)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_values_copy_bytes(
     values: &HashMap<String, contextdb_core::Value>,
 ) -> contextdb_core::Result<usize> {
@@ -9819,7 +11043,10 @@ pub(crate) fn preparation_values_copy_bytes(
     )
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn preparation_assignment_sizes(
     expr: &contextdb_parser::ast::Expr,
     values: &HashMap<String, contextdb_core::Value>,
@@ -9906,7 +11133,10 @@ pub(crate) fn preparation_assignment_sizes(
 }
 
 impl OwnedMemoryReservation {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_original_nonwriter_copy(
         &self,
         bytes: usize,
@@ -9918,7 +11148,8 @@ impl OwnedMemoryReservation {
     )> {
         if self._writer_use.is_some() || self.accountant().is_engine() {
             return Err(contextdb_core::Error::Other(
-                "original nonwriter copy origin mismatch".into()));
+                "original nonwriter copy origin mismatch".into(),
+            ));
         }
         let lease = contextdb_tx::SourceLease {
             identity: 0,
@@ -9928,7 +11159,8 @@ impl OwnedMemoryReservation {
             contextdb_tx::NativeSourceOrigin::new(self.accountant().as_ptr() as usize, lease);
         if !funder.accepts_retained_original_copy(origin, lease) {
             return Err(contextdb_core::Error::Other(
-                "original nonwriter copy recipient mismatch".into()));
+                "original nonwriter copy recipient mismatch".into(),
+            ));
         }
         // Use this exact untagged original, even if a writer was registered
         // later. No WriterUse lookup or current provider supplies its debit.
@@ -9945,7 +11177,10 @@ impl OwnedMemoryReservation {
         Ok((original, origin, lease))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_retained_original_nonwriter_row_for(
         &self,
         row: &contextdb_core::VersionedRow,
@@ -9971,7 +11206,10 @@ impl OwnedMemoryReservation {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_retained_original_nonwriter_vector_parts_for(
         &self,
         table: &str,
@@ -10018,7 +11256,10 @@ impl OwnedMemoryReservation {
 
 // Private original-funded preparation. These helpers never select a current
 // writer: the caller lends the use already held by terminal finalization.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_preparation_writer(
     original: &WriterUse,
     expected: &AccountantHandle,
@@ -10078,7 +11319,10 @@ pub(crate) fn loan_preparation_original<R>(
     Ok(prepare(&seed))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn preparation_original_writer(
     original: &OwnedMemoryReservation,
 ) -> contextdb_core::Result<&WriterUse> {
@@ -10089,9 +11333,13 @@ fn preparation_original_writer(
 fn preparation_original_writer_scalar(
     original: &OwnedMemoryReservation,
 ) -> std::result::Result<&WriterUse, &'static str> {
-    let accountant = original.accountant.as_ref()
+    let accountant = original
+        .accountant
+        .as_ref()
         .ok_or("preparation original has no accountant")?;
-    let writer = original._writer_use.as_ref()
+    let writer = original
+        ._writer_use
+        .as_ref()
         .ok_or("preparation original has no held writer use")?;
     validate_preparation_writer_scalar(writer, accountant)?;
     if original.own_control.as_ref().is_some_and(|control| {
@@ -10117,7 +11365,10 @@ pub(crate) fn native_preparation_original(
     Ok((writer, projection))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_preparation_funder(
     writer: &WriterUse,
     funder: &contextdb_tx::SourceFunder,
@@ -10128,12 +11379,16 @@ fn validate_preparation_funder(
     };
     if !funder.matches_native_origin(writer.accountant.as_ptr() as usize, lease) {
         return Err(contextdb_core::Error::Other(
-            "preparation funder does not match its pinned native original".into()));
+            "preparation funder does not match its pinned native original".into(),
+        ));
     }
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn validate_owned_original(
     original: &OwnedMemoryReservation,
     expected: &AccountantHandle,
@@ -10144,7 +11399,10 @@ pub(crate) fn validate_owned_original(
     validate_preparation_funder(writer, funder)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reserve_preparation_for_use(
     original: &WriterUse,
     bytes: usize,
@@ -10165,7 +11423,10 @@ fn reserve_preparation_for_use(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn reserve_preparation_from_writer_use(
     original: &WriterUse,
     expected: &AccountantHandle,
@@ -10229,7 +11490,10 @@ pub(crate) fn reserve_native_storage_from_writer_use_for(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn reserve_preparation_from_original(
     original: &OwnedMemoryReservation,
     bytes: usize,
@@ -10243,11 +11507,19 @@ pub(crate) fn reserve_preparation_from_original(
 
 /// Capability-only move companion; zero physical bytes and no admission event.
 /// It pins the producer's already validated writer, never a current registry use.
-pub(crate) fn retain_preparation_original(original: &OwnedMemoryReservation) -> OwnedMemoryReservation {
-    let writer = preparation_original_writer(original).expect("validated producing Original").clone();
+pub(crate) fn retain_preparation_original(
+    original: &OwnedMemoryReservation,
+) -> OwnedMemoryReservation {
+    let writer = preparation_original_writer(original)
+        .expect("validated producing Original")
+        .clone();
     let projection = StoreAccountantHandle::from_writer_use(&writer);
-    OwnedMemoryReservation { accountant: Some(projection.as_handle()), bytes: 0,
-        _writer_use: Some(writer), own_control: None }
+    OwnedMemoryReservation {
+        accountant: Some(projection.as_handle()),
+        bytes: 0,
+        _writer_use: Some(writer),
+        own_control: None,
+    }
 }
 
 /// Scalar companion to preparation admission. It retains the SAME Original,
@@ -10260,12 +11532,15 @@ pub(crate) fn reserve_preparation_original_native(
     hint: &'static str,
 ) -> std::result::Result<OwnedMemoryReservation, contextdb_core::read_memory::NativeRefusal> {
     let writer = preparation_original_writer(original)
-        .expect("private diagnostic requires its validated Original").clone();
+        .expect("private diagnostic requires its validated Original")
+        .clone();
     let projection = StoreAccountantHandle::from_writer_use(&writer);
     projection.try_allocate_for_original_native(bytes, subsystem, operation, hint)?;
     Ok(OwnedMemoryReservation {
-        accountant: Some(projection.as_handle()), bytes,
-        _writer_use: Some(writer), own_control: None,
+        accountant: Some(projection.as_handle()),
+        bytes,
+        _writer_use: Some(writer),
+        own_control: None,
     })
 }
 
@@ -10302,7 +11577,10 @@ fn native_map_group_width() -> usize {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn native_map_plan<K, V>(members: usize) -> contextdb_core::Result<NativeMapPlan> {
     let item = Layout::new::<(K, V)>();
     let group = native_map_group_width();
@@ -10362,7 +11640,10 @@ fn native_capacity_mismatch() -> contextdb_core::Error {
     contextdb_core::Error::Other("preparation native capacity mismatch".into())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn validate_native_map_capacity<K, V>(
     map: &HashMap<K, V>,
     plan: &NativeMapPlan,
@@ -10373,7 +11654,10 @@ pub(crate) fn validate_native_map_capacity<K, V>(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn validate_native_set_capacity<K>(
     set: &std::collections::HashSet<K>,
     plan: &NativeMapPlan,
@@ -10384,11 +11668,15 @@ pub(crate) fn validate_native_set_capacity<K>(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn native_ring_plan<T>(required: usize) -> contextdb_core::Result<(usize, Layout)> {
     if std::mem::size_of::<T>() == 0 {
         return Err(contextdb_core::Error::Other(
-            "preparation exact ring capacity requires a nonzero entry layout".into()));
+            "preparation exact ring capacity requires a nonzero entry layout".into(),
+        ));
     }
     let capacity = if required == 0 {
         0
@@ -10401,7 +11689,10 @@ pub(crate) fn native_ring_plan<T>(required: usize) -> contextdb_core::Result<(us
     Ok((capacity, layout))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn validate_native_ring_capacity<T>(
     ring: &std::collections::VecDeque<T>,
     capacity: usize,
@@ -10413,7 +11704,10 @@ pub(crate) fn validate_native_ring_capacity<T>(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reserve_native_container(
     original: &OwnedMemoryReservation,
     bytes: usize,
@@ -10427,7 +11721,10 @@ fn reserve_native_container(
     )
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn new_owned_native_map<K, V>(
     original: &OwnedMemoryReservation,
     members: usize,
@@ -10442,7 +11739,10 @@ pub(crate) fn new_owned_native_map<K, V>(
     Ok((map, memory))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn new_owned_native_set<K>(
     original: &OwnedMemoryReservation,
     members: usize,
@@ -10457,7 +11757,10 @@ pub(crate) fn new_owned_native_set<K>(
     Ok((set, memory))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn new_owned_native_ring<T>(
     original: &OwnedMemoryReservation,
     required: usize,
@@ -10472,7 +11775,10 @@ pub(crate) fn new_owned_native_ring<T>(
     Ok((ring, memory))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_native_vec_capacity<T>(values: &Vec<T>, capacity: usize) -> contextdb_core::Result<()> {
     let expected = if std::mem::size_of::<T>() == 0 {
         usize::MAX
@@ -10485,7 +11791,10 @@ fn validate_native_vec_capacity<T>(values: &Vec<T>, capacity: usize) -> contextd
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn new_owned_native_vec<T>(
     original: &OwnedMemoryReservation,
     capacity: usize,
@@ -10500,7 +11809,10 @@ pub(crate) fn new_owned_native_vec<T>(
     Ok((values, memory))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn copy_owned_native_slice<T: Copy>(
     original: &OwnedMemoryReservation,
     source: &[T],
@@ -10514,7 +11826,10 @@ pub(crate) fn copy_owned_native_slice<T: Copy>(
     Ok((values, memory))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn copy_prepaid_native_string(source: &str) -> contextdb_core::Result<String> {
     let value = source.to_owned();
     if value.capacity() != source.len() {
@@ -10523,7 +11838,10 @@ fn copy_prepaid_native_string(source: &str) -> contextdb_core::Result<String> {
     Ok(value)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn copy_owned_native_string(
     original: &OwnedMemoryReservation,
     source: &str,
@@ -10536,7 +11854,10 @@ pub(crate) fn copy_owned_native_string(
 
 // This recursion is entered only after a genuine original grant admitted the
 // entire nested plan. Verify each container before inserting its children.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn copy_prepaid_native_json(
     value: &serde_json::Value,
 ) -> contextdb_core::Result<serde_json::Value> {
@@ -10569,7 +11890,10 @@ fn copy_prepaid_native_json(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn copy_prepaid_native_value(
     value: &contextdb_core::Value,
 ) -> contextdb_core::Result<contextdb_core::Value> {
@@ -10591,7 +11915,10 @@ fn copy_prepaid_native_value(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reserve_preparation_original_copy(
     original: &OwnedMemoryReservation,
     bytes: usize,
@@ -10603,7 +11930,10 @@ fn reserve_preparation_original_copy(
     )
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn copy_owned_event_row_values(
     original: &OwnedMemoryReservation,
     row: &contextdb_core::VersionedRow,
@@ -10637,7 +11967,10 @@ pub(crate) fn copy_owned_event_row_values(
     Ok((values, credit))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn copy_owned_native_value(
     original: &OwnedMemoryReservation,
     value: &contextdb_core::Value,
@@ -10649,7 +11982,10 @@ pub(crate) fn copy_owned_native_value(
 }
 
 /// Exact original projection. This never discovers a writer registration.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn persistence_original_projection(
     original: &OwnedMemoryReservation,
 ) -> contextdb_core::Result<StoreAccountantHandle> {
@@ -10658,7 +11994,10 @@ pub(crate) fn persistence_original_projection(
     ))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn grow_preparation_from_original(
     original: &mut OwnedMemoryReservation,
     bytes: usize,
@@ -10676,41 +12015,81 @@ pub(crate) fn grow_preparation_from_original(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn grow_preparation_with_operation_label(
-    original: &mut OwnedMemoryReservation, bytes: usize, subsystem: &str,
-    operation: impl std::fmt::Display, hint: &str,
+    original: &mut OwnedMemoryReservation,
+    bytes: usize,
+    subsystem: &str,
+    operation: impl std::fmt::Display,
+    hint: &str,
 ) -> contextdb_core::Result<()> {
     let writer = preparation_original_writer(original)?;
     let prepare = |value: &dyn std::fmt::Display| {
         contextdb_core::error::DiagnosticLabel::try_format_with_invoice(value, |bytes| {
             let projection = StoreAccountantHandle::from_writer_use(writer);
-            projection.try_allocate_for_original_native(bytes, "vector_index", "diagnostic_label",
-                "Release retained diagnostics or raise MEMORY_LIMIT.")
-                .map_err(|error| crate::persistence::native_storage_admission::original_storage_error(
-                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)))?;
+            projection
+                .try_allocate_for_original_native(
+                    bytes,
+                    "vector_index",
+                    "diagnostic_label",
+                    "Release retained diagnostics or raise MEMORY_LIMIT.",
+                )
+                .map_err(|error| {
+                    crate::persistence::native_storage_admission::original_storage_error(
+                        crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                            error,
+                        ),
+                    )
+                })?;
             Ok(OwnedMemoryReservation {
-                accountant: Some(writer.accountant.clone()), bytes,
-                _writer_use: Some(writer.clone()), own_control: None,
+                accountant: Some(writer.accountant.clone()),
+                bytes,
+                _writer_use: Some(writer.clone()),
+                own_control: None,
             })
         })
     };
     let subsystem = prepare(&subsystem)?;
     let operation = prepare(&operation)?;
     let hint = prepare(&hint)?;
-    let next = original.bytes.checked_add(bytes).ok_or_else(source_size_overflow)?;
+    let next = original
+        .bytes
+        .checked_add(bytes)
+        .ok_or_else(source_size_overflow)?;
     let projection = persistence_original_projection(original)?;
-    projection.try_allocate_for_provenance_native_named(bytes, "vector_index", "diagnostic_label",
-        "Release retained diagnostics or raise MEMORY_LIMIT.", Some(&projection),
-        subsystem.as_ref(), operation.as_ref())
-        .map_err(|error| match crate::persistence::native_storage_admission::original_storage_error(
-            crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error)) {
-            contextdb_core::Error::MemoryBudgetExceeded { requested_bytes, available_bytes,
-                budget_limit_bytes, .. } => contextdb_core::Error::MemoryBudgetExceeded {
-                subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint,
+    projection
+        .try_allocate_for_provenance_native_named(
+            bytes,
+            "vector_index",
+            "diagnostic_label",
+            "Release retained diagnostics or raise MEMORY_LIMIT.",
+            Some(&projection),
+            subsystem.as_ref(),
+            operation.as_ref(),
+        )
+        .map_err(
+            |error| match crate::persistence::native_storage_admission::original_storage_error(
+                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(error),
+            ) {
+                contextdb_core::Error::MemoryBudgetExceeded {
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    ..
+                } => contextdb_core::Error::MemoryBudgetExceeded {
+                    subsystem,
+                    operation,
+                    requested_bytes,
+                    available_bytes,
+                    budget_limit_bytes,
+                    hint,
+                },
+                other => other,
             },
-            other => other,
-        })?;
+        )?;
     original.bytes = next;
     Ok(())
 }
@@ -10719,15 +12098,23 @@ pub(crate) fn grow_preparation_with_operation_label(
 /// failure data. In particular this does not call reserve_copy_native, whose
 /// untagged try_grow kernel would change the writer provenance of the debit.
 pub(crate) fn grow_preparation_original_native(
-    original: &mut OwnedMemoryReservation, bytes: usize,
-    subsystem: &'static str, operation: &'static str, hint: &'static str,
+    original: &mut OwnedMemoryReservation,
+    bytes: usize,
+    subsystem: &'static str,
+    operation: &'static str,
+    hint: &'static str,
 ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
     use contextdb_core::read_memory::NativeRefusal;
-    let next = original.bytes.checked_add(bytes)
+    let next = original
+        .bytes
+        .checked_add(bytes)
         .ok_or(NativeRefusal::Other("source allocation size overflow"))?;
     let projection = persistence_original_projection(original).map_err(|error| match error {
         contextdb_core::Error::Other(reason) => NativeRefusal::Other(
-            reason.static_text().expect("Original validation returns only borrowed static diagnostics")),
+            reason
+                .static_text()
+                .expect("Original validation returns only borrowed static diagnostics"),
+        ),
         _ => unreachable!("Original validation returns only borrowed static diagnostics"),
     })?;
     projection.try_allocate_for_original_native(bytes, subsystem, operation, hint)?;
@@ -10745,7 +12132,10 @@ pub(crate) fn release_preparation_original(original: &mut OwnedMemoryReservation
     original.bytes -= bytes;
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn detach_preparation_original(
     original: &mut OwnedMemoryReservation,
     bytes: usize,
@@ -10767,7 +12157,10 @@ pub(crate) fn detach_preparation_original(
     Ok(detached)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn merge_preparation_original(
     original: &mut OwnedMemoryReservation,
     credit: &mut OwnedMemoryReservation,
@@ -10779,7 +12172,8 @@ pub(crate) fn merge_preparation_original(
         || left.accountant.as_ptr() != right.accountant.as_ptr()
     {
         return Err(contextdb_core::Error::Other(
-            "original persistence credit origin mismatch".into()));
+            "original persistence credit origin mismatch".into(),
+        ));
     }
     let next = original
         .bytes
@@ -10790,7 +12184,10 @@ pub(crate) fn merge_preparation_original(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn clone_persistence_original_writer(
     original: &OwnedMemoryReservation,
 ) -> contextdb_core::Result<WriterUse> {
@@ -10851,12 +12248,17 @@ impl MemoryAccountant {
         Ok(())
     }
     fn try_allocate_with_provenance_native(
-        &self, bytes: usize, provenance: Option<&StoreAccountantHandle>,
+        &self,
+        bytes: usize,
+        provenance: Option<&StoreAccountantHandle>,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         let original = self.admit_reader_original_native(bytes)?;
         let result = self.try_allocate_with_provenance_native_local(bytes, provenance);
         if result.is_ok()
-            && let Some(original) = original { original.transfer(); }
+            && let Some(original) = original
+        {
+            original.transfer();
+        }
         result
     }
     fn try_allocate_with_provenance_native_local(
@@ -10995,10 +12397,14 @@ impl MemoryAccountant {
         hint: &'static str,
         provenance: Option<&StoreAccountantHandle>,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
-        self.try_allocate_for_provenance_native_named(bytes, subsystem, operation, hint,
-            provenance, subsystem, operation)
+        self.try_allocate_for_provenance_native_named(
+            bytes, subsystem, operation, hint, provenance, subsystem, operation,
+        )
     }
-    #[expect(clippy::too_many_arguments, reason = "Keep the same-payer provenance, allocation operation and observer labels explicit at the admission boundary.") ]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep the same-payer provenance, allocation operation and observer labels explicit at the admission boundary."
+    )]
     fn try_allocate_for_provenance_native_named(
         &self,
         bytes: usize,
@@ -11010,7 +12416,10 @@ impl MemoryAccountant {
         _observed_operation: &str,
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         #[cfg(test)]
-        let _capture_operation = compaction_admission_capture::Phase::operation(_observed_subsystem, _observed_operation);
+        let _capture_operation = compaction_admission_capture::Phase::operation(
+            _observed_subsystem,
+            _observed_operation,
+        );
         let native_reclaim_meters = contextdb_core::find_attribution::native_reclaim_meter_scope();
         let allocation = (|| {
             #[cfg(any(test, feature = "test-seams"))]
@@ -11051,18 +12460,18 @@ impl MemoryAccountant {
             }
             let mut allocation = self.try_allocate_with_provenance_native(bytes, provenance);
             {
-            #[cfg(any(test, feature = "test-seams"))]
-            let (subsystem, operation) = (_observed_subsystem, _observed_operation);
-            #[cfg(any(test, feature = "test-seams"))]
-            if allocation.is_ok() {
-                note_budget_admission(
-                    self as *const Self as usize,
-                    subsystem,
-                    operation,
-                    bytes,
-                    self.used.load(Ordering::SeqCst),
-                );
-            }
+                #[cfg(any(test, feature = "test-seams"))]
+                let (subsystem, operation) = (_observed_subsystem, _observed_operation);
+                #[cfg(any(test, feature = "test-seams"))]
+                if allocation.is_ok() {
+                    note_budget_admission(
+                        self as *const Self as usize,
+                        subsystem,
+                        operation,
+                        bytes,
+                        self.used.load(Ordering::SeqCst),
+                    );
+                }
             }
             // A saved graph whose topology does not fit is admitted once the
             // serving pages already resident give way to it: they are re-readable,
@@ -11264,13 +12673,17 @@ mod cgroup_ceiling_tests;
 
 /// Keep the attach-time writer's pinned epoch for storage bookkeeping. A reader
 /// handle cannot acquire writer provenance through this private bridge.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn reserve_storage_from_original_handle(
     handle: &StoreAccountantHandle,
 ) -> contextdb_core::Result<OwnedMemoryReservation> {
     if !handle.is_writer() {
         return Err(contextdb_core::Error::Other(
-            "storage bookkeeping requires an original writer".into()));
+            "storage bookkeeping requires an original writer".into(),
+        ));
     }
     let accountant = handle.as_handle();
     let writer = handle.original_writer_use(&accountant);
@@ -11291,9 +12704,20 @@ struct OriginalImageRecordBudget {
     reservation: parking_lot::Mutex<OwnedMemoryReservation>,
 }
 impl contextdb_core::read_memory::ReadMemoryBudget for OriginalImageRecordBudget {
-    fn try_reserve(&self, bytes: usize, subsystem: &'static str, operation: &'static str,
-        hint: &'static str) -> contextdb_core::Result<()> {
-        grow_preparation_from_original(&mut self.reservation.lock(),bytes,subsystem,operation,hint)
+    fn try_reserve(
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
+    ) -> contextdb_core::Result<()> {
+        grow_preparation_from_original(
+            &mut self.reservation.lock(),
+            bytes,
+            subsystem,
+            operation,
+            hint,
+        )
     }
     fn release(&self, _bytes: usize) {
         // The outer record scope owns all of these allocations, including
@@ -11301,31 +12725,58 @@ impl contextdb_core::read_memory::ReadMemoryBudget for OriginalImageRecordBudget
         // drops once, after the caller has destroyed the record carriers.
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn image_memory_for_original_record(
     frame: &crate::persistence::OriginalPersistenceFrame<'_>,
 ) -> contextdb_core::Result<crate::read_image_memory::ImageMemoryHandle> {
-    image_memory_for_original_work(frame, "persistence", "graph_history_window",
-        "Raise MEMORY_LIMIT to admit graph history publication.")
+    image_memory_for_original_work(
+        frame,
+        "persistence",
+        "graph_history_window",
+        "Raise MEMORY_LIMIT to admit graph history publication.",
+    )
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn image_memory_for_original_work(
     frame: &crate::persistence::OriginalPersistenceFrame<'_>,
-    subsystem: &'static str, operation: &'static str, hint: &'static str,
+    subsystem: &'static str,
+    operation: &'static str,
+    hint: &'static str,
 ) -> contextdb_core::Result<crate::read_image_memory::ImageMemoryHandle> {
-    frame.reserve(std::mem::size_of::<OriginalImageRecordBudget>()
-        .saturating_add(std::mem::size_of::<crate::read_image_memory::ImageMemory>())
-        .saturating_add(4 * std::mem::size_of::<usize>()))?;
-    let reservation = reserve_preparation_from_original(frame.original, 0, subsystem, operation, hint)?;
-    let accountant = AccountantHandle::clone(reservation.accountant.as_ref().expect("validated original record funder"));
-    let budget = Arc::new(OriginalImageRecordBudget { reservation: parking_lot::Mutex::new(reservation) });
-    Ok(crate::read_image_memory::ImageMemory::charging_reader_for(accountant, budget, subsystem, operation, hint))
+    frame.reserve(
+        std::mem::size_of::<OriginalImageRecordBudget>()
+            .saturating_add(std::mem::size_of::<crate::read_image_memory::ImageMemory>())
+            .saturating_add(4 * std::mem::size_of::<usize>()),
+    )?;
+    let reservation =
+        reserve_preparation_from_original(frame.original, 0, subsystem, operation, hint)?;
+    let accountant = AccountantHandle::clone(
+        reservation
+            .accountant
+            .as_ref()
+            .expect("validated original record funder"),
+    );
+    let budget = Arc::new(OriginalImageRecordBudget {
+        reservation: parking_lot::Mutex::new(reservation),
+    });
+    Ok(crate::read_image_memory::ImageMemory::charging_reader_for(
+        accountant, budget, subsystem, operation, hint,
+    ))
 }
 
 /// Transfer a held original debit into the store's existing retained accounting.
 /// The exact writer use is copied from that original before any debit moves;
 /// this never allocates/re-admits payload bytes through a registered accountant.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn transfer_preparation_to_retained(
     mut original: OwnedMemoryReservation,
 ) -> contextdb_core::Result<(AccountantHandle, WriterUse, usize)> {
@@ -11340,7 +12791,7 @@ mod paired_capture_original_contract_tests {
     use super::*;
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
     use contextdb_tx::native_capture::NativeCapture;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Barrier;
 
     struct Payload {
@@ -11359,19 +12810,32 @@ mod paired_capture_original_contract_tests {
                 resume.wait();
                 assert_eq!(self.owner.usage().used, self.held);
             }
-            assert_eq!(at_entry, self.held,
-                "the genuine Original must remain paid in the payload destructor");
-            if self.unwind { std::panic::panic_any("original payload destructor probe"); }
+            assert_eq!(
+                at_entry, self.held,
+                "the genuine Original must remain paid in the payload destructor"
+            );
+            if self.unwind {
+                std::panic::panic_any("original payload destructor probe");
+            }
         }
     }
     struct FreeWatch;
     impl Drop for FreeWatch {
-        fn drop(&mut self) { oracle::disarm_source_free_watch(); }
+        fn drop(&mut self) {
+            oracle::disarm_source_free_watch();
+        }
     }
     fn assert_frees(count: usize, held: usize, expected: usize) {
         for free in &oracle::source_free_for_test(count)[..count] {
-            assert_eq!(*free, if expected == 0 { (0, 0, 0) } else { (held, held, 1) },
-                "each exact allocation must still be fully funded before AND after System.dealloc");
+            assert_eq!(
+                *free,
+                if expected == 0 {
+                    (0, 0, 0)
+                } else {
+                    (held, held, 1)
+                },
+                "each exact allocation must still be fully funded before AND after System.dealloc"
+            );
         }
     }
     fn physical_original(weak_tail: bool, unwind: bool, concurrent: bool) {
@@ -11381,50 +12845,83 @@ mod paired_capture_original_contract_tests {
         let original = writer.reserve_assembly_original(&funder).unwrap();
         let before = owner.usage().used;
         let bytes = NativeCapture::allocation_bytes::<Payload, OwnedMemoryReservation>().unwrap();
-        let credit = reserve_preparation_from_original(&original, bytes,
-            "writer_source", "prepared_exact_root", "admit the exact root").unwrap();
+        let credit = reserve_preparation_from_original(
+            &original,
+            bytes,
+            "writer_source",
+            "prepared_exact_root",
+            "admit the exact root",
+        )
+        .unwrap();
         assert_eq!(credit.bytes(), bytes);
         assert_eq!(credit.accountant().as_ptr(), original.accountant().as_ptr());
         let source_use = preparation_original_writer(&original).unwrap();
         let paid_use = preparation_original_writer(&credit).unwrap();
-        assert_eq!((paid_use.stable_identity, paid_use.epoch),
-            (source_use.stable_identity, source_use.epoch));
+        assert_eq!(
+            (paid_use.stable_identity, paid_use.epoch),
+            (source_use.stable_identity, source_use.epoch)
+        );
         let held = owner.usage().used;
         assert_eq!(held - before, bytes);
         let drops = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(Barrier::new(2));
         let resume = Arc::new(Barrier::new(2));
-        let payload = Payload { owner: owner.clone(), held, drops: drops.clone(), unwind,
-            gate: concurrent.then(|| (entered.clone(), resume.clone())) };
+        let payload = Payload {
+            owner: owner.clone(),
+            held,
+            drops: drops.clone(),
+            unwind,
+            gate: concurrent.then(|| (entered.clone(), resume.clone())),
+        };
         let counter = owner.used.as_ptr() as usize;
-        let (root, requests, count) = oracle::source_requests_for_test(counter,
-            || NativeCapture::from_prepaid(payload, credit, bytes));
+        let (root, requests, count) = oracle::source_requests_for_test(counter, || {
+            NativeCapture::from_prepaid(payload, credit, bytes)
+        });
         // The real constructor allocates invoice Arc, credit Box, data Arc.
         // Sum actual allocator layouts rather than trusting retained_bytes.
         assert_eq!(count, 3);
         assert_eq!(requests[..count].iter().map(|r| r.1).sum::<usize>(), bytes);
-        assert!(oracle::source_request_credit_for_test()[..count].iter().all(|n| *n == held));
+        assert!(
+            oracle::source_request_credit_for_test()[..count]
+                .iter()
+                .all(|n| *n == held)
+        );
         assert_eq!(root.retained_bytes(), bytes);
         oracle::watch_source_free_for_test(&requests[..count], counter);
         let _watch = FreeWatch;
-        let ((clone, weak, upgraded), _, clone_allocations) = oracle::native_requests_for_test(|| {
-            let clone = root.clone();
-            let weak = root.downgrade();
-            let upgraded = weak.upgrade().unwrap();
-            (clone, weak, upgraded)
-        });
-        assert_eq!(clone_allocations, 0, "clone/downgrade/upgrade must not allocate");
+        let ((clone, weak, upgraded), _, clone_allocations) =
+            oracle::native_requests_for_test(|| {
+                let clone = root.clone();
+                let weak = root.downgrade();
+                let upgraded = weak.upgrade().unwrap();
+                (clone, weak, upgraded)
+            });
+        assert_eq!(
+            clone_allocations, 0,
+            "clone/downgrade/upgrade must not allocate"
+        );
         assert!(root.ptr_eq(&upgraded));
         drop(upgraded);
         assert_eq!(owner.usage().used, held);
         assert_frees(count, held, 0);
-        let weak = if weak_tail { Some(weak) } else { drop(weak); None };
+        let weak = if weak_tail {
+            Some(weak)
+        } else {
+            drop(weak);
+            None
+        };
         if concurrent {
             let start = Arc::new(Barrier::new(3));
             let a_start = start.clone();
-            let a = std::thread::spawn(move || { a_start.wait(); drop(root); });
+            let a = std::thread::spawn(move || {
+                a_start.wait();
+                drop(root);
+            });
             let b_start = start.clone();
-            let b = std::thread::spawn(move || { b_start.wait(); drop(clone); });
+            let b = std::thread::spawn(move || {
+                b_start.wait();
+                drop(clone);
+            });
             start.wait();
             entered.wait();
             let during_drop = owner.usage().used;
@@ -11441,15 +12938,22 @@ mod paired_capture_original_contract_tests {
             let outcome = catch_unwind(AssertUnwindSafe(|| drop(root)));
             if unwind {
                 let panic = outcome.expect_err("the payload destructor must unwind");
-                assert_eq!(panic.downcast_ref::<&'static str>(), Some(&"original payload destructor probe"));
-            } else { outcome.unwrap(); }
+                assert_eq!(
+                    panic.downcast_ref::<&'static str>(),
+                    Some(&"original payload destructor probe")
+                );
+            } else {
+                outcome.unwrap();
+            }
         }
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         if let Some(weak) = weak {
             assert_eq!(owner.usage().used, held);
             assert_frees(count, held, 0);
             let (_, _, failed_upgrade_allocations) = oracle::native_requests_for_test(|| {
-                for _ in 0..3 { assert!(weak.upgrade().is_none()); }
+                for _ in 0..3 {
+                    assert!(weak.upgrade().is_none());
+                }
             });
             assert_eq!(failed_upgrade_allocations, 0);
             assert_eq!(owner.usage().used, held);
@@ -11457,17 +12961,32 @@ mod paired_capture_original_contract_tests {
                 let clone = weak.clone();
                 let start = Arc::new(Barrier::new(3));
                 let a_start = start.clone();
-                let a = std::thread::spawn(move || { a_start.wait(); drop(weak); });
+                let a = std::thread::spawn(move || {
+                    a_start.wait();
+                    drop(weak);
+                });
                 let b_start = start.clone();
-                let b = std::thread::spawn(move || { b_start.wait(); drop(clone); });
+                let b = std::thread::spawn(move || {
+                    b_start.wait();
+                    drop(clone);
+                });
                 start.wait();
                 a.join().unwrap();
                 b.join().unwrap();
-            } else { drop(weak); }
+            } else {
+                drop(weak);
+            }
         }
         assert_frees(count, held, 1);
-        assert_eq!(owner.usage().used, before, "refund exactly the prepaid invoice, with no leak");
-        assert_eq!(preparation_original_writer(&original).unwrap().epoch, source_use.epoch);
+        assert_eq!(
+            owner.usage().used,
+            before,
+            "refund exactly the prepaid invoice, with no leak"
+        );
+        assert_eq!(
+            preparation_original_writer(&original).unwrap().epoch,
+            source_use.epoch
+        );
     }
 
     // Frame: both control allocations and the credit Box must be physically
@@ -11476,7 +12995,9 @@ mod paired_capture_original_contract_tests {
     #[serial_test::serial]
     fn paired_capture_original_paid_through_physical_frees_and_unwind() {
         for weak_tail in [false, true] {
-            for unwind in [false, true] { physical_original(weak_tail, unwind, false); }
+            for unwind in [false, true] {
+                physical_original(weak_tail, unwind, false);
+            }
         }
     }
 
@@ -11485,7 +13006,9 @@ mod paired_capture_original_contract_tests {
     #[test]
     #[serial_test::serial]
     fn paired_capture_original_concurrent_final_drops_keep_allocations_paid() {
-        for weak_tail in [false, true] { physical_original(weak_tail, false, true); }
+        for weak_tail in [false, true] {
+            physical_original(weak_tail, false, true);
+        }
     }
 
     // Frame: an existing genuine Original must refuse insufficient successor
@@ -11507,12 +13030,18 @@ mod paired_capture_original_contract_tests {
         // allocator requests; do not infer allocation absence from byte counters.
         let source_use = preparation_original_writer(&original).unwrap();
         let projection = StoreAccountantHandle::from_writer_use(source_use);
-        let (native_result, _, native_allocations) = oracle::native_requests_for_test(||
-            reserve_native_storage_from_writer_use(source_use, &projection, bytes));
+        let (native_result, _, native_allocations) = oracle::native_requests_for_test(|| {
+            reserve_native_storage_from_writer_use(source_use, &projection, bytes)
+        });
         assert_eq!(native_allocations, 0);
         match native_result {
             Err(contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, ..
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                ..
             }) => {
                 assert_eq!(subsystem, "redb");
                 assert_eq!(operation, "exact_byte_read");
@@ -11523,11 +13052,21 @@ mod paired_capture_original_contract_tests {
             _ => panic!("the genuine Original scalar kernel must refuse before allocation"),
         }
         assert_eq!(owner.usage().used, before);
-        let result = reserve_preparation_from_original(&original, bytes,
-            "writer_source", "prepared_exact_root", "admit the exact root");
+        let result = reserve_preparation_from_original(
+            &original,
+            bytes,
+            "writer_source",
+            "prepared_exact_root",
+            "admit the exact root",
+        );
         match result {
             Err(contextdb_core::Error::MemoryBudgetExceeded {
-                subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, ..
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                ..
             }) => {
                 assert_eq!(subsystem, "writer_source");
                 assert_eq!(operation, "prepared_exact_root");
@@ -11541,8 +13080,14 @@ mod paired_capture_original_contract_tests {
         assert_eq!(preparation_original_writer(&original).unwrap().epoch, epoch);
         // Positive boundary control: the same original can fund the exact sum.
         owner.set_budget(Some(before + bytes)).unwrap();
-        let credit = reserve_preparation_from_original(&original, bytes,
-            "writer_source", "prepared_exact_root", "admit the exact root").unwrap();
+        let credit = reserve_preparation_from_original(
+            &original,
+            bytes,
+            "writer_source",
+            "prepared_exact_root",
+            "admit the exact root",
+        )
+        .unwrap();
         assert_eq!(owner.usage().used, before + bytes);
         drop(credit);
         assert_eq!(owner.usage().used, before);
@@ -11553,6 +13098,10 @@ mod paired_capture_original_contract_tests {
 impl Drop for MemoryAccountant {
     fn drop(&mut self) {
         crate::vector_read_memory::root_observations::producer_dropped(
-            self as *const _ as usize, 2, self.used.load(Ordering::SeqCst), 0);
+            self as *const _ as usize,
+            2,
+            self.used.load(Ordering::SeqCst),
+            0,
+        );
     }
 }

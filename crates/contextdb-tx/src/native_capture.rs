@@ -238,17 +238,19 @@ impl EnginePublishedRead {
 
 impl std::fmt::Debug for EnginePublishedRead {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PublishedRead").field("snapshot", &self.snapshot)
-            .field("lsn", &self.lsn).finish_non_exhaustive()
+        f.debug_struct("PublishedRead")
+            .field("snapshot", &self.snapshot)
+            .field("lsn", &self.lsn)
+            .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod paired_capture_contract_tests {
     use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::sync::{Barrier, Mutex};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
 
     #[derive(Default)]
     struct Trace {
@@ -278,14 +280,20 @@ mod paired_capture_contract_tests {
             self.trace.payload_drops.fetch_add(1, Ordering::SeqCst);
             self.trace.events.lock().unwrap().push("payload");
             self.trace.early_credit.fetch_add(
-                self.trace.credit_drops.load(Ordering::SeqCst), Ordering::SeqCst);
+                self.trace.credit_drops.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
             if let Some((entered, resume)) = &self.gate {
                 entered.wait();
                 resume.wait();
                 self.trace.early_credit.fetch_add(
-                    self.trace.credit_drops.load(Ordering::SeqCst), Ordering::SeqCst);
+                    self.trace.credit_drops.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
             }
-            if self.unwind { std::panic::panic_any("payload destructor probe"); }
+            if self.unwind {
+                std::panic::panic_any("payload destructor probe");
+            }
         }
     }
     struct Credit(Arc<Trace>);
@@ -295,11 +303,21 @@ mod paired_capture_contract_tests {
             self.0.events.lock().unwrap().push("credit");
         }
     }
-    fn capture(trace: &Arc<Trace>, unwind: bool,
-        gate: Option<(Arc<Barrier>, Arc<Barrier>)>) -> NativeCapture {
+    fn capture(
+        trace: &Arc<Trace>,
+        unwind: bool,
+        gate: Option<(Arc<Barrier>, Arc<Barrier>)>,
+    ) -> NativeCapture {
         let bytes = NativeCapture::allocation_bytes::<Payload, Credit>().unwrap();
-        NativeCapture::from_prepaid(Payload { trace: trace.clone(), gate, unwind },
-            Credit(trace.clone()), bytes)
+        NativeCapture::from_prepaid(
+            Payload {
+                trace: trace.clone(),
+                gate,
+                unwind,
+            },
+            Credit(trace.clone()),
+            bytes,
+        )
     }
     fn invoice_owners(capture: &NativeCaptureWeak) -> usize {
         Arc::strong_count(&capture.invoice.0)
@@ -330,7 +348,11 @@ mod paired_capture_contract_tests {
         assert_eq!(invoice_owners(&weak), 2);
         for _ in 0..3 {
             assert!(weak.upgrade().is_none());
-            assert_eq!(invoice_owners(&weak), 2, "failed upgrade leaked an invoice count");
+            assert_eq!(
+                invoice_owners(&weak),
+                2,
+                "failed upgrade leaked an invoice count"
+            );
             trace.assert_counts(1, 0);
         }
         drop(weak);
@@ -358,8 +380,10 @@ mod paired_capture_contract_tests {
             assert!(retained.downcast_ref::<u64>().is_none());
             trace.assert_counts(0, 0);
             match &retained {
-                CaptureHandle::Native(native) => assert_eq!(native.retained_bytes(),
-                    NativeCapture::allocation_bytes::<Payload, Credit>().unwrap()),
+                CaptureHandle::Native(native) => assert_eq!(
+                    native.retained_bytes(),
+                    NativeCapture::allocation_bytes::<Payload, Credit>().unwrap()
+                ),
                 _ => panic!("Native downcast changed transport"),
             }
         }
@@ -379,13 +403,21 @@ mod paired_capture_contract_tests {
         let contender = root.clone();
         let start = Arc::new(Barrier::new(3));
         let a_start = start.clone();
-        let a = std::thread::spawn(move || { a_start.wait(); drop(root); });
+        let a = std::thread::spawn(move || {
+            a_start.wait();
+            drop(root);
+        });
         let b_start = start.clone();
-        let b = std::thread::spawn(move || { b_start.wait(); drop(contender); });
+        let b = std::thread::spawn(move || {
+            b_start.wait();
+            drop(contender);
+        });
         start.wait();
         entered.wait(); // Last payload destructor is parked; no timing oracle.
-        let parked_counts = (trace.payload_drops.load(Ordering::SeqCst),
-            trace.credit_drops.load(Ordering::SeqCst));
+        let parked_counts = (
+            trace.payload_drops.load(Ordering::SeqCst),
+            trace.credit_drops.load(Ordering::SeqCst),
+        );
         resume.wait();
         a.join().unwrap();
         b.join().unwrap();
@@ -396,9 +428,15 @@ mod paired_capture_contract_tests {
             let contender = weak.clone();
             let start = Arc::new(Barrier::new(3));
             let a_start = start.clone();
-            let a = std::thread::spawn(move || { a_start.wait(); drop(weak); });
+            let a = std::thread::spawn(move || {
+                a_start.wait();
+                drop(weak);
+            });
             let b_start = start.clone();
-            let b = std::thread::spawn(move || { b_start.wait(); drop(contender); });
+            let b = std::thread::spawn(move || {
+                b_start.wait();
+                drop(contender);
+            });
             start.wait();
             a.join().unwrap();
             b.join().unwrap();
@@ -423,7 +461,10 @@ mod paired_capture_contract_tests {
             let weak = weak_tail.then(|| root.downgrade());
             let panic = catch_unwind(AssertUnwindSafe(|| drop(root)))
                 .expect_err("payload destructor must unwind");
-            assert_eq!(panic.downcast_ref::<&'static str>(), Some(&"payload destructor probe"));
+            assert_eq!(
+                panic.downcast_ref::<&'static str>(),
+                Some(&"payload destructor probe")
+            );
             if let Some(weak) = weak {
                 trace.assert_counts(1, 0);
                 assert!(weak.upgrade().is_none());

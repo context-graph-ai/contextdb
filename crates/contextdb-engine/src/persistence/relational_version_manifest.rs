@@ -15,7 +15,10 @@ impl RedbPersistence {
     /// Coalesced postings need an interval subtraction only when another
     /// physical version of this row survives. Fully retired postings keep the
     /// existing manifest reconciliation path and require no payload copy.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn relational_manifest_has_successor_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -51,7 +54,10 @@ impl RedbPersistence {
         Ok(witness.table == table && witness.identity[..8] == physical[..8])
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn replace_relational_manifest_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -63,7 +69,10 @@ impl RedbPersistence {
         self.replace_relational_manifest_pending_in_write(write, table, physical, old, new, None)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn replace_relational_manifest_pending_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -157,9 +166,17 @@ impl RedbPersistence {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn relational_manifest_damage(&self, reason: impl std::fmt::Display) -> Error {
-        crate::funded_error::corruption_display(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), format_args!("relational version manifest: {reason}"))
+        crate::funded_error::corruption_display(
+            self.require_decode_original()
+                .and_then(|original| original.read_budget()),
+            self.path.display(),
+            format_args!("relational version manifest: {reason}"),
+        )
     }
     pub(super) fn relational_manifest_error(&self, error: Error) -> Error {
         match error {
@@ -173,7 +190,10 @@ impl RedbPersistence {
 
     /// Authenticate every retained member and both table boundaries before
     /// retiring a whole table generation. The loop never collects a table.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn retire_relational_manifests_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -245,7 +265,10 @@ pub(super) struct ManifestKey {
 impl RetainedReadSource {
     /// Independent authenticated expectation, including an empty seek and the
     /// first member beyond the addressed row group.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn manifest_next<E>(
         &self,
         start: Vec<u8>,
@@ -321,7 +344,10 @@ impl RetainedReadSource {
 
     /// Captured-frontier row reading preserves the existing native traversal
     /// and current-row authentication without descending the history manifest.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn current_relational_group<E: From<Error>>(
         &self,
         read: &redb::ReadTransaction,
@@ -340,17 +366,19 @@ impl RetainedReadSource {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         before()?;
-        let _controls = contextdb_core::read_memory::ReadCredit::try_new(
-            read_memory.clone(),
-            std::mem::size_of::<Option<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>>(
-            ) + 2
-                * (std::mem::size_of::<crate::read_image_memory::ImageMemory>()
-                    + 2 * std::mem::size_of::<usize>()),
-            "reader",
-            "current_row_controls",
-            "Raise the declared reader memory limit.",
-        )
-        .map_err(E::from)?;
+        let _controls =
+            contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory.clone(),
+                std::mem::size_of::<
+                    Option<(VersionedRow, crate::read_image_memory::ImageMemoryHandle)>,
+                >() + 2
+                    * (std::mem::size_of::<crate::read_image_memory::ImageMemory>()
+                        + 2 * std::mem::size_of::<usize>()),
+                "reader",
+                "current_row_controls",
+                "Raise the declared reader memory limit.",
+            )
+            .map_err(E::from)?;
         let _name = contextdb_core::read_memory::ReadCredit::try_new(
             read_memory.clone(),
             table.len().checked_add(4).ok_or_else(|| {
@@ -486,7 +514,10 @@ impl RetainedReadSource {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reconcile_addressed_relational_group<E>(
         &self,
         read: &redb::ReadTransaction,
@@ -815,7 +846,10 @@ impl RetainedReadSource {
 impl CheckpointReadSource {
     /// Export validates the complete captured table before any version is
     /// filtered or copied. A directory-driven selection cannot hide a gap.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verify_relational_version_manifests(
         &self,
         table: &str,
@@ -964,7 +998,10 @@ impl CheckpointReadSource {
 impl RedbPersistence {
     /// Stream a complete witnessed mutation source without retaining its
     /// decoded versions or a table-sized coordinate list.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn visit_relational_rows_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -991,16 +1028,20 @@ impl RedbPersistence {
             // those mutations may finalize the write's closed table pages.
             let row = row_memory.scope(|| {
                 let relation = write.open_table(definition).map_err(Self::storage_error)?;
-                let lower = physical_after.as_ref().map_or(
-                    std::ops::Bound::Unbounded,
-                    |key| std::ops::Bound::Excluded(key.as_slice()),
-                );
-                let mut physical = relation.range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+                let lower = physical_after
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, |key| {
+                        std::ops::Bound::Excluded(key.as_slice())
+                    });
+                let mut physical = relation
+                    .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
                     .map_err(Self::storage_error)?;
                 let entry = physical.next().transpose().map_err(Self::storage_error)?;
                 let Some(coordinate) = coordinate.as_ref() else {
                     if entry.is_some() {
-                        return Err(self.relational_manifest_damage("unwitnessed mutation row suffix"));
+                        return Err(
+                            self.relational_manifest_damage("unwitnessed mutation row suffix")
+                        );
                     }
                     return Ok(None);
                 };
@@ -1010,22 +1051,30 @@ impl RedbPersistence {
                     return Err(self.relational_manifest_damage("mutation row member is missing"));
                 };
                 if key.value() != witness.identity {
-                    return Err(self.relational_manifest_damage("mutation row membership order differs"));
+                    return Err(
+                        self.relational_manifest_damage("mutation row membership order differs")
+                    );
                 }
-                let actual = manifest::manifest_for_body(table, key.value(), body.value(), &mut proof)
-                    .map_err(|e| self.relational_manifest_error(e))?;
+                let actual =
+                    manifest::manifest_for_body(table, key.value(), body.value(), &mut proof)
+                        .map_err(|e| self.relational_manifest_error(e))?;
                 if actual != *coordinate {
                     return Err(self.relational_manifest_damage("mutation row body differs"));
                 }
-                let identity: [u8; 24] = key.value().try_into()
-                    .map_err(|_| self.relational_manifest_damage("mutation row key width differs"))?;
+                let identity: [u8; 24] = key.value().try_into().map_err(|_| {
+                    self.relational_manifest_damage("mutation row key width differs")
+                })?;
                 let row = Self::decode_versioned_row(body.value(), None)?;
                 if Self::rel_row_key(&row).as_slice() != identity.as_slice() {
-                    return Err(self.relational_manifest_damage("mutation row occurrence disagrees with its key"));
+                    return Err(self.relational_manifest_damage(
+                        "mutation row occurrence disagrees with its key",
+                    ));
                 }
                 Ok(Some((identity, row)))
             })?;
-            let Some((identity, row)) = row else { return Ok(()); };
+            let Some((identity, row)) = row else {
+                return Ok(());
+            };
             // Nested callback decodes share this one-record owner; they cannot
             // refund the current row while the callback still borrows it.
             row_memory.scope(|| visit(&row))?;
@@ -1035,7 +1084,10 @@ impl RedbPersistence {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn visit_relational_rows_in_write_original(
         &self,
         original: &OriginalPersistenceFrame<'_>,
@@ -1052,50 +1104,72 @@ impl RedbPersistence {
         let mut physical_after: Option<[u8; 24]> = None;
         let mut exclusive = false;
         loop {
-            let mut proof = content_identity::original_writer::ProofAdmission::new(original.original, self.proof_scratch_owner())?;
-            let coordinate = content_identity::original_version_manifest::writer_manifest_next(write, &after, exclusive, &mut proof)
-                .map_err(|e| self.relational_manifest_error(e))?
-                .filter(|key| key.starts_with(&prefix));
+            let mut proof = content_identity::original_writer::ProofAdmission::new(
+                original.original,
+                self.proof_scratch_owner(),
+            )?;
+            let coordinate = content_identity::original_version_manifest::writer_manifest_next(
+                write, &after, exclusive, &mut proof,
+            )
+            .map_err(|e| self.relational_manifest_error(e))?
+            .filter(|key| key.starts_with(&prefix));
             let row_memory = OriginalPersistenceFrame::new(original.original)?;
             // End every physical access guard before fingerprint mutations:
             // those mutations may finalize the write's closed table pages.
             let row = (|| {
                 let relation = write.open_table(definition).map_err(Self::storage_error)?;
-                let lower = physical_after.as_ref().map_or(
-                    std::ops::Bound::Unbounded,
-                    |key| std::ops::Bound::Excluded(key.as_slice()),
-                );
-                let mut physical = relation.range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+                let lower = physical_after
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, |key| {
+                        std::ops::Bound::Excluded(key.as_slice())
+                    });
+                let mut physical = relation
+                    .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
                     .map_err(Self::storage_error)?;
                 let entry = physical.next().transpose().map_err(Self::storage_error)?;
                 let Some(coordinate) = coordinate.as_ref() else {
                     if entry.is_some() {
-                        return Err(self.relational_manifest_damage("unwitnessed mutation row suffix"));
+                        return Err(
+                            self.relational_manifest_damage("unwitnessed mutation row suffix")
+                        );
                     }
                     return Ok(None);
                 };
-                let witness = content_identity::original_version_manifest::parse_manifest(coordinate)
-                    .map_err(|e| self.relational_manifest_error(e))?;
+                let witness =
+                    content_identity::original_version_manifest::parse_manifest(coordinate)
+                        .map_err(|e| self.relational_manifest_error(e))?;
                 let Some((key, body)) = entry else {
                     return Err(self.relational_manifest_damage("mutation row member is missing"));
                 };
                 if key.value() != witness.identity {
-                    return Err(self.relational_manifest_damage("mutation row membership order differs"));
+                    return Err(
+                        self.relational_manifest_damage("mutation row membership order differs")
+                    );
                 }
-                let actual = content_identity::original_version_manifest::manifest_for_body(table, key.value(), body.value(), &mut proof)
-                    .map_err(|e| self.relational_manifest_error(e))?;
+                let actual = content_identity::original_version_manifest::manifest_for_body(
+                    table,
+                    key.value(),
+                    body.value(),
+                    &mut proof,
+                )
+                .map_err(|e| self.relational_manifest_error(e))?;
                 if actual != *coordinate {
                     return Err(self.relational_manifest_damage("mutation row body differs"));
                 }
-                let identity: [u8; 24] = key.value().try_into()
-                    .map_err(|_| self.relational_manifest_damage("mutation row key width differs"))?;
+                let identity: [u8; 24] = key.value().try_into().map_err(|_| {
+                    self.relational_manifest_damage("mutation row key width differs")
+                })?;
                 let row = Self::decode_versioned_row_original(&row_memory, body.value(), None)?;
                 if Self::rel_row_key(&row).as_slice() != identity.as_slice() {
-                    return Err(self.relational_manifest_damage("mutation row occurrence disagrees with its key"));
+                    return Err(self.relational_manifest_damage(
+                        "mutation row occurrence disagrees with its key",
+                    ));
                 }
                 Ok(Some((identity, row)))
             })()?;
-            let Some((identity, row)) = row else { return Ok(()); };
+            let Some((identity, row)) = row else {
+                return Ok(());
+            };
             // Nested callback decodes share this one-record owner; they cannot
             // refund the current row while the callback still borrows it.
             visit(&row, &row_memory)?;
@@ -1108,7 +1182,10 @@ impl RedbPersistence {
     /// Predecessor selection is complete with respect to the rooted version
     /// universe, so a missing newer physical version cannot select an older
     /// authentic version for closure.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn verify_relational_group_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -1125,7 +1202,10 @@ impl RedbPersistence {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn verify_relational_group_pending_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -1210,7 +1290,10 @@ impl RedbPersistence {
 }
 
 impl RetainedReadSource {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn historical_index_preflight<E: From<Error>>(
         &self,
         table: &str,
@@ -1245,7 +1328,10 @@ impl RetainedReadSource {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn historical_index_preflight_core(
         &self,
         table: &str,
@@ -1259,7 +1345,8 @@ impl RetainedReadSource {
 
         if snapshot.0 > self.logical_frontier.0 {
             return Err(Error::Other(
-                "index snapshot exceeds captured frontier".into()));
+                "index snapshot exceeds captured frontier".into(),
+            ));
         }
         let memory = crate::read_image_memory::ImageMemory::charging_reader(
             self._source_memory.memory.accountant.clone(),
@@ -1524,7 +1611,10 @@ impl RetainedReadSource {
 }
 
 impl RetainedReadSource {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn decode_preflight_posting(
         &self,
         key: &[u8],
@@ -1676,7 +1766,10 @@ impl PendingManifestPublication {
             admission,
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn push(&mut self, coordinate: &[u8], present: bool) -> Result<()> {
         let list = &mut self.mutations.list;
         if list.len() == list.capacity() {
@@ -1719,7 +1812,10 @@ impl PendingManifestPublication {
         let mutation = manifest::manifest_mutation(coordinate, present)?;
         debug_assert_eq!(
             mutation.logical_key.capacity()
-                + mutation.logical_value.as_ref().map_or(0, super::content_identity::LogicalMutationValue::heap_capacity),
+                + mutation.logical_value.as_ref().map_or(
+                    0,
+                    super::content_identity::LogicalMutationValue::heap_capacity
+                ),
             bytes
         );
         self.mutations.list.push(mutation);

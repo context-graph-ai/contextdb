@@ -179,7 +179,10 @@ fn open(session: &ReadSession, table: &str) -> ReadCursor {
     let cursor = session
         .open_cursor(&format!("SELECT id FROM {table} ORDER BY id"), &none())
         .expect("open a cursor");
-    assert!(cursor.first_page().has_more(), "the cursor has further pages");
+    assert!(
+        cursor.first_page().has_more(),
+        "the cursor has further pages"
+    );
     cursor
 }
 
@@ -247,7 +250,10 @@ fn open_across(path: &Path, table: &str, during: impl FnOnce()) -> ReadCursor {
     resume_tx.send(()).expect("finish registration");
     let (_session, cursor) = opening.join().expect("join the opener");
     let cursor = cursor.expect("register the older snapshot");
-    assert!(cursor.first_page().has_more(), "the cursor has further pages");
+    assert!(
+        cursor.first_page().has_more(),
+        "the cursor has further pages"
+    );
     cursor
 }
 

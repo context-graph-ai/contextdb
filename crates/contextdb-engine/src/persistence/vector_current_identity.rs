@@ -17,7 +17,10 @@ fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode<'a>(key: &[u8], bytes: &'a [u8]) -> Result<(u64, &'a [u8])> {
     if bytes.len() < 48 || !bytes.starts_with(MAGIC) {
         return Err(damage("CURRENT identity envelope is truncated"));
@@ -64,7 +67,10 @@ fn contribution(record: &VectorPartitionMembershipRecord) -> Vec<u8> {
     bytes
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn transition<const CHECK: bool>(
     write: &redb::WriteTransaction,
     previous: Option<&VectorPartitionMembershipRecord>,
@@ -184,7 +190,10 @@ fn fold(xor: &mut Vec<u8>, bytes: &[u8]) {
 /// The accepted row and witness are read from the existing precommit capture.
 /// Native page admission uses that operation's reader, separate from the fixed
 /// number of logical metadata probes and decodes.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn accepted_identity(
     root: &WriterSnapshot,
     index: &VectorIndexRef,
@@ -193,7 +202,7 @@ pub(crate) fn accepted_identity(
     copies: &mut VectorCopyAdmission,
     memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<(TxId, Lsn)>> {
-        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+    let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
     vector_membership_source::operation_checkpoint()?;
     let mut scratch = copies.scratch();
@@ -287,8 +296,7 @@ pub(crate) fn accepted_identity(
             payload,
         )
         .map_err(damage)?;
-        let native =
-            vector_partition_route_native_capacity(payload).map_err(damage)?;
+        let native = vector_partition_route_native_capacity(payload).map_err(damage)?;
         scratch.reserve(native.saturating_mul(8))?;
         // All decoded fields are transient; only two scalar identities leave
         // this lookup. Release their codec charges after the record and keys

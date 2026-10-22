@@ -15,12 +15,15 @@ const CREATE_WORK_NODE_CONTACTS: &str = "CREATE TABLE work_node_contacts (\
 /// path before recording the first authenticated contact. This table is
 /// ContextDB-owned hub bookkeeping, so its declaration is authored here and
 /// never comes from an application policy map.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn ensure_node_contacts_schema(
     db: &Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(), Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     if !db
         .table_names()
@@ -57,14 +60,17 @@ pub(crate) fn ensure_node_contacts_schema(
 /// Record one authenticated exchange. Schema installation remains the
 /// server-side work-ledger concern; a missing table is reported to the serve
 /// loop and never turns an unauthenticated request into state.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn record_node_contact(
     db: &Database,
     node_id: &str,
     now_ms: i64,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(), Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     ensure_node_contacts_schema(db, read_memory.clone())?;
     db.execute_with_read_memory(

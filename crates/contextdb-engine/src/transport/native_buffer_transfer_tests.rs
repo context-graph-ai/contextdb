@@ -7,7 +7,8 @@ use contextdb_core::read_memory::ReadMemoryOwner;
 use std::sync::Arc;
 
 fn native_owner(limit: u64) -> (DeclaredReadRoot, ReadMemoryOwner) {
-    let parent = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
+    let parent =
+        DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
     let owner = parent
         .native_child()
         .expect("admit one native request owner")
@@ -50,7 +51,12 @@ fn delivery_body_and_reply_move_without_a_copy_or_a_second_charge() {
     drop(body);
     assert_eq!(parent.retained_bytes_for_test(), start);
     drop(owner);
-    assert_eq!(parent.retained_bytes_for_test(), crate::vector_read_memory::native_control_layouts_for_test().0.size() as u64);
+    assert_eq!(
+        parent.retained_bytes_for_test(),
+        crate::vector_read_memory::native_control_layouts_for_test()
+            .0
+            .size() as u64
+    );
     parent.assert_final_root_free_for_test();
 }
 

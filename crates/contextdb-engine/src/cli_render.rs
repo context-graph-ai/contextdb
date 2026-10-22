@@ -67,7 +67,10 @@ fn render_table_meta_inner(table: &str, meta: &TableMeta, verbose: bool) -> Stri
 
 // Native metadata rendering borrows each declaration. Only the final text and
 // the ordered table-clause scratch have storage, admitted before construction.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn metadata_text(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     text: std::fmt::Arguments<'_>,
@@ -551,7 +554,10 @@ impl std::fmt::Display for MetadataDdl<'_> {
         Ok(())
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn render_table_meta_funded(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     table: &str,
@@ -593,7 +599,10 @@ pub(crate) fn render_table_meta_funded(
     )
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn metadata_text_len(text: std::fmt::Arguments<'_>) -> Result<usize> {
     struct Count(usize);
     impl std::fmt::Write for Count {
@@ -615,7 +624,10 @@ pub(crate) fn metadata_text_len(text: std::fmt::Arguments<'_>) -> Result<usize> 
 /// This is the entry point `.schema --verbose` uses when it has a database in
 /// hand. [`render_table_meta_verbose`] remains for callers that hold only a
 /// `TableMeta`; it renders everything except the stored-value counts.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn render_table_meta_verbose_with_counts(db: &Database, table: &str) -> Result<String> {
     let mut rendered = match db.table_meta(table) {
         Some(meta) => render_table_meta_verbose(table, &meta),
@@ -631,7 +643,10 @@ pub fn render_table_meta_verbose_with_counts(db: &Database, table: &str) -> Resu
 ///
 /// Empty for a table that maintains nothing. A store that cannot be read is an
 /// error rather than a report of zero.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn render_maintained_count_inventory(db: &Database, table: &str) -> Result<String> {
     let Some(meta) = db.table_meta(table) else {
         return Ok(String::new());
@@ -753,7 +768,10 @@ pub fn render_explain_output(explained: &ExplainOutput) -> String {
 /// Render `.explain <sql>` with its established split: execute an ordinary
 /// relational SELECT/WITH to report its real route, inspect vector similarity
 /// metadata without running the search, and only plan a write.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn render_explain(
     db: &Database,
     sql: &str,
@@ -764,14 +782,17 @@ pub fn render_explain(
 }
 
 /// Execute using the caller's existing operation read owner.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn render_explain_with_read_memory(
     db: &Database,
     sql: &str,
     params: &std::collections::HashMap<String, Value>,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<String> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let statement = contextdb_parser::parse(sql)?;
     let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());

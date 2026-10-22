@@ -430,7 +430,8 @@ pub fn take_membership_count_decodes_for_test() -> (usize, usize) {
 // Raw erasure observations stay inside the existing engine diagnostic surface.
 #[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]
 pub(crate) use crate::persistence::writer_source::cold_provider::physical_vector::{
-    PhysicalVectorRecordView, PhysicalVectorRootObservation, PhysicalVectorTable, PhysicalVectorDiscovery,
+    PhysicalVectorDiscovery, PhysicalVectorRecordView, PhysicalVectorRootObservation,
+    PhysicalVectorTable,
 };
 
 /// None of these observations is a complete erasure receipt. These explicit
@@ -460,16 +461,24 @@ pub(crate) const RETAINED_VECTOR_COVERAGE_GAPS: [RetainedVectorCoverageGap; 8] =
 ];
 #[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]
 pub(crate) enum RetainedVectorObservationEvent<'a> {
-    Root { expected: redb::StorageSnapshotIdentity, snapshot: contextdb_core::SnapshotId,
-        lsn: Lsn, fenced: bool },
+    Root {
+        expected: redb::StorageSnapshotIdentity,
+        snapshot: contextdb_core::SnapshotId,
+        lsn: Lsn,
+        fenced: bool,
+    },
     Raw(PhysicalVectorRecordView<'a>),
     UnknownTable(&'a str),
-    ResidentOwner { index: &'a contextdb_core::VectorIndexRef,
+    ResidentOwner {
+        index: &'a contextdb_core::VectorIndexRef,
         partition: &'a contextdb_core::VectorPartitionKey,
-        owner: contextdb_vector::store::PhysicalVectorOwnerView<'a> },
-    GraphRecord { index: &'a contextdb_core::VectorIndexRef,
+        owner: contextdb_vector::store::PhysicalVectorOwnerView<'a>,
+    },
+    GraphRecord {
+        index: &'a contextdb_core::VectorIndexRef,
         partition: &'a contextdb_core::VectorPartitionKey,
-        record: contextdb_vector::hnsw::PhysicalGraphRecord<'a> },
+        record: contextdb_vector::hnsw::PhysicalGraphRecord<'a>,
+    },
     CoverageGap(RetainedVectorCoverageGap),
 }
 #[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]

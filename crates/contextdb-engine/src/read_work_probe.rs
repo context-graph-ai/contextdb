@@ -297,7 +297,9 @@ impl CommitDirectoryFundingReceipt {
             image_accountant_alive: image.map(|sample| sample.2),
             image_accountant_used_bytes: image.map(|sample| sample.3),
             image_physical_free_returned: self.image.map(|image| image.is_physically_freed()),
-            image_accountant_physical_free_returned: self.image.map(|image| image.accountant_is_physically_freed()),
+            image_accountant_physical_free_returned: self
+                .image
+                .map(|image| image.accountant_is_physically_freed()),
         }
     }
 }
@@ -581,7 +583,9 @@ thread_local! {
 fn legacy_funding_owner_name<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(
     owner: &std::sync::Arc<T>,
 ) -> String {
-    if let Some(funder) = owner.funding_owner_handle_for_test() { return funding_owner_name(funder); }
+    if let Some(funder) = owner.funding_owner_handle_for_test() {
+        return funding_owner_name(funder);
+    }
     if let Some(funder) = owner.funding_owner_for_test() {
         return legacy_funding_owner_name(funder);
     }
@@ -594,7 +598,9 @@ fn legacy_funding_owner_name<T: ?Sized + contextdb_core::read_memory::ReadMemory
 fn legacy_funding_owner_id<T: ?Sized + contextdb_core::read_memory::ReadMemoryBudget>(
     owner: &std::sync::Arc<T>,
 ) -> usize {
-    if let Some(funder) = owner.funding_owner_handle_for_test() { return funding_owner_id(funder); }
+    if let Some(funder) = owner.funding_owner_handle_for_test() {
+        return funding_owner_id(funder);
+    }
     if let Some(funder) = owner.funding_owner_for_test() {
         return legacy_funding_owner_id(funder);
     }
@@ -608,8 +614,11 @@ pub(crate) fn funding_owner_name(
     if let Some(funder) = owner.funding_owner_for_test() {
         return legacy_funding_owner_name(funder);
     }
-    format!("{}@{:p}", std::any::type_name::<contextdb_core::read_memory::ReadMemoryOwner>(),
-        owner.accounting_identity() as *const ())
+    format!(
+        "{}@{:p}",
+        std::any::type_name::<contextdb_core::read_memory::ReadMemoryOwner>(),
+        owner.accounting_identity() as *const ()
+    )
 }
 pub(crate) fn funding_owner_id(
     owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1216,15 +1225,21 @@ pub(crate) fn note_commit_directory_open_funding(
 pub(crate) fn note_commit_directory_image_memory(
     image: &crate::read_image_memory::ImageMemoryHandle,
 ) {
-    note_commit_directory_image_observation(crate::read_image_memory::ImageMemoryObservation::new(image));
+    note_commit_directory_image_observation(crate::read_image_memory::ImageMemoryObservation::new(
+        image,
+    ));
 }
 pub(crate) fn note_commit_directory_image_observation(
     image: crate::read_image_memory::ImageMemoryObservation,
 ) {
     ACTIVE.with(|active| {
         if let Some(active) = active.borrow().as_ref()
-            && let Some(receipt) = active.commit_directory_funding.lock()
-                .unwrap_or_else(|error| error.into_inner()).as_mut() {
+            && let Some(receipt) = active
+                .commit_directory_funding
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+        {
             receipt.image = Some(image);
         }
     });
@@ -1251,7 +1266,8 @@ pub(crate) fn note_commit_directory_source_registration_funding(
     before: (usize, usize),
 ) {
     let window = CommitDirectorySourceRegistrationFunding {
-        image_owner_identity: image.as_ref() as *const crate::read_image_memory::ImageMemory as usize,
+        image_owner_identity: image.as_ref() as *const crate::read_image_memory::ImageMemory
+            as usize,
         image_accountant_identity: image.accountant.as_ptr() as usize,
         image_held_before_reservation: before.0,
         image_held_after_reservation: image.held(),
@@ -1282,9 +1298,10 @@ pub mod allocator_events;
 
 /// Current retained trace, read in place without copying or clearing its owners.
 #[cfg(feature = "test-seams")]
-pub fn retained_trace_invoice(database: &crate::Database,
-    visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner))
-    -> Option<contextdb_vector::mem::TraceInvoiceForTest> {
+pub fn retained_trace_invoice(
+    database: &crate::Database,
+    visit: impl FnOnce(&contextdb_core::read_memory::ReadMemoryOwner),
+) -> Option<contextdb_vector::mem::TraceInvoiceForTest> {
     database.retained_vector_trace_invoice_for_test(visit)
 }
 

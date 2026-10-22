@@ -156,7 +156,10 @@ pub enum RuntimeRootViolation {
 }
 
 pub trait RuntimeDirectoryInspector {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn inspect(&self, root: &Path) -> Result<RuntimeDirectoryFacts, LocalTransportError>;
 }
 
@@ -167,15 +170,24 @@ pub trait RuntimeDirectoryEnvironment {
 
     /// Platform fallback roots are derived from the process identity, never
     /// from a caller-selected request value.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn effective_user_identity(&self) -> Result<LocalUserIdentity, LocalTransportError>;
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn linux_per_user_runtime_directory(&self) -> Result<PathBuf, LocalTransportError> {
         Ok(PathBuf::from("/run/user").join(self.effective_user_identity()?.0.to_string()))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn macos_user_temporary_directory(&self) -> Result<PathBuf, LocalTransportError>;
 }
 
@@ -259,7 +271,10 @@ impl RuntimeDirectoryInspector for SystemRuntimeDirectoryInspector {
 /// caller-supplied container or the owner-only channel directory below it. A
 /// symbolic link is reported as a link rather than as a non-directory: it is
 /// the more specific refusal and the one an operator has to act on.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_runtime_root_shape(
     facts: &RuntimeDirectoryFacts,
     current_user: LocalUserIdentity,
@@ -302,7 +317,10 @@ fn validate_runtime_root_shape(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn validate_runtime_root(
     facts: &RuntimeDirectoryFacts,
     current_user: LocalUserIdentity,
@@ -323,7 +341,10 @@ pub fn validate_runtime_root(
 /// owner-only boundary is the `contextdb` child created below it and the
 /// channel socket inside that child, both of which are created and then
 /// validated against the full owner-only rule.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_runtime_container_root(
     facts: &RuntimeDirectoryFacts,
     current_user: LocalUserIdentity,
@@ -383,7 +404,10 @@ fn validate_macos_system_temporary_container(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn validate_channel_path(
     facts: &ChannelPathFacts,
     current_user: LocalUserIdentity,
@@ -432,7 +456,10 @@ pub const fn unix_socket_path_limit() -> Option<usize> {
 /// The limit applies to what is handed to the kernel, so this is checked on
 /// the address a bind or a connect actually receives -- never on a pathname
 /// the operating system is never shown.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn validate_socket_path_length(path: &Path) -> Result<(), LocalTransportError> {
     let Some(limit) = unix_socket_path_limit() else {
         return Err(LocalTransportError::PlatformUnsupported);
@@ -461,7 +488,10 @@ pub fn validate_socket_path_length(path: &Path) -> Result<(), LocalTransportErro
 /// is a short, fixed-shape address. On platforms with no equivalent -- macOS,
 /// which has no `/proc` -- the absolute pathname IS the address, so the limit
 /// still applies there and is reported the same way it always was.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn validate_channel_addressability(path: &Path) -> Result<(), LocalTransportError> {
     if unix_socket_path_limit().is_none() {
         return Err(LocalTransportError::PlatformUnsupported);
@@ -477,7 +507,10 @@ pub fn validate_channel_addressability(path: &Path) -> Result<(), LocalTransport
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn resolve_runtime_directory(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -488,7 +521,10 @@ pub fn resolve_runtime_directory(
     resolve_runtime_directory_with_environment(&authoritative_request, inspector, &environment)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn resolve_runtime_directory_with_environment(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -504,7 +540,10 @@ pub fn resolve_runtime_directory_with_environment(
 
 /// The same resolution, keeping the runtime root beside the directory it
 /// names for a caller that needs both.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolve_runtime_layout_with_environment(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -514,51 +553,50 @@ fn resolve_runtime_layout_with_environment(
         return Err(LocalTransportError::PlatformUnsupported);
     }
 
-    let (root, source) = if let Some(explicit) = request.explicit_root.clone() {
-        (explicit, RuntimeDirectorySource::Explicit)
-    } else {
-        #[cfg(target_os = "linux")]
-        {
-            match environment.xdg_runtime_directory() {
-                Some(root) => (root, RuntimeDirectorySource::Xdg),
-                None => (
-                    environment.linux_per_user_runtime_directory()?,
-                    RuntimeDirectorySource::PerUserFallback,
-                ),
+    let (root, source) =
+        if let Some(explicit) = request.explicit_root.clone() {
+            (explicit, RuntimeDirectorySource::Explicit)
+        } else {
+            #[cfg(target_os = "linux")]
+            {
+                match environment.xdg_runtime_directory() {
+                    Some(root) => (root, RuntimeDirectorySource::Xdg),
+                    None => (
+                        environment.linux_per_user_runtime_directory()?,
+                        RuntimeDirectorySource::PerUserFallback,
+                    ),
+                }
             }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::fs::MetadataExt;
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::fs::MetadataExt;
 
-            let _ = environment;
-            let alias_facts = inspector.inspect(Path::new("/tmp"))?;
-            if !alias_facts.available {
-                return Err(LocalTransportError::RuntimeRoot(
-                    RuntimeRootViolation::Unavailable,
-                ));
+                let _ = environment;
+                let alias_facts = inspector.inspect(Path::new("/tmp"))?;
+                if !alias_facts.available {
+                    return Err(LocalTransportError::RuntimeRoot(
+                        RuntimeRootViolation::Unavailable,
+                    ));
+                }
+                let canonical_parent = alias_facts.resolved_root;
+                let facts = inspector.inspect(&canonical_parent)?;
+                let full_mode = std::fs::symlink_metadata(&canonical_parent)
+                    .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?
+                    .mode();
+                validate_macos_system_temporary_container(&facts, full_mode)?;
+                let leaf = format!("cdb{:016x}", request.current_user.0);
+                let direct_dir = canonical_parent.join(leaf);
+                let runtime = RuntimeDirectory::direct(&direct_dir);
+                validate_channel_addressability(&runtime.path().join(
+                    "0000000000000000000000000000000000000000000000000000000000000000.sock",
+                ))?;
+                return Ok((runtime, RuntimeDirectorySource::MacosTemporary));
             }
-            let canonical_parent = alias_facts.resolved_root;
-            let facts = inspector.inspect(&canonical_parent)?;
-            let full_mode = std::fs::symlink_metadata(&canonical_parent)
-                .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?
-                .mode();
-            validate_macos_system_temporary_container(&facts, full_mode)?;
-            let leaf = format!("cdb{:016x}", request.current_user.0);
-            let direct_dir = canonical_parent.join(leaf);
-            let runtime = RuntimeDirectory::direct(&direct_dir);
-            validate_channel_addressability(
-                &runtime
-                    .path()
-                    .join("0000000000000000000000000000000000000000000000000000000000000000.sock"),
-            )?;
-            return Ok((runtime, RuntimeDirectorySource::MacosTemporary));
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            return Err(LocalTransportError::PlatformUnsupported);
-        }
-    };
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                return Err(LocalTransportError::PlatformUnsupported);
+            }
+        };
     let facts = inspector.inspect(&root)?;
     match source {
         RuntimeDirectorySource::Explicit => {
@@ -592,7 +630,10 @@ fn resolve_runtime_layout_with_environment(
 ///
 /// Reader coordination resolves separately and inventories every known
 /// candidate directory for the same physical database.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn runtime_directory_for_store(
     supplied: Option<&Path>,
     current_user: LocalUserIdentity,
@@ -614,7 +655,10 @@ pub fn runtime_directory_for_store(
 /// Resolve and validate the platform-native base, then create and validate
 /// its owner-only `contextdb` child. Callers cannot supply any emergency or
 /// temporary fallback path through this API.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn prepare_runtime_directory(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -625,7 +669,10 @@ pub fn prepare_runtime_directory(
     prepare_runtime_directory_with_environment(&authoritative_request, inspector, &environment)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn prepare_runtime_directory_with_environment(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -643,7 +690,10 @@ pub fn prepare_runtime_directory_with_environment(
 /// in along with it, so a caller that must name both -- the directory the
 /// channel is bound in, and the root it sits inside -- is never left deriving
 /// one from the other.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn prepare_runtime_layout(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -655,7 +705,10 @@ pub fn prepare_runtime_layout(
         .map(|(runtime, _)| runtime)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn prepare_runtime_layout_with_environment(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -811,7 +864,10 @@ fn prepare_macos_default_runtime_directory(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn create_owner_only_runtime_child(path: &Path) -> Result<(), LocalTransportError> {
     #[cfg(unix)]
     {
@@ -834,7 +890,10 @@ fn create_owner_only_runtime_child(path: &Path) -> Result<(), LocalTransportErro
 
 /// Inspect an existing channel object without opening, connecting, or
 /// removing it. The caller validates the returned facts against its owner.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn inspect_channel_path(
     path: &Path,
     runtime_directory: &Path,
@@ -843,7 +902,10 @@ pub fn inspect_channel_path(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn inspect_system_runtime_root(root: &Path) -> Result<RuntimeDirectoryFacts, LocalTransportError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -889,7 +951,10 @@ fn inspect_system_runtime_root(_root: &Path) -> Result<RuntimeDirectoryFacts, Lo
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn inspect_system_channel_path(
     path: &Path,
     runtime_directory: &Path,
@@ -920,7 +985,10 @@ fn inspect_system_channel_path(
 /// privilege-dropping process, so the check evaluates the effective identity
 /// and treats every failure as not writable.
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn filesystem_is_writable(path: &Path) -> Result<bool, LocalTransportError> {
     let evaluated = nix::unistd::faccessat(
         nix::fcntl::AT_FDCWD,
@@ -955,7 +1023,10 @@ pub const fn linux_filesystem_type_is_local(reported: i64) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn filesystem_is_local(path: &Path) -> Result<bool, LocalTransportError> {
     let filesystem = nix::sys::statfs::statfs(path)
         .map_err(|error| LocalTransportError::FilesystemInspection(error.to_string()))?;
@@ -1005,7 +1076,9 @@ mod macos_locator_tests {
         f.available = false;
         assert_eq!(
             validate_macos_system_temporary_container(&f, valid_mode),
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::Unavailable))
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::Unavailable
+            ))
         );
 
         // Relative
@@ -1013,7 +1086,9 @@ mod macos_locator_tests {
         f.is_absolute = false;
         assert_eq!(
             validate_macos_system_temporary_container(&f, valid_mode),
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::Relative))
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::Relative
+            ))
         );
 
         // NonLocal
@@ -1021,7 +1096,9 @@ mod macos_locator_tests {
         f.is_local = false;
         assert_eq!(
             validate_macos_system_temporary_container(&f, valid_mode),
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NonLocal))
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::NonLocal
+            ))
         );
 
         // SymbolicLink
@@ -1029,7 +1106,9 @@ mod macos_locator_tests {
         f.is_symbolic_link = true;
         assert_eq!(
             validate_macos_system_temporary_container(&f, valid_mode),
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::SymbolicLink))
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::SymbolicLink
+            ))
         );
 
         // NotDirectory
@@ -1037,7 +1116,9 @@ mod macos_locator_tests {
         f.is_directory = false;
         assert_eq!(
             validate_macos_system_temporary_container(&f, valid_mode),
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotDirectory))
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::NotDirectory
+            ))
         );
 
         // WrongOwner (non-root UID)
@@ -1045,7 +1126,9 @@ mod macos_locator_tests {
         f.owner = LocalUserIdentity(501);
         assert_eq!(
             validate_macos_system_temporary_container(&f, valid_mode),
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::WrongOwner))
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::WrongOwner
+            ))
         );
 
         // NotWritable
@@ -1053,17 +1136,23 @@ mod macos_locator_tests {
         f.writable = false;
         assert_eq!(
             validate_macos_system_temporary_container(&f, valid_mode),
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotWritable))
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::NotWritable
+            ))
         );
 
         // InsecureMode (missing S_ISVTX sticky bit 0o1000 in full_mode)
         assert_eq!(
             validate_macos_system_temporary_container(&valid_facts, 0o777),
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::InsecureMode))
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::InsecureMode
+            ))
         );
         assert_eq!(
             validate_macos_system_temporary_container(&valid_facts, 0o755),
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::InsecureMode))
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::InsecureMode
+            ))
         );
     }
 
@@ -1071,8 +1160,8 @@ mod macos_locator_tests {
     fn macos_default_descriptor_preparer_creates_and_cleans_exclusive_owned_nonce_leaf() {
         use std::os::unix::fs::MetadataExt;
 
-        let canonical_tmp = std::fs::canonicalize("/tmp")
-            .expect("canonicalize /tmp must succeed on native Darwin");
+        let canonical_tmp =
+            std::fs::canonicalize("/tmp").expect("canonicalize /tmp must succeed on native Darwin");
         let current_uid = LocalUserIdentity(nix::unistd::geteuid().as_raw() as u64);
         let pid = std::process::id();
         let nonce = std::time::SystemTime::now()
@@ -1083,11 +1172,17 @@ mod macos_locator_tests {
         let test_leaf_path = canonical_tmp.join(&nonce_leaf);
 
         // Ensure we never delete a pre-existing path
-        assert!(!test_leaf_path.exists(), "test nonce collision: path already exists");
+        assert!(
+            !test_leaf_path.exists(),
+            "test nonce collision: path already exists"
+        );
 
         // Positive case: prepare descriptor-relative runtime child
         let prepared = prepare_macos_default_runtime_directory(&test_leaf_path, current_uid);
-        assert!(prepared.is_ok(), "prepare descriptor on owned nonce leaf must succeed");
+        assert!(
+            prepared.is_ok(),
+            "prepare descriptor on owned nonce leaf must succeed"
+        );
 
         // Identity check: verify created leaf metadata dev and ino
         let metadata = std::fs::symlink_metadata(&test_leaf_path).expect("leaf metadata");
@@ -1106,8 +1201,16 @@ mod macos_locator_tests {
         // Verify inode identity has not changed before cleanup
         let pre_cleanup_meta = std::fs::symlink_metadata(&test_leaf_path)
             .expect("re-read leaf metadata before cleanup");
-        assert_eq!(pre_cleanup_meta.dev(), created_dev, "device changed before cleanup");
-        assert_eq!(pre_cleanup_meta.ino(), created_ino, "inode changed before cleanup");
+        assert_eq!(
+            pre_cleanup_meta.dev(),
+            created_dev,
+            "device changed before cleanup"
+        );
+        assert_eq!(
+            pre_cleanup_meta.ino(),
+            created_ino,
+            "inode changed before cleanup"
+        );
 
         // Cleanup only our test inode
         std::fs::remove_dir(&test_leaf_path).expect("exclusive test leaf cleanup must succeed");
@@ -1116,8 +1219,8 @@ mod macos_locator_tests {
 
     #[test]
     fn macos_default_descriptor_preparer_refuses_symlink_regular_file_and_insecure_mode() {
-        let canonical_tmp = std::fs::canonicalize("/tmp")
-            .expect("canonicalize /tmp must succeed on native Darwin");
+        let canonical_tmp =
+            std::fs::canonicalize("/tmp").expect("canonicalize /tmp must succeed on native Darwin");
         let current_uid = LocalUserIdentity(nix::unistd::geteuid().as_raw() as u64);
         let pid = std::process::id();
         let base_nonce = std::time::SystemTime::now()
@@ -1137,8 +1240,11 @@ mod macos_locator_tests {
         assert!(
             matches!(
                 symlink_res,
-                Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::SymbolicLink))
-                    | Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotDirectory))
+                Err(LocalTransportError::RuntimeRoot(
+                    RuntimeRootViolation::SymbolicLink
+                )) | Err(LocalTransportError::RuntimeRoot(
+                    RuntimeRootViolation::NotDirectory
+                ))
             ),
             "symlink leaf must be refused via O_NOFOLLOW with SymbolicLink or NotDirectory: got {:?}",
             symlink_res
@@ -1153,7 +1259,9 @@ mod macos_locator_tests {
         let file_res = prepare_macos_default_runtime_directory(&file_path, current_uid);
         assert_eq!(
             file_res,
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::NotDirectory)),
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::NotDirectory
+            )),
             "regular file leaf must be refused with NotDirectory"
         );
         std::fs::remove_file(&file_path).expect("cleanup test file");
@@ -1165,11 +1273,15 @@ mod macos_locator_tests {
         let mut builder = std::fs::DirBuilder::new();
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o755);
-        builder.create(&insecure_path).expect("create test 0755 directory");
+        builder
+            .create(&insecure_path)
+            .expect("create test 0755 directory");
         let insecure_res = prepare_macos_default_runtime_directory(&insecure_path, current_uid);
         assert_eq!(
             insecure_res,
-            Err(LocalTransportError::RuntimeRoot(RuntimeRootViolation::InsecureMode)),
+            Err(LocalTransportError::RuntimeRoot(
+                RuntimeRootViolation::InsecureMode
+            )),
             "insecurely moded 0755 leaf must be refused with InsecureMode"
         );
         std::fs::remove_dir(&insecure_path).expect("cleanup test 0755 directory");

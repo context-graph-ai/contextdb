@@ -93,7 +93,8 @@ fn visible(db: &Database) -> Vec<Vec<Value>> {
         &empty(),
     )
     .unwrap()
-    .rows().to_vec()
+    .rows()
+    .to_vec()
 }
 fn graphs(db: &Database) -> Vec<(Option<u64>, Option<u64>)> {
     ["embedding", "compressed"]

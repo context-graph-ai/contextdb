@@ -25,7 +25,8 @@ fn partition_status(db: &Database) -> HashMap<String, Value> {
     assert_eq!(result.rows().len(), 1);
     result
         .columns()
-        .iter().cloned()
+        .iter()
+        .cloned()
         .zip(result.rows().iter().next().unwrap().iter().cloned())
         .collect()
 }

@@ -15,7 +15,8 @@ use contextdb_core::read_contract::{
 };
 use contextdb_core::{Error, Result, Value};
 use contextdb_engine::local_transport::{
-    LocalHandshake, ManualDeadlineClock, channel_filesystem_identity, };
+    LocalHandshake, ManualDeadlineClock, channel_filesystem_identity,
+};
 use contextdb_engine::persistence::read_persistence_test_scaffold;
 use contextdb_engine::read_session::{ReadSessionEvent, ReadSessionTestObserver};
 use contextdb_engine::{

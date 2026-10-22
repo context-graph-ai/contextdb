@@ -55,7 +55,8 @@ fn digest(path: &std::path::Path) -> DirectTypedImageDigest {
                     .limits
                     .limits
                     .memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");

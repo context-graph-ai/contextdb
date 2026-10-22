@@ -225,7 +225,8 @@ fn an_ordered_read_of_a_declared_index_traces_its_walk_with_a_transaction_open()
         broken.push(format!(
             "with a transaction open the ordered read is planned as {} over {:?} instead of \
              walking the declared index it uses on committed state",
-            staged.trace().physical_plan, staged.trace().index_used
+            staged.trace().physical_plan,
+            staged.trace().index_used
         ));
     }
     let ceiling = committed.trace().rows_examined + 1 + WALK_SLACK;
@@ -233,7 +234,8 @@ fn an_ordered_read_of_a_declared_index_traces_its_walk_with_a_transaction_open()
         broken.push(format!(
             "with a transaction open the ordered read examined {} rows against {} for the same \
              five-row answer on committed state alone, over a table of {STORED_ROWS} rows",
-            staged.trace().rows_examined, committed.trace().rows_examined
+            staged.trace().rows_examined,
+            committed.trace().rows_examined
         ));
     }
     assert!(

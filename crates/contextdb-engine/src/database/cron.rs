@@ -280,25 +280,41 @@ impl Database {
     /// `.events status` introspection and is a real public accessor, not a
     /// test seam.
     pub(crate) fn direct_cron_status_funded(
-        &self, owner: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> Result<crate::local_transport::query_funding::Funded<Vec<crate::direct_file_reader::DirectScheduleStatus>>> {
+        &self,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<
+        crate::local_transport::query_funding::Funded<
+            Vec<crate::direct_file_reader::DirectScheduleStatus>,
+        >,
+    > {
         use crate::direct_file_reader::DirectScheduleStatus;
         let _operation = self.assert_open_operation();
         let callbacks = self.cron.callbacks.read();
         let schedules = self.cron.schedules.lock();
-        let bytes = schedules.values().try_fold(schedules.len().checked_mul(std::mem::size_of::<DirectScheduleStatus>())
-            .ok_or_else(|| Error::Other("schedule status size overflow".into()))?, |bytes, schedule| {
-                bytes.checked_add(schedule.name.len()).and_then(|n| n.checked_add(schedule.every_text.len()))
+        let bytes = schedules.values().try_fold(
+            schedules
+                .len()
+                .checked_mul(std::mem::size_of::<DirectScheduleStatus>())
+                .ok_or_else(|| Error::Other("schedule status size overflow".into()))?,
+            |bytes, schedule| {
+                bytes
+                    .checked_add(schedule.name.len())
+                    .and_then(|n| n.checked_add(schedule.every_text.len()))
                     .and_then(|n| n.checked_add(schedule.callback.len()))
                     .ok_or_else(|| Error::Other("schedule status size overflow".into()))
-            })?;
+            },
+        )?;
         crate::local_transport::query_funding::Funded::allocate_owned(Some(owner), bytes, || {
             let mut result = Vec::with_capacity(schedules.len());
             for schedule in schedules.values() {
                 result.push(DirectScheduleStatus {
-                    name: schedule.name.clone(), every: schedule.every_text.clone(), callback: schedule.callback.clone(),
-                    callback_registered: callbacks.contains_key(&schedule.callback), next_fire_at_ms: schedule.next_fire_at_ms,
-                    last_fire_at_ms: schedule.last_fire_at_ms, fire_count: schedule.fire_count,
+                    name: schedule.name.clone(),
+                    every: schedule.every_text.clone(),
+                    callback: schedule.callback.clone(),
+                    callback_registered: callbacks.contains_key(&schedule.callback),
+                    next_fire_at_ms: schedule.next_fire_at_ms,
+                    last_fire_at_ms: schedule.last_fire_at_ms,
+                    fire_count: schedule.fire_count,
                 });
             }
             result
@@ -377,8 +393,9 @@ impl Database {
 
     fn require_admin_cron_ddl(&self) -> Result<()> {
         if self.has_access_constraints_for_query() {
-            return Err(Error::Other((
-                "DDL requires an admin database handle".to_string()).into()));
+            return Err(Error::Other(
+                ("DDL requires an admin database handle".to_string()).into(),
+            ));
         }
         Ok(())
     }
@@ -750,10 +767,13 @@ impl Database {
                     });
                     match callback_result {
                         Ok(result) => result,
-                        Err(payload) => Err(Error::Other((format!(
-                            "cron callback panicked: {}",
-                            panic_payload_to_string(payload)
-                        )).into())),
+                        Err(payload) => Err(Error::Other(
+                            (format!(
+                                "cron callback panicked: {}",
+                                panic_payload_to_string(payload)
+                            ))
+                            .into(),
+                        )),
                     }
                 },
                 |ws| {
@@ -863,7 +883,8 @@ impl Database {
                         self.discard_staged_trigger_audits_for_persistence(lsn);
                     }
                     if let Some(ws) = failure.write_set {
-                        let _ = self.release_insert_allocations(&ws, &mut vector_copy_owner.borrow_mut());
+                        let _ = self
+                            .release_insert_allocations(&ws, &mut vector_copy_owner.borrow_mut());
                     } else {
                         let _ = self.rollback_without_callback_tx_control(tx);
                     }
@@ -1380,7 +1401,9 @@ impl Database {
                         self.tx_mgr.vector_executor(
                             self.vector_store.clone(),
                             Arc::new(OnceLock::new()),
-                            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
+                            contextdb_vector::MemoryBudgetOwner::clone(
+                                &self.finalization.vector_accountant,
+                            ),
                         ),
                     );
                     construction.initialized[46] = true;

@@ -75,7 +75,8 @@ fn submit_blob_job(db: &Database, job_id: &str, input_refs: Vec<InputRef>) {
 fn work_job_ids(db: &Database) -> Vec<Vec<Value>> {
     db.execute("SELECT job_id FROM work_jobs ORDER BY job_id", &params())
         .expect("read work-ledger job ids")
-        .rows().to_vec()
+        .rows()
+        .to_vec()
 }
 
 fn report_rows(mut pairs: Vec<(String, String)>) -> Vec<Vec<Value>> {
@@ -94,7 +95,8 @@ fn rows(db: &Database) -> Vec<Vec<Value>> {
         &params(),
     )
     .expect("read public purge fixture rows")
-    .rows().to_vec()
+    .rows()
+    .to_vec()
 }
 
 fn observable_state(db: &Database) -> ObservablePurgeState {
@@ -227,14 +229,21 @@ fn public_purge_batch_is_atomic_across_injected_persistence_failure_and_reopen()
                 ((refusal_peak, success_peak), (refusal_origin, success_origin))
             }).join().expect("selected purge row completes without leaking its fault");
             let (peak, origins) = peak;
-            assert!(origins.0.complete && origins.1.complete,
-                "purge allocation census must be complete for width {columns}: {origins:?}");
-            assert!(peak.0 > 0 && peak.1 > 0, "both actual publication paths were measured");
+            assert!(
+                origins.0.complete && origins.1.complete,
+                "purge allocation census must be complete for width {columns}: {origins:?}"
+            );
+            assert!(
+                peak.0 > 0 && peak.1 > 0,
+                "both actual publication paths were measured"
+            );
             peaks.push(peak);
             peak_origins.push((columns, origins));
         }
-        assert!(peaks[1].0 <= peaks[0].0 && peaks[1].1 <= peaks[0].1,
-            "unrelated nested schema width must not increase physical purge workspace on refusal or success: {peaks:?}; actual native/header/padding origins: {peak_origins:?}");
+        assert!(
+            peaks[1].0 <= peaks[0].0 && peaks[1].1 <= peaks[0].1,
+            "unrelated nested schema width must not increase physical purge workspace on refusal or success: {peaks:?}; actual native/header/padding origins: {peak_origins:?}"
+        );
     }
     // Authoritative erasure waits for proved orphan cleanup, while maintenance
     // completes outside queries (maintenance intent line 41; root policy 22).
@@ -538,7 +547,11 @@ fn public_purge_reports_only_distinct_sorted_work_job_blob_survivors() {
         )
         .expect("purge the two selected work jobs");
 
-    assert_eq!(result.rows_affected(), 2, "the selected count remains exact");
+    assert_eq!(
+        result.rows_affected(),
+        2,
+        "the selected count remains exact"
+    );
     assert_eq!(
         result.columns(),
         vec!["blob_hash".to_string(), "remaining_job_id".to_string()],

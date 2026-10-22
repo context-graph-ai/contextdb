@@ -34,7 +34,10 @@ enum Scalar {
 }
 
 impl Predicate {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn capture(
         expr: &Expr,
         parameters: &HashMap<String, Value>,
@@ -116,7 +119,10 @@ impl Predicate {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn expression(&self) -> Result<Expr> {
         Ok(match self {
             Self::Column(table, column) => Expr::Column(ColumnRef {
@@ -179,7 +185,10 @@ impl Predicate {
 }
 
 impl NodeLocalPredicate {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn capture(
         expr: Option<&Expr>,
         parameters: &HashMap<String, Value>,
@@ -196,7 +205,10 @@ impl NodeLocalPredicate {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         RedbPersistence::decode_config_value(bytes)
     }
@@ -205,7 +217,10 @@ impl NodeLocalPredicate {
         format!("authoritative_purge_local_applied.v1.{}", self.id)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn select(
         &self,
         db: &Database,
@@ -220,7 +235,8 @@ impl NodeLocalPredicate {
         };
         if crate::executor::effective_sync_direction(&meta) != SyncDirection::None {
             return Err(Error::SyncError(
-                "node-local purge instruction requires SYNC OFF".into()));
+                "node-local purge instruction requires SYNC OFF".into(),
+            ));
         }
         let predicate = self
             .predicate

@@ -22,9 +22,14 @@ impl Database {
         // No caller holds the commit boundary here. Serialize samples before
         // capturing their roots so concurrent commits cannot reorder the lines.
         let _emission = EMISSION.lock();
-        let (receipt, lsn, schema_history_charge) = self.with_writer_memory_ownership_receipt_for_test(|receipt| {
-            (receipt, self.tx_mgr.capture_published_read().lsn, self.schema_history_retained_bytes())
-        });
+        let (receipt, lsn, schema_history_charge) = self
+            .with_writer_memory_ownership_receipt_for_test(|receipt| {
+                (
+                    receipt,
+                    self.tx_mgr.capture_published_read().lsn,
+                    self.schema_history_retained_bytes(),
+                )
+            });
         let rss_bytes = current_process_rss_bytes();
         let current_rows_by_table = receipt
             .current_rows_by_table
@@ -191,7 +196,10 @@ impl Database {
             "ddl_log_entries".into(),
             serde_json::json!(receipt.ddl_log_entries),
         );
-        owners.insert("schema_history_charge".into(), serde_json::json!(schema_history_charge));
+        owners.insert(
+            "schema_history_charge".into(),
+            serde_json::json!(schema_history_charge),
+        );
         owners.insert(
             "ddl_log_estimated_bytes".into(),
             serde_json::json!(receipt.ddl_log_estimated_bytes),
@@ -208,11 +216,26 @@ impl Database {
             "pending_schema_stages".into(),
             serde_json::json!(receipt.pending_schema_stages),
         );
-        owners.insert("writer_schema_charge".into(), serde_json::json!(receipt.writer_schema_charge));
-        owners.insert("custody_companion_memo".into(), serde_json::json!(receipt.custody_companion_memo));
-        owners.insert("custody_tenant_mirror".into(), serde_json::json!(receipt.custody_tenant_mirror));
-        owners.insert("pending_lineage_generation_charge".into(), serde_json::json!(receipt.pending_lineage_generation_charge));
-        owners.insert("sink_window_charge".into(), serde_json::json!(receipt.sink_window_charge));
+        owners.insert(
+            "writer_schema_charge".into(),
+            serde_json::json!(receipt.writer_schema_charge),
+        );
+        owners.insert(
+            "custody_companion_memo".into(),
+            serde_json::json!(receipt.custody_companion_memo),
+        );
+        owners.insert(
+            "custody_tenant_mirror".into(),
+            serde_json::json!(receipt.custody_tenant_mirror),
+        );
+        owners.insert(
+            "pending_lineage_generation_charge".into(),
+            serde_json::json!(receipt.pending_lineage_generation_charge),
+        );
+        owners.insert(
+            "sink_window_charge".into(),
+            serde_json::json!(receipt.sink_window_charge),
+        );
         owners.insert(
             "named_owner_total".into(),
             serde_json::json!(receipt.named_owner_total),

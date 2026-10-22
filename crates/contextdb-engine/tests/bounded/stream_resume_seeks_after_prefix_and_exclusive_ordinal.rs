@@ -357,7 +357,8 @@ fn measure_consumer_tail(database: &Database, completed: i64) -> (u64, u64) {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        result.rows(), expected,
+        result.rows(),
+        expected,
         "the batch claim returns only its ordered pending session tail"
     );
     assert_eq!(
@@ -382,7 +383,10 @@ fn measure_consumer_tail(database: &Database, completed: i64) -> (u64, u64) {
         Some("idx_event_search_source_events_session_sequence")
     );
     assert!(discovery.trace().sort_elided);
-    (result.trace().rows_examined, discovery.trace().rows_examined)
+    (
+        result.trace().rows_examined,
+        discovery.trace().rows_examined,
+    )
 }
 #[test]
 fn durable_consumer_reader_child() {

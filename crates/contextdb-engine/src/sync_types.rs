@@ -791,7 +791,10 @@ pub(crate) fn natural_key_from_row_values(
 }
 
 /// Build an identity under the caller's existing projected-answer credit.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn natural_key_from_row_values_admitted(
     meta: &TableMeta,
     values: &HashMap<String, Value>,
@@ -860,7 +863,9 @@ impl std::fmt::Debug for RowChange {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 let mut map = f.debug_map();
                 let mut after: Option<&str> = None;
-                while let Some((key, value)) = self.0.iter()
+                while let Some((key, value)) = self
+                    .0
+                    .iter()
                     .filter(|(key, _)| after.is_none_or(|prior| key.as_str() > prior))
                     .min_by(|(a, _), (b, _)| a.cmp(b))
                 {

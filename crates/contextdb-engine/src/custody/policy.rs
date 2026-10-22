@@ -11,12 +11,15 @@ pub(crate) struct Runtime {
     pub signer: LineageSigner,
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn require_admin(
     db: &Database,
     _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
-        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+    let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
 
     if db.contexts().is_some() || db.scope_labels().is_some() || db.principal().is_some() {
         use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind};
@@ -100,14 +103,17 @@ pub(crate) fn differing_clause(
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn declare(
     db: &Database,
     p: &contextdb_parser::DeclareTenantTablePolicy,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<QueryResultData> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -150,14 +156,17 @@ pub(crate) fn declare(
     Ok(QueryResultData::empty())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn check_binding(
     db: &Database,
     table: &str,
     candidate: &TableMeta,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -186,14 +195,17 @@ pub(crate) fn check_binding(
 }
 
 // DECLARE protects even a name not installed yet.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn check_declared(
     db: &Database,
     table: &str,
     candidate: &TableMeta,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -357,13 +369,16 @@ fn policy_cells(p: &ApplicationTablePolicy) -> Vec<Value> {
     ]
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn show_policy(
     db: &Database,
     table: Option<&str>,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<QueryResultData> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -395,12 +410,15 @@ pub(crate) fn show_policy(
     Ok(result)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn show_bindings(
     db: &Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<QueryResultData> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 

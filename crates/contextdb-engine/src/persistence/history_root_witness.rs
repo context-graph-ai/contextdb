@@ -14,11 +14,18 @@ fn protected(name: &str) -> bool {
         })
         || name == READ_LINEAGE_CONFIG_TABLE.name()
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn corruption(name: &str, reason: impl std::fmt::Display) -> Error {
-    crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), name.strip_prefix("rel_").unwrap_or(name), format_args!(
+    crate::funded_error::corruption_display(
+        crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),
+        name.strip_prefix("rel_").unwrap_or(name),
+        format_args!(
             "historical root witness {reason}; recreate a store without producer witnesses"
-        ))
+        ),
+    )
 }
 fn record(root: Option<[u8; 32]>, incarnation: [u8; 16]) -> [u8; RECORD_BYTES] {
     let mut bytes = [0; RECORD_BYTES];
@@ -63,7 +70,10 @@ fn matches(bytes: &[u8], root: Option<[u8; 32]>) -> bool {
         }
 }
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn begin_history_write(db: &redb::Database) -> Result<redb::WriteTransaction> {
         let write = db.begin_write().map_err(Self::storage_error)?;
         if !write.table_exists(WITNESSES).map_err(Self::storage_error)? {
@@ -73,16 +83,23 @@ impl RedbPersistence {
         Ok(write.with_table_root_hook(Self::historical_root_event))
     }
     pub(super) fn begin_history_write_funded(
-        original: &crate::memory_accounting::OwnedMemoryReservation, db: &redb::Database,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        db: &redb::Database,
     ) -> crate::funded_error::OriginalResult<redb::WriteTransaction> {
         let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
-        let write = db.begin_write().map_err(|error| diagnostic.storage(original, error))?;
-        if !write.table_exists(WITNESSES).map_err(|error| diagnostic.storage(original, error))? {
+        let write = db
+            .begin_write()
+            .map_err(|error| diagnostic.storage(original, error))?;
+        if !write
+            .table_exists(WITNESSES)
+            .map_err(|error| diagnostic.storage(original, error))?
+        {
             // The witness formatter and erasure verifier remain explicit
             // producer gaps; neither is retrospectively charged to Original.
             return Err(diagnostic.error(corruption(WITNESSES.name(), "metadata is absent")));
         }
-        super::erasure_frontiers::verify_in_write(&write).map_err(|error| diagnostic.error(error))?;
+        super::erasure_frontiers::verify_in_write(&write)
+            .map_err(|error| diagnostic.error(error))?;
         Ok(write.with_table_root_hook(Self::historical_root_event))
     }
     pub(super) fn historical_root_event(
@@ -98,7 +115,10 @@ impl RedbPersistence {
         Self::historical_root_event_inner(write, name, event)
             .map_err(|error| redb::StorageError::AdmissionRefused(Box::new(error)))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn historical_root_event_inner(
         write: &redb::WriteTransaction,
         name: &str,
@@ -158,7 +178,10 @@ impl RedbPersistence {
     /// A relation's committed row count, as its producer witness captured it
     /// when the relation last closed: one witness lookup, nothing enumerated.
     /// `None` when the relation has never been witnessed.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn witnessed_row_count_in_read(
         read: &redb::ReadTransaction,
         name: &str,
@@ -178,7 +201,10 @@ impl RedbPersistence {
     }
     /// [`Self::witnessed_row_count_in_read`] inside a write transaction: the
     /// count as of the relation's last close in this transaction or before.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn witnessed_row_count_in_write(
         write: &redb::WriteTransaction,
         name: &str,
@@ -191,12 +217,18 @@ impl RedbPersistence {
             .map(Some)
             .ok_or_else(|| corruption(name, "record is malformed"))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn initialize_history_witnesses(write: &redb::WriteTransaction) -> Result<()> {
         write.open_table(WITNESSES).map_err(Self::storage_error)?;
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn check_history_witness_schema(read: &redb::ReadTransaction) -> Result<()> {
         read.open_table(WITNESSES).map_err(|error| match error {
             redb::TableError::TableDoesNotExist(_) => {
@@ -209,7 +241,10 @@ impl RedbPersistence {
     /// For a read that asks only the canonical tree of an index: whether the
     /// index table's physical root still matches its producer witness. An
     /// absent or malformed witness, and a storage failure, still refuse.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn verify_history_root_canonical(
         read: &redb::ReadTransaction,
         name: &str,
@@ -246,7 +281,10 @@ impl RedbPersistence {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn verify_history_root(read: &redb::ReadTransaction, name: &str) -> Result<()> {
         if !protected(name) {
             return Ok(());
@@ -807,7 +845,10 @@ mod tests {
         assert_eq!(stored[0], 1);
         let incarnation: [u8; 16] = stored[2..18].try_into().unwrap();
         let root: [u8; 32] = stored[18..].try_into().unwrap();
-        assert_eq!(stored.as_slice(), record(Some(root), incarnation).as_slice());
+        assert_eq!(
+            stored.as_slice(),
+            record(Some(root), incarnation).as_slice()
+        );
         assert_eq!(root, physical);
         let length = RedbPersistence::witnessed_row_count_in_read(&read, "rel_fixture")
             .unwrap()
@@ -841,13 +882,22 @@ mod tests {
 
     fn assert_one_span(original: &[u8], mutated: &[u8], start: usize, end: usize) {
         assert_ne!(&original[start..end], &mutated[start..end]);
-        assert!(original.iter().zip(mutated).enumerate().all(|(index, (before, after))| {
-            (index >= start && index < end) || before == after
-        }));
+        assert!(
+            original
+                .iter()
+                .zip(mutated)
+                .enumerate()
+                .all(|(index, (before, after))| {
+                    (index >= start && index < end) || before == after
+                })
+        );
     }
 
     fn assert_canonical_malformed(db: &redb::Database, bytes: &[u8]) {
-        assert!(!valid_record(bytes), "producer predicate must reject this one-field record");
+        assert!(
+            !valid_record(bytes),
+            "producer predicate must reject this one-field record"
+        );
         let read = db.begin_read().unwrap();
         match RedbPersistence::verify_history_root_canonical(&read, "rel_fixture") {
             Err(Error::StoreCorrupted { reason, .. }) => {

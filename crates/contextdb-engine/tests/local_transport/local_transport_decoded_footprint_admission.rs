@@ -7,12 +7,13 @@
 //! read-contract memory ceiling, and require the channel to refuse them with a
 //! typed transport error rather than allocate first and answer later.
 
-use super::wire_fixture_test_support::{encode_message};
+use super::wire_fixture_test_support::encode_message;
 use contextdb_core::Value;
 use contextdb_core::read_contract::{MetadataPage, ReadLimits};
 use contextdb_engine::local_transport::{
     CursorPageResponse, LocalRequest, LocalRequestEnvelope, LocalResponse, LocalTransportError,
-    MAX_FRAME_BYTES, decode_message_exact, };
+    MAX_FRAME_BYTES, decode_message_exact,
+};
 use std::collections::BTreeMap;
 use std::mem::size_of;
 
@@ -276,7 +277,10 @@ fn a_cursor_page_whose_decoded_rows_exceed_the_memory_ceiling_is_refused() {
         Err(error) => error,
     };
     assert!(
-        matches!(error, contextdb_engine::read_contract::ReadEncodingError::MemoryCeilingExceeded { .. }),
+        matches!(
+            error,
+            contextdb_engine::read_contract::ReadEncodingError::MemoryCeilingExceeded { .. }
+        ),
         "an oversized cursor page must be refused with a typed transport error, observed {error:?}"
     );
 }

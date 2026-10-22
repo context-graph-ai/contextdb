@@ -10,7 +10,10 @@ enum RegistrationHandle {
 impl std::ops::Deref for RegistrationHandle {
     type Target = RegistrationCell;
     fn deref(&self) -> &RegistrationCell {
-        match self { Self::Host(cell) => cell, Self::Paid(cell) => cell }
+        match self {
+            Self::Host(cell) => cell,
+            Self::Paid(cell) => cell,
+        }
     }
 }
 struct RegistrationCell {
@@ -25,7 +28,10 @@ struct RegistrationLinks {
     next: Option<RegistrationHandle>,
 }
 #[derive(Clone)]
-pub(super) struct CancellationRegistration { node: RegistrationHandle, owner: Option<ReadMemoryOwner> }
+pub(super) struct CancellationRegistration {
+    node: RegistrationHandle,
+    owner: Option<ReadMemoryOwner>,
+}
 impl std::fmt::Debug for CancellationRegistration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         <OwnerReadCancellation as std::fmt::Debug>::fmt(&self.node.cancellation, f)
@@ -36,21 +42,38 @@ impl CancellationRegistration {
         OwnerReadCancellation::funded_bytes() + ReadPaidArc::<RegistrationCell>::bytes()
     }
     pub(super) fn from_prepaid(owner: ReadMemoryOwner, mut credit: ReadCredit) -> Self {
-        let token = credit.try_split_off(OwnerReadCancellation::funded_bytes())
+        let token = credit
+            .try_split_off(OwnerReadCancellation::funded_bytes())
             .expect("prepaid exact cancellation layout");
         let cancellation = OwnerReadCancellation::from_prepaid(owner.clone(), token);
-        Self { node: RegistrationHandle::Paid(ReadPaidArc::from_prepaid(
-            RegistrationCell { cancellation, links: Mutex::new(RegistrationLinks::default()) }, credit)), owner: Some(owner) }
+        Self {
+            node: RegistrationHandle::Paid(ReadPaidArc::from_prepaid(
+                RegistrationCell {
+                    cancellation,
+                    links: Mutex::new(RegistrationLinks::default()),
+                },
+                credit,
+            )),
+            owner: Some(owner),
+        }
     }
     pub(super) fn host(cancellation: OwnerReadCancellation) -> Self {
-        Self { node: RegistrationHandle::Host(Arc::new(RegistrationCell {
-            cancellation, links: Mutex::new(RegistrationLinks::default()),
-        })), owner: None }
+        Self {
+            node: RegistrationHandle::Host(Arc::new(RegistrationCell {
+                cancellation,
+                links: Mutex::new(RegistrationLinks::default()),
+            })),
+            owner: None,
+        }
     }
     pub(super) fn owner(&self) -> ReadMemoryOwner {
-        self.owner.clone().expect("engine request keeps its original registration owner")
+        self.owner
+            .clone()
+            .expect("engine request keeps its original registration owner")
     }
-    pub(super) fn cancellation(&self) -> OwnerReadCancellation { self.node.cancellation.clone() }
+    pub(super) fn cancellation(&self) -> OwnerReadCancellation {
+        self.node.cancellation.clone()
+    }
     pub(super) fn rearm_standing(&mut self) {
         let RegistrationHandle::Paid(node) = &mut self.node else {
             panic!("standing registration requires original funding");
@@ -73,23 +96,38 @@ pub(super) struct CancellationRegistry {
     snapshots: usize,
 }
 impl CancellationRegistry {
-    pub(super) fn len(&self) -> usize { self.len }
-    pub(super) fn is_empty(&self) -> bool { self.len == 0 }
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+    pub(super) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
     pub(super) fn get(&self, key: &[u8; 16]) -> Option<OwnerReadCancellation> {
         let mut current = self.head.clone();
         while let Some(node) = current {
             let links = node.links.lock().unwrap_or_else(|p| p.into_inner());
-            if links.key == *key && links.retired.is_none() { return Some(node.cancellation.clone()); }
+            if links.key == *key && links.retired.is_none() {
+                return Some(node.cancellation.clone());
+            }
             current = links.next.clone();
         }
         None
     }
-    pub(super) fn contains_key(&self, key: &[u8; 16]) -> bool { self.get(key).is_some() }
+    pub(super) fn contains_key(&self, key: &[u8; 16]) -> bool {
+        self.get(key).is_some()
+    }
     fn advance(&mut self) -> u64 {
-        self.epoch = self.epoch.checked_add(1).expect("cancellation registry epoch exhausted");
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("cancellation registry epoch exhausted");
         self.epoch
     }
-    pub(super) fn insert(&mut self, key: [u8; 16], entry: CancellationRegistration) -> Option<OwnerReadCancellation> {
+    pub(super) fn insert(
+        &mut self,
+        key: [u8; 16],
+        entry: CancellationRegistration,
+    ) -> Option<OwnerReadCancellation> {
         {
             let mut links = entry.node.links.lock().unwrap_or_else(|p| p.into_inner());
             links.key = key;
@@ -118,7 +156,9 @@ impl CancellationRegistry {
     }
     fn sweep(&mut self) -> RetiredRegistrations {
         let mut removed = RetiredRegistrations(None);
-        if self.snapshots != 0 { return removed; }
+        if self.snapshots != 0 {
+            return removed;
+        }
         let mut previous: Option<RegistrationHandle> = None;
         let mut current = self.head.clone();
         while let Some(node) = current {
@@ -126,8 +166,14 @@ impl CancellationRegistry {
             let next = links.next.clone();
             if links.retired.is_some() {
                 if let Some(previous) = &previous {
-                    previous.links.lock().unwrap_or_else(|p| p.into_inner()).next = next.clone();
-                } else { self.head = next.clone(); }
+                    previous
+                        .links
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .next = next.clone();
+                } else {
+                    self.head = next.clone();
+                }
                 links.next = removed.0.take();
                 drop(links);
                 removed.0 = Some(node);
@@ -142,18 +188,28 @@ impl CancellationRegistry {
     /// Snapshot membership is frozen by epoch; removed cells remain invoiced
     /// until every concurrent shutdown snapshot has released its guard.
     fn begin_snapshot(&mut self) -> u64 {
-        self.snapshots = self.snapshots.checked_add(1).expect("registry snapshot count exhausted");
+        self.snapshots = self
+            .snapshots
+            .checked_add(1)
+            .expect("registry snapshot count exhausted");
         self.epoch
     }
-    fn next_at(&self, epoch: u64, after: Option<[u8; 16]>) -> Option<([u8; 16], OwnerReadCancellation)> {
+    fn next_at(
+        &self,
+        epoch: u64,
+        after: Option<[u8; 16]>,
+    ) -> Option<([u8; 16], OwnerReadCancellation)> {
         let mut current = self.head.clone();
         let mut selected: Option<([u8; 16], OwnerReadCancellation)> = None;
         while let Some(node) = current {
             let links = node.links.lock().unwrap_or_else(|p| p.into_inner());
-            if links.born <= epoch && links.retired.is_none_or(|retired| retired > epoch)
+            if links.born <= epoch
+                && links.retired.is_none_or(|retired| retired > epoch)
                 && after.is_none_or(|after| links.key > after)
                 && selected.as_ref().is_none_or(|(key, _)| links.key < *key)
-            { selected = Some((links.key, node.cancellation.clone())); }
+            {
+                selected = Some((links.key, node.cancellation.clone()));
+            }
             current = links.next.clone();
         }
         selected
@@ -163,13 +219,20 @@ pub(super) struct RetiredRegistrations(Option<RegistrationHandle>);
 impl Drop for RetiredRegistrations {
     fn drop(&mut self) {
         while let Some(node) = self.0.take() {
-            self.0 = node.links.lock().unwrap_or_else(|p| p.into_inner()).next.take();
+            self.0 = node
+                .links
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .next
+                .take();
             drop(node);
         }
     }
 }
 impl Drop for CancellationRegistry {
-    fn drop(&mut self) { drop(RetiredRegistrations(self.head.take())); }
+    fn drop(&mut self) {
+        drop(RetiredRegistrations(self.head.take()));
+    }
 }
 pub(super) struct CancellationRegistrySnapshot<'a> {
     registry: &'a Mutex<CancellationRegistry>,
@@ -178,16 +241,29 @@ pub(super) struct CancellationRegistrySnapshot<'a> {
 }
 impl<'a> CancellationRegistrySnapshot<'a> {
     pub(super) fn new(registry: &'a Mutex<CancellationRegistry>) -> Self {
-        let epoch = registry.lock().expect("owner cancellation registry").begin_snapshot();
-        Self { registry, epoch, after: None }
+        let epoch = registry
+            .lock()
+            .expect("owner cancellation registry")
+            .begin_snapshot();
+        Self {
+            registry,
+            epoch,
+            after: None,
+        }
     }
 }
 impl Iterator for CancellationRegistrySnapshot<'_> {
     type Item = OwnerReadCancellation;
     fn next(&mut self) -> Option<Self::Item> {
-        let selected = self.registry.lock().expect("owner cancellation registry")
+        let selected = self
+            .registry
+            .lock()
+            .expect("owner cancellation registry")
             .next_at(self.epoch, self.after);
-        selected.map(|(key, token)| { self.after = Some(key); token })
+        selected.map(|(key, token)| {
+            self.after = Some(key);
+            token
+        })
     }
 }
 impl Drop for CancellationRegistrySnapshot<'_> {

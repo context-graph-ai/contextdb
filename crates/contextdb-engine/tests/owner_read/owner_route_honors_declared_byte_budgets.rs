@@ -18,7 +18,7 @@
 //! publish the same bytes, and a payload that really is over the declared
 //! budget still refuses by naming that budget.
 
-use super::wire_fixture_test_support::{encode_cursor_page};
+use super::wire_fixture_test_support::encode_cursor_page;
 use contextdb_core::read_contract::{
     OwnerReadLimits, ReadFailureKind, ReadFailureLimit, ReadLimits, ReadRoute,
 };
@@ -211,11 +211,7 @@ fn a_cursor_page_inside_the_declared_page_budget_is_served_over_the_owner_route(
     let over_the_channel = {
         let session = owner_session(&owner_runtime, &path);
         let cursor = session.open_cursor(SELECT_WIDE, &HashMap::new());
-        cursor.map(|cursor| {
-            cursor
-                .first_page()
-                .clone()
-        })
+        cursor.map(|cursor| cursor.first_page().clone())
     };
 
     drop(database);
@@ -276,7 +272,8 @@ fn a_metadata_answer_inside_the_declared_result_budget_is_served_over_the_owner_
         session
             .metadata(MetadataRequest::Tables, None)
             .expect("the committed file answers the table inventory")
-            .body.clone()
+            .body
+            .clone()
     };
 
     let published = inventory_bytes(&from_the_file);

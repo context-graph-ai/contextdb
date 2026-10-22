@@ -124,14 +124,21 @@ impl GraphStore {
         source: Arc<dyn GraphReadSource>,
         control: contextdb_tx::SourceCharge,
     ) -> Self {
-        Self { source: Some(source), _source_control: Some(control), ..Self::new() }
+        Self {
+            source: Some(source),
+            _source_control: Some(control),
+            ..Self::new()
+        }
     }
 
     pub fn is_source_backed(&self) -> bool {
         self.source.is_some()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn capture_source(
         &self,
         snapshot: SnapshotId,
@@ -148,7 +155,10 @@ impl GraphStore {
     /// Visit one version at a time; false stops at the current window. This
     /// helper never collects adjacency, and an identity query seeks only that
     /// identity in the durable implementation.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn visit_edges(
         &self,
         root: Option<&Arc<dyn GraphSnapshot>>,
@@ -158,7 +168,10 @@ impl GraphStore {
         self.visit_edges_with_owner(root, query, |entry, _| visit(entry))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn visit_edges_with_owner(
         &self,
         root: Option<&Arc<dyn GraphSnapshot>>,
@@ -176,14 +189,16 @@ impl GraphStore {
         }
         if self.is_source_backed() {
             return Err(contextdb_core::Error::Other(
-                "graph read requires a captured source root".into()));
+                "graph read requires a captured source root".into(),
+            ));
         }
         let adjacency = match query.direction {
             Direction::Outgoing => &self.forward_adj,
             Direction::Incoming => &self.reverse_adj,
             Direction::Both => {
                 return Err(contextdb_core::Error::Other(
-                    "graph cursor requires one direction".into()));
+                    "graph cursor requires one direction".into(),
+                ));
             }
         };
         let entries = adjacency.read();
@@ -207,7 +222,10 @@ impl GraphStore {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn visit_row_edges(
         &self,
         root: Option<&Arc<dyn GraphSnapshot>>,
@@ -220,7 +238,8 @@ impl GraphStore {
             while let Some(window) = cursor.next_edge()? {
                 if window.row_owner() != Some(owner) {
                     return Err(contextdb_core::Error::Other(
-                        "row graph cursor returned another owner".into()));
+                        "row graph cursor returned another owner".into(),
+                    ));
                 }
                 if !visit(window.edge())? {
                     break;
@@ -230,18 +249,21 @@ impl GraphStore {
         }
         if self.is_source_backed() {
             return Err(contextdb_core::Error::Other(
-                "graph read requires a captured source root".into()));
+                "graph read requires a captured source root".into(),
+            ));
         }
         let Some((other, edge_type)) = query.identity else {
             return Err(contextdb_core::Error::Other(
-                "row graph lookup requires its complete edge identity".into()));
+                "row graph lookup requires its complete edge identity".into(),
+            ));
         };
         let incoming = match query.direction {
             Direction::Incoming => true,
             Direction::Outgoing => false,
             Direction::Both => {
                 return Err(contextdb_core::Error::Other(
-                    "graph cursor requires one direction".into()));
+                    "graph cursor requires one direction".into(),
+                ));
             }
         };
         let adjacency = if incoming {

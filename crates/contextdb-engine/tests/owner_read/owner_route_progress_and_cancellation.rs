@@ -838,7 +838,10 @@ fn cancellation_received_before_owner_cursor_page_publication_withdraws_and_repl
         handshake,
         timeouts,
         Arc::clone(&clock),
-        database.declared_reader_memory().expect("original reader owner").into(),
+        database
+            .declared_reader_memory()
+            .expect("original reader owner")
+            .into(),
     ))
     .expect("connect through the observed owner carrier");
     let limits = one_row_page_reader_options().limits;
@@ -1125,7 +1128,9 @@ impl DeadlineClock for PublicationCommitWaitClock {
                 && *self.authorizing_thread.lock().unwrap() == Some(std::thread::current().id())
                 && !self.announced.swap(true, Ordering::SeqCst)
             {
-                self.waiting.send(()).expect("actual erasure-gate timer poll");
+                self.waiting
+                    .send(())
+                    .expect("actual erasure-gate timer poll");
             }
             Poll::Pending
         }))
@@ -1171,7 +1176,8 @@ impl OwnerServicePublicationObserver for WriterContendedPublicationObserver {
     }
 
     fn cancellation_received(&self, request_ordinal: u64) {
-        self.cancelled_request.store(request_ordinal, Ordering::SeqCst);
+        self.cancelled_request
+            .store(request_ordinal, Ordering::SeqCst);
     }
 
     fn cursor_page_published(&self, _request_ordinal: u64) {
@@ -1268,7 +1274,10 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
             response_ms: 60_000,
         },
         clock,
-        database.declared_reader_memory().expect("original reader owner").into(),
+        database
+            .declared_reader_memory()
+            .expect("original reader owner")
+            .into(),
     ))
     .unwrap();
     let limits = one_row_page_reader_options().limits;
@@ -1322,34 +1331,53 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
             writer_database.arm_authoritative_purge_point_remove_persistence_failure_for_test();
         }
         writer_database.execute(
-            if is_purge { "PURGE FROM publication_wait_rows WHERE id = 2" }
-            else { "INSERT INTO publication_wait_rows VALUES (4)" },
+            if is_purge {
+                "PURGE FROM publication_wait_rows WHERE id = 2"
+            } else {
+                "INSERT INTO publication_wait_rows VALUES (4)"
+            },
             &HashMap::new(),
         )
     });
     if let Some(park) = &purge_park {
-        park.parked.recv_timeout(Duration::from_secs(5))
+        park.parked
+            .recv_timeout(Duration::from_secs(5))
             .expect("real purge owns publication fences and erasure gate before durability");
     } else {
-        assert!(pause.as_ref().unwrap().wait_until_reached(Duration::from_secs(5)),
-            "ordinary writer pauses while holding commit lock");
+        assert!(
+            pause
+                .as_ref()
+                .unwrap()
+                .wait_until_reached(Duration::from_secs(5)),
+            "ordinary writer pauses while holding commit lock"
+        );
     }
     observer.resume.wait();
     if is_purge {
-        waiting_rx.recv_timeout(Duration::from_secs(5))
+        waiting_rx
+            .recv_timeout(Duration::from_secs(5))
             .expect("authorizing worker actually polls its pending erasure-gate timer");
     }
     if contention == PublicationContention::SuccessfulPurge {
         purge_park.as_ref().unwrap().resume.send(()).unwrap();
-        writer.join().unwrap().expect("successful purge commits authoritative erasure");
+        writer
+            .join()
+            .unwrap()
+            .expect("successful purge commits authoritative erasure");
         let (mut client, result) = answered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(matches!(&result,
+        assert!(
+            matches!(&result,
             Err(OwnerReadScaffoldError::Database(Error::ReadFailure(failure)))
             | Err(OwnerReadScaffoldError::Refused(failure))
                 if failure.kind() == contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure),
-            "a successful purge forbids publication or replay of erased bytes: {result:?}");
+            "a successful purge forbids publication or replay of erased bytes: {result:?}"
+        );
         fetch.join().unwrap();
-        block_on(client.request(LocalRequestEnvelope { limits, request: LocalRequest::OwnerStatus })).unwrap();
+        block_on(client.request(LocalRequestEnvelope {
+            limits,
+            request: LocalRequest::OwnerStatus,
+        }))
+        .unwrap();
         assert_eq!(observer.published.load(Ordering::SeqCst), 0);
         let erased_resources = service.resources();
         assert_eq!(erased_resources.active_cancellations, 0);
@@ -1357,13 +1385,31 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
         assert_eq!(erased_resources.cursor_count, 0);
         assert_eq!(erased_resources.cursor_retained_bytes, 0);
         assert_eq!(erased_resources.buffered_bytes, 0);
-        assert!(database.execute("SELECT id FROM publication_wait_rows WHERE id = 2", &HashMap::new()).unwrap().rows().is_empty());
+        assert!(
+            database
+                .execute(
+                    "SELECT id FROM publication_wait_rows WHERE id = 2",
+                    &HashMap::new()
+                )
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
         drop(client);
         service.shutdown_and_drain().unwrap();
         database.close().unwrap();
         let reopened = Database::open(&path).unwrap();
-        assert_eq!(reopened.execute("SELECT id FROM publication_wait_rows ORDER BY id", &HashMap::new()).unwrap().rows(),
-            vec![vec![Value::Int64(1)], vec![Value::Int64(3)]], "successful purge remains erased after reopen");
+        assert_eq!(
+            reopened
+                .execute(
+                    "SELECT id FROM publication_wait_rows ORDER BY id",
+                    &HashMap::new()
+                )
+                .unwrap()
+                .rows(),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(3)]],
+            "successful purge remains erased after reopen"
+        );
         reopened.close().unwrap();
         return;
     }
@@ -1372,28 +1418,70 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
     }
     // Cancellation must answer while the purge still holds its gate. The
     // ordinary writer control must publish while its commit lock stays held.
-    let (mut client, result) = answered_rx.recv_timeout(Duration::from_secs(5))
+    let (mut client, result) = answered_rx
+        .recv_timeout(Duration::from_secs(5))
         .expect("answer arrives before releasing the contending writer/purge");
-    block_on(client.request(LocalRequestEnvelope { limits, request: LocalRequest::OwnerStatus })).unwrap();
+    block_on(client.request(LocalRequestEnvelope {
+        limits,
+        request: LocalRequest::OwnerStatus,
+    }))
+    .unwrap();
     assert_eq!(service.resources().active_cancellations, 0);
     if contention == PublicationContention::FailedPurgeCancellation {
-        assert!(matches!(&result, Err(OwnerReadScaffoldError::Database(Error::ReadCancelled))),
-            "real channel cancellation retains its typed refusal: {result:?}");
-        assert_eq!(observer.cancelled_request.load(Ordering::SeqCst), observer.request.load(Ordering::SeqCst));
+        assert!(
+            matches!(
+                &result,
+                Err(OwnerReadScaffoldError::Database(Error::ReadCancelled))
+            ),
+            "real channel cancellation retains its typed refusal: {result:?}"
+        );
+        assert_eq!(
+            observer.cancelled_request.load(Ordering::SeqCst),
+            observer.request.load(Ordering::SeqCst)
+        );
         assert_ne!(observer.request.load(Ordering::SeqCst), 0);
         assert_eq!(observer.published.load(Ordering::SeqCst), 0);
         assert_eq!(service.resources().cursor_count, 1);
         purge_park.as_ref().unwrap().resume.send(()).unwrap();
-        let error = writer.join().unwrap().expect_err("armed real purge must fail and roll back");
-        assert!(error.to_string().contains("authoritative purge point-remove persistence failure injected"),
-            "failure comes from the intended durable transaction: {error}");
+        let error = writer
+            .join()
+            .unwrap()
+            .expect_err("armed real purge must fail and roll back");
+        assert!(
+            error
+                .to_string()
+                .contains("authoritative purge point-remove persistence failure injected"),
+            "failure comes from the intended durable transaction: {error}"
+        );
         let replay = block_on(client.request(LocalRequestEnvelope {
-            limits, request: LocalRequest::CursorFetch { cursor_id, rows: None },
-        })).expect("same cursor replays only after failed purge rollback");
-        let [LocalResponse::CursorPage { page }] = replay.as_slice() else { panic!("one replay page"); };
-        assert_eq!(one_page_id(decode_cursor_page(&page.payload).unwrap().rows()), 2);
-        assert_eq!(database.execute("SELECT id FROM publication_wait_rows ORDER BY id", &HashMap::new()).unwrap().rows(),
-            vec![vec![Value::Int64(1)], vec![Value::Int64(2)], vec![Value::Int64(3)]]);
+            limits,
+            request: LocalRequest::CursorFetch {
+                cursor_id,
+                rows: None,
+            },
+        }))
+        .expect("same cursor replays only after failed purge rollback");
+        let [LocalResponse::CursorPage { page }] = replay.as_slice() else {
+            panic!("one replay page");
+        };
+        assert_eq!(
+            one_page_id(decode_cursor_page(&page.payload).unwrap().rows()),
+            2
+        );
+        assert_eq!(
+            database
+                .execute(
+                    "SELECT id FROM publication_wait_rows ORDER BY id",
+                    &HashMap::new()
+                )
+                .unwrap()
+                .rows(),
+            vec![
+                vec![Value::Int64(1)],
+                vec![Value::Int64(2)],
+                vec![Value::Int64(3)]
+            ]
+        );
     } else {
         pause.as_ref().unwrap().release();
         writer.join().unwrap().expect("ordinary writer succeeds");
@@ -1401,7 +1489,10 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
         let [LocalResponse::CursorPage { page }] = responses.as_slice() else {
             panic!("exactly one successful page: {responses:?}");
         };
-        assert_eq!(one_page_id(decode_cursor_page(&page.payload).unwrap().rows()), 2);
+        assert_eq!(
+            one_page_id(decode_cursor_page(&page.payload).unwrap().rows()),
+            2
+        );
     }
     fetch.join().unwrap();
     // A status exchange is an ordering fence after page publication and guard
@@ -1457,20 +1548,41 @@ fn owner_cursor_publication_beside_a_paused_writer(contention: PublicationConten
     database.close().unwrap();
     let reopened = Database::open(&path).unwrap();
     let expected = if contention == PublicationContention::OrdinaryWriter {
-        vec![vec![Value::Int64(1)], vec![Value::Int64(2)], vec![Value::Int64(3)], vec![Value::Int64(4)]]
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+            vec![Value::Int64(4)],
+        ]
     } else {
-        vec![vec![Value::Int64(1)], vec![Value::Int64(2)], vec![Value::Int64(3)]]
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]
     };
-    assert_eq!(reopened.execute("SELECT id FROM publication_wait_rows ORDER BY id", &HashMap::new()).unwrap().rows(),
-        expected, "failed purge publishes no durable erasure; ordinary commit stays durable");
+    assert_eq!(
+        reopened
+            .execute(
+                "SELECT id FROM publication_wait_rows ORDER BY id",
+                &HashMap::new()
+            )
+            .unwrap()
+            .rows(),
+        expected,
+        "failed purge publishes no durable erasure; ordinary commit stays durable"
+    );
     reopened.close().unwrap();
 }
 
 #[cfg(unix)]
 #[test]
 fn owner_channel_cursor_publication_is_not_held_by_a_paused_writer() {
-    for contention in [PublicationContention::OrdinaryWriter,
-        PublicationContention::FailedPurgeCancellation, PublicationContention::SuccessfulPurge] {
+    for contention in [
+        PublicationContention::OrdinaryWriter,
+        PublicationContention::FailedPurgeCancellation,
+        PublicationContention::SuccessfulPurge,
+    ] {
         owner_cursor_publication_beside_a_paused_writer(contention);
     }
 }

@@ -13,7 +13,10 @@ pub(crate) struct RetainedCommitDirectory {
 }
 
 impl RetainedCommitDirectory {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn new(
         source: RetainedReadSource,
         bounds: &ReadHistoryOnRequest,
@@ -116,7 +119,10 @@ struct OpenEndpointProof<'a, 'operation> {
 }
 
 impl RetainedCommitDirectory {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn get_value(
         &self,
         lsn: Lsn,
@@ -201,7 +207,10 @@ impl ReadCommitDirectory for RetainedCommitDirectory {
     fn get(&self, lsn: Lsn, context: &ReadCommitContext<'_>) -> Result<Option<TxId>> {
         self.get_value(lsn, context, None)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn floor(
         &self,
         upper: Bound<Lsn>,
@@ -213,7 +222,10 @@ impl ReadCommitDirectory for RetainedCommitDirectory {
             })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn census(&self, context: &ReadCommitContext<'_>) -> Result<(usize, Lsn)> {
         context.checkpoint()?;
         #[cfg(any(test, feature = "test-seams"))]
@@ -223,7 +235,10 @@ impl ReadCommitDirectory for RetainedCommitDirectory {
         Ok((self.count, self.first.map_or(Lsn(0), |(lsn, _)| lsn)))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn cursor(
         &self,
         lower: Bound<Lsn>,
@@ -284,7 +299,10 @@ struct RetainedCommitCursor {
 }
 
 impl RetainedCommitCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn finish(&mut self, context: &ReadCommitContext<'_>) -> Result<Option<(Lsn, TxId)>> {
         context.checkpoint()?;
         if self.complete_range {
@@ -309,7 +327,10 @@ impl RetainedCommitCursor {
 }
 
 impl ReadCommitCursor for RetainedCommitCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next_entry(&mut self, context: &ReadCommitContext<'_>) -> Result<Option<(Lsn, TxId)>> {
         context.checkpoint()?;
         self.source

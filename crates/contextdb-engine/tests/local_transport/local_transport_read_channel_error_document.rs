@@ -15,7 +15,7 @@
 //! a declared memory ceiling; and a class the channel has no tag for still
 //! arrives carrying its name and its words.
 
-use super::wire_fixture_test_support::{encode_message};
+use super::wire_fixture_test_support::encode_message;
 use contextdb_core::read_contract::{
     OwnerLimitExceededDetail, ReadFailure, ReadFailureDetail, ReadFailureKind, ReadFailureLimit,
     ReadLimits,
@@ -23,14 +23,14 @@ use contextdb_core::read_contract::{
 use contextdb_core::types::{ContextId, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
 use contextdb_core::{Error, VectorPartitionDeclarationIssue};
 use contextdb_engine::local_transport::{
-    ALL_TAGS, BodyField, ReadChannelError, TAG_ACL_DENIED,
-    TAG_BFS_DEPTH_EXCEEDED, TAG_BFS_VISITED_EXCEEDED, TAG_COLUMN_NOT_FOUND,
-    TAG_INVALID_VECTOR_PARTITION_DECLARATION, TAG_MEMORY_BUDGET_EXCEEDED, TAG_READ_CANCELLED,
-    TAG_SCOPE_LABEL_VIOLATION, TAG_TABLE_NOT_FOUND, TAG_UNKNOWN,
-    TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER, TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
+    ALL_TAGS, BodyField, ReadChannelError, TAG_ACL_DENIED, TAG_BFS_DEPTH_EXCEEDED,
+    TAG_BFS_VISITED_EXCEEDED, TAG_COLUMN_NOT_FOUND, TAG_INVALID_VECTOR_PARTITION_DECLARATION,
+    TAG_MEMORY_BUDGET_EXCEEDED, TAG_READ_CANCELLED, TAG_SCOPE_LABEL_VIOLATION, TAG_TABLE_NOT_FOUND,
+    TAG_UNKNOWN, TAG_USE_VECTOR_REQUIRES_VECTOR_ORDER, TAG_VECTOR_EXACT_SEARCH_BUDGET_EXCEEDED,
     TAG_VECTOR_FILTERED_ROUTE_UNAVAILABLE, TAG_VECTOR_INDEXED_ROUTE_UNAVAILABLE,
     TAG_VECTOR_PARTITION_LIMIT_EXCEEDED, TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, body_grammar,
-    decode_message_exact, };
+    decode_message_exact,
+};
 use std::collections::BTreeSet;
 
 /// The ceiling a caller declares for an ordinary exchange in these proofs.

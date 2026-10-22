@@ -242,7 +242,8 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
         "the reopened writable IN walk examines exactly its delivered postings"
     );
     assert_eq!(
-        writer_answer.result.trace().rows_examined, writer_delivered,
+        writer_answer.result.trace().rows_examined,
+        writer_delivered,
         "the reopened writable IN walk examines exactly its delivered rows"
     );
     writer_reopened.close().unwrap();
@@ -369,7 +370,8 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
     // Proving the route first is what keeps the rest from reporting a clean
     // bill on a branch it never entered.
     assert_eq!(
-        outcome.result.trace().physical_plan, "IndexScan",
+        outcome.result.trace().physical_plan,
+        "IndexScan",
         "a listed-value predicate is answered through the declared index"
     );
     assert_eq!(
@@ -481,7 +483,8 @@ fn a_listed_value_read_walks_the_run_each_value_names() {
         "a short IN query owes no index entry from the following unselected prefix"
     );
     assert_eq!(
-        after.result.trace().rows_examined, control.result.trace().rows_examined,
+        after.result.trace().rows_examined,
+        control.result.trace().rows_examined,
         "the same selected runs examine the same rows after another prefix is appended"
     );
     durable.close().unwrap();

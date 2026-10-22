@@ -396,7 +396,12 @@ fn inspected(db: &Database, name: &str) -> String {
         .columns()
         .iter()
         .position(|column| column == name)
-        .unwrap_or_else(|| panic!("SHOW VECTOR_PARTITIONS exposes {name}: {:?}", shown.columns()));
+        .unwrap_or_else(|| {
+            panic!(
+                "SHOW VECTOR_PARTITIONS exposes {name}: {:?}",
+                shown.columns()
+            )
+        });
     assert_eq!(shown.rows().len(), 1, "one partition");
     match &shown.rows()[0][position] {
         Value::Text(value) => value.clone(),

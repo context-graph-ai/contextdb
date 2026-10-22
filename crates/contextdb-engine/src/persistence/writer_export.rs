@@ -4,7 +4,10 @@ use super::*;
 use std::ops::Bound;
 
 impl WriterSnapshot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_config_into(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -13,14 +16,23 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).copy_config_into(owner, artifact)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_authored_into(
-        self: &Arc<Self>, owner: SourceWindowOwner, artifact: &RedbPersistence, through: Lsn,
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
+        artifact: &RedbPersistence,
+        through: Lsn,
     ) -> Result<()> {
         WriterSnapshotHandle::from(self.clone()).copy_authored_into(owner, artifact, through)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_ddl_into(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -32,7 +44,10 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_config_into(
         &self,
         owner: SourceWindowOwner,
@@ -59,32 +74,59 @@ impl WriterSnapshotHandle {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_authored_into(
-        &self, owner: SourceWindowOwner, artifact: &RedbPersistence, through: Lsn,
+        &self,
+        owner: SourceWindowOwner,
+        artifact: &RedbPersistence,
+        through: Lsn,
     ) -> Result<()> {
         let read = self.owner_read()?;
-        let witnessed = RedbPersistence::witnessed_row_count_in_read(&read, super::authored_history::BODIES.name())?;
-        if read.normal_table_root(super::authored_history::BODIES.name()).map_err(RedbPersistence::storage_error)?.is_none() && witnessed.is_none() { return Ok(()); }
+        let witnessed = RedbPersistence::witnessed_row_count_in_read(
+            &read,
+            super::authored_history::BODIES.name(),
+        )?;
+        if read
+            .normal_table_root(super::authored_history::BODIES.name())
+            .map_err(RedbPersistence::storage_error)?
+            .is_none()
+            && witnessed.is_none()
+        {
+            return Ok(());
+        }
         RedbPersistence::verify_history_root(&read, super::authored_history::BODIES.name())?;
-        let mut cursor = self.cursor(owner, super::authored_history::BODIES.name(),
-            writer_source::WriterCursorFamily::Text, Bound::Unbounded, Bound::Unbounded, false)?;
+        let mut cursor = self.cursor(
+            owner,
+            super::authored_history::BODIES.name(),
+            writer_source::WriterCursorFamily::Text,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            false,
+        )?;
         while let Some(window) = cursor.next(|_, bytes| {
             let row = RedbPersistence::decode_versioned_row(bytes, None)?;
             crate::read_image_memory::reserve(bytes.len())?;
             Ok((row.lsn <= through).then(|| bytes.to_vec()))
         })? {
             if let Some(bytes) = &window.value {
-                let key = std::str::from_utf8(window.position()).map_err(|_| Error::StoreCorrupted {
-                    path: "authored history".into(), reason: "invalid occurrence key".into(),
-                })?;
+                let key =
+                    std::str::from_utf8(window.position()).map_err(|_| Error::StoreCorrupted {
+                        path: "authored history".into(),
+                        reason: "invalid occurrence key".into(),
+                    })?;
                 artifact.append_encoded_authored_occurrence(key, bytes)?;
             }
         }
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_ddl_into(
         &self,
         owner: SourceWindowOwner,
@@ -137,35 +179,66 @@ impl WriterSnapshotHandle {
 }
 
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn append_authored_row(&self, table: &str, meta: &TableMeta, row: &VersionedRow) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn append_authored_row(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        row: &VersionedRow,
+    ) -> Result<()> {
         self.prepare_proof_owner()?;
         let _decode = self.writer_decode_scope()?;
         let mut paid = self.proof_admission();
-        paid.admit(row.estimated_bytes().saturating_mul(4).saturating_add(table.len().saturating_mul(2)).saturating_add(256))?;
+        paid.admit(
+            row.estimated_bytes()
+                .saturating_mul(4)
+                .saturating_add(table.len().saturating_mul(2))
+                .saturating_add(256),
+        )?;
         let key = super::authored_history::body_key(table, &Self::rel_row_key(row));
         let encoded = Self::encode_versioned_row(row, Some(meta))?;
         self.append_encoded_authored_occurrence(&key, &encoded)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn append_encoded_authored_occurrence(&self, key: &str, encoded: &[u8]) -> Result<()> {
         self.prepare_proof_owner()?;
         let _decode = self.writer_decode_scope()?;
         let mut paid = self.proof_admission();
-        paid.admit(key.len().saturating_add(encoded.len().saturating_mul(8)).saturating_add(256))?;
+        paid.admit(
+            key.len()
+                .saturating_add(encoded.len().saturating_mul(8))
+                .saturating_add(256),
+        )?;
         let row = Self::decode_versioned_row(encoded, None)?;
         self.with_db(|db| {
             let write = Self::begin_history_write(db)?;
-            write.open_table(super::authored_history::BODIES).map_err(Self::storage_error)?
-                .insert(key, encoded).map_err(Self::storage_error)?;
-            Self::raise_noncanonical_writer_floors_in_write(&write, row.created_tx.max(row.deleted_tx.unwrap_or(TxId(0))), row.lsn, row.row_id)?;
+            write
+                .open_table(super::authored_history::BODIES)
+                .map_err(Self::storage_error)?
+                .insert(key, encoded)
+                .map_err(Self::storage_error)?;
+            Self::raise_noncanonical_writer_floors_in_write(
+                &write,
+                row.created_tx.max(row.deleted_tx.unwrap_or(TxId(0))),
+                row.lsn,
+                row.row_id,
+            )?;
             Self::write_writer_recovery_bounds_in_write(&write, None)?;
             write.commit().map_err(Self::storage_error)
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn append_encoded_config_occurrence(&self, key: &str, encoded: &[u8]) -> Result<()> {
         self.prepare_proof_owner()?;
         let mut admission = self.proof_admission();
@@ -201,7 +274,10 @@ impl RedbPersistence {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn append_ddl_occurrence(&self, key: &str, lsn: Lsn, change: &DdlChange) -> Result<()> {
         self.prepare_proof_owner()?;
         let mut admission = self.proof_admission();
@@ -220,7 +296,9 @@ impl RedbPersistence {
         }
         let mut length = Counter(0);
         bincode::serde::encode_into_std_write(change, &mut length, bincode::config::standard())
-            .map_err(|error| Error::Other((format!("declaration encoding failed: {error}")).into()))?;
+            .map_err(|error| {
+                Error::Other((format!("declaration encoding failed: {error}")).into())
+            })?;
         admission.admit(
             length
                 .0

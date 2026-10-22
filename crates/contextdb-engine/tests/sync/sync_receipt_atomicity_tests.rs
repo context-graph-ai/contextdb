@@ -47,7 +47,9 @@ struct RejectSyncedCommit;
 impl DatabasePlugin for RejectSyncedCommit {
     fn pre_commit(&self, _ws: &WriteSet, source: CommitSource) -> contextdb_core::Result<()> {
         if source == CommitSource::SyncPull {
-            return Err(Error::Other("injected synced-commit failure".to_string().into()));
+            return Err(Error::Other(
+                "injected synced-commit failure".to_string().into(),
+            ));
         }
         Ok(())
     }

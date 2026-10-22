@@ -928,7 +928,8 @@ fn embedded_and_bounded_owner_reads_share_quarantine_and_resource_failure_truth(
         );
     }
     assert_eq!(
-        embedded.rows(), bounded.rows(),
+        embedded.rows(),
+        bounded.rows(),
         "embedded and bounded owner reads publish one snapshot-derived lifecycle projection"
     );
 

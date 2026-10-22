@@ -1,6 +1,9 @@
 use contextdb_core::*;
 use std::collections::HashSet;
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn charged_bfs_bytes<T>(capacity: usize) -> Result<usize> {
     if capacity == 0 {
         return Ok(0);
@@ -10,7 +13,10 @@ pub(super) fn charged_bfs_bytes<T>(capacity: usize) -> Result<usize> {
         .and_then(|bytes| bytes.checked_add(16))
         .ok_or_else(|| Error::Other("graph storage size overflow".into()))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn charged_bfs_admit(
     credit: &mut contextdb_core::read_memory::ReadCredit,
     bytes: usize,
@@ -22,7 +28,10 @@ pub(super) fn charged_bfs_admit(
         "Raise the declared reader memory limit.",
     )
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn charged_bfs_vec_space<T>(
     values: &mut Vec<T>,
     credit: &mut contextdb_core::read_memory::ReadCredit,
@@ -61,7 +70,10 @@ pub(super) fn charged_bfs_vec_space<T>(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn charged_bfs_visit(
     visited: &mut HashSet<NodeId>,
     node: NodeId,

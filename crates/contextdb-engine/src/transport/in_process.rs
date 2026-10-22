@@ -512,7 +512,9 @@ pub(crate) mod native_serving {
         Ok(ReadShared::try_from_prepaid_with(invoice, make)?)
     }
 
-    use crate::local_transport::native_driver::{NativeCallerWake as NativeInProcessWake, NativeCallerPark as NativeInProcessPark};
+    use crate::local_transport::native_driver::{
+        NativeCallerPark as NativeInProcessPark, NativeCallerWake as NativeInProcessWake,
+    };
 
     pub(super) struct Mailbox {
         routes: ReadShared<super::super::native_wire::NativeWireRoutes>,

@@ -89,7 +89,10 @@ pub(super) enum DdlReplay {
     },
 }
 impl DdlReplay {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn peek_lsn(&mut self) -> Result<Option<Lsn>> {
         match self {
             Self::Empty => Ok(None),
@@ -119,7 +122,10 @@ impl DdlReplay {
             }
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_occurrence(&mut self) -> Result<Option<DdlReplayEntry>> {
         match self {
             Self::Empty => Ok(None),
@@ -158,7 +164,10 @@ pub(super) struct DdlReplayEntry {
 }
 
 impl ChangeReplay {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_entry(&mut self) -> Result<Option<ChangeReplayEntry>> {
         match self {
             Self::Durable(cursor) => Ok(cursor.next_change()?.map(|window| {
@@ -244,7 +253,10 @@ pub(super) fn suspend_root_for_manager(
 
 /// Preserve the consumer's typed refusal across the storage callback's shared
 /// core-error boundary; the private sentinel never reaches the caller.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn next_window_with_work<T: Send, E: From<Error>>(
     cursor: &mut dyn contextdb_relational::source::RelationalCursor<T>,
     before: &mut dyn FnMut() -> std::result::Result<(), E>,
@@ -285,7 +297,8 @@ pub(super) fn visible_row_with_work<E: From<Error>>(
 > {
     if snapshot.0 > source.snapshot().0 {
         return Err(E::from(Error::Other(
-            "relational snapshot exceeds the captured source frontier".into())));
+            "relational snapshot exceeds the captured source frontier".into(),
+        )));
     }
     let mut cursor = source
         .row_id_cursor(table, row_id, snapshot)
@@ -347,7 +360,10 @@ impl Database {
 
     /// Reconcile an indexed plan input against this operation's captured root.
     /// No successful plan output may depend on whether this input was pulled.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn preflight_historical_index<E: From<Error>>(
         &self,
         table: &str,
@@ -390,12 +406,8 @@ impl Database {
         if snapshot == root.snapshot {
             return Ok(());
         }
-        let source =
-            self.statement_relational_source_at_snapshot(
-                root,
-                read_memory,
-                snapshot,
-            )
+        let source = self
+            .statement_relational_source_at_snapshot(root, read_memory, snapshot)
             .map_err(E::from)?;
         let mut refusal = None;
         let result = source.historical_index_preflight(table, index, snapshot, &mut || {
@@ -412,7 +424,10 @@ impl Database {
 
     /// Retain a selected immutable staged row before touching its committed
     /// predecessor. Legacy plugin rows use a prepaid, revalidated copy.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_staged_row_matching(
         &self,
         tx: TxId,
@@ -428,63 +443,78 @@ impl Database {
         let root = self.writer_read_root()?.ok_or_else(|| {
             Error::Other("staged writer lookup requires its captured root".into())
         })?;
-        let source = self.statement_relational_source(
-            root,
-            read_memory.clone(),
-        )?;
+        let source = self.statement_relational_source(root, read_memory.clone())?;
         let mut before = usize::MAX;
         loop {
             let selected = if matches!(&self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
                 self.tx_mgr.with_read(tx, |read| {
-                    for (position, (name, row)) in read.relational_inserts.iter().enumerate().rev() {
-                        if name != table || position >= before || !matches(row) { continue; }
-                        if read.relational_inserts[position + 1..].iter()
-                            .any(|(name, newer)| name == table && newer.row_id == row.row_id) { continue; }
-                        let deleted = read.relational_deletes.iter()
+                    for (position, (name, row)) in read.relational_inserts.iter().enumerate().rev()
+                    {
+                        if name != table || position >= before || !matches(row) {
+                            continue;
+                        }
+                        if read.relational_inserts[position + 1..]
+                            .iter()
+                            .any(|(name, newer)| name == table && newer.row_id == row.row_id)
+                        {
+                            continue;
+                        }
+                        let deleted = read
+                            .relational_deletes
+                            .iter()
                             .any(|(name, id, _)| name == table && *id == row.row_id);
                         // Only scalar selection metadata escapes this immutable
                         // source loan. The output copy is independently admitted
                         // and rechecked below; no bare row-owner Arc escapes.
-                        return Some((position, row.row_id, row.created_tx, row.lsn,
-                            row.estimated_bytes(), deleted, None));
+                        return Some((
+                            position,
+                            row.row_id,
+                            row.created_tx,
+                            row.lsn,
+                            row.estimated_bytes(),
+                            deleted,
+                            None,
+                        ));
                     }
                     None
                 })?
-            } else { self.tx_mgr.with_write_set(tx, |ws| {
-                let rows = ws.ordered_staged_rows.statement_rows(table);
-                for (position, (name, row)) in ws.relational_inserts.iter().enumerate().rev() {
-                    if name != table || position >= before || !matches(row) {
-                        continue;
+            } else {
+                self.tx_mgr.with_write_set(tx, |ws| {
+                    let rows = ws.ordered_staged_rows.statement_rows(table);
+                    for (position, (name, row)) in ws.relational_inserts.iter().enumerate().rev() {
+                        if name != table || position >= before || !matches(row) {
+                            continue;
+                        }
+                        // Raw public WriteSet edits may leave superseded versions.
+                        // Inspect that suffix only after a matching row exists;
+                        // an absent/new key allocates no copied identity directory.
+                        if ws.relational_inserts[position + 1..]
+                            .iter()
+                            .any(|(name, newer)| name == table && newer.row_id == row.row_id)
+                        {
+                            continue;
+                        }
+                        let deleted = ws
+                            .relational_deletes
+                            .iter()
+                            .any(|(name, id, _)| name == table && *id == row.row_id);
+                        let owner = rows
+                            .as_ref()
+                            .filter(|rows| rows.row(row.row_id).is_some_and(|owned| owned == row))
+                            .cloned();
+                        return Some((
+                            position,
+                            row.row_id,
+                            row.created_tx,
+                            row.lsn,
+                            row.estimated_bytes(),
+                            deleted,
+                            owner,
+                        ));
                     }
-                    // Raw public WriteSet edits may leave superseded versions.
-                    // Inspect that suffix only after a matching row exists;
-                    // an absent/new key allocates no copied identity directory.
-                    if ws.relational_inserts[position + 1..]
-                        .iter()
-                        .any(|(name, newer)| name == table && newer.row_id == row.row_id)
-                    {
-                        continue;
-                    }
-                    let deleted = ws
-                        .relational_deletes
-                        .iter()
-                        .any(|(name, id, _)| name == table && *id == row.row_id);
-                    let owner = rows
-                        .as_ref()
-                        .filter(|rows| rows.row(row.row_id).is_some_and(|owned| owned == row))
-                        .cloned();
-                    return Some((
-                        position,
-                        row.row_id,
-                        row.created_tx,
-                        row.lsn,
-                        row.estimated_bytes(),
-                        deleted,
-                        owner,
-                    ));
-                }
-                None
-            })? };
+                    None
+                })?
+            };
             let Some((position, id, created, lsn, bytes, deleted, owner)) = selected else {
                 return Ok(None);
             };
@@ -569,11 +599,9 @@ impl Database {
         let Some(root) = self.writer_read_root().map_err(E::from)? else {
             return Ok(false);
         };
-        let source = self.statement_relational_source(
-            root,
-            read_memory.clone(),
-        )
-        .map_err(E::from)?;
+        let source = self
+            .statement_relational_source(root, read_memory.clone())
+            .map_err(E::from)?;
         source.verify_historical_versions(table).map_err(E::from)?;
         let mut cursor = source
             .row_cursor(table, Bound::Unbounded, Bound::Unbounded, false)
@@ -585,7 +613,10 @@ impl Database {
     }
 
     /// A declared exact/prefix probe and its payloads share one storage root.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_indexed_rows_for_values(
         &self,
         table: &str,
@@ -607,7 +638,10 @@ impl Database {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_indexed_rows_for_values_within(
         &self,
         table: &str,
@@ -640,10 +674,7 @@ impl Database {
         }) else {
             return Ok(None);
         };
-        let source = self.statement_relational_source(
-            root.clone(),
-            read_memory.clone(),
-        )?;
+        let source = self.statement_relational_source(root.clone(), read_memory.clone())?;
         let mut scratch = contextdb_core::read_memory::ReadCredit::try_new(
             read_memory.clone(),
             values
@@ -772,7 +803,10 @@ impl Database {
         Ok(Some(rows))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_rank_join(
         &self,
         policy: &RankPolicy,
@@ -802,20 +836,19 @@ impl Database {
             })?;
         let Some((column, direction)) = index.columns.first() else {
             return Err(Error::Other(
-                "rank policy protected index has no columns".into()));
+                "rank policy protected index has no columns".into(),
+            ));
         };
         if column != &policy.joined_column {
             return Err(Error::Other(
-                "rank policy protected index no longer leads with its join column".into()));
+                "rank policy protected index no longer leads with its join column".into(),
+            ));
         }
         let key = vec![match direction {
             SortDirection::Asc => DirectedValue::Asc(TotalOrdAsc(join_value.clone())),
             SortDirection::Desc => DirectedValue::Desc(TotalOrdDesc(join_value.clone())),
         }];
-        let source = self.statement_relational_source(
-            root.clone(),
-            read_memory.clone(),
-        )?;
+        let source = self.statement_relational_source(root.clone(), read_memory.clone())?;
         source.historical_index_preflight(
             &policy.joined_table,
             &index.name,
@@ -934,7 +967,10 @@ impl Database {
 
     /// Commit preparation needs the actual committed frontier, independently
     /// of an outer statement's retained transaction base.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn committed_row_exists_at_current_frontier(
         &self,
         table: &str,
@@ -946,10 +982,7 @@ impl Database {
 
         let published = self.tx_mgr.capture_published_read();
         if let Some(root) = durable_root(published.handle)? {
-            let source = self.statement_relational_source(
-                root,
-                read_memory.clone(),
-            )?;
+            let source = self.statement_relational_source(root, read_memory.clone())?;
             return Ok(contextdb_relational::source::visible_row(
                 &source,
                 table,
@@ -966,7 +999,10 @@ impl Database {
 
     /// The sidecars must come from the same retained root as the row being
     /// selected; their resident maps are absent on a file-backed writer.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn relational_sync_source_at_read_root(
         &self,
         table: &str,
@@ -981,10 +1017,7 @@ impl Database {
 
         use contextdb_relational::source::RelationalReadSource;
         if let Some(root) = self.writer_read_root()? {
-            let source = self.statement_relational_source(
-                root,
-                read_memory.clone(),
-            )?;
+            let source = self.statement_relational_source(root, read_memory.clone())?;
             return Ok(source
                 .sync_source(table, row_id)?
                 .map_or((None, None), |(lsn, kind)| (Some(lsn), Some(kind))));
@@ -996,7 +1029,10 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn insert_relational_row_from_read(
         &self,
         tx: TxId,
@@ -1030,7 +1066,10 @@ impl Database {
         result
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn insert_relational_row_from_read_inner(
         &self,
         tx: TxId,
@@ -1098,7 +1137,10 @@ impl Database {
         })
     }
     /// Read maintained content totals from this operation's captured publication.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_content_size_totals(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1111,13 +1153,20 @@ impl Database {
             .transpose()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_read_root(&self) -> Result<Option<WriterSnapshotHandle>> {
         if let Some(captured) = self.captured_graph_decisions() {
             captured.check()?;
             return Ok(captured.root.clone());
         }
-        if let Some(working)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
+        if let Some(working) =
+            crate::persistence::received_working_source::WorkingReadSource::current_for(
+                self.tx_mgr.identity(),
+            )?
+        {
             return Ok(Some(working.root()));
         }
         if self.persistence.is_none() {
@@ -1162,7 +1211,10 @@ impl Database {
             _same_thread: std::marker::PhantomData,
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_root_scope(&self) -> Result<WriterRootScope> {
         let owner = self.tx_mgr.identity();
         let owners = ROOT
@@ -1190,7 +1242,10 @@ impl Database {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn resident_pull_history(
         &self,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1221,15 +1276,20 @@ impl Database {
 
     /// Keep the resident source view through response construction and encoding.
     /// Nested extraction scopes inherit this same registration and ceiling.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn enter_resident_pull_history(
         &self,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<WriterReadScope>> {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
-        if self.persistence.is_some() || self.image_history.is_some()
-            || self.relational_store.uses_disk_backed_committed_bodies() {
+        if self.persistence.is_some()
+            || self.image_history.is_some()
+            || self.relational_store.uses_disk_backed_committed_bodies()
+        {
             return Ok(None);
         }
         let scope = self.writer_read_scope(memory.clone())?;
@@ -1237,7 +1297,10 @@ impl Database {
         Ok(Some(scope))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_read_scope(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1254,7 +1317,10 @@ impl Database {
     }
 
     /// Predicate rows are temporary even when their statement retains its root.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_temporary_output_scope(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1324,7 +1390,10 @@ impl Database {
         });
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_config_value<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,
@@ -1362,7 +1431,10 @@ impl Database {
         Ok(value)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_config_values_with_prefix<T: serde::de::DeserializeOwned>(
         &self,
         prefix: &str,
@@ -1462,7 +1534,10 @@ impl Database {
         Ok(Some(row))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_ordered_next<E: From<Error>>(
         &self,
         source: &crate::persistence::writer_adapters::WriterRelationalSource,
@@ -1722,7 +1797,11 @@ impl Database {
                         .map_err(E::from)?;
                     let selected = source.exact_row(table, &key).map_err(E::from)?;
                     if selected.is_none() {
-                        return Err(E::from(crate::funded_error::corruption_text(Ok(read_memory.clone()), table, "visible posting has no saved row version".into())));
+                        return Err(E::from(crate::funded_error::corruption_text(
+                            Ok(read_memory.clone()),
+                            table,
+                            "visible posting has no saved row version".into(),
+                        )));
                     }
                     selected
                 } else {
@@ -1785,7 +1864,10 @@ impl Database {
         reason = "one group step needs its scan's source, table, index, snapshot, direction, \
                   discovered posting and work callback"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn historical_group_step<E: From<Error>>(
         source: &crate::persistence::writer_adapters::WriterRelationalSource,
         table: &str,
@@ -1873,9 +1955,15 @@ impl Database {
                         // posting that selected it.
                         let row = source
                             .indexed_point_row(table, row_id, snapshot)?
-                            .ok_or_else(|| crate::funded_error::corruption_text(source.diagnostic_budget(), table, "visible historical posting has no authenticated \
+                            .ok_or_else(|| {
+                                crate::funded_error::corruption_text(
+                                    source.diagnostic_budget(),
+                                    table,
+                                    "visible historical posting has no authenticated \
                                          visible row"
-                                    .into()))?;
+                                        .into(),
+                                )
+                            })?;
                         source.check_posting_matches_version(
                             table,
                             index,
@@ -1979,7 +2067,10 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_exact_next<E: From<Error>>(
         &self,
         source: &crate::persistence::writer_adapters::WriterRelationalSource,
@@ -2073,7 +2164,11 @@ impl Database {
                         visible_row(source, table, posting.value().entry.row_id, snapshot)
                             .map_err(E::from)?;
                     if selected.is_none() {
-                        return Err(E::from(crate::funded_error::corruption_text(source.diagnostic_budget(), table, "visible posting has no saved row version".into())));
+                        return Err(E::from(crate::funded_error::corruption_text(
+                            source.diagnostic_budget(),
+                            table,
+                            "visible posting has no saved row version".into(),
+                        )));
                     }
                     selected
                 } else {
@@ -2114,7 +2209,10 @@ impl Database {
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn relational_point_with_tx(
         &self,
         tx: Option<TxId>,
@@ -2129,9 +2227,11 @@ impl Database {
 
         if self.retained_relational_source.is_some() {
             if tx.is_some() {
-                return Err(Error::Other((
-                    "a committed-image relational source cannot carry a write transaction"
-                        .to_owned()).into()));
+                return Err(Error::Other(
+                    ("a committed-image relational source cannot carry a write transaction"
+                        .to_owned())
+                    .into(),
+                ));
             }
             if let Some(row_id) = self.indexed_visible_row_id_by_columns(
                 table,
@@ -2160,10 +2260,7 @@ impl Database {
                 .relational
                 .point_lookup_with_tx(tx, table, col, value, snapshot);
         };
-        let source = self.statement_relational_source(
-            root,
-            read_memory.clone(),
-        )?;
+        let source = self.statement_relational_source(root, read_memory.clone())?;
         let meta = self
             .table_meta(table)
             .ok_or_else(|| Error::TableNotFound(table.to_owned()))?;
@@ -2327,7 +2424,10 @@ impl Database {
         Ok(row)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn relational_scan_filter_with_tx(
         &self,
         tx: Option<TxId>,
@@ -2341,9 +2441,11 @@ impl Database {
 
         if self.retained_relational_source.is_some() {
             if tx.is_some() {
-                return Err(Error::Other((
-                    "a committed-image relational source cannot carry a write transaction"
-                        .to_owned()).into()));
+                return Err(Error::Other(
+                    ("a committed-image relational source cannot carry a write transaction"
+                        .to_owned())
+                    .into(),
+                ));
             }
             return Ok(self
                 .committed_rows_at(table, snapshot, read_memory)?
@@ -2356,10 +2458,7 @@ impl Database {
                 .relational
                 .scan_filter_with_tx(tx, table, snapshot, predicate);
         };
-        let source = self.statement_relational_source(
-            root,
-            read_memory.clone(),
-        )?;
+        let source = self.statement_relational_source(root, read_memory.clone())?;
         let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         let rows = self.relational.scan_filter_with_source(
             tx,
@@ -2382,7 +2481,10 @@ impl Database {
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_constraint_staged_match(
         &self,
         tx: TxId,
@@ -2472,15 +2574,23 @@ impl Database {
             // Preserve the established last-insertion precedence by borrowing
             // the actual source positions. Return only its matching scalar id.
             return self.tx_mgr.with_read(tx, |read| {
-                Ok(read.relational_inserts.iter().rev().find_map(|(name, row)| {
-                    #[cfg(feature = "in-process-test-seams")]
-                    crate::writer_query_test_seams::note_constraint_staged_row();
-                    #[cfg(feature = "test-seams")]
-                    crate::writer_query_test_seams::note_target_entry(name);
-                    (name == table && Some(row.row_id) != skip && columns.iter().zip(values)
-                        .all(|(column, value)| row.values.get(column) == Some(value)))
+                Ok(read
+                    .relational_inserts
+                    .iter()
+                    .rev()
+                    .find_map(|(name, row)| {
+                        #[cfg(feature = "in-process-test-seams")]
+                        crate::writer_query_test_seams::note_constraint_staged_row();
+                        #[cfg(feature = "test-seams")]
+                        crate::writer_query_test_seams::note_target_entry(name);
+                        (name == table
+                            && Some(row.row_id) != skip
+                            && columns
+                                .iter()
+                                .zip(values)
+                                .all(|(column, value)| row.values.get(column) == Some(value)))
                         .then_some(row.row_id)
-                }))
+                    }))
             })?;
         }
         self.tx_mgr.with_write_set(tx, |ws| {
@@ -2502,7 +2612,8 @@ impl Database {
                     };
                     if name != table || row.row_id != entry.row_id {
                         return Err(Error::Other(
-                            "maintained staged position names another row".into()));
+                            "maintained staged position names another row".into(),
+                        ));
                     }
                     if Some(row.row_id) != skip {
                         return Ok(Some(row.row_id));
@@ -2537,7 +2648,10 @@ impl Database {
         })?
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_indexed_row(
         &self,
         table: &str,
@@ -2564,7 +2678,10 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_indexed_row_with_overlay(
         &self,
         table: &str,
@@ -2597,10 +2714,7 @@ impl Database {
         }) else {
             return Ok(None);
         };
-        let source = self.statement_relational_source(
-            root,
-            read_memory.clone(),
-        )?;
+        let source = self.statement_relational_source(root, read_memory.clone())?;
         // The caller's budget funds the native key built from the probed
         // values before it is built; the cursor borrows it, and its encoded
         // endpoints are admitted where they are encoded.
@@ -2710,7 +2824,11 @@ impl Database {
                             row.value().values.get(column) != Some(value)
                         })
                 {
-                    return Err(crate::funded_error::corruption_text(Ok(read_memory.clone()), table, "indexed point posting differs from its captured row".into()));
+                    return Err(crate::funded_error::corruption_text(
+                        Ok(read_memory.clone()),
+                        table,
+                        "indexed point posting differs from its captured row".into(),
+                    ));
                 }
                 if let Some((tx, _)) = overlay
                     && self.tx_mgr.with_read(tx, |ws| {
@@ -2733,20 +2851,26 @@ impl Database {
 impl Database {
     /// One dispatch for every graph consumer: images never ask for a writer
     /// publication, and memory databases alone have no captured source.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn graph_read_root(
         &self,
     ) -> Result<Option<crate::persistence::graph_read::EngineGraphReadRoot>> {
         if let Some(source) = &self.retained_graph_source {
-            return Ok(Some(crate::persistence::graph_read::EngineGraphReadRoot::Image(
-                source.clone(),
-            )));
+            return Ok(Some(
+                crate::persistence::graph_read::EngineGraphReadRoot::Image(source.clone()),
+            ));
         }
         Ok(self
             .writer_read_root()?
             .map(crate::persistence::graph_read::EngineGraphReadRoot::Writer))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn graph_snapshot(
         &self,
         snapshot: SnapshotId,
@@ -2760,7 +2884,10 @@ impl Database {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn durable_root(
     handle: Option<contextdb_tx::native_capture::CaptureHandle>,
 ) -> Result<Option<WriterSnapshotHandle>> {
@@ -2768,18 +2895,26 @@ pub(super) fn durable_root(
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn capture_writer_statement(
         &self,
     ) -> Result<(SnapshotId, Option<WriterSnapshotHandle>)> {
         if self.already_closed() {
             return Err(closed_database_error());
         }
-        if let Some(working)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
+        if let Some(working) =
+            crate::persistence::received_working_source::WorkingReadSource::current_for(
+                self.tx_mgr.identity(),
+            )?
+        {
             use contextdb_relational::source::RelationalReadSource;
-            let snapshot=SNAPSHOT_OVERRIDE.with(|cell|cell.borrow().unwrap_or(working.snapshot()));
-            let working=working.at_snapshot(snapshot)?;
-            return Ok((snapshot,Some(working.root())));
+            let snapshot =
+                SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(working.snapshot()));
+            let working = working.at_snapshot(snapshot)?;
+            return Ok((snapshot, Some(working.root())));
         }
         if let Some(root) = ROOT.with(|slot| {
             slot.borrow()
@@ -2803,22 +2938,32 @@ impl Database {
     /// Schema mutations use the actual writer frontier even when a callback
     /// runs inside an older accepted read. The enclosing read retains its
     /// original descriptor when this nested writer scope exits.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn capture_writer_schema_statement(
         &self,
     ) -> Result<(SnapshotId, Option<WriterSnapshotHandle>)> {
         if self.already_closed() {
             return Err(closed_database_error());
         }
-        if let Some(working)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
+        if let Some(working) =
+            crate::persistence::received_working_source::WorkingReadSource::current_for(
+                self.tx_mgr.identity(),
+            )?
+        {
             use contextdb_relational::source::RelationalReadSource;
-            return Ok((working.snapshot(),Some(working.root())));
+            return Ok((working.snapshot(), Some(working.root())));
         }
         let published = self.tx_mgr.capture_published_read();
         Ok((published.snapshot, durable_root(published.handle)?))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn capture_writer_transaction_statement(
         &self,
         tx: Option<TxId>,
@@ -2841,7 +2986,10 @@ impl Database {
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn clone_writer_row(
         &self,
         row: &VersionedRow,
@@ -2861,7 +3009,10 @@ impl Database {
         Ok(row)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_cursor_storage_pin(
         &self,
         snapshot: SnapshotId,
@@ -2950,7 +3101,10 @@ pub(super) struct WriterStagedPostingAdmission {
     control: Option<crate::memory_accounting::ControlCredit>,
 }
 impl WriterStagedPostingAdmission {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare(
         accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<Arc<Self>> {
@@ -3013,7 +3167,9 @@ impl GraphPublicationWeak {
         Self::Owned(handle.downgrade())
     }
 
-    fn capture_published_read(&self) -> Option<(usize, contextdb_tx::native_capture::EnginePublishedRead)> {
+    fn capture_published_read(
+        &self,
+    ) -> Option<(usize, contextdb_tx::native_capture::EnginePublishedRead)> {
         match self {
             Self::Legacy(manager) => manager.upgrade().map(|manager| {
                 let identity = Arc::as_ptr(&manager) as usize;
@@ -3068,10 +3224,17 @@ impl contextdb_graph::source::GraphReadSource for ScopedGraphSource {
             .get()
             .and_then(GraphPublicationWeak::capture_published_read)
             .ok_or_else(|| Error::Other("graph publication is unavailable".into()))?;
-        if let Some(source) = crate::persistence::received_working_source::WorkingReadSource::current_for(owner)? {
+        if let Some(source) =
+            crate::persistence::received_working_source::WorkingReadSource::current_for(owner)?
+        {
             let source = source.at_snapshot(snapshot)?.for_read(read_memory.clone());
-            return Ok(Arc::new(crate::persistence::writer_adapters::WriterGraphSnapshot::new_for_read(
-                source.root(), read_memory)?.for_working(source)));
+            return Ok(Arc::new(
+                crate::persistence::writer_adapters::WriterGraphSnapshot::new_for_read(
+                    source.root(),
+                    read_memory,
+                )?
+                .for_working(source),
+            ));
         }
         let scoped = ROOT.with(|slot| {
             slot.borrow()
@@ -3086,7 +3249,8 @@ impl contextdb_graph::source::GraphReadSource for ScopedGraphSource {
         };
         if snapshot.0 > root.snapshot.0 {
             return Err(Error::Other(
-                "graph snapshot exceeds the captured source frontier".into()));
+                "graph snapshot exceeds the captured source frontier".into(),
+            ));
         }
         Ok(Arc::new(
             crate::persistence::writer_adapters::WriterGraphSnapshot::new_for_read(
@@ -3099,7 +3263,10 @@ impl contextdb_graph::source::GraphReadSource for ScopedGraphSource {
 
 /// Probe only the selected endpoints. Reverse probes skip versions already
 /// visited by a selected source, preserving one visit per physical version.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn visit_graph_versions_for_nodes(
     store: &GraphStore,
     root: Option<WriterSnapshotHandle>,
@@ -3107,7 +3274,7 @@ pub(super) fn visit_graph_versions_for_nodes(
     mut visit: impl FnMut(&AdjEntry) -> Result<()>,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     for node in nodes {
         for reverse in [false, true] {
@@ -3155,14 +3322,17 @@ pub(super) fn visit_graph_versions_for_nodes(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn visit_graph_versions(
     store: &GraphStore,
     root: Option<WriterSnapshotHandle>,
     mut visit: impl FnMut(&AdjEntry) -> Result<()>,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     if let Some(root) = root {
         // All-version enumeration is historical even at frontier equality.
@@ -3189,7 +3359,8 @@ impl Database {
     /// posting, automatic or declared, in one ordered family, so a bounded
     /// cursor can walk a single-column automatic index in key order.
     pub(crate) fn automatic_indexes_are_ordered(&self) -> bool {
-        self.persistence.is_some() || self.retained_relational_source.is_some()
+        self.persistence.is_some()
+            || self.retained_relational_source.is_some()
             || self.relational_store.uses_disk_backed_committed_bodies()
     }
 
@@ -3197,7 +3368,10 @@ impl Database {
     /// family is keyed by target, the forward family by source. A durable
     /// writer reads the statement's root; only a memory store has resident
     /// maps to walk.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn visit_graph_adjacency(
         &self,
         reverse: bool,
@@ -3208,7 +3382,10 @@ impl Database {
 
         self.visit_graph_adjacency_at_root(self.graph_read_root()?, reverse, visit, read_memory)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn visit_graph_adjacency_at_root(
         &self,
         root: Option<crate::persistence::graph_read::EngineGraphReadRoot>,
@@ -3242,7 +3419,10 @@ impl Database {
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn visit_graph_versions(
         &self,
         visit: impl FnMut(&AdjEntry) -> Result<()>,
@@ -3252,7 +3432,10 @@ impl Database {
 
         self.visit_graph_adjacency(false, visit, read_memory)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn collect_graph_versions(
         &self,
         mut keep: impl FnMut(&AdjEntry) -> bool,
@@ -3283,7 +3466,10 @@ impl Database {
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn graph_path_with_sync_overlay(
         &self,
         snapshot: SnapshotId,
@@ -3359,7 +3545,10 @@ impl Database {
         Ok(false)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn collect_change_log_versions(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -3398,7 +3587,10 @@ impl Database {
     /// seeks the key's postings instead of decoding every table once for each
     /// arriving row. A table with no index over exactly the key's columns
     /// streams that table alone.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn visit_row_versions_for_natural_key(
         &self,
         table: &str,
@@ -3435,10 +3627,7 @@ impl Database {
                         .all(|((have, _), want)| have == want)
             })
             .cloned();
-        let source = self.statement_relational_source(
-            root,
-            read_memory.clone(),
-        )?;
+        let source = self.statement_relational_source(root, read_memory.clone())?;
         source.verify_historical_versions(table)?;
         let Some(index) = index else {
             let mut rows = source.row_cursor(
@@ -3634,7 +3823,10 @@ mod vector_write_copy_budget_tests {
 impl Database {
     /// Each invocation independently captures the actual committed descriptor.
     /// Neither the Legacy ROOT TLS nor a current-config cache substitutes for it.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_native_committed_config_text(
         &self,
         prefix: &str,
@@ -3652,7 +3844,8 @@ impl Database {
             .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?
             .ok_or_else(|| {
                 NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(Error::Other(
-                    "writer publication has no durable root".into())))
+                    "writer publication has no durable root".into(),
+                )))
             })?;
         root.native_config_text(operation, context, prefix, tenant)
     }
@@ -3662,7 +3855,10 @@ impl Database {
 impl Database {
     /// Independently capture the committed publication for THIS raw prefix call.
     /// The returned cursor pins that exact root while using the original request.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_native_committed_config_prefix(
         &self,
         prefix: &str,
@@ -3681,7 +3877,8 @@ impl Database {
             .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)))?
             .ok_or_else(|| {
                 NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(Error::Other(
-                    "writer publication has no durable root".into())))
+                    "writer publication has no durable root".into(),
+                )))
             })?;
         root.native_raw_config_prefix(operation, context, prefix)
     }
@@ -3691,7 +3888,10 @@ impl Database {
 impl Database {
     /// Pin once for both custody count and construction passes. Each cursor
     /// remains funded by the same request/context; no Legacy TLS is consulted.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_native_custody_root(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -3847,62 +4047,112 @@ mod historical_group_consumer_tests {
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn statement_relational_source(&self,root:WriterSnapshotHandle,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>)
-        ->Result<crate::persistence::writer_adapters::WriterRelationalSource> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn statement_relational_source(
+        &self,
+        root: WriterSnapshotHandle,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<crate::persistence::writer_adapters::WriterRelationalSource> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let source=crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(root,read_memory.clone())?;
-        match crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
-            Some(working)=>Ok(source.for_working(working.for_read(read_memory))),None=>Ok(source),
+        let source = crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+            root,
+            read_memory.clone(),
+        )?;
+        match crate::persistence::received_working_source::WorkingReadSource::current_for(
+            self.tx_mgr.identity(),
+        )? {
+            Some(working) => Ok(source.for_working(working.for_read(read_memory))),
+            None => Ok(source),
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn statement_relational_source_at_snapshot(&self,root:WriterSnapshotHandle,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,snapshot:SnapshotId)
-        ->Result<crate::persistence::writer_adapters::WriterRelationalSource> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn statement_relational_source_at_snapshot(
+        &self,
+        root: WriterSnapshotHandle,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        snapshot: SnapshotId,
+    ) -> Result<crate::persistence::writer_adapters::WriterRelationalSource> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        if let Some(working)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
-            let working=working.at_snapshot(snapshot)?.for_read(read_memory.clone());
-            return Ok(crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(root,read_memory)?.for_working(working));
+        if let Some(working) =
+            crate::persistence::received_working_source::WorkingReadSource::current_for(
+                self.tx_mgr.identity(),
+            )?
+        {
+            let working = working.at_snapshot(snapshot)?.for_read(read_memory.clone());
+            return Ok(
+                crate::persistence::writer_adapters::WriterRelationalSource::new_for_read(
+                    root,
+                    read_memory,
+                )?
+                .for_working(working),
+            );
         }
-        crate::persistence::writer_adapters::WriterRelationalSource::new_for_read_at_snapshot(root,read_memory,snapshot)
+        crate::persistence::writer_adapters::WriterRelationalSource::new_for_read_at_snapshot(
+            root,
+            read_memory,
+            snapshot,
+        )
     }
 }
-
 
 impl Database {
     // Immutable source windows stay reader-owned. Only independently cloned
     // selected targets enter the caller's actual original preparation frame.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn collect_original_graph_versions(&self,
-        frame: &crate::persistence::OriginalPersistenceFrame<'_>, keep: impl Fn(&AdjEntry) -> bool,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Vec<AdjEntry>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn collect_original_graph_versions(
+        &self,
+        frame: &crate::persistence::OriginalPersistenceFrame<'_>,
+        keep: impl Fn(&AdjEntry) -> bool,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Vec<AdjEntry>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let mut count = 0usize;
-        self.visit_graph_versions(|edge| {
-            if keep(edge) { count = count.checked_add(1).ok_or_else(EngineMetadataJournal::identity_error)?; }
-            Ok(())
-        }, read_memory.clone())?;
+        self.visit_graph_versions(
+            |edge| {
+                if keep(edge) {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(EngineMetadataJournal::identity_error)?;
+                }
+                Ok(())
+            },
+            read_memory.clone(),
+        )?;
         frame.array::<AdjEntry>(count)?;
         let mut entries = Vec::with_capacity(count);
-        if entries.capacity() != count { return Err(EngineMetadataJournal::identity_error()); }
-        self.visit_graph_versions(|edge| {
-            if keep(edge) {
-                if entries.len() == count { return Err(EngineMetadataJournal::identity_error()); }
-                frame.record(edge)?;
-                entries.push(edge.clone());
-            }
-            Ok(())
-        }, read_memory)?;
-        if entries.len() != count { return Err(EngineMetadataJournal::identity_error()); }
+        if entries.capacity() != count {
+            return Err(EngineMetadataJournal::identity_error());
+        }
+        self.visit_graph_versions(
+            |edge| {
+                if keep(edge) {
+                    if entries.len() == count {
+                        return Err(EngineMetadataJournal::identity_error());
+                    }
+                    frame.record(edge)?;
+                    entries.push(edge.clone());
+                }
+                Ok(())
+            },
+            read_memory,
+        )?;
+        if entries.len() != count {
+            return Err(EngineMetadataJournal::identity_error());
+        }
         Ok(entries)
     }
-
-
 }
 
-use crate::persistence::writer_source::{WriterSnapshotHandle};
+use crate::persistence::writer_source::WriterSnapshotHandle;

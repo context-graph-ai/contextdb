@@ -44,7 +44,8 @@ fn snapshot_inspection_reads_physical_history_without_touching_the_artifact() {
                 .limits
                 .limits
                 .memory,
-        ).expect("admit the declared fixture root");
+        )
+        .expect("admit the declared fixture root");
 
     let inspector = SnapshotInspector::open(
         &artifact_path,
@@ -125,7 +126,8 @@ fn snapshot_inspection_omits_large_values_and_reports_blob_state_without_bytes()
                 .limits
                 .limits
                 .memory,
-        ).expect("admit the declared fixture root");
+        )
+        .expect("admit the declared fixture root");
 
     let inspector = SnapshotInspector::open(
         &artifact_path,
@@ -210,7 +212,8 @@ fn sync_apply_state_digest_is_deterministic_and_changes_with_durable_state() {
                 .limits
                 .limits
                 .memory,
-        ).expect("admit the declared fixture root");
+        )
+        .expect("admit the declared fixture root");
 
     let before = SnapshotInspector::open(
         &before_path,
@@ -228,7 +231,8 @@ fn sync_apply_state_digest_is_deterministic_and_changes_with_durable_state() {
                 .limits
                 .limits
                 .memory,
-        ).expect("admit the declared fixture root");
+        )
+        .expect("admit the declared fixture root");
 
     let first = SnapshotInspector::open(
         &first_after_path,
@@ -246,7 +250,8 @@ fn sync_apply_state_digest_is_deterministic_and_changes_with_durable_state() {
                 .limits
                 .limits
                 .memory,
-        ).expect("admit the declared fixture root");
+        )
+        .expect("admit the declared fixture root");
 
     let second = SnapshotInspector::open(
         &second_after_path,
@@ -308,7 +313,8 @@ fn snapshot_export_preserves_trigger_audit_retention_stamps_exactly() {
                 .limits
                 .limits
                 .memory,
-        ).expect("admit the declared fixture root");
+        )
+        .expect("admit the declared fixture root");
 
     let inspector = SnapshotInspector::open(
         &artifact_path,

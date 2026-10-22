@@ -137,7 +137,11 @@ fn every_route(
         .expect("stage a row of the reader's own");
     answers.push((
         "transaction with staged rows",
-        classify(narrowed.execute_in_tx(tx, sql, binds).map(|r| r.rows().len())),
+        classify(
+            narrowed
+                .execute_in_tx(tx, sql, binds)
+                .map(|r| r.rows().len()),
+        ),
     ));
     narrowed.rollback(tx).expect("rollback");
     answers

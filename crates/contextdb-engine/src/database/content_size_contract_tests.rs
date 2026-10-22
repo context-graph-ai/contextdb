@@ -932,8 +932,8 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
         .expect("open reader before vector clear");
         let old_before_clear = {
             let fixture_answer_79 = old_reader
-            .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .expect("read committed vector before clear");
+                .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
+                .expect("read committed vector before clear");
             fixture_answer_79.rows().to_vec()
         };
         let mut active_cursor = old_reader
@@ -948,28 +948,28 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
             .unwrap();
         let fresh_answer = {
             let fixture_answer_80 = db
-            .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .unwrap();
+                .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
+                .unwrap();
             fixture_answer_80.rows().to_vec()
         };
         let old_after_clear = {
             let fixture_answer_81 = active_cursor
-            .fetch(None)
-            .expect("active statement keeps its vector after clear");
+                .fetch(None)
+                .expect("active statement keeps its vector after clear");
             fixture_answer_81.rows().to_vec()
         };
         active_cursor.close().unwrap();
         let retained_session_after_clear = {
             let fixture_answer_82 = old_reader
-            .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .expect("new statement on retained session sees clear");
+                .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
+                .expect("new statement on retained session sees clear");
             fixture_answer_82.rows().to_vec()
         };
         let new_reader = crate::ReadSession::open(&path).expect("open reader after vector clear");
         let new_after_clear = {
             let fixture_answer_83 = new_reader
-            .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .expect("new reader sees the committed clear");
+                .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
+                .expect("new reader sees the committed clear");
             fixture_answer_83.rows().to_vec()
         };
         drop(new_reader);
@@ -979,8 +979,8 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
         let db = open();
         let reopened_answer = {
             let fixture_answer_84 = db
-            .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .unwrap();
+                .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
+                .unwrap();
             fixture_answer_84.rows().to_vec()
         };
         eprintln!(
@@ -989,8 +989,8 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
         let reopened_reader = crate::ReadSession::open(&path).expect("open reader after reopen");
         let reader_after_reopen = {
             let fixture_answer_85 = reopened_reader
-            .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
-            .expect("reopened reader sees the committed clear");
+                .execute("SELECT v FROM items WHERE id = 1", &HashMap::new())
+                .expect("reopened reader sees the committed clear");
             fixture_answer_85.rows().to_vec()
         };
         drop(reopened_reader);
@@ -1100,8 +1100,8 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
     let db = open();
     let live_answer = {
         let fixture_answer_86 = db
-        .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("hydrate live quantized vector after reopen");
+            .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
+            .expect("hydrate live quantized vector after reopen");
         fixture_answer_86.rows().to_vec()
     };
     let old_reader = crate::ReadSession::open_with_options(
@@ -1117,8 +1117,8 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
     .expect("capture live SQ8 reader");
     let old_before_clear = {
         let fixture_answer_87 = old_reader
-        .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("reader hydrates live quantized body");
+            .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
+            .expect("reader hydrates live quantized body");
         fixture_answer_87.rows().to_vec()
     };
     let mut active_cursor = old_reader
@@ -1136,28 +1136,28 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
     .expect("commit quantized clear");
     let cleared_answer = {
         let fixture_answer_88 = db
-        .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("read cleared quantized vector");
+            .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
+            .expect("read cleared quantized vector");
         fixture_answer_88.rows().to_vec()
     };
     let old_after_clear = {
         let fixture_answer_89 = active_cursor
-        .fetch(None)
-        .expect("active statement keeps live quantized body");
+            .fetch(None)
+            .expect("active statement keeps live quantized body");
         fixture_answer_89.rows().to_vec()
     };
     active_cursor.close().unwrap();
     let retained_session_after_clear = {
         let fixture_answer_90 = old_reader
-        .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("new SQ8 statement on retained session sees clear");
+            .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
+            .expect("new SQ8 statement on retained session sees clear");
         fixture_answer_90.rows().to_vec()
     };
     let new_reader = crate::ReadSession::open(&path).expect("capture cleared SQ8 reader");
     let new_after_clear = {
         let fixture_answer_91 = new_reader
-        .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("new reader sees quantized clear");
+            .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
+            .expect("new reader sees quantized clear");
         fixture_answer_91.rows().to_vec()
     };
     drop(new_reader);
@@ -1167,8 +1167,8 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
     let db = open();
     let reopened_answer = {
         let fixture_answer_92 = db
-        .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
-        .expect("quantized clear stays NULL after reopen");
+            .execute("SELECT v FROM compact_items WHERE id = 1", &HashMap::new())
+            .expect("quantized clear stays NULL after reopen");
         fixture_answer_92.rows().to_vec()
     };
     db.close().unwrap();
@@ -1209,8 +1209,8 @@ fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
 // Acceptance: public execute returns a terminal value with no retained answer/copy credit.
 #[test]
 fn public_execute_releases_answer_and_copy_credit_before_return() {
-    use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
     use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+    use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
@@ -1232,7 +1232,8 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
             let used = self.used.fetch_add(bytes, Ordering::SeqCst) + bytes;
             self.peak.fetch_max(used, Ordering::SeqCst);
             if subsystem == "reader" && operation == "materialize_answer" {
-                self.materialize_answer_bytes.fetch_add(bytes, Ordering::SeqCst);
+                self.materialize_answer_bytes
+                    .fetch_add(bytes, Ordering::SeqCst);
                 oracle::answer_copy_reservation(bytes);
             }
             Ok(())
@@ -1249,25 +1250,54 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         layout: (usize, usize),
     ) -> usize {
         let control = observation.receipt();
-        assert_ne!(control.pointer, 0, "actual producer control address was observed");
-        assert_eq!(control.reservations, 1,
-            "only the producer's prepaid control is admitted; no eager image reservation");
-        assert_eq!((control.bytes, control.align), layout,
-            "actual execution allocates the calibrated producer's control layout");
-        assert_eq!(control.admitted, control.bytes,
-            "the control reservation pays its exact native Box request");
-        assert!(control.funded_at_allocation >= control.bytes,
-            "the original operation owner pays before control allocation");
-        assert_eq!(control.frees, 1, "the actual control Box physically frees once");
-        assert!(control.funded_at_free >= control.bytes,
-            "control funding survives until System.dealloc");
-        assert_eq!(control.funded_after_free, control.funded_at_free,
-            "physical free precedes the original owner's refund");
-        assert_eq!(control.refund_after_free, Some(control.bytes),
-            "the first refund after the actual control free returns its exact invoice");
-        assert_eq!(control.funded_after_refund,
-            Some(control.funded_after_free.checked_sub(control.bytes).unwrap()),
-            "the exact originating owner returns only this control invoice after free");
+        assert_ne!(
+            control.pointer, 0,
+            "actual producer control address was observed"
+        );
+        assert_eq!(
+            control.reservations, 1,
+            "only the producer's prepaid control is admitted; no eager image reservation"
+        );
+        assert_eq!(
+            (control.bytes, control.align),
+            layout,
+            "actual execution allocates the calibrated producer's control layout"
+        );
+        assert_eq!(
+            control.admitted, control.bytes,
+            "the control reservation pays its exact native Box request"
+        );
+        assert!(
+            control.funded_at_allocation >= control.bytes,
+            "the original operation owner pays before control allocation"
+        );
+        assert_eq!(
+            control.frees, 1,
+            "the actual control Box physically frees once"
+        );
+        assert!(
+            control.funded_at_free >= control.bytes,
+            "control funding survives until System.dealloc"
+        );
+        assert_eq!(
+            control.funded_after_free, control.funded_at_free,
+            "physical free precedes the original owner's refund"
+        );
+        assert_eq!(
+            control.refund_after_free,
+            Some(control.bytes),
+            "the first refund after the actual control free returns its exact invoice"
+        );
+        assert_eq!(
+            control.funded_after_refund,
+            Some(
+                control
+                    .funded_after_free
+                    .checked_sub(control.bytes)
+                    .unwrap()
+            ),
+            "the exact originating owner returns only this control invoice after free"
+        );
         control.bytes
     }
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
@@ -1364,17 +1394,34 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         calibration_owner.clone(),
     );
     let bridge = image.vector_copy(0).unwrap();
-    assert_eq!(bridge.owner.retained_bytes(), 0, "control owns no vector payload");
-    assert_eq!(image.held(), 0, "control invoice is separate from image bytes");
+    assert_eq!(
+        bridge.owner.retained_bytes(),
+        0,
+        "control owns no vector payload"
+    );
+    assert_eq!(
+        image.held(),
+        0,
+        "control invoice is separate from image bytes"
+    );
     let native_control = calibration.receipt();
-    assert_ne!(native_control.pointer, 0, "real producer control address was observed");
+    assert_ne!(
+        native_control.pointer, 0,
+        "real producer control address was observed"
+    );
     assert_eq!(native_control.frees, 0, "bridge still owns its control Box");
-    assert_eq!(native_control.funded_at_allocation, native_control.bytes,
-        "isolated producer debits exactly the physical control request");
+    assert_eq!(
+        native_control.funded_at_allocation, native_control.bytes,
+        "isolated producer debits exactly the physical control request"
+    );
     let control_layout = (native_control.bytes, native_control.align);
     bridge.into_image();
     assert_control_freed(&calibration, control_layout);
-    assert_eq!(image.held(), 0, "zero payload transfer creates no eager image");
+    assert_eq!(
+        image.held(),
+        0,
+        "zero payload transfer creates no eager image"
+    );
     assert_eq!(calibration_owner.used.load(Ordering::SeqCst), 0);
     drop(image);
     drop(calibration);
@@ -1410,7 +1457,9 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
     let answer_credit = owned.answer_charge.held();
     let copy_credit = owned.vector_copy_charge.held();
     let physical_control_bytes = assert_control_freed(&control, control_layout);
-    let eager_image_bytes = owner.materialize_answer_bytes.load(Ordering::SeqCst)
+    let eager_image_bytes = owner
+        .materialize_answer_bytes
+        .load(Ordering::SeqCst)
         .checked_sub(physical_control_bytes)
         .expect("actual materialization pays its physically observed control");
     assert!(
@@ -1446,7 +1495,9 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         owner.used.load(Ordering::SeqCst) > 0,
         "internal lifetime retains executing reader credit"
     );
-    let converted = owned.into_public().expect("publish the admitted fixture answer");
+    let converted = owned
+        .into_public()
+        .expect("publish the admitted fixture answer");
     assert_eq!(converted.rows(), expected);
     assert_eq!(
         owner.used.load(Ordering::SeqCst),
@@ -1464,8 +1515,11 @@ fn public_execute_releases_answer_and_copy_credit_before_return() {
         .unwrap();
     assert_eq!(explicit.rows(), expected);
     assert_control_freed(&control, control_layout);
-    assert_eq!(owner.materialize_answer_bytes.load(Ordering::SeqCst), control_layout.0,
-        "public explicit-owner route also creates no eager image beyond its actual control");
+    assert_eq!(
+        owner.materialize_answer_bytes.load(Ordering::SeqCst),
+        control_layout.0,
+        "public explicit-owner route also creates no eager image beyond its actual control"
+    );
     assert!(
         owner.peak.load(Ordering::SeqCst) > 0,
         "public execution actually admitted memory"

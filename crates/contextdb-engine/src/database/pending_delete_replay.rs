@@ -21,7 +21,10 @@ impl PendingReplay {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn new(
         root: crate::persistence::WriterSnapshotHandle,
         owner: SourceWindowOwner,
@@ -54,7 +57,10 @@ impl PendingReplay {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn resident(
         image: Option<contextdb_relational::membership::MembershipImage>,
         since: Lsn,
@@ -73,7 +79,10 @@ impl PendingReplay {
         Ok(source)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn fill(&mut self) -> Result<()> {
         if self.peeked.is_none()
             && let Some(cursor) = self.cursor.as_mut()
@@ -112,7 +121,10 @@ impl PendingReplay {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn peek_lsn(&mut self) -> Result<Option<Lsn>> {
         if let Some(resident) = self.resident.as_mut() {
             return resident.peek_lsn();
@@ -121,7 +133,10 @@ impl PendingReplay {
         Ok(self.peeked.as_ref().map(|window| window.value))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_record(&mut self) -> Result<Option<PendingRecordWindow>> {
         if let Some(resident) = self.resident.as_mut() {
             return resident.next_record().map(|record| {

@@ -130,7 +130,10 @@ impl HolderPresence {
     /// Keep this presence held beside its store under `label` once the guard is gone, until
     /// [`release_kept`] or the process exits. Refuses, releasing this presence, when this process
     /// already keeps one under `label` beside that store.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn keep(self, label: [u8; 16]) -> Result<()> {
         let mut kept = KEPT
             .lock()
@@ -256,7 +259,10 @@ fn forget_losable(companion: &Path, offset: i64) -> bool {
 /// cannot lock or another process already holds this token. A token is held once: tokens are
 /// minted fresh for every unit of work and never reused.
 #[cfg(target_os = "linux")]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn hold(store_path: &Path, token: [u8; 16]) -> Result<HolderPresence> {
     const OPERATION: &str = "taking background-work presence";
     let path = store_holders_path(store_path);
@@ -299,7 +305,10 @@ pub fn hold(store_path: &Path, token: [u8; 16]) -> Result<HolderPresence> {
 /// Whether a live process holds `token`'s presence. Changes no byte and never creates the
 /// companion: a missing companion means there is no holder.
 #[cfg(target_os = "linux")]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn probe(store_path: &Path, token: [u8; 16]) -> Result<Holder> {
     const OPERATION: &str = "asking for background-work presence";
     let path = store_holders_path(store_path);
@@ -326,7 +335,10 @@ pub fn probe(store_path: &Path, token: [u8; 16]) -> Result<Holder> {
 /// when no process holds it. Never polls and never gives up: a stopped holder keeps the caller
 /// waiting until it resumes and releases.
 #[cfg(target_os = "linux")]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn wait_released(store_path: &Path, token: [u8; 16]) -> Result<()> {
     const OPERATION: &str = "waiting for background-work presence";
     let path = store_holders_path(store_path);
@@ -400,7 +412,10 @@ fn lock(file: &File, offset: i64, kind: libc::c_short, command: libc::c_int) -> 
 }
 
 #[cfg(target_os = "linux")]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn open_existing(path: &Path, operation: &str) -> Result<Option<File>> {
     match OpenOptions::new()
         .read(true)

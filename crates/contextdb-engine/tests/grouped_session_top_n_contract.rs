@@ -239,7 +239,8 @@ fn expected(ordinals: &[usize]) -> Vec<Vec<Value>> {
 }
 fn check(answer: QueryResult, rows: &[Vec<Value>], route: GroupRoute) -> Vec<u64> {
     assert_eq!(
-        answer.rows(), rows,
+        answer.rows(),
+        rows,
         "rows follow context ASC then exact session rank ASC"
     );
     assert_eq!(answer.trace().groups.len(), 2);

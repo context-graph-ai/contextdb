@@ -58,7 +58,10 @@ fn issued_continuation(vocabulary: MetadataPageVocabulary, key: &str) -> String 
 
 /// Where a resumed page starts, or the refusal for a token this question did
 /// not issue.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resume_after(
     vocabulary: MetadataPageVocabulary,
     token: &str,
@@ -123,7 +126,10 @@ pub(crate) fn metadata_event_key(item: &MetadataItem) -> String {
 
 /// Cut one page out of a complete inventory. The continuation is the key of
 /// the last item published, so a resumed page starts strictly after it.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn continuation_page(
     vocabulary: MetadataPageVocabulary,
     items: Vec<MetadataItem>,
@@ -199,7 +205,10 @@ fn key_of(item: &MetadataItem) -> String {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn finish_metadata_page(
     page: MetadataPage,
 ) -> std::result::Result<MetadataPage, MetadataPagingError> {
@@ -350,7 +359,10 @@ pub(crate) fn promote_event_status_item(
     // list can be cut anywhere; the name itself is what follows the colon.
     let named = |prefix: &str| -> String {
         match fields.get("name") {
-            Some(Value::Text(name)) => name.strip_prefix(prefix).map(str::to_owned).unwrap_or_default(),
+            Some(Value::Text(name)) => name
+                .strip_prefix(prefix)
+                .map(str::to_owned)
+                .unwrap_or_default(),
             _ => String::new(),
         }
     };
@@ -526,53 +538,109 @@ pub(crate) fn events_of(page: &MetadataPage) -> DirectEventsStatus {
 
 /// Admit only the actual new promotion buffers; original page storage retains
 /// its separate original decode/source invoice throughout this borrow.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn table_names_of_funded(
-    page: &MetadataPage, memory: &crate::read_image_memory::ImageMemoryHandle,
+    page: &MetadataPage,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> contextdb_core::Result<Vec<String>> {
-    let names = page.items.iter().filter_map(|item| match item { MetadataItem::Table(name) => Some(name), _ => None });
+    let names = page.items.iter().filter_map(|item| match item {
+        MetadataItem::Table(name) => Some(name),
+        _ => None,
+    });
     let count = names.clone().count();
-    let mut bytes = count.checked_mul(std::mem::size_of::<String>()).ok_or_else(promotion_size_error)?;
-    for name in names.clone() { bytes = bytes.checked_add(name.len()).ok_or_else(promotion_size_error)?; }
+    let mut bytes = count
+        .checked_mul(std::mem::size_of::<String>())
+        .ok_or_else(promotion_size_error)?;
+    for name in names.clone() {
+        bytes = bytes
+            .checked_add(name.len())
+            .ok_or_else(promotion_size_error)?;
+    }
     memory.reserve(bytes)?;
     let mut output = Vec::with_capacity(count);
-    for name in names { output.push(name.clone()); }
+    for name in names {
+        output.push(name.clone());
+    }
     Ok(output)
 }
 fn promotion_size_error() -> contextdb_core::Error {
     contextdb_core::Error::Other("metadata promotion size overflow".into())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn events_of_funded(
-    page: &MetadataPage, memory: &crate::read_image_memory::ImageMemoryHandle,
+    page: &MetadataPage,
+    memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> contextdb_core::Result<DirectEventsStatus> {
     let mut counts = [0usize; 4];
     let mut bytes = 0usize;
     let mut add = |value: usize| -> contextdb_core::Result<()> {
-        bytes = bytes.checked_add(value).ok_or_else(promotion_size_error)?; Ok(())
+        bytes = bytes.checked_add(value).ok_or_else(promotion_size_error)?;
+        Ok(())
     };
     for item in &page.items {
-        let MetadataItem::EventStatus(fields) = item else { continue; };
-        let Some(Value::Text(kind)) = fields.get("kind") else { continue; };
+        let MetadataItem::EventStatus(fields) = item else {
+            continue;
+        };
+        let Some(Value::Text(kind)) = fields.get("kind") else {
+            continue;
+        };
         let (slot, prefix, width, texts): (usize, &str, usize, &[&str]) = match kind.as_str() {
-            "event_type" => (0, "event_type:", std::mem::size_of::<DirectEventTypeStatus>(), &["trigger", "table"]),
-            "sink" => (1, "sink:", std::mem::size_of::<DirectSinkStatus>(), &["sink_type"]),
-            "route" => (2, "route:", std::mem::size_of::<DirectRouteStatus>(), &["event_type", "sink"]),
-            "schedule" => (3, "schedule:", std::mem::size_of::<DirectScheduleStatus>(), &["every", "callback"]),
+            "event_type" => (
+                0,
+                "event_type:",
+                std::mem::size_of::<DirectEventTypeStatus>(),
+                &["trigger", "table"],
+            ),
+            "sink" => (
+                1,
+                "sink:",
+                std::mem::size_of::<DirectSinkStatus>(),
+                &["sink_type"],
+            ),
+            "route" => (
+                2,
+                "route:",
+                std::mem::size_of::<DirectRouteStatus>(),
+                &["event_type", "sink"],
+            ),
+            "schedule" => (
+                3,
+                "schedule:",
+                std::mem::size_of::<DirectScheduleStatus>(),
+                &["every", "callback"],
+            ),
             _ => continue,
         };
-        counts[slot] = counts[slot].checked_add(1).ok_or_else(promotion_size_error)?;
+        counts[slot] = counts[slot]
+            .checked_add(1)
+            .ok_or_else(promotion_size_error)?;
         add(width)?;
-        if let Some(Value::Text(name)) = fields.get("name") { add(name.strip_prefix(prefix).map_or(0, str::len))?; }
-        for key in texts { if let Some(Value::Text(text)) = fields.get(*key) { add(text.len())?; } }
+        if let Some(Value::Text(name)) = fields.get("name") {
+            add(name.strip_prefix(prefix).map_or(0, str::len))?;
+        }
+        for key in texts {
+            if let Some(Value::Text(text)) = fields.get(*key) {
+                add(text.len())?;
+            }
+        }
     }
     memory.reserve(bytes)?;
     let mut status = DirectEventsStatus {
-        event_types: Vec::with_capacity(counts[0]), sinks: Vec::with_capacity(counts[1]),
-        routes: Vec::with_capacity(counts[2]), schedules: Vec::with_capacity(counts[3]),
+        event_types: Vec::with_capacity(counts[0]),
+        sinks: Vec::with_capacity(counts[1]),
+        routes: Vec::with_capacity(counts[2]),
+        schedules: Vec::with_capacity(counts[3]),
     };
     for item in &page.items {
-        if let MetadataItem::EventStatus(fields) = item { promote_event_status_item(fields, &mut status); }
+        if let MetadataItem::EventStatus(fields) = item {
+            promote_event_status_item(fields, &mut status);
+        }
     }
     Ok(status)
 }
@@ -584,7 +652,11 @@ use contextdb_core::read_memory::ReadMemoryOwner;
 use serde::Serialize;
 
 #[derive(Clone, Copy)]
-enum InventoryValue<'a> { Text(&'a str), Bool(bool), Int(i64) }
+enum InventoryValue<'a> {
+    Text(&'a str),
+    Bool(bool),
+    Int(i64),
+}
 impl Serialize for InventoryValue<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -609,55 +681,105 @@ impl Serialize for EventProjection<'_> {
         fields[9] = Some(("kind", InventoryValue::Text(self.kind)));
         fields.sort_unstable_by_key(|entry| entry.map(|(key, _)| key));
         let mut map = s.serialize_map(Some(fields.iter().flatten().count()))?;
-        for (key, value) in fields.into_iter().flatten() { map.serialize_entry(key, &value)?; }
+        for (key, value) in fields.into_iter().flatten() {
+            map.serialize_entry(key, &value)?;
+        }
         map.end()
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-fn inventory_text(owner: &ReadMemoryOwner, text: std::fmt::Arguments<'_>) -> contextdb_core::Result<Funded<String>> {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn inventory_text(
+    owner: &ReadMemoryOwner,
+    text: std::fmt::Arguments<'_>,
+) -> contextdb_core::Result<Funded<String>> {
     struct Count(usize);
     impl std::fmt::Write for Count {
         fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?; Ok(())
+            self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+            Ok(())
         }
     }
     let mut count = Count(0);
     std::fmt::write(&mut count, text).map_err(|_| promotion_size_error())?;
-    let mut output = Funded::allocate_owned(Some(owner.clone()), count.0, || String::with_capacity(count.0))?;
+    let mut output = Funded::allocate_owned(Some(owner.clone()), count.0, || {
+        String::with_capacity(count.0)
+    })?;
     std::fmt::write(&mut output.value, text).map_err(|_| promotion_size_error())?;
     Ok(output)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn event_projection<'a>(
-    owner: &ReadMemoryOwner, kind: &'static str, name: &str,
+    owner: &ReadMemoryOwner,
+    kind: &'static str,
+    name: &str,
     fields: &[(&'static str, InventoryValue<'a>)],
 ) -> contextdb_core::Result<EventProjection<'a>> {
     let name = inventory_text(owner, format_args!("{kind}:{name}"))?;
     // This is the established key_of(Value::Text) spelling, including Debug
     // escaping. Keep the funded key through sorting and page selection.
     let key = inventory_text(owner, format_args!("Text({:?})", name.value))?;
-    let mut projected = EventProjection { name, key, kind, fields: [None; 8] };
-    for (slot, field) in projected.fields.iter_mut().zip(fields) { *slot = Some(*field); }
+    let mut projected = EventProjection {
+        name,
+        key,
+        kind,
+        fields: [None; 8],
+    };
+    for (slot, field) in projected.fields.iter_mut().zip(fields) {
+        *slot = Some(*field);
+    }
     Ok(projected)
 }
 #[derive(Clone, Copy)]
-enum Inventory<'a> { Tables(&'a [&'a str]), Events(&'a [EventProjection<'a>]) }
+enum Inventory<'a> {
+    Tables(&'a [&'a str]),
+    Events(&'a [EventProjection<'a>]),
+}
 impl Inventory<'_> {
-    fn len(&self) -> usize { match self { Self::Tables(items) => items.len(), Self::Events(items) => items.len() } }
-    fn key(&self, at: usize) -> &str { match self { Self::Tables(items) => items[at], Self::Events(items) => &items[at].key.value } }
+    fn len(&self) -> usize {
+        match self {
+            Self::Tables(items) => items.len(),
+            Self::Events(items) => items.len(),
+        }
+    }
+    fn key(&self, at: usize) -> &str {
+        match self {
+            Self::Tables(items) => items[at],
+            Self::Events(items) => &items[at].key.value,
+        }
+    }
     fn window(&self, start: usize, end: usize) -> Self {
-        match self { Self::Tables(items) => Self::Tables(&items[start..end]), Self::Events(items) => Self::Events(&items[start..end]) }
+        match self {
+            Self::Tables(items) => Self::Tables(&items[start..end]),
+            Self::Events(items) => Self::Events(&items[start..end]),
+        }
     }
 }
 impl Serialize for Inventory<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         #[derive(Serialize)]
-        enum Item<'a> { Table(&'a str), EventStatus(&'a EventProjection<'a>) }
+        enum Item<'a> {
+            Table(&'a str),
+            EventStatus(&'a EventProjection<'a>),
+        }
         let mut seq = s.serialize_seq(Some(self.len()))?;
         match self {
-            Self::Tables(items) => for item in *items { seq.serialize_element(&Item::Table(item))?; },
-            Self::Events(items) => for item in *items { seq.serialize_element(&Item::EventStatus(item))?; },
+            Self::Tables(items) => {
+                for item in *items {
+                    seq.serialize_element(&Item::Table(item))?;
+                }
+            }
+            Self::Events(items) => {
+                for item in *items {
+                    seq.serialize_element(&Item::EventStatus(item))?;
+                }
+            }
         }
         seq.end()
     }
@@ -669,87 +791,237 @@ struct InventoryPage<'a> {
     has_more: bool,
     continuation: Option<&'a str>,
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn inventory_page(
-    owner: ReadMemoryOwner, vocabulary: MetadataPageVocabulary, inventory: Inventory<'_>,
-    continuation: Option<&str>, page_bytes: u64,
+    owner: ReadMemoryOwner,
+    vocabulary: MetadataPageVocabulary,
+    inventory: Inventory<'_>,
+    continuation: Option<&str>,
+    page_bytes: u64,
 ) -> Result<Funded<MetadataPage>, MetadataPagingError> {
     let error = |error| MetadataPagingError::Encoding(ReadEncodingError::Admission(error));
-    let resume = continuation.map(|token| token.strip_prefix(issuing_question(vocabulary))
-        .and_then(|rest| rest.strip_prefix(':')).ok_or_else(|| MetadataPagingError::Continuation(
-            ReadFailure::invalid_continuation(format!("this continuation was not issued by {}", issuing_question(vocabulary)))))).transpose()?;
-    let start = (0..inventory.len()).find(|&at| resume.is_none_or(|resume| inventory.key(at) > resume)).unwrap_or(inventory.len());
+    let resume = continuation
+        .map(|token| {
+            token
+                .strip_prefix(issuing_question(vocabulary))
+                .and_then(|rest| rest.strip_prefix(':'))
+                .ok_or_else(|| {
+                    MetadataPagingError::Continuation(ReadFailure::invalid_continuation(format!(
+                        "this continuation was not issued by {}",
+                        issuing_question(vocabulary)
+                    )))
+                })
+        })
+        .transpose()?;
+    let start = (0..inventory.len())
+        .find(|&at| resume.is_none_or(|resume| inventory.key(at) > resume))
+        .unwrap_or(inventory.len());
     let mut end = start;
     // Measure each candidate in exactly the same terminal/nonterminal shape
     // as the original pager. No candidate item or source map is cloned.
     while end < inventory.len() {
         let candidate = end + 1;
         let has_more = candidate < inventory.len();
-        let token = if has_more { Some(inventory_text(&owner,
-            format_args!("{}:{}", issuing_question(vocabulary), inventory.key(candidate - 1))).map_err(error)?) } else { None };
-        let view = InventoryPage { vocabulary, items: inventory.window(start, candidate), has_more,
-            continuation: token.as_ref().map(|token| token.value.as_str()) };
-        let size = crate::read_contract::encoded_size(&view).map_err(MetadataPagingError::Encoding)? as u64;
+        let token = if has_more {
+            Some(
+                inventory_text(
+                    &owner,
+                    format_args!(
+                        "{}:{}",
+                        issuing_question(vocabulary),
+                        inventory.key(candidate - 1)
+                    ),
+                )
+                .map_err(error)?,
+            )
+        } else {
+            None
+        };
+        let view = InventoryPage {
+            vocabulary,
+            items: inventory.window(start, candidate),
+            has_more,
+            continuation: token.as_ref().map(|token| token.value.as_str()),
+        };
+        let size = crate::read_contract::encoded_size(&view)
+            .map_err(MetadataPagingError::Encoding)? as u64;
         if size > page_bytes {
-            if end == start { return Err(MetadataPagingError::Oversized(oversized_refusal(page_bytes, size))); }
+            if end == start {
+                return Err(MetadataPagingError::Oversized(oversized_refusal(
+                    page_bytes, size,
+                )));
+            }
             break;
         }
         end = candidate;
     }
     let has_more = end < inventory.len();
-    let token = if has_more { Some(inventory_text(&owner,
-        format_args!("{}:{}", issuing_question(vocabulary), inventory.key(end - 1))).map_err(error)?) } else { None };
-    let view = InventoryPage { vocabulary, items: inventory.window(start, end), has_more,
-        continuation: token.as_ref().map(|token| token.value.as_str()) };
+    let token = if has_more {
+        Some(
+            inventory_text(
+                &owner,
+                format_args!(
+                    "{}:{}",
+                    issuing_question(vocabulary),
+                    inventory.key(end - 1)
+                ),
+            )
+            .map_err(error)?,
+        )
+    } else {
+        None
+    };
+    let view = InventoryPage {
+        vocabulary,
+        items: inventory.window(start, end),
+        has_more,
+        continuation: token.as_ref().map(|token| token.value.as_str()),
+    };
     let bytes = crate::read_contract::encode_transport_funded(&view, Some(owner.clone()), u64::MAX)
         .map_err(MetadataPagingError::Encoding)?;
-    let memory = crate::local_transport::query_funding::QueryMemory::with_original_owner(owner, u64::MAX)
-        .map_err(error)?.image();
-    let page: Funded<MetadataPage> = crate::local_transport::query_funding::decode(&bytes.value, &memory).map_err(error)?;
-    page.value.validate().map_err(|_| MetadataPagingError::Encoding(ReadEncodingError::InvalidPayload))?;
+    let memory =
+        crate::local_transport::query_funding::QueryMemory::with_original_owner(owner, u64::MAX)
+            .map_err(error)?
+            .image();
+    let page: Funded<MetadataPage> =
+        crate::local_transport::query_funding::decode(&bytes.value, &memory).map_err(error)?;
+    page.value
+        .validate()
+        .map_err(|_| MetadataPagingError::Encoding(ReadEncodingError::InvalidPayload))?;
     Ok(page)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn borrowed_table_page<'a>(
-    owner: ReadMemoryOwner, names: impl ExactSizeIterator<Item = &'a str>,
-    continuation: Option<&str>, page_bytes: u64,
+    owner: ReadMemoryOwner,
+    names: impl ExactSizeIterator<Item = &'a str>,
+    continuation: Option<&str>,
+    page_bytes: u64,
 ) -> Result<Funded<MetadataPage>, MetadataPagingError> {
-    let bytes = names.len().checked_mul(std::mem::size_of::<&str>())
-        .ok_or_else(|| MetadataPagingError::Encoding(ReadEncodingError::Admission(promotion_size_error())))?;
-    let mut names = Funded::allocate_owned(Some(owner.clone()), bytes,
-        || names.collect::<Vec<_>>()).map_err(|error| MetadataPagingError::Encoding(ReadEncodingError::Admission(error)))?;
-    names.value.sort_unstable(); names.value.dedup();
-    inventory_page(owner, MetadataPageVocabulary::Tables, Inventory::Tables(&names.value), continuation, page_bytes)
+    let bytes = names
+        .len()
+        .checked_mul(std::mem::size_of::<&str>())
+        .ok_or_else(|| {
+            MetadataPagingError::Encoding(ReadEncodingError::Admission(promotion_size_error()))
+        })?;
+    let mut names =
+        Funded::allocate_owned(Some(owner.clone()), bytes, || names.collect::<Vec<_>>())
+            .map_err(|error| MetadataPagingError::Encoding(ReadEncodingError::Admission(error)))?;
+    names.value.sort_unstable();
+    names.value.dedup();
+    inventory_page(
+        owner,
+        MetadataPageVocabulary::Tables,
+        Inventory::Tables(&names.value),
+        continuation,
+        page_bytes,
+    )
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn borrowed_event_page(
-    owner: ReadMemoryOwner, status: &DirectEventsStatus, continuation: Option<&str>, page_bytes: u64,
+    owner: ReadMemoryOwner,
+    status: &DirectEventsStatus,
+    continuation: Option<&str>,
+    page_bytes: u64,
 ) -> Result<Funded<MetadataPage>, MetadataPagingError> {
-    use InventoryValue::{Text, Bool, Int};
+    use InventoryValue::{Bool, Int, Text};
     let error = |error| MetadataPagingError::Encoding(ReadEncodingError::Admission(error));
-    let count = status.event_types.len().checked_add(status.sinks.len())
-        .and_then(|n| n.checked_add(status.routes.len())).and_then(|n| n.checked_add(status.schedules.len()))
+    let count = status
+        .event_types
+        .len()
+        .checked_add(status.sinks.len())
+        .and_then(|n| n.checked_add(status.routes.len()))
+        .and_then(|n| n.checked_add(status.schedules.len()))
         .ok_or_else(|| error(promotion_size_error()))?;
-    let bytes = count.checked_mul(std::mem::size_of::<EventProjection<'_>>()).ok_or_else(|| error(promotion_size_error()))?;
-    let mut items = Funded::allocate_owned(Some(owner.clone()), bytes,
-        || Vec::with_capacity(count)).map_err(error)?;
-    for event in &status.event_types { items.value.push(event_projection(&owner, "event_type", &event.name,
-        &[("trigger", Text(&event.trigger)), ("table", Text(&event.table))]).map_err(error)?); }
-    for sink in &status.sinks { items.value.push(event_projection(&owner, "sink", &sink.name,
-        &[("sink_type", Text(&sink.sink_type)), ("callback_registered", Bool(sink.callback_registered)),
-          ("delivered", Int(sink.delivered as i64)), ("queued", Int(sink.queued as i64)),
-          ("retried", Int(sink.retried as i64)), ("uncertain", Int(sink.uncertain as i64)),
-          ("permanent_failures", Int(sink.permanent_failures as i64)), ("examined", Int(sink.examined as i64))]).map_err(error)?); }
-    for route in &status.routes { items.value.push(event_projection(&owner, "route", &route.name,
-        &[("event_type", Text(&route.event_type)), ("sink", Text(&route.sink))]).map_err(error)?); }
+    let bytes = count
+        .checked_mul(std::mem::size_of::<EventProjection<'_>>())
+        .ok_or_else(|| error(promotion_size_error()))?;
+    let mut items =
+        Funded::allocate_owned(Some(owner.clone()), bytes, || Vec::with_capacity(count))
+            .map_err(error)?;
+    for event in &status.event_types {
+        items.value.push(
+            event_projection(
+                &owner,
+                "event_type",
+                &event.name,
+                &[
+                    ("trigger", Text(&event.trigger)),
+                    ("table", Text(&event.table)),
+                ],
+            )
+            .map_err(error)?,
+        );
+    }
+    for sink in &status.sinks {
+        items.value.push(
+            event_projection(
+                &owner,
+                "sink",
+                &sink.name,
+                &[
+                    ("sink_type", Text(&sink.sink_type)),
+                    ("callback_registered", Bool(sink.callback_registered)),
+                    ("delivered", Int(sink.delivered as i64)),
+                    ("queued", Int(sink.queued as i64)),
+                    ("retried", Int(sink.retried as i64)),
+                    ("uncertain", Int(sink.uncertain as i64)),
+                    ("permanent_failures", Int(sink.permanent_failures as i64)),
+                    ("examined", Int(sink.examined as i64)),
+                ],
+            )
+            .map_err(error)?,
+        );
+    }
+    for route in &status.routes {
+        items.value.push(
+            event_projection(
+                &owner,
+                "route",
+                &route.name,
+                &[
+                    ("event_type", Text(&route.event_type)),
+                    ("sink", Text(&route.sink)),
+                ],
+            )
+            .map_err(error)?,
+        );
+    }
     for schedule in &status.schedules {
-        let mut item = event_projection(&owner, "schedule", &schedule.name,
-            &[("every", Text(&schedule.every)), ("callback", Text(&schedule.callback)),
-              ("callback_registered", Bool(schedule.callback_registered)), ("next_fire_at_ms", Int(schedule.next_fire_at_ms as i64)),
-              ("fire_count", Int(schedule.fire_count as i64))]).map_err(error)?;
-        if let Some(last) = schedule.last_fire_at_ms { item.fields[5] = Some(("last_fire_at_ms", Int(last as i64))); }
+        let mut item = event_projection(
+            &owner,
+            "schedule",
+            &schedule.name,
+            &[
+                ("every", Text(&schedule.every)),
+                ("callback", Text(&schedule.callback)),
+                ("callback_registered", Bool(schedule.callback_registered)),
+                ("next_fire_at_ms", Int(schedule.next_fire_at_ms as i64)),
+                ("fire_count", Int(schedule.fire_count as i64)),
+            ],
+        )
+        .map_err(error)?;
+        if let Some(last) = schedule.last_fire_at_ms {
+            item.fields[5] = Some(("last_fire_at_ms", Int(last as i64)));
+        }
         items.value.push(item);
     }
-    items.value.sort_unstable_by(|left, right| left.key.value.cmp(&right.key.value));
-    inventory_page(owner, MetadataPageVocabulary::EventsStatus, Inventory::Events(&items.value), continuation, page_bytes)
+    items
+        .value
+        .sort_unstable_by(|left, right| left.key.value.cmp(&right.key.value));
+    inventory_page(
+        owner,
+        MetadataPageVocabulary::EventsStatus,
+        Inventory::Events(&items.value),
+        continuation,
+        page_bytes,
+    )
 }

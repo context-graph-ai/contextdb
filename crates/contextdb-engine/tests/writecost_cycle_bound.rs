@@ -135,7 +135,9 @@ fn each_cycle_reports_at_most_its_cap_and_a_larger_backlog_drains_across_cycles(
         "the first cycle runs to its cap"
     );
     assert_eq!(
-        db.execute("SELECT COUNT(*) FROM bulk", &p()).unwrap().rows(),
+        db.execute("SELECT COUNT(*) FROM bulk", &p())
+            .unwrap()
+            .rows(),
         vec![vec![Value::Int64(400)]]
     );
 }

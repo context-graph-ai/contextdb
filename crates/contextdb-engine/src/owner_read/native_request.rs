@@ -14,7 +14,10 @@ pub struct NativeReadRequest {
 }
 
 impl NativeReadRequest {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new(
         receipt: NativeReadChildReceipt,
     ) -> contextdb_core::Result<(Self, NativeReadCancellation)> {

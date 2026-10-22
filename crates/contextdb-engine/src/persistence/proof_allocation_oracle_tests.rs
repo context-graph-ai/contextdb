@@ -120,7 +120,10 @@ impl<'a> AnswerCopyControlObservation<'a> {
                 ..Default::default()
             });
         });
-        Self { _counter: counter, _thread: std::marker::PhantomData }
+        Self {
+            _counter: counter,
+            _thread: std::marker::PhantomData,
+        }
     }
     pub(crate) fn receipt(&self) -> AnswerCopyControlReceipt {
         ANSWER_COPY_CONTROL.with(std::cell::Cell::get)
@@ -134,9 +137,13 @@ impl Drop for AnswerCopyControlObservation<'_> {
 pub(crate) fn answer_copy_reservation(bytes: usize) {
     ANSWER_COPY_CONTROL.with(|slot| {
         let mut state = slot.get();
-        if state.counter == 0 { return; }
+        if state.counter == 0 {
+            return;
+        }
         state.reservations += 1;
-        if state.reservations == 1 { state.admitted = bytes; }
+        if state.reservations == 1 {
+            state.admitted = bytes;
+        }
         slot.set(state);
     });
 }
@@ -145,8 +152,9 @@ pub(crate) fn answer_copy_refund(bytes: usize) {
         let mut state = slot.get();
         if state.counter != 0 && state.frees == 1 && state.refund_after_free.is_none() {
             state.refund_after_free = Some(bytes);
-            state.funded_after_refund = Some(unsafe { &*(state.counter as *const AtomicUsize) }
-                .load(AtomicOrdering::SeqCst));
+            state.funded_after_refund = Some(
+                unsafe { &*(state.counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst),
+            );
             slot.set(state);
         }
     });
@@ -154,28 +162,34 @@ pub(crate) fn answer_copy_refund(bytes: usize) {
 fn answer_copy_allocated(pointer: usize, layout: Layout) {
     ANSWER_COPY_CONTROL.with(|slot| {
         let mut state = slot.get();
-        if state.counter == 0 || state.reservations != 1 || state.pointer != 0 || state.frees != 0 { return; }
+        if state.counter == 0 || state.reservations != 1 || state.pointer != 0 || state.frees != 0 {
+            return;
+        }
         state.pointer = pointer;
         state.bytes = layout.size();
         state.align = layout.align();
         // The observation guard borrows this exact owner's counter throughout.
-        state.funded_at_allocation = unsafe { &*(state.counter as *const AtomicUsize) }
-            .load(AtomicOrdering::SeqCst);
+        state.funded_at_allocation =
+            unsafe { &*(state.counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst);
         slot.set(state);
     });
 }
 fn answer_copy_free(pointer: usize, after_system: bool) {
     ANSWER_COPY_CONTROL.with(|slot| {
         let mut state = slot.get();
-        if state.counter == 0 || state.pointer != pointer || state.frees != 0 { return; }
-        let funded = unsafe { &*(state.counter as *const AtomicUsize) }
-            .load(AtomicOrdering::SeqCst);
+        if state.counter == 0 || state.pointer != pointer || state.frees != 0 {
+            return;
+        }
+        let funded =
+            unsafe { &*(state.counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst);
         if after_system {
             state.funded_after_free = funded;
             state.frees += 1;
             // The retained address is evidence only; frees disarms matching
             // before any subsequent allocation can reuse it.
-        } else { state.funded_at_free = funded; }
+        } else {
+            state.funded_at_free = funded;
+        }
         slot.set(state);
     });
 }
@@ -188,10 +202,17 @@ static NEXT_DECLARATION_EPOCH: AtomicUsize = AtomicUsize::new(1);
 // at physical free; observing never retains the payload or pays its invoice.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct DeclarationRequest {
-    generation: usize, free_started: bool,
-    pointer: usize, bytes: usize, align: usize,
-    parent: usize, baseline: usize, used_at_alloc: usize,
-    used_before_free: usize, used_after_free: usize, frees: usize,
+    generation: usize,
+    free_started: bool,
+    pointer: usize,
+    bytes: usize,
+    align: usize,
+    parent: usize,
+    baseline: usize,
+    used_at_alloc: usize,
+    used_before_free: usize,
+    used_after_free: usize,
+    frees: usize,
     // Original writer counter address, standing debit, allocation debit,
     // immediately-before-free debit, immediately-after-free debit.
     writer: [usize; 5],
@@ -200,14 +221,20 @@ pub(crate) struct DeclarationRequest {
 impl std::fmt::Debug for DeclarationRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeclarationRequest")
-            .field("generation", &self.generation).field("free_started", &self.free_started)
-            .field("pointer", &self.pointer).field("bytes", &self.bytes).field("align", &self.align)
-            .field("reader_parent", &self.parent).field("reader_standing", &self.baseline)
+            .field("generation", &self.generation)
+            .field("free_started", &self.free_started)
+            .field("pointer", &self.pointer)
+            .field("bytes", &self.bytes)
+            .field("align", &self.align)
+            .field("reader_parent", &self.parent)
+            .field("reader_standing", &self.baseline)
             .field("reader_at_alloc", &self.used_at_alloc)
             .field("reader_before_free", &self.used_before_free)
-            .field("reader_after_free", &self.used_after_free).field("frees", &self.frees)
+            .field("reader_after_free", &self.used_after_free)
+            .field("frees", &self.frees)
             .field("writer_counter_standing_alloc_before_after", &self.writer)
-            .field("process_alloc_before_after", &self.process).finish()
+            .field("process_alloc_before_after", &self.process)
+            .finish()
     }
 }
 // The actual empty-selected-table fixture has at most eight declarations.
@@ -245,43 +272,83 @@ const _: () = assert!(std::mem::size_of::<DeclarationEvidence>() <= 12 * 1024);
 impl std::fmt::Debug for DeclarationEvidence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeclarationEvidence")
-            .field("complete", &self.complete).field("count", &self.count)
-            .field("freed", &self.freed).field("active", &self.active)
-            .field("peak_active", &self.peak_active).field("pending", &self.pending)
+            .field("complete", &self.complete)
+            .field("count", &self.count)
+            .field("freed", &self.freed)
+            .field("active", &self.active)
+            .field("peak_active", &self.peak_active)
+            .field("pending", &self.pending)
             .field("first_gap_request", &self.first_gap_request)
             .field("first_invalid_event", &self.first_invalid_event)
             .field("first_invalid_request", &self.first_invalid_request)
             .field("last_free", &self.last_free)
-            .field("first_gap_pointer_size_align_phase_live_used_baseline_parent", &self.first_gap)
-            .field("first_gap_writer_counter_standing_used_process", &self.first_gap_other_funding)
-            .field("slots", &self.requests).finish()
+            .field(
+                "first_gap_pointer_size_align_phase_live_used_baseline_parent",
+                &self.first_gap,
+            )
+            .field(
+                "first_gap_writer_counter_standing_used_process",
+                &self.first_gap_other_funding,
+            )
+            .field("slots", &self.requests)
+            .finish()
     }
 }
 impl DeclarationEvidence {
     const fn new() -> Self {
-        Self { first_gap: None, first_gap_other_funding: [0; 4], requests: [DeclarationRequest {
-            generation: 0, free_started: false,
-            pointer: 0, bytes: 0, align: 0, parent: 0, baseline: 0,
-            used_at_alloc: 0, used_before_free: 0, used_after_free: 0, frees: 0,
-            writer: [0; 5], process: [0; 3],
-        }; DECLARATION_ACTIVE_CAPACITY], count: 0, freed: 0, active: 0, peak_active: 0, pending: None,
-            first_gap_request: None, first_invalid_event: None, first_invalid_request: None, last_free: None,
-            complete: true }
+        Self {
+            first_gap: None,
+            first_gap_other_funding: [0; 4],
+            requests: [DeclarationRequest {
+                generation: 0,
+                free_started: false,
+                pointer: 0,
+                bytes: 0,
+                align: 0,
+                parent: 0,
+                baseline: 0,
+                used_at_alloc: 0,
+                used_before_free: 0,
+                used_after_free: 0,
+                frees: 0,
+                writer: [0; 5],
+                process: [0; 3],
+            }; DECLARATION_ACTIVE_CAPACITY],
+            count: 0,
+            freed: 0,
+            active: 0,
+            peak_active: 0,
+            pending: None,
+            first_gap_request: None,
+            first_invalid_event: None,
+            first_invalid_request: None,
+            last_free: None,
+            complete: true,
+        }
     }
     fn invalidate(&mut self, event: [usize; 4]) {
         self.complete = false;
         if self.first_invalid_event.is_none() {
             self.first_invalid_event = Some(event);
-            self.first_invalid_request = self.requests.iter()
-                .find(|r| r.generation != 0 && r.pointer == event[0] && r.frees == 0).copied();
+            self.first_invalid_request = self
+                .requests
+                .iter()
+                .find(|r| r.generation != 0 && r.pointer == event[0] && r.frees == 0)
+                .copied();
         }
     }
     fn validate(&mut self, live: usize) {
-        let mut active = self.requests.iter().filter(|r| r.generation != 0 && r.frees == 0);
+        let mut active = self
+            .requests
+            .iter()
+            .filter(|r| r.generation != 0 && r.frees == 0);
         let slots = active.clone().count();
         let bytes = active.try_fold(0usize, |sum, r| sum.checked_add(r.bytes));
-        if self.pending.is_some() || slots != self.active || bytes != Some(live)
-            || self.freed.checked_add(self.active) != Some(self.count) {
+        if self.pending.is_some()
+            || slots != self.active
+            || bytes != Some(live)
+            || self.freed.checked_add(self.active) != Some(self.count)
+        {
             self.invalidate([0, live, 0, 4]);
         }
     }
@@ -323,8 +390,12 @@ impl DeclarationObservation {
     // producer control is created. Needed to distinguish an independent writer
     // debit from this reader parent's standing and sibling credits.
     pub(crate) fn observe_writer(&mut self, writer: crate::memory_accounting::AccountantHandle) {
-        DECLARATION_WRITER.with(|slot| slot.set((
-            writer.writer_registration_observation_for_test().4, writer.usage().used)));
+        DECLARATION_WRITER.with(|slot| {
+            slot.set((
+                writer.writer_registration_observation_for_test().4,
+                writer.usage().used,
+            ))
+        });
         self.writer = Some(writer);
     }
 
@@ -355,10 +426,13 @@ impl DeclarationObservation {
 pub(crate) fn declaration_observation() -> DeclarationObservation {
     DECLARATION_WRITER.with(|slot| slot.set((0, 0)));
     DECLARATION_EVIDENCE.with(|slot| *slot.borrow_mut() = DeclarationEvidence::new());
-    DECLARATION_EPOCH.with(|slot| slot.set(
-        NEXT_DECLARATION_EPOCH.fetch_add(1, AtomicOrdering::SeqCst)));
+    DECLARATION_EPOCH
+        .with(|slot| slot.set(NEXT_DECLARATION_EPOCH.fetch_add(1, AtomicOrdering::SeqCst)));
     DECLARATION_OBSERVATION.with(|slot| slot.set(true));
-    DeclarationObservation { reset_counter: false, writer: None }
+    DeclarationObservation {
+        reset_counter: false,
+        writer: None,
+    }
 }
 impl Drop for DeclarationObservation {
     fn drop(&mut self) {
@@ -386,19 +460,28 @@ fn sample_declaration_funding(allocated: usize, freed: usize) {
         // Do not initialise destructor-bearing TLS from an allocator callback.
         // funded_by_reader initialises it before arming this const Cell flag.
         let reader = if FUNDING_READER_ACTIVE.with(std::cell::Cell::get) {
-            FUNDING_READER.try_with(|slot| {
-                slot.try_borrow().ok().and_then(|parent| parent.as_ref().map(|parent| parent.retained_bytes_for_source_unit_test() as usize))
-            }).ok().flatten()
+            FUNDING_READER
+                .try_with(|slot| {
+                    slot.try_borrow().ok().and_then(|parent| {
+                        parent
+                            .as_ref()
+                            .map(|parent| parent.retained_bytes_for_source_unit_test() as usize)
+                    })
+                })
+                .ok()
+                .flatten()
         } else {
             None
         };
         if FUNDING_READER_ACTIVE.with(std::cell::Cell::get) && reader.is_none() {
             DECLARATION_CENSUS_INVALID.with(|invalid| invalid.set(true));
         }
-        let used = reader.or_else(|| (writer != 0).then(|| {
-            // Existing writer oracle: funded_requests keeps its accountant alive.
-            unsafe { &*(writer as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
-        }));
+        let used = reader.or_else(|| {
+            (writer != 0).then(|| {
+                // Existing writer oracle: funded_requests keeps its accountant alive.
+                unsafe { &*(writer as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
+            })
+        });
         if let Some(used) = used {
             let Some(overlap) = live.checked_add(allocated) else {
                 DECLARATION_CENSUS_INVALID.with(|invalid| invalid.set(true));
@@ -410,12 +493,20 @@ fn sample_declaration_funding(allocated: usize, freed: usize) {
             };
             let admitted = used.saturating_sub(baseline);
             let event = DECLARATION_EVENT.with(std::cell::Cell::get);
-            let parent = if writer != 0 { writer } else {
-                FUNDING_READER.with(|slot| slot.borrow().as_ref()
-                    .map_or(0, |parent| parent.as_ref() as *const crate::vector_read_memory::DeclaredReadMemory as usize))
+            let parent = if writer != 0 {
+                writer
+            } else {
+                FUNDING_READER.with(|slot| {
+                    slot.borrow().as_ref().map_or(0, |parent| {
+                        parent.as_ref() as *const crate::vector_read_memory::DeclaredReadMemory
+                            as usize
+                    })
+                })
             };
             let (writer_counter, writer_standing) = DECLARATION_WRITER.with(std::cell::Cell::get);
-            let writer_used = if writer_counter == 0 { 0 } else {
+            let writer_used = if writer_counter == 0 {
+                0
+            } else {
                 // DeclarationObservation retains this exact accountant through
                 // every sample, including its final physical free.
                 unsafe { &*(writer_counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
@@ -424,41 +515,66 @@ fn sample_declaration_funding(allocated: usize, freed: usize) {
             DECLARATION_EVIDENCE.with(|evidence| {
                 let mut evidence = evidence.borrow_mut();
                 if overlap > admitted && evidence.first_gap.is_none() {
-                    evidence.first_gap = Some([event[0], event[1], event[2], event[3],
-                        overlap, used, baseline, parent]);
-                    evidence.first_gap_other_funding = [writer_counter, writer_standing, writer_used, process];
+                    evidence.first_gap = Some([
+                        event[0], event[1], event[2], event[3], overlap, used, baseline, parent,
+                    ]);
+                    evidence.first_gap_other_funding =
+                        [writer_counter, writer_standing, writer_used, process];
                 }
                 if event[3] == 1 && allocated != 0 {
                     let next = evidence.count.checked_add(1);
-                    if let Some(next) = next { evidence.count = next; }
-                    else { evidence.invalidate(event); }
+                    if let Some(next) = next {
+                        evidence.count = next;
+                    } else {
+                        evidence.invalidate(event);
+                    }
                     if let Some(active) = evidence.active.checked_add(1) {
                         evidence.active = active;
                         evidence.peak_active = evidence.peak_active.max(active);
-                    } else { evidence.invalidate(event); }
-                    let index = evidence.requests.iter().position(|r| r.generation == 0 || r.frees == 1);
+                    } else {
+                        evidence.invalidate(event);
+                    }
+                    let index = evidence
+                        .requests
+                        .iter()
+                        .position(|r| r.generation == 0 || r.frees == 1);
                     if let (Some(generation), Some(index)) = (next, index) {
-                        if evidence.pending.is_some() { evidence.invalidate(event); }
+                        if evidence.pending.is_some() {
+                            evidence.invalidate(event);
+                        }
                         evidence.requests[index] = DeclarationRequest {
-                            generation, bytes: event[1], align: event[2], parent, baseline,
+                            generation,
+                            bytes: event[1],
+                            align: event[2],
+                            parent,
+                            baseline,
                             used_at_alloc: used,
                             writer: [writer_counter, writer_standing, writer_used, 0, 0],
                             process: [process, 0, 0],
                             ..Default::default()
                         };
                         evidence.pending = Some(index);
-                        if evidence.first_gap.is_some_and(|gap| gap[0] == 0 && gap[3] == 1)
-                            && evidence.first_gap_request.is_none() {
+                        if evidence
+                            .first_gap
+                            .is_some_and(|gap| gap[0] == 0 && gap[3] == 1)
+                            && evidence.first_gap_request.is_none()
+                        {
                             evidence.first_gap_request = Some(evidence.requests[index]);
                         }
-                    } else { evidence.invalidate(event); }
+                    } else {
+                        evidence.invalidate(event);
+                    }
                 } else if event[0] != 0 && (event[3] == 2 || event[3] == 3) {
-                    let index = evidence.requests.iter().position(|r|
-                        r.generation != 0 && r.pointer == event[0] && r.frees == 0);
+                    let index = evidence
+                        .requests
+                        .iter()
+                        .position(|r| r.generation != 0 && r.pointer == event[0] && r.frees == 0);
                     if let Some(index) = index {
                         let mut request = evidence.requests[index];
-                        if request.bytes != event[1] || request.align != event[2]
-                            || request.free_started != (event[3] == 3) {
+                        if request.bytes != event[1]
+                            || request.align != event[2]
+                            || request.free_started != (event[3] == 3)
+                        {
                             evidence.invalidate(event);
                         } else if event[3] == 2 {
                             request.free_started = true;
@@ -474,33 +590,50 @@ fn sample_declaration_funding(allocated: usize, freed: usize) {
                         }
                         // Preserve the allocation origin even after this slot
                         // is physically freed and reused by another generation.
-                        if evidence.first_gap.is_some_and(|gap|
-                            gap[0] == event[0] && gap[3] == event[3])
-                            && evidence.first_gap_request.is_none() {
+                        if evidence
+                            .first_gap
+                            .is_some_and(|gap| gap[0] == event[0] && gap[3] == event[3])
+                            && evidence.first_gap_request.is_none()
+                        {
                             evidence.first_gap_request = Some(request);
                         }
                         evidence.requests[index] = request;
-                    } else { evidence.invalidate(event); }
+                    } else {
+                        evidence.invalidate(event);
+                    }
                     // Count physical events even on an overflowed census;
                     // incomplete never becomes complete again after recycling.
                     if event[3] == 3 {
-                        if let (Some(freed), Some(active)) =
-                            (evidence.freed.checked_add(1), evidence.active.checked_sub(1)) {
+                        if let (Some(freed), Some(active)) = (
+                            evidence.freed.checked_add(1),
+                            evidence.active.checked_sub(1),
+                        ) {
                             evidence.freed = freed;
                             evidence.active = active;
-                        } else { evidence.invalidate(event); }
+                        } else {
+                            evidence.invalidate(event);
+                        }
                     }
                 } else if event[3] == 4 {
                     if evidence.first_gap_request.is_none()
-                        && evidence.first_gap.is_some_and(|gap| gap[3] == 4) {
-                        evidence.first_gap_request = evidence.requests.iter()
-                            .find(|r| r.generation != 0 && r.frees == 0).copied();
+                        && evidence.first_gap.is_some_and(|gap| gap[3] == 4)
+                    {
+                        evidence.first_gap_request = evidence
+                            .requests
+                            .iter()
+                            .find(|r| r.generation != 0 && r.frees == 0)
+                            .copied();
                     }
                     evidence.validate(remaining);
                 }
             });
-            slot.set((writer, baseline, remaining,
-                gap.max(overlap.saturating_sub(admitted)), peak.max(overlap)));
+            slot.set((
+                writer,
+                baseline,
+                remaining,
+                gap.max(overlap.saturating_sub(admitted)),
+                peak.max(overlap),
+            ));
         }
     });
 }
@@ -529,8 +662,10 @@ pub(crate) fn funded_requests<T>(
     let guard = Guard;
     DECLARATION_CENSUS_INVALID.with(|invalid| invalid.set(false));
     let (value, _, _) = measured(operation);
-    assert!(!DECLARATION_CENSUS_INVALID.with(std::cell::Cell::get),
-        "declaration census mismatch invalidates the physical funding proof");
+    assert!(
+        !DECLARATION_CENSUS_INVALID.with(std::cell::Cell::get),
+        "declaration census mismatch invalidates the physical funding proof"
+    );
     let gap = FUNDING_CENSUS.with(|slot| slot.get().3);
     drop(guard);
     (value, gap)
@@ -559,10 +694,16 @@ pub(crate) fn source_requests_for_test<T>(
 pub(crate) fn reader_requests_for_test<T>(counter: usize, action: impl FnOnce() -> T) -> T {
     struct Guard;
     impl Drop for Guard {
-        fn drop(&mut self) { SOURCE_COUNTER_IS_READER.with(|slot| slot.set(false)); }
+        fn drop(&mut self) {
+            SOURCE_COUNTER_IS_READER.with(|slot| slot.set(false));
+        }
     }
-    READER_STANDING_FUNDING.with(|slot| slot.set(
-        unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }.load(AtomicOrdering::SeqCst) as usize));
+    READER_STANDING_FUNDING.with(|slot| {
+        slot.set(
+            unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
+                .load(AtomicOrdering::SeqCst) as usize,
+        )
+    });
     SOURCE_COUNTER_IS_READER.with(|slot| slot.set(true));
     let guard = Guard;
     let (value, _, _) = source_requests_for_test(counter, action);
@@ -571,8 +712,8 @@ pub(crate) fn reader_requests_for_test<T>(counter: usize, action: impl FnOnce() 
 }
 fn observed_source_funding(counter: usize) -> usize {
     if SOURCE_COUNTER_IS_READER.with(std::cell::Cell::get) {
-        (unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
-            .load(AtomicOrdering::SeqCst) as usize)
+        (unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }.load(AtomicOrdering::SeqCst)
+            as usize)
             .saturating_sub(READER_STANDING_FUNDING.with(std::cell::Cell::get))
     } else {
         unsafe { &*(counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
@@ -740,10 +881,17 @@ pub(crate) struct PurgePeakReceipt {
 }
 impl PurgePeakReceipt {
     const fn new() -> Self {
-        Self { complete: true, payload_peak: 0, publication_frontier: None, raw_peak: 0,
-            payload_at_raw_peak: 0, header_at_raw_peak: 0, padding_at_raw_peak: 0,
+        Self {
+            complete: true,
+            payload_peak: 0,
+            publication_frontier: None,
+            raw_peak: 0,
+            payload_at_raw_peak: 0,
+            header_at_raw_peak: 0,
+            padding_at_raw_peak: 0,
             request_at_raw_peak: (0, 0, 0, 0),
-            producer_snapshot: PurgeProducerSnapshotHandle::INVALID }
+            producer_snapshot: PurgeProducerSnapshotHandle::INVALID,
+        }
     }
 }
 // Receipts copied through thread return values and assertion formatting carry
@@ -760,7 +908,10 @@ struct PurgeProducerSnapshotHandle {
     generation: usize,
 }
 impl PurgeProducerSnapshotHandle {
-    const INVALID: Self = Self { slot: usize::MAX, generation: 0 };
+    const INVALID: Self = Self {
+        slot: usize::MAX,
+        generation: 0,
+    };
 }
 struct PurgeProducerSnapshot {
     generation: usize,
@@ -769,8 +920,11 @@ struct PurgeProducerSnapshot {
 }
 impl PurgeProducerSnapshot {
     const fn new() -> Self {
-        Self { generation: 0, producers: [UNKNOWN_PURGE_PRODUCER; 1024],
-            live_at_raw_peak: [(0, 0, 0, 0); 1024] }
+        Self {
+            generation: 0,
+            producers: [UNKNOWN_PURGE_PRODUCER; 1024],
+            live_at_raw_peak: [(0, 0, 0, 0); 1024],
+        }
     }
 }
 impl Measurement {
@@ -787,12 +941,17 @@ impl Measurement {
         }
         slot.generation = generation;
         self.purge_producer_snapshots_used = generation;
-        PurgeProducerSnapshotHandle { slot: index, generation }
+        PurgeProducerSnapshotHandle {
+            slot: index,
+            generation,
+        }
     }
-    fn purge_producer_snapshot(&self, handle: PurgeProducerSnapshotHandle)
-        -> Option<&PurgeProducerSnapshot>
-    {
-        self.purge_producer_snapshots.get(handle.slot)
+    fn purge_producer_snapshot(
+        &self,
+        handle: PurgeProducerSnapshotHandle,
+    ) -> Option<&PurgeProducerSnapshot> {
+        self.purge_producer_snapshots
+            .get(handle.slot)
             .filter(|slot| handle.generation != 0 && slot.generation == handle.generation)
     }
     fn snapshot_purge_producers(&mut self) {
@@ -813,10 +972,14 @@ impl std::fmt::Debug for PurgePeakReceipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let complete = {
             let measurement = MEASUREMENT.lock().unwrap();
-            self.complete && measurement.purge_producer_snapshot(self.producer_snapshot).is_some()
+            self.complete
+                && measurement
+                    .purge_producer_snapshot(self.producer_snapshot)
+                    .is_some()
         };
         let mut report = f.debug_struct("PurgePeakReceipt");
-        report.field("complete", &complete)
+        report
+            .field("complete", &complete)
             .field("payload_peak", &self.payload_peak)
             .field("publication_frontier", &self.publication_frontier)
             .field("raw_peak", &self.raw_peak)
@@ -829,12 +992,14 @@ impl std::fmt::Debug for PurgePeakReceipt {
             // lock; formatting happens only after the lock has been released.
             let entry = {
                 let measurement = MEASUREMENT.lock().unwrap();
-                measurement.purge_producer_snapshot(self.producer_snapshot)
+                measurement
+                    .purge_producer_snapshot(self.producer_snapshot)
                     .map(|slot| (slot.live_at_raw_peak[index], slot.producers[index]))
             };
             if let Some((request, producer)) = entry {
                 if request.0 != 0 {
-                    report.field("live_pointer_size_align_overhead", &request)
+                    report
+                        .field("live_pointer_size_align_overhead", &request)
                         .field("producer_site_and_value_type", &producer);
                 }
             }
@@ -849,19 +1014,23 @@ pub(crate) fn note_purge_publication_frontier(frontier: u64) {
         measurement.purge_receipt.publication_frontier = Some(frontier);
     }
 }
-pub(crate) fn measured_purge<T>(operation: impl FnOnce() -> T)
-    -> (T, usize, usize, PurgePeakReceipt)
-{
+pub(crate) fn measured_purge<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, usize, usize, PurgePeakReceipt) {
     struct Guard;
     impl Drop for Guard {
-        fn drop(&mut self) { MEASUREMENT.lock().unwrap().purge_active = false; }
+        fn drop(&mut self) {
+            MEASUREMENT.lock().unwrap().purge_active = false;
+        }
     }
     {
         let mut measurement = MEASUREMENT.lock().unwrap();
         assert!(!measurement.purge_active);
         measurement.purge_active = true;
         // Reset in place: no 32 KiB array value is built on this thread's stack.
-        for request in &mut measurement.purge_live { *request = (0, 0, 0, 0); }
+        for request in &mut measurement.purge_live {
+            *request = (0, 0, 0, 0);
+        }
         for producer in &mut measurement.purge_live_producers {
             *producer = UNKNOWN_PURGE_PRODUCER;
         }
@@ -876,7 +1045,10 @@ pub(crate) fn measured_purge<T>(operation: impl FnOnce() -> T)
     let (value, peak, live) = measured(operation);
     let receipt = {
         let mut measurement = MEASUREMENT.lock().unwrap();
-        if measurement.purge_producer_snapshot(measurement.purge_receipt.producer_snapshot).is_none() {
+        if measurement
+            .purge_producer_snapshot(measurement.purge_receipt.producer_snapshot)
+            .is_none()
+        {
             measurement.purge_receipt.complete = false;
         }
         measurement.purge_receipt
@@ -943,8 +1115,11 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         if NATIVE_REQUEST_ACTIVE
             .try_with(std::cell::Cell::get)
             .unwrap_or(false)
-            && crate::vector_read_memory::native_ownership_proof::refuse_selected_live_layout(layout)
-            || crate::vector_read_memory::native_ownership_proof::refuse_allocation(layout) {
+            && crate::vector_read_memory::native_ownership_proof::refuse_selected_live_layout(
+                layout,
+            )
+            || crate::vector_read_memory::native_ownership_proof::refuse_allocation(layout)
+        {
             native_scan_producer_tests::allocator_null(layout);
             return std::ptr::null_mut();
         }
@@ -963,7 +1138,8 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             }
         }
         let declaration_epoch = DECLARATION_EPOCH
-            .try_with(std::cell::Cell::get).unwrap_or(0);
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(0);
         DECLARATION_EVENT.with(|slot| slot.set([0, layout.size(), layout.align(), 1]));
         sample_declaration_funding(layout.size(), 0);
         let base = unsafe { System.alloc(allocation) };
@@ -987,7 +1163,9 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                     evidence.requests[index].pointer = pointer as usize;
                 }
                 if let Some(gap) = evidence.first_gap.as_mut()
-                    && gap[0] == 0 && gap[3] == 1 {
+                    && gap[0] == 0
+                    && gap[3] == 1
+                {
                     gap[0] = pointer as usize;
                     if let Some(request) = evidence.first_gap_request.as_mut() {
                         request.pointer = pointer as usize;
@@ -1043,25 +1221,38 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 measurement.payload_live += layout.size();
                 if measurement.purge_active {
                     let request = (pointer as usize, layout.size(), layout.align(), offset);
-                    if let Some(index) = measurement.purge_live.iter().position(|slot| slot.0 == 0) {
+                    if let Some(index) = measurement.purge_live.iter().position(|slot| slot.0 == 0)
+                    {
                         measurement.purge_live[index] = request;
                         measurement.purge_live_producers[index] = PURGE_PRODUCER
-                            .try_with(std::cell::Cell::get).unwrap_or(UNKNOWN_PURGE_PRODUCER);
-                    } else { measurement.purge_receipt.complete = false; }
-                    measurement.purge_receipt.payload_peak = measurement.purge_receipt.payload_peak
+                            .try_with(std::cell::Cell::get)
+                            .unwrap_or(UNKNOWN_PURGE_PRODUCER);
+                    } else {
+                        measurement.purge_receipt.complete = false;
+                    }
+                    measurement.purge_receipt.payload_peak = measurement
+                        .purge_receipt
+                        .payload_peak
                         .max(measurement.payload_live);
                     if measurement.live > measurement.purge_receipt.raw_peak {
                         measurement.purge_receipt.raw_peak = measurement.live;
                         measurement.purge_receipt.payload_at_raw_peak = measurement.payload_live;
                         measurement.purge_receipt.request_at_raw_peak = request;
                         measurement.snapshot_purge_producers();
-                        let count = measurement.purge_live.iter().filter(|slot| slot.0 != 0).count();
-                        let overhead: usize = measurement.purge_live.iter().map(|slot| slot.3).sum();
+                        let count = measurement
+                            .purge_live
+                            .iter()
+                            .filter(|slot| slot.0 != 0)
+                            .count();
+                        let overhead: usize =
+                            measurement.purge_live.iter().map(|slot| slot.3).sum();
                         let headers = count * std::mem::size_of::<Header>();
                         measurement.purge_receipt.header_at_raw_peak = headers;
                         measurement.purge_receipt.padding_at_raw_peak = overhead - headers;
                         let payload: usize = measurement.purge_live.iter().map(|slot| slot.1).sum();
-                        if payload != measurement.payload_live || payload + overhead != measurement.live {
+                        if payload != measurement.payload_live
+                            || payload + overhead != measurement.live
+                        {
                             measurement.purge_receipt.complete = false;
                         }
                     }
@@ -1109,13 +1300,21 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                     }
                 }
                 if measurement.purge_active {
-                    if let Some(index) = measurement.purge_live.iter().position(|slot| slot.0 == pointer as usize) {
+                    if let Some(index) = measurement
+                        .purge_live
+                        .iter()
+                        .position(|slot| slot.0 == pointer as usize)
+                    {
                         let slot = measurement.purge_live[index];
                         let matches = slot.1 == layout.size() && slot.2 == layout.align();
                         measurement.purge_live[index] = (0, 0, 0, 0);
                         measurement.purge_live_producers[index] = UNKNOWN_PURGE_PRODUCER;
-                        if !matches { measurement.purge_receipt.complete = false; }
-                    } else { measurement.purge_receipt.complete = false; }
+                        if !matches {
+                            measurement.purge_receipt.complete = false;
+                        }
+                    } else {
+                        measurement.purge_receipt.complete = false;
+                    }
                 }
                 measurement.payload_live -= layout.size();
                 measurement.live -= header.bytes;
@@ -1156,13 +1355,22 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 .sum();
             watch.live_at_free.store(live, AtomicOrdering::SeqCst);
             watch.before.store(before, AtomicOrdering::SeqCst);
-// capture969 begin
+            // capture969 begin
             #[cfg(feature = "test-seams")]
-            crate::database::retained_trace_ownership_tests::ordered_cut("native-free-before",
-                [pointer as usize, layout.size(), layout.align(), header.window,
-                 watch as *const _ as usize, watch.window.load(AtomicOrdering::SeqCst),
-                 watch.bytes.load(AtomicOrdering::SeqCst), before]);
-// capture969 end
+            crate::database::retained_trace_ownership_tests::ordered_cut(
+                "native-free-before",
+                [
+                    pointer as usize,
+                    layout.size(),
+                    layout.align(),
+                    header.window,
+                    watch as *const _ as usize,
+                    watch.window.load(AtomicOrdering::SeqCst),
+                    watch.bytes.load(AtomicOrdering::SeqCst),
+                    before,
+                ],
+            );
+            // capture969 end
         }
         super::super::writer_row_heads::staging_witness::freed(pointer as usize, layout.size());
         crate::vector_read_memory::native_ownership_proof::before_free(
@@ -1174,16 +1382,21 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         // census until System has physically freed it. An early invoice
         // release therefore appears as a gap at its real deallocation.
         let declaration_free = header.declaration_epoch != 0
-            && DECLARATION_EPOCH.try_with(std::cell::Cell::get).unwrap_or(0)
+            && DECLARATION_EPOCH
+                .try_with(std::cell::Cell::get)
+                .unwrap_or(0)
                 == header.declaration_epoch;
         if declaration_free {
-            DECLARATION_EVENT.with(|slot| slot.set([pointer as usize, layout.size(), layout.align(), 2]));
+            DECLARATION_EVENT
+                .with(|slot| slot.set([pointer as usize, layout.size(), layout.align(), 2]));
             sample_declaration_funding(0, 0);
         }
         selected_json_producer_rows::freed(pointer as usize, layout, false);
         answer_copy_free(pointer as usize, false);
         let producer_free = crate::vector_read_memory::root_observations::before_physical_free(
-            pointer as usize, layout);
+            pointer as usize,
+            layout,
+        );
         unsafe {
             System.dealloc(pointer.sub(offset), allocation);
         }
@@ -1191,7 +1404,8 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         selected_json_producer_rows::freed(pointer as usize, layout, true);
         answer_copy_free(pointer as usize, true);
         if declaration_free {
-            DECLARATION_EVENT.with(|slot| slot.set([pointer as usize, layout.size(), layout.align(), 3]));
+            DECLARATION_EVENT
+                .with(|slot| slot.set([pointer as usize, layout.size(), layout.align(), 3]));
             sample_declaration_funding(0, layout.size());
         }
         crate::vector_read_memory::native_ownership_proof::after_free(pointer);
@@ -1204,13 +1418,22 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 unsafe { &*(counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
             };
             watch.after.store(after, AtomicOrdering::SeqCst);
-// capture969 begin
+            // capture969 begin
             #[cfg(feature = "test-seams")]
-            crate::database::retained_trace_ownership_tests::ordered_cut("native-free-after",
-                [pointer as usize, layout.size(), layout.align(), header.window,
-                 watch as *const _ as usize, watch.window.load(AtomicOrdering::SeqCst),
-                 watch.bytes.load(AtomicOrdering::SeqCst), after]);
-// capture969 end
+            crate::database::retained_trace_ownership_tests::ordered_cut(
+                "native-free-after",
+                [
+                    pointer as usize,
+                    layout.size(),
+                    layout.align(),
+                    header.window,
+                    watch as *const _ as usize,
+                    watch.window.load(AtomicOrdering::SeqCst),
+                    watch.bytes.load(AtomicOrdering::SeqCst),
+                    after,
+                ],
+            );
+            // capture969 end
             watch.count.fetch_add(1, AtomicOrdering::SeqCst);
             watch.pointer.store(0, AtomicOrdering::SeqCst);
         }
@@ -2724,7 +2947,9 @@ impl contextdb_core::read_memory::ReadMemoryBudget for MaintenanceReaderSpy {
                         owners.len() < owners.capacity(),
                         "fixed spy slots cover live image owners"
                     );
-                    owners.push(crate::read_image_memory::ImageMemoryObservation::new(&owner));
+                    owners.push(crate::read_image_memory::ImageMemoryObservation::new(
+                        &owner,
+                    ));
                 }
             }
         }
@@ -3214,7 +3439,8 @@ mod row_check_cache_ownership_contract {
                 if NULL_PHASE.get() == PHASE.get() {
                     let (size, align) = NULL_LAYOUT.get();
                     crate::vector_read_memory::native_ownership_proof::arm_refuse_one_live_layout(
-                        std::alloc::Layout::from_size_align(size, align).expect("recorded cache layout"),
+                        std::alloc::Layout::from_size_align(size, align)
+                            .expect("recorded cache layout"),
                     );
                 }
                 super::SOURCE_REQUEST_COUNTER.set(CACHE_PAYER.get());
@@ -3573,8 +3799,13 @@ mod row_check_cache_ownership_contract {
         let layouts = PHASE_LAYOUTS.get();
         let targets = [
             0,
-            (0..phases).find(|phase| PHASES.get()[*phase].5 == 0).expect("initial map phase"),
-            (0..phases).filter(|phase| PHASES.get()[*phase].5 == 0).last().expect("replacement phase"),
+            (0..phases)
+                .find(|phase| PHASES.get()[*phase].5 == 0)
+                .expect("initial map phase"),
+            (0..phases)
+                .filter(|phase| PHASES.get()[*phase].5 == 0)
+                .last()
+                .expect("replacement phase"),
         ];
         let mut payers = vec![payer];
         for target in targets {
@@ -3591,11 +3822,18 @@ mod row_check_cache_ownership_contract {
             NULL_LAYOUT.set((0, 0));
             let (retry, _, _, payer) = run_case(&db, roomy_read_limits().memory, 0);
             payers.push(payer);
-            assert!(retry, "the same database remains queryable after allocator null");
+            assert!(
+                retry,
+                "the same database remains queryable after allocator null"
+            );
         }
         drop(db);
         for payer in payers {
-            assert_eq!(payer.used.load(Ordering::SeqCst), 0, "all original payer invoices settle");
+            assert_eq!(
+                payer.used.load(Ordering::SeqCst),
+                0,
+                "all original payer invoices settle"
+            );
         }
     }
 
@@ -3607,7 +3845,10 @@ mod row_check_cache_ownership_contract {
         let (ok, _, _, payer) = run_case(&db, roomy_read_limits().memory, 0);
         CANCEL_DURING_MIGRATION_AFTER.set(0);
         assert!(!ok);
-        assert!(MIGRATED.get() >= 2, "cancellation follows copied cache entries");
+        assert!(
+            MIGRATED.get() >= 2,
+            "cancellation follows copied cache entries"
+        );
         let (retry, _, _, retry_payer) = run_case(&db, roomy_read_limits().memory, 0);
         assert!(retry);
         drop(db);
@@ -3876,10 +4117,8 @@ fn vector_identity_directory_refunds_only_after_its_buffer_is_freed() {
         );
         drop(frame);
         assert_eq!(funding.usage().used, before);
-
     }
 }
-
 
 /// Inspect the existing window at an admission boundary, without allocating
 /// another observation ledger or measuring another thread's allocations.
@@ -3924,8 +4163,13 @@ mod original_failure_contract {
             }
             fn commit_failed(&self, _: &WriteSet, _: CommitSource, error: &Error) {
                 if let Error::Other(message) = error {
-                    self.callback_pointer
-                        .store(message.as_text().expect("original application text").as_ptr() as usize, AtomicOrdering::SeqCst);
+                    self.callback_pointer.store(
+                        message
+                            .as_text()
+                            .expect("original application text")
+                            .as_ptr() as usize,
+                        AtomicOrdering::SeqCst,
+                    );
                 }
                 self.callbacks.fetch_add(1, AtomicOrdering::SeqCst);
             }
@@ -3960,9 +4204,24 @@ mod original_failure_contract {
             let Error::Other(ref message) = error else {
                 panic!("preserve plugin error variant");
             };
-            assert_eq!(message.as_text().expect("original application text").as_ptr() as usize, pointer);
-            assert_eq!(message.as_text().expect("original application text").len(), length);
-            assert!(message.as_text().expect("original application text").bytes().all(|byte| byte == b'x'));
+            assert_eq!(
+                message
+                    .as_text()
+                    .expect("original application text")
+                    .as_ptr() as usize,
+                pointer
+            );
+            assert_eq!(
+                message.as_text().expect("original application text").len(),
+                length
+            );
+            assert!(
+                message
+                    .as_text()
+                    .expect("original application text")
+                    .bytes()
+                    .all(|byte| byte == b'x')
+            );
             assert_eq!(plugin.callbacks.load(AtomicOrdering::SeqCst), 1);
             assert_eq!(
                 plugin.callback_pointer.load(AtomicOrdering::SeqCst),
@@ -4285,12 +4544,18 @@ mod original_failure_contract {
             diagnostic: ScalarOrPointer,
             scope: Option<std::ptr::NonNull<()>>,
         }
-        assert_eq!(std::mem::size_of::<crate::funded_error::OriginalError>(),
-            std::mem::size_of::<CompactCarrier>());
-        assert_eq!(std::mem::align_of::<crate::funded_error::OriginalError>(),
-            std::mem::align_of::<CompactCarrier>());
-        assert_eq!(std::mem::size_of::<crate::funded_error::OriginalResult<()>>(),
-            std::mem::size_of::<std::result::Result<(), CompactCarrier>>());
+        assert_eq!(
+            std::mem::size_of::<crate::funded_error::OriginalError>(),
+            std::mem::size_of::<CompactCarrier>()
+        );
+        assert_eq!(
+            std::mem::align_of::<crate::funded_error::OriginalError>(),
+            std::mem::align_of::<CompactCarrier>()
+        );
+        assert_eq!(
+            std::mem::size_of::<crate::funded_error::OriginalResult<()>>(),
+            std::mem::size_of::<std::result::Result<(), CompactCarrier>>()
+        );
         let writer = MemoryAccountant::writer_no_limit().unwrap();
         let owner = writer.accountant();
         let funder = writer.prepare_source_funder().unwrap();
@@ -4456,14 +4721,21 @@ mod original_failure_contract {
         // Measure the real prepared cell, then deny that exact carrier by one
         // byte at the actual decoder entry. The visitor must never run.
         let (prepared, requests, count) = source_requests_for_test(counter, || {
-            crate::funded_error::OriginalError::prepare(&original,
-                "events", "decode_sink_queue_entry",
-                "Reduce pending deliveries or raise MEMORY_LIMIT.").unwrap()
+            crate::funded_error::OriginalError::prepare(
+                &original,
+                "events",
+                "decode_sink_queue_entry",
+                "Reduce pending deliveries or raise MEMORY_LIMIT.",
+            )
+            .unwrap()
         });
         assert_eq!(count, 1);
         let carrier_bytes = requests[0].1;
         assert_eq!(owner.usage().used - baseline, carrier_bytes);
-        assert_eq!(source_request_credit_for_test()[0], baseline + carrier_bytes);
+        assert_eq!(
+            source_request_credit_for_test()[0],
+            baseline + carrier_bytes
+        );
         watch_source_free_for_test(&requests[..count], counter);
         let _carrier_watch = FreeWatch;
         drop(prepared);
@@ -4473,13 +4745,18 @@ mod original_failure_contract {
         assert_eq!(free.0, baseline + carrier_bytes);
         disarm_source_free_watch();
         assert_eq!(owner.usage().used, baseline);
-        owner.set_budget(Some(baseline + carrier_bytes - 1)).unwrap();
+        owner
+            .set_budget(Some(baseline + carrier_bytes - 1))
+            .unwrap();
         FOREIGN_ENTRIES.store(0, AtomicOrdering::SeqCst);
         LAST_REQUEST.with(|slot| slot.set((0, 0, 0)));
         let (denied, denial_gap) = funded_requests(&owner, || {
             let _observation = declaration_observation();
             crate::persistence::original_event_decode::decode_funded::<Foreign>(
-                &original, &[2], true)
+                &original,
+                &[2],
+                true,
+            )
         });
         let allocations = LAST_REQUEST.with(|slot| slot.get().2);
         let denied = match denied {
@@ -4487,9 +4764,15 @@ mod original_failure_contract {
             Ok(_) => panic!("one byte short must refuse before the foreign producer"),
         };
         assert!(denied.is_memory_refusal());
-        assert!(denied.source_is_qualified(), "scalar pre-entry refusal has no foreign payload");
+        assert!(
+            denied.source_is_qualified(),
+            "scalar pre-entry refusal has no foreign payload"
+        );
         assert_eq!(FOREIGN_ENTRIES.load(AtomicOrdering::SeqCst), 0);
-        assert_eq!(allocations, 0, "no carrier allocation after failed prepayment");
+        assert_eq!(
+            allocations, 0,
+            "no carrier allocation after failed prepayment"
+        );
         assert_eq!(denial_gap, 0);
         drop(denied);
         assert_eq!(owner.usage().used, baseline);
@@ -4498,9 +4781,13 @@ mod original_failure_contract {
             let _observation = declaration_observation();
             // This owning cell exists BEFORE the foreign visitor allocates its
             // String. Paying the carrier must never qualify that source.
-            let prepared = crate::funded_error::OriginalError::prepare(&original,
-                "events", "decode_sink_queue_entry",
-                "Reduce pending deliveries or raise MEMORY_LIMIT.").unwrap();
+            let prepared = crate::funded_error::OriginalError::prepare(
+                &original,
+                "events",
+                "decode_sink_queue_entry",
+                "Reduce pending deliveries or raise MEMORY_LIMIT.",
+            )
+            .unwrap();
             let error = match crate::persistence::original_event_decode::decode_funded::<Foreign>(
                 &original,
                 &[2],
@@ -4515,24 +4802,39 @@ mod original_failure_contract {
                 if !source.source_is_qualified()));
             let mut raw = std::io::Cursor::new([0u8; 512]);
             write!(&mut raw, "{public}").unwrap();
-            assert!(std::str::from_utf8(&raw.get_ref()[..raw.position() as usize])
-                .unwrap().contains("foreign decoder detail without producer funding"));
+            assert!(
+                std::str::from_utf8(&raw.get_ref()[..raw.position() as usize])
+                    .unwrap()
+                    .contains("foreign decoder detail without producer funding")
+            );
             owner.set_budget(Some(owner.usage().used)).unwrap();
-            assert!(crate::memory_accounting::reserve_preparation_original_native(
-                &original, 1, "events", "decode_sink_queue_entry",
-                "Reduce pending deliveries or raise MEMORY_LIMIT.").is_err());
+            assert!(
+                crate::memory_accounting::reserve_preparation_original_native(
+                    &original,
+                    1,
+                    "events",
+                    "decode_sink_queue_entry",
+                    "Reduce pending deliveries or raise MEMORY_LIMIT."
+                )
+                .is_err()
+            );
             let before_transfer = owner.usage().used;
             let before_requests = LAST_REQUEST.with(|slot| slot.get().2);
             let error = prepared.unqualified(public);
-            assert_eq!(LAST_REQUEST.with(|slot| slot.get().2), before_requests,
-                "already produced foreign primary moves into prepaid custody without allocation");
+            assert_eq!(
+                LAST_REQUEST.with(|slot| slot.get().2),
+                before_requests,
+                "already produced foreign primary moves into prepaid custody without allocation"
+            );
             assert_eq!(owner.usage().used, before_transfer);
             assert!(!error.source_is_qualified());
             assert!(!error.is_memory_refusal());
             let mut retained = std::io::Cursor::new([0u8; 512]);
             write!(&mut retained, "{error}").unwrap();
-            assert_eq!(&raw.get_ref()[..raw.position() as usize],
-                &retained.get_ref()[..retained.position() as usize]);
+            assert_eq!(
+                &raw.get_ref()[..raw.position() as usize],
+                &retained.get_ref()[..retained.position() as usize]
+            );
             assert_eq!(FOREIGN_ENTRIES.load(AtomicOrdering::SeqCst), 1);
             drop(error);
         });
@@ -4562,10 +4864,14 @@ mod original_failure_contract {
             let original = writer.reserve_assembly_original(&funder).unwrap();
             let baseline = owner.usage().used;
             let counter = owner.writer_registration_observation_for_test().4;
-            let (diagnosis, primary_requests, primary_count) = source_requests_for_test(counter, || {
-                crate::persistence::original_event_decode::decode_funded::<bool>(
-                    &original, &[2], true)
-            });
+            let (diagnosis, primary_requests, primary_count) =
+                source_requests_for_test(counter, || {
+                    crate::persistence::original_event_decode::decode_funded::<bool>(
+                        &original,
+                        &[2],
+                        true,
+                    )
+                });
             assert!(primary_count > 0);
             let diagnosis = match diagnosis {
                 Err(error) => error,
@@ -4601,14 +4907,23 @@ mod original_failure_contract {
             // Real native views retain these exact scopes. Their guard/custody
             // controls and clones must keep the scopes paid until the LAST view.
             let before_views = owner.usage().used;
-            let ((outer_view, inner_view), _view_requests, view_count) =
-                persistence.with_db(|raw| Ok(source_requests_for_test(counter, || {
-                    let outer_view = redb::with_native_storage_admission(
-                        outer_clone.clone(), || raw.begin_native_read()).unwrap();
-                    let inner_view = redb::with_native_storage_admission(
-                        inner_clone.clone(), || raw.begin_native_read()).unwrap();
-                    (outer_view, inner_view)
-                }))).unwrap();
+            let ((outer_view, inner_view), _view_requests, view_count) = persistence
+                .with_db(|raw| {
+                    Ok(source_requests_for_test(counter, || {
+                        let outer_view =
+                            redb::with_native_storage_admission(outer_clone.clone(), || {
+                                raw.begin_native_read()
+                            })
+                            .unwrap();
+                        let inner_view =
+                            redb::with_native_storage_admission(inner_clone.clone(), || {
+                                raw.begin_native_read()
+                            })
+                            .unwrap();
+                        (outer_view, inner_view)
+                    }))
+                })
+                .unwrap();
             assert!(view_count > 0 && view_count <= 32);
             // The adapter prepares outside this window. Observe the scope
             // cells themselves for retention by the actual live native views.
@@ -4617,27 +4932,38 @@ mod original_failure_contract {
             let ((outer_view_clone, inner_view_clone), _, view_clone_allocations) =
                 native_requests_for_test(|| (outer_view.clone(), inner_view.clone()));
             assert_eq!(view_clone_allocations, 0);
-            assert_eq!(outer_view.storage_snapshot_identity(), outer_view_clone.storage_snapshot_identity());
-            assert_eq!(inner_view.storage_snapshot_identity(), inner_view_clone.storage_snapshot_identity());
+            assert_eq!(
+                outer_view.storage_snapshot_identity(),
+                outer_view_clone.storage_snapshot_identity()
+            );
+            assert_eq!(
+                inner_view.storage_snapshot_identity(),
+                inner_view_clone.storage_snapshot_identity()
+            );
             let mut failed = [false; 2];
             let (error, _, late_allocations) = native_requests_for_test(|| {
                 // The database adapter and BOTH run_original boundaries prepay
                 // before producer entry. Exhaust admission only after that work.
                 NATIVE_REQUEST_ACTIVE.with(|active| active.set(false));
-                persistence.with_db_original_funded(&original, |raw| {
-                    outer.run_original(OriginalStoragePhase::ReceivedOuter, || {
-                        inner.run_original(OriginalStoragePhase::ReceivedBegin, || {
-                            owner.set_budget(Some(owner.usage().used)).unwrap();
-                            NATIVE_REQUEST_ACTIVE.with(|active| active.set(true));
-                            // Reinstall the genuine outer owner for its actual
-                            // native producer while the inner callback is live.
-                            failed[0] = redb::with_native_storage_admission(
-                                outer_clone.clone(), || raw.begin_native_read()).is_err();
-                            failed[1] = raw.begin_native_read().is_err();
-                            Err::<(), _>(diagnosis)
+                persistence
+                    .with_db_original_funded(&original, |raw| {
+                        outer.run_original(OriginalStoragePhase::ReceivedOuter, || {
+                            inner.run_original(OriginalStoragePhase::ReceivedBegin, || {
+                                owner.set_budget(Some(owner.usage().used)).unwrap();
+                                NATIVE_REQUEST_ACTIVE.with(|active| active.set(true));
+                                // Reinstall the genuine outer owner for its actual
+                                // native producer while the inner callback is live.
+                                failed[0] = redb::with_native_storage_admission(
+                                    outer_clone.clone(),
+                                    || raw.begin_native_read(),
+                                )
+                                .is_err();
+                                failed[1] = raw.begin_native_read().is_err();
+                                Err::<(), _>(diagnosis)
+                            })
                         })
                     })
-                }).unwrap_err()
+                    .unwrap_err()
             });
             assert_eq!(
                 failed,
@@ -4650,20 +4976,30 @@ mod original_failure_contract {
             );
             assert_eq!(error.to_string(), expected);
             assert!(!error.is_memory_refusal());
-            assert!(error.source_is_qualified(), "scalar secondary refusals preserve funded primary");
+            assert!(
+                error.source_is_qualified(),
+                "scalar secondary refusals preserve funded primary"
+            );
             assert!(
                 source_free_for_test(count)[..count]
                     .iter()
                     .all(|free| free.2 == 0)
             );
-            assert_eq!(source_free_for_test(count + 1)[count].2, 0,
-                "the actual decoded primary remains live through scope propagation");
+            assert_eq!(
+                source_free_for_test(count + 1)[count].2,
+                0,
+                "the actual decoded primary remains live through scope propagation"
+            );
             drop(Some(error));
             let primary_free = source_free_for_test(count + 1)[count];
-            assert_eq!(primary_free.2, 1,
-                "dropping the error destroys its primary even while native views retain scopes");
-            assert_eq!(primary_free.0, primary_free.1,
-                "primary invoice survives physical free");
+            assert_eq!(
+                primary_free.2, 1,
+                "dropping the error destroys its primary even while native views retain scopes"
+            );
+            assert_eq!(
+                primary_free.0, primary_free.1,
+                "primary invoice survives physical free"
+            );
             assert!(primary_free.0.saturating_sub(baseline) >= primary_requests[0].1);
             assert!(
                 source_free_for_test(count)[..count]
@@ -4678,11 +5014,19 @@ mod original_failure_contract {
                 drop(outer_clone);
                 drop(inner_clone);
             }
-            assert!(source_free_for_test(count)[..count].iter().all(|free| free.2 == 0),
-                "real native views retain both scopes after admission clones drop");
+            assert!(
+                source_free_for_test(count)[..count]
+                    .iter()
+                    .all(|free| free.2 == 0),
+                "real native views retain both scopes after admission clones drop"
+            );
             drop((outer_view, inner_view));
-            assert!(source_free_for_test(count)[..count].iter().all(|free| free.2 == 0),
-                "cloned native views are now the last scope holders");
+            assert!(
+                source_free_for_test(count)[..count]
+                    .iter()
+                    .all(|free| free.2 == 0),
+                "cloned native views are now the last scope holders"
+            );
             if inner_first {
                 drop(inner_view_clone);
                 drop(outer_view_clone);
@@ -4706,7 +5050,6 @@ mod original_failure_contract {
     }
 }
 
-
 #[path = "selected_json_producer_rows.rs"]
 pub(crate) mod selected_json_producer_rows;
 
@@ -4726,26 +5069,39 @@ pub(crate) fn watch_exact_frees_for_test(requests: &[(usize, usize, usize)], cou
     }
     for (request, watch) in requests.iter().zip(NATIVE_FREE.iter()) {
         assert_ne!(request.0, 0);
-        let header = unsafe { (request.0 as *const u8)
-            .sub(std::mem::size_of::<Header>()).cast::<Header>().read() };
+        let header = unsafe {
+            (request.0 as *const u8)
+                .sub(std::mem::size_of::<Header>())
+                .cast::<Header>()
+                .read()
+        };
         watch.window.store(header.window, AtomicOrdering::SeqCst);
         watch.bytes.store(request.1, AtomicOrdering::SeqCst);
         watch.before.store(0, AtomicOrdering::SeqCst);
         watch.after.store(0, AtomicOrdering::SeqCst);
         watch.counter.store(counter, AtomicOrdering::SeqCst);
         watch.pointer.store(request.0, AtomicOrdering::SeqCst);
-// capture969 begin
+        // capture969 begin
         #[cfg(feature = "test-seams")]
-        crate::database::retained_trace_ownership_tests::ordered_cut("native-free-register",
-            [request.0, request.1, request.2, header.window,
-             watch as *const _ as usize, counter, 0, 0]);
-// capture969 end
+        crate::database::retained_trace_ownership_tests::ordered_cut(
+            "native-free-register",
+            [
+                request.0,
+                request.1,
+                request.2,
+                header.window,
+                watch as *const _ as usize,
+                counter,
+                0,
+                0,
+            ],
+        );
+        // capture969 end
     }
 }
 
 #[path = "native_scan_producer_tests.rs"]
 mod native_scan_producer_tests;
-
 
 // A borrowed observation window for constructors whose original production
 // statements must stay intact. It uses this same allocator and fixed receipts.
@@ -4758,8 +5114,11 @@ impl SourceRequestsWindow {
         let window = {
             let mut measurement = MEASUREMENT.lock().unwrap();
             if measurement.active_window != 0 {
-                assert_eq!(MEASURING_HERE.with(std::cell::Cell::get), measurement.active_window,
-                    "a source receipt may borrow only its own thread's measurement");
+                assert_eq!(
+                    MEASURING_HERE.with(std::cell::Cell::get),
+                    measurement.active_window,
+                    "a source receipt may borrow only its own thread's measurement"
+                );
                 (measurement.active_window, false)
             } else {
                 measurement.last_window += 1;
@@ -4772,20 +5131,26 @@ impl SourceRequestsWindow {
                 (measurement.active_window, true)
             }
         };
-        assert!(!NATIVE_REQUEST_ACTIVE.with(std::cell::Cell::get),
-            "source request receipts cannot overlap");
+        assert!(
+            !NATIVE_REQUEST_ACTIVE.with(std::cell::Cell::get),
+            "source request receipts cannot overlap"
+        );
         SOURCE_REQUEST_CREDIT.with(|slot| slot.set([0; 256]));
         NATIVE_REQUESTS.with(|slot| slot.set([(0, 0, 0); 256]));
         NATIVE_REQUEST_COUNT.with(|slot| slot.set(0));
         SOURCE_REQUEST_COUNTER.with(|slot| slot.set(counter));
         MEASURING_HERE.with(|slot| slot.set(window.0));
         NATIVE_REQUEST_ACTIVE.with(|slot| slot.set(true));
-        Self { owns_measurement: window.1 }
+        Self {
+            owns_measurement: window.1,
+        }
     }
     pub(crate) fn receipt(&self) -> ([(usize, usize, usize); 256], [usize; 256], usize) {
-        (NATIVE_REQUESTS.with(std::cell::Cell::get),
+        (
+            NATIVE_REQUESTS.with(std::cell::Cell::get),
             SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get),
-            NATIVE_REQUEST_COUNT.with(std::cell::Cell::get))
+            NATIVE_REQUEST_COUNT.with(std::cell::Cell::get),
+        )
     }
 }
 impl Drop for SourceRequestsWindow {

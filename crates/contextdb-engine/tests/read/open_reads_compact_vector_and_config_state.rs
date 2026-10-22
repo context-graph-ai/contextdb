@@ -177,7 +177,11 @@ fn largest_schema_and_vector_image_reads_as_authored_after_open() {
                 &HashMap::new(),
             )
             .expect("read authored vector row");
-        assert_eq!(&actual.rows(), expected, "{table} row and vector membership");
+        assert_eq!(
+            &actual.rows(),
+            expected,
+            "{table} row and vector membership"
+        );
     }
     let schemas = reader
         .metadata(MetadataRequest::Tables, None)

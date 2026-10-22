@@ -633,7 +633,8 @@ fn a_refused_candidate_catch_up_returns_every_decode_charge_and_later_succeeds()
     let nearest = |db: &Database, q: Vec<f32>| {
         db.execute(query, &HashMap::from([("q".into(), Value::Vector(q))]))
             .unwrap()
-            .rows().to_vec()
+            .rows()
+            .to_vec()
     };
     assert_eq!(
         nearest(&db, vec![1.0, 0.0, 0.0]),

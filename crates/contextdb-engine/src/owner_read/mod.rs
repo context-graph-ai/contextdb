@@ -71,10 +71,14 @@ impl OwnerReadScaffoldError {
 
     pub(crate) fn from_local(error: LocalTransportError) -> Self {
         let error = match error.into_admission_error() {
-            Ok(error) => return match crate::local_transport::query_funding::memory_refusal_ceiling(&error) {
-                Some(ceiling) => Self::Refused(crate::local_transport::memory_ceiling_read_failure(ceiling, None)),
-                None => Self::from_local(crate::local_transport::invalid_channel_data()),
-            },
+            Ok(error) => {
+                return match crate::local_transport::query_funding::memory_refusal_ceiling(&error) {
+                    Some(ceiling) => Self::Refused(
+                        crate::local_transport::memory_ceiling_read_failure(ceiling, None),
+                    ),
+                    None => Self::from_local(crate::local_transport::invalid_channel_data()),
+                };
+            }
             Err(error) => error,
         };
         match error {
@@ -122,5 +126,7 @@ fn response_expectation(request: &LocalRequest) -> LocalResponseExpectation {
 pub type OwnerReadScaffoldResult<T> = std::result::Result<T, OwnerReadScaffoldError>;
 
 impl From<LocalTransportError> for OwnerReadScaffoldError {
-    fn from(error: LocalTransportError) -> Self { Self::from_local(error) }
+    fn from(error: LocalTransportError) -> Self {
+        Self::from_local(error)
+    }
 }

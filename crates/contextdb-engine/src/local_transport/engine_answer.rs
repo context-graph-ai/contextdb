@@ -1017,9 +1017,9 @@ impl From<ReadChannelError> for contextdb_core::Error {
                     index: VectorIndexRef { table, column },
                     issue,
                 },
-                None => Self::Other(
-                    "read channel carried an unknown vector declaration issue".into(),
-                ),
+                None => {
+                    Self::Other("read channel carried an unknown vector declaration issue".into())
+                }
             },
             ReadChannelError::VectorPartitionLimitExceeded {
                 table,
@@ -1151,9 +1151,10 @@ impl From<ReadChannelError> for contextdb_core::Error {
                         .collect::<BTreeSet<ScopeLabel>>(),
                 }
             }
-            ReadChannelError::StoreCorrupted { path, reason } => {
-                Self::StoreCorrupted { path: path.into(), reason: reason.into() }
-            }
+            ReadChannelError::StoreCorrupted { path, reason } => Self::StoreCorrupted {
+                path: path.into(),
+                reason: reason.into(),
+            },
             ReadChannelError::StoreIdentityUnprovable { path } => {
                 Self::StoreIdentityUnprovable { path }
             }
@@ -1205,34 +1206,50 @@ impl From<ReadChannelError> for contextdb_core::Error {
 
 /// The request parser selects mutually exclusive conversion destinations.
 /// Price the tree OR invalid-UUID diagnostic, never their nonexistent overlap.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn query_context_conversion_bytes(
-    requested: &str, allowed: usize,
+    requested: &str,
+    allowed: usize,
 ) -> contextdb_core::Result<usize> {
     if context_from_word(requested).is_some() {
         super::query_funding::tree_bytes::<contextdb_core::ContextId, ()>(allowed)
     } else {
-        requested.len().checked_add(
-            "ContextScopeViolation: requested context  did not arrive as a readable identifier".len(),
-        ).ok_or_else(|| contextdb_core::Error::Other("query allocation size overflow".into()))
+        requested
+            .len()
+            .checked_add(
+                "ContextScopeViolation: requested context  did not arrive as a readable identifier"
+                    .len(),
+            )
+            .ok_or_else(|| contextdb_core::Error::Other("query allocation size overflow".into()))
     }
 }
 
 /// Ordinary queries preserve their decoder's ORIGINAL invoice through a move
 /// conversion. The special cases avoid collect/format replacement scratch.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn convert_query_error(
     document: super::query_funding::Funded<ReadChannelError>,
     memory: &crate::read_image_memory::ImageMemoryHandle,
 ) -> contextdb_core::Result<super::query_funding::Funded<contextdb_core::Error>> {
-    use contextdb_core::types::{ContextId, ScopeLabel};
     use contextdb_core::Error as E;
+    use contextdb_core::types::{ContextId, ScopeLabel};
     let bytes = super::query_funding::error_conversion_bytes(&document.value)?;
     super::query_funding::Funded::allocate_owned(Some(memory.owner()), bytes, || {
         match document.into_retained() {
-            ReadChannelError::Unknown { class_name, message } => {
+            ReadChannelError::Unknown {
+                class_name,
+                message,
+            } => {
                 let mut text = String::with_capacity(class_name.len() + message.len() + 2);
-                text.push_str(&class_name); text.push_str(": "); text.push_str(&message);
+                text.push_str(&class_name);
+                text.push_str(": ");
+                text.push_str(&message);
                 E::Other(text.into())
             }
             ReadChannelError::ContextScopeViolation { requested, allowed } => {
@@ -1240,23 +1257,36 @@ pub(crate) fn convert_query_error(
                     Some(requested) => {
                         let mut retained = BTreeSet::<ContextId>::new();
                         for word in allowed {
-                            if let Some(context) = context_from_word(&word) { retained.insert(context); }
+                            if let Some(context) = context_from_word(&word) {
+                                retained.insert(context);
+                            }
                         }
-                        E::ContextScopeViolation { requested, allowed: retained }
+                        E::ContextScopeViolation {
+                            requested,
+                            allowed: retained,
+                        }
                     }
                     None => {
                         let prefix = "ContextScopeViolation: requested context ";
                         let suffix = " did not arrive as a readable identifier";
-                        let mut text = String::with_capacity(prefix.len() + requested.len() + suffix.len());
-                        text.push_str(prefix); text.push_str(&requested); text.push_str(suffix);
+                        let mut text =
+                            String::with_capacity(prefix.len() + requested.len() + suffix.len());
+                        text.push_str(prefix);
+                        text.push_str(&requested);
+                        text.push_str(suffix);
                         E::Other(text.into())
                     }
                 }
             }
             ReadChannelError::ScopeLabelViolation { requested, allowed } => {
                 let mut retained = BTreeSet::new();
-                for word in allowed { retained.insert(ScopeLabel(word)); }
-                E::ScopeLabelViolation { requested: ScopeLabel(requested), allowed: retained }
+                for word in allowed {
+                    retained.insert(ScopeLabel(word));
+                }
+                E::ScopeLabelViolation {
+                    requested: ScopeLabel(requested),
+                    allowed: retained,
+                }
             }
             other => E::from(other),
         }
@@ -1268,9 +1298,13 @@ pub(crate) const BLOB_SOURCE_REFUSAL_MAX_BYTES: usize = 4096;
 
 /// Encode the existing read-channel error grammar directly from borrowed
 /// source fields. No intermediate owned error document or field copy exists.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_read_error_into_slice(
-    error: &contextdb_core::Error, output: &mut [u8],
+    error: &contextdb_core::Error,
+    output: &mut [u8],
 ) -> Result<usize, super::LocalTransportError> {
     let length = output.len().min(BLOB_SOURCE_REFUSAL_MAX_BYTES);
     write_read_error(error, &mut &mut output[..length])
@@ -1278,49 +1312,78 @@ pub(crate) fn encode_read_error_into_slice(
 
 /// The same borrowed field writer also serves ordinary queries, whose existing
 /// frame ceiling is the only wire cap. No blob cap is imposed on a query.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_query_error_funded(
     error: &contextdb_core::Error,
     owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<super::query_funding::Funded<Vec<u8>>> {
-        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+    let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.checked_add(bytes.len()).ok_or(std::io::ErrorKind::InvalidData)?;
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or(std::io::ErrorKind::InvalidData)?;
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     let invalid = || contextdb_core::Error::Other("query error encoding failed".into());
     let mut size = Count(0);
     write_read_error(error, &mut size).map_err(|_| invalid())?;
-    let mut output = super::query_funding::Funded::allocate_owned(Some(owner), size.0,
-        || Vec::with_capacity(size.0))?;
+    let mut output = super::query_funding::Funded::allocate_owned(Some(owner), size.0, || {
+        Vec::with_capacity(size.0)
+    })?;
     write_read_error(error, &mut output.value).map_err(|_| invalid())?;
-    if output.value.len() != size.0 { return Err(invalid()); }
+    if output.value.len() != size.0 {
+        return Err(invalid());
+    }
     Ok(output)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn write_read_error<W: std::io::Write>(
-    error: &contextdb_core::Error, output: &mut W,
+    error: &contextdb_core::Error,
+    output: &mut W,
 ) -> Result<usize, super::LocalTransportError> {
     use super::{LocalTransportError, PayloadViolation};
     use contextdb_core::Error as E;
-    struct Sink<'a, W> { output: &'a mut W, offset: usize }
+    struct Sink<'a, W> {
+        output: &'a mut W,
+        offset: usize,
+    }
     impl<W: std::io::Write> Sink<'_, W> {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), LocalTransportError> {
-            let written = bincode::serde::encode_into_std_write(value, &mut *self.output,
-                bincode::config::standard())
-                .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
-            self.offset = self.offset.checked_add(written)
+            let written = bincode::serde::encode_into_std_write(
+                value,
+                &mut *self.output,
+                bincode::config::standard(),
+            )
+            .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
+            self.offset = self
+                .offset
+                .checked_add(written)
                 .ok_or(LocalTransportError::Payload(PayloadViolation::Malformed))?;
             Ok(())
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn display(&mut self, value: impl fmt::Display) -> Result<(), LocalTransportError> {
             struct Count(usize);
             impl fmt::Write for Count {
@@ -1333,21 +1396,31 @@ pub(super) fn write_read_error<W: std::io::Write>(
             fmt::write(&mut count, format_args!("{value}"))
                 .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
             self.field(&(count.0 as u64))?;
-            struct Text<'a, W> { output: &'a mut W, count: usize }
+            struct Text<'a, W> {
+                output: &'a mut W,
+                count: usize,
+            }
             impl<W: std::io::Write> fmt::Write for Text<'_, W> {
                 fn write_str(&mut self, text: &str) -> fmt::Result {
-                    self.output.write_all(text.as_bytes()).map_err(|_| fmt::Error)?;
+                    self.output
+                        .write_all(text.as_bytes())
+                        .map_err(|_| fmt::Error)?;
                     self.count = self.count.checked_add(text.len()).ok_or(fmt::Error)?;
                     Ok(())
                 }
             }
-            let mut text = Text { output: &mut *self.output, count: 0 };
+            let mut text = Text {
+                output: &mut *self.output,
+                count: 0,
+            };
             fmt::write(&mut text, format_args!("{value}"))
                 .map_err(|_| LocalTransportError::Payload(PayloadViolation::Malformed))?;
             if text.count != count.0 {
                 return Err(LocalTransportError::Payload(PayloadViolation::Malformed));
             }
-            self.offset = self.offset.checked_add(count.0)
+            self.offset = self
+                .offset
+                .checked_add(count.0)
                 .ok_or(LocalTransportError::Payload(PayloadViolation::Malformed))?;
             Ok(())
         }
@@ -1568,7 +1641,7 @@ pub(super) fn write_read_error<W: std::io::Write>(
             sink.field(&TAG_STORE_CORRUPTED)?;
             sink.display(path)?;
             sink.display(reason)?;
-        },
+        }
         E::StoreIdentityUnprovable { path } => body!(TAG_STORE_IDENTITY_UNPROVABLE, path),
         E::LegacyVectorStoreDetected {
             found_format_marker,
@@ -1612,7 +1685,7 @@ pub(super) fn write_read_error<W: std::io::Write>(
         E::Other(message) => {
             sink.field(&TAG_OTHER)?;
             sink.display(message)?;
-        },
+        }
         // Match the owning read-channel adapter's existing Other class, while
         // writing borrowed scalar/prepaid diagnostics without an owned String.
         E::NativeEngineOther(_) | E::FundedEngine(_) => {

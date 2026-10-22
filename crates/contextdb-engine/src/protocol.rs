@@ -738,23 +738,28 @@ fn serialized_size_for_version<T: Serialize>(
     Ok((payload.0, envelope.0))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_for_version_with_read_owner<T: Serialize>(
     version: u8,
     message_type: MessageType,
     message: &T,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<(Vec<u8>, contextdb_core::read_memory::ReadCredit)> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     if !supports_protocol_version(version) {
-        return Err(contextdb_core::Error::SyncError((
-            SyncError::ProtocolVersionMismatch {
+        return Err(contextdb_core::Error::SyncError(
+            (SyncError::ProtocolVersionMismatch {
                 received: version,
                 oldest_supported: OLDEST_SUPPORTED_PROTOCOL_VERSION,
                 newest_supported: PROTOCOL_VERSION,
             }
-            .to_string()).into()));
+            .to_string())
+            .into(),
+        ));
     }
     let (payload_bytes, envelope_bytes) =
         serialized_size_for_version(version, &message_type, message)

@@ -289,7 +289,12 @@ fn retention_keeps_a_snapshot_visible_edge_whose_target_row_arrives_and_expires_
          deferred row would make this journey prove nothing"
     );
 
-    emitted.extend(drain(&mut opened.cursor, 2, second.page.has_more(), journey));
+    emitted.extend(drain(
+        &mut opened.cursor,
+        2,
+        second.page.has_more(),
+        journey,
+    ));
 
     assert_emitted_exactly_once(&emitted, &targets, journey);
 }

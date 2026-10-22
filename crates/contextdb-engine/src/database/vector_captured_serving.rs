@@ -9,7 +9,7 @@
 //! lease, reads through in-read helpers, and charges the operation's own
 //! funder through the existing caller-reservation protocol.
 use super::*;
-use crate::persistence::{RetainedReadSource};
+use crate::persistence::RetainedReadSource;
 use contextdb_vector::VectorCopyAdmission;
 use contextdb_vector::store::{
     CapturedVectorGraphLayer, CapturedVectorServingSelection, CapturedVectorSuffix,
@@ -24,7 +24,10 @@ fn refusal(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<()> {
     if request(DormantVectorLoadRequest::Checkpoint) {
         Ok(())
@@ -33,7 +36,10 @@ fn checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Resu
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reserve(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool, bytes: usize) -> Result<()> {
     if bytes == 0 || request(DormantVectorLoadRequest::Reserve(bytes)) {
         Ok(())
@@ -56,7 +62,10 @@ pub(crate) struct CapturedVectorRootLease {
 }
 
 impl CapturedVectorRootLease {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writable(
         read: Arc<redb::ReadTransaction>,
         writer: WriterSnapshotHandle,
@@ -70,7 +79,10 @@ impl CapturedVectorRootLease {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn retained(
         read: Arc<redb::ReadTransaction>,
         source: RetainedReadSource,
@@ -86,7 +98,10 @@ impl CapturedVectorRootLease {
 
     /// Authoritative erasure published after capture refuses every later
     /// read of the erased table through this root with its typed refusal.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn check_scope(&self, table: &str) -> Result<()> {
         match &self.holder {
             CapturedRootHolder::Writer(writer) => writer.check_table_scope(table),
@@ -100,7 +115,10 @@ impl CapturedVectorRootLease {
     }
 
     /// Run one in-read step on the captured read after its scope check.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn with_read<T>(
         &self,
         index: &VectorIndexRef,
@@ -121,20 +139,32 @@ impl CapturedVectorRootLease {
 
     /// Authenticate the read against the actual sealed lease and its original
     /// holder. Writer aliases preserve the existing equivalent-user-root rule.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn paged_expected_root(&self)
-        -> Result<(redb::StorageSnapshotIdentity, SnapshotId, Lsn)> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn paged_expected_root(
+        &self,
+    ) -> Result<(redb::StorageSnapshotIdentity, SnapshotId, Lsn)> {
         match &self.holder {
             CapturedRootHolder::Writer(writer) => {
                 let expected = writer.storage_identity();
                 if self.read.storage_snapshot_identity().user_root != expected.user_root {
-                    return Err(refusal("captured lease no longer matches its writer holder"));
+                    return Err(refusal(
+                        "captured lease no longer matches its writer holder",
+                    ));
                 }
-                Ok((self.read.storage_snapshot_identity(), writer.snapshot, writer.lsn))
+                Ok((
+                    self.read.storage_snapshot_identity(),
+                    writer.snapshot,
+                    writer.lsn,
+                ))
             }
             CapturedRootHolder::Retained(source) => {
                 if self.read.storage_snapshot_identity() != source.storage_identity() {
-                    return Err(refusal("captured lease no longer matches its registered image"));
+                    return Err(refusal(
+                        "captured lease no longer matches its registered image",
+                    ));
                 }
                 source.vector_physical_frontier()
             }
@@ -143,7 +173,10 @@ impl CapturedVectorRootLease {
 
     /// Paged readers of a captured layer reopen tables on this same read and
     /// keep this lease alive while any of them is open.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn paged_root_capture(
         self: &Arc<Self>,
     ) -> crate::persistence::vector_paged::PagedRootCapture {
@@ -151,7 +184,9 @@ impl CapturedVectorRootLease {
         Arc::new(move || {
             let captured = crate::persistence::vector_paged::CapturedPagedRoot {
                 read: Arc::clone(&lease.read),
-                holder: crate::persistence::vector_paged::PagedRootHolder::Captured(Arc::clone(&lease)),
+                holder: crate::persistence::vector_paged::PagedRootHolder::Captured(Arc::clone(
+                    &lease,
+                )),
             };
             captured.authenticate()?;
             Ok(captured)
@@ -174,7 +209,10 @@ fn catalog_identity(descriptor: VectorPartitionGenerationDescriptor) -> VectorGr
 
 /// Writable admission for one sealed layer: its resident graph plus the
 /// encoded payload that coexists with it during decode.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writable_admission(
     identity: VectorGraphGeneration,
     resident_bytes: u64,
@@ -269,7 +307,10 @@ impl CapturedServingSupplier {
     /// The saved residency of a frozen identity, as this root's catalog
     /// names it. Writable registry descriptors already carry the saved
     /// value; a committed image's frozen placeholders take it from here.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn saved_resident_bytes(
         &self,
         descriptor: &DormantVectorGraphGeneration,
@@ -306,7 +347,10 @@ impl CapturedServingSupplier {
         Ok(descriptor.resident_bytes as u64)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn loader_control(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -325,7 +369,10 @@ impl CapturedServingSupplier {
         Ok(control)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn layer(
         &self,
         descriptor: DormantVectorGraphGeneration,
@@ -333,10 +380,20 @@ impl CapturedServingSupplier {
         base: BoundBase,
         owner: &mut VectorCopyAdmission,
     ) -> Result<CapturedVectorGraphLayer> {
-        let mut control = self.loader_control(owner, std::mem::size_of::<CapturedLayerLoader>()
-            .saturating_add(2 * std::mem::size_of::<usize>()))?;
-        control.reserve(self.layout.partition_key_columns.len() * std::mem::size_of::<String>()
-            + self.layout.partition_key_columns.iter().map(|name| name.len()).sum::<usize>())?;
+        let mut control = self.loader_control(
+            owner,
+            std::mem::size_of::<CapturedLayerLoader>()
+                .saturating_add(2 * std::mem::size_of::<usize>()),
+        )?;
+        control.reserve(
+            self.layout.partition_key_columns.len() * std::mem::size_of::<String>()
+                + self
+                    .layout
+                    .partition_key_columns
+                    .iter()
+                    .map(|name| name.len())
+                    .sum::<usize>(),
+        )?;
         let loader: Arc<dyn DormantVectorGraphLoader> = Arc::new(CapturedLayerLoader {
             source: DurableVectorGenerationSource::CapturedRoot(Arc::clone(&self.lease)),
             lease: Arc::clone(&self.lease),
@@ -417,7 +474,10 @@ impl CapturedVectorSuffixSource for CapturedServingSupplier {
         Ok(layer)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn bind_serving_frontier(
         &self,
         base: Option<VectorGraphGeneration>,
@@ -492,7 +552,10 @@ impl CapturedVectorSuffixSource for CapturedServingSupplier {
 }
 
 /// Build the root-owned serving selection for one captured root.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn captured_serving_selection(
     lease: CapturedVectorRootLease,
     partition: &VectorPartitionRef,
@@ -506,7 +569,9 @@ pub(crate) fn captured_serving_selection(
 ) -> Result<CapturedVectorServingSelection> {
     let historical = match &lease.holder {
         CapturedRootHolder::Writer(writer) => snapshot != writer.snapshot,
-        CapturedRootHolder::Retained(source) => !source.ordered_prefix_snapshot_is_current(snapshot),
+        CapturedRootHolder::Retained(source) => {
+            !source.ordered_prefix_snapshot_is_current(snapshot)
+        }
     };
     let captured_catalog = inspection.captured_catalog || historical;
     let mut control = owner.scratch();
@@ -636,9 +701,11 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
     ) -> Result<LoadedVectorGraphGeneration> {
         if generation != self.descriptor || caller_reserved_load_bytes != self.descriptor.load_bytes
         {
-            return Err(Error::Other((
-                "captured vector loader received a descriptor or reservation other than its own"
-                    .to_string()).into()));
+            return Err(Error::Other(
+                ("captured vector loader received a descriptor or reservation other than its own"
+                    .to_string())
+                .into(),
+            ));
         }
         checkpoint(request)?;
         let resident = self.descriptor.resident_bytes;
@@ -665,54 +732,58 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
         reserve(request, known.saturating_sub(reserved))?;
         reserved = reserved.max(known);
         checkpoint(request)?;
-        let (graph_bytes, paged) = if self.is_base {
-            let record = self.source.load_base(
-                &self.partition.index,
-                &self.partition.partition_key,
-                self.descriptor.identity.generation_id,
-            )?;
-            let paged = record
-                .graph
-                .bytes
-                .starts_with(&crate::persistence::vector_paged::META_MAGIC)
-                || record.graph_format_version
-                    == crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
-            if record.highest_included_tx != self.descriptor.identity.covered_tx
-                || record.highest_included_lsn != self.descriptor.identity.covered_lsn
-                || record.dimension as usize != self.dimension
-                || record.quantization != self.quantization
-                || record.algorithm_version != VECTOR_GRAPH_ALGORITHM_VERSION
-                || (record.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION && !paged)
-            {
-                return Err(Error::Other((
-                    "saved vector base disagrees with its catalog or column declaration"
-                        .to_string()).into()));
-            }
-            (record.graph.bytes, paged)
-        } else {
-            let record = self.source.load_change(
-                &self.partition.index,
-                &self.partition.partition_key,
-                self.base.generation_id,
-                self.descriptor.identity.generation_id,
-            )?;
-            if record.covered_through_tx != self.descriptor.identity.covered_tx
-                || record.covered_through_lsn != self.descriptor.identity.covered_lsn
-                || record.dimension as usize != self.dimension
-                || record.quantization != self.quantization
-                || record.algorithm_version != VECTOR_GRAPH_ALGORITHM_VERSION
-                || record.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION
-            {
-                return Err(Error::Other((
+        let (graph_bytes, paged) =
+            if self.is_base {
+                let record = self.source.load_base(
+                    &self.partition.index,
+                    &self.partition.partition_key,
+                    self.descriptor.identity.generation_id,
+                )?;
+                let paged = record
+                    .graph
+                    .bytes
+                    .starts_with(&crate::persistence::vector_paged::META_MAGIC)
+                    || record.graph_format_version
+                        == crate::persistence::vector_paged::VECTOR_GRAPH_PAGED_FORMAT_VERSION;
+                if record.highest_included_tx != self.descriptor.identity.covered_tx
+                    || record.highest_included_lsn != self.descriptor.identity.covered_lsn
+                    || record.dimension as usize != self.dimension
+                    || record.quantization != self.quantization
+                    || record.algorithm_version != VECTOR_GRAPH_ALGORITHM_VERSION
+                    || (record.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION && !paged)
+                {
+                    return Err(Error::Other(
+                        ("saved vector base disagrees with its catalog or column declaration"
+                            .to_string())
+                        .into(),
+                    ));
+                }
+                (record.graph.bytes, paged)
+            } else {
+                let record = self.source.load_change(
+                    &self.partition.index,
+                    &self.partition.partition_key,
+                    self.base.generation_id,
+                    self.descriptor.identity.generation_id,
+                )?;
+                if record.covered_through_tx != self.descriptor.identity.covered_tx
+                    || record.covered_through_lsn != self.descriptor.identity.covered_lsn
+                    || record.dimension as usize != self.dimension
+                    || record.quantization != self.quantization
+                    || record.algorithm_version != VECTOR_GRAPH_ALGORITHM_VERSION
+                    || record.graph_format_version != VECTOR_GRAPH_FORMAT_VERSION
+                {
+                    return Err(Error::Other((
                     "saved vector change graph disagrees with its catalog or column declaration"
                         .to_string()).into()));
-            }
-            (record.graph.bytes, true)
-        };
+                }
+                (record.graph.bytes, true)
+            };
         checkpoint(request)?;
         if graph_bytes.len() != durable {
-            return Err(Error::Other((
-                "saved vector graph length disagrees with its catalog".to_string()).into()));
+            return Err(Error::Other(
+                ("saved vector graph length disagrees with its catalog".to_string()).into(),
+            ));
         }
         if !paged {
             return Err(crate::persistence::vector_paged::corruption(
@@ -756,7 +827,9 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
         // here and return the unused load headroom after graph_bytes frees.
         let current_resident = LoadedVectorGraphGeneration::paged_resident_control_bytes();
         if current_resident > resident {
-            return Err(Error::Other("native sealed graph exceeds its admitted control bound".into()));
+            return Err(Error::Other(
+                "native sealed graph exceeds its admitted control bound".into(),
+            ));
         }
         // This is the find's one load of the generation: the store adopts it
         // rather than loading again, so the load is metered here.
@@ -777,8 +850,9 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
         drop(graph_bytes);
         checkpoint(request)?;
         if !paged && graph.estimated_resident_bytes() != current_resident {
-            return Err(Error::Other((
-                "saved vector graph residency disagrees with its catalog".to_string()).into()));
+            return Err(Error::Other(
+                ("saved vector graph residency disagrees with its catalog".to_string()).into(),
+            ));
         }
         // The caller's reservation already funds this residency on the
         // operation's own funder; ownership stays there and is released when
@@ -808,7 +882,10 @@ struct CapturedSuffixLoader {
 }
 
 impl CapturedVectorSuffixLoader for CapturedSuffixLoader {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn load(
         &self,
         caller_reserved_load_bytes: usize,
@@ -821,9 +898,11 @@ impl CapturedVectorSuffixLoader for CapturedSuffixLoader {
             });
         }
         if caller_reserved_load_bytes != self.admitted_load {
-            return Err(Error::Other((
-                "captured suffix loader received a reservation other than its saved admission"
-                    .to_string()).into()));
+            return Err(Error::Other(
+                ("captured suffix loader received a reservation other than its saved admission"
+                    .to_string())
+                .into(),
+            ));
         }
         checkpoint(request)?;
         let (saved_resident, saved_workspace) = vector_tail_reservation(
@@ -904,8 +983,9 @@ impl CapturedVectorSuffixLoader for CapturedSuffixLoader {
         checkpoint(request)?;
         let actual = graph.estimated_resident_bytes();
         if actual > admitted_resident {
-            return Err(Error::Other((
-                "vector suffix graph exceeded its admitted resident bound".to_string()).into()));
+            return Err(Error::Other(
+                ("vector suffix graph exceeded its admitted resident bound".to_string()).into(),
+            ));
         }
         Ok(LoadedCapturedVectorSuffix {
             tail: Some(LoadedVectorFreshTail {
@@ -953,9 +1033,12 @@ impl contextdb_vector::store::StreamedVectorSuffixHandle for CapturedSuffixLoade
 
     #[cfg(any(test, feature = "test-seams"))]
     fn policy_for_test(&self) -> Option<(usize, usize, usize)> {
-        Some((self.policy.hnsw_m, self.policy.hnsw_ef_construction, self.policy.hnsw_ef_search))
+        Some((
+            self.policy.hnsw_m,
+            self.policy.hnsw_ef_construction,
+            self.policy.hnsw_ef_search,
+        ))
     }
-
 
     fn observe_vector_decode(&self, _row_id: RowId, _created_tx: TxId, _lsn: Lsn) {
         #[cfg(any(test, feature = "test-seams"))]
@@ -972,5 +1055,4 @@ impl contextdb_vector::store::StreamedVectorSuffixHandle for CapturedSuffixLoade
     }
 }
 
-
-use crate::persistence::writer_source::{WriterSnapshotHandle};
+use crate::persistence::writer_source::WriterSnapshotHandle;

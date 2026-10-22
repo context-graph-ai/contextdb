@@ -29,7 +29,8 @@ struct PerRequestReader {
 }
 impl PerRequestReader {
     fn next(&self) -> DeclaredReadRoot {
-        let parent = DeclaredReadMemory::from_reader_limit(ReadLimits::SHIPPED_MEMORY).expect("admit the declared fixture root");
+        let parent = DeclaredReadMemory::from_reader_limit(ReadLimits::SHIPPED_MEMORY)
+            .expect("admit the declared fixture root");
         self.parents.lock().unwrap().push(parent.clone());
         parent
     }
@@ -37,7 +38,10 @@ impl PerRequestReader {
 impl crate::vector_read_memory::NativeReadRequestBudgetProvider for PerRequestReader {
     fn request_budget_owner_native(
         &self,
-    ) -> Result<crate::vector_read_memory::RequestReadOwner, crate::vector_read_memory::RequestOwnerFailure> {
+    ) -> Result<
+        crate::vector_read_memory::RequestReadOwner,
+        crate::vector_read_memory::RequestOwnerFailure,
+    > {
         self.next().request_budget_owner_native()
     }
 }
@@ -148,7 +152,9 @@ async fn pull_all(db: Arc<Database>) -> contextdb_core::Result<Pulled> {
                 .await
             {
                 Ok(reply) => reply,
-                Err(error) => break Err(contextdb_core::Error::SyncError(error.to_string().into())),
+                Err(error) => {
+                    break Err(contextdb_core::Error::SyncError(error.to_string().into()));
+                }
             };
         let envelope = decode(&reply).expect("decode reply");
         let response = match envelope.message_type {

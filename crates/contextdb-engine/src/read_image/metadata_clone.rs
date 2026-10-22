@@ -5,10 +5,16 @@ use crate::direct_file_reader::*;
 use contextdb_core::{Error, Result};
 use std::collections::BTreeMap;
 pub(crate) trait CloneHeapBytes {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn clone_heap_bytes(&self) -> Result<usize>;
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sum(values: impl IntoIterator<Item = usize>) -> Result<usize> {
     values.into_iter().try_fold(0usize, |sum, value| {
         sum.checked_add(value)
@@ -39,7 +45,10 @@ impl<T: CloneHeapBytes> CloneHeapBytes for Option<T> {
     }
 }
 impl<T: CloneHeapBytes> CloneHeapBytes for Vec<T> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn clone_heap_bytes(&self) -> Result<usize> {
         let slots = self
             .len()
@@ -51,7 +60,10 @@ impl<T: CloneHeapBytes> CloneHeapBytes for Vec<T> {
     }
 }
 impl<K: CloneHeapBytes + Ord, V: CloneHeapBytes> CloneHeapBytes for BTreeMap<K, V> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn clone_heap_bytes(&self) -> Result<usize> {
         let nodes = crate::local_transport::query_funding::tree_bytes::<K, V>(self.len())?;
         self.iter().try_fold(nodes, |bytes, (key, value)| {

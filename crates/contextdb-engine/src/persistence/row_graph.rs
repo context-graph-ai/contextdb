@@ -13,7 +13,10 @@ fn corruption(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn validate(owned: &OwnedAdjEntry) -> Result<()> {
     if owned.owner.table.is_empty()
         || owned.owner.created_tx != owned.entry.created_tx
@@ -24,7 +27,10 @@ pub(super) fn validate(owned: &OwnedAdjEntry) -> Result<()> {
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn encode_row_graph(owned: &OwnedAdjEntry) -> Result<Vec<u8>> {
     struct Size(usize);
     impl std::io::Write for Size {
@@ -57,7 +63,10 @@ pub(super) fn encode_row_graph(owned: &OwnedAdjEntry) -> Result<Vec<u8>> {
 impl RedbPersistence {
     /// The table and generation are part of ownership, even when two rows
     /// share endpoints, a transaction and an LSN.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn row_graph_key(owned: &OwnedAdjEntry, reverse: bool) -> Result<Vec<u8>> {
         validate(owned)?;
         let owner = &owned.owner;
@@ -89,14 +98,20 @@ impl RedbPersistence {
         Ok(key)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn initialize_row_graph_in_write(write: &redb::WriteTransaction) -> Result<()> {
         write.open_table(FORWARD).map_err(Self::storage_error)?;
         write.open_table(REVERSE).map_err(Self::storage_error)?;
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn apply_row_graph_in_write(
         write: &redb::WriteTransaction,
         ws: &contextdb_tx::WriteSet,
@@ -137,7 +152,8 @@ impl RedbPersistence {
                 if owned.owner.table == table && owned.owner.row_id == row {
                     if selected.is_some() {
                         return Err(Error::Other(
-                            "fixture selector names multiple row versions".into()));
+                            "fixture selector names multiple row versions".into(),
+                        ));
                     }
                     selected = Some(key.value().to_vec());
                 }
@@ -150,7 +166,10 @@ impl RedbPersistence {
         write.commit().map_err(Self::storage_error)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn append_row_graph_edge(&self, owned: &OwnedAdjEntry) -> Result<()> {
         self.prepare_proof_owner()?;
         self.graph_writer_window(|| {
@@ -186,7 +205,10 @@ impl RedbPersistence {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn erase_row_graph_in_write(
         write: &redb::WriteTransaction,
         selected: &[OwnedAdjEntry],
@@ -227,25 +249,43 @@ impl RedbPersistence {
 impl RedbPersistence {
     /// Retire one table's exact row owners in the caller's schema transaction.
     /// Each native window and its decode are funded until physically freed.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn retire_row_graph_table_in_write(
-        &self, write: &redb::WriteTransaction, table: &str,
+        &self,
+        write: &redb::WriteTransaction,
+        table: &str,
         original: Option<&crate::memory_accounting::OwnedMemoryReservation>,
     ) -> Result<()> {
-        let mut after: Option<(Vec<u8>, crate::read_image_memory::ImageMemoryHandle, Option<crate::memory_accounting::OwnedMemoryReservation>)> = None;
+        let mut after: Option<(
+            Vec<u8>,
+            crate::read_image_memory::ImageMemoryHandle,
+            Option<crate::memory_accounting::OwnedMemoryReservation>,
+        )> = None;
         loop {
             let frame = original.map(OriginalPersistenceFrame::new).transpose()?;
             let memory = match frame.as_ref() {
                 Some(frame) => crate::memory_accounting::image_memory_for_original_record(frame)?,
-                None => crate::read_image_memory::ImageMemory::operation_writer(self.require_decode_accountant()?)?,
+                None => crate::read_image_memory::ImageMemory::operation_writer(
+                    self.require_decode_accountant()?,
+                )?,
             };
             let next = memory.scope(|| -> Result<_> {
                 let source = write.open_table(FORWARD).map_err(Self::storage_error)?;
-                let lower = after.as_ref().map_or(std::ops::Bound::Unbounded,
-                    |(key, _, _)| std::ops::Bound::Excluded(key.as_slice()));
-                let mut cursor = source.range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+                let lower = after
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, |(key, _, _)| {
+                        std::ops::Bound::Excluded(key.as_slice())
+                    });
+                let mut cursor = source
+                    .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
                     .map_err(Self::storage_error)?;
-                let Some((key, value)) = cursor.next().transpose().map_err(Self::storage_error)? else { return Ok(None); };
+                let Some((key, value)) = cursor.next().transpose().map_err(Self::storage_error)?
+                else {
+                    return Ok(None);
+                };
                 crate::read_image_memory::reserve(key.value().len())?;
                 let position = key.value().to_vec();
                 let owned: OwnedAdjEntry = Self::decode_exact(value.value())?;
@@ -255,37 +295,62 @@ impl RedbPersistence {
                 }
                 Ok(Some((position, owned)))
             })?;
-            let Some((key, owned)) = next else { break; };
+            let Some((key, owned)) = next else {
+                break;
+            };
             if owned.owner.table == table {
-                memory.scope(|| Self::erase_row_graph_in_write(write, std::slice::from_ref(&owned)))?;
+                memory.scope(|| {
+                    Self::erase_row_graph_in_write(write, std::slice::from_ref(&owned))
+                })?;
             }
             drop(owned);
-            after = Some((key, memory, frame.map(OriginalPersistenceFrame::into_reservation)));
+            after = Some((
+                key,
+                memory,
+                frame.map(OriginalPersistenceFrame::into_reservation),
+            ));
         }
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn retire_received_shape_losses_in_write(
-        &self, write: &redb::WriteTransaction, stage: &ReceivedSchemaPersistenceProjection,
+        &self,
+        write: &redb::WriteTransaction,
+        stage: &ReceivedSchemaPersistenceProjection,
         original: Option<&crate::memory_accounting::OwnedMemoryReservation>,
     ) -> Result<()> {
         for table in &stage.affected_tables {
-            if stage.table_meta.get(table).is_some_and(crate::database::has_graph_edge_table_shape) { continue; }
+            if stage
+                .table_meta
+                .get(table)
+                .is_some_and(crate::database::has_graph_edge_table_shape)
+            {
+                continue;
+            }
             let frame = original.map(OriginalPersistenceFrame::new).transpose()?;
             let memory = match frame.as_ref() {
                 Some(frame) => crate::memory_accounting::image_memory_for_original_record(frame)?,
-                None => crate::read_image_memory::ImageMemory::operation_writer(self.require_decode_accountant()?)?,
+                None => crate::read_image_memory::ImageMemory::operation_writer(
+                    self.require_decode_accountant()?,
+                )?,
             };
             let loses_shape = memory.scope(|| -> Result<bool> {
                 let metadata = write.open_table(META_TABLE).map_err(Self::storage_error)?;
                 crate::read_image_memory::reserve(table.len().saturating_add(64))?;
                 let key = Self::meta_key(table);
-                let Some(encoded) = metadata.get(key.as_str()).map_err(Self::storage_error)? else { return Ok(false); };
+                let Some(encoded) = metadata.get(key.as_str()).map_err(Self::storage_error)? else {
+                    return Ok(false);
+                };
                 let (before, _) = Self::decode_table_meta_versioned(encoded.value())?;
                 Ok(crate::database::has_graph_edge_table_shape(&before))
             })?;
-            if loses_shape { self.retire_row_graph_table_in_write(write, table, original)?; }
+            if loses_shape {
+                self.retire_row_graph_table_in_write(write, table, original)?;
+            }
         }
         Ok(())
     }

@@ -361,14 +361,14 @@ fn received_missing_witness_refuses(drop_selected: bool, reverse: bool) {
     let before_lsn = db.current_lsn();
     let before_selected = {
         let fixture_answer_96 = db
-        .execute("SELECT * FROM selected_links", &HashMap::new())
-        .unwrap();
+            .execute("SELECT * FROM selected_links", &HashMap::new())
+            .unwrap();
         fixture_answer_96.rows().to_vec()
     };
     let before_other = {
         let fixture_answer_97 = db
-        .execute("SELECT * FROM other_links", &HashMap::new())
-        .unwrap();
+            .execute("SELECT * FROM other_links", &HashMap::new())
+            .unwrap();
         fixture_answer_97.rows().to_vec()
     };
     let before_schema = format!("{:?}", db.table_meta("selected_links"));

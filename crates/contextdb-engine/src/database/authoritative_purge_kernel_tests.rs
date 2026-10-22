@@ -127,7 +127,8 @@ fn exact_rows(
         None => db.execute(&sql, &arguments),
     }
     .expect("read exact fixture row")
-    .rows().to_vec()
+    .rows()
+    .to_vec()
 }
 
 fn secondary_index_rows(db: &Database, body: &str) -> SecondaryIndexProbe {
@@ -203,36 +204,80 @@ fn row_graph_owner(db: &Database, row_id: RowId) -> Option<contextdb_tx::RowEdge
 
 // Consult the captured physical graph root with the SAVED exact row owner,
 // never look up a deleted owning row and mistake None for absent adjacency.
-fn assert_saved_row_witnesses(db: &Database, fixture: &Fixture, before: &OwnedCopies, selected_present: bool) {
+fn assert_saved_row_witnesses(
+    db: &Database,
+    fixture: &Fixture,
+    before: &OwnedCopies,
+    selected_present: bool,
+) {
     let memory = db.declared_reader_memory().unwrap();
     let root = db.graph_snapshot(db.snapshot_for_read(), memory).unwrap();
     for (owner, source, target, present) in [
-        (before.selected_row_graph_owner.as_ref().unwrap(), fixture.selected, fixture.selected_graph_target, selected_present),
-        (before.survivor_row_graph_owner.as_ref().unwrap(), fixture.survivor, fixture.survivor_graph_target, true),
+        (
+            before.selected_row_graph_owner.as_ref().unwrap(),
+            fixture.selected,
+            fixture.selected_graph_target,
+            selected_present,
+        ),
+        (
+            before.survivor_row_graph_owner.as_ref().unwrap(),
+            fixture.survivor,
+            fixture.survivor_graph_target,
+            true,
+        ),
     ] {
-        for (node, other, direction) in [(source, target, Direction::Outgoing), (target, source, Direction::Incoming)] {
+        for (node, other, direction) in [
+            (source, target, Direction::Outgoing),
+            (target, source, Direction::Incoming),
+        ] {
             let mut count = 0;
-            db.graph_store.visit_row_edges(root.as_ref(), contextdb_graph::source::GraphQuery {
-                node, direction, identity: Some((other, EDGE_TYPE)),
-            }, owner, |edge| {
-                assert_eq!(edge.source, source);
-                assert_eq!(edge.target, target);
-                assert_eq!(edge.edge_type, EDGE_TYPE);
-                assert_eq!(edge.created_tx, owner.created_tx);
-                assert_eq!(edge.lsn, owner.lsn);
-                count += 1;
-                Ok(true)
-            }).expect("read physical row-owner lane without logical visibility filtering");
-            assert_eq!(count, usize::from(present), "saved exact witness in each physical direction");
+            db.graph_store
+                .visit_row_edges(
+                    root.as_ref(),
+                    contextdb_graph::source::GraphQuery {
+                        node,
+                        direction,
+                        identity: Some((other, EDGE_TYPE)),
+                    },
+                    owner,
+                    |edge| {
+                        assert_eq!(edge.source, source);
+                        assert_eq!(edge.target, target);
+                        assert_eq!(edge.edge_type, EDGE_TYPE);
+                        assert_eq!(edge.created_tx, owner.created_tx);
+                        assert_eq!(edge.lsn, owner.lsn);
+                        count += 1;
+                        Ok(true)
+                    },
+                )
+                .expect("read physical row-owner lane without logical visibility filtering");
+            assert_eq!(
+                count,
+                usize::from(present),
+                "saved exact witness in each physical direction"
+            );
         }
     }
 }
 
-fn standalone_copies(db: &Database, source: Uuid, target: Uuid) -> (Option<DurableGraphArrival>, BTreeSet<Uuid>, BTreeSet<Uuid>) {
+fn standalone_copies(
+    db: &Database,
+    source: Uuid,
+    target: Uuid,
+) -> (Option<DurableGraphArrival>, BTreeSet<Uuid>, BTreeSet<Uuid>) {
     let memory = db.declared_reader_memory().unwrap();
-    let arrival = db.with_graph_arrival(&(source, target, EDGE_TYPE.to_owned()),
-        |record| Ok(record.cloned()), memory).unwrap();
-    (arrival, graph_neighbors(db, source, Direction::Outgoing), graph_neighbors(db, target, Direction::Incoming))
+    let arrival = db
+        .with_graph_arrival(
+            &(source, target, EDGE_TYPE.to_owned()),
+            |record| Ok(record.cloned()),
+            memory,
+        )
+        .unwrap();
+    (
+        arrival,
+        graph_neighbors(db, source, Direction::Outgoing),
+        graph_neighbors(db, target, Direction::Incoming),
+    )
 }
 
 fn graph_probe(db: &Database, fixture: &Fixture) -> GraphProbe {
@@ -303,7 +348,8 @@ fn exact_edge_rows(db: &Database, id: Uuid) -> Vec<Vec<Value>> {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("read exact durable edge owner row")
-    .rows().to_vec()
+    .rows()
+    .to_vec()
 }
 
 fn captured(selection: &AuthoritativePurgeSelection, row_id: RowId) -> CapturedLineage {
@@ -940,8 +986,11 @@ fn assert_full_selected_absence_after_reopen(
     let reopened_vectors = vector_row_ids(db);
     assert!(!reopened_vectors.contains(&fixture.selected_note.row_id));
     assert!(reopened_vectors.contains(&fixture.survivor_note.row_id));
-    assert_eq!(&indexed_note_coverage(db), expected_indexed,
-        "reopen serves exactly the saved survivors through INDEXED with no query build");
+    assert_eq!(
+        &indexed_note_coverage(db),
+        expected_indexed,
+        "reopen serves exactly the saved survivors through INDEXED with no query build"
+    );
     assert!(graph_neighbors(db, fixture.selected, Direction::Outgoing).is_empty());
     assert!(graph_neighbors(db, fixture.selected_graph_target, Direction::Incoming).is_empty());
     assert_eq!(
@@ -1046,9 +1095,7 @@ fn assert_full_selected_absence_after_reopen(
 /// already uses, and `USE VECTOR INDEXED` refuses instead of scanning.
 fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
     let index = VectorIndexRef::new(NOTES, "embedding");
-    let builds_before = db
-        .__vector_passive_activity_counters_for_test()
-        .hnsw_builds;
+    let builds_before = db.__vector_passive_activity_counters_for_test().hnsw_builds;
     let serial_before = db.__debug_vector_hnsw_build_serial_for_test(index.clone());
     db.__reset_last_query_vector_trace_for_test();
     let result = db
@@ -1057,9 +1104,7 @@ fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
             &HashMap::new(),
         )
         .expect("public INDEXED coverage query");
-    let builds_after = db
-        .__vector_passive_activity_counters_for_test()
-        .hnsw_builds;
+    let builds_after = db.__vector_passive_activity_counters_for_test().hnsw_builds;
     let serial_after = db.__debug_vector_hnsw_build_serial_for_test(index);
     assert_eq!(
         builds_after, builds_before,
@@ -1113,7 +1158,10 @@ fn indexed_note_coverage(db: &Database) -> BTreeSet<RowId> {
         .__take_last_query_vector_trace_for_test(read_memory)
         .expect("read the admitted trace observation")
         .expect("the vector query publishes its route trace");
-    assert!(trace.used_hnsw, "the executed answer traversed the maintained graph");
+    assert!(
+        trace.used_hnsw,
+        "the executed answer traversed the maintained graph"
+    );
     assert_eq!(trace.fallback_reason, None);
     assert!(
         trace.partition_routes.iter().all(|route| {
@@ -1147,11 +1195,23 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     let standalone_source = Uuid::new_v4();
     let standalone_target = Uuid::new_v4();
     let standalone_tx = seed.db.begin().unwrap();
-    assert!(seed.db.insert_edge(standalone_tx, standalone_source, standalone_target,
-        EDGE_TYPE.to_owned(), HashMap::new()).unwrap());
+    assert!(
+        seed.db
+            .insert_edge(
+                standalone_tx,
+                standalone_source,
+                standalone_target,
+                EDGE_TYPE.to_owned(),
+                HashMap::new()
+            )
+            .unwrap()
+    );
     seed.db.commit(standalone_tx).unwrap();
     let standalone_before = standalone_copies(&seed.db, standalone_source, standalone_target);
-    assert!(standalone_before.0.is_some(), "real standalone contribution has a durable arrival");
+    assert!(
+        standalone_before.0.is_some(),
+        "real standalone contribution has a durable arrival"
+    );
     assert_eq!(standalone_before.1, BTreeSet::from([standalone_target]));
     assert_eq!(standalone_before.2, BTreeSet::from([standalone_source]));
     let before = owned_copies(&seed.db, &fixture);
@@ -1246,10 +1306,18 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         .expect("commit selected note lineage purge");
     let after_notes = owned_copies(&seed.db, &fixture);
     assert_saved_row_witnesses(&seed.db, &fixture, &before, true);
-    assert!(standalone_copies(&seed.db, standalone_source, standalone_target) == standalone_before,
-        "unrelated note erasure preserves the standalone arrival and both directions");
-    assert_eq!(after_notes.selected_row_graph_owner, before.selected_row_graph_owner);
-    assert_eq!(after_notes.survivor_row_graph_owner, before.survivor_row_graph_owner);
+    assert!(
+        standalone_copies(&seed.db, standalone_source, standalone_target) == standalone_before,
+        "unrelated note erasure preserves the standalone arrival and both directions"
+    );
+    assert_eq!(
+        after_notes.selected_row_graph_owner,
+        before.selected_row_graph_owner
+    );
+    assert_eq!(
+        after_notes.survivor_row_graph_owner,
+        before.survivor_row_graph_owner
+    );
     assert!(after_notes.selected_live.is_empty());
     assert!(after_notes.selected_secondary_index.rows.is_empty());
     assert_eq!(
@@ -1262,8 +1330,11 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
     assert!(after_notes.survivor_vector_present);
     // HnswIndex::len documents vector count. The durable-pages arm currently
     // counts points; that production defect must not weaken this N-1 oracle.
-    assert_eq!(after_notes.hnsw_len, before.hnsw_len - 1,
-        "logical vector membership loses exactly the erased row, including shared representations");
+    assert_eq!(
+        after_notes.hnsw_len,
+        before.hnsw_len - 1,
+        "logical vector membership loses exactly the erased row, including shared representations"
+    );
     let indexed_after = indexed_note_coverage(&seed.db);
     let mut indexed_without_selected = indexed_before.clone();
     assert!(
@@ -1394,8 +1465,10 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         .expect("commit selected edge lineage purge separately from notes");
     let after_edges = owned_copies(&seed.db, &fixture);
     assert_saved_row_witnesses(&seed.db, &fixture, &before, false);
-    assert!(standalone_copies(&seed.db, standalone_source, standalone_target) == standalone_before,
-        "selected row-owner erasure preserves the independent standalone contribution");
+    assert!(
+        standalone_copies(&seed.db, standalone_source, standalone_target) == standalone_before,
+        "selected row-owner erasure preserves the independent standalone contribution"
+    );
     assert!(after_edges.selected_edge_live.is_empty());
     assert!(after_edges.selected_edge_history.is_empty());
     assert_eq!(after_edges.selected_edge_history_count, 0);
@@ -1474,8 +1547,10 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
         &indexed_without_selected,
     );
     assert_saved_row_witnesses(&reopened, &fixture, &before, false);
-    assert!(standalone_copies(&reopened, standalone_source, standalone_target) == standalone_before,
-        "standalone arrival and both directions survive reopen");
+    assert!(
+        standalone_copies(&reopened, standalone_source, standalone_target) == standalone_before,
+        "standalone arrival and both directions survive reopen"
+    );
     assert_eq!(
         reopened.classify_authoritative_purge_root_for_test(
             NOTES,

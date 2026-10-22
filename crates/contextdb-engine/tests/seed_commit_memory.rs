@@ -275,7 +275,9 @@ fn a_seed_commit_has_an_exact_writer_boundary_and_keeps_the_prior_state_on_refus
                         assert_eq!(requested_bytes, available_bytes + 1);
                     }
                     other => {
-                        panic!("one byte below the exact writer boundary must refuse typed: {other:?}")
+                        panic!(
+                            "one byte below the exact writer boundary must refuse typed: {other:?}"
+                        )
                     }
                 }
             } else {
@@ -286,9 +288,12 @@ fn a_seed_commit_has_an_exact_writer_boundary_and_keeps_the_prior_state_on_refus
                 .unwrap();
             let expected = if short { 0 } else { 8 };
             assert_eq!(
-                db.execute("SELECT COUNT(*) FROM boundary", &HashMap::with_hasher(seed.clone()))
-                    .unwrap()
-                    .rows(),
+                db.execute(
+                    "SELECT COUNT(*) FROM boundary",
+                    &HashMap::with_hasher(seed.clone())
+                )
+                .unwrap()
+                .rows(),
                 vec![vec![Value::Int64(expected)]]
             );
             db.close().unwrap();
@@ -297,7 +302,10 @@ fn a_seed_commit_has_an_exact_writer_boundary_and_keeps_the_prior_state_on_refus
             reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
             assert_eq!(
                 reopened
-                    .execute("SELECT COUNT(*) FROM boundary", &HashMap::with_hasher(seed.clone()))
+                    .execute(
+                        "SELECT COUNT(*) FROM boundary",
+                        &HashMap::with_hasher(seed.clone())
+                    )
                     .unwrap()
                     .rows(),
                 vec![vec![Value::Int64(expected)]]

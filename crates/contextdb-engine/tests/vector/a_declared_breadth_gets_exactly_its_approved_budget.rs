@@ -402,7 +402,11 @@ fn opening_and_walking_are_charged_against_the_declared_work() {
             }
         }
         if let Ok(answer) = answer {
-            assert_eq!(answer.rows().len(), LIMIT, "work={work}: never a short page");
+            assert_eq!(
+                answer.rows().len(),
+                LIMIT,
+                "work={work}: never a short page"
+            );
         }
     }
     // One shared walk

@@ -56,7 +56,10 @@ unsafe fn finish(raw: NonNull<()>) {
 /// Preserve startup's existing retained-charge semantics for declared writers,
 /// and its process admission semantics for undeclared writers. Both receipts
 /// precede this new control's allocation; null/unwind owns their rollback.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn original(
     accountant: &AccountantHandle,
     bytes: usize,
@@ -186,14 +189,15 @@ unsafe fn admit_preparation(
     let mut invoice = block.invoice.lock().unwrap_or_else(|e| e.into_inner());
     let invoice = invoice.as_mut().expect("live preparation invoice");
     #[cfg(test)]
-    if block.direct_source { super::direct_source_contract_rows::before_native_invoice(layout, invoice); }
+    if block.direct_source {
+        super::direct_source_contract_rows::before_native_invoice(layout, invoice);
+    }
     let admitted = if block.direct_source {
         invoice.grow_direct_source_native(layout.size())
     } else {
         invoice.grow_cache_preparation_native(layout.size(), block.startup)
     };
-    if let Err(refusal) = admitted
-    {
+    if let Err(refusal) = admitted {
         *failure = Some(super::native_storage_admission::NativeStorageFailure::Refused(refusal));
         return Err(redb::NativeStorageRefused);
     }
@@ -203,7 +207,10 @@ unsafe fn admit_preparation(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn with_preparation<T>(
     accountant: &AccountantHandle,
     startup: bool,
@@ -249,30 +256,50 @@ pub(super) fn with_preparation<T>(
 /// Install only around the actual read-only native open. Every native backing
 /// retains this same invoice owner, so successful open, null and unwind all
 /// keep original source funding until the last physical backing is freed.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn direct_preparation(
     memory: &crate::read_image_memory::ImageMemory,
 ) -> Result<redb::NativeStorageAdmission> {
     let layout = Layout::new::<PreparationBlock>();
-    let invoice = memory.direct_source_native_credit(layout.size())
-        .map_err(|failure| super::native_storage_admission::original_storage_error(
-            super::native_storage_admission::NativeStorageFailure::Refused(failure)))?;
+    let invoice = memory
+        .direct_source_native_credit(layout.size())
+        .map_err(|failure| {
+            super::native_storage_admission::original_storage_error(
+                super::native_storage_admission::NativeStorageFailure::Refused(failure),
+            )
+        })?;
     let Some(pointer) = NonNull::new(unsafe { alloc(layout) }.cast::<PreparationBlock>()) else {
         return Err(super::native_storage_admission::original_storage_error(
             super::native_storage_admission::NativeStorageFailure::AllocatorFailed {
-                site: "direct source cache preparation", layout,
-            }));
+                site: "direct source cache preparation",
+                layout,
+            },
+        ));
     };
-    unsafe { pointer.as_ptr().write(PreparationBlock {
-        owners: AtomicUsize::new(1), startup: false, direct_source: true,
-        invoice: std::sync::Mutex::new(Some(invoice)),
-        failure: std::sync::Mutex::new(None), writer: None,
-    }) };
+    unsafe {
+        pointer.as_ptr().write(PreparationBlock {
+            owners: AtomicUsize::new(1),
+            startup: false,
+            direct_source: true,
+            invoice: std::sync::Mutex::new(Some(invoice)),
+            failure: std::sync::Mutex::new(None),
+            writer: None,
+        })
+    };
     // SAFETY: concrete owned receipt; source-only ordinary admission; failure
     // inspector borrows the same scalar slot. No writer discovery or Weak tail.
-    Ok(unsafe { redb::NativeStorageAdmission::from_owned_receipt(
-        pointer.cast(), retain_preparation, finish_preparation, admit_preparation,
-    ).with_failure_inspector(inspect_preparation) })
+    Ok(unsafe {
+        redb::NativeStorageAdmission::from_owned_receipt(
+            pointer.cast(),
+            retain_preparation,
+            finish_preparation,
+            admit_preparation,
+        )
+        .with_failure_inspector(inspect_preparation)
+    })
 }
 
 #[cfg(test)]
@@ -282,7 +309,11 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn last_reserve_for_test() -> (usize, usize, usize) {
     let layout = Layout::new::<ReserveBlock>();
-    (LAST_RESERVE.with(std::cell::Cell::get), layout.size(), layout.align())
+    (
+        LAST_RESERVE.with(std::cell::Cell::get),
+        layout.size(),
+        layout.align(),
+    )
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -292,10 +323,15 @@ pub(super) fn direct_observation_for_test(pointer: usize) -> ((usize, usize, usi
     let block = unsafe { &*(pointer as *const PreparationBlock) };
     assert!(block.direct_source);
     let invoice = block.invoice.lock().unwrap_or_else(|e| e.into_inner());
-    let (payer, bytes) = invoice.as_ref().expect("live preparation invoice").observation_for_test();
+    let (payer, bytes) = invoice
+        .as_ref()
+        .expect("live preparation invoice")
+        .observation_for_test();
     let layout = Layout::new::<PreparationBlock>();
     ((pointer, layout.size(), layout.align()), bytes, payer)
 }
 
 #[cfg(test)]
-pub(super) fn preparation_layout_for_test() -> Layout { Layout::new::<PreparationBlock>() }
+pub(super) fn preparation_layout_for_test() -> Layout {
+    Layout::new::<PreparationBlock>()
+}

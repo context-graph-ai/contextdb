@@ -42,7 +42,10 @@ impl Drop for SourcePageCharge {
 ///
 /// Redb restores enclosing callbacks on return or unwind. Admission errors
 /// travel with their original typed payload through storage adaptation.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn with_source_page_admission<T>(
     accountant: crate::memory_accounting::AccountantHandle,
     read: impl FnOnce() -> Result<T>,
@@ -57,7 +60,10 @@ pub(super) fn with_source_page_admission<T>(
 
 /// Catalog reclamation reads cleanup evidence, not a generation being built
 /// or served. Keep its physical source owner under the cleanup operation.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn with_catalog_reclamation_source_page_admission<T>(
     accountant: crate::memory_accounting::AccountantHandle,
     read: impl FnOnce() -> Result<T>,
@@ -72,7 +78,10 @@ pub(super) fn with_catalog_reclamation_source_page_admission<T>(
 
 /// Covered journal deletion owns storage pages independently of any later
 /// generation installation. Its reads must not imply generation-body work.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn with_journal_cleanup_source_page_admission<T>(
     accountant: crate::memory_accounting::AccountantHandle,
     read: impl FnOnce() -> Result<T>,
@@ -88,7 +97,10 @@ pub(super) fn with_journal_cleanup_source_page_admission<T>(
 /// Frontier metadata can occupy an arbitrarily large physical extent even
 /// when its decoded descriptor is bounded. Charge that extent before redb
 /// allocates it, while retaining the preparation operation's early refusal.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn with_preparation_source_page_admission<T>(
     accountant: crate::memory_accounting::AccountantHandle,
     read: impl FnOnce() -> Result<T>,
@@ -252,7 +264,10 @@ impl SourceRefusalScope {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn with_source_page_admission_for<T>(
     accountant: crate::memory_accounting::AccountantHandle,
     operation: &'static str,

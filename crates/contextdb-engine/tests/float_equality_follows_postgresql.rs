@@ -263,7 +263,11 @@ fn an_indexed_float_range_with_one_bound_answers_like_a_scan() {
             &params(&[("grp", Value::Int64(1)), ("score", Value::Float64(1.0))]),
         )
         .unwrap();
-    assert_eq!(plan.trace().physical_plan, "IndexScan", "the one-bound range reads the index");
+    assert_eq!(
+        plan.trace().physical_plan,
+        "IndexScan",
+        "the one-bound range reads the index"
+    );
     db.close().unwrap();
 }
 

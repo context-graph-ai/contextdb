@@ -17,7 +17,10 @@ pub struct GraphQuery<'a> {
 /// Captures the engine's already published root without opening another store.
 /// A statement-bound adapter must return that statement's root on every capture.
 pub trait GraphReadSource: Send + Sync {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn capture(
         &self,
         snapshot: SnapshotId,
@@ -30,18 +33,25 @@ pub trait GraphReadSource: Send + Sync {
 pub trait GraphSnapshot: Send + Sync {
     /// Seek the node/identity prefix, retaining a full physical continuation
     /// key. No adjacency list is materialized, including for high-degree nodes.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn cursor(&self, query: GraphQuery<'_>) -> Result<GraphCursorOwner>;
 
     /// Resolve exactly one row version without scanning sibling owners.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn row_cursor(
         &self,
         _query: GraphQuery<'_>,
         _owner: &RowEdgeOwner,
     ) -> Result<GraphCursorOwner> {
         Err(contextdb_core::Error::Other(
-            "graph source does not support exact row ownership".into()))
+            "graph source does not support exact row ownership".into(),
+        ))
     }
 }
 
@@ -53,7 +63,10 @@ pub trait GraphCursor: Send {
     }
     /// Return one admitted version window. Advancing must not retain earlier
     /// decoded windows; errors, cancellation and drop release cursor scratch.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next_edge(&mut self) -> Result<Option<OwnedReadBox<dyn GraphEdgeWindow>>>;
 }
 

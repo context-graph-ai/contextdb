@@ -456,7 +456,8 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         db.execute("UPDATE funded_items SET v = '[0,1,0]'", &HashMap::new())
             .unwrap();
         let parent =
-            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824).expect("admit the declared fixture root");
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824)
+                .expect("admit the declared fixture root");
         let child = parent.child().unwrap();
         let child_control = parent.retained_bytes_for_test();
         let observer = crate::vector_read_memory::declared_child_observer(&child).unwrap();
@@ -478,7 +479,8 @@ fn cancellation_during_actual_build_returns_workspace_and_preserves_serving_cata
         let writer_before = db.accountant().usage().used;
         let small_parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             child_control + operation_control as u64 - 1,
-        ).expect("admit the declared fixture root");
+        )
+        .expect("admit the declared fixture root");
         let small_child = small_parent.child().unwrap();
         let error = db
             .maintenance_context()
@@ -1064,11 +1066,11 @@ fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_remova
             .unwrap();
         let exact = {
             let fixture_answer_66 = db
-            .execute(
-                "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR EXACT LIMIT 1",
-                &HashMap::new(),
-            )
-            .unwrap();
+                .execute(
+                    "SELECT id, v FROM t ORDER BY v <=> [1] USE VECTOR EXACT LIMIT 1",
+                    &HashMap::new(),
+                )
+                .unwrap();
             fixture_answer_66.rows().to_vec()
         };
         assert_eq!(exact.len(), 1);
@@ -1799,8 +1801,8 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         let a_params = HashMap::from([("scope".into(), Value::Int64(0))]);
         let exact = {
             let fixture_answer_68 = db
-            .execute(&query.replace("INDEXED", "EXACT"), &a_params)
-            .unwrap();
+                .execute(&query.replace("INDEXED", "EXACT"), &a_params)
+                .unwrap();
             fixture_answer_68.rows().to_vec()
         };
         for _ in 0..32 {
@@ -2113,8 +2115,8 @@ fn last_membership_cleanup_keeps_catalog_targets_with_a_pinned_retired_chain() {
         let pin = db.pin_snapshot(snapshot).unwrap();
         let old_rows = {
             let fixture_answer_74 = db
-            .execute_at_snapshot(sql, &HashMap::new(), snapshot)
-            .unwrap();
+                .execute_at_snapshot(sql, &HashMap::new(), snapshot)
+                .unwrap();
             fixture_answer_74.rows().to_vec()
         };
         assert!(old_rows.is_empty());
@@ -2640,8 +2642,8 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         let query_params = HashMap::new();
         let old_answer = {
             let fixture_answer_76 = db
-            .execute_at_snapshot(query, &query_params, old_snapshot)
-            .unwrap();
+                .execute_at_snapshot(query, &query_params, old_snapshot)
+                .unwrap();
             fixture_answer_76.rows().to_vec()
         };
         for value in [2, 3] {
@@ -2655,8 +2657,8 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
         assert!(before.base.generation_id > original.base.generation_id);
         let exact = {
             let fixture_answer_77 = db
-            .execute(&query.replace("INDEXED", "EXACT"), &query_params)
-            .unwrap();
+                .execute(&query.replace("INDEXED", "EXACT"), &query_params)
+                .unwrap();
             fixture_answer_77.rows().to_vec()
         };
         let healthy_sql = "SELECT id, v FROM healthy ORDER BY v <=> [1] USE VECTOR INDEXED LIMIT 1";
@@ -3228,15 +3230,22 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
         // Independently allocate the real constructor's maximum native
         // capacities, including owed reachability links and restart cursors.
         // Their original invoice must outlive every observed physical free.
-        use contextdb_vector::hnsw::paged_builder::{
-            PagedGraphWorkspace, PagedVectorPoint, PagedPoint, PagedEdge,
-            PagedVectorProgress, PointId, encode_paged_point_into,
-        };
         use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
+        use contextdb_vector::hnsw::paged_builder::{
+            PagedEdge, PagedGraphWorkspace, PagedPoint, PagedVectorPoint, PagedVectorProgress,
+            PointId, encode_paged_point_into,
+        };
         let plan = vector_paged_build::paged_batch_plan(&declaration).unwrap();
         let payer = Arc::new(MemoryAccountant::with_budget(finite_floor));
-        let reservation = db.vector_store.reserve_workspace(payer.clone(), finite_floor,
-            "fixture_generation_copy", "exact finite construction layout").unwrap();
+        let reservation = db
+            .vector_store
+            .reserve_workspace(
+                payer.clone(),
+                finite_floor,
+                "fixture_generation_copy",
+                "exact finite construction layout",
+            )
+            .unwrap();
         assert_eq!(payer.usage().used, finite_floor);
         let counter = payer.writer_registration_observation_for_test().4;
         let (storage, requests, count) = oracle::source_requests_for_test(counter, || {
@@ -3247,54 +3256,110 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
                     // Four owed layer-zero reachability links are a native
                     // graph obligation (reachability::LAYER0_SLACK), independent
                     // of the planner helper this proof is checking.
-                    let capacity = if level == 0 { 2 * policy.hnsw_m + 4 }
-                        else { policy.hnsw_m };
-                    let edge = PagedEdge { point_id: PointId(0, 0), origin_id: 0, distance: 0.0 };
+                    let capacity = if level == 0 {
+                        2 * policy.hnsw_m + 4
+                    } else {
+                        policy.hnsw_m
+                    };
+                    let edge = PagedEdge {
+                        point_id: PointId(0, 0),
+                        origin_id: 0,
+                        distance: 0.0,
+                    };
                     neighbours.push(vec![edge; capacity]);
                 }
-                PagedVectorPoint::F32(PagedPoint { id: PointId(15, 0), origin_id: 0,
-                    values: vec![1.0; layout.dimension], neighbours })
+                PagedVectorPoint::F32(PagedPoint {
+                    id: PointId(15, 0),
+                    origin_id: 0,
+                    values: vec![1.0; layout.dimension],
+                    neighbours,
+                })
             });
             let mut dirty = Vec::with_capacity(plan.dirty_page_bytes);
             if let PagedVectorPoint::F32(point) = &nodes[0] {
                 encode_paged_point_into(point, &mut dirty).unwrap();
             }
             let keys: [Vec<u8>; 3] = std::array::from_fn(|_| vec![0; plan.source_key_bytes]);
-            let mut progress = Box::new(PagedVectorProgress::new(1, 1, TxId(1), Lsn(1), graph_count));
+            let mut progress =
+                Box::new(PagedVectorProgress::new(1, 1, TxId(1), Lsn(1), graph_count));
             progress.last_source_key = Some(vec![0; plan.source_key_bytes]);
             progress.cleanup_cursor = Some(vec![0; plan.source_key_bytes]);
             (scratch, nodes, dirty, keys, progress)
         });
-        assert!(count > 6 && count <= 128, "fixed oracle covers every real construction buffer: {count}");
+        assert!(
+            count > 6 && count <= 128,
+            "fixed oracle covers every real construction buffer: {count}"
+        );
         let scratch_bytes: usize = requests[..6].iter().map(|r| r.1).sum();
-        assert!(scratch_bytes > 0 && scratch_bytes <= PagedGraphWorkspace::exact_allocation_bound(plan.scratch_points).unwrap());
+        assert!(
+            scratch_bytes > 0
+                && scratch_bytes
+                    <= PagedGraphWorkspace::exact_allocation_bound(plan.scratch_points).unwrap()
+        );
         for node in &storage.1 {
-            let PagedVectorPoint::F32(node) = node else { unreachable!() };
+            let PagedVectorPoint::F32(node) = node else {
+                unreachable!()
+            };
             let point_capacity = std::mem::size_of::<PagedVectorPoint>()
                 + node.values.capacity() * std::mem::size_of::<f32>()
                 + node.neighbours.capacity() * std::mem::size_of::<Vec<PagedEdge>>()
-                + node.neighbours.iter().map(|v| v.capacity() * std::mem::size_of::<PagedEdge>()).sum::<usize>();
-            assert_eq!(plan.max_node_bytes, point_capacity + 256,
-                "actual owned level/link/value capacities plus codec framing");
+                + node
+                    .neighbours
+                    .iter()
+                    .map(|v| v.capacity() * std::mem::size_of::<PagedEdge>())
+                    .sum::<usize>();
+            assert_eq!(
+                plan.max_node_bytes,
+                point_capacity + 256,
+                "actual owned level/link/value capacities plus codec framing"
+            );
         }
-        assert!(storage.2.len() <= plan.max_node_bytes && storage.2.capacity() == plan.dirty_page_bytes);
-        assert_eq!(plan.progress_bytes, std::mem::size_of_val(storage.4.as_ref()) + 2 * plan.source_key_bytes + 256);
-        assert_eq!(finite_floor, PagedGraphWorkspace::exact_allocation_bound(plan.scratch_points).unwrap()
-            + 6 * plan.max_node_bytes + storage.2.capacity()
-            + storage.3.iter().map(Vec::capacity).sum::<usize>() + plan.progress_bytes);
+        assert!(
+            storage.2.len() <= plan.max_node_bytes && storage.2.capacity() == plan.dirty_page_bytes
+        );
+        assert_eq!(
+            plan.progress_bytes,
+            std::mem::size_of_val(storage.4.as_ref()) + 2 * plan.source_key_bytes + 256
+        );
+        assert_eq!(
+            finite_floor,
+            PagedGraphWorkspace::exact_allocation_bound(plan.scratch_points).unwrap()
+                + 6 * plan.max_node_bytes
+                + storage.2.capacity()
+                + storage.3.iter().map(Vec::capacity).sum::<usize>()
+                + plan.progress_bytes
+        );
         let actual_bytes: usize = requests[..count].iter().map(|r| r.1).sum();
-        assert!(actual_bytes <= finite_floor, "all independently observed native allocations fit their invoice");
-        assert_eq!(oracle::source_unfunded_peak_for_test().0, 0, "construction buffers are admitted before allocation");
+        assert!(
+            actual_bytes <= finite_floor,
+            "all independently observed native allocations fit their invoice"
+        );
+        assert_eq!(
+            oracle::source_unfunded_peak_for_test().0,
+            0,
+            "construction buffers are admitted before allocation"
+        );
         oracle::watch_source_free_for_test(&requests[..count], counter);
         drop(storage);
-        for (before_free, after_free, freed) in oracle::source_free_for_test(count).into_iter().take(count) {
+        for (before_free, after_free, freed) in
+            oracle::source_free_for_test(count).into_iter().take(count)
+        {
             assert_eq!(freed, 1, "each actual buffer physically frees exactly once");
-            assert_eq!((before_free, after_free), (finite_floor, finite_floor),
-                "the original construction invoice survives physical free");
+            assert_eq!(
+                (before_free, after_free),
+                (finite_floor, finite_floor),
+                "the original construction invoice survives physical free"
+            );
         }
         drop(reservation);
-        assert_eq!(payer.usage().used, 0, "only destruction returns the complete original invoice");
-        eprintln!("physical_construction_layout invoice={finite_floor} actual_bytes={actual_bytes} scratch_bytes={scratch_bytes} allocations={count} all_free_before_refund=true");
+        assert_eq!(
+            payer.usage().used,
+            0,
+            "only destruction returns the complete original invoice"
+        );
+        eprintln!(
+            "physical_construction_layout invoice={finite_floor} actual_bytes={actual_bytes} scratch_bytes={scratch_bytes} allocations={count} all_free_before_refund=true"
+        );
     }
 
     assert!(finite_floor < selected.build_phase_bytes());
@@ -3376,11 +3441,18 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
         (raw_count, graph_count)
     );
     db.accountant.set_budget(Some(baseline + HEADROOM)).unwrap();
-    let (result, actual_peak, _) = crate::persistence::content_identity::proof_allocation_oracle_tests::measured(|| db.run_maintenance_cycle());
+    let (result, actual_peak, _) =
+        crate::persistence::content_identity::proof_allocation_oracle_tests::measured(|| {
+            db.run_maintenance_cycle()
+        });
     let report = result.unwrap();
-    assert!(actual_peak <= HEADROOM,
-        "actual native construction and metadata allocation fits the unchanged fixed workspace: {actual_peak}");
-    eprintln!("physical_construction_growth history_rounds=64 peak_bytes={actual_peak} bound_bytes={HEADROOM}");
+    assert!(
+        actual_peak <= HEADROOM,
+        "actual native construction and metadata allocation fits the unchanged fixed workspace: {actual_peak}"
+    );
+    eprintln!(
+        "physical_construction_growth history_rounds=64 peak_bytes={actual_peak} bound_bytes={HEADROOM}"
+    );
     assert_eq!(report.vector.first_failure, None, "{report:?}");
     assert_eq!(report.vector.built_partitions, 1, "{report:?}");
     assert!(
@@ -3420,17 +3492,41 @@ fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_re
     assert_eq!(db.accountant.underflow_count_for_test(), 0);
     for history_rounds in [16, 32] {
         let grown = seed_retained_generation_selection(
-            &directory.path().join(format!("history-{history_rounds}.db")), 768, "F32", history_rounds);
+            &directory
+                .path()
+                .join(format!("history-{history_rounds}.db")),
+            768,
+            "F32",
+            history_rounds,
+        );
         let baseline = grown.accountant.usage().used;
-        grown.accountant.set_budget(Some(baseline + HEADROOM)).unwrap();
-        let (result, actual_peak, _) = crate::persistence::content_identity::proof_allocation_oracle_tests::measured(|| grown.run_maintenance_cycle());
+        grown
+            .accountant
+            .set_budget(Some(baseline + HEADROOM))
+            .unwrap();
+        let (result, actual_peak, _) =
+            crate::persistence::content_identity::proof_allocation_oracle_tests::measured(|| {
+                grown.run_maintenance_cycle()
+            });
         let report = result.unwrap();
-        assert_eq!(report.vector.first_failure, None, "history={history_rounds}: {report:?}");
+        assert_eq!(
+            report.vector.first_failure, None,
+            "history={history_rounds}: {report:?}"
+        );
         assert_eq!(report.vector.built_partitions, 1);
-        assert!(actual_peak <= HEADROOM,
-            "N/2N/4N retained history uses the same physical workspace envelope: history={history_rounds} peak={actual_peak}");
-        eprintln!("physical_construction_growth history_rounds={history_rounds} peak_bytes={actual_peak} bound_bytes={HEADROOM}");
-        assert_eq!(grown.vector_memory_ownership_receipt_for_test().temporary_workspace, 0);
+        assert!(
+            actual_peak <= HEADROOM,
+            "N/2N/4N retained history uses the same physical workspace envelope: history={history_rounds} peak={actual_peak}"
+        );
+        eprintln!(
+            "physical_construction_growth history_rounds={history_rounds} peak_bytes={actual_peak} bound_bytes={HEADROOM}"
+        );
+        assert_eq!(
+            grown
+                .vector_memory_ownership_receipt_for_test()
+                .temporary_workspace,
+            0
+        );
         assert_eq!(grown.accountant.underflow_count_for_test(), 0);
     }
     eprintln!(

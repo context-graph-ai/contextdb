@@ -82,7 +82,10 @@ pub(super) fn reopen_independent(file: &File, writable: bool) -> io::Result<File
 /// Native companion for the publication wait: static diagnoses and OS facts
 /// travel inline instead of acquiring an opaque std I/O error allocation.
 #[cfg(target_os = "linux")]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn reopen_independent_native(file: &File, writable: bool) -> Result<File, WaitIo> {
     use std::io::Write as _;
     use std::os::unix::ffi::OsStrExt as _;
@@ -640,7 +643,10 @@ impl Drop for SignalsBlocked {
 /// On success the description holds the claim and the data lock exclusive;
 /// the gate and reader hold it took on the way are given back. On every other
 /// outcome it holds nothing it took here.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn acquire_for_writer(
     file: &File,
     wait: &WriterWait<'_>,
@@ -790,7 +796,10 @@ pub(crate) fn acquire_for_writer(
 
 /// One exclusive byte for a writer: asked for without waiting, and only if
 /// it is held, one blocking request, made once.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writer_takes(file: &File, offset: i64) -> Result<(), WriterAcquireRefusal> {
     if try_byte(file, offset, ByteLock::Exclusive).map_err(WriterAcquireRefusal::Io)?
         == Granted::Yes
@@ -801,7 +810,10 @@ fn writer_takes(file: &File, offset: i64) -> Result<(), WriterAcquireRefusal> {
 }
 
 /// One blocking exclusive request by a writer, made once.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn writer_blocks_on(file: &File, offset: i64) -> Result<(), WriterAcquireRefusal> {
     #[cfg(any(test, feature = "test-seams"))]
     count_for_test(file, |counts| counts.writer_hold_waits += 1);

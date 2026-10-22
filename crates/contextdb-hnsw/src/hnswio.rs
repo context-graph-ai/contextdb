@@ -1906,12 +1906,22 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for ExactPointVec<
         struct V<T>(std::marker::PhantomData<T>);
         impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for V<T> {
             type Value = ExactPointVec<T>;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("a bounded point sequence") }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
-                let n = seq.size_hint().ok_or_else(|| serde::de::Error::custom("point sequence has no encoded length"))?;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a bounded point sequence")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let n = seq.size_hint().ok_or_else(|| {
+                    serde::de::Error::custom("point sequence has no encoded length")
+                })?;
                 let mut values = Vec::with_capacity(n);
                 for _ in 0..n {
-                    values.push(seq.next_element()?.ok_or_else(|| serde::de::Error::custom("short point sequence"))?);
+                    values.push(
+                        seq.next_element()?
+                            .ok_or_else(|| serde::de::Error::custom("short point sequence"))?,
+                    );
                 }
                 std::result::Result::Ok(ExactPointVec(values))
             }
@@ -1930,24 +1940,45 @@ struct ExactGraphPoint<T> {
 fn validate_point_sequence_lengths<T>(bytes: &[u8]) -> Result<()> {
     let mut at = 13usize;
     let count = |at: &mut usize| -> Result<usize> {
-        let end = at.checked_add(8).ok_or_else(|| anyhow!("point length overflow"))?;
-        let raw = bytes.get(*at..end).ok_or_else(|| anyhow!("short point length"))?;
+        let end = at
+            .checked_add(8)
+            .ok_or_else(|| anyhow!("point length overflow"))?;
+        let raw = bytes
+            .get(*at..end)
+            .ok_or_else(|| anyhow!("short point length"))?;
         *at = end;
-        usize::try_from(u64::from_le_bytes(raw.try_into().unwrap())).map_err(|_| anyhow!("point length overflow"))
+        usize::try_from(u64::from_le_bytes(raw.try_into().unwrap()))
+            .map_err(|_| anyhow!("point length overflow"))
     };
     let n = count(&mut at)?;
-    at = at.checked_add(n.checked_mul(std::mem::size_of::<T>().max(1)).ok_or_else(|| anyhow!("point values overflow"))?)
+    at = at
+        .checked_add(
+            n.checked_mul(std::mem::size_of::<T>().max(1))
+                .ok_or_else(|| anyhow!("point values overflow"))?,
+        )
         .ok_or_else(|| anyhow!("point values overflow"))?;
-    if at > bytes.len() { return Err(anyhow!("short point values")); }
+    if at > bytes.len() {
+        return Err(anyhow!("short point values"));
+    }
     let layers = count(&mut at)?;
-    if layers > 16 { return Err(anyhow!("invalid point layer count")); }
+    if layers > 16 {
+        return Err(anyhow!("invalid point layer count"));
+    }
     for _ in 0..layers {
         let n = count(&mut at)?;
-        at = at.checked_add(n.checked_mul(17).ok_or_else(|| anyhow!("point links overflow"))?)
+        at = at
+            .checked_add(
+                n.checked_mul(17)
+                    .ok_or_else(|| anyhow!("point links overflow"))?,
+            )
             .ok_or_else(|| anyhow!("point links overflow"))?;
-        if at > bytes.len() { return Err(anyhow!("short point links")); }
+        if at > bytes.len() {
+            return Err(anyhow!("short point links"));
+        }
     }
-    if at != bytes.len() { return Err(anyhow!("point has trailing bytes")); }
+    if at != bytes.len() {
+        return Err(anyhow!("point has trailing bytes"));
+    }
     Ok(())
 }
 
@@ -1970,10 +2001,12 @@ pub fn decode_paged_point<T: DeserializeOwned>(
         return Err(anyhow!("invalid HNSW point identity or layer count"));
     }
     let neighbours = point
-        .neighbours.0
+        .neighbours
+        .0
         .into_iter()
         .map(|layer| {
-            layer.0
+            layer
+                .0
                 .into_iter()
                 .map(|edge| crate::paged::PagedEdge {
                     point_id: PointId(edge.point_id.layer, edge.point_id.rank),

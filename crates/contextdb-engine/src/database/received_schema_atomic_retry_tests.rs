@@ -791,11 +791,11 @@ fn received_mixed_data_alter_data_keeps_authored_values_order_and_one_commit() {
     let assert_visible = |db: &Database| {
         let actual = {
             let fixture_answer_61 = db
-            .execute(
-                "SELECT id, parent_id, previous_body, body FROM mixed_children ORDER BY id",
-                &HashMap::new(),
-            )
-            .unwrap();
+                .execute(
+                    "SELECT id, parent_id, previous_body, body FROM mixed_children ORDER BY id",
+                    &HashMap::new(),
+                )
+                .unwrap();
             fixture_answer_61.rows().to_vec()
         };
         assert_eq!(
@@ -1011,18 +1011,31 @@ fn received_mixed_data_alter_data_keeps_authored_values_order_and_one_commit() {
 // test above and every earlier body remain byte-identical. These wrappers are
 // separate because the frozen bodies cannot be parameterized by this packet.
 #[derive(Clone, Copy, Debug)]
-enum NativeMemoryReplayCase { Clean, CallbackRefusal, MemoryRefusal, GraphGuard }
+enum NativeMemoryReplayCase {
+    Clean,
+    CallbackRefusal,
+    MemoryRefusal,
+    GraphGuard,
+}
 
 fn open_native_received_memory() -> Database {
     let db = Database::open_owned_for_test(
-        std::path::Path::new(":memory:"), DatabaseOpenOptions {
+        std::path::Path::new(":memory:"),
+        DatabaseOpenOptions {
             memory_limit: Some(1_610_612_736),
             ..DatabaseOpenOptions::default()
         },
-    ).expect("construct Native memory Database from its actual open-time writer");
-    assert!(matches!(&db.tx_mgr, DatabaseTransactionHost::Owned(_)),
-        "Native memory replay requires DatabaseTransactionHost::Owned after every construction");
-    assert_eq!(db.memory_limit(), Some(1_610_612_736), "keep the invariant writer budget");
+    )
+    .expect("construct Native memory Database from its actual open-time writer");
+    assert!(
+        matches!(&db.tx_mgr, DatabaseTransactionHost::Owned(_)),
+        "Native memory replay requires DatabaseTransactionHost::Owned after every construction"
+    );
+    assert_eq!(
+        db.memory_limit(),
+        Some(1_610_612_736),
+        "keep the invariant writer budget"
+    );
     db
 }
 
@@ -1031,8 +1044,11 @@ fn open_native_received_memory() -> Database {
 /// The force-Legacy constructor mutant is not caught by the frozen Legacy row.
 #[test]
 fn native_memory_received_source_prefix_rows() {
-    for case in [NativeMemoryReplayCase::Clean, NativeMemoryReplayCase::CallbackRefusal,
-        NativeMemoryReplayCase::MemoryRefusal] {
+    for case in [
+        NativeMemoryReplayCase::Clean,
+        NativeMemoryReplayCase::CallbackRefusal,
+        NativeMemoryReplayCase::MemoryRefusal,
+    ] {
         assert_native_memory_received_source_prefix(case);
     }
 }
@@ -1250,8 +1266,7 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
                 &HashMap::new(),
             )
             .unwrap();
-        let actual = visible_answer
-            .rows();
+        let actual = visible_answer.rows();
         assert_eq!(
             actual,
             vec![
@@ -1280,13 +1295,26 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
     let db = open_native_received_memory();
     apply_received(&db, &seed, &seed_context, &seed_lineages).unwrap();
     let original_limit = db.memory_limit();
-    db.execute("CREATE TABLE mixed_unrelated (id INTEGER PRIMARY KEY, body TEXT)", &HashMap::new()).unwrap();
-    db.execute("INSERT INTO mixed_unrelated VALUES (99, 'preserved')", &HashMap::new()).unwrap();
-    db.execute("CREATE TRIGGER native_prefix_read ON mixed_children WHEN INSERT INCLUDING SYNC", &HashMap::new()).unwrap();
+    db.execute(
+        "CREATE TABLE mixed_unrelated (id INTEGER PRIMARY KEY, body TEXT)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO mixed_unrelated VALUES (99, 'preserved')",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER native_prefix_read ON mixed_children WHEN INSERT INCLUDING SYNC",
+        &HashMap::new(),
+    )
+    .unwrap();
     let visits = Arc::new(Mutex::new(Vec::new()));
-    let reject = Arc::new(std::sync::atomic::AtomicBool::new(
-        matches!(case, NativeMemoryReplayCase::CallbackRefusal),
-    ));
+    let reject = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
+        case,
+        NativeMemoryReplayCase::CallbackRefusal
+    )));
     db.register_transactional_trigger_callback("native_prefix_read", {
         let visits = visits.clone();
         let reject = reject.clone();
@@ -1295,49 +1323,93 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
             let body = context.row_values["body"].clone();
             // Read the ACTUAL current transaction, not just the supplied context.
             // A final-schema replay decodes A incorrectly or cannot read its old body.
-            let selected = handle.execute_in_tx(
-                context.tx, "SELECT body FROM mixed_children WHERE id = $id",
-                &HashMap::from([("id".to_string(), id.clone())]),
-            )?.rows().to_vec();
+            let selected = handle
+                .execute_in_tx(
+                    context.tx,
+                    "SELECT body FROM mixed_children WHERE id = $id",
+                    &HashMap::from([("id".to_string(), id.clone())]),
+                )?
+                .rows()
+                .to_vec();
             assert_eq!(selected, vec![vec![body.clone()]]);
-            let parents = handle.execute_in_tx(
-                context.tx, "SELECT id FROM mixed_parents ORDER BY id", &HashMap::new(),
-            )?.rows().to_vec();
-            let expected = if id == Value::Int64(1) { Vec::new() }
-                else { vec![vec![Value::Int64(7)]] };
-            assert_eq!(parents, expected, "a callback sees its source prefix, not the final parent overlay");
+            let parents = handle
+                .execute_in_tx(
+                    context.tx,
+                    "SELECT id FROM mixed_parents ORDER BY id",
+                    &HashMap::new(),
+                )?
+                .rows()
+                .to_vec();
+            let expected = if id == Value::Int64(1) {
+                Vec::new()
+            } else {
+                vec![vec![Value::Int64(7)]]
+            };
+            assert_eq!(
+                parents, expected,
+                "a callback sees its source prefix, not the final parent overlay"
+            );
             visits.lock().push((id.clone(), body, parents));
             if id == Value::Int64(2) && reject.load(Ordering::SeqCst) {
-                return Err(Error::Other("native prefix callback refusal".to_string().into()));
+                return Err(Error::Other(
+                    "native prefix callback refusal".to_string().into(),
+                ));
             }
             Ok(())
         }
-    }).unwrap();
+    })
+    .unwrap();
     db.complete_initialization().unwrap();
 
     // Public transaction rollback must not add a commit or expose its staged row.
     let rollback_root = db.tx_mgr.published_read_snapshot();
     let rollback_commits = db.tx_mgr.commit_index_snapshot();
     let tx = db.begin().unwrap();
-    db.execute_in_tx(tx, "INSERT INTO mixed_parents VALUES (999)", &HashMap::new()).unwrap();
-    assert_eq!(db.execute_in_tx(tx, "SELECT id FROM mixed_parents", &HashMap::new()).unwrap().rows(),
-        vec![vec![Value::Int64(999)]]);
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO mixed_parents VALUES (999)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute_in_tx(tx, "SELECT id FROM mixed_parents", &HashMap::new())
+            .unwrap()
+            .rows(),
+        vec![vec![Value::Int64(999)]]
+    );
     db.rollback(tx).unwrap();
     assert_eq!(db.tx_mgr.published_read_snapshot(), rollback_root);
     assert_eq!(db.tx_mgr.commit_index_snapshot(), rollback_commits);
-    assert!(db.execute("SELECT id FROM mixed_parents", &HashMap::new()).unwrap().rows().is_empty());
+    assert!(
+        db.execute("SELECT id FROM mixed_parents", &HashMap::new())
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
 
     if matches!(case, NativeMemoryReplayCase::GraphGuard) {
         changes.edges.push(EdgeChange {
-            source: uuid::Uuid::from_u128(1), target: uuid::Uuid::from_u128(2),
-            edge_type: "native_prefix_edge".to_string(), properties: HashMap::new(), lsn: source_a,
+            source: uuid::Uuid::from_u128(1),
+            target: uuid::Uuid::from_u128(2),
+            edge_type: "native_prefix_edge".to_string(),
+            properties: HashMap::new(),
+            lsn: source_a,
         });
         let live = db.relational_store.table_meta.read().clone();
         let mut projected = live.clone();
-        for ddl in &changes.ddl { Database::apply_sync_table_ddl_to_projected_meta(&mut projected, ddl); }
-        assert!(Database::private_source_order_supported(
-            &changes, &live, &projected, db.declared_reader_memory().unwrap(),
-        ).unwrap(), "Native graph prefix remains RED until the complete path supports graph changes");
+        for ddl in &changes.ddl {
+            Database::apply_sync_table_ddl_to_projected_meta(&mut projected, ddl);
+        }
+        assert!(
+            Database::private_source_order_supported(
+                &changes,
+                &live,
+                &projected,
+                db.declared_reader_memory().unwrap(),
+            )
+            .unwrap(),
+            "Native graph prefix remains RED until the complete path supports graph changes"
+        );
     }
     let before = db.current_lsn();
     let commits_before = db.tx_mgr.commit_index_len();
@@ -1354,20 +1426,38 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
     let schema_before = format!("{:?}", db.table_meta(child));
     let publication_before = format!("{:?}", db.published_state_snapshot_for_test());
     let audits_before = format!("{:?}", db.trigger_audit_log());
-    if matches!(case, NativeMemoryReplayCase::CallbackRefusal | NativeMemoryReplayCase::MemoryRefusal) {
-        if matches!(case, NativeMemoryReplayCase::MemoryRefusal) { db.set_memory_limit(Some(1)).unwrap(); }
+    if matches!(
+        case,
+        NativeMemoryReplayCase::CallbackRefusal | NativeMemoryReplayCase::MemoryRefusal
+    ) {
+        if matches!(case, NativeMemoryReplayCase::MemoryRefusal) {
+            db.set_memory_limit(Some(1)).unwrap();
+        }
         let failed = apply_complete(&db, &changes, &received, &lineages, source_c);
         // Restore the original declaration before making any observation reads.
         db.set_memory_limit(original_limit).unwrap();
         let error = failed.expect_err("the whole Native received unit must refuse");
         match case {
             NativeMemoryReplayCase::CallbackRefusal => {
-                assert!(error.to_string().contains("native prefix callback refusal"), "{error:?}");
-                assert_eq!(visits.lock().len(), 2, "refuse only after both genuine source-prefix callbacks");
+                assert!(
+                    error.to_string().contains("native prefix callback refusal"),
+                    "{error:?}"
+                );
+                assert_eq!(
+                    visits.lock().len(),
+                    2,
+                    "refuse only after both genuine source-prefix callbacks"
+                );
             }
             NativeMemoryReplayCase::MemoryRefusal => {
-                assert!(matches!(error, Error::MemoryBudgetExceeded { .. }), "typed admission refusal: {error:?}");
-                assert!(visits.lock().is_empty(), "no callback runs after failed admission");
+                assert!(
+                    matches!(error, Error::MemoryBudgetExceeded { .. }),
+                    "typed admission refusal: {error:?}"
+                );
+                assert!(
+                    visits.lock().is_empty(),
+                    "no callback runs after failed admission"
+                );
             }
             _ => unreachable!(),
         }
@@ -1375,10 +1465,23 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
         assert_eq!(db.tx_mgr.published_read_snapshot(), root_before);
         assert_eq!(db.tx_mgr.commit_index_snapshot(), index_before);
         assert_eq!(format!("{:?}", db.table_meta(child)), schema_before);
-        assert_eq!(format!("{:?}", db.published_state_snapshot_for_test()), publication_before);
+        assert_eq!(
+            format!("{:?}", db.published_state_snapshot_for_test()),
+            publication_before
+        );
         assert_eq!(format!("{:?}", db.trigger_audit_log()), audits_before);
-        assert!(db.execute("SELECT id FROM mixed_children", &HashMap::new()).unwrap().rows().is_empty());
-        assert!(db.execute("SELECT id FROM mixed_parents", &HashMap::new()).unwrap().rows().is_empty());
+        assert!(
+            db.execute("SELECT id FROM mixed_children", &HashMap::new())
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
+        assert!(
+            db.execute("SELECT id FROM mixed_parents", &HashMap::new())
+                .unwrap()
+                .rows()
+                .is_empty()
+        );
         let refused_history = db.changes_since(before).unwrap();
         assert!(refused_history.rows.is_empty());
         assert!(refused_history.ddl.is_empty());
@@ -1391,15 +1494,31 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
     let outcome = apply_complete(&db, &changes, &received, &lineages, source_c)
         .expect("one complete Native overlay accepts data A / ALTER B / parent data C");
     drop(observation_scope);
-    let observed = observer.observation().expect("the actual received stage must attach its existing observer");
-    assert_eq!(observed.staged_table_names,
-        BTreeSet::from([parent.to_string(), child.to_string()]));
-    assert_eq!(*visits.lock(), vec![
-        (Value::Int64(1), Value::Text(text_uuid.clone()), Vec::new()),
-        (Value::Int64(2), Value::Uuid(later_uuid), vec![vec![Value::Int64(7)]]),
-    ], "one callback per source row, with its authored type and current prefix");
-    assert_eq!(db.execute("SELECT id, body FROM mixed_unrelated", &HashMap::new()).unwrap().rows(),
-        vec![vec![Value::Int64(99), Value::Text("preserved".to_string())]]);
+    let observed = observer
+        .observation()
+        .expect("the actual received stage must attach its existing observer");
+    assert_eq!(
+        observed.staged_table_names,
+        BTreeSet::from([parent.to_string(), child.to_string()])
+    );
+    assert_eq!(
+        *visits.lock(),
+        vec![
+            (Value::Int64(1), Value::Text(text_uuid.clone()), Vec::new()),
+            (
+                Value::Int64(2),
+                Value::Uuid(later_uuid),
+                vec![vec![Value::Int64(7)]]
+            ),
+        ],
+        "one callback per source row, with its authored type and current prefix"
+    );
+    assert_eq!(
+        db.execute("SELECT id, body FROM mixed_unrelated", &HashMap::new())
+            .unwrap()
+            .rows(),
+        vec![vec![Value::Int64(99), Value::Text("preserved".to_string())]]
+    );
     assert_eq!(outcome.applied_rows, 3);
     assert_eq!(outcome.skipped_rows, 0);
     assert!(outcome.conflicts.is_empty());
@@ -1568,7 +1687,11 @@ fn assert_native_memory_received_source_prefix(case: NativeMemoryReplayCase) {
     assert_eq!(second.current_lsn(), second_outcome.new_lsn);
     assert_visible(&second);
 
-    assert_eq!(db.memory_limit(), original_limit, "restore exactly the declared budget");
+    assert_eq!(
+        db.memory_limit(),
+        original_limit,
+        "restore exactly the declared budget"
+    );
     assert_eq!(second.memory_limit(), original_limit);
     second.close().unwrap();
     db.close().unwrap();
@@ -1588,7 +1711,8 @@ mod edge_column_owner_contract {
     fn sql(db: &Database, query: &str) -> Vec<Vec<Value>> {
         db.execute(query, &HashMap::new())
             .unwrap_or_else(|e| panic!("{query}: {e:?}"))
-            .rows().to_vec()
+            .rows()
+            .to_vec()
     }
 
     fn open(path: &std::path::Path) -> Database {
@@ -2110,8 +2234,7 @@ mod edge_column_owner_contract {
                     "previous_body"
                 };
                 let actual = {
-                    let fixture_answer_65 = handle
-                    .execute_in_tx(
+                    let fixture_answer_65 = handle.execute_in_tx(
                         context.tx,
                         &format!("SELECT {name} FROM prefix_notes WHERE id = $id"),
                         &HashMap::from([("id".into(), id.clone())]),

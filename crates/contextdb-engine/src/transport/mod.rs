@@ -271,8 +271,9 @@ impl NativeTerminal {
                     ),
                 ),
             ),
-            Self::Refused(allocator @ NativeRefusal::AllocatorFailed { .. }) =>
-                contextdb_core::Error::NativeEngineOther(allocator),
+            Self::Refused(allocator @ NativeRefusal::AllocatorFailed { .. }) => {
+                contextdb_core::Error::NativeEngineOther(allocator)
+            }
             Self::Refused(NativeRefusal::Other(_)) => {
                 contextdb_core::Error::SyncError(terminal_class::ALLOCATION.into())
             }
@@ -463,7 +464,9 @@ pub(crate) fn encode_terminal(
             WireRefusalRef::ReadFailure(ReadFailureRef::Borrowed(failure))
         }
         NativeTerminal::Cancelled => WireRefusalRef::ReadCancelled,
-        NativeTerminal::Refused(NativeRefusal::Other(_) | NativeRefusal::AllocatorFailed { .. })
+        NativeTerminal::Refused(
+            NativeRefusal::Other(_) | NativeRefusal::AllocatorFailed { .. },
+        )
         | NativeTerminal::Kernel(_)
         | NativeTerminal::Class(_) => return None,
     };
@@ -546,7 +549,9 @@ pub(crate) fn terminal_class_of(terminal: &NativeTerminal) -> &'static str {
     use contextdb_core::read_memory::NativeRefusal;
     match terminal {
         NativeTerminal::Class(class) => class,
-        NativeTerminal::Refused(NativeRefusal::Other(_) | NativeRefusal::AllocatorFailed { .. }) => terminal_class::ALLOCATION,
+        NativeTerminal::Refused(
+            NativeRefusal::Other(_) | NativeRefusal::AllocatorFailed { .. },
+        ) => terminal_class::ALLOCATION,
         _ => terminal_class::FAULT,
     }
 }
@@ -667,7 +672,10 @@ pub(crate) enum ReadBoundResponder {
     Native(NativeStreamResponder),
 }
 impl ReadBoundResponder {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_finish(
         self,
         body: BoundedWireBody,
@@ -860,7 +868,10 @@ impl WireRefusal {
 /// Admit `bytes` on `owner` before the allocation it pays for. A native owner
 /// refuses with a heap-free `NativeRefusal` (carried as a native terminal); a
 /// Legacy owner keeps its ordinary refusal.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn admit_on(
     owner: &ReadMemoryOwner,
     bytes: usize,
@@ -889,7 +900,10 @@ pub(crate) fn allocation_failed(owner: &ReadMemoryOwner, reason: &'static str) -
 
 /// Encode `value` into storage admitted on `owner` before it is allocated: a
 /// counting pass sizes it exactly, then it is written into that storage.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_admitted<T: serde::Serialize>(
     owner: &ReadMemoryOwner,
     value: &T,
@@ -940,7 +954,10 @@ pub(crate) struct AdmittedWireVec {
 }
 
 impl AdmittedWireVec {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn allocate(length: usize, reader: ReadMemoryOwner) -> WireResult<Self> {
         let layout =
             std::alloc::Layout::array::<u8>(length).map_err(|_| native_wire::allocation_error())?;
@@ -974,7 +991,10 @@ impl AdmittedWireVec {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_from(bytes: &[u8], reader: ReadMemoryOwner) -> WireResult<Self> {
         let mut copy = Self::allocate(bytes.len(), reader)?;
         copy.bytes.copy_from_slice(bytes);
@@ -997,7 +1017,10 @@ impl AdmittedWireVec {
     /// Adopt bytes whose exact allocation `reader` already paid for, keeping
     /// the same invoice. A foreign or inexact invoice refuses without reserving;
     /// the refused bytes free before their invoice.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn from_prepaid(
         bytes: Vec<u8>,
         credit: contextdb_core::read_memory::ReadCredit,
@@ -1035,7 +1058,10 @@ impl AdmittedWireVec {
         self.bytes.as_ptr()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn from_legacy(bytes: Vec<u8>, reader: ReadMemoryOwner) -> WireResult<Self> {
         let capacity = bytes.capacity();
         let credit = contextdb_core::read_memory::ReadCredit::try_new_owned(
@@ -1075,7 +1101,10 @@ fn materialize_body(mut body: BoundedWireBody) -> WireFuture<'static, AdmittedWi
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn wrap_legacy_reply(bytes: Vec<u8>, reader: ReadMemoryOwner) -> WireResult<BoundedWireReply> {
     let admitted = AdmittedWireVec::from_legacy(bytes, reader.clone())?;
     let length = admitted.bytes.len() as u64;
@@ -1175,7 +1204,10 @@ pub trait ClientTransport: Send + Sync {
     /// The default cannot prove opaque adapter controls were admitted, so it
     /// deliberately returns the genuine legacy branch.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn request_stream_admitted<'a>(
         &'a self,
         subject: &'a str,
@@ -1203,7 +1235,10 @@ pub trait ClientTransport: Send + Sync {
     /// Check whether a request with a known single-message response can be
     /// retried safely if no valid reply arrives. This is a borrowed preflight:
     /// adapters must not send bytes from this method.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn ensure_single_reply_retry_safe(&self, _request_bytes: &[u8]) -> TransportResult<()> {
         Ok(())
     }
@@ -1239,7 +1274,10 @@ struct NativeStopState {
 }
 impl NativeStop {
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_new(flag: Arc<AtomicBool>, standing: &ReadMemoryOwner) -> WireResult<Self> {
         let invoice = native_wire::wire_credit(
             standing.clone(),
@@ -1304,7 +1342,10 @@ impl NativeStop {
 
     /// The registration constructs its Waker from the admitted native cell;
     /// an opaque host Waker/StdWeak budget bridge cannot enter this slot.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_register_wake<T>(
         &self,
         wake: contextdb_core::read_memory::ReadShared<T>,
@@ -1381,7 +1422,10 @@ pub trait ServerTransport: Send + Sync {
     /// Native requires a concrete transport producer; default activation never
     /// silently executes Legacy. Empty/Bound retain their existing delegation.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn serve_native_installation<'a>(
         &'a self,
         legacy: Vec<HandlerRegistration>,
@@ -1420,7 +1464,10 @@ pub trait ServerTransport: Send + Sync {
     /// Opaque installations have exact pre-admitted slots. An unadapted
     /// transport keeps its genuine legacy serving behavior.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn serve_read_bound_installation<'a>(
         &'a self,
         legacy: Vec<HandlerRegistration>,
@@ -1587,7 +1634,10 @@ impl BoundedWireBody {
         }
     }
     /// A Legacy reply's complete Vec, admitted on the selected reader.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn from_legacy_reply(bytes: Vec<u8>, reader: ReadMemoryOwner) -> WireResult<Self> {
         Ok(Self::from_native_reply(AdmittedWireVec::from_legacy(
             bytes, reader,

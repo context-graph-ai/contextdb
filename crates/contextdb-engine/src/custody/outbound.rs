@@ -4,7 +4,10 @@ use crate::{Database, database::OutboundSyncUnit, sync_types::ChangeSet};
 use contextdb_core::{Lsn, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn units(
     db: &Database,
     changes: ChangeSet,
@@ -12,7 +15,7 @@ pub(crate) fn units(
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<OutboundSyncUnit>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut manifests = Vec::new();
     let mut seen = BTreeSet::new();

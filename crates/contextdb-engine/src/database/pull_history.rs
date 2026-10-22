@@ -1,6 +1,6 @@
 //! One protected resident history view and admitted per-occurrence copies.
 use super::*;
-use contextdb_core::read_memory::{ReadCredit};
+use contextdb_core::read_memory::ReadCredit;
 
 /// The registration protects superseded occurrences as well as the visible
 /// version. Its slot is admitted before the registry can allocate it.
@@ -79,7 +79,10 @@ impl Database {
         Ok(result)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn capture_resident_pull_history(
         &self,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -156,7 +159,10 @@ impl<T: Clone> ResidentHistoryCursor<T> {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next(&mut self) -> Result<Option<(T, ReadCredit)>> {
         let Some((last_lsn, last_ordinal)) = self.end else {
             return Ok(None);

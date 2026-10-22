@@ -27,7 +27,10 @@ pub(crate) struct NativePacketNamespace {
     cursor: Option<NativeBuffer>,
 }
 impl NativePacketNamespace {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn from_buffers(
         tenant: NativeBuffer,
         hub: NativeBuffer,
@@ -51,7 +54,10 @@ impl NativePacketNamespace {
             cursor: None,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn with_cursor(
         mut self,
         cursor: Option<NativeBuffer>,
@@ -68,7 +74,10 @@ impl NativePacketNamespace {
         self.cursor = cursor;
         Ok(self)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn text(&self) -> Selected<(&str, &str, &str)> {
         Ok((self.tenant.as_str(), self.hub.text()?, self.edge.text()?))
     }
@@ -93,12 +102,18 @@ pub(crate) struct NativeBorrowedOutcomeBatch {
     context: NativeReadOpenContext,
 }
 impl NativeBorrowedOutcomeBatch {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn checkpoint(&self) -> Selected<()> {
         same_request(&self.operation, &self.context)
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn same_request(operation: &NativeReadRequest, context: &NativeReadOpenContext) -> Selected<()> {
     if !operation
         .owner()
@@ -112,7 +127,10 @@ struct Views<'window> {
     guards: NativeSelectionHold<NativeCustodyView<'window>>,
 }
 impl<'window> Views<'window> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pin(selection: &'window NativeCustodySelection, owner: &ReadMemoryOwner) -> Selected<Self> {
         if !selection.is_funded_by(owner) {
             return Err(Failure::OwnerMismatch);
@@ -255,7 +273,10 @@ impl std::io::Write for NamedCounter {
         Ok(())
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn named_bytes(owner: &ReadMemoryOwner, packet: &PacketView<'_, '_>) -> Selected<NativeBuffer> {
     let mut count = NamedCounter(0);
     packet
@@ -271,7 +292,10 @@ fn named_bytes(owner: &ReadMemoryOwner, packet: &PacketView<'_, '_>) -> Selected
     }
     Ok(bytes)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn encode_packet(
     operation: &NativeReadRequest,
     context: &NativeReadOpenContext,
@@ -375,7 +399,10 @@ fn encode_packet(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn coherent(selection: &NativeOutcomeSelection) -> Selected<()> {
     let mut descriptor = None;
     let mut check = |records: &NativeCustodySelection| -> Selected<()> {
@@ -436,7 +463,10 @@ pub(crate) struct OutcomeLengths {
 /// views. The diagnostic body, signed core and lookup source are counted and
 /// never built; the certificate is the one buffer built here, because the
 /// signature's encoding depends on its bytes, and it is freed before return.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn measure_packet(
     owner: &ReadMemoryOwner,
     identity: &FabricIdentity,
@@ -520,7 +550,10 @@ impl PageCut<'_> {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn encode_selection(
     selection: &NativeOutcomeSelection,
     operation: &NativeReadRequest,
@@ -683,7 +716,10 @@ fn encode_selection(
 /// Private real caller of the native selection and fixed same-key signer.
 /// The caller owns admitted request text; no child owner or legacy fetch is made.
 #[allow(clippy::too_many_arguments)] // Original capabilities and the page bound stay explicit.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_custody_outcomes(
     db: &Database,
     identity: &FabricIdentity,

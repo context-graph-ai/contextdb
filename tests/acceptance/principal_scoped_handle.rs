@@ -306,7 +306,8 @@ fn t9_04_principal_a_cannot_write_to_b_row() {
         .execute("UPDATE memos SET body = $body WHERE id = $id", &p)
         .unwrap();
     assert_eq!(
-        update.rows_affected(), 0,
+        update.rows_affected(),
+        0,
         "UPDATE predicate targeting an ACL-denied row must behave as no visible match"
     );
     let mut flip = HashMap::new();
@@ -325,7 +326,8 @@ fn t9_04_principal_a_cannot_write_to_b_row() {
     );
     let delete = h.execute("DELETE FROM memos WHERE id = $id", &p).unwrap();
     assert_eq!(
-        delete.rows_affected(), 0,
+        delete.rows_affected(),
+        0,
         "DELETE predicate targeting an ACL-denied row must behave as no visible match"
     );
 

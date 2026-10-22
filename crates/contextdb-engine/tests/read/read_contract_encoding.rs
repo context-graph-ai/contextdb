@@ -8,7 +8,9 @@ use contextdb_engine::read_contract::{
     CanonicalCascadeReport, CanonicalIndexCandidate, CanonicalQueryResult, CanonicalQueryTrace,
     CanonicalVectorPartitionHnswDisclosure, CanonicalVectorSearchDisclosure, ReadEncodingError,
     cursor_page_encoded_size, decode_cursor_page, decode_metadata_page, decode_query_result,
-    encode_cursor_page as encode_cursor_page_native, encode_metadata_page as encode_metadata_page_native, encode_query_result as encode_query_result_native, metadata_page_encoded_size,
+    encode_cursor_page as encode_cursor_page_native,
+    encode_metadata_page as encode_metadata_page_native,
+    encode_query_result as encode_query_result_native, metadata_page_encoded_size,
     query_result_encoded_size,
 };
 use contextdb_engine::{
@@ -21,20 +23,24 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-
 // Standalone codec inputs are application fixtures with the same explicit
 // unbounded ceiling already declared by QueryFixture and cursor_fixture.
 pub(super) fn fixture_encoding_owner() -> contextdb_core::read_memory::ReadMemoryOwner {
     contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
-        .expect("codec fixture root").child().expect("codec fixture child")
+        .expect("codec fixture root")
+        .child()
+        .expect("codec fixture child")
 }
 pub(super) fn encode_query_result(result: &QueryResult) -> Result<Vec<u8>, ReadEncodingError> {
     encode_query_result_native(result, result.encoding_owner_for_test())
         .map(|bytes| bytes.as_slice().to_vec())
 }
 fn encode_cursor_page(page: &CursorPage) -> Result<Vec<u8>, ReadEncodingError> {
-    encode_cursor_page_native(page, page.encoding_owner().expect("funded actual page fixture"))
-        .map(|bytes| bytes.as_slice().to_vec())
+    encode_cursor_page_native(
+        page,
+        page.encoding_owner().expect("funded actual page fixture"),
+    )
+    .map(|bytes| bytes.as_slice().to_vec())
 }
 fn encode_metadata_page(page: &MetadataPage) -> Result<Vec<u8>, ReadEncodingError> {
     encode_metadata_page_native(page, fixture_encoding_owner())
@@ -42,22 +48,45 @@ fn encode_metadata_page(page: &MetadataPage) -> Result<Vec<u8>, ReadEncodingErro
 }
 
 struct QueryFixture {
-    columns: Vec<String>, rows: Vec<Vec<Value>>, rows_affected: u64,
-    trace: QueryTrace, cascade: Option<CascadeReport>,
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    rows_affected: u64,
+    trace: QueryTrace,
+    cascade: Option<CascadeReport>,
 }
 impl QueryFixture {
-    fn empty() -> Self { Self { columns: vec![], rows: vec![], rows_affected: 0,
-        trace: QueryTrace::scan(), cascade: None } }
+    fn empty() -> Self {
+        Self {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: 0,
+            trace: QueryTrace::scan(),
+            cascade: None,
+        }
+    }
     fn finish(self) -> QueryResult {
-        let owner = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
-            .expect("codec fixture root").child().expect("codec fixture child");
-        QueryResult::from_owned_parts_for_test(owner, self.columns, self.rows,
-            self.rows_affected, self.trace, self.cascade).expect("funded actual result fixture")
+        let owner =
+            contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
+                .expect("codec fixture root")
+                .child()
+                .expect("codec fixture child");
+        QueryResult::from_owned_parts_for_test(
+            owner,
+            self.columns,
+            self.rows,
+            self.rows_affected,
+            self.trace,
+            self.cascade,
+        )
+        .expect("funded actual result fixture")
     }
 }
 fn cursor_fixture(columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool) -> CursorPage {
-    let owner = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
-        .expect("codec fixture root").child().expect("codec fixture child");
+    let owner =
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(u64::MAX)
+            .expect("codec fixture root")
+            .child()
+            .expect("codec fixture child");
     CursorPage::from_owned_parts_for_test(owner, columns, rows, has_more)
         .expect("funded actual page fixture")
 }
@@ -139,8 +168,12 @@ fn sparse_parts() -> QueryFixture {
     }
 }
 
-fn result_with_every_value_kind() -> QueryResult { rich_parts().finish() }
-fn materially_different_result() -> QueryResult { sparse_parts().finish() }
+fn result_with_every_value_kind() -> QueryResult {
+    rich_parts().finish()
+}
+fn materially_different_result() -> QueryResult {
+    sparse_parts().finish()
+}
 
 fn expected_result_with_every_value_kind() -> CanonicalQueryResult {
     CanonicalQueryResult {

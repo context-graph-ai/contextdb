@@ -127,7 +127,12 @@ fn mixed_file_reads_point_load_exact_vectors_and_keep_their_snapshot_after_recyc
         )
         .expect("the saved indexed route remains complete when its graph working set fits");
     assert_eq!(
-        indexed.trace().vector_search.as_ref().unwrap().resolved_mode,
+        indexed
+            .trace()
+            .vector_search
+            .as_ref()
+            .unwrap()
+            .resolved_mode,
         VectorSearchMode::Indexed
     );
     assert_eq!(indexed.rows(), expected);

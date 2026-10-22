@@ -14,7 +14,10 @@ pub(crate) enum PurgeReportShape {
 
 // Every authenticated source copy of the selected key belongs
 // to its purge, including equivalent and refused submissions with local lives.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn lineage_roots(
     db: &Database,
     table: &str,
@@ -23,7 +26,7 @@ pub(crate) fn lineage_roots(
     incumbent: &str,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<String>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -49,62 +52,99 @@ pub(crate) fn lineage_roots(
     Ok(roots.into_iter().collect())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn metadata_keys(
     db: &Database,
     selected: &[RowRef],
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<String>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     metadata_keys_matching(db, selected, None, read_memory)
 }
 
 /// Retired occurrences cannot erase custody for a new same-key incarnation.
 /// Immutable creator evidence or an exact materialized local life must match.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn metadata_keys_for_retired_lives(
     db: &Database,
     selected: &[(RowRef, u64, u64, String)],
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<String>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let _references_credit = contextdb_core::read_memory::ReadCredit::try_new(
         read_memory.clone(),
-        selected.iter().map(|(reference, _, _, _)| {
-            std::mem::size_of::<RowRef>().saturating_add(reference.table.len())
-                .saturating_add(reference.key.held_bytes()).saturating_add(32)
-        }).sum(),
-        "writer_source", "retired_custody_references",
+        selected
+            .iter()
+            .map(|(reference, _, _, _)| {
+                std::mem::size_of::<RowRef>()
+                    .saturating_add(reference.table.len())
+                    .saturating_add(reference.key.held_bytes())
+                    .saturating_add(32)
+            })
+            .sum(),
+        "writer_source",
+        "retired_custody_references",
         "Raise MEMORY_LIMIT to prepare selected retired custody references.",
     )?;
-    let references = selected.iter().map(|(reference, _, _, _)| reference.clone()).collect::<Vec<_>>();
+    let references = selected
+        .iter()
+        .map(|(reference, _, _, _)| reference.clone())
+        .collect::<Vec<_>>();
     metadata_keys_matching(db, &references, Some(selected), read_memory)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn metadata_keys_matching(
     db: &Database,
     selected: &[RowRef],
     lives: Option<&[(RowRef, u64, u64, String)]>,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<String>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
     let records = custody_hold.retain(db.custody_rows(selected, read_memory.clone())?)?;
-    let matches_anchor = |anchor: &LocalLifeAnchor| lives.is_some_and(|lives|
-        lives.iter().any(|(reference, generation, row, _)|
-            anchor.original_table == reference.table && anchor.table_generation == *generation
-                && anchor.local_row_id == *row));
-    let matches_manifest = |manifest: &ManifestRecord| lives.map_or_else(
-        || manifest.rows.iter().any(|row| selected.contains(&row.reference)),
-        |lives| matches_anchor(&manifest.root_life)
-            || manifest.member_lives.iter().any(&matches_anchor)
-            || manifest.rows.iter().any(|row| lives.iter().any(|(reference, generation, _, root)|
-                row.reference == *reference && row.creator.table_generation == *generation
-                    && row.creator.lineage_root == *root)));
+    let matches_anchor = |anchor: &LocalLifeAnchor| {
+        lives.is_some_and(|lives| {
+            lives.iter().any(|(reference, generation, row, _)| {
+                anchor.original_table == reference.table
+                    && anchor.table_generation == *generation
+                    && anchor.local_row_id == *row
+            })
+        })
+    };
+    let matches_manifest = |manifest: &ManifestRecord| {
+        lives.map_or_else(
+            || {
+                manifest
+                    .rows
+                    .iter()
+                    .any(|row| selected.contains(&row.reference))
+            },
+            |lives| {
+                matches_anchor(&manifest.root_life)
+                    || manifest.member_lives.iter().any(&matches_anchor)
+                    || manifest.rows.iter().any(|row| {
+                        lives.iter().any(|(reference, generation, _, root)| {
+                            row.reference == *reference
+                                && row.creator.table_generation == *generation
+                                && row.creator.lineage_root == *root
+                        })
+                    })
+            },
+        )
+    };
 
     let mut submissions = BTreeSet::new();
     for record in &records {
@@ -112,8 +152,12 @@ fn metadata_keys_matching(
             Record::Manifest(m) if matches_manifest(m) => {
                 submissions.insert(m.id);
             }
-            Record::MaterializedOwner(o) if lives.map_or_else(
-                || selected.contains(&o.incumbent_reference), |_| matches_anchor(&o.incumbent)) => {
+            Record::MaterializedOwner(o)
+                if lives.map_or_else(
+                    || selected.contains(&o.incumbent_reference),
+                    |_| matches_anchor(&o.incumbent),
+                ) =>
+            {
                 submissions.insert(o.submission);
             }
             Record::Terminal { record: t, .. } if lives.is_none() && selected.contains(&t.root) => {

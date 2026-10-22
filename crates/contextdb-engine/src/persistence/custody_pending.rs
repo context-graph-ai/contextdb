@@ -45,7 +45,10 @@ fn damage<T>(_: T) -> Error {
 }
 
 /// Create the empty tables alongside a newly complete group index.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn create(write: &redb::WriteTransaction) -> Result<()> {
     for result in [
         write.delete_table(ROOT_KEYS).map(|_| ()),
@@ -73,7 +76,10 @@ pub(super) fn create(write: &redb::WriteTransaction) -> Result<()> {
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn index_complete(write: &redb::WriteTransaction) -> Result<bool> {
     if write
         .table_root_fingerprint(custody_groups::GROUP_TABLE)
@@ -92,7 +98,10 @@ fn index_complete(write: &redb::WriteTransaction) -> Result<bool> {
 }
 
 /// Parse the trailing 32-hex-digit submission of an edge outcome key.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn outcome_submission(key: &str) -> Result<[u8; 16]> {
     let hex = key
         .rsplit('.')
@@ -109,7 +118,10 @@ fn outcome_submission(key: &str) -> Result<[u8; 16]> {
 }
 
 /// Parse `N` bytes of lowercase hex from the start of `hex`.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_hex<const N: usize>(hex: &str) -> Result<[u8; N]> {
     let hex = hex
         .get(..2 * N)
@@ -150,7 +162,10 @@ impl DigestHead {
 }
 
 /// Visit the member keys of the group whose head is `head`.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn visit_members(
     groups: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
     head: &[u8],
@@ -170,7 +185,10 @@ fn visit_members(
 }
 
 /// Submissions whose edge terminals depend on the evidence record `key`.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn dependent_submissions(
     groups: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
     key: &str,
@@ -219,7 +237,10 @@ fn dependent_submissions(
 
 /// Maintain pending membership for one committed custody CONFIG entry. When
 /// `defer` is set the caller recomputes every submission once at the end.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn maintain(
     write: &redb::WriteTransaction,
     key: &str,
@@ -328,7 +349,10 @@ const RECHECK_BATCH: usize = 64;
 
 /// Recompute every current submission: a destination change, or the end of a
 /// rebuild. Proportional to current local roots, and only at those events.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn recompute_all(write: &redb::WriteTransaction, owner: &Owner) -> Result<()> {
     use redb::ReadableTable;
     if !index_complete(write)? {
@@ -378,7 +402,10 @@ pub(super) fn recompute_all(write: &redb::WriteTransaction, owner: &Owner) -> Re
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn recompute(write: &redb::WriteTransaction, which: &[[u8; 16]], owner: &Owner) -> Result<()> {
     use redb::ReadableTable;
     if which.is_empty() {
@@ -447,7 +474,10 @@ fn same_namespace(a: &Namespace<'_>, b: &Namespace<'_>) -> bool {
 }
 
 /// A verification fault: damaged evidence (`Ok(false)`) or a real refusal.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn verdict(result: crate::custody::native_selection::Selected<()>) -> Result<bool> {
     use crate::custody::native_selection::Failure;
     match result {
@@ -457,7 +487,8 @@ fn verdict(result: crate::custody::native_selection::Selected<()>) -> Result<boo
         Err(Failure::Unqualified(error)) => Err(error),
         Err(Failure::ColdUnqualified(error)) => Err(Error::Other((format!("{error:?}")).into())),
         Err(Failure::OwnerMismatch) => Err(Error::Other(
-            "custody pending verification owner mismatch".into())),
+            "custody pending verification owner mismatch".into(),
+        )),
     }
 }
 
@@ -465,7 +496,10 @@ fn verdict(result: crate::custody::native_selection::Selected<()>) -> Result<boo
 /// its complete evidence at this view: a valid signature, the matching
 /// diagnostic block, and an object admission whose certificate is present,
 /// valid and agrees with it. The same checks commit validation applies.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn terminal_verified(
     groups: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
     config: &impl redb::ReadableTable<&'static str, &'static [u8]>,
@@ -585,7 +619,10 @@ fn terminal_verified(
 /// registered destination exists in its submission group. A terminal there
 /// that fails verification records the submission as damaged instead of
 /// excluding it.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn set_pending(
     groups: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
     config: &impl redb::ReadableTable<&'static str, &'static [u8]>,

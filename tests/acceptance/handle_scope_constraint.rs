@@ -794,7 +794,8 @@ fn t6_09_edge_cannot_flip_label_to_server() {
     p.insert("id".into(), Value::Uuid(Uuid::from_u128(2)));
     let delete = edge.execute("DELETE FROM rows WHERE id = $id", &p).unwrap();
     assert_eq!(
-        delete.rows_affected(), 0,
+        delete.rows_affected(),
+        0,
         "DELETE predicate targeting a server-labelled hidden row must behave as no visible match"
     );
     drop(edge);

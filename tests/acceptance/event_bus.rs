@@ -941,7 +941,11 @@ fn t5_11_route_scoped_to_context_excludes_other_contexts() {
         let result = admin
             .execute("SELECT id FROM invs WHERE id = $id", &p)
             .unwrap();
-        assert_eq!(result.rows().len(), 0, "denied scoped write must not persist");
+        assert_eq!(
+            result.rows().len(),
+            0,
+            "denied scoped write must not persist"
+        );
     }
 
     let live_admin_log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));

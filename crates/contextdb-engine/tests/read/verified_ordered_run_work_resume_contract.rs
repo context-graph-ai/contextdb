@@ -778,7 +778,8 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
                                 .expect("admit the fixture page copy reader"),
                         )
                         .expect("share the admitted first page")
-                        .rows().to_vec()
+                        .rows()
+                        .to_vec()
                 })
                 .collect::<Vec<_>>();
             let mut more = cursors
@@ -794,7 +795,9 @@ fn interleaved_cursors_continue_correctly_when_their_windows_are_evicted() {
                         .cursor
                         .fetch(Some(page))
                         .expect("a cursor continues after its window is evicted");
-                    let terminal = fetched.into_public_page_for_test().expect("publish the fetched fixture page");
+                    let terminal = fetched
+                        .into_public_page_for_test()
+                        .expect("publish the fetched fixture page");
                     collected[index].extend(terminal.rows().iter().cloned());
                     more[index] = terminal.has_more();
                 }

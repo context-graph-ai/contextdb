@@ -19,7 +19,10 @@ pub enum ReadPrincipal {
 
 /// Apply the fixed same-operating-system-user authorization rule after the
 /// carrier has obtained credentials.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn authenticate_peer(
     owner: LocalUserIdentity,
     observed: Result<LocalUserIdentity, LocalTransportError>,
@@ -35,7 +38,10 @@ pub fn authenticate_peer(
 }
 
 #[cfg(target_os = "linux")]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn peer_user_from_stream(
     stream: &std::os::unix::net::UnixStream,
 ) -> Result<LocalUserIdentity, LocalTransportError> {
@@ -70,7 +76,10 @@ pub fn peer_user_from_stream<T>(_: &T) -> Result<LocalUserIdentity, LocalTranspo
 /// Compose the carrier-provided Unix peer credential with the protocol
 /// handshake before a request can enter admission.
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn authenticate_stream_handshake(
     stream: &std::os::unix::net::UnixStream,
     expected: &LocalHandshake,
@@ -110,7 +119,10 @@ pub struct AdmittedReader {
 /// a byte from it, so it can neither hold the handshake deadline open nor make
 /// the channel spend a frame reader on it.
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn authenticate_framed_stream_handshake<'a>(
     stream: &'a mut std::os::unix::net::UnixStream,
     expected: &'a LocalHandshake,
@@ -154,25 +166,44 @@ pub fn authenticate_framed_stream_handshake<'a>(
 }
 
 #[cfg(unix)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn authenticate_framed_stream_handshake_funded<'a>(
-    stream: &'a mut std::os::unix::net::UnixStream, expected: &'a LocalHandshake,
-    clock: &'a dyn DeadlineClock, deadline_ms: u64,
+    stream: &'a mut std::os::unix::net::UnixStream,
+    expected: &'a LocalHandshake,
+    clock: &'a dyn DeadlineClock,
+    deadline_ms: u64,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> DeadlineOperationWait<'a, AdmittedReader> {
-    super::deadline_operation_funded(clock, super::DeadlineStage::Handshake, deadline_ms, owner, || {
-        let peer = peer_user_from_stream(stream).and_then(|peer_user| {
-            authenticate_peer(expected.owner_user, Ok(peer_user)).map(|principal| (peer_user, principal))
-        });
-        let reader = peer.and_then(|peer| frame_readiness(stream).map(|reader| (peer, reader)));
-        async move {
-            let ((peer_user, principal), reader) = reader?;
-            let bytes = reader.await.map_err(|_| super::invalid_channel_data())?;
-            let presented = super::decode_handshake_exact(&bytes).map_err(|error| {
-                if matches!(error, LocalTransportError::Refusal(_)) { error } else { super::invalid_channel_data() }
-            })?;
-            validate_handshake(expected, &presented, peer_user)?;
-            Ok(AdmittedReader { principal, declared: presented.declared })
-        }
-    })
+    super::deadline_operation_funded(
+        clock,
+        super::DeadlineStage::Handshake,
+        deadline_ms,
+        owner,
+        || {
+            let peer = peer_user_from_stream(stream).and_then(|peer_user| {
+                authenticate_peer(expected.owner_user, Ok(peer_user))
+                    .map(|principal| (peer_user, principal))
+            });
+            let reader = peer.and_then(|peer| frame_readiness(stream).map(|reader| (peer, reader)));
+            async move {
+                let ((peer_user, principal), reader) = reader?;
+                let bytes = reader.await.map_err(|_| super::invalid_channel_data())?;
+                let presented = super::decode_handshake_exact(&bytes).map_err(|error| {
+                    if matches!(error, LocalTransportError::Refusal(_)) {
+                        error
+                    } else {
+                        super::invalid_channel_data()
+                    }
+                })?;
+                validate_handshake(expected, &presented, peer_user)?;
+                Ok(AdmittedReader {
+                    principal,
+                    declared: presented.declared,
+                })
+            }
+        },
+    )
 }

@@ -2,10 +2,11 @@
 //! Crash-recoverable, physical-store publication fencing for authoritative erasure.
 
 use super::{
-    CoordinationWatch, CoordinationWatchFailure, RangeLockMode, RangeLockOutcome, announce_companion_release,
-    block_on_companion_range_lock, create_reader_breadcrumb_directory, reader_breadcrumb_root,
-    reader_snapshot_directory, release_companion_range_lock, take_companion_range_lock_shared,
-    validate_reader_breadcrumb_directory, validate_reader_runtime_directory,
+    CoordinationWatch, CoordinationWatchFailure, RangeLockMode, RangeLockOutcome,
+    announce_companion_release, block_on_companion_range_lock, create_reader_breadcrumb_directory,
+    reader_breadcrumb_root, reader_snapshot_directory, release_companion_range_lock,
+    take_companion_range_lock_shared, validate_reader_breadcrumb_directory,
+    validate_reader_runtime_directory,
 };
 use contextdb_core::read_contract::DatabaseIdentity;
 use contextdb_core::{Error, Lsn, Result};
@@ -153,7 +154,10 @@ pub(crate) struct PreparedPurgePublication {
 }
 
 impl AcquiredPurgePublication {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare(
         self,
         frontier: Lsn,
@@ -174,14 +178,20 @@ impl PreparedPurgePublication {
     pub(crate) fn marker(&self) -> Option<DurableMarker> {
         self.fences.as_ref().map(PreparedPublicationSet::marker)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit(self) -> Result<()> {
         if let Some(fences) = self.fences {
             fences.commit()?;
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn abort(self) -> Result<()> {
         if let Some(fences) = self.fences {
             fences.abort()?;
@@ -195,7 +205,10 @@ pub(crate) struct FenceSet(pub(crate) Vec<Fence>);
 pub(crate) struct PreparedPublicationSet(Vec<PreparedPublication>);
 
 impl FenceSet {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare(
         self,
         frontier: Lsn,
@@ -231,7 +244,10 @@ impl PreparedPublicationSet {
             .marker()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit(self) -> Result<()> {
         for publication in self.0 {
             let path = publication.fence.path.display().to_string();
@@ -246,7 +262,10 @@ impl PreparedPublicationSet {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn abort(self) -> Result<()> {
         for publication in self.0 {
             let path = publication.fence.path.display().to_string();
@@ -1118,7 +1137,10 @@ pub(crate) fn install_before_admission_sleep_hook_for_test(hook: PublicationWait
 }
 
 impl Fence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn acquire_reader_admission(
         &self,
         budget: Option<&crate::executor::ReadPublicationBudget>,
@@ -1229,23 +1251,28 @@ impl Fence {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn acquire_for_prepare(mut self) -> Result<Self> {
         block_on_companion_range_lock(
             &self.file,
             PUBLICATION_ADMISSION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         )
-        .map_err(|error| Error::Other((format!("acquire purge publication admission: {error}")).into()))?;
+        .map_err(|error| {
+            Error::Other((format!("acquire purge publication admission: {error}")).into())
+        })?;
         if let Err(error) = block_on_companion_range_lock(
             &self.file,
             PUBLICATION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         ) {
             release_exclusive_admission(&self.file);
-            return Err(Error::Other((format!(
-                "acquire purge publication fence: {error}"
-            )).into()));
+            return Err(Error::Other(
+                (format!("acquire purge publication fence: {error}")).into(),
+            ));
         }
         self.writer_acquired = true;
         Ok(self)
@@ -1259,23 +1286,28 @@ impl Fence {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn is_pending(&mut self) -> Result<bool> {
         block_on_companion_range_lock(
             &self.file,
             PUBLICATION_ADMISSION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         )
-        .map_err(|error| Error::Other((format!("acquire purge recovery admission: {error}")).into()))?;
+        .map_err(|error| {
+            Error::Other((format!("acquire purge recovery admission: {error}")).into())
+        })?;
         if let Err(error) = block_on_companion_range_lock(
             &self.file,
             PUBLICATION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         ) {
             release_exclusive_admission(&self.file);
-            return Err(Error::Other((format!(
-                "acquire purge recovery probe: {error}"
-            )).into()));
+            return Err(Error::Other(
+                (format!("acquire purge recovery probe: {error}")).into(),
+            ));
         }
         let pending = read_latest(&mut self.file)
             .map(|state| matches!(state, State::Pending(_)))
@@ -1295,7 +1327,10 @@ impl Fence {
         self.publish_with_budget(snapshot_lsn, tables, value, None)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn publish_with_budget<T>(
         &mut self,
         snapshot_lsn: Lsn,
@@ -1373,7 +1408,10 @@ impl Fence {
         verdict
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare(
         self,
         frontier: Lsn,
@@ -1382,7 +1420,10 @@ impl Fence {
         self.prepare_with_token(frontier, tables, uuid::Uuid::new_v4().into_bytes())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_with_token(
         mut self,
         frontier: Lsn,
@@ -1393,30 +1434,32 @@ impl Fence {
             self = self.acquire_for_prepare()?;
         }
         let result = (|| {
-            let prior = match read_latest(&mut self.file)
-                .map_err(|error| Error::Other((format!("read purge publication fence: {error}")).into()))?
-            {
+            let prior = match read_latest(&mut self.file).map_err(|error| {
+                Error::Other((format!("read purge publication fence: {error}")).into())
+            })? {
                 State::Clear(clear) => clear,
                 State::Pending(_) => {
-                    return Err(Error::Other((
-                        "authoritative purge publication is awaiting crash recovery".to_owned()).into()));
+                    return Err(Error::Other(
+                        ("authoritative purge publication is awaiting crash recovery".to_owned())
+                            .into(),
+                    ));
                 }
             };
-            let generation = prior
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| Error::Other(("purge publication generation overflow".to_owned()).into()))?;
-            let sequence = prior
-                .sequence
-                .checked_add(1)
-                .ok_or_else(|| Error::Other(("purge publication sequence overflow".to_owned()).into()))?;
+            let generation = prior.generation.checked_add(1).ok_or_else(|| {
+                Error::Other(("purge publication generation overflow".to_owned()).into())
+            })?;
+            let sequence = prior.sequence.checked_add(1).ok_or_else(|| {
+                Error::Other(("purge publication sequence overflow".to_owned()).into())
+            })?;
             let mut identities = BTreeSet::from([wildcard_identity()]);
             identities.extend(tables.iter().map(|table| table_identity(table)));
             let tables: Vec<_> = identities.into_iter().collect();
             let mut additions = 0_u64;
             for table in &tables {
                 if find_bucket(&mut self.file, prior.index_offset, prior.capacity, table)
-                    .map_err(|error| Error::Other((format!("read purge frontier index: {error}")).into()))?
+                    .map_err(|error| {
+                        Error::Other((format!("read purge frontier index: {error}")).into())
+                    })?
                     .1
                     .is_none()
                 {
@@ -1425,10 +1468,9 @@ impl Fence {
                     })?;
                 }
             }
-            let count = prior
-                .count
-                .checked_add(additions)
-                .ok_or_else(|| Error::Other(("purge publication table count overflow".to_owned()).into()))?;
+            let count = prior.count.checked_add(additions).ok_or_else(|| {
+                Error::Other(("purge publication table count overflow".to_owned()).into())
+            })?;
             let mut capacity = prior.capacity;
             while count.checked_mul(10).ok_or_else(|| {
                 Error::Other(("purge publication capacity arithmetic overflow".to_owned()).into())
@@ -1439,8 +1481,9 @@ impl Fence {
                     Error::Other(("purge publication frontier capacity overflow".to_owned()).into())
                 })?;
             }
-            let current_end = index_end(prior.index_offset, prior.capacity)
-                .map_err(|error| Error::Other((format!("size purge frontier index: {error}")).into()))?;
+            let current_end = index_end(prior.index_offset, prior.capacity).map_err(|error| {
+                Error::Other((format!("size purge frontier index: {error}")).into())
+            })?;
             if self
                 .file
                 .metadata()
@@ -1507,27 +1550,33 @@ impl Fence {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn recover(&mut self, marker: Option<DurableMarker>) -> Result<()> {
         block_on_companion_range_lock(
             &self.file,
             PUBLICATION_ADMISSION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         )
-        .map_err(|error| Error::Other((format!("acquire purge recovery admission: {error}")).into()))?;
+        .map_err(|error| {
+            Error::Other((format!("acquire purge recovery admission: {error}")).into())
+        })?;
         if let Err(error) = block_on_companion_range_lock(
             &self.file,
             PUBLICATION_LOCK_OFFSET,
             RangeLockMode::Exclusive,
         ) {
             release_exclusive_admission(&self.file);
-            return Err(Error::Other((format!(
-                "acquire purge recovery fence: {error}"
-            )).into()));
+            return Err(Error::Other(
+                (format!("acquire purge recovery fence: {error}")).into(),
+            ));
         }
         let result = (|| {
-            let State::Pending(pending) = read_latest(&mut self.file)
-                .map_err(|error| Error::Other((format!("read purge recovery fence: {error}")).into()))?
+            let State::Pending(pending) = read_latest(&mut self.file).map_err(|error| {
+                Error::Other((format!("read purge recovery fence: {error}")).into())
+            })?
             else {
                 return Ok(());
             };
@@ -1549,23 +1598,27 @@ impl Fence {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn finish_commit(file: &mut File, pending: &PendingState, tables: &[[u8; 32]]) -> Result<()> {
-    apply_pending(file, pending, tables)
-        .map_err(|error| Error::Other((format!("apply purge publication frontiers: {error}")).into()))?;
+    apply_pending(file, pending, tables).map_err(|error| {
+        Error::Other((format!("apply purge publication frontiers: {error}")).into())
+    })?;
     let clear = ClearState {
-        sequence: pending
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::Other(("purge publication sequence overflow".to_owned()).into()))?,
+        sequence: pending.sequence.checked_add(1).ok_or_else(|| {
+            Error::Other(("purge publication sequence overflow".to_owned()).into())
+        })?,
         generation: pending.generation,
         frontier: pending.frontier,
         index_offset: pending.index_offset,
         capacity: pending.capacity,
         count: pending.count,
     };
-    write_state(file, &State::Clear(clear.clone()))
-        .map_err(|error| Error::Other((format!("commit purge publication fence: {error}")).into()))?;
+    write_state(file, &State::Clear(clear.clone())).map_err(|error| {
+        Error::Other((format!("commit purge publication fence: {error}")).into())
+    })?;
     if pending.index_offset == pending.prior.index_offset {
         file.set_len(
             index_end(clear.index_offset, clear.capacity).map_err(|error| {
@@ -1573,25 +1626,31 @@ fn finish_commit(file: &mut File, pending: &PendingState, tables: &[[u8; 32]]) -
             })?,
         )
         .and_then(|_| file.sync_data())
-        .map_err(|error| Error::Other((format!("trim committed purge manifest: {error}")).into()))?;
+        .map_err(|error| {
+            Error::Other((format!("trim committed purge manifest: {error}")).into())
+        })?;
     }
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn finish_abort(file: &mut File, prior: &ClearState, pending: &PendingState) -> Result<()> {
     let clear = ClearState {
-        sequence: pending
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::Other(("purge publication sequence overflow".to_owned()).into()))?,
+        sequence: pending.sequence.checked_add(1).ok_or_else(|| {
+            Error::Other(("purge publication sequence overflow".to_owned()).into())
+        })?,
         ..prior.clone()
     };
-    write_state(file, &State::Clear(clear.clone()))
-        .map_err(|error| Error::Other((format!("abort purge publication fence: {error}")).into()))?;
+    write_state(file, &State::Clear(clear.clone())).map_err(|error| {
+        Error::Other((format!("abort purge publication fence: {error}")).into())
+    })?;
     file.set_len(
-        index_end(clear.index_offset, clear.capacity)
-            .map_err(|error| Error::Other((format!("size aborted purge frontier index: {error}")).into()))?,
+        index_end(clear.index_offset, clear.capacity).map_err(|error| {
+            Error::Other((format!("size aborted purge frontier index: {error}")).into())
+        })?,
     )
     .and_then(|_| file.sync_data())
     .map_err(|error| Error::Other((format!("trim aborted purge manifest: {error}")).into()))?;
@@ -1606,13 +1665,17 @@ impl PreparedPublication {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit(mut self) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if super::read_persistence_test_scaffold::take_purge_pending_for_test() {
             // Left exactly as a writer that died here leaves it: Pending.
-            return Err(Error::Other((
-                "injected: the purge publication was left Pending".to_owned()).into()));
+            return Err(Error::Other(
+                ("injected: the purge publication was left Pending".to_owned()).into(),
+            ));
         }
         finish_commit(&mut self.fence.file, &self.pending, &self.tables)?;
         self.resolved = true;
@@ -1620,7 +1683,10 @@ impl PreparedPublication {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn abort(mut self) -> Result<()> {
         finish_abort(&mut self.fence.file, &self.prior, &self.pending)?;
         self.resolved = true;

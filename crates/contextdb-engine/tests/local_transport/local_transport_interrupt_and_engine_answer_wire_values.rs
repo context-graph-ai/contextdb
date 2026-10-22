@@ -10,13 +10,14 @@
 //! the encoder produced.
 
 use super::wire_fixture_test_support::FixtureFrame;
-use super::wire_fixture_test_support::{encode_message};
+use super::wire_fixture_test_support::encode_message;
 use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits};
 use contextdb_core::{Error, Value};
 use contextdb_engine::local_transport::{
-    FrameBufferAllocator, FrameReader, LocalInboundKind, LocalInboundMessage,
-    LocalOutboundMessage, LocalProtocolBoundary, LocalRequest, LocalRequestEnvelope, LocalResponse,
-    LocalResponseExpectation, LocalTransportError, decode_message_exact, };
+    FrameBufferAllocator, FrameReader, LocalInboundKind, LocalInboundMessage, LocalOutboundMessage,
+    LocalProtocolBoundary, LocalRequest, LocalRequestEnvelope, LocalResponse,
+    LocalResponseExpectation, LocalTransportError, decode_message_exact,
+};
 
 /// The caller limits every request carries, ahead of the request itself.
 const LIMITS_FIXTURE: &[u8] = &[

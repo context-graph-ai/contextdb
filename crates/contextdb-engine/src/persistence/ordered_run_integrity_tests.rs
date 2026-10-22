@@ -54,7 +54,8 @@ fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Res
                 .limit
                 .map(|bytes| bytes as u64)
                 .unwrap_or(u64::MAX),
-        ).expect("admit the declared fixture root");
+        )
+        .expect("admit the declared fixture root");
     let persistence_fixture_reader_1 = persistence_fixture_parent_1
         .child()
         .expect("admit the persistence fixture reader child");
@@ -148,7 +149,8 @@ fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
                             .limit
                             .map(|bytes| bytes as u64)
                             .unwrap_or(u64::MAX),
-                    ).expect("admit the declared fixture root");
+                    )
+                    .expect("admit the declared fixture root");
                 let persistence_fixture_reader_2 = persistence_fixture_parent_2
                     .child()
                     .expect("admit the persistence fixture reader child");
@@ -741,7 +743,8 @@ fn the_pinned_working_set_does_not_grow_with_the_range() {
                     .limit
                     .map(|bytes| bytes as u64)
                     .unwrap_or(u64::MAX),
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let persistence_fixture_reader_3 = persistence_fixture_parent_3
             .child()
             .expect("admit the persistence fixture reader child");

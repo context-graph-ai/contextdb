@@ -2422,7 +2422,8 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
     assert_eq!(partial_open.first_page.rows().len(), 3);
     assert_eq!(cursor_page_ids(&partial_open.first_page), vec![0, 1, 2]);
     assert_eq!(
-        partial_open.first_page.rows(), smaller_page.first_page.rows(),
+        partial_open.first_page.rows(),
+        smaller_page.first_page.rows(),
         "byte stopping preserves every value in each complete row"
     );
     assert!(

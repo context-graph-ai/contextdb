@@ -37,7 +37,10 @@ impl ApplicationTablePolicyExpectation {
     /// Add caller input using the same clause words as
     /// `DECLARE TENANT TABLE POLICY`. The hub still resolves and
     /// authenticates this expectation before it can become authority.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn expect_table(
         mut self,
         table: impl Into<String>,
@@ -54,7 +57,10 @@ impl ApplicationTablePolicyExpectation {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_expectation_clauses(
     table: &str,
     clauses: &str,
@@ -305,7 +311,10 @@ impl crate::Database {
     /// Members must be named by that policy, written in `tx`, and reference this root. An empty
     /// member list is valid. Invalid registration aborts `tx`; rollback or failed commit leaves
     /// neither rows nor a manifest. The engine computes BLAKE3 over every application column.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn register_delivery_manifest(
         &self,
         tx: TxId,
@@ -318,7 +327,10 @@ impl crate::Database {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn register_delivery_manifest_with_read_memory(
         &self,
         tx: TxId,
@@ -358,7 +370,10 @@ impl crate::Database {
     ///
     /// Returns `None` for a missing, hidden, purged, discarded, pending, or old-destination root.
     /// This metadata read changes no journal, binding, or watermark and obeys the handle's scope.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn delivery_outcome(
         &self,
         root_table: &str,
@@ -367,7 +382,10 @@ impl crate::Database {
         self.delivery_outcome_with_read_memory(root_table, root_key, self.declared_reader_memory()?)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn delivery_outcome_with_read_memory(
         &self,
         root_table: &str,
@@ -383,7 +401,10 @@ impl crate::Database {
     /// Only an admitted durable outcome grants credit; transport watermarks do not. `SYNC OFF`
     /// returns disabled and zero eligible units. Counts obey this handle's row scope and do not
     /// mutate custody. Administrative `SHOW` queries use the ordinary read session limits.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn delivery_status(
         &self,
         root_table: &str,
@@ -391,7 +412,10 @@ impl crate::Database {
         self.delivery_status_with_read_memory(root_table, self.declared_reader_memory()?)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn delivery_status_with_read_memory(
         &self,
         root_table: &str,
@@ -405,7 +429,10 @@ impl crate::Database {
 
 // Only the authenticated local read decoder constructs this projection. Public
 // deserialization is deliberately not provided for an admitted outcome or cursor.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_outcome_projection(
     text: &str,
 ) -> contextdb_core::Result<Option<DeliveryOutcome>> {

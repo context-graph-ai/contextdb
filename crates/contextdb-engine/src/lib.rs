@@ -73,6 +73,7 @@ mod direct_file_reader;
 #[doc(hidden)]
 pub mod direct_file_reader;
 pub mod executor;
+mod funded_error;
 #[cfg(not(feature = "test-seams"))]
 mod local_transport;
 #[cfg(feature = "test-seams")]
@@ -84,19 +85,18 @@ mod memory_accounting;
 #[cfg(feature = "test-seams")]
 pub mod memory_accounting;
 mod metadata_page;
-mod owned_worker;
 #[cfg(not(feature = "test-seams"))]
 mod owned_cursor_page;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub mod owned_cursor_page;
+mod owned_worker;
 #[cfg(not(feature = "test-seams"))]
 mod owner_read;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub mod owner_read;
 pub mod peer_directory;
-mod funded_error;
 pub mod persistence;
 pub mod persistent_store;
 pub mod plugin;

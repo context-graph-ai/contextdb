@@ -41,7 +41,10 @@ impl MemoryErasureFrontiers {
         self.0.as_ref().map_or(Lsn(0), |root| root.lock().global)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn copy_into(
         &self,
         destination: &RedbPersistence,
@@ -91,7 +94,10 @@ impl MemoryErasureFrontiers {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn validate(&self, scope: &crate::executor::ReadPublicationScope) -> Result<()> {
         scope.check_publication_budget()?;
         if let Some(root) = &self.0 {
@@ -110,7 +116,10 @@ impl MemoryErasureFrontiers {
         }
         scope.check_publication_budget()
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare(
         &self,
         tables: &BTreeSet<String>,

@@ -8,7 +8,10 @@ impl RedbPersistence {
         dead_code,
         reason = "Full repair is never part of bounded writable startup"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn repair_current_transaction_order(
         &self,
         commit_index: &BTreeMap<Lsn, TxId>,
@@ -25,7 +28,12 @@ impl RedbPersistence {
             .try_fold(TxId(0), |previous, tx| (tx >= previous).then_some(tx))
             .is_none()
         {
-            return Err(crate::funded_error::corruption_text(self.require_decode_original().and_then(|original| original.read_budget()), self.path.display(), "commit index assigns one transaction to disjoint commit ranges".into()));
+            return Err(crate::funded_error::corruption_text(
+                self.require_decode_original()
+                    .and_then(|original| original.read_budget()),
+                self.path.display(),
+                "commit index assigns one transaction to disjoint commit ranges".into(),
+            ));
         }
         let remap = |tx: &mut TxId| {
             if let Some(value) = mapping.get(tx) {
@@ -250,7 +258,10 @@ impl RedbPersistence {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn transform_transaction_records(
         &self,
         write: &redb::WriteTransaction,

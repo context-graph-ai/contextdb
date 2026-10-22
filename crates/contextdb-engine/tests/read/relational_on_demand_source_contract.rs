@@ -631,8 +631,8 @@ fn a_seventy_kibibyte_indexed_text_value_commits_reads_and_authenticates() {
     );
     let ordered = {
         let fixture_answer_23 = reader
-        .execute("SELECT id FROM wide_rows ORDER BY label", &HashMap::new())
-        .unwrap();
+            .execute("SELECT id FROM wide_rows ORDER BY label", &HashMap::new())
+            .unwrap();
         fixture_answer_23.rows().to_vec()
     };
     assert_eq!(
@@ -646,11 +646,11 @@ fn a_seventy_kibibyte_indexed_text_value_commits_reads_and_authenticates() {
     );
     let selected = {
         let fixture_answer_24 = reader
-        .execute(
-            "SELECT id FROM wide_rows WHERE label = $label",
-            &params([("label", Value::Text(wide_label('c', WIDE_INDEX_TEXT_BYTES)))]),
-        )
-        .unwrap();
+            .execute(
+                "SELECT id FROM wide_rows WHERE label = $label",
+                &params([("label", Value::Text(wide_label('c', WIDE_INDEX_TEXT_BYTES)))]),
+            )
+            .unwrap();
         fixture_answer_24.rows().to_vec()
     };
     assert_eq!(selected, vec![vec![Value::Int64(2)]]);

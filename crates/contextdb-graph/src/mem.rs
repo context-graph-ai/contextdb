@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
 use crate::source::GraphCursor as _;
 use crate::source::{GraphCursorHandle, GraphQuery, GraphReadHandle, GraphSnapshot};
 use crate::store::{GraphAdjEntry, GraphStore};
 use contextdb_core::*;
 use contextdb_tx::{OwnedAdjEntry, RowEdgeOwner, TransactionManager, WriteSetApplicator};
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -258,7 +258,10 @@ impl BoundedBfsCursor {
     /// Preserve every visible physical edge binding for single-hop SQL. This
     /// must be selected before the first pull; reachability keeps coalescing.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn preserve_single_hop_bindings(&mut self) -> Result<()> {
         if self.min_depth != 1 || self.max_depth != 1 {
             return Err(Error::InvalidStateTransition(
@@ -275,25 +278,36 @@ impl BoundedBfsCursor {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn checked_graph_add(left: usize, right: usize, operation: &str) -> Result<usize> {
     left.checked_add(right).ok_or_else(|| {
-        Error::Other((format!(
-            "bounded graph {operation} memory size exceeds the native address space"
-        )).into())
+        Error::Other(
+            (format!("bounded graph {operation} memory size exceeds the native address space"))
+                .into(),
+        )
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn checked_graph_mul(left: usize, right: usize, operation: &str) -> Result<usize> {
     left.checked_mul(right).ok_or_else(|| {
-        Error::Other((format!(
-            "bounded graph {operation} memory size exceeds the native address space"
-        )).into())
+        Error::Other(
+            (format!("bounded graph {operation} memory size exceeds the native address space"))
+                .into(),
+        )
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bounded_capacity_bytes<T>(capacity: usize, operation: &str) -> Result<usize> {
     checked_graph_mul(capacity, std::mem::size_of::<T>(), operation)
 }
@@ -331,14 +345,16 @@ where
     let mut owned = String::new();
     if owned.try_reserve_exact(requested).is_err() {
         release_retained(requested);
-        return Err(E::from(Error::Other((
-            "bounded graph edge type allocation failed".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded graph edge type allocation failed".to_string()).into(),
+        )));
     }
     let actual = owned.capacity();
     if actual < requested {
         release_retained(requested);
-        return Err(E::from(Error::Other((
-            "bounded graph edge type capacity moved backwards".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded graph edge type capacity moved backwards".to_string()).into(),
+        )));
     }
     let actual = reconcile_graph_allocation(requested, actual, before_retain, release_retained)?;
     owned.push_str(source);
@@ -377,8 +393,9 @@ where
         before_edge()?;
         if anchor.matches(&node_entries[candidate]) {
             let position = candidate.checked_add(offset).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded graph adjacency position overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded graph adjacency position overflow".to_string()).into(),
+                ))
             })?;
             return Ok(AdjacencyResume::Relocated {
                 anchor_position: candidate,
@@ -395,7 +412,8 @@ where
                 if anchor.matches(entry) {
                     let position = candidate.checked_add(offset).ok_or_else(|| {
                         E::from(Error::Other(
-                            "bounded graph adjacency position overflow".into()))
+                            "bounded graph adjacency position overflow".into(),
+                        ))
                     })?;
                     return Ok(AdjacencyResume::Relocated {
                         anchor_position: candidate,
@@ -428,8 +446,9 @@ where
         .retained_bytes
         .checked_sub(anchor.retained_bytes)
         .ok_or_else(|| {
-            E::from(Error::Other((
-                "bounded graph adjacency anchor accounting underflow".to_string()).into()))
+            E::from(Error::Other(
+                ("bounded graph adjacency anchor accounting underflow".to_string()).into(),
+            ))
         })?;
     release_retained(anchor.retained_bytes);
     Ok(())
@@ -494,8 +513,9 @@ where
     };
     let Some(current) = cursor.current.as_mut() else {
         release_retained(anchor_bytes);
-        return Err(E::from(Error::Other((
-            "bounded graph continuation lost its anchored adjacency".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded graph continuation lost its anchored adjacency".to_string()).into(),
+        )));
     };
     current.anchor = Some(AdjacencyAnchor {
         row_owner,
@@ -527,7 +547,8 @@ where
         drop(edge);
         cursor.retained_bytes = cursor.retained_bytes.checked_sub(bytes).ok_or_else(|| {
             E::from(Error::Other(
-                "graph logical edge accounting underflow".into()))
+                "graph logical edge accounting underflow".into(),
+            ))
         })?;
         release_retained(bytes);
     }
@@ -550,7 +571,8 @@ where
 {
     let current = cursor.current.as_ref().ok_or_else(|| {
         E::from(Error::Other(
-            "graph continuation lost its logical edge".into()))
+            "graph continuation lost its logical edge".into(),
+        ))
     })?;
     if current.logical_edge.as_ref().is_some_and(|last| {
         last.source == source && last.target == target && last.edge_type == edge_type
@@ -612,7 +634,8 @@ where
         drop(replacement);
         release_retained(requested);
         return Err(E::from(Error::Other(
-            "bounded graph predecessor allocation failed".into())));
+            "bounded graph predecessor allocation failed".into(),
+        )));
     }
     let actual = replacement.capacity() * std::mem::size_of::<T>() + 16;
     if actual > requested {
@@ -723,7 +746,8 @@ where
         drop(path);
         release_retained(requested);
         return Err(E::from(Error::Other(
-            "bounded graph output path allocation failed".into())));
+            "bounded graph output path allocation failed".into(),
+        )));
     }
     let actual = path.capacity() * std::mem::size_of::<(NodeId, EdgeType)>();
     let mut retained =
@@ -780,8 +804,9 @@ where
     let mut filters = Vec::new();
     if filters.try_reserve_exact(source.len()).is_err() {
         release_retained(requested);
-        return Err(E::from(Error::Other((
-            "bounded graph edge-filter allocation failed".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded graph edge-filter allocation failed".to_string()).into(),
+        )));
     }
     let actual_vec = match bounded_capacity_bytes::<EdgeType>(filters.capacity(), "edge filters") {
         Ok(bytes) => bytes,
@@ -792,8 +817,9 @@ where
     };
     if actual_vec < requested {
         release_retained(requested);
-        return Err(E::from(Error::Other((
-            "bounded graph edge-filter capacity moved backwards".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded graph edge-filter capacity moved backwards".to_string()).into(),
+        )));
     }
     let actual_vec =
         reconcile_graph_allocation(requested, actual_vec, before_retain, release_retained)?;
@@ -820,7 +846,10 @@ where
     Ok((Some(filters), retained))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn next_graph_capacity(current: usize, required: usize) -> Result<usize> {
     if current == 0 {
         return Ok(required);
@@ -844,8 +873,9 @@ where
     let mut visited = HashSet::new();
     if visited.try_reserve(1).is_err() {
         release_retained(requested);
-        return Err(E::from(Error::Other((
-            "bounded graph visited allocation failed".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded graph visited allocation failed".to_string()).into(),
+        )));
     }
     let actual = match bounded_capacity_bytes::<NodeId>(visited.capacity(), "visited nodes") {
         Ok(bytes) => bytes,
@@ -856,8 +886,9 @@ where
     };
     if actual < requested {
         release_retained(requested);
-        return Err(E::from(Error::Other((
-            "bounded graph visited capacity moved backwards".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded graph visited capacity moved backwards".to_string()).into(),
+        )));
     }
     let actual = reconcile_graph_allocation(requested, actual, before_retain, release_retained)?;
     visited.insert(start);
@@ -878,8 +909,9 @@ where
         return Ok(None);
     }
     let required = visited.len().checked_add(1).ok_or_else(|| {
-        E::from(Error::Other((
-            "bounded graph visited length overflow".to_string()).into()))
+        E::from(Error::Other(
+            ("bounded graph visited length overflow".to_string()).into(),
+        ))
     })?;
     let requested_capacity = next_graph_capacity(visited.capacity(), required).map_err(E::from)?;
     let requested =
@@ -888,8 +920,9 @@ where
     let mut replacement = HashSet::new();
     if replacement.try_reserve(requested_capacity).is_err() {
         release_retained(requested);
-        return Err(E::from(Error::Other((
-            "bounded graph visited allocation failed".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded graph visited allocation failed".to_string()).into(),
+        )));
     }
     let actual = match bounded_capacity_bytes::<NodeId>(replacement.capacity(), "visited nodes") {
         Ok(bytes) => bytes,
@@ -900,8 +933,9 @@ where
     };
     if actual < requested {
         release_retained(requested);
-        return Err(E::from(Error::Other((
-            "bounded graph visited capacity moved backwards".to_string()).into())));
+        return Err(E::from(Error::Other(
+            ("bounded graph visited capacity moved backwards".to_string()).into(),
+        )));
     }
     let actual = reconcile_graph_allocation(requested, actual, before_retain, release_retained)?;
     let mut remaining = visited.len();
@@ -913,15 +947,17 @@ where
         }
         let Some(node) = source.next().copied() else {
             release_retained(actual);
-            return Err(E::from(Error::Other((
-                "bounded graph visited set changed during migration".to_string()).into())));
+            return Err(E::from(Error::Other(
+                ("bounded graph visited set changed during migration".to_string()).into(),
+            )));
         };
         remaining = match remaining.checked_sub(1) {
             Some(remaining) => remaining,
             None => {
                 release_retained(actual);
-                return Err(E::from(Error::Other((
-                    "bounded graph visited migration underflow".to_string()).into())));
+                return Err(E::from(Error::Other(
+                    ("bounded graph visited migration underflow".to_string()).into(),
+                )));
             }
         };
         replacement.insert(node);
@@ -969,12 +1005,14 @@ where
     while position < filters.len() {
         before_work()?;
         let filter = filters.get(position).ok_or_else(|| {
-            E::from(Error::Other((
-                "bounded graph edge-filter position changed".to_string()).into()))
+            E::from(Error::Other(
+                ("bounded graph edge-filter position changed".to_string()).into(),
+            ))
         })?;
         position = position.checked_add(1).ok_or_else(|| {
-            E::from(Error::Other((
-                "bounded graph edge-filter position overflow".to_string()).into()))
+            E::from(Error::Other(
+                ("bounded graph edge-filter position overflow".to_string()).into(),
+            ))
         })?;
         if filter.as_str() == edge_type {
             return Ok(true);
@@ -1003,7 +1041,10 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
             Self::Owned(handle) => handle.with_transactions(|transactions| transactions.snapshot()),
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_graph_read<R>(&self, tx: TxId, f: impl FnOnce(GraphStaging<'_>) -> R) -> Result<R> {
         match self {
             Self::Legacy(manager) => manager.with_write_set(tx, |ws| {
@@ -1026,7 +1067,10 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
             }),
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_write_set<R>(
         &self,
         tx: TxId,
@@ -1108,7 +1152,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
 
     /// Validate a row-derived edge before its admitted transaction mutation.
     /// Endpoint deduplication is deliberately absent: ownership is per row.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn validate_row_edge(
         &self,
         tx: TxId,
@@ -1137,7 +1184,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn edge_count(
         &self,
         source: NodeId,
@@ -1150,7 +1200,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         self.try_edge_count(source, edge_type, snapshot, read_memory)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_edge_count(
         &self,
         source: NodeId,
@@ -1180,7 +1233,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visit_neighbors(
         &self,
         root: Option<&Arc<dyn GraphSnapshot>>,
@@ -1265,7 +1321,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn bfs_with_write_set(
         &self,
         tx: TxId,
@@ -1424,7 +1483,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     /// Use the root already captured by the enclosing statement. The engine
     /// supplies the same handle used by relational and vector consumers.
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bounded_bfs_cursor_at_source<E>(
         &self,
         start: NodeId,
@@ -1442,7 +1504,8 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     {
         if self.store.is_source_backed() && root.is_none() {
             return Err(E::from(Error::Other(
-                "graph traversal requires a captured source root".into())));
+                "graph traversal requires a captured source root".into(),
+            )));
         }
         let source_root = root.map(GraphReadHandle);
         let (edge_types, edge_types_bytes) =
@@ -1702,12 +1765,14 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     .retained_bytes
                     .checked_sub(queue_entry_bytes)
                     .ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded graph queue-memory accounting underflow".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded graph queue-memory accounting underflow".to_string()).into(),
+                        ))
                     })?;
                 let frontier = bounded_queue_pop(cursor).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded graph continuation lost its queued node".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded graph continuation lost its queued node".to_string()).into(),
+                    ))
                 })?;
                 cursor.retained_bytes = next_retained;
                 release_retained(queue_entry_bytes);
@@ -1743,8 +1808,9 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             });
             if should_emit {
                 let current = cursor.current.as_ref().ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded graph continuation lost its current node".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded graph continuation lost its current node".to_string()).into(),
+                    ))
                 })?;
                 let (path, output_bytes) = rebuild_bounded_path(
                     cursor,
@@ -1781,8 +1847,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     .current
                     .as_ref()
                     .ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded graph continuation lost its completed node".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded graph continuation lost its completed node".to_string())
+                                .into(),
+                        ))
                     })?
                     .frontier
                     .retained_bytes;
@@ -1790,12 +1858,15 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     .retained_bytes
                     .checked_sub(finished_bytes)
                     .ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded graph retained-memory accounting underflow".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded graph retained-memory accounting underflow".to_string())
+                                .into(),
+                        ))
                     })?;
                 let finished = cursor.current.take().ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded graph continuation lost its completed node".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded graph continuation lost its completed node".to_string()).into(),
+                    ))
                 })?;
                 cursor.retained_bytes = next_retained;
                 release_retained(finished.frontier.retained_bytes);
@@ -1804,8 +1875,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
 
             let (node, phase, position) = {
                 let current = cursor.current.as_ref().ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded graph continuation lost its adjacency position".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded graph continuation lost its adjacency position".to_string())
+                            .into(),
+                    ))
                 })?;
                 (current.frontier.node, current.phase, current.position)
             };
@@ -1817,8 +1890,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     .current
                     .as_ref()
                     .ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded graph continuation lost its completed node".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded graph continuation lost its completed node".to_string())
+                                .into(),
+                        ))
                     })?
                     .frontier
                     .retained_bytes;
@@ -1826,12 +1901,15 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     .retained_bytes
                     .checked_sub(finished_bytes)
                     .ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded graph retained-memory accounting underflow".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded graph retained-memory accounting underflow".to_string())
+                                .into(),
+                        ))
                     })?;
                 let finished = cursor.current.take().ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded graph continuation lost its completed node".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded graph continuation lost its completed node".to_string()).into(),
+                    ))
                 })?;
                 cursor.retained_bytes = next_retained;
                 release_retained(finished.frontier.retained_bytes);
@@ -1901,7 +1979,8 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                 before_edge()?;
                 let current = cursor.current.as_mut().ok_or_else(|| {
                     E::from(Error::Other(
-                        "graph continuation lost its source cursor".into()))
+                        "graph continuation lost its source cursor".into(),
+                    ))
                 })?;
                 if current.source_cursor.is_none() {
                     current.source_cursor = Some(GraphCursorHandle(
@@ -2004,8 +2083,11 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     AdjacencyPhase::Outgoing => &self.store.forward_adj,
                     AdjacencyPhase::Incoming => &self.store.reverse_adj,
                     AdjacencyPhase::Done => {
-                        return Err(E::from(Error::Other((
-                            "bounded graph continuation reached a completed adjacency".to_string()).into())));
+                        return Err(E::from(Error::Other(
+                            ("bounded graph continuation reached a completed adjacency"
+                                .to_string())
+                            .into(),
+                        )));
                     }
                 };
                 // One charge covers this pass over the adjacency: taking the lock,
@@ -2017,8 +2099,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     drop(entries);
                     release_current_anchor(cursor, &mut release_retained)?;
                     let current = cursor.current.as_mut().ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded graph continuation lost its empty adjacency".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded graph continuation lost its empty adjacency".to_string())
+                                .into(),
+                        ))
                     })?;
                     current.committed_done = true;
                     continue;
@@ -2029,8 +2113,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                 // identity now sits before anything at it is read.
                 let resume = {
                     let current = cursor.current.as_ref().ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded graph continuation lost its anchored adjacency".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded graph continuation lost its anchored adjacency".to_string())
+                                .into(),
+                        ))
                     })?;
                     match current.anchor.as_ref() {
                         Some(anchor) => relocate_adjacency_anchor(
@@ -2050,9 +2136,11 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     } => {
                         drop(entries);
                         let current = cursor.current.as_mut().ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded graph continuation lost its relocated adjacency"
-                                    .to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded graph continuation lost its relocated adjacency"
+                                    .to_string())
+                                .into(),
+                            ))
                         })?;
                         if let Some(anchor) = current.anchor.as_mut() {
                             anchor.position = anchor_position;
@@ -2064,9 +2152,11 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                         drop(entries);
                         release_current_anchor(cursor, &mut release_retained)?;
                         let current = cursor.current.as_mut().ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded graph continuation lost its restarted adjacency"
-                                    .to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded graph continuation lost its restarted adjacency"
+                                    .to_string())
+                                .into(),
+                            ))
                         })?;
                         current.position = 0;
                         continue;
@@ -2077,16 +2167,19 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     drop(entries);
                     release_current_anchor(cursor, &mut release_retained)?;
                     let current = cursor.current.as_mut().ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded graph continuation lost its completed adjacency".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded graph continuation lost its completed adjacency".to_string())
+                                .into(),
+                        ))
                     })?;
                     current.committed_done = true;
                     continue;
                 }
 
                 let entry = node_entries.get(position).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded graph adjacency changed during a read lock".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded graph adjacency changed during a read lock".to_string()).into(),
+                    ))
                 })?;
                 if cursor
                     .current
@@ -2113,8 +2206,9 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     continue;
                 }
                 let next_position = position.checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded graph adjacency position overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded graph adjacency position overflow".to_string()).into(),
+                    ))
                 })?;
                 install_adjacency_anchor(
                     cursor,
@@ -2148,8 +2242,11 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                         .current
                         .as_mut()
                         .ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded graph continuation lost its charged adjacency".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded graph continuation lost its charged adjacency"
+                                    .to_string())
+                                .into(),
+                            ))
                         })?
                         .position = next_position;
                     continue;
@@ -2165,8 +2262,11 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                         .current
                         .as_mut()
                         .ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded graph continuation lost its charged adjacency".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded graph continuation lost its charged adjacency"
+                                    .to_string())
+                                .into(),
+                            ))
                         })?
                         .position = next_position;
                     continue;
@@ -2183,8 +2283,11 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                         .current
                         .as_mut()
                         .ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded graph continuation lost its charged adjacency".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded graph continuation lost its charged adjacency"
+                                    .to_string())
+                                .into(),
+                            ))
                         })?
                         .position = next_position;
                     continue;
@@ -2194,8 +2297,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     .current
                     .as_mut()
                     .ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded graph continuation lost its charged adjacency".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded graph continuation lost its charged adjacency".to_string())
+                                .into(),
+                        ))
                     })?
                     .position = next_position;
                 // Admitted through a borrow of the entry, with the adjacency
@@ -2301,7 +2406,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     /// alike would put an allocation on every walked edge that nothing had
     /// reserved.
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn admit_bounded_neighbor<E, Edge, Path, Retain, Release>(
         &self,
         cursor: &mut BoundedBfsCursor,
@@ -2326,7 +2434,8 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             .as_ref()
             .ok_or_else(|| {
                 E::from(Error::Other(
-                    "graph continuation lost its logical adjacency".into()))
+                    "graph continuation lost its logical adjacency".into(),
+                ))
             })?
             .phase;
         let (source, target) = if matches!(phase.direction(), Direction::Incoming) {
@@ -2354,14 +2463,15 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         let expand = !cursor.visited.contains(&neighbor);
 
         let current = cursor.current.as_ref().ok_or_else(|| {
-            E::from(Error::Other((
-                "bounded graph continuation lost its path source".to_string()).into()))
+            E::from(Error::Other(
+                ("bounded graph continuation lost its path source".to_string()).into(),
+            ))
         })?;
-        let next_depth = current
-            .frontier
-            .depth
-            .checked_add(1)
-            .ok_or_else(|| E::from(Error::Other(("bounded graph depth overflow".to_string()).into())))?;
+        let next_depth = current.frontier.depth.checked_add(1).ok_or_else(|| {
+            E::from(Error::Other(
+                ("bounded graph depth overflow".to_string()).into(),
+            ))
+        })?;
         let parent = current.frontier.path;
         let path = append_bounded_path(
             cursor,
@@ -2415,8 +2525,9 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         }
         let visited_growth = match prepared_visited.as_ref() {
             Some((_, actual, previous)) => actual.checked_sub(*previous).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded graph visited capacity moved backwards".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded graph visited capacity moved backwards".to_string()).into(),
+                ))
             }),
             None => Ok(0),
         };
@@ -2455,8 +2566,9 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             }
             release_retained(queue_bytes);
             release_retained(path_bytes);
-            return Err(E::from(Error::Other((
-                "bounded graph continuation lost its admitted adjacency".to_string()).into())));
+            return Err(E::from(Error::Other(
+                ("bounded graph continuation lost its admitted adjacency".to_string()).into(),
+            )));
         }
         if let Some((replacement, _, previous)) = prepared_visited {
             let old = std::mem::replace(&mut cursor.visited, replacement);
@@ -2485,7 +2597,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
 
     /// Traverse using the enclosing statement's pinned source root.
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bfs_at_source(
         &self,
         start: NodeId,
@@ -2615,7 +2730,10 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok((TraversalResult { nodes }, credit.into_inner()))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn current_edge_properties(
         &self,
         source: NodeId,
@@ -2645,9 +2763,15 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         Ok(existing)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn current_owned_edge_properties(
-        &self, source: NodeId, target: NodeId, edge_type: &str,
+        &self,
+        source: NodeId,
+        target: NodeId,
+        edge_type: &str,
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Option<OwnedEdgePropertyCopy>> {
         let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
@@ -2655,28 +2779,56 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         let snapshot = self.tx_mgr.snapshot();
         let root = self.store.capture_source(snapshot, reader.clone())?;
         let mut existing = None;
-        self.store.visit_edges_with_owner(root.as_ref(), GraphQuery {
-            node: source, direction: Direction::Outgoing, identity: Some((target, edge_type)),
-        }, |entry, row_owner| {
-            if row_owner.is_none() && entry.visible_at(snapshot) {
-                let controls = entry.properties.capacity().checked_mul(
-                    std::mem::size_of::<(String, Value)>().saturating_add(1).saturating_mul(4))
-                    .ok_or_else(|| Error::Other("graph property copy size overflow".into()))?;
-                let bytes = controls.checked_add(entry.estimated_bytes())
-                    .ok_or_else(|| Error::Other("graph property copy size overflow".into()))?;
-                let memory = contextdb_core::read_memory::ReadCredit::try_new(reader.clone(), bytes,
-                    "graph", "edge_property_input", "Raise MEMORY_LIMIT to copy this edge's properties.")?;
-                existing = Some(OwnedEdgePropertyCopy { values: entry.properties.clone(), _memory: memory });
-            }
-            Ok(true)
-        })?;
+        self.store.visit_edges_with_owner(
+            root.as_ref(),
+            GraphQuery {
+                node: source,
+                direction: Direction::Outgoing,
+                identity: Some((target, edge_type)),
+            },
+            |entry, row_owner| {
+                if row_owner.is_none() && entry.visible_at(snapshot) {
+                    let controls = entry
+                        .properties
+                        .capacity()
+                        .checked_mul(
+                            std::mem::size_of::<(String, Value)>()
+                                .saturating_add(1)
+                                .saturating_mul(4),
+                        )
+                        .ok_or_else(|| Error::Other("graph property copy size overflow".into()))?;
+                    let bytes = controls
+                        .checked_add(entry.estimated_bytes())
+                        .ok_or_else(|| Error::Other("graph property copy size overflow".into()))?;
+                    let memory = contextdb_core::read_memory::ReadCredit::try_new(
+                        reader.clone(),
+                        bytes,
+                        "graph",
+                        "edge_property_input",
+                        "Raise MEMORY_LIMIT to copy this edge's properties.",
+                    )?;
+                    existing = Some(OwnedEdgePropertyCopy {
+                        values: entry.properties.clone(),
+                        _memory: memory,
+                    });
+                }
+                Ok(true)
+            },
+        )?;
         Ok(existing)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn owned_dag_reaches(
-        &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
-        start: NodeId, goal: NodeId, edge_type: &str,
+        &self,
+        handle: &contextdb_tx::manager::EngineTransactionHandle<S>,
+        tx: TxId,
+        start: NodeId,
+        goal: NodeId,
+        edge_type: &str,
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
         let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
@@ -2686,123 +2838,278 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         let root = self.store.capture_source(snapshot, reader)?;
         let mut visited = std::collections::BTreeSet::new();
         let mut queue = VecDeque::new();
-        let mut enqueue = |node: NodeId, visited: &mut std::collections::BTreeSet<NodeId>, queue: &mut VecDeque<NodeId>| -> Result<()> {
-            if visited.contains(&node) { return Ok(()); }
+        let mut enqueue = |node: NodeId,
+                           visited: &mut std::collections::BTreeSet<NodeId>,
+                           queue: &mut VecDeque<NodeId>|
+         -> Result<()> {
+            if visited.contains(&node) {
+                return Ok(());
+            }
             // One worst-case B-tree node plus geometric queue growth and its
             // old/new overlap per newly retained node. No staged-edge directory.
-            let bytes = std::mem::size_of::<NodeId>().checked_mul(16)
-                .and_then(|n| n.checked_add(128)).ok_or_else(|| Error::Other("graph traversal size overflow".into()))?;
-            memory.try_grow_for(bytes, "graph", "dag_cycle_check",
-                "Raise MEMORY_LIMIT to validate this DAG insertion.")?;
-            visited.insert(node); queue.push_back(node); Ok(())
+            let bytes = std::mem::size_of::<NodeId>()
+                .checked_mul(16)
+                .and_then(|n| n.checked_add(128))
+                .ok_or_else(|| Error::Other("graph traversal size overflow".into()))?;
+            memory.try_grow_for(
+                bytes,
+                "graph",
+                "dag_cycle_check",
+                "Raise MEMORY_LIMIT to validate this DAG insertion.",
+            )?;
+            visited.insert(node);
+            queue.push_back(node);
+            Ok(())
         };
         enqueue(start, &mut visited, &mut queue)?;
         while let Some(current) = queue.pop_front() {
             let mut found = false;
-            self.store.visit_edges(root.as_ref(), GraphQuery {
-                node: current, direction: Direction::Outgoing, identity: None,
-            }, |entry| {
-                if entry.edge_type != edge_type || !entry.visible_at(snapshot) { return Ok(true); }
-                let deleted = handle.with_transactions(|transactions| transactions.with_read(tx, |read| {
-                    read.adj_deletes.iter().any(|(source, kind, target, _)|
-                        *source == entry.source && *target == entry.target && kind == edge_type)
-                }))?;
-                if deleted { return Ok(true); }
-                if entry.target == goal { found = true; return Ok(false); }
-                enqueue(entry.target, &mut visited, &mut queue)?;
-                Ok(true)
-            })?;
-            if found { return Ok(true); }
-            let found = handle.with_transactions(|transactions| transactions.with_read(tx, |read| -> Result<bool> {
-                for entry in read.adj_inserts.iter().filter(|entry| entry.source == current && entry.edge_type == edge_type) {
-                    if entry.target == goal { return Ok(true); }
+            self.store.visit_edges(
+                root.as_ref(),
+                GraphQuery {
+                    node: current,
+                    direction: Direction::Outgoing,
+                    identity: None,
+                },
+                |entry| {
+                    if entry.edge_type != edge_type || !entry.visible_at(snapshot) {
+                        return Ok(true);
+                    }
+                    let deleted = handle.with_transactions(|transactions| {
+                        transactions.with_read(tx, |read| {
+                            read.adj_deletes.iter().any(|(source, kind, target, _)| {
+                                *source == entry.source
+                                    && *target == entry.target
+                                    && kind == edge_type
+                            })
+                        })
+                    })?;
+                    if deleted {
+                        return Ok(true);
+                    }
+                    if entry.target == goal {
+                        found = true;
+                        return Ok(false);
+                    }
                     enqueue(entry.target, &mut visited, &mut queue)?;
-                }
-                Ok(false)
-            }))??;
-            if found { return Ok(true); }
+                    Ok(true)
+                },
+            )?;
+            if found {
+                return Ok(true);
+            }
+            let found = handle.with_transactions(|transactions| {
+                transactions.with_read(tx, |read| -> Result<bool> {
+                    for entry in read
+                        .adj_inserts
+                        .iter()
+                        .filter(|entry| entry.source == current && entry.edge_type == edge_type)
+                    {
+                        if entry.target == goal {
+                            return Ok(true);
+                        }
+                        enqueue(entry.target, &mut visited, &mut queue)?;
+                    }
+                    Ok(false)
+                })
+            })??;
+            if found {
+                return Ok(true);
+            }
         }
         Ok(false)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn stage_owned_graph_entry(
-        &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
-        entry: &AdjEntry, replacement: bool,
+        &self,
+        handle: &contextdb_tx::manager::EngineTransactionHandle<S>,
+        tx: TxId,
+        entry: &AdjEntry,
+        replacement: bool,
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<()> {
         let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
 
-        let _input = contextdb_core::read_memory::ReadCredit::try_new(reader, entry.edge_type.len(),
-            "graph", "edge_delete_input", "Raise MEMORY_LIMIT to stage this edge.")?;
+        let _input = contextdb_core::read_memory::ReadCredit::try_new(
+            reader,
+            entry.edge_type.len(),
+            "graph",
+            "edge_delete_input",
+            "Raise MEMORY_LIMIT to stage this edge.",
+        )?;
         let deletes = [(entry.source, entry.edge_type.clone(), entry.target, tx)];
-        handle.with_transactions(|transactions| transactions.with_engine(tx, |held| {
-            held.with_tx_checkpoint(|held| {
-                if replacement {
-                    loop {
-                        let position = held.read().adj_inserts.iter().rposition(|old|
-                            old.source == entry.source && old.target == entry.target && old.edge_type == entry.edge_type);
-                        let Some(position) = position else { break; };
-                        let empty = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::AdjInserts(&[]))?;
-                        let remove = held.prepare_aux_splice(position, &[position], empty)?;
-                        held.publish_tx(remove);
+        handle.with_transactions(|transactions| {
+            transactions.with_engine(tx, |held| {
+                held.with_tx_checkpoint(|held| {
+                    if replacement {
+                        loop {
+                            let position = held.read().adj_inserts.iter().rposition(|old| {
+                                old.source == entry.source
+                                    && old.target == entry.target
+                                    && old.edge_type == entry.edge_type
+                            });
+                            let Some(position) = position else {
+                                break;
+                            };
+                            let empty = held.copy_aux(
+                                contextdb_tx::staged_source::AuxBorrow::AdjInserts(&[]),
+                            )?;
+                            let remove = held.prepare_aux_splice(position, &[position], empty)?;
+                            held.publish_tx(remove);
+                        }
+                        if !held
+                            .read()
+                            .adj_deletes
+                            .iter()
+                            .any(|(source, kind, target, _)| {
+                                *source == entry.source
+                                    && *target == entry.target
+                                    && kind == &entry.edge_type
+                            })
+                        {
+                            let delete = held.copy_aux(
+                                contextdb_tx::staged_source::AuxBorrow::AdjDeletes(&deletes),
+                            )?;
+                            let delete = held.prepare_aux_splice(
+                                held.read().adj_deletes.len(),
+                                &[],
+                                delete,
+                            )?;
+                            held.publish_tx(delete);
+                        }
                     }
-                    if !held.read().adj_deletes.iter().any(|(source, kind, target, _)|
-                        *source == entry.source && *target == entry.target && kind == &entry.edge_type) {
-                        let delete = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::AdjDeletes(&deletes))?;
-                        let delete = held.prepare_aux_splice(held.read().adj_deletes.len(), &[], delete)?;
-                        held.publish_tx(delete);
-                    }
-                }
-                // This is an independent original copy funded by the actual
-                // source. The reader's temporary input credit never transfers.
-                let insert = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::AdjInserts(std::slice::from_ref(entry)))?;
-                let insert = held.prepare_aux_splice(held.read().adj_inserts.len(), &[], insert)?;
-                held.publish_tx(insert);
-                Ok(())
+                    // This is an independent original copy funded by the actual
+                    // source. The reader's temporary input credit never transfers.
+                    let insert =
+                        held.copy_aux(contextdb_tx::staged_source::AuxBorrow::AdjInserts(
+                            std::slice::from_ref(entry),
+                        ))?;
+                    let insert =
+                        held.prepare_aux_splice(held.read().adj_inserts.len(), &[], insert)?;
+                    held.publish_tx(insert);
+                    Ok(())
+                })
             })
-        }))
+        })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    #[expect(clippy::too_many_arguments, reason = "The transaction, edge identity, payload and read owner must reach the same admitted insertion.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The transaction, edge identity, payload and read owner must reach the same admitted insertion."
+    )]
     fn insert_owned_edge(
-        &self, handle: &contextdb_tx::manager::EngineTransactionHandle<S>, tx: TxId,
-        source: NodeId, target: NodeId, edge_type: String,
+        &self,
+        handle: &contextdb_tx::manager::EngineTransactionHandle<S>,
+        tx: TxId,
+        source: NodeId,
+        target: NodeId,
+        edge_type: String,
         properties: std::collections::HashMap<String, Value>,
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<bool> {
         let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();
 
-        let deleted = handle.with_transactions(|transactions| transactions.with_read(tx, |read|
-            read.adj_deletes.iter().any(|(s, kind, t, _)| *s == source && *t == target && kind == &edge_type)))?;
-        if !deleted && let Some(mut existing) = self.current_owned_edge_properties(source, target, &edge_type, reader.clone())? {
-            if properties.is_empty() || properties.iter().all(|(key, value)| existing.values.get(key) == Some(value)) { return Ok(false); }
-            let controls = properties.len().checked_add(existing.values.len())
-                .and_then(|n| n.checked_mul(std::mem::size_of::<(String, Value)>().saturating_add(1).saturating_mul(8)))
+        let deleted = handle.with_transactions(|transactions| {
+            transactions.with_read(tx, |read| {
+                read.adj_deletes
+                    .iter()
+                    .any(|(s, kind, t, _)| *s == source && *t == target && kind == &edge_type)
+            })
+        })?;
+        if !deleted
+            && let Some(mut existing) =
+                self.current_owned_edge_properties(source, target, &edge_type, reader.clone())?
+        {
+            if properties.is_empty()
+                || properties
+                    .iter()
+                    .all(|(key, value)| existing.values.get(key) == Some(value))
+            {
+                return Ok(false);
+            }
+            let controls = properties
+                .len()
+                .checked_add(existing.values.len())
+                .and_then(|n| {
+                    n.checked_mul(
+                        std::mem::size_of::<(String, Value)>()
+                            .saturating_add(1)
+                            .saturating_mul(8),
+                    )
+                })
                 .ok_or_else(|| Error::Other("graph merged property size overflow".into()))?;
-            existing._memory.try_grow_for(controls, "graph", "edge_property_input",
-                "Raise MEMORY_LIMIT to merge this edge's properties.")?;
+            existing._memory.try_grow_for(
+                controls,
+                "graph",
+                "edge_property_input",
+                "Raise MEMORY_LIMIT to merge this edge's properties.",
+            )?;
             existing.values.extend(properties);
-            let entry = AdjEntry { source, target, edge_type, properties: std::mem::take(&mut existing.values),
-                created_tx: tx, deleted_tx: None, lsn: Lsn(0) };
+            let entry = AdjEntry {
+                source,
+                target,
+                edge_type,
+                properties: std::mem::take(&mut existing.values),
+                created_tx: tx,
+                deleted_tx: None,
+                lsn: Lsn(0),
+            };
             self.stage_owned_graph_entry(handle, tx, &entry, true, reader)?;
             return Ok(false);
         }
-        let duplicate = handle.with_transactions(|transactions| transactions.with_read(tx, |read|
-            read.adj_inserts.iter().any(|entry| entry.source == source && entry.target == target && entry.edge_type == edge_type)))?;
-        if duplicate { return Ok(false); }
-        if self.dag_edge_types.read().contains(&edge_type)
-            && (source == target || self.owned_dag_reaches(handle, tx, target, source, &edge_type, reader.clone())?) {
-            return Err(Error::CycleDetected { edge_type, source_node: source, target_node: target });
+        let duplicate = handle.with_transactions(|transactions| {
+            transactions.with_read(tx, |read| {
+                read.adj_inserts.iter().any(|entry| {
+                    entry.source == source && entry.target == target && entry.edge_type == edge_type
+                })
+            })
+        })?;
+        if duplicate {
+            return Ok(false);
         }
-        let entry = AdjEntry { source, target, edge_type, properties, created_tx: tx, deleted_tx: None, lsn: Lsn(0) };
+        if self.dag_edge_types.read().contains(&edge_type)
+            && (source == target
+                || self.owned_dag_reaches(
+                    handle,
+                    tx,
+                    target,
+                    source,
+                    &edge_type,
+                    reader.clone(),
+                )?)
+        {
+            return Err(Error::CycleDetected {
+                edge_type,
+                source_node: source,
+                target_node: target,
+            });
+        }
+        let entry = AdjEntry {
+            source,
+            target,
+            edge_type,
+            properties,
+            created_tx: tx,
+            deleted_tx: None,
+            lsn: Lsn(0),
+        };
         self.stage_owned_graph_entry(handle, tx, &entry, false, reader)?;
         Ok(true)
     }
 
     /// Carry one edge forward with a new property set, as one replacement.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn replace_edge_properties(
         &self,
         tx: TxId,
@@ -2864,7 +3171,10 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         .map(|(result, _credit)| result)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn neighbors(
         &self,
         node: NodeId,
@@ -2901,7 +3211,15 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<bool> {
         if let ExecutorTransactions::Owned(handle) = &self.tx_mgr {
-            return self.insert_owned_edge(handle, tx, source, target, edge_type, properties, read_memory);
+            return self.insert_owned_edge(
+                handle,
+                tx,
+                source,
+                target,
+                edge_type,
+                properties,
+                read_memory,
+            );
         }
         let deleted_in_ws = self.tx_mgr.with_write_set(tx, |ws| {
             ws.adj_deletes
@@ -2980,7 +3298,10 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         Ok(true)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn delete_edge(
         &self,
         tx: TxId,
@@ -3009,28 +3330,51 @@ impl<S: WriteSetApplicator> GraphExecutor for MemGraphExecutor<S> {
         )?;
 
         if let ExecutorTransactions::Owned(handle) = &self.tx_mgr {
-            let _input = contextdb_core::read_memory::ReadCredit::try_new(read_memory, edge_type.len(),
-                "graph", "edge_delete_input", "Raise MEMORY_LIMIT to stage this edge deletion.")?;
+            let _input = contextdb_core::read_memory::ReadCredit::try_new(
+                read_memory,
+                edge_type.len(),
+                "graph",
+                "edge_delete_input",
+                "Raise MEMORY_LIMIT to stage this edge deletion.",
+            )?;
             let deletes = [(source, edge_type.to_owned(), target, tx)];
-            return handle.with_transactions(|transactions| transactions.with_engine(tx, |held| {
-                held.with_tx_checkpoint(|held| {
-                    loop {
-                        let position = held.read().adj_inserts.iter().rposition(|entry|
-                            entry.source == source && entry.target == target && entry.edge_type == edge_type);
-                        let Some(position) = position else { break; };
-                        let empty = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::AdjInserts(&[]))?;
-                        let remove = held.prepare_aux_splice(position, &[position], empty)?;
-                        held.publish_tx(remove);
-                    }
-                    if committed_edge_exists && !held.read().adj_deletes.iter().any(|(s, kind, t, _)|
-                        *s == source && *t == target && kind == edge_type) {
-                        let delete = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::AdjDeletes(&deletes))?;
-                        let delete = held.prepare_aux_splice(held.read().adj_deletes.len(), &[], delete)?;
-                        held.publish_tx(delete);
-                    }
-                    Ok(())
+            return handle.with_transactions(|transactions| {
+                transactions.with_engine(tx, |held| {
+                    held.with_tx_checkpoint(|held| {
+                        loop {
+                            let position = held.read().adj_inserts.iter().rposition(|entry| {
+                                entry.source == source
+                                    && entry.target == target
+                                    && entry.edge_type == edge_type
+                            });
+                            let Some(position) = position else {
+                                break;
+                            };
+                            let empty = held.copy_aux(
+                                contextdb_tx::staged_source::AuxBorrow::AdjInserts(&[]),
+                            )?;
+                            let remove = held.prepare_aux_splice(position, &[position], empty)?;
+                            held.publish_tx(remove);
+                        }
+                        if committed_edge_exists
+                            && !held.read().adj_deletes.iter().any(|(s, kind, t, _)| {
+                                *s == source && *t == target && kind == edge_type
+                            })
+                        {
+                            let delete = held.copy_aux(
+                                contextdb_tx::staged_source::AuxBorrow::AdjDeletes(&deletes),
+                            )?;
+                            let delete = held.prepare_aux_splice(
+                                held.read().adj_deletes.len(),
+                                &[],
+                                delete,
+                            )?;
+                            held.publish_tx(delete);
+                        }
+                        Ok(())
+                    })
                 })
-            }));
+            });
         }
 
         self.tx_mgr.with_write_set(tx, |ws| {

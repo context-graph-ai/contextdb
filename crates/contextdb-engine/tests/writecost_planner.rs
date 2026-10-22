@@ -143,7 +143,11 @@ fn every_route(
         .expect("stage a row of the reader's own");
     answers.push((
         "transaction with staged rows",
-        classify(narrowed.execute_in_tx(tx, sql, binds).map(|r| r.rows().len())),
+        classify(
+            narrowed
+                .execute_in_tx(tx, sql, binds)
+                .map(|r| r.rows().len()),
+        ),
     ));
     narrowed.rollback(tx).expect("rollback");
     answers
@@ -424,7 +428,8 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
             )
             .unwrap();
         assert_eq!(
-            staged.rows_affected(), 1,
+            staged.rows_affected(),
+            1,
             "the unique route sees this transaction's replacement"
         );
         let read = db
@@ -481,7 +486,8 @@ fn unique_predicate_writes_keep_equal_work_across_retained_history() {
             )
             .unwrap();
         assert_eq!(
-            deleted.rows_affected(), 1,
+            deleted.rows_affected(),
+            1,
             "the secondary unique key sees the staged replacement"
         );
         db.commit(tx).unwrap();

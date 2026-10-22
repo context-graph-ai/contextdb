@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 #[doc(hidden)]
 pub use crate::json_read_builder::{
-    ClosedJsonReadHooks, JsonReadAdmissionGuard, deserialize_json_in_read_scope, json_retained_heap_bytes,
+    ClosedJsonReadHooks, JsonReadAdmissionGuard, deserialize_json_in_read_scope,
+    json_retained_heap_bytes,
 };
 
 pub type NodeId = Uuid;
@@ -351,7 +352,11 @@ thread_local! {
 #[doc(hidden)]
 pub fn with_borrowed_json_wire<T>(make: impl FnOnce() -> T) -> T {
     struct Restore(bool);
-    impl Drop for Restore { fn drop(&mut self) { BORROWED_JSON_WIRE.with(|slot| slot.set(self.0)); } }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BORROWED_JSON_WIRE.with(|slot| slot.set(self.0));
+        }
+    }
     let _restore = Restore(BORROWED_JSON_WIRE.with(|slot| slot.replace(true)));
     make()
 }
@@ -380,7 +385,10 @@ mod json_as_string {
         // on both codec visits; no temporary text buffer exists to fund.
         if super::BORROWED_JSON_WIRE.with(std::cell::Cell::get) && !ser.is_human_readable() {
             use serde::ser::{Error, SerializeSeq};
-            struct BinaryText<S: SerializeSeq> { sequence: S, failure: Option<S::Error> }
+            struct BinaryText<S: SerializeSeq> {
+                sequence: S,
+                failure: Option<S::Error>,
+            }
             impl<S: SerializeSeq> std::io::Write for BinaryText<S> {
                 fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                     for byte in bytes {
@@ -391,12 +399,21 @@ mod json_as_string {
                     }
                     Ok(bytes.len())
                 }
-                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
             }
-            let length = count.0.ok_or_else(|| S::Error::custom("JSON text length overflow"))?;
-            let mut output = BinaryText { sequence: ser.serialize_seq(Some(length))?, failure: None };
+            let length = count
+                .0
+                .ok_or_else(|| S::Error::custom("JSON text length overflow"))?;
+            let mut output = BinaryText {
+                sequence: ser.serialize_seq(Some(length))?,
+                failure: None,
+            };
             let encoded = serde_json::to_writer(&mut output, value);
-            if let Some(error) = output.failure { return Err(error); }
+            if let Some(error) = output.failure {
+                return Err(error);
+            }
             encoded.map_err(S::Error::custom)?;
             return output.sequence.end();
         }
@@ -452,7 +469,9 @@ mod json_as_string {
                     // selected CodecError boundary. Its custom implementation
                     // sees the ledger cause and returns Captured without text.
                     match crate::json_read_builder::capture_closed_json(error) {
-                        Ok(()) => Err(serde::de::Error::custom("JSON diagnosis retained by producer")),
+                        Ok(()) => Err(serde::de::Error::custom(
+                            "JSON diagnosis retained by producer",
+                        )),
                         // Unknown native/custom recipes keep their original
                         // conversion and remain outside positive coverage.
                         Err(error) => Err(serde::de::Error::custom(error)),

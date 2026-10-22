@@ -10,7 +10,10 @@ pub(super) const CHANGE_LOG_LSN_COUNT: TableDefinition<u64, u64> =
     TableDefinition::new("change_log_lsn_count");
 
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn ddl_lsn_from_key(key: &str) -> Result<Lsn> {
         key.split_once(':')
             .map_or(key, |(lsn, _)| lsn)
@@ -22,7 +25,10 @@ impl RedbPersistence {
             })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn numeric_change_key(key: &str) -> Result<[u8; 16]> {
         let (lsn, ordinal) = key
             .split_once(':')
@@ -57,7 +63,10 @@ impl RedbPersistence {
     }
 
     /// Repack carries exact private bytes; it never reauthors an occurrence.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn write_carried_change_log_selectors_in_write(
         write: &redb::WriteTransaction,
         key: &str,
@@ -93,7 +102,10 @@ impl RedbPersistence {
         Self::write_change_log_selectors_in_write(write, key, bytes)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn write_change_log_selectors_in_write(
         write: &redb::WriteTransaction,
         textual_key: &str,
@@ -138,7 +150,10 @@ impl RedbPersistence {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn remove_change_log_selectors_in_write(
         write: &redb::WriteTransaction,
         textual_key: &str,
@@ -147,7 +162,10 @@ impl RedbPersistence {
         Self::detach_change_log_selectors_in_write(write, textual_key, false)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn detach_change_log_selectors_in_write(
         write: &redb::WriteTransaction,
         textual_key: &str,
@@ -157,7 +175,10 @@ impl RedbPersistence {
         Self::detach_change_log_selectors_validated_in_write(write, textual_key, carry)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn detach_change_log_selectors_validated_in_write(
         write: &redb::WriteTransaction,
         textual_key: &str,
@@ -220,7 +241,10 @@ impl RedbPersistence {
 }
 
 impl super::writer_source::WriterSnapshot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn ddl_history_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -229,7 +253,10 @@ impl super::writer_source::WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).ddl_history_cursor(owner, since)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn ddl_history_cursor_ordered(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -241,7 +268,10 @@ impl super::writer_source::WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn ddl_history_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -250,7 +280,10 @@ impl WriterSnapshotHandle {
         self.ddl_history_cursor_ordered(owner, since, false)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn ddl_history_cursor_ordered(
         &self,
         owner: SourceWindowOwner,
@@ -282,7 +315,10 @@ impl WriterSnapshotHandle {
 impl super::writer_source::WriterReadCursor {
     /// Compare only the requested declaration kind. Other history payloads
     /// remain borrowed storage bytes and never become decoded metadata copies.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_ddl_candidate(
         &mut self,
         encoded_kind: u8,
@@ -311,7 +347,10 @@ impl super::writer_source::WriterReadCursor {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_ddl_position(
         &mut self,
     ) -> Result<Option<super::writer_source::WriterWindow<Lsn>>> {
@@ -324,7 +363,10 @@ impl super::writer_source::WriterReadCursor {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_ddl_history(
         &mut self,
     ) -> Result<Option<super::writer_source::WriterWindow<(Lsn, DdlChange)>>> {
@@ -346,7 +388,8 @@ impl super::writer_source::WriterReadCursor {
                 drop(change);
                 owner.release(owner.held() - before);
                 return Err(Error::Other(
-                    "declaration history record has trailing bytes".into()));
+                    "declaration history record has trailing bytes".into(),
+                ));
             }
             Ok((Lsn(lsn), change))
         })

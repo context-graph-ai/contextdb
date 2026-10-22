@@ -98,7 +98,8 @@ fn reads_decode_only_under_the_declared_reader_never_the_writer() {
     let db = store(&path, 64 * 1024 * 1024, 1 << 30);
     let artifact = root.path().join("reads.snapshot");
     db.export_snapshot(&artifact).unwrap();
-    let parent = DeclaredReadMemory::from_reader_limit(1 << 30).expect("admit the declared fixture root");
+    let parent =
+        DeclaredReadMemory::from_reader_limit(1 << 30).expect("admit the declared fixture root");
     let inspector =
         SnapshotInspector::open(&artifact, parent.child().unwrap(), parent.clone()).unwrap();
 

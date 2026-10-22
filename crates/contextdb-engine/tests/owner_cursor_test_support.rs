@@ -13,9 +13,15 @@ pub struct OwnerPageFixture {
     pub has_more: bool,
 }
 impl OwnerPageFixture {
-    pub fn rows(&self) -> &[Vec<contextdb_core::Value>] { &self.rows }
-    pub fn columns(&self) -> &[String] { &self.columns }
-    pub fn has_more(&self) -> bool { self.has_more }
+    pub fn rows(&self) -> &[Vec<contextdb_core::Value>] {
+        &self.rows
+    }
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    pub fn has_more(&self) -> bool {
+        self.has_more
+    }
     fn validate(&self) -> Result<(), ReadEncodingError> {
         if self.rows.iter().any(|row| row.len() != self.columns.len()) {
             return Err(ReadEncodingError::InvalidPayload);
@@ -84,8 +90,14 @@ pub fn with_empty_observation(page_bytes: Vec<u8>) -> Vec<u8> {
 
 pub fn assert_empty_observation(bytes: &[u8], page: &CursorPage) {
     let observed = decode(bytes).expect("decode the complete owner observation");
-    assert_eq!((&observed.page.columns[..], &observed.page.rows[..], observed.page.has_more),
-        (page.columns(), page.rows(), page.has_more()));
+    assert_eq!(
+        (
+            &observed.page.columns[..],
+            &observed.page.rows[..],
+            observed.page.has_more
+        ),
+        (page.columns(), page.rows(), page.has_more())
+    );
     assert_eq!(observed.trace.physical_plan, "Scan");
     assert_eq!(observed.trace.index_used, None);
     assert_eq!(observed.trace.rows_examined, 0);

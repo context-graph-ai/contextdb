@@ -72,7 +72,8 @@ fn take_commit_fault(transaction: &redb::WriteTransaction) -> Result<bool> {
 pub(crate) fn before_custody_commit(transaction: &redb::WriteTransaction) -> Result<()> {
     if take_commit_fault(transaction)? {
         return Err(contextdb_core::Error::Other(
-            "storage error: injected delivery commit failure".into()));
+            "storage error: injected delivery commit failure".into(),
+        ));
     }
     Ok(())
 }

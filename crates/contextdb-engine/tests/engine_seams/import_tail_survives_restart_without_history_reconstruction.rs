@@ -62,22 +62,22 @@ fn run(history: usize) -> usize {
         // native pages. Both layers must still read that selected root.
         let before = {
             let fixture_answer_38 = db
-            .execute(
-                "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1",
-                &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
-            )
-            .unwrap();
+                .execute(
+                    "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1",
+                    &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
+                )
+                .unwrap();
             fixture_answer_38.rows().to_vec()
         };
         assert_eq!(before, vec![vec![Value::Int64(10_000)]]);
         assert!(db.persist_import_vector_tails().unwrap());
         let rows = {
             let fixture_answer_39 = db
-            .execute(
-                "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1",
-                &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
-            )
-            .unwrap();
+                .execute(
+                    "SELECT id FROM points WHERE bucket = 1 ORDER BY embedding <=> $q LIMIT 1",
+                    &HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]),
+                )
+                .unwrap();
             fixture_answer_39.rows().to_vec()
         };
         assert_eq!(rows, vec![vec![Value::Int64(10_000)]]);
@@ -197,7 +197,8 @@ fn partition_status(db: &Database) -> HashMap<String, Value> {
     assert_eq!(result.rows().len(), 1);
     result
         .columns()
-        .iter().cloned()
+        .iter()
+        .cloned()
         .zip(result.rows().iter().next().unwrap().iter().cloned())
         .collect()
 }

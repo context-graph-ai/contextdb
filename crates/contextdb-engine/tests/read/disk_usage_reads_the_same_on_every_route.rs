@@ -107,7 +107,8 @@ fn disk_usage_is_the_same_number_from_the_owner_and_from_the_file() {
         .expect("the file answers what the same store is using");
 
     assert_eq!(
-        from_the_file.columns(), over_the_channel.columns(),
+        from_the_file.columns(),
+        over_the_channel.columns(),
         "one question, one shape of answer"
     );
     assert_eq!(

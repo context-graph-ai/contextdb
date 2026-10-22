@@ -59,11 +59,15 @@ impl BoundaryState {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != STATE_BYTES {
-            return Err(Error::Other((
-                "historical index commitment has invalid size".to_owned()).into()));
+            return Err(Error::Other(
+                ("historical index commitment has invalid size".to_owned()).into(),
+            ));
         }
         let mut state = Self::empty();
         for (lane, pair) in state.lanes.iter_mut().zip(bytes.chunks_exact(2)) {
@@ -110,7 +114,10 @@ fn framed(parts: &[&[u8]]) -> Vec<u8> {
 
 /// The identity a re-declared index changes: its name and its encoded
 /// declaration.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn index_identity(declaration: &IndexDecl) -> Result<Vec<u8>> {
     Ok(framed(&[
         declaration.name.as_bytes(),
@@ -124,7 +131,10 @@ pub(super) fn index_identity(declaration: &IndexDecl) -> Result<Vec<u8>> {
 /// Heap-allocated: a commit folds these inside deep writer stacks.
 /// The framing is streamed into the hasher, so the only allocations are the
 /// two fixed-size buffers [`CommitmentBatch`] funds as fold scratch.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn element(table: &str, identity: &[u8], key_row: &[u8], tx: TxId) -> Box<[u16; LANES]> {
     element_checked(table, identity, key_row, tx, &mut || Ok(()))
         .expect("an unchecked element never refuses")
@@ -132,7 +142,10 @@ fn element(table: &str, identity: &[u8], key_row: &[u8], tx: TxId) -> Box<[u16; 
 
 /// [`element`] with a checkpoint between every 64 KiB of the key and row it
 /// hashes, so a wide key never runs a request past its cancellation.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn element_checked(
     table: &str,
     identity: &[u8],
@@ -148,7 +161,10 @@ fn element_checked(
 
 /// The element hash up to its key part: the domain, the table and the index
 /// identity, each length-prefixed. The key part follows, then a boundary.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn element_prefix(
     table: &str,
     identity: &[u8],
@@ -161,7 +177,10 @@ fn element_prefix(
     Ok(hasher)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn hash_part(
     hasher: &mut blake3::Hasher,
     part: &[u8],
@@ -178,7 +197,10 @@ fn hash_part(
 /// Close an element hash that holds its key part with the boundary `tx`.
 /// One version's two elements share everything up to here, so the caller
 /// clones the hasher once its key is streamed and finishes each copy.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn element_finish(
     mut hasher: blake3::Hasher,
     tx: TxId,
@@ -204,7 +226,10 @@ fn element_finish(
 
 /// The canonical posting position of `(key, row)` at transaction zero: the
 /// one byte string both sides frame for a version or posting of that row.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn key_row(key: &IndexKey, row: RowId) -> Result<Vec<u8>> {
     Ok(DurableRelationalIndexKey::new(key.clone(), row, TxId(0))?.0)
 }
@@ -214,7 +239,10 @@ pub(super) fn key_row(key: &IndexKey, row: RowId) -> Result<Vec<u8>> {
 /// stored vector is projected in place, never decoding the rest of the row.
 /// The writer's fold keeps the key; verification streams the same bytes into
 /// its element hash instead.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn key_row_from_body(body: &[u8], declaration: &IndexDecl) -> Result<Vec<u8>> {
     let mut key = content_identity::version_manifest::VecKey::default();
     let mut scratch = Vec::new();
@@ -234,7 +262,10 @@ pub(super) fn key_row_from_body(body: &[u8], declaration: &IndexDecl) -> Result<
 /// [`key_row_from_body`] with the caller's checkpoint, run at least once per
 /// 64 KiB of the body and every 4096 projected vector components, and its
 /// own `reserve`, called before each allocation.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn key_row_from_body_with(
     body: &[u8],
     declaration: &IndexDecl,
@@ -324,7 +355,10 @@ enum Funding {
 }
 
 impl Funding {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn diagnostic_budget(&self) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
         match self {
             Self::Writer { owner, .. } => owner.diagnostic_budget(),
@@ -332,7 +366,10 @@ impl Funding {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn admit(&mut self, bytes: usize, operation: &str) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if take_admission_refusal_for_test() {
@@ -444,7 +481,10 @@ fn pair_bytes(table: &str, index: &str) -> usize {
 }
 
 /// The exact length of [`index_identity`], measured without building it.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn identity_len(declaration: &IndexDecl) -> Result<usize> {
     let mut size = bincode::enc::write::SizeWriter::default();
     bincode::serde::encode_into_writer(declaration, &mut size, bincode::config::standard())
@@ -472,7 +512,10 @@ pub(crate) struct CommitmentBatch {
 }
 
 impl CommitmentBatch {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_funding(mut funding: Funding) -> Result<Self> {
         funding.admit(FOLD_SCRATCH_BYTES, "fold_scratch")?;
         Ok(Self {
@@ -485,7 +528,10 @@ impl CommitmentBatch {
     }
 
     /// A batch paid for by the active writer operation.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn for_writer() -> Result<Self> {
         Self::with_funding(Funding::Writer {
             owner: crate::read_image_memory::active_owner()?,
@@ -494,7 +540,10 @@ impl CommitmentBatch {
     }
 
     /// A batch paid for from the owned-writer path's original reservation.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn for_original(
         original: &crate::memory_accounting::OwnedMemoryReservation,
     ) -> Result<Self> {
@@ -511,7 +560,10 @@ impl CommitmentBatch {
 
     /// Hold room for a temporary of `bytes`: only growth past the high-water
     /// mark is admitted.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn admit_transient(&mut self, bytes: usize) -> Result<()> {
         if bytes > self.transient {
             self.funding
@@ -521,7 +573,10 @@ impl CommitmentBatch {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn index(
         &mut self,
         write_txn: &redb::WriteTransaction,
@@ -566,7 +621,10 @@ impl CommitmentBatch {
         clippy::too_many_arguments,
         reason = "one interval names its table, index, side, key and row, both ends and its sign"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn fold_interval(
         &mut self,
         write_txn: &redb::WriteTransaction,
@@ -599,7 +657,10 @@ impl CommitmentBatch {
     /// index being rebuilt, or the versions of a row table being replaced
     /// wholesale. The other side is kept, so a replacement that leaves the
     /// postings alone must reproduce exactly what they cover.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reset(
         &mut self,
         write_txn: &redb::WriteTransaction,
@@ -621,7 +682,10 @@ impl CommitmentBatch {
     /// [`Self::finish`] requires the index to hold no posting yet and
     /// withdraws any publication, so a reader sees an index with no postings
     /// and nothing to trust until the rebuild publishes it.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn defer_until_rebuild(&mut self, table: &str, indexes: &[IndexDecl]) -> Result<()> {
         for declaration in indexes {
             if !self.deferred.contains(table, &declaration.name) {
@@ -637,7 +701,10 @@ impl CommitmentBatch {
     /// dropped. Unless the pair is written again in this transaction, its
     /// states and publication are removed at [`Self::finish`], which also
     /// requires its posting table to be gone or empty.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn drop_index(&mut self, table: &str, index: &str) -> Result<()> {
         self.touched.remove(table, index);
         if !self.dropped.contains(table, index) {
@@ -651,7 +718,10 @@ impl CommitmentBatch {
     /// Store every touched pair, refuse unequal ones, and return the
     /// authenticated publications and the removals of cleared pairs, with the
     /// funding that pays for them.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn finish(mut self, write_txn: &redb::WriteTransaction) -> Result<Publications> {
         let pairs = self
             .touched
@@ -708,7 +778,11 @@ impl CommitmentBatch {
                     .delete_table(definition)
                     .map_err(RedbPersistence::storage_error)?;
             } else {
-                return Err(crate::funded_error::corruption_text(self.funding.diagnostic_budget(), &name, "a dropped historical index still holds postings".into()));
+                return Err(crate::funded_error::corruption_text(
+                    self.funding.diagnostic_budget(),
+                    &name,
+                    "a dropped historical index still holds postings".into(),
+                ));
             }
             for side in [Side::Postings, Side::Versions] {
                 states
@@ -731,8 +805,12 @@ impl CommitmentBatch {
                     .is_empty()
                     .map_err(RedbPersistence::storage_error)?
                 {
-                    return Err(crate::funded_error::corruption_display(self.funding.diagnostic_budget(), &name, "rows were written past a historical index that already holds \
-                                 postings"));
+                    return Err(crate::funded_error::corruption_display(
+                        self.funding.diagnostic_budget(),
+                        &name,
+                        "rows were written past a historical index that already holds \
+                                 postings",
+                    ));
                 }
                 // The rebuild derives both states afresh; nothing is kept that
                 // a reader could mistake for a publication.
@@ -748,10 +826,14 @@ impl CommitmentBatch {
                 continue;
             }
             if touched.postings != touched.versions {
-                return Err(crate::funded_error::corruption_display(self.funding.diagnostic_budget(), table, format_args!(
+                return Err(crate::funded_error::corruption_display(
+                    self.funding.diagnostic_budget(),
+                    table,
+                    format_args!(
                         "historical index {index} postings do not cover what its row versions \
                          cover"
-                    )));
+                    ),
+                ));
             }
             for (side, state) in [
                 (Side::Postings, &touched.postings),
@@ -810,7 +892,10 @@ impl Publications {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn load(
     write_txn: &redb::WriteTransaction,
     table: &str,
@@ -834,7 +919,10 @@ fn load(
 /// What a reader authenticates for one (table, index): the content-identity
 /// entry its stored states and declaration imply, and whether those states
 /// are equal. `None` when nothing is published for the pair.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn published_in_read(
     read: &redb::ReadTransaction,
     table: &str,
@@ -893,12 +981,25 @@ impl<'a> HistoricalPostings<'a> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn corrupt(&self, reason: &str) -> Error {
-        crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), super::DiagnosticIndexName { table: &self.table, index: &self.declaration.name }, reason)
+        crate::funded_error::corruption_display(
+            crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),
+            super::DiagnosticIndexName {
+                table: &self.table,
+                index: &self.declaration.name,
+            },
+            reason,
+        )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn end_at(&self, key: &DurableRelationalIndexKey) -> Result<Option<Option<TxId>>> {
         self.inner
             .get(key)
@@ -912,7 +1013,10 @@ impl<'a> HistoricalPostings<'a> {
         clippy::type_complexity,
         reason = "a neighbour is its start and its end, each side optional"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn neighbours(
         &self,
         key: &IndexKey,
@@ -957,7 +1061,10 @@ impl<'a> HistoricalPostings<'a> {
     }
 
     /// The interval invariant for `[start, end)` among its neighbours.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn check_interval(
         &self,
         key: &IndexKey,
@@ -988,7 +1095,10 @@ impl<'a> HistoricalPostings<'a> {
 
     /// Write the interval starting at `position` with `end`, replacing
     /// whatever interval started there.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn put(
         &mut self,
         batch: &mut CommitmentBatch,
@@ -1028,7 +1138,10 @@ impl<'a> HistoricalPostings<'a> {
     }
 
     /// Remove the interval starting at `position`, if any.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn remove(
         &mut self,
         batch: &mut CommitmentBatch,
@@ -1094,7 +1207,8 @@ pub(super) fn damage_postings_state_for_test(
         Some(stored) => BoundaryState::decode(stored.value())?,
         None => {
             return Err(Error::Other(
-                "no historical index commitment to damage".into()));
+                "no historical index commitment to damage".into(),
+            ));
         }
     };
     state.lanes[0] = state.lanes[0].wrapping_add(1);
@@ -1122,7 +1236,10 @@ pub struct HistoricalIndexVerification {
 /// and row version, so the request's cancellation and active-time limit stop
 /// it mid-walk, and its scratch, keys and answer are charged to the
 /// requesting reader's `memory` before they are allocated.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn verify_in_read(
     read: &redb::ReadTransaction,
     verifier: &content_identity::ContentIdentityReadVerifier,
@@ -1131,7 +1248,7 @@ pub(super) fn verify_in_read(
     memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     checkpoint: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<HistoricalIndexVerification>> {
-        let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
+    let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
     const OPERATION: &str = "historical_index_verification";
     const HINT: &str = "Raise MEMORY_LIMIT to verify this table's historical indexes.";
@@ -1195,7 +1312,9 @@ pub(super) fn verify_in_read(
     let rows_name = RedbPersistence::rel_table_name(table);
     for declaration in &declarations {
         let index_name = RedbPersistence::relational_index_table_name(table, &declaration.name);
-        let corrupt = |path: &str, reason: String| crate::funded_error::corruption_display(Ok(credit_budget.clone()), path, reason);
+        let corrupt = |path: &str, reason: String| {
+            crate::funded_error::corruption_display(Ok(credit_budget.clone()), path, reason)
+        };
         let identity = index_identity(declaration)?;
         let mut postings = BoundaryState::empty();
         let mut posting_count = 0_u64;
@@ -1232,7 +1351,9 @@ pub(super) fn verify_in_read(
                         &mut group,
                         bincode::config::standard(),
                     )
-                    .map_err(|error| Error::Other((format!("bincode encode error: {error}")).into()))?;
+                    .map_err(|error| {
+                        Error::Other((format!("bincode encode error: {error}")).into())
+                    })?;
                     let end = RedbPersistence::decode_exact::<Option<TxId>>(end.value())?;
                     if end.is_some_and(|end| end <= start) || start == OPEN_END {
                         return Err(corrupt(
@@ -1387,7 +1508,10 @@ impl KeyCredit {
     fn start_record(&mut self, retained: usize) {
         self.record = retained;
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn admit(&mut self, bytes: usize) -> Result<()> {
         self.record = self.record.saturating_add(bytes);
         if self.record > self.held {
@@ -1399,7 +1523,10 @@ impl KeyCredit {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn entry_state_bytes(
     read: &redb::ReadTransaction,
     table: &str,
@@ -1418,7 +1545,10 @@ fn entry_state_bytes(
 
 impl RedbPersistence {
     /// [`verify_in_read`] against the committed image.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verify_historical_indexes(
         &self,
         table: &str,
@@ -1448,7 +1578,10 @@ impl RedbPersistence {
 
 impl RetainedReadSource {
     /// [`verify_in_read`] against this source's pinned committed root.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verify_historical_indexes(
         &self,
         table: &str,

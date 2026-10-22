@@ -4,7 +4,10 @@ use super::*;
 impl RedbPersistence {
     /// Remove the terminal lifetime using a borrowed posting guard and a single
     /// encoded scalar endpoint. Payload width never multiplies into row copies.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prune_terminal_relational_posting_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -111,8 +114,9 @@ impl RedbPersistence {
                 continue;
             };
             let name = Self::relational_index_table_name(table, &declaration.name);
-            let damage = |reason: &str| crate::funded_error::corruption_display(
-                memory.diagnostic_budget(), &name, reason);
+            let damage = |reason: &str| {
+                crate::funded_error::corruption_display(memory.diagnostic_budget(), &name, reason)
+            };
             let definition = TableDefinition::<BorrowedRelationalIndexKey, &[u8]>::new(&name);
             let index = match write.open_table(definition) {
                 Ok(index) => index,
@@ -192,7 +196,10 @@ impl RedbPersistence {
     /// The predecessor seek and at most two replacements do not depend on the
     /// number of retained row versions. The caller removes the row manifest in
     /// this same transaction, so no committed root can observe only one half.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prune_relational_posting_intervals_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -260,7 +267,14 @@ impl RedbPersistence {
                 Err(redb::TableError::TableDoesNotExist(_)) => continue,
                 Err(error) => return Err(Self::storage_error(error)),
             };
-            let corrupt = |reason: &str| crate::funded_error::corruption_display(self.require_decode_original().and_then(|original| original.read_budget()), &name, reason);
+            let corrupt = |reason: &str| {
+                crate::funded_error::corruption_display(
+                    self.require_decode_original()
+                        .and_then(|original| original.read_budget()),
+                    &name,
+                    reason,
+                )
+            };
             let normalized =
                 contextdb_relational::index_key_for_row(&declaration.columns, &row.values);
             let probe =
@@ -543,7 +557,8 @@ mod tests {
                 db.execute("SELECT id FROM expired WHERE tag = 'same'", &HashMap::new())
             })
             .unwrap()
-            .rows().to_vec()
+            .rows()
+            .to_vec()
         };
         assert_eq!(read(&db), vec![vec![Value::Int64(1)]]);
         let pin = db.pin_snapshot(snapshot).unwrap();
@@ -599,10 +614,9 @@ mod tests {
         // default_decode_accountant into the empty slot unless a writer image for
         // this handle is already active. Hold that image across open, then drop
         // it once attach has kept this same pointer.
-        let _open_writer = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            writer_handle.clone(),
-        )
-        .unwrap();
+        let _open_writer =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(writer_handle.clone())
+                .unwrap();
         let persistence = RedbPersistence::open_with_cache(&path, 0).unwrap();
         persistence.attach_memory_accountant(writer_handle.clone());
         let writer = persistence.proof_accountant().unwrap();
@@ -639,8 +653,10 @@ mod tests {
                 let write = database
                     .begin_write()
                     .map_err(RedbPersistence::storage_error)?;
-                let funded_original = crate::read_image_memory::active_owner()?.preparation_original()?;
-                let mut outputs = content_identity::OriginalIdentityMutations::new(&funded_original, 0)?;
+                let funded_original =
+                    crate::read_image_memory::active_owner()?.preparation_original()?;
+                let mut outputs =
+                    content_identity::OriginalIdentityMutations::new(&funded_original, 0)?;
                 persistence.prune_relational_posting_intervals_in_write(
                     &write,
                     "counted",
@@ -725,10 +741,9 @@ mod tests {
         // default_decode_accountant into the empty slot unless a writer image for
         // this handle is already active. Hold that image across open, then drop
         // it once attach has kept this same pointer.
-        let _open_writer = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            writer_handle.clone(),
-        )
-        .unwrap();
+        let _open_writer =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(writer_handle.clone())
+                .unwrap();
         let persistence = RedbPersistence::open_with_cache(&path, 0).unwrap();
         persistence.attach_memory_accountant(writer_handle.clone());
         let writer = persistence.proof_accountant().unwrap();
@@ -819,10 +834,9 @@ mod tests {
         // default_decode_accountant into the empty slot unless a writer image for
         // this handle is already active. Hold that image across open, then drop
         // it once attach has kept this same pointer.
-        let _open_writer = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            writer_handle.clone(),
-        )
-        .unwrap();
+        let _open_writer =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(writer_handle.clone())
+                .unwrap();
         let persistence = RedbPersistence::open_with_cache(&path, 0).unwrap();
         persistence.attach_memory_accountant(writer_handle.clone());
         let writer = persistence.proof_accountant().unwrap();
@@ -964,7 +978,9 @@ mod tests {
             .unwrap();
         drop(persistence);
         assert_eq!(
-            writer.usage().used
+            writer
+                .usage()
+                .used
                 .checked_sub(engine_control_baseline)
                 .expect("no underfunded controls"),
             0,
@@ -998,10 +1014,9 @@ mod tests {
         // default_decode_accountant into the empty slot unless a writer image for
         // this handle is already active. Hold that image across open, then drop
         // it once attach has kept this same pointer.
-        let _open_writer = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            writer_handle.clone(),
-        )
-        .unwrap();
+        let _open_writer =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(writer_handle.clone())
+                .unwrap();
         let persistence = RedbPersistence::open_with_cache(&path, 0).unwrap();
         persistence.attach_memory_accountant(writer_handle.clone());
         let writer = persistence.proof_accountant().unwrap();
@@ -1052,8 +1067,10 @@ mod tests {
                     let write = database
                         .begin_write()
                         .map_err(RedbPersistence::storage_error)?;
-                    let funded_original = crate::read_image_memory::active_owner()?.preparation_original()?;
-                    let mut outputs = content_identity::OriginalIdentityMutations::new(&funded_original, 0)?;
+                    let funded_original =
+                        crate::read_image_memory::active_owner()?.preparation_original()?;
+                    let mut outputs =
+                        content_identity::OriginalIdentityMutations::new(&funded_original, 0)?;
                     persistence.prune_relational_posting_intervals_in_write(
                         &write,
                         "points",
@@ -1113,7 +1130,9 @@ mod tests {
             .unwrap();
         drop(persistence);
         assert_eq!(
-            writer.usage().used
+            writer
+                .usage()
+                .used
                 .checked_sub(engine_control_baseline)
                 .expect("no underfunded controls"),
             0,

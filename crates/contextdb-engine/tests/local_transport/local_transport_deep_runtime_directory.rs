@@ -143,7 +143,10 @@ fn an_owner_serves_and_a_reader_reads_below_a_runtime_directory_past_the_address
         owner_handshake(&store),
         ReadClientTimeouts::default(),
         clock,
-        database.declared_reader_memory().expect("original reader owner").into(),
+        database
+            .declared_reader_memory()
+            .expect("original reader owner")
+            .into(),
     ))
     .expect("a reader connects to the deep channel");
 

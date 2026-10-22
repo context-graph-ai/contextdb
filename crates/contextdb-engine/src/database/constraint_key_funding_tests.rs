@@ -44,7 +44,8 @@ fn a_unique_key_larger_than_the_read_limit_validates_on_the_writer_budget() {
         .execute("INSERT INTO notes VALUES (2, $body)", &body("k"))
         .unwrap();
     assert_eq!(
-        duplicate.rows_affected(), 0,
+        duplicate.rows_affected(),
+        0,
         "validation found the committed key and stored nothing"
     );
     db.close().unwrap();

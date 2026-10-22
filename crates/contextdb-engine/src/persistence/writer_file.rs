@@ -520,7 +520,8 @@ impl WriterFileView {
 
     fn native_owner(&self) -> Result<Arc<LockedWriterFile>, redb::NativeBackendError> {
         self.owner.upgrade().ok_or(redb::NativeBackendError::Closed(
-            redb::NativeIoCause::WriterOwnerClosed))
+            redb::NativeIoCause::WriterOwnerClosed,
+        ))
     }
 
     #[cfg(any(test, feature = "test-seams"))]
@@ -573,7 +574,11 @@ impl redb::StorageBackend for WriterFileView {
 
 impl redb::NativeStorageBackend for WriterFileView {
     fn native_len(&self) -> Result<u64, redb::NativeBackendError> {
-        self.native_owner()?.file.metadata().map(|metadata| metadata.len()).map_err(Into::into)
+        self.native_owner()?
+            .file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(Into::into)
     }
 
     #[cfg(unix)]
@@ -593,12 +598,20 @@ impl redb::NativeStorageBackend for WriterFileView {
     }
 
     #[cfg(windows)]
-    fn native_read(&self, mut offset: u64, mut out: &mut [u8]) -> Result<(), redb::NativeBackendError> {
+    fn native_read(
+        &self,
+        mut offset: u64,
+        mut out: &mut [u8],
+    ) -> Result<(), redb::NativeBackendError> {
         use std::os::windows::fs::FileExt as _;
         let owner = self.native_owner()?;
         while !out.is_empty() {
             match owner.file.seek_read(out, offset) {
-                Ok(0) => return Err(redb::NativeBackendError::Io(io::ErrorKind::UnexpectedEof.into())),
+                Ok(0) => {
+                    return Err(redb::NativeBackendError::Io(
+                        io::ErrorKind::UnexpectedEof.into(),
+                    ));
+                }
                 Ok(count) => {
                     offset += count as u64;
                     out = &mut out[count..];
@@ -613,10 +626,9 @@ impl redb::NativeStorageBackend for WriterFileView {
     fn native_set_len(&self, len: u64) -> Result<(), redb::NativeBackendError> {
         LAST_DISK_GROWTH_REFUSAL.set(None);
         let owner = self.native_owner()?;
-        let mut reserved = owner
-            .projected_growth_bytes
-            .lock()
-            .map_err(|_| redb::NativeBackendError::Closed(redb::NativeIoCause::ProjectedGrowthPoisoned))?;
+        let mut reserved = owner.projected_growth_bytes.lock().map_err(|_| {
+            redb::NativeBackendError::Closed(redb::NativeIoCause::ProjectedGrowthPoisoned)
+        })?;
         let current = owner.file.metadata()?.len();
         *reserved = len.saturating_sub(current);
         let result = if *reserved > 0 {
@@ -628,9 +640,13 @@ impl redb::NativeStorageBackend for WriterFileView {
                     limit_bytes: limit,
                 };
                 LAST_DISK_GROWTH_REFUSAL.set(Some(refusal));
-                Err(redb::NativeBackendError::Closed(redb::NativeIoCause::DiskGrowthRefused {
-                    current_bytes: current, projected_bytes: len, limit_bytes: limit,
-                }))
+                Err(redb::NativeBackendError::Closed(
+                    redb::NativeIoCause::DiskGrowthRefused {
+                        current_bytes: current,
+                        projected_bytes: len,
+                        limit_bytes: limit,
+                    },
+                ))
             } else {
                 owner.file.set_len(len).map_err(Into::into)
             }
@@ -682,12 +698,20 @@ impl redb::NativeStorageBackend for WriterFileView {
     }
 
     #[cfg(windows)]
-    fn native_write(&self, mut offset: u64, mut data: &[u8]) -> Result<(), redb::NativeBackendError> {
+    fn native_write(
+        &self,
+        mut offset: u64,
+        mut data: &[u8],
+    ) -> Result<(), redb::NativeBackendError> {
         use std::os::windows::fs::FileExt as _;
         let owner = self.native_owner()?;
         while !data.is_empty() {
             match owner.file.seek_write(data, offset) {
-                Ok(0) => return Err(redb::NativeBackendError::Io(io::ErrorKind::WriteZero.into())),
+                Ok(0) => {
+                    return Err(redb::NativeBackendError::Io(
+                        io::ErrorKind::WriteZero.into(),
+                    ));
+                }
                 Ok(count) => {
                     offset += count as u64;
                     data = &data[count..];
@@ -710,15 +734,24 @@ pub(super) struct OpenedWriterDatabase {
 fn legacy_writer_error(error: redb::NativeBackendError) -> io::Error {
     match error {
         redb::NativeBackendError::Io(error) => error,
-        redb::NativeBackendError::Closed(redb::NativeIoCause::WriterOwnerClosed) =>
-            io::Error::other("writer file ownership is closed"),
-        redb::NativeBackendError::Closed(redb::NativeIoCause::ProjectedGrowthPoisoned) =>
-            io::Error::other("projected file-growth reservation was poisoned"),
+        redb::NativeBackendError::Closed(redb::NativeIoCause::WriterOwnerClosed) => {
+            io::Error::other("writer file ownership is closed")
+        }
+        redb::NativeBackendError::Closed(redb::NativeIoCause::ProjectedGrowthPoisoned) => {
+            io::Error::other("projected file-growth reservation was poisoned")
+        }
         redb::NativeBackendError::Closed(redb::NativeIoCause::DiskGrowthRefused {
-            current_bytes, projected_bytes, limit_bytes,
-        }) => io::Error::new(io::ErrorKind::QuotaExceeded, DiskGrowthRefusal {
-            current_bytes, projected_bytes, limit_bytes,
-        }),
+            current_bytes,
+            projected_bytes,
+            limit_bytes,
+        }) => io::Error::new(
+            io::ErrorKind::QuotaExceeded,
+            DiskGrowthRefusal {
+                current_bytes,
+                projected_bytes,
+                limit_bytes,
+            },
+        ),
     }
 }
 

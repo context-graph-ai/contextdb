@@ -157,7 +157,10 @@ enum HnswInner {
 /// return only the requested graph-envelope range; callers charge the result
 /// as query scratch before it becomes resident.
 pub trait ReadOnlyVectorGraphPageSource: Send + Sync {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reader(&self) -> Result<Box<dyn ReadOnlyVectorGraphPageReader>>;
 
     /// Bytes in one independently authenticated source-page body. The serving
@@ -184,7 +187,10 @@ pub trait ReadOnlyVectorGraphPageSource: Send + Sync {
 /// bounded cursor resumes on another thread, so a page reader moves between
 /// threads with its cursor.
 pub trait ReadOnlyVectorGraphPageReader: Send {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_range(&mut self, offset: usize, len: usize) -> Result<Vec<u8>>;
 }
 
@@ -1482,8 +1488,9 @@ impl PagedHnsw {
         // a sum of squares is non-finite exactly when some coordinate was, and
         // the sum of 768 squared f32 values cannot itself overflow f64.
         if !left_norm.is_finite() {
-            return Err(HnswBoundedSearchError::Callback(E::from(Error::Other((
-                "durable HNSW point contains a non-finite coordinate".to_string()).into()))));
+            return Err(HnswBoundedSearchError::Callback(E::from(Error::Other(
+                ("durable HNSW point contains a non-finite coordinate".to_string()).into(),
+            ))));
         }
         Ok(f32_graph_cosine_distance(dot, left_norm, right_norm))
     }
@@ -2426,10 +2433,14 @@ fn set_allocation_bytes<T>(capacity: usize) -> usize {
 
 /// Shared physical bucket/control sizing for scratch sets and row-verdict maps.
 /// Refuse unrepresentable allocation geometry before asking an allocator.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn checked_hash_allocation_bytes<T>(capacity: usize) -> Result<usize> {
     const GROUP_BYTES: usize = 16;
-    let overflow = || Error::Other(("bounded HNSW hash allocation size overflow".to_string()).into());
+    let overflow =
+        || Error::Other(("bounded HNSW hash allocation size overflow".to_string()).into());
     if capacity == 0 {
         return Ok(0);
     }
@@ -2464,7 +2475,11 @@ where
         }
         Ok(current
             .checked_mul(2)
-            .ok_or_else(|| E::from(Error::Other(("bounded HNSW capacity overflow".to_string()).into())))?
+            .ok_or_else(|| {
+                E::from(Error::Other(
+                    ("bounded HNSW capacity overflow".to_string()).into(),
+                ))
+            })?
             .max(required))
     }
 
@@ -2502,17 +2517,17 @@ where
         let mut values = Vec::new();
         if values.try_reserve_exact(requested_capacity).is_err() {
             self.release_capacity(container, requested_capacity, element_bytes);
-            return Err(E::from(Error::Other((format!(
-                "bounded HNSW {operation} allocation failed"
-            )).into())));
+            return Err(E::from(Error::Other(
+                (format!("bounded HNSW {operation} allocation failed")).into(),
+            )));
         }
         let actual_capacity = values.capacity();
         if actual_capacity < requested_capacity {
             drop(values);
             self.release_capacity(container, requested_capacity, element_bytes);
-            return Err(E::from(Error::Other((format!(
-                "bounded HNSW {operation} capacity moved backwards"
-            )).into())));
+            return Err(E::from(Error::Other(
+                (format!("bounded HNSW {operation} capacity moved backwards")).into(),
+            )));
         }
         if let Err(error) = (self.acquire)(HnswSearchScratchEvent::Reconcile {
             container,
@@ -2555,18 +2570,18 @@ where
                 Some(value) => *value,
                 None => {
                     self.free_vec(replacement, container);
-                    return Err(E::from(Error::Other((format!(
-                        "bounded HNSW {operation} changed during migration"
-                    )).into())));
+                    return Err(E::from(Error::Other(
+                        (format!("bounded HNSW {operation} changed during migration")).into(),
+                    )));
                 }
             };
             position = match position.checked_add(1) {
                 Some(position) => position,
                 None => {
                     self.free_vec(replacement, container);
-                    return Err(E::from(Error::Other((format!(
-                        "bounded HNSW {operation} migration position overflow"
-                    )).into())));
+                    return Err(E::from(Error::Other(
+                        (format!("bounded HNSW {operation} migration position overflow")).into(),
+                    )));
                 }
             };
             replacement.push(value);
@@ -2604,18 +2619,18 @@ where
                 Some(value) => *value,
                 None => {
                     self.free_vec(replacement, container);
-                    return Err(E::from(Error::Other((format!(
-                        "bounded HNSW {operation} changed during migration"
-                    )).into())));
+                    return Err(E::from(Error::Other(
+                        (format!("bounded HNSW {operation} changed during migration")).into(),
+                    )));
                 }
             };
             position = match position.checked_add(1) {
                 Some(position) => position,
                 None => {
                     self.free_vec(replacement, container);
-                    return Err(E::from(Error::Other((format!(
-                        "bounded HNSW {operation} migration position overflow"
-                    )).into())));
+                    return Err(E::from(Error::Other(
+                        (format!("bounded HNSW {operation} migration position overflow")).into(),
+                    )));
                 }
             };
             replacement.push(value);
@@ -2649,17 +2664,17 @@ where
         let mut values = HashSet::new();
         if values.try_reserve(requested_capacity).is_err() {
             self.release_capacity(container, requested_bytes, 1);
-            return Err(E::from(Error::Other((format!(
-                "bounded HNSW {operation} allocation failed"
-            )).into())));
+            return Err(E::from(Error::Other(
+                (format!("bounded HNSW {operation} allocation failed")).into(),
+            )));
         }
         let actual_capacity = values.capacity();
         if actual_capacity < requested_capacity {
             drop(values);
             self.release_capacity(container, requested_bytes, 1);
-            return Err(E::from(Error::Other((format!(
-                "bounded HNSW {operation} capacity moved backwards"
-            )).into())));
+            return Err(E::from(Error::Other(
+                (format!("bounded HNSW {operation} capacity moved backwards")).into(),
+            )));
         }
         let actual_bytes = set_allocation_bytes::<T>(actual_capacity);
         if let Err(error) = (self.acquire)(HnswSearchScratchEvent::Reconcile {
@@ -2701,17 +2716,17 @@ where
             }
             let Some(value) = source.next().copied() else {
                 self.free_set(replacement, container);
-                return Err(E::from(Error::Other((format!(
-                    "bounded HNSW {operation} changed during migration"
-                )).into())));
+                return Err(E::from(Error::Other(
+                    (format!("bounded HNSW {operation} changed during migration")).into(),
+                )));
             };
             remaining = match remaining.checked_sub(1) {
                 Some(remaining) => remaining,
                 None => {
                     self.free_set(replacement, container);
-                    return Err(E::from(Error::Other((format!(
-                        "bounded HNSW {operation} migration underflow"
-                    )).into())));
+                    return Err(E::from(Error::Other(
+                        (format!("bounded HNSW {operation} migration underflow")).into(),
+                    )));
                 }
             };
             replacement.insert(value);
@@ -2743,18 +2758,18 @@ where
 {
     match error {
         HnswBoundedSearchError::Callback(error) => error,
-        HnswBoundedSearchError::CapacityOverflow(operation) => E::from(Error::Other((format!(
-            "bounded HNSW {operation} capacity overflow"
-        )).into())),
-        HnswBoundedSearchError::AllocationFailed(operation) => E::from(Error::Other((format!(
-            "bounded HNSW {operation} allocation failed"
-        )).into())),
-        HnswBoundedSearchError::CapacityInvariant(operation) => E::from(Error::Other((format!(
-            "bounded HNSW {operation} capacity moved backwards"
-        )).into())),
-        HnswBoundedSearchError::SearchInvariant(operation) => E::from(Error::Other((format!(
-            "bounded HNSW {operation} violated a search invariant"
-        )).into())),
+        HnswBoundedSearchError::CapacityOverflow(operation) => E::from(Error::Other(
+            (format!("bounded HNSW {operation} capacity overflow")).into(),
+        )),
+        HnswBoundedSearchError::AllocationFailed(operation) => E::from(Error::Other(
+            (format!("bounded HNSW {operation} allocation failed")).into(),
+        )),
+        HnswBoundedSearchError::CapacityInvariant(operation) => E::from(Error::Other(
+            (format!("bounded HNSW {operation} capacity moved backwards")).into(),
+        )),
+        HnswBoundedSearchError::SearchInvariant(operation) => E::from(Error::Other(
+            (format!("bounded HNSW {operation} violated a search invariant")).into(),
+        )),
     }
 }
 
@@ -2781,13 +2796,16 @@ where
         VectorQuantization::SQ8 => query.len(),
         VectorQuantization::SQ4 => query.len().div_ceil(2),
         VectorQuantization::F32 => {
-            return Err(E::from(Error::Other((
-                "bounded HNSW requested a quantized query for F32 data".to_string()).into())));
+            return Err(E::from(Error::Other(
+                ("bounded HNSW requested a quantized query for F32 data".to_string()).into(),
+            )));
         }
     };
-    let encoded_len = 12usize
-        .checked_add(payload_len)
-        .ok_or_else(|| E::from(Error::Other(("bounded HNSW query size overflow".to_string()).into())))?;
+    let encoded_len = 12usize.checked_add(payload_len).ok_or_else(|| {
+        E::from(Error::Other(
+            ("bounded HNSW query size overflow".to_string()).into(),
+        ))
+    })?;
     let mut encoded = scratch.allocate_vec(
         HnswSearchScratchContainer::QueryBytes,
         encoded_len,
@@ -2826,8 +2844,9 @@ where
         }
         VectorQuantization::F32 => {
             scratch.free_vec(encoded, HnswSearchScratchContainer::QueryBytes);
-            return Err(E::from(Error::Other((
-                "bounded HNSW reached the quantized encoder with F32 data".to_string()).into())));
+            return Err(E::from(Error::Other(
+                ("bounded HNSW reached the quantized encoder with F32 data".to_string()).into(),
+            )));
         }
     }
     Ok(encoded)
@@ -2843,7 +2862,11 @@ where
     let bytes = query
         .len()
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| E::from(Error::Other(("bounded HNSW exact-key overflow".to_string()).into())))?;
+        .ok_or_else(|| {
+            E::from(Error::Other(
+                ("bounded HNSW exact-key overflow".to_string()).into(),
+            ))
+        })?;
     let mut key = scratch.allocate_vec(HnswSearchScratchContainer::ExactKey, bytes, "exact key")?;
     for value in query {
         key.extend_from_slice(&value.to_bits().to_be_bytes());
@@ -2901,8 +2924,10 @@ where
                         }
                     }
                     VectorQuantization::F32 => {
-                        return Err(E::from(Error::Other((
-                            "bounded HNSW scored a quantized query against F32 data".to_string()).into())));
+                        return Err(E::from(Error::Other(
+                            ("bounded HNSW scored a quantized query against F32 data".to_string())
+                                .into(),
+                        )));
                     }
                 };
                 let stored = if scale == 0.0 {
@@ -2961,8 +2986,9 @@ impl<'query> BoundedHnswQuerySelfScores<'query> {
         E: From<Error>,
     {
         if self.query.len() != query.len() || !std::ptr::eq(self.query.as_ptr(), query.as_ptr()) {
-            return Err(E::from(Error::Other((
-                "bounded HNSW query self-score cache belongs to another query".to_string()).into())));
+            return Err(E::from(Error::Other(
+                ("bounded HNSW query self-score cache belongs to another query".to_string()).into(),
+            )));
         }
         let cached = match quantization {
             VectorQuantization::F32 => self.f32,
@@ -2971,8 +2997,9 @@ impl<'query> BoundedHnswQuerySelfScores<'query> {
         };
         if let Some(cached) = cached {
             if cached.dimension != query.len() {
-                return Err(E::from(Error::Other((
-                    "bounded HNSW query self-score cache dimension changed".to_string()).into())));
+                return Err(E::from(Error::Other(
+                    ("bounded HNSW query self-score cache dimension changed".to_string()).into(),
+                )));
             }
             return Ok(cached.score);
         }
@@ -3703,7 +3730,10 @@ impl HnswIndex {
             _ => None,
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn publish_paged_tail_root(
         &self,
         previous: &Arc<paged_builder::PagedVectorTail>,
@@ -3715,14 +3745,18 @@ impl HnswIndex {
         let mut current = tail.write();
         if !Arc::ptr_eq(&current, previous) {
             return Err(Error::Other(
-                "paged graph changed outside serialized row publication".into()));
+                "paged graph changed outside serialized row publication".into(),
+            ));
         }
         *current = Arc::new(next);
         Ok(())
     }
     /// Row persistence commits its pages before swapping this small root
     /// pointer. Searches already holding the preceding Arc keep their view.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn append_paged_tail(
         &self,
         entries: &[VectorEntry],
@@ -3737,7 +3771,8 @@ impl HnswIndex {
         let mut current = tail.write();
         if !Arc::ptr_eq(&current, &previous) {
             return Err(Error::Other(
-                "paged graph root changed outside serialized row publication".into()));
+                "paged graph root changed outside serialized row publication".into(),
+            ));
         }
         *current = Arc::new(next);
         Ok(())
@@ -3759,7 +3794,10 @@ impl HnswIndex {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn from_vector_entries_with_progress(
         entries: &[VectorEntry],
         dimension: usize,
@@ -3786,7 +3824,10 @@ impl HnswIndex {
         Self::new_with_policy(entries, dimension, quantization, policy)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn new_with_policy(
         entries: &[StoredVectorEntry],
         dimension: usize,
@@ -3797,7 +3838,10 @@ impl HnswIndex {
             .expect("infallible graph progress callback")
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn new_with_policy_and_progress(
         entries: &[StoredVectorEntry],
         dimension: usize,
@@ -3819,7 +3863,10 @@ impl HnswIndex {
     /// Maintenance-only borrowed insertion pool. The caller admits the worker
     /// bound before source materialization and holds it through every join.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn from_vector_entries_with_parallel_progress(
         entries: &[VectorEntry],
         dimension: usize,
@@ -3941,7 +3988,10 @@ impl HnswIndex {
     /// process-lifetime owner separately admits the requested native stacks
     /// and the measured stack-cache/arena/TLS runtime retention.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn parallel_insertion_extra_bytes(
         points: usize,
         policy: crate::store::ResolvedVectorPolicy,
@@ -3979,7 +4029,10 @@ impl HnswIndex {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn new_with_policy_and_workers(
         entries: &[StoredVectorEntry],
         dimension: usize,
@@ -4134,9 +4187,9 @@ impl HnswIndex {
                                     Ok(handle) => handles.push(handle),
                                     Err(error) => {
                                         stop.store(true, Ordering::Release);
-                                        failure = Some(Error::Other((format!(
-                                            "cannot start graph worker: {error}"
-                                        )).into()));
+                                        failure = Some(Error::Other(
+                                            (format!("cannot start graph worker: {error}")).into(),
+                                        ));
                                         break;
                                     }
                                 }
@@ -4148,7 +4201,8 @@ impl HnswIndex {
                                     Err(_) => {
                                         stop.store(true, Ordering::Release);
                                         failure = Some(Error::Other(
-                                            "graph insertion worker panicked".into()));
+                                            "graph insertion worker panicked".into(),
+                                        ));
                                     }
                                 }
                             }
@@ -4177,7 +4231,8 @@ impl HnswIndex {
                         })?;
                         if slot.replace(point.get_point_id()).is_some() {
                             return Err(Error::Other(
-                                "graph worker emitted duplicate origin".into()));
+                                "graph worker emitted duplicate origin".into(),
+                            ));
                         }
                     }
                     for (origin, point) in physical.into_iter().enumerate() {
@@ -4306,7 +4361,10 @@ impl HnswIndex {
     /// the native page codec. Links and data ids are exported unchanged; this
     /// performs no insertion or graph search. The caller admits the retained
     /// graph, borrowed row directory and transaction workspace before calling.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn export_resident_paged_batch(
         &self,
         rows: &[&VectorEntry],
@@ -4316,7 +4374,10 @@ impl HnswIndex {
     ) -> Result<paged_builder::PagedVectorProgress> {
         use paged_builder::{PagedEdge, PagedVectorIdentity, PagedVectorPhase, PagedVectorPoint};
         #[allow(clippy::too_many_arguments)]
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn export<T: Clone + Send + Sync>(
             points: &hnsw_rs::hnsw::PointIndexation<'_, T>,
             id_to_row: &HashMap<usize, RowId>,
@@ -4343,7 +4404,8 @@ impl HnswIndex {
             }
             if next.graph.points + next.members != previous.total_points {
                 return Err(Error::Other(
-                    "resident export coverage differs from its frontier".into()));
+                    "resident export coverage differs from its frontier".into(),
+                ));
             }
             let mut exported = 0;
             let layers = if previous.encoded_points == next.graph.points {
@@ -4363,7 +4425,8 @@ impl HnswIndex {
                         layer as u8,
                         i32::try_from(rank).map_err(|_| {
                             Error::Other(
-                                "resident export point rank exceeds the durable range".into())
+                                "resident export point rank exceeds the durable range".into(),
+                            )
                         })?,
                     );
                     if exported == plan.max_points {
@@ -4384,7 +4447,8 @@ impl HnswIndex {
                         .map(|position| rows[position])
                         .map_err(|_| {
                             Error::Other(
-                                "resident export row is outside the captured frontier".into())
+                                "resident export row is outside the captured frontier".into(),
+                            )
                         })?;
                     let neighbours = point
                         .get_neighborhood_id()
@@ -4433,11 +4497,14 @@ impl HnswIndex {
                         }
                     }
                     .map_err(|error| {
-                        Error::Other((format!("resident export point encoding failed: {error}")).into())
+                        Error::Other(
+                            (format!("resident export point encoding failed: {error}")).into(),
+                        )
                     })?;
                     if bytes.len() > plan.max_node_bytes {
                         return Err(Error::Other(
-                            "resident export exceeds its admitted point window".into()));
+                            "resident export exceeds its admitted point window".into(),
+                        ));
                     }
                     transaction.store_point(&native)?;
                     transaction.store_identity(&identity)?;
@@ -4459,7 +4526,8 @@ impl HnswIndex {
             }
             if next.encoded_points != next.graph.points {
                 return Err(Error::Other(
-                    "resident export ended before complete coverage".into()));
+                    "resident export ended before complete coverage".into(),
+                ));
             }
             // Each row sharing a point keeps its own versioned identity naming
             // that point. Members follow the points, at most `max_points` per
@@ -4497,7 +4565,8 @@ impl HnswIndex {
                         .map(|position| rows[position])
                         .map_err(|_| {
                             Error::Other(
-                                "resident export member is outside the captured frontier".into())
+                                "resident export member is outside the captured frontier".into(),
+                            )
                         })?;
                     transaction.store_identity(&PagedVectorIdentity {
                         point,
@@ -4555,13 +4624,17 @@ impl HnswIndex {
                 },
             ),
             _ => Err(Error::Other(
-                "resident export requires a completed fresh graph".into())),
+                "resident export requires a completed fresh graph".into(),
+            )),
         }
     }
 
     /// Validate and encode an insertion without changing the fresh graph.
     /// The caller admits and retains this work until transaction publication.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_insert(
         &self,
         entry: &StoredVectorEntry,
@@ -4569,18 +4642,23 @@ impl HnswIndex {
     ) -> Result<PreparedHnswInsertion> {
         if matches!(self.hnsw, HnswInner::DurablePages(_)) {
             return Err(Error::Other(
-                "paged tail insertion requires the row transaction callback".into()));
+                "paged tail insertion requires the row transaction callback".into(),
+            ));
         }
         if entry.deleted_tx.is_some() {
-            return Err(Error::Other((
-                "cannot insert a deleted vector into a mutable HNSW graph".to_string()).into()));
+            return Err(Error::Other(
+                ("cannot insert a deleted vector into a mutable HNSW graph".to_string()).into(),
+            ));
         }
         if entry.vector.len() != self.dimension {
-            return Err(Error::Other((format!(
-                "cannot insert vector dimension {} into HNSW dimension {}",
-                entry.vector.len(),
-                self.dimension
-            )).into()));
+            return Err(Error::Other(
+                (format!(
+                    "cannot insert vector dimension {} into HNSW dimension {}",
+                    entry.vector.len(),
+                    self.dimension
+                ))
+                .into(),
+            ));
         }
         let encoded = match (&entry.vector, self.quantization) {
             (StoredVector::F32(_), VectorQuantization::F32) => None,
@@ -4588,14 +4666,16 @@ impl HnswIndex {
             | (StoredVector::SQ4 { .. }, VectorQuantization::SQ4) => {
                 let encoded = entry.vector.to_hnsw_u8();
                 if encoded.is_empty() {
-                    return Err(Error::Other((
-                        "cannot insert an empty quantized vector into HNSW".to_string()).into()));
+                    return Err(Error::Other(
+                        ("cannot insert an empty quantized vector into HNSW".to_string()).into(),
+                    ));
                 }
                 Some(encoded)
             }
             _ => {
-                return Err(Error::Other((
-                    "stored vector quantization does not match its HNSW graph".to_string()).into()));
+                return Err(Error::Other(
+                    ("stored vector quantization does not match its HNSW graph".to_string()).into(),
+                ));
             }
         };
         let exact_key = exact_key_for_stored_vector(&entry.vector);
@@ -4608,8 +4688,9 @@ impl HnswIndex {
             &self.hnsw,
             HnswInner::F32Sealed(_) | HnswInner::QuantizedSealed(_)
         ) {
-            return Err(Error::Other((
-                "cannot insert into a sealed durable HNSW graph".to_string()).into()));
+            return Err(Error::Other(
+                ("cannot insert into a sealed durable HNSW graph".to_string()).into(),
+            ));
         }
         Ok(PreparedHnswInsertion {
             build_serial: self.build_serial,
@@ -4721,7 +4802,10 @@ impl HnswIndex {
     }
 
     #[allow(dead_code)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn insert(&self, entry: &StoredVectorEntry) -> Result<()> {
         let prepared = self.prepare_insert(entry, 1)?;
         self.publish_insert(prepared);
@@ -4734,7 +4818,10 @@ impl HnswIndex {
     /// neighbour record is 8 + 1 + 4 + 4 bytes. Exact keys use the stored representation.
     /// This bounds encoded bytes, not construction scratch or resident maps.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn durable_generation_capacity_bound(
         count: usize,
         dimension: usize,
@@ -4773,7 +4860,10 @@ impl HnswIndex {
 
     /// Refine the codec bound using the completed builder's actual edges and
     /// exact-key lists, without materializing a generation-sized payload.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn durable_generation_encoding_capacity(&self) -> Result<usize> {
         let overflow =
             || Error::Other("durable HNSW codec capacity exceeds the process range".into());
@@ -4809,7 +4899,8 @@ impl HnswIndex {
             }
             _ => {
                 return Err(Error::Other(
-                    "a sealed durable HNSW graph cannot be re-encoded".into()));
+                    "a sealed durable HNSW graph cannot be re-encoded".into(),
+                ));
             }
         }
         for (key, rows) in self.exact_rows.read().iter() {
@@ -4838,7 +4929,10 @@ impl HnswIndex {
     /// with the row and exact-vector maps, so loading never scans the vector
     /// store or rebuilds a graph.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn encode_durable_generation(&self) -> Result<Vec<u8>> {
         // One buffer owns the envelope, graph and maps. Backfill the length
         // and checksum after appending their bytes; never retain separate
@@ -4852,7 +4946,8 @@ impl HnswIndex {
         )?;
         if capacity > bound {
             return Err(Error::Other(
-                "durable HNSW codec exceeds its admitted capacity bound".into()));
+                "durable HNSW codec exceeds its admitted capacity bound".into(),
+            ));
         }
         let mut envelope = Vec::with_capacity(capacity);
         envelope.extend_from_slice(&DURABLE_ENVELOPE_MAGIC);
@@ -4878,9 +4973,12 @@ impl HnswIndex {
                         .to_string()).into()));
             }
         }
-        .map_err(|error| Error::Other((format!("could not encode durable HNSW graph: {error}")).into()))?;
-        let graph_length = u64::try_from(envelope.len() - graph_offset)
-            .map_err(|_| Error::Other(("durable HNSW byte length exceeds u64".to_string()).into()))?;
+        .map_err(|error| {
+            Error::Other((format!("could not encode durable HNSW graph: {error}")).into())
+        })?;
+        let graph_length = u64::try_from(envelope.len() - graph_offset).map_err(|_| {
+            Error::Other(("durable HNSW byte length exceeds u64".to_string()).into())
+        })?;
         envelope[graph_length_offset..graph_offset].copy_from_slice(&graph_length.to_le_bytes());
         let id_to_row = self.id_to_row.read();
         let id_lsn = self.id_lsn.read();
@@ -4945,7 +5043,10 @@ impl HnswIndex {
     /// provide the column definition it is loading for; incompatible
     /// dimension or quantization is refused before a graph is exposed.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn decode_durable_generation(
         bytes: &[u8],
         expected_dimension: usize,
@@ -4953,18 +5054,21 @@ impl HnswIndex {
     ) -> Result<Self> {
         let mut reader = DurableReader::new(bytes);
         if reader.read_exact(DURABLE_ENVELOPE_MAGIC.len())? != DURABLE_ENVELOPE_MAGIC.as_slice() {
-            return Err(Error::Other((
-                "invalid durable HNSW envelope magic".to_string()).into()));
+            return Err(Error::Other(
+                ("invalid durable HNSW envelope magic".to_string()).into(),
+            ));
         }
         if reader.read_u16()? != DURABLE_ENVELOPE_VERSION {
-            return Err(Error::Other((
-                "unsupported durable HNSW envelope version".to_string()).into()));
+            return Err(Error::Other(
+                ("unsupported durable HNSW envelope version".to_string()).into(),
+            ));
         }
         let expected_checksum = reader.read_u64()?;
         let payload = reader.remaining();
         if read_checksum(payload, "graph_decode_hashed_bytes") != expected_checksum {
-            return Err(Error::Other((
-                "durable HNSW envelope checksum mismatch".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW envelope checksum mismatch".to_string()).into(),
+            ));
         }
         let mut payload = DurableReader::new(payload);
         let dimension = payload.read_usize()?;
@@ -4975,19 +5079,22 @@ impl HnswIndex {
         }
         let quantization = quantization_from_tag(payload.read_u8()?)?;
         if quantization != expected_quantization {
-            return Err(Error::Other((
-                "durable HNSW quantization does not match the vector column".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW quantization does not match the vector column".to_string()).into(),
+            ));
         }
         let ef_search = payload.read_usize()?;
         if ef_search == 0 {
-            return Err(Error::Other((
-                "durable HNSW has an invalid search breadth".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW has an invalid search breadth".to_string()).into(),
+            ));
         }
         let graph_bytes = payload.read_bytes()?;
         let row_count = payload.read_usize()?;
         if row_count > payload.remaining().len() / DURABLE_ROW_ENTRY_BYTES {
-            return Err(Error::Other((
-                "durable HNSW row mapping length is invalid".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW row mapping length is invalid".to_string()).into(),
+            ));
         }
         let mut id_to_row = HashMap::with_capacity(row_count);
         let mut id_lsn = HashMap::with_capacity(row_count);
@@ -4999,8 +5106,9 @@ impl HnswIndex {
                     .insert(data_id, RowId(payload.read_u64()?))
                     .is_some()
             {
-                return Err(Error::Other((
-                    "durable HNSW has invalid row mappings".to_string()).into()));
+                return Err(Error::Other(
+                    ("durable HNSW has invalid row mappings".to_string()).into(),
+                ));
             }
             let lsn = payload.read_u64()?;
             if lsn != UNKNOWN_ROW_VERSION {
@@ -5010,8 +5118,9 @@ impl HnswIndex {
         }
         let exact_count = payload.read_usize()?;
         if exact_count > payload.remaining().len() / 16 {
-            return Err(Error::Other((
-                "durable HNSW exact mapping length is invalid".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW exact mapping length is invalid".to_string()).into(),
+            ));
         }
         let mut exact_rows = HashMap::with_capacity(exact_count);
         let mut previous_key: Option<Vec<u8>> = None;
@@ -5022,35 +5131,40 @@ impl HnswIndex {
                     .as_ref()
                     .is_some_and(|previous| key <= *previous)
             {
-                return Err(Error::Other((
-                    "durable HNSW has invalid exact-vector mappings".to_string()).into()));
+                return Err(Error::Other(
+                    ("durable HNSW has invalid exact-vector mappings".to_string()).into(),
+                ));
             }
             let count = payload.read_usize()?;
             if count > payload.remaining().len() / 8 {
-                return Err(Error::Other((
-                    "durable HNSW exact row length is invalid".to_string()).into()));
+                return Err(Error::Other(
+                    ("durable HNSW exact row length is invalid".to_string()).into(),
+                ));
             }
             let mut rows = Vec::with_capacity(count);
             let mut previous_row = None;
             for _ in 0..count {
                 let row = RowId(payload.read_u64()?);
                 if previous_row.is_some_and(|previous| row <= previous) {
-                    return Err(Error::Other((
-                        "durable HNSW exact-vector rows are not ordered".to_string()).into()));
+                    return Err(Error::Other(
+                        ("durable HNSW exact-vector rows are not ordered".to_string()).into(),
+                    ));
                 }
                 previous_row = Some(row);
                 rows.push(row);
             }
             if rows.is_empty() || exact_rows.insert(key.clone(), rows).is_some() {
-                return Err(Error::Other((
-                    "durable HNSW has duplicate exact-vector mappings".to_string()).into()));
+                return Err(Error::Other(
+                    ("durable HNSW has duplicate exact-vector mappings".to_string()).into(),
+                ));
             }
             previous_key = Some(key);
         }
         let (members, member_rows) = read_graph_members(&mut payload, &id_to_row)?;
         if !payload.is_empty() {
-            return Err(Error::Other((
-                "durable HNSW envelope has trailing payload bytes".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW envelope has trailing payload bytes".to_string()).into(),
+            ));
         }
         let hnsw = match quantization {
             VectorQuantization::F32 => HnswInner::F32Sealed(Box::new(
@@ -5063,18 +5177,21 @@ impl HnswIndex {
                     Error::Other((format!("could not load durable F32 HNSW graph: {error}")).into())
                 })?,
             )),
-            VectorQuantization::SQ8 | VectorQuantization::SQ4 => HnswInner::QuantizedSealed(Box::new(
-                decode_owned_graph_with_layer0_slack(
-                    graph_bytes,
-                    DistQuantizedCosine { quantization },
-                    reachability::LAYER0_SLACK,
-                )
-                .map_err(|error| {
-                    Error::Other((format!(
-                        "could not load durable quantized HNSW graph: {error}"
-                    )).into())
-                })?,
-            )),
+            VectorQuantization::SQ8 | VectorQuantization::SQ4 => {
+                HnswInner::QuantizedSealed(Box::new(
+                    decode_owned_graph_with_layer0_slack(
+                        graph_bytes,
+                        DistQuantizedCosine { quantization },
+                        reachability::LAYER0_SLACK,
+                    )
+                    .map_err(|error| {
+                        Error::Other(
+                            (format!("could not load durable quantized HNSW graph: {error}"))
+                                .into(),
+                        )
+                    })?,
+                ))
+            }
         };
         let graph_points = match &hnsw {
             HnswInner::F32Sealed(graph) => graph.get_nb_point(),
@@ -5087,8 +5204,9 @@ impl HnswIndex {
             }
         };
         if graph_points.checked_add(member_rows) != Some(id_to_row.len()) {
-            return Err(Error::Other((
-                "durable HNSW graph point count does not match row mappings".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW graph point count does not match row mappings".to_string()).into(),
+            ));
         }
         let mapped_points_match = match &hnsw {
             HnswInner::F32Sealed(graph) => graph
@@ -5107,8 +5225,9 @@ impl HnswIndex {
             }
         };
         if !mapped_points_match {
-            return Err(Error::Other((
-                "durable HNSW graph points do not match row mappings".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW graph points do not match row mappings".to_string()).into(),
+            ));
         }
         let mut row_to_point = BTreeMap::new();
         match &hnsw {
@@ -5156,7 +5275,10 @@ impl HnswIndex {
     /// Read the allocation bound from the existing envelope without decoding
     /// or retaining points. Old catalogs may contain an earlier charge formula.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn durable_resident_bound(
         bytes: &[u8],
         dimension: usize,
@@ -5167,18 +5289,22 @@ impl HnswIndex {
         if reader.read_exact(8)? != DURABLE_ENVELOPE_MAGIC
             || reader.read_u16()? != DURABLE_ENVELOPE_VERSION
         {
-            return Err(Error::Other(("invalid durable HNSW envelope".to_string()).into()));
+            return Err(Error::Other(
+                ("invalid durable HNSW envelope".to_string()).into(),
+            ));
         }
         let checksum = reader.read_u64()?;
         if read_checksum(reader.remaining(), "graph_sizing_hashed_bytes") != checksum {
-            return Err(Error::Other((
-                "durable HNSW envelope checksum mismatch".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW envelope checksum mismatch".to_string()).into(),
+            ));
         }
         if reader.read_usize()? != dimension
             || quantization_from_tag(reader.read_u8()?)? != quantization
         {
-            return Err(Error::Other((
-                "durable HNSW declaration mismatch".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW declaration mismatch".to_string()).into(),
+            ));
         }
         reader.read_usize()?;
         let graph = reader.read_bytes()?;
@@ -5187,13 +5313,15 @@ impl HnswIndex {
         let mut topology = DurableReader::new(graph);
         topology.read_u16()?;
         if topology.read_usize()? != m {
-            return Err(Error::Other((
-                "durable HNSW topology disagrees with its catalog".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW topology disagrees with its catalog".to_string()).into(),
+            ));
         }
         let count = reader.read_usize()?;
         if count > reader.remaining().len() / DURABLE_ROW_ENTRY_BYTES {
-            return Err(Error::Other((
-                "durable HNSW row mapping length is invalid".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW row mapping length is invalid".to_string()).into(),
+            ));
         }
         Ok(Self::estimated_resident_bytes_with_m(
             count,
@@ -5211,7 +5339,10 @@ impl HnswIndex {
     /// row mappings, the serving cache and its slot directory, and a fixed
     /// allowance for the layer headers and small state around them.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn durable_reader_resident_bound(
         bytes: &[u8],
         dimension: usize,
@@ -5291,7 +5422,10 @@ impl HnswIndex {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn durable_reader_resident_bound_for_cache(
         bytes: &[u8],
         dimension: usize,
@@ -5302,14 +5436,18 @@ impl HnswIndex {
         if cache_bytes < PAGED_VECTOR_MIN_CACHE_BYTES
             || !cache_bytes.is_multiple_of(PAGED_VECTOR_SOURCE_PAGE_BYTES)
         {
-            return Err(Error::Other((
-                "durable HNSW reader cache size is outside its supported bounds".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW reader cache size is outside its supported bounds".to_string())
+                    .into(),
+            ));
         }
         let mut reader = DurableReader::new(bytes);
         if reader.read_exact(8)? != DURABLE_ENVELOPE_MAGIC
             || reader.read_u16()? != DURABLE_ENVELOPE_VERSION
         {
-            return Err(Error::Other(("invalid durable HNSW envelope".to_string()).into()));
+            return Err(Error::Other(
+                ("invalid durable HNSW envelope".to_string()).into(),
+            ));
         }
         // Sizing reads lengths and hashes nothing. The bytes it sizes are
         // checked once, by the decode that follows -- or, for a saved graph,
@@ -5320,33 +5458,40 @@ impl HnswIndex {
         if reader.read_usize()? != dimension
             || quantization_from_tag(reader.read_u8()?)? != quantization
         {
-            return Err(Error::Other((
-                "durable HNSW declaration mismatch".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW declaration mismatch".to_string()).into(),
+            ));
         }
         if reader.read_usize()? == 0 {
-            return Err(Error::Other((
-                "durable HNSW has an invalid search breadth".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW has an invalid search breadth".to_string()).into(),
+            ));
         }
         let graph = reader.read_bytes()?;
         let mut topology = DurableReader::new(graph);
         if topology.read_u16()? != 1 {
-            return Err(Error::Other((
-                "unsupported ContextDB HNSW graph format version".to_string()).into()));
+            return Err(Error::Other(
+                ("unsupported ContextDB HNSW graph format version".to_string()).into(),
+            ));
         }
         if topology.read_usize()? != m {
-            return Err(Error::Other((
-                "durable HNSW topology disagrees with its catalog".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW topology disagrees with its catalog".to_string()).into(),
+            ));
         }
         let points_resident = Self::durable_reader_points_resident(&mut topology, m)?;
         let count = reader.read_usize()?;
         if count > reader.remaining().len() / DURABLE_ROW_ENTRY_BYTES {
-            return Err(Error::Other((
-                "durable HNSW row mapping length is invalid".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW row mapping length is invalid".to_string()).into(),
+            ));
         }
         let containers = count
             .checked_mul(DURABLE_READER_ROW_MAPPING_BYTES)
             .and_then(|mappings| mappings.checked_add(points_resident))
-            .ok_or_else(|| Error::Other(("durable HNSW container residency overflow".to_string()).into()))?;
+            .ok_or_else(|| {
+                Error::Other(("durable HNSW container residency overflow".to_string()).into())
+            })?;
         // The serving cache and the directory that finds its pages, sized the
         // way the decode sizes them for this cache and this generation.
         let page_slots = cache_bytes
@@ -5359,7 +5504,9 @@ impl HnswIndex {
             .and_then(|bound| bound.checked_add(cache_bytes))
             .and_then(|bound| bound.checked_add(serving_slot_directory_bytes(page_slots)))
             .and_then(|bound| bound.checked_add(containers))
-            .ok_or_else(|| Error::Other(("durable HNSW reader residency overflow".to_string()).into()))
+            .ok_or_else(|| {
+                Error::Other(("durable HNSW reader residency overflow".to_string()).into())
+            })
     }
 
     /// What a paged decode will hold for this generation's points, read from
@@ -5369,9 +5516,13 @@ impl HnswIndex {
     /// here exactly as the decode refuses it, so the declared degree bounds
     /// every list, and a graph that uses fewer links than its degree allows is
     /// charged only for the links it has.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn durable_reader_points_resident(topology: &mut DurableReader<'_>, m: usize) -> Result<usize> {
-        let overflow = || Error::Other(("durable HNSW point residency overflow".to_string()).into());
+        let overflow =
+            || Error::Other(("durable HNSW point residency overflow".to_string()).into());
         let _ef_construction = topology.read_usize()?;
         let _extend_candidates = topology.read_u8()?;
         let _keep_pruned = topology.read_u8()?;
@@ -5380,7 +5531,9 @@ impl HnswIndex {
         let _scale = topology.read_f64()?;
         let layer_count = topology.read_usize()?;
         if layer_count > 16 {
-            return Err(Error::Other(("durable HNSW topology is invalid".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW topology is invalid".to_string()).into(),
+            ));
         }
         // Level zero holds the construction degree plus the links reachability
         // owes; no list of a sound graph is longer.
@@ -5407,8 +5560,9 @@ impl HnswIndex {
                 for _ in 0..neighbour_layers {
                     let neighbours = topology.read_usize()?;
                     if neighbours > longest_list {
-                        return Err(Error::Other((
-                            "durable HNSW graph has too many neighbours".to_string()).into()));
+                        return Err(Error::Other(
+                            ("durable HNSW graph has too many neighbours".to_string()).into(),
+                        ));
                     }
                     total = neighbours
                         .checked_mul(std::mem::size_of::<PagedNeighbour>())
@@ -5426,7 +5580,10 @@ impl HnswIndex {
     /// Decode immutable topology while retaining point values in the saved
     /// generation. `source` addresses byte ranges within this envelope.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn decode_paged_durable_generation(
         bytes: &[u8],
         source: Arc<dyn ReadOnlyVectorGraphPageSource>,
@@ -5453,7 +5610,10 @@ impl HnswIndex {
     /// could catch nothing the first did not, so it is not repeated; every
     /// length and cross-reference is still checked.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn decode_paged_authenticated_generation(
         bytes: &[u8],
         source: Arc<dyn ReadOnlyVectorGraphPageSource>,
@@ -5473,7 +5633,10 @@ impl HnswIndex {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn decode_paged_generation(
         bytes: &[u8],
         source: Arc<dyn ReadOnlyVectorGraphPageSource>,
@@ -5487,37 +5650,44 @@ impl HnswIndex {
         if reader.read_exact(8)? != DURABLE_ENVELOPE_MAGIC
             || reader.read_u16()? != DURABLE_ENVELOPE_VERSION
         {
-            return Err(Error::Other(("invalid durable HNSW envelope".to_string()).into()));
+            return Err(Error::Other(
+                ("invalid durable HNSW envelope".to_string()).into(),
+            ));
         }
         let checksum = reader.read_u64()?;
         if check == EnvelopeCheck::Verify
             && read_checksum(reader.remaining(), "graph_decode_hashed_bytes") != checksum
         {
-            return Err(Error::Other((
-                "durable HNSW envelope checksum mismatch".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW envelope checksum mismatch".to_string()).into(),
+            ));
         }
         let dimension = reader.read_usize()?;
         let quantization = quantization_from_tag(reader.read_u8()?)?;
         if dimension != expected_dimension || quantization != expected_quantization {
-            return Err(Error::Other((
-                "durable HNSW declaration mismatch".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW declaration mismatch".to_string()).into(),
+            ));
         }
         if quantization != VectorQuantization::F32 {
-            return Err(Error::Other((
-                "paged durable HNSW currently requires F32 vectors".to_string()).into()));
+            return Err(Error::Other(
+                ("paged durable HNSW currently requires F32 vectors".to_string()).into(),
+            ));
         }
         let ef_search = reader.read_usize()?;
         if ef_search == 0 {
-            return Err(Error::Other((
-                "durable HNSW has an invalid search breadth".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW has an invalid search breadth".to_string()).into(),
+            ));
         }
         let graph_length = reader.read_usize()?;
         let graph_offset = reader.position;
         let graph_bytes = reader.read_exact(graph_length)?;
         let mut graph = DurableReader::new(graph_bytes);
         if graph.read_u16()? != 1 {
-            return Err(Error::Other((
-                "unsupported ContextDB HNSW graph format version".to_string()).into()));
+            return Err(Error::Other(
+                ("unsupported ContextDB HNSW graph format version".to_string()).into(),
+            ));
         }
         let m = graph.read_usize()?;
         let ef_construction = graph.read_usize()?;
@@ -5525,21 +5695,27 @@ impl HnswIndex {
         let _keep_pruned = graph.read_u8()?;
         let max_layer = graph.read_usize()?;
         if m == 0 || max_layer == 0 || max_layer > 16 {
-            return Err(Error::Other(("durable HNSW topology is invalid".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW topology is invalid".to_string()).into(),
+            ));
         }
         if graph.read_usize()? != dimension {
-            return Err(Error::Other((
-                "durable HNSW graph point dimension does not match its definition".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW graph point dimension does not match its definition".to_string())
+                    .into(),
+            ));
         }
         let scale = graph.read_f64()?;
         if !scale.is_finite() || scale <= 0.0 {
-            return Err(Error::Other((
-                "durable HNSW graph has an invalid level scale".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW graph has an invalid level scale".to_string()).into(),
+            ));
         }
         let layer_count = graph.read_usize()?;
         if layer_count != max_layer {
-            return Err(Error::Other((
-                "durable HNSW graph layer count does not match its definition".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW graph layer count does not match its definition".to_string()).into(),
+            ));
         }
         let mut points = Vec::with_capacity(layer_count);
         let mut point_count = 0usize;
@@ -5550,24 +5726,30 @@ impl HnswIndex {
                 let origin_id = graph.read_usize()?;
                 let point_id = graph.read_point_id()?;
                 if point_id != hnsw_rs::hnsw::PointId(layer as u8, rank as i32) {
-                    return Err(Error::Other((
-                        "durable HNSW graph has an inconsistent point position".to_string()).into()));
+                    return Err(Error::Other(
+                        ("durable HNSW graph has an inconsistent point position".to_string())
+                            .into(),
+                    ));
                 }
                 if graph.read_usize()? != dimension {
-                    return Err(Error::Other((
-                        "durable HNSW graph point dimension does not match its definition"
-                            .to_string()).into()));
+                    return Err(Error::Other(
+                        ("durable HNSW graph point dimension does not match its definition"
+                            .to_string())
+                        .into(),
+                    ));
                 }
-                let vector_offset = graph_offset
-                    .checked_add(graph.position)
-                    .ok_or_else(|| Error::Other(("durable HNSW offset overflow".to_string()).into()))?;
+                let vector_offset = graph_offset.checked_add(graph.position).ok_or_else(|| {
+                    Error::Other(("durable HNSW offset overflow".to_string()).into())
+                })?;
                 graph.skip(dimension.checked_mul(4).ok_or_else(|| {
                     Error::Other(("durable HNSW point byte length overflow".to_string()).into())
                 })?)?;
                 let neighbour_layers = graph.read_usize()?;
                 if neighbour_layers != 16 {
-                    return Err(Error::Other((
-                        "durable HNSW graph has an invalid neighbour layer count".to_string()).into()));
+                    return Err(Error::Other(
+                        ("durable HNSW graph has an invalid neighbour layer count".to_string())
+                            .into(),
+                    ));
                 }
                 let mut neighbours = Vec::with_capacity(neighbour_layers);
                 for neighbour_layer in 0..neighbour_layers {
@@ -5580,8 +5762,9 @@ impl HnswIndex {
                     if neighbour_count > degree
                         || (neighbour_layer >= max_layer && neighbour_count != 0)
                     {
-                        return Err(Error::Other((
-                            "durable HNSW graph has too many neighbours".to_string()).into()));
+                        return Err(Error::Other(
+                            ("durable HNSW graph has too many neighbours".to_string()).into(),
+                        ));
                     }
                     let mut layer_neighbours = Vec::with_capacity(neighbour_count);
                     for _ in 0..neighbour_count {
@@ -5589,14 +5772,18 @@ impl HnswIndex {
                         let neighbour = graph.read_point_id()?;
                         let distance = graph.read_f32()?;
                         if !distance.is_finite() {
-                            return Err(Error::Other((
-                                "durable HNSW graph has a non-finite edge distance".to_string()).into()));
+                            return Err(Error::Other(
+                                ("durable HNSW graph has a non-finite edge distance".to_string())
+                                    .into(),
+                            ));
                         }
                         layer_neighbours.push(PagedNeighbour {
                             origin_id: u32::try_from(origin_id).map_err(|_| {
-                                Error::Other((
-                                    "durable HNSW edge origin exceeds the paged graph limit"
-                                        .to_string()).into())
+                                Error::Other(
+                                    ("durable HNSW edge origin exceeds the paged graph limit"
+                                        .to_string())
+                                    .into(),
+                                )
                             })?,
                             point_id: neighbour,
                             distance,
@@ -5609,9 +5796,9 @@ impl HnswIndex {
                     vector_offset,
                     neighbours,
                 });
-                point_count = point_count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Other(("durable HNSW point count overflow".to_string()).into()))?;
+                point_count = point_count.checked_add(1).ok_or_else(|| {
+                    Error::Other(("durable HNSW point count overflow".to_string()).into())
+                })?;
             }
             points.push(decoded);
         }
@@ -5619,13 +5806,15 @@ impl HnswIndex {
             0 => None,
             1 => Some(graph.read_point_id()?),
             _ => {
-                return Err(Error::Other((
-                    "durable HNSW entry point is invalid".to_string()).into()));
+                return Err(Error::Other(
+                    ("durable HNSW entry point is invalid".to_string()).into(),
+                ));
             }
         };
         if !graph.is_empty() {
-            return Err(Error::Other((
-                "ContextDB HNSW graph has trailing bytes".to_string()).into()));
+            return Err(Error::Other(
+                ("ContextDB HNSW graph has trailing bytes".to_string()).into(),
+            ));
         }
         let point_at = |id: hnsw_rs::hnsw::PointId| {
             usize::try_from(id.1)
@@ -5635,25 +5824,31 @@ impl HnswIndex {
         if (point_count == 0) != entry_point.is_none()
             || entry_point.is_some_and(|id| point_at(id).is_none())
         {
-            return Err(Error::Other((
-                "durable HNSW graph has an invalid entry point".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW graph has an invalid entry point".to_string()).into(),
+            ));
         }
         for point in points.iter().flatten() {
             for edge in point.neighbours.iter().flatten() {
                 let neighbour = point_at(edge.point_id).ok_or_else(|| {
-                    Error::Other(("durable HNSW graph edge refers to a missing point".to_string()).into())
+                    Error::Other(
+                        ("durable HNSW graph edge refers to a missing point".to_string()).into(),
+                    )
                 })?;
                 if neighbour.origin_id != edge.origin_id as usize {
-                    return Err(Error::Other((
-                        "durable HNSW graph edge has an inconsistent origin id".to_string()).into()));
+                    return Err(Error::Other(
+                        ("durable HNSW graph edge has an inconsistent origin id".to_string())
+                            .into(),
+                    ));
                 }
             }
         }
         let row_count = reader.read_usize()?;
         if row_count < point_count || row_count > reader.remaining().len() / DURABLE_ROW_ENTRY_BYTES
         {
-            return Err(Error::Other((
-                "durable HNSW graph point count does not match row mappings".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW graph point count does not match row mappings".to_string()).into(),
+            ));
         }
         let mut id_to_row = HashMap::with_capacity(row_count);
         let mut id_lsn = HashMap::with_capacity(row_count);
@@ -5665,8 +5860,9 @@ impl HnswIndex {
             if previous_data_id.is_some_and(|previous| data_id <= previous)
                 || id_to_row.insert(data_id, row_id).is_some()
             {
-                return Err(Error::Other((
-                    "durable HNSW has invalid row mappings".to_string()).into()));
+                return Err(Error::Other(
+                    ("durable HNSW has invalid row mappings".to_string()).into(),
+                ));
             }
             let lsn = reader.read_u64()?;
             if lsn != UNKNOWN_ROW_VERSION {
@@ -5677,7 +5873,9 @@ impl HnswIndex {
         for (layer, layer_points) in points.iter().enumerate() {
             for (rank, point) in layer_points.iter().enumerate() {
                 let row_id = *id_to_row.get(&point.origin_id).ok_or_else(|| {
-                    Error::Other(("durable HNSW graph points do not match row mappings".to_string()).into())
+                    Error::Other(
+                        ("durable HNSW graph points do not match row mappings".to_string()).into(),
+                    )
                 })?;
                 let rank = i32::try_from(rank).map_err(|_| {
                     Error::Other(("durable HNSW graph point rank exceeds i32".to_string()).into())
@@ -5686,15 +5884,17 @@ impl HnswIndex {
                     .insert(row_id, PointId(layer as u8, rank))
                     .is_some()
                 {
-                    return Err(Error::Other((
-                        "durable HNSW has invalid row mappings".to_string()).into()));
+                    return Err(Error::Other(
+                        ("durable HNSW has invalid row mappings".to_string()).into(),
+                    ));
                 }
             }
         }
         let exact_count = reader.read_usize()?;
         if exact_count > reader.remaining().len() / 16 {
-            return Err(Error::Other((
-                "durable HNSW exact-vector mapping count is invalid".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW exact-vector mapping count is invalid".to_string()).into(),
+            ));
         }
         // The paged graph retains only a compact key fingerprint and row IDs.
         // Each possible match is checked against its saved vector bytes.
@@ -5703,13 +5903,15 @@ impl HnswIndex {
         for _ in 0..exact_count {
             let key = reader.read_bytes()?;
             if key.is_empty() || previous_key.is_some_and(|previous| key <= previous) {
-                return Err(Error::Other((
-                    "durable HNSW has invalid exact-vector mappings".to_string()).into()));
+                return Err(Error::Other(
+                    ("durable HNSW has invalid exact-vector mappings".to_string()).into(),
+                ));
             }
             let count = reader.read_usize()?;
             if count == 0 || count > reader.remaining().len() / 8 {
-                return Err(Error::Other((
-                    "durable HNSW exact row length is invalid".to_string()).into()));
+                return Err(Error::Other(
+                    ("durable HNSW exact row length is invalid".to_string()).into(),
+                ));
             }
             let mut previous_row = None;
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -5720,8 +5922,9 @@ impl HnswIndex {
             for _ in 0..count {
                 let row = reader.read_u64()?;
                 if previous_row.is_some_and(|previous| row <= previous) {
-                    return Err(Error::Other((
-                        "durable HNSW exact-vector rows are not ordered".to_string()).into()));
+                    return Err(Error::Other(
+                        ("durable HNSW exact-vector rows are not ordered".to_string()).into(),
+                    ));
                 }
                 previous_row = Some(row);
                 rows.push(RowId(row));
@@ -5734,13 +5937,15 @@ impl HnswIndex {
         }
         let (members, member_rows) = read_graph_members(&mut reader, &id_to_row)?;
         if point_count.checked_add(member_rows) != Some(row_count) {
-            return Err(Error::Other((
-                "durable HNSW graph point count does not match row mappings".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW graph point count does not match row mappings".to_string()).into(),
+            ));
         }
         map_member_points(&members, &id_to_row, &mut row_to_point)?;
         if !reader.is_empty() {
-            return Err(Error::Other((
-                "durable HNSW envelope has trailing payload bytes".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW envelope has trailing payload bytes".to_string()).into(),
+            ));
         }
         let topology_bytes = points.iter().fold(
             points.capacity() * std::mem::size_of::<Vec<PagedPoint>>(),
@@ -5765,20 +5970,23 @@ impl HnswIndex {
         );
         let source_page_bytes = source.page_bytes();
         if source_page_bytes == 0 || source_page_bytes > PAGED_VECTOR_SOURCE_PAGE_BYTES {
-            return Err(Error::Other((
-                "retained graph source page exceeds its serving cache".to_string()).into()));
+            return Err(Error::Other(
+                ("retained graph source page exceeds its serving cache".to_string()).into(),
+            ));
         }
         if cache_bytes < PAGED_VECTOR_MIN_CACHE_BYTES
             || !cache_bytes.is_multiple_of(PAGED_VECTOR_SOURCE_PAGE_BYTES)
         {
-            return Err(Error::Other((
-                "durable HNSW reader cache size is outside its supported bounds".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW reader cache size is outside its supported bounds".to_string())
+                    .into(),
+            ));
         }
         let page_capacity = cache_bytes.min(bytes.len());
         let page_slots = page_capacity.div_ceil(source_page_bytes);
-        let cache_bytes = page_slots
-            .checked_mul(source_page_bytes)
-            .ok_or_else(|| Error::Other(("retained graph page cache size overflow".to_string()).into()))?;
+        let cache_bytes = page_slots.checked_mul(source_page_bytes).ok_or_else(|| {
+            Error::Other(("retained graph page cache size overflow".to_string()).into())
+        })?;
         // The serving cache is admitted for every slot it may fill, up front
         // and in full, exactly as when those slots were one pre-allocated
         // arena: the page bodies, the shared handle each one carries, and the
@@ -5989,7 +6197,8 @@ impl HnswIndex {
             .max(std::mem::size_of::<Hnsw<'static, u8, DistQuantizedCosine>>())
             .max(std::mem::size_of::<LoadedHnsw<f32, HnswF32Distance>>())
             .max(std::mem::size_of::<LoadedHnsw<u8, DistQuantizedCosine>>());
-        std::mem::size_of::<Self>().saturating_add(variant_control)
+        std::mem::size_of::<Self>()
+            .saturating_add(variant_control)
             .saturating_add(16 * std::mem::size_of::<Vec<usize>>())
             .saturating_add(
                 count.saturating_mul(
@@ -6088,7 +6297,10 @@ impl HnswIndex {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn search(
         &self,
         index: &VectorIndexRef,
@@ -6098,7 +6310,10 @@ impl HnswIndex {
         self.search_with_ef_search(index, query, k, self.ef_search)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn search_with_ef_search(
         &self,
         index: &VectorIndexRef,
@@ -6531,8 +6746,10 @@ impl HnswIndex {
                             &mut scratch.release,
                             |row_id, before_source_entry, acquire, release| {
                                 let required = scored.len().checked_add(1).ok_or_else(|| {
-                                    E::from(Error::Other((
-                                        "bounded HNSW merge-result length overflow".to_string()).into()))
+                                    E::from(Error::Other(
+                                        ("bounded HNSW merge-result length overflow".to_string())
+                                            .into(),
+                                    ))
                                 })?;
                                 let mut row_scratch = VectorSearchScratch {
                                     acquire: &mut **acquire,
@@ -6556,16 +6773,19 @@ impl HnswIndex {
                     while row_position < row_limit {
                         before_source_entry()?;
                         let row_id = *row_ids.get(row_position).ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded HNSW exact-row position changed".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded HNSW exact-row position changed".to_string()).into(),
+                            ))
                         })?;
                         row_position = row_position.checked_add(1).ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded HNSW exact-row position overflow".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded HNSW exact-row position overflow".to_string()).into(),
+                            ))
                         })?;
                         let required = scored.len().checked_add(1).ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded HNSW merge-result length overflow".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded HNSW merge-result length overflow".to_string()).into(),
+                            ))
                         })?;
                         scratch.ensure_vec_capacity(
                             &mut scored,
@@ -6584,19 +6804,22 @@ impl HnswIndex {
             while neighbour_position < raw.neighbours.len() {
                 before_source_entry()?;
                 let neighbour = raw.neighbours.get(neighbour_position).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW raw-neighbour position changed".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW raw-neighbour position changed".to_string()).into(),
+                    ))
                 })?;
                 neighbour_position = neighbour_position.checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW raw-neighbour position overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW raw-neighbour position overflow".to_string()).into(),
+                    ))
                 })?;
                 let Some(row_id) = id_to_row.get(&neighbour.d_id).copied() else {
                     continue;
                 };
                 let required = scored.len().checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW merge-result length overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW merge-result length overflow".to_string()).into(),
+                    ))
                 })?;
                 scratch.ensure_vec_capacity(
                     &mut scored,
@@ -6629,19 +6852,22 @@ impl HnswIndex {
             while scored_position < scored.len() {
                 before_source_entry()?;
                 let (row_id, score) = *scored.get(scored_position).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW scored-row position changed".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW scored-row position changed".to_string()).into(),
+                    ))
                 })?;
                 scored_position = scored_position.checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW scored-row position overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW scored-row position overflow".to_string()).into(),
+                    ))
                 })?;
                 if seen.contains(&row_id) {
                     continue;
                 }
                 let required = seen.len().checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW seen-row length overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW seen-row length overflow".to_string()).into(),
+                    ))
                 })?;
                 scratch.ensure_set_capacity(
                     &mut seen,
@@ -6655,8 +6881,9 @@ impl HnswIndex {
                     break;
                 }
                 let required = rows.len().checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded HNSW result length overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded HNSW result length overflow".to_string()).into(),
+                    ))
                 })?;
                 scratch.ensure_vec_capacity(
                     &mut rows,
@@ -6673,8 +6900,10 @@ impl HnswIndex {
             .capacity()
             .checked_mul(std::mem::size_of::<(RowId, f32)>())
             .ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded HNSW result capacity exceeds the native address space".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded HNSW result capacity exceeds the native address space".to_string())
+                        .into(),
+                ))
             });
         let mut scratch = VectorSearchScratch {
             acquire: &mut acquire,
@@ -7167,7 +7396,8 @@ impl HnswIndex {
                         }
                         None => {
                             return Err(E::from(Error::Other(
-                                "resident result row missing its point".into())));
+                                "resident result row missing its point".into(),
+                            )));
                         }
                     }
                 };
@@ -7720,15 +7950,19 @@ impl HnswIndex {
                             {
                                 before_source_entry()?;
                                 let row_id = *row_ids.get(exact_position).ok_or_else(|| {
-                                    E::from(Error::Other((
-                                        "bounded allowed HNSW exact-row position changed"
-                                            .to_string()).into()))
+                                    E::from(Error::Other(
+                                        ("bounded allowed HNSW exact-row position changed"
+                                            .to_string())
+                                        .into(),
+                                    ))
                                 })?;
                                 exact_position =
                                     exact_position.checked_add(1).ok_or_else(|| {
-                                        E::from(Error::Other((
-                                            "bounded allowed HNSW exact-row position overflow"
-                                                .to_string()).into()))
+                                        E::from(Error::Other(
+                                            ("bounded allowed HNSW exact-row position overflow"
+                                                .to_string())
+                                            .into(),
+                                        ))
                                     })?;
                                 if is_allowed(row_id) && seen.insert(row_id) {
                                     rows.push((row_id, exact_score));
@@ -7743,12 +7977,14 @@ impl HnswIndex {
                 while !exact_bucket_completes && position < raw_retained.len() {
                     before_source_entry()?;
                     let neighbour = raw_retained.get(position).ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded allowed HNSW neighbour position changed".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded allowed HNSW neighbour position changed".to_string()).into(),
+                        ))
                     })?;
                     position = position.checked_add(1).ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded allowed HNSW neighbour position overflow".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded allowed HNSW neighbour position overflow".to_string()).into(),
+                        ))
                     })?;
                     let Some(row_id) = id_to_row.get(&neighbour.d_id).copied() else {
                         continue;
@@ -7797,9 +8033,11 @@ impl HnswIndex {
             Some(bytes) => bytes,
             None => {
                 scratch.free_vec(rows, HnswSearchScratchContainer::Result);
-                return Err(E::from(Error::Other((
-                    "bounded allowed HNSW result capacity exceeds the native address space"
-                        .to_string()).into())));
+                return Err(E::from(Error::Other(
+                    ("bounded allowed HNSW result capacity exceeds the native address space"
+                        .to_string())
+                    .into(),
+                )));
             }
         };
         let status = if exact_bucket_completes {
@@ -7938,68 +8176,71 @@ impl HnswIndex {
         }
     }
     #[cfg(any(test, feature = "test-seams"))]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn graph_topology_digest_with_owner_for_test(
-        &self, owner: &mut crate::VectorCopyAdmission,
+        &self,
+        owner: &mut crate::VectorCopyAdmission,
     ) -> Result<u64> {
-                let Some(tail) = self.paged_tail_snapshot() else {
-                    return Ok(self.graph_topology_digest_for_test());
+        let Some(tail) = self.paged_tail_snapshot() else {
+            return Ok(self.graph_topology_digest_for_test());
+        };
+        let mut reader = tail.graph_reader()?;
+        let graph = &tail.progress().graph;
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        digest_u64(&mut digest, graph.points as u64);
+        digest_u64(&mut digest, graph.layer_counts.len() as u64);
+        digest_u64(
+            &mut digest,
+            graph
+                .layer_counts
+                .iter()
+                .rposition(|count| *count != 0)
+                .unwrap_or(0) as u64,
+        );
+        for (level, count) in graph.layer_counts.iter().enumerate() {
+            digest_u64(&mut digest, level as u64);
+            for rank in 0..*count {
+                let value = reader.read_with_copy_admission(
+                    paged_builder::PagedVectorReadRequest::Point {
+                        id: PointId(level as u8, rank as i32),
+                    },
+                    &mut |bytes| {
+                        let mut copy = owner.scratch();
+                        copy.reserve(bytes)?;
+                        Ok(Some(copy))
+                    },
+                )?;
+                let paged_builder::PagedVectorReadValue::Point(point) = value else {
+                    return Err(Error::Other("graph diagnostic received a non-point".into()));
                 };
-                let mut reader = tail.graph_reader()?;
-                let graph = &tail.progress().graph;
-                let mut digest = 0xcbf2_9ce4_8422_2325u64;
-                digest_u64(&mut digest, graph.points as u64);
-                digest_u64(&mut digest, graph.layer_counts.len() as u64);
-                digest_u64(
-                    &mut digest,
-                    graph
-                        .layer_counts
-                        .iter()
-                        .rposition(|count| *count != 0)
-                        .unwrap_or(0) as u64,
-                );
-                for (level, count) in graph.layer_counts.iter().enumerate() {
+                let (origin, id, neighbours) = match &*point {
+                    paged_builder::PagedVectorPoint::F32(point) => {
+                        (point.origin_id, point.id, &point.neighbours)
+                    }
+                    paged_builder::PagedVectorPoint::Quantized(point) => {
+                        (point.origin_id, point.id, &point.neighbours)
+                    }
+                };
+                digest_u64(&mut digest, origin as u64);
+                digest_u64(&mut digest, id.0 as u64);
+                digest_i32(&mut digest, id.1);
+                for (level, edges) in neighbours.iter().enumerate() {
                     digest_u64(&mut digest, level as u64);
-                    for rank in 0..*count {
-                        let value = reader.read_with_copy_admission(
-                            paged_builder::PagedVectorReadRequest::Point {
-                                id: PointId(level as u8, rank as i32),
-                            },
-                            &mut |bytes| {
-                                let mut copy = owner.scratch();
-                                copy.reserve(bytes)?;
-                                Ok(Some(copy))
-                            },
-                        )?;
-                        let paged_builder::PagedVectorReadValue::Point(point) = value else {
-                            return Err(Error::Other("graph diagnostic received a non-point".into()));
-                        };
-                        let (origin, id, neighbours) = match &*point {
-                            paged_builder::PagedVectorPoint::F32(point) => {
-                                (point.origin_id, point.id, &point.neighbours)
-                            }
-                            paged_builder::PagedVectorPoint::Quantized(point) => {
-                                (point.origin_id, point.id, &point.neighbours)
-                            }
-                        };
-                        digest_u64(&mut digest, origin as u64);
-                        digest_u64(&mut digest, id.0 as u64);
-                        digest_i32(&mut digest, id.1);
-                        for (level, edges) in neighbours.iter().enumerate() {
-                            digest_u64(&mut digest, level as u64);
-                            digest_u64(&mut digest, edges.len() as u64);
-                            for edge in edges {
-                                digest_u64(&mut digest, edge.origin_id as u64);
-                                digest_u64(&mut digest, edge.distance.to_bits() as u64);
-                                digest_u64(&mut digest, edge.point_id.0 as u64);
-                                digest_i32(&mut digest, edge.point_id.1);
-                            }
-                        }
+                    digest_u64(&mut digest, edges.len() as u64);
+                    for edge in edges {
+                        digest_u64(&mut digest, edge.origin_id as u64);
+                        digest_u64(&mut digest, edge.distance.to_bits() as u64);
+                        digest_u64(&mut digest, edge.point_id.0 as u64);
+                        digest_i32(&mut digest, edge.point_id.1);
                     }
                 }
-                Ok(digest)
+            }
+        }
+        Ok(digest)
     }
-
 }
 
 fn exact_key_for_stored_vector(vector: &StoredVector) -> Option<Vec<u8>> {
@@ -8020,14 +8261,18 @@ fn quantization_tag(quantization: VectorQuantization) -> u8 {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn quantization_from_tag(tag: u8) -> Result<VectorQuantization> {
     match tag {
         0 => Ok(VectorQuantization::F32),
         1 => Ok(VectorQuantization::SQ8),
         2 => Ok(VectorQuantization::SQ4),
-        _ => Err(Error::Other((
-            "durable HNSW has an unknown quantization".to_string()).into())),
+        _ => Err(Error::Other(
+            ("durable HNSW has an unknown quantization".to_string()).into(),
+        )),
     }
 }
 
@@ -8067,7 +8312,10 @@ fn write_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn write_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     let length = u64::try_from(value.len())
         .map_err(|_| Error::Other(("durable HNSW byte length exceeds u64".to_string()).into()))?;
@@ -8086,26 +8334,33 @@ impl<'a> DurableReader<'a> {
         Self { bytes, position: 0 }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_exact(&mut self, length: usize) -> Result<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or_else(|| Error::Other(("durable HNSW envelope length overflow".to_string()).into()))?;
-        let value = self
-            .bytes
-            .get(self.position..end)
-            .ok_or_else(|| Error::Other(("durable HNSW envelope is truncated".to_string()).into()))?;
+        let end = self.position.checked_add(length).ok_or_else(|| {
+            Error::Other(("durable HNSW envelope length overflow".to_string()).into())
+        })?;
+        let value = self.bytes.get(self.position..end).ok_or_else(|| {
+            Error::Other(("durable HNSW envelope is truncated".to_string()).into())
+        })?;
         self.position = end;
         Ok(value)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_u8(&mut self) -> Result<u8> {
         Ok(self.read_exact(1)?[0])
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_u16(&mut self) -> Result<u16> {
         let bytes: [u8; 2] = self
             .read_exact(2)?
@@ -8114,7 +8369,10 @@ impl<'a> DurableReader<'a> {
         Ok(u16::from_le_bytes(bytes))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_u32(&mut self) -> Result<u32> {
         let bytes: [u8; 4] = self
             .read_exact(4)?
@@ -8123,7 +8381,10 @@ impl<'a> DurableReader<'a> {
         Ok(u32::from_le_bytes(bytes))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_i32(&mut self) -> Result<i32> {
         let bytes: [u8; 4] = self
             .read_exact(4)?
@@ -8132,27 +8393,42 @@ impl<'a> DurableReader<'a> {
         Ok(i32::from_le_bytes(bytes))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_f32(&mut self) -> Result<f32> {
         Ok(f32::from_bits(self.read_u32()?))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_f64(&mut self) -> Result<f64> {
         Ok(f64::from_bits(self.read_u64()?))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_point_id(&mut self) -> Result<hnsw_rs::hnsw::PointId> {
         Ok(hnsw_rs::hnsw::PointId(self.read_u8()?, self.read_i32()?))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn skip(&mut self, length: usize) -> Result<()> {
         self.read_exact(length).map(|_| ())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_u64(&mut self) -> Result<u64> {
         let bytes: [u8; 8] = self
             .read_exact(8)?
@@ -8161,14 +8437,22 @@ impl<'a> DurableReader<'a> {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_usize(&mut self) -> Result<usize> {
         usize::try_from(self.read_u64()?).map_err(|_| {
-            Error::Other(("durable HNSW value exceeds this platform address space".to_string()).into())
+            Error::Other(
+                ("durable HNSW value exceeds this platform address space".to_string()).into(),
+            )
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_bytes(&mut self) -> Result<&'a [u8]> {
         let length = self.read_usize()?;
         self.read_exact(length)
@@ -8242,15 +8526,19 @@ fn graph_identity_key_of_quantized(bytes: &[u8]) -> Vec<u8> {
 /// (representative, member) data id pairs. Every id must be a mapped row, a
 /// member never its own representative nor listed twice; returns the groups,
 /// each ascending by member row, and their member count.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_graph_members(
     reader: &mut DurableReader<'_>,
     id_to_row: &HashMap<usize, RowId>,
 ) -> Result<(GraphMembers, usize)> {
     let pair_count = reader.read_usize()?;
     if pair_count > reader.remaining().len() / 24 {
-        return Err(Error::Other((
-            "durable HNSW member mapping length is invalid".to_string()).into()));
+        return Err(Error::Other(
+            ("durable HNSW member mapping length is invalid".to_string()).into(),
+        ));
     }
     let mut members = GraphMembers::new();
     let mut previous = None;
@@ -8262,8 +8550,9 @@ fn read_graph_members(
             || !id_to_row.contains_key(&pair.0)
             || !id_to_row.contains_key(&pair.1)
         {
-            return Err(Error::Other((
-                "durable HNSW has invalid graph-identity members".to_string()).into()));
+            return Err(Error::Other(
+                ("durable HNSW has invalid graph-identity members".to_string()).into(),
+            ));
         }
         previous = Some(pair);
         members
@@ -8275,7 +8564,10 @@ fn read_graph_members(
 }
 
 /// Give every member row its representative's graph point.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn map_member_points(
     members: &GraphMembers,
     id_to_row: &HashMap<usize, RowId>,
@@ -8285,7 +8577,9 @@ fn map_member_points(
         let point = *row_to_point
             .get(&id_to_row[representative])
             .ok_or_else(|| {
-                Error::Other(("durable HNSW member's representative has no point".to_string()).into())
+                Error::Other(
+                    ("durable HNSW member's representative has no point".to_string()).into(),
+                )
             })?;
         for (row, _) in group.keys() {
             row_to_point.insert(*row, point);
@@ -9191,7 +9485,9 @@ mod tests {
                 || {
                     distances.set(distances.get() + 1);
                     if distances.get() > 2 {
-                        Err(Error::Other(("upper descent work limit".to_string()).into()))
+                        Err(Error::Other(
+                            ("upper descent work limit".to_string()).into(),
+                        ))
                     } else {
                         Ok(())
                     }
@@ -9596,7 +9892,9 @@ mod tests {
                     let reservation = self.reservations.get() + 1;
                     self.reservations.set(reservation);
                     if self.refuse_reservation.get() == Some(reservation) {
-                        return Err(Error::Other((format!("refused reservation {reservation}")).into()));
+                        return Err(Error::Other(
+                            (format!("refused reservation {reservation}")).into(),
+                        ));
                     }
                     (
                         container,
@@ -9617,7 +9915,9 @@ mod tests {
                 }
             };
             if self.held.get() + bytes > self.allowance {
-                return Err(Error::Other(("over the declared allowance".to_string()).into()));
+                return Err(Error::Other(
+                    ("over the declared allowance".to_string()).into(),
+                ));
             }
             self.charge(container, bytes);
             Ok(())
@@ -9785,7 +10085,9 @@ mod tests {
                 SEARCH_DISTANCES.with(|count| count.set(taken));
             }
             if Some(taken) == fail_at {
-                return Err(Error::Other((format!("cancelled at distance {taken}")).into()));
+                return Err(Error::Other(
+                    (format!("cancelled at distance {taken}")).into(),
+                ));
             }
             Ok(())
         }
@@ -10348,7 +10650,9 @@ mod tests {
                 self.bytes
                     .get(offset..end.min(self.bytes.len()))
                     .map(<[u8]>::to_vec)
-                    .ok_or_else(|| Error::Other(("test graph page is out of range".to_string()).into()))
+                    .ok_or_else(|| {
+                        Error::Other(("test graph page is out of range".to_string()).into())
+                    })
             }
         }
 
@@ -12525,41 +12829,84 @@ pub(crate) mod page_ownership_tests;
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub enum PhysicalGraphRecord<'a> {
-    F32Point { data_id: usize, point: PointId, row: Option<RowId>, lsn: Option<Lsn>, values: &'a [f32] },
-    QuantizedPoint { data_id: usize, point: PointId, row: Option<RowId>, lsn: Option<Lsn>, values: &'a [u8] },
-    Member { representative: usize, data_id: usize, row: RowId, lsn: Lsn },
-    ServingPage { offset: usize, bytes: &'a [u8] },
+    F32Point {
+        data_id: usize,
+        point: PointId,
+        row: Option<RowId>,
+        lsn: Option<Lsn>,
+        values: &'a [f32],
+    },
+    QuantizedPoint {
+        data_id: usize,
+        point: PointId,
+        row: Option<RowId>,
+        lsn: Option<Lsn>,
+        values: &'a [u8],
+    },
+    Member {
+        representative: usize,
+        data_id: usize,
+        row: RowId,
+        lsn: Lsn,
+    },
+    ServingPage {
+        offset: usize,
+        bytes: &'a [u8],
+    },
     Unvisited(&'static str),
 }
 #[cfg(any(test, feature = "test-seams"))]
 impl HnswIndex {
     #[doc(hidden)]
-    pub fn visit_physical_records<E>(&self, mut visit: impl FnMut(PhysicalGraphRecord<'_>) -> std::result::Result<(), E>) -> std::result::Result<(), E> {
+    pub fn visit_physical_records<E>(
+        &self,
+        mut visit: impl FnMut(PhysicalGraphRecord<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         let rows = self.id_to_row.read();
         let versions = self.id_lsn.read();
         macro_rules! points {
             ($graph:expr, $kind:ident) => {
                 for point in $graph.get_point_indexation() {
                     let data_id = point.get_origin_id();
-                    visit(PhysicalGraphRecord::$kind { data_id, point: point.get_point_id(),
-                        row: rows.get(&data_id).copied(), lsn: versions.get(&data_id).copied(), values: point.get_v() })?;
+                    visit(PhysicalGraphRecord::$kind {
+                        data_id,
+                        point: point.get_point_id(),
+                        row: rows.get(&data_id).copied(),
+                        lsn: versions.get(&data_id).copied(),
+                        values: point.get_v(),
+                    })?;
                 }
-            }
+            };
         }
         match &self.hnsw {
-            HnswInner::F32Mutable(graph) => { points!(graph, F32Point); }
-            HnswInner::F32Sealed(graph) => { points!(graph, F32Point); }
-            HnswInner::QuantizedMutable(graph) => { points!(graph, QuantizedPoint); }
-            HnswInner::QuantizedSealed(graph) => { points!(graph, QuantizedPoint); }
+            HnswInner::F32Mutable(graph) => {
+                points!(graph, F32Point);
+            }
+            HnswInner::F32Sealed(graph) => {
+                points!(graph, F32Point);
+            }
+            HnswInner::QuantizedMutable(graph) => {
+                points!(graph, QuantizedPoint);
+            }
+            HnswInner::QuantizedSealed(graph) => {
+                points!(graph, QuantizedPoint);
+            }
             HnswInner::F32Paged(graph) => {
                 let cache = graph.page_cache.lock();
                 for page in cache.slots.iter().flatten() {
-                    visit(PhysicalGraphRecord::ServingPage { offset: page.offset, bytes: &page.bytes })?;
+                    visit(PhysicalGraphRecord::ServingPage {
+                        offset: page.offset,
+                        bytes: &page.bytes,
+                    })?;
                 }
-                visit(PhysicalGraphRecord::Unvisited("saved source pages and per-walk/escaped page holders"))?;
+                visit(PhysicalGraphRecord::Unvisited(
+                    "saved source pages and per-walk/escaped page holders",
+                ))?;
             }
             HnswInner::DurablePages(_) => {
-                visit(PhysicalGraphRecord::Unvisited("native paged source requires its authentic engine holder"))?;
+                visit(PhysicalGraphRecord::Unvisited(
+                    "native paged source requires its authentic engine holder",
+                ))?;
             }
         }
         drop(versions);
@@ -12567,7 +12914,12 @@ impl HnswIndex {
         let members = self.members.read();
         for (representative, rows) in members.iter() {
             for ((row, data_id), lsn) in rows {
-                visit(PhysicalGraphRecord::Member { representative: *representative, data_id: *data_id, row: *row, lsn: *lsn })?;
+                visit(PhysicalGraphRecord::Member {
+                    representative: *representative,
+                    data_id: *data_id,
+                    row: *row,
+                    lsn: *lsn,
+                })?;
             }
         }
         Ok(())

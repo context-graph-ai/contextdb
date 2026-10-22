@@ -30,7 +30,11 @@ fn count(db: &Database, sql: &str, params: HashMap<String, Value>) -> i64 {
     let answer = db
         .execute(sql, &params)
         .unwrap_or_else(|error| panic!("count `{sql}`: {error}"));
-    assert_eq!(answer.rows().len(), 1, "a count answers one row: {answer:?}");
+    assert_eq!(
+        answer.rows().len(),
+        1,
+        "a count answers one row: {answer:?}"
+    );
     assert_eq!(answer.rows()[0].len(), 1, "a count answers one column");
     match &answer.rows()[0][0] {
         Value::Int64(count) => *count,

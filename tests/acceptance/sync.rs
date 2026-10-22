@@ -1185,8 +1185,8 @@ async fn f11_push_during_endpoint_outage_gives_a_clear_error() {
 async fn sync_e2e_value_txid_round_trip() {
     use contextdb_core::{TxId, Value};
     use contextdb_engine::Database;
-    use contextdb_server::{SyncClient, SyncServer, peer_dial_spec};
     use contextdb_server::transport::iroh::IrohServer;
+    use contextdb_server::{SyncClient, SyncServer, peer_dial_spec};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1231,7 +1231,9 @@ async fn sync_e2e_value_txid_round_trip() {
     let task = tokio::spawn(async move { server_handle.run_until(shutdown_handle).await });
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        endpoint.large_request_test_controller().wait_until_routes_ready_for_test(),
+        endpoint
+            .large_request_test_controller()
+            .wait_until_routes_ready_for_test(),
     )
     .await
     .expect("the tenant routes are registered before edge clients connect");

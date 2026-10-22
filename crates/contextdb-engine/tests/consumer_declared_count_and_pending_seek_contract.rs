@@ -90,7 +90,8 @@ fn stream_counts(db: &Database, id: u128, expected: &[(&str, &str, i64)]) -> u64
     );
     println!(
         "grouped stream count rows_examined={} history={:?}",
-        answer.trace().rows_examined, work.history
+        answer.trace().rows_examined,
+        work.history
     );
     answer.trace().rows_examined
 }
@@ -686,7 +687,8 @@ fn pending_rows(db: &Database, pending: bool, expected: &[(&str, &str, &str)]) -
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        answer.rows(), expected,
+        answer.rows(),
+        expected,
         "boolean equality selects exactly its declared Context and generation in index suffix order"
     );
     assert_eq!(answer.trace().index_used.as_deref(), Some(PENDING_INDEX));
@@ -697,7 +699,8 @@ fn pending_rows(db: &Database, pending: bool, expected: &[(&str, &str, &str)]) -
     );
     println!(
         "pending seek rows_examined={} history={:?}",
-        answer.trace().rows_examined, work.history
+        answer.trace().rows_examined,
+        work.history
     );
     (answer.trace().rows_examined, work.history.row_versions)
 }
@@ -867,7 +870,8 @@ fn an_in_transaction_context_count_is_served_from_the_declaration() {
         assert_eq!(answer.rows(), vec![vec![Value::Int64(expected)]]);
         println!(
             "in-tx context count committed={committed} rows_examined={} maintained_count={:?}",
-            answer.trace().rows_examined, answer.trace().maintained_count
+            answer.trace().rows_examined,
+            answer.trace().maintained_count
         );
         assert_eq!(
             answer.trace().maintained_count.as_deref(),
@@ -1011,10 +1015,13 @@ fn an_in_transaction_count_answers_its_own_snapshot_after_another_commit() {
         .unwrap();
     println!(
         "in-tx count after another commit: served {:?} ({:?}), ordinary {:?}",
-        served.rows(), served.trace().maintained_count, ordinary.rows()
+        served.rows(),
+        served.trace().maintained_count,
+        ordinary.rows()
     );
     assert_eq!(
-        served.rows(), ordinary.rows(),
+        served.rows(),
+        ordinary.rows(),
         "the declared count and the ordinary count agree on the transaction's view"
     );
     assert!(
@@ -1083,7 +1090,8 @@ fn an_in_transaction_count_matches_float_keys_by_index_order() {
     assert_eq!(served.rows(), two, "the served count sees -0.0 as 0.0");
     assert_eq!(ordinary.rows(), two, "the ordinary count sees -0.0 as 0.0");
     assert_eq!(
-        committed.rows(), two,
+        committed.rows(),
+        two,
         "the committed count keys -0.0 and 0.0 as one value"
     );
     db.close().unwrap();

@@ -99,7 +99,10 @@ impl RedbPersistence {
             ))
         })
     }
-    pub(crate) fn detach_cached_row_page_for_test(&self, page: &redb::AccessGuard<'_, &'static [u8]>) -> Result<(u64, usize, usize, bool)> {
+    pub(crate) fn detach_cached_row_page_for_test(
+        &self,
+        page: &redb::AccessGuard<'_, &'static [u8]>,
+    ) -> Result<(u64, usize, usize, bool)> {
         self.with_db(|db| Ok(db.detach_cached_guard_for_test(page)))
     }
     pub(crate) fn hold_row_page_for_test(

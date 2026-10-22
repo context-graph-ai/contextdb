@@ -1,5 +1,5 @@
-use crate::funded_error::{OriginalError, OriginalResult};
 use super::*;
+use crate::funded_error::{OriginalError, OriginalResult};
 use std::cell::Cell;
 
 const EVENT_TYPES_CONFIG_KEY: &str = "__event_bus_event_types";
@@ -290,7 +290,10 @@ impl SinkQueue {
 
 /// Give `entry` its rewritten attempt count for `persist` and keep it only if
 /// `persist` succeeds; the entry is borrowed, never copied.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn with_rewritten_attempts<T>(
     entry: &mut SinkQueueEntry,
     attempts: u32,
@@ -313,7 +316,10 @@ pub(crate) struct SinkWindowCopyCharge {
 }
 
 impl SinkWindowCopyCharge {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve(owner: &crate::read_image_memory::ImageMemoryHandle, bytes: usize) -> Result<Self> {
         owner.reserve(bytes)?;
         Ok(Self {
@@ -582,7 +588,10 @@ impl EventBusState {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn begin_dispatcher_queue_mutation(&self) -> Result<QueueMutationLease> {
         let mut state = self.queue_mutation_state.lock();
         while state.mutation_blocked && !state.dispatcher_writes_closed {
@@ -624,13 +633,17 @@ impl EventBusState {
     /// taking the transaction commit mutex, then move the returned guard into
     /// `freeze_for_commit_locked_purge` from that mutex's active-prepare
     /// callback.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn begin_authoritative_purge_queue_drain(
         &self,
     ) -> Result<AuthoritativePurgeQueueDrainGuard> {
         if EVENT_BUS_CALLBACK_DEPTH.with(|depth| depth.get() != 0) {
-            return Err(Error::SyncError((
-                "authoritative purge cannot begin from an event-bus callback".to_string()).into()));
+            return Err(Error::SyncError(
+                ("authoritative purge cannot begin from an event-bus callback".to_string()).into(),
+            ));
         }
         let mut state = self.queue_mutation_state.lock();
         while state.checkout_paused || state.mutation_blocked {
@@ -659,7 +672,10 @@ impl EventBusState {
     /// Build the complete post-purge queue image before durability.  The
     /// payload, attempt count, and access gate remain in their original
     /// `SinkQueueEntry`; publication later swaps this opaque VecDeque map.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_authoritative_purge_queue_replacement(
         &self,
         queue_mutation_token: AuthoritativePurgeQueueMutationToken,
@@ -883,7 +899,10 @@ pub(crate) struct EventBusResourceCleanup {
 }
 
 impl EventBusResourceCleanup {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn close(mut self) {
         if self.publish_quiescence
             && let Some(persistence) = &self.persistence
@@ -1090,7 +1109,10 @@ impl EventBusState {
         self.next_queue_id.load(Ordering::SeqCst)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn ensure_queue_capacity(&self, events: &[PreparedSinkEvent]) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         let capacity = self.queue_capacity_for_test.load(Ordering::SeqCst);
@@ -1181,7 +1203,10 @@ impl Database {
     /// Source-order coordination belongs to `ReceivedSchemaStage`; this helper
     /// deliberately does not append category-local DDL to the log.
     #[allow(dead_code)] // consumed when received-schema publication joins the staged Redb transaction
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_received_event_bus_publication(
         &self,
         ddl: &[DdlChange],
@@ -1198,7 +1223,10 @@ impl Database {
         self.prepare_received_event_bus_publication_from_projection(definitions)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn received_event_bus_projection_bytes(&self) -> Result<usize> {
         let definitions = self.event_bus.definitions.lock();
         let encoded = bincode::serde::encode_into_std_write(
@@ -1206,7 +1234,9 @@ impl Database {
             &mut std::io::sink(),
             bincode::config::standard(),
         )
-        .map_err(|error| Error::Other((format!("price received event definitions: {error}")).into()))?;
+        .map_err(|error| {
+            Error::Other((format!("price received event definitions: {error}")).into())
+        })?;
         let entries =
             definitions.event_types.len() + definitions.sinks.len() + definitions.routes.len();
         let filter_entries = definitions.routes.values().fold(0usize, |entries, route| {
@@ -1246,7 +1276,10 @@ impl Database {
         *self.event_bus.definitions.lock() = definitions;
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn apply_received_event_bus_ddl_to_projection(
         &self,
         definitions: &mut EventBusDefinitions,
@@ -1258,7 +1291,10 @@ impl Database {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_received_event_bus_publication_from_projection(
         &self,
         definitions: EventBusDefinitions,
@@ -1312,7 +1348,10 @@ impl Database {
         self.event_bus.waiters.notify_all();
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn load_event_bus_state_from_persistence(&self) -> Result<()> {
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
             let Some(persistence) = self.persistence.as_deref() else {
@@ -1465,54 +1504,76 @@ impl Database {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn put_event_type_def(definitions: &mut EventBusDefinitions, def: EventTypeDef) -> Result<()> {
         if let Some(existing) = definitions.event_types.get(&def.name) {
             if existing == &def {
                 return Ok(());
             }
-            return Err(Error::Other((format!(
-                "event type already exists with a different definition: {}",
-                def.name
-            )).into()));
+            return Err(Error::Other(
+                (format!(
+                    "event type already exists with a different definition: {}",
+                    def.name
+                ))
+                .into(),
+            ));
         }
         definitions.event_types.insert(def.name.clone(), def);
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn put_sink_def(definitions: &mut EventBusDefinitions, def: SinkDef) -> Result<()> {
         if let Some(existing) = definitions.sinks.get(&def.name) {
             if existing == &def {
                 return Ok(());
             }
-            return Err(Error::Other((format!(
-                "sink already exists with a different definition: {}",
-                def.name
-            )).into()));
+            return Err(Error::Other(
+                (format!(
+                    "sink already exists with a different definition: {}",
+                    def.name
+                ))
+                .into(),
+            ));
         }
         definitions.sinks.insert(def.name.clone(), def);
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn put_route_def(definitions: &mut EventBusDefinitions, def: RouteDef) -> Result<String> {
         let route_table = definitions
             .event_types
             .get(&def.event_type)
             .map(|event_type| event_type.table.clone())
-            .ok_or_else(|| Error::Other((format!("event type not found: {}", def.event_type)).into()))?;
+            .ok_or_else(|| {
+                Error::Other((format!("event type not found: {}", def.event_type)).into())
+            })?;
         if !definitions.sinks.contains_key(&def.sink) {
-            return Err(Error::Other((format!("sink not found: {}", def.sink)).into()));
+            return Err(Error::Other(
+                (format!("sink not found: {}", def.sink)).into(),
+            ));
         }
         if let Some(existing) = definitions.routes.get(&def.name) {
             if existing == &def {
                 return Ok(route_table);
             }
-            return Err(Error::Other((format!(
-                "route already exists with a different definition: {}",
-                def.name
-            )).into()));
+            return Err(Error::Other(
+                (format!(
+                    "route already exists with a different definition: {}",
+                    def.name
+                ))
+                .into(),
+            ));
         }
         definitions.routes.insert(def.name.clone(), def);
         Ok(route_table)
@@ -1527,7 +1588,10 @@ impl Database {
             .or(Some(String::new()))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn validate_event_bus_ddl_batch_with_table_lookup<F>(
         &self,
         ddl: &[DdlChange],
@@ -1550,7 +1614,10 @@ impl Database {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn stage_event_bus_ddl_in_tx(&self, tx: TxId, ddl: DdlChange) -> Result<()> {
         if self.pending_local_schema_stages.lock().contains_key(&tx) {
             return Err(Error::Other((
@@ -1575,7 +1642,10 @@ impl Database {
             .unwrap_or_default()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn apply_event_bus_ddl_from_user(
         &self,
         ddl: Vec<DdlChange>,
@@ -1587,7 +1657,10 @@ impl Database {
         self.apply_event_bus_ddl_batch(ddl, read_memory.clone())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn stage_event_bus_ddl_for_commit(
         &self,
         lsn: Lsn,
@@ -1623,7 +1696,12 @@ impl Database {
             ddl: ddl.to_vec(),
             generation_sidecars,
         };
-        let memory_history = self.prepare_staged_memory_schema_history(lsn, 0, ddl, &persistence.generation_sidecars)?;
+        let memory_history = self.prepare_staged_memory_schema_history(
+            lsn,
+            0,
+            ddl,
+            &persistence.generation_sidecars,
+        )?;
         self.event_bus
             .stage_event_bus_ddl_commit(lsn, projected, persistence, memory_history);
         Ok(ddl_count)
@@ -1657,7 +1735,10 @@ impl Database {
             .remove(&lsn);
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn apply_event_bus_ddl_batch(
         &self,
         ddl: Vec<DdlChange>,
@@ -1675,7 +1756,10 @@ impl Database {
         self.commit_event_bus_definitions_and_log_batch(projected, ddl, read_memory.clone())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn event_bus_definitions_with_ddl(
         &self,
         tx: Option<TxId>,
@@ -1691,7 +1775,10 @@ impl Database {
         Ok(projected)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn apply_event_bus_ddl_to_definitions(
         &self,
         definitions: &mut EventBusDefinitions,
@@ -1702,7 +1789,10 @@ impl Database {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn apply_event_bus_ddl_to_definitions_with_table_lookup(
         definitions: &mut EventBusDefinitions,
         ddl: &DdlChange,
@@ -1760,9 +1850,12 @@ impl Database {
                     },
                 )?;
                 if !table.is_empty() && *table != route_table {
-                    return Err(Error::Other((format!(
-                        "route table mismatch for {name}: ddl={table}, event_type={route_table}"
-                    )).into()));
+                    return Err(Error::Other(
+                        (format!(
+                            "route table mismatch for {name}: ddl={table}, event_type={route_table}"
+                        ))
+                        .into(),
+                    ));
                 }
                 Ok(())
             }
@@ -1891,7 +1984,10 @@ impl Database {
         next
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn event_bus_config_values_without_table(
         &self,
         table: &str,
@@ -1924,7 +2020,10 @@ impl Database {
     /// context and scope-label constraints, plus the resolved registration
     /// principal, are captured at registration time and gate every replayed and
     /// live delivery before the callback is invoked.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn register_sink<F>(
         &self,
         name: &str,
@@ -1937,9 +2036,11 @@ impl Database {
         let _operation = self.open_operation()?;
         let principal = match (&self.access.principal, principal) {
             (Some(handle_principal), Some(requested)) if handle_principal != &requested => {
-                return Err(Error::Other((
-                    "principal-scoped handles cannot register sinks for another principal"
-                        .to_string()).into()));
+                return Err(Error::Other(
+                    ("principal-scoped handles cannot register sinks for another principal"
+                        .to_string())
+                    .into(),
+                ));
             }
             (Some(handle_principal), None) => Some(handle_principal.clone()),
             (_, requested) => requested,
@@ -1977,7 +2078,10 @@ impl Database {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn register_sink_with_access<F>(
         &self,
         name: &str,
@@ -1990,15 +2094,23 @@ impl Database {
         if !self.event_bus.definitions.lock().sinks.contains_key(name) {
             return Err(Error::Other((format!("sink not found: {name}")).into()));
         }
-        let registration = SinkRegistration { access, callback: Arc::new(deliver) };
+        let registration = SinkRegistration {
+            access,
+            callback: Arc::new(deliver),
+        };
         let owning = matches!(&self.tx_mgr, DatabaseTransactionHost::Owned(_));
         if owning {
             // A refused Native runtime admission must not replace the handler.
             // A newly launched worker waits for this registration/notification.
             self.ensure_sink_dispatcher_running(name)?;
         }
-        self.event_bus.callbacks.write().insert(name.to_string(), registration);
-        if !owning { self.ensure_sink_dispatcher_running(name)?; }
+        self.event_bus
+            .callbacks
+            .write()
+            .insert(name.to_string(), registration);
+        if !owning {
+            self.ensure_sink_dispatcher_running(name)?;
+        }
         self.event_bus.waiters.notify_all();
         Ok(())
     }
@@ -2117,11 +2229,21 @@ impl Database {
     /// delivery metrics and whether a callback is currently registered), and
     /// route. Backs the CLI's `.events status` introspection and is a real
     /// public accessor, not a test seam.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn direct_events_status_funded(
-        &self, owner: contextdb_core::read_memory::ReadMemoryOwner,
-    ) -> Result<crate::local_transport::query_funding::Funded<crate::direct_file_reader::DirectEventsStatus>> {
-        use crate::direct_file_reader::{DirectEventsStatus, DirectEventTypeStatus, DirectSinkStatus, DirectRouteStatus};
+        &self,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<
+        crate::local_transport::query_funding::Funded<
+            crate::direct_file_reader::DirectEventsStatus,
+        >,
+    > {
+        use crate::direct_file_reader::{
+            DirectEventTypeStatus, DirectEventsStatus, DirectRouteStatus, DirectSinkStatus,
+        };
         let _operation = self.assert_open_operation();
         let schedules = self.direct_cron_status_funded(owner.clone())?;
         // Keep the captured definitions borrowed through count/reserve/build.
@@ -2129,41 +2251,76 @@ impl Database {
         let callbacks = self.event_bus.callbacks.read();
         let mut bytes = 0usize;
         let mut add = |amount: usize| -> Result<()> {
-            bytes = bytes.checked_add(amount).ok_or_else(|| Error::Other("event status size overflow".into()))?; Ok(())
+            bytes = bytes
+                .checked_add(amount)
+                .ok_or_else(|| Error::Other("event status size overflow".into()))?;
+            Ok(())
         };
         for event in definitions.event_types.values() {
             add(std::mem::size_of::<DirectEventTypeStatus>())?;
-            add(event.name.len())?; add(event.table.len())?; add(event.trigger.as_ddl_trigger().len())?;
+            add(event.name.len())?;
+            add(event.table.len())?;
+            add(event.trigger.as_ddl_trigger().len())?;
         }
         for sink in definitions.sinks.values() {
             add(std::mem::size_of::<DirectSinkStatus>())?;
-            add(sink.name.len())?; add(sink.sink_type.as_ddl_sink_type().len())?;
+            add(sink.name.len())?;
+            add(sink.sink_type.as_ddl_sink_type().len())?;
         }
         for route in definitions.routes.values() {
             add(std::mem::size_of::<DirectRouteStatus>())?;
-            add(route.name.len())?; add(route.event_type.len())?; add(route.sink.len())?;
+            add(route.name.len())?;
+            add(route.event_type.len())?;
+            add(route.sink.len())?;
         }
-        let mut status = crate::local_transport::query_funding::Funded::allocate_owned(Some(owner), bytes, || {
-            let mut status = DirectEventsStatus {
-                event_types: Vec::with_capacity(definitions.event_types.len()), sinks: Vec::with_capacity(definitions.sinks.len()),
-                routes: Vec::with_capacity(definitions.routes.len()), schedules: schedules.value,
-            };
-            for event in definitions.event_types.values() {
-                status.event_types.push(DirectEventTypeStatus { name: event.name.clone(),
-                    trigger: event.trigger.as_ddl_trigger().to_owned(), table: event.table.clone() });
-            }
-            for sink in definitions.sinks.values() {
-                let metrics = self.sink_metrics(&sink.name);
-                status.sinks.push(DirectSinkStatus { name: sink.name.clone(), sink_type: sink.sink_type.as_ddl_sink_type().to_owned(),
-                    callback_registered: callbacks.contains_key(&sink.name), delivered: metrics.delivered, queued: metrics.queued,
-                    retried: metrics.retried, uncertain: metrics.uncertain, permanent_failures: metrics.permanent_failures, examined: metrics.examined });
-            }
-            for route in definitions.routes.values() {
-                status.routes.push(DirectRouteStatus { name: route.name.clone(), event_type: route.event_type.clone(), sink: route.sink.clone() });
-            }
+        let mut status = crate::local_transport::query_funding::Funded::allocate_owned(
+            Some(owner),
+            bytes,
+            || {
+                let mut status = DirectEventsStatus {
+                    event_types: Vec::with_capacity(definitions.event_types.len()),
+                    sinks: Vec::with_capacity(definitions.sinks.len()),
+                    routes: Vec::with_capacity(definitions.routes.len()),
+                    schedules: schedules.value,
+                };
+                for event in definitions.event_types.values() {
+                    status.event_types.push(DirectEventTypeStatus {
+                        name: event.name.clone(),
+                        trigger: event.trigger.as_ddl_trigger().to_owned(),
+                        table: event.table.clone(),
+                    });
+                }
+                for sink in definitions.sinks.values() {
+                    let metrics = self.sink_metrics(&sink.name);
+                    status.sinks.push(DirectSinkStatus {
+                        name: sink.name.clone(),
+                        sink_type: sink.sink_type.as_ddl_sink_type().to_owned(),
+                        callback_registered: callbacks.contains_key(&sink.name),
+                        delivered: metrics.delivered,
+                        queued: metrics.queued,
+                        retried: metrics.retried,
+                        uncertain: metrics.uncertain,
+                        permanent_failures: metrics.permanent_failures,
+                        examined: metrics.examined,
+                    });
+                }
+                for route in definitions.routes.values() {
+                    status.routes.push(DirectRouteStatus {
+                        name: route.name.clone(),
+                        event_type: route.event_type.clone(),
+                        sink: route.sink.clone(),
+                    });
+                }
+                status
+            },
+        )?;
+        if let Some(credit) = schedules.credit {
             status
-        })?;
-        if let Some(credit) = schedules.credit { status.credit.as_mut().expect("event inventory owns credit").try_merge_prepaid(credit)?; }
+                .credit
+                .as_mut()
+                .expect("event inventory owns credit")
+                .try_merge_prepaid(credit)?;
+        }
         Ok(status)
     }
 
@@ -2278,7 +2435,10 @@ impl Database {
             .unwrap_or(0)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_sink_events_for_write_set(
         &self,
         ws: &contextdb_tx::WriteSet,
@@ -2289,7 +2449,10 @@ impl Database {
         self.prepare_sink_events_for_write_set_with_event_bus_ddl(ws, &[], read_memory)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_sink_events_for_write_set_with_event_bus_ddl(
         &self,
         ws: &contextdb_tx::WriteSet,
@@ -2298,7 +2461,9 @@ impl Database {
     ) -> Result<Vec<PreparedSinkEvent>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        if self.private_prefix_effects_prepared(ws) { return Ok(Vec::new()); }
+        if self.private_prefix_effects_prepared(ws) {
+            return Ok(Vec::new());
+        }
         if ws.relational_inserts.is_empty() && ws.relational_deletes.is_empty() {
             return Ok(Vec::new());
         }
@@ -2511,10 +2676,18 @@ impl Database {
         self.event_bus.next_queue_id.store(next, Ordering::SeqCst);
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn prepare_private_prefix_sink_events(&self, tx: TxId, lsn: Lsn,
-        targets: &super::connected_replay::PrivateChangedRows, initial_len: usize,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn prepare_private_prefix_sink_events(
+        &self,
+        tx: TxId,
+        lsn: Lsn,
+        targets: &super::connected_replay::PrivateChangedRows,
+        initial_len: usize,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         // The detached receiver alone owns this counter. Only END publishes
@@ -2522,34 +2695,84 @@ impl Database {
         let base = self.event_bus.next_action_id();
         let mut scratch = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
         let definitions_bytes = self.received_event_bus_projection_bytes()?;
-        let metadata_bytes = self.relational_store.table_meta.read().values()
-            .map(|meta| meta.estimated_bytes().saturating_mul(8)).fold(0usize, usize::saturating_add);
-        let rows = self.tx_mgr.with_write_set(tx, |ws| ws.relational_inserts.len())?;
-        scratch.try_grow_for(definitions_bytes.saturating_mul(8).saturating_add(metadata_bytes)
-            .saturating_add(rows.saturating_mul(256)).saturating_add(4096),
-            "sync", "connected_sink_prefix_scratch", "Raise the declared memory limit to prepare source-prefix events.")?;
+        let metadata_bytes = self
+            .relational_store
+            .table_meta
+            .read()
+            .values()
+            .map(|meta| meta.estimated_bytes().saturating_mul(8))
+            .fold(0usize, usize::saturating_add);
+        let rows = self
+            .tx_mgr
+            .with_write_set(tx, |ws| ws.relational_inserts.len())?;
+        scratch.try_grow_for(
+            definitions_bytes
+                .saturating_mul(8)
+                .saturating_add(metadata_bytes)
+                .saturating_add(rows.saturating_mul(256))
+                .saturating_add(4096),
+            "sync",
+            "connected_sink_prefix_scratch",
+            "Raise the declared memory limit to prepare source-prefix events.",
+        )?;
         let definitions = self.received_event_bus_projection();
         let mut cache = HashMap::new();
         let mut events = Vec::new();
         self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
             for (index, (table, row)) in ws.relational_inserts.iter().enumerate() {
-                if index < initial_len && !targets.contains(table, row.row_id) { continue; }
-                if ws.relational_inserts[index + 1..].iter()
-                    .any(|(name, next)| name == table && next.row_id == row.row_id) { continue; }
-                let trigger = if targets.before(table, row.row_id).is_some() {
-                    EventTrigger::Update
-                } else { EventTrigger::Insert };
-                self.append_private_prefix_sink_candidate(tx, &mut events, &definitions,
-                    RowEventCandidateRef { table, trigger, row_id: row.row_id, values: &row.values },
-                    lsn, ws, &mut cache, read_memory.clone())?;
-            }
-            for (table, row) in targets.predecessors() {
-                if ws.relational_inserts.iter().any(|(name, inserted)| name == table && inserted.row_id == row.row_id) {
+                if index < initial_len && !targets.contains(table, row.row_id) {
                     continue;
                 }
-                self.append_private_prefix_sink_candidate(tx, &mut events, &definitions,
-                    RowEventCandidateRef { table, trigger: EventTrigger::Delete, row_id: row.row_id, values: &row.values },
-                    lsn, ws, &mut cache, read_memory.clone())?;
+                if ws.relational_inserts[index + 1..]
+                    .iter()
+                    .any(|(name, next)| name == table && next.row_id == row.row_id)
+                {
+                    continue;
+                }
+                let trigger = if targets.before(table, row.row_id).is_some() {
+                    EventTrigger::Update
+                } else {
+                    EventTrigger::Insert
+                };
+                self.append_private_prefix_sink_candidate(
+                    tx,
+                    &mut events,
+                    &definitions,
+                    RowEventCandidateRef {
+                        table,
+                        trigger,
+                        row_id: row.row_id,
+                        values: &row.values,
+                    },
+                    lsn,
+                    ws,
+                    &mut cache,
+                    read_memory.clone(),
+                )?;
+            }
+            for (table, row) in targets.predecessors() {
+                if ws
+                    .relational_inserts
+                    .iter()
+                    .any(|(name, inserted)| name == table && inserted.row_id == row.row_id)
+                {
+                    continue;
+                }
+                self.append_private_prefix_sink_candidate(
+                    tx,
+                    &mut events,
+                    &definitions,
+                    RowEventCandidateRef {
+                        table,
+                        trigger: EventTrigger::Delete,
+                        row_id: row.row_id,
+                        values: &row.values,
+                    },
+                    lsn,
+                    ws,
+                    &mut cache,
+                    read_memory.clone(),
+                )?;
             }
             Ok(())
         })??;
@@ -2557,37 +2780,87 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn append_private_prefix_sink_candidate(&self, tx: TxId, out: &mut Vec<PreparedSinkEvent>,
-        definitions: &EventBusDefinitions, candidate: RowEventCandidateRef<'_>, lsn: Lsn,
-        ws: &contextdb_tx::WriteSet, cache: &mut HashMap<String, EventGateSnapshot>,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn append_private_prefix_sink_candidate(
+        &self,
+        tx: TxId,
+        out: &mut Vec<PreparedSinkEvent>,
+        definitions: &EventBusDefinitions,
+        candidate: RowEventCandidateRef<'_>,
+        lsn: Lsn,
+        ws: &contextdb_tx::WriteSet,
+        cache: &mut HashMap<String, EventGateSnapshot>,
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         for event_type in definitions.event_types.values() {
-            if event_type.table != candidate.table || event_type.trigger != candidate.trigger { continue; }
-            let severity = candidate.values.get("severity").and_then(Value::as_text).unwrap_or("");
-            let gate = self.event_gate_snapshot_cached(candidate.table, candidate.values, ws, cache, read_memory.clone())?;
-            for route in definitions.routes.values().filter(|route| route.event_type == event_type.name) {
-                if !route_matches(route, candidate.values) { continue; }
-                self.admit_private_prefix_sink_event(tx,
+            if event_type.table != candidate.table || event_type.trigger != candidate.trigger {
+                continue;
+            }
+            let severity = candidate
+                .values
+                .get("severity")
+                .and_then(Value::as_text)
+                .unwrap_or("");
+            let gate = self.event_gate_snapshot_cached(
+                candidate.table,
+                candidate.values,
+                ws,
+                cache,
+                read_memory.clone(),
+            )?;
+            for route in definitions
+                .routes
+                .values()
+                .filter(|route| route.event_type == event_type.name)
+            {
+                if !route_matches(route, candidate.values) {
+                    continue;
+                }
+                self.admit_private_prefix_sink_event(
+                    tx,
                     crate::memory_accounting::preparation_values_copy_bytes(candidate.values)?
-                        .saturating_add(event_type.name.len()).saturating_add(candidate.table.len())
-                        .saturating_add(severity.len()).saturating_add(route.sink.len())
+                        .saturating_add(event_type.name.len())
+                        .saturating_add(candidate.table.len())
+                        .saturating_add(severity.len())
+                        .saturating_add(route.sink.len())
                         .saturating_add(owned_gate_metadata_bytes(&gate)?.saturating_mul(4))
-                        .saturating_add(std::mem::size_of::<PreparedSinkEvent>().saturating_mul(4)).saturating_add(512))?;
+                        .saturating_add(std::mem::size_of::<PreparedSinkEvent>().saturating_mul(4))
+                        .saturating_add(512),
+                )?;
                 let id = self.event_bus.allocate_queue_id();
-                out.push((route.sink.clone(), SinkQueueEntry { id,
-                    event: SinkEvent { action_id: id, event_type: event_type.name.clone(),
-                        table: candidate.table.to_owned(), severity: severity.to_owned(),
-                        row_values: crate::memory_accounting::preparation_copy_values(candidate.values)?, at_lsn: lsn },
-                    row_id: candidate.row_id, attempts: 0, gate: gate.clone() }));
+                out.push((
+                    route.sink.clone(),
+                    SinkQueueEntry {
+                        id,
+                        event: SinkEvent {
+                            action_id: id,
+                            event_type: event_type.name.clone(),
+                            table: candidate.table.to_owned(),
+                            severity: severity.to_owned(),
+                            row_values: crate::memory_accounting::preparation_copy_values(
+                                candidate.values,
+                            )?,
+                            at_lsn: lsn,
+                        },
+                        row_id: candidate.row_id,
+                        attempts: 0,
+                        gate: gate.clone(),
+                    },
+                ));
             }
         }
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn append_prepared_sink_events_for_candidate(
         &self,
         out: &mut Vec<PreparedSinkEvent>,
@@ -2649,7 +2922,10 @@ impl Database {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn event_gate_snapshot_cached(
         &self,
         table: &str,
@@ -2674,7 +2950,10 @@ impl Database {
         self.event_gate_snapshot_with_meta(&meta, values, ws, read_memory)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn event_gate_snapshot_with_meta(
         &self,
         meta: &TableMeta,
@@ -2728,7 +3007,10 @@ impl Database {
         Ok(gate)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn grant_rows_for_acl(
         &self,
         acl_ref: &AclRef,
@@ -2739,77 +3021,129 @@ impl Database {
     ) -> Result<EventGrantRows> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let prepare=|mut memory:crate::memory_accounting::OwnedMemoryReservation,original:bool| {
-        let mut grants=Vec::new();
-        let deleted=|row:RowId|ws.relational_deletes.iter().any(|(table,id,_)|
-            table==&acl_ref.ref_table && *id==row);
-        let visited = self.visit_writer_rows::<Error>(
-            &acl_ref.ref_table,
-            |row| {
-                if row.visible_at(snapshot)
-                    && !deleted(row.row_id)
-                    && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
-                {
-                    Self::admit_event_grant_copy(&mut memory, grants.is_empty(), row,original)?;
-                    grants.push(crate::memory_accounting::preparation_copy_values(&row.values)?);
-                }
-                Ok(())
-            },
-            read_memory,
-        )?;
-        if !visited {
-            let tables = self.relational_store.tables.read();
-            for row in tables.get(&acl_ref.ref_table).into_iter().flatten() {
-                if row.visible_at(snapshot)
-                    && !deleted(row.row_id)
-                    && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
-                {
-                    Self::admit_event_grant_copy(&mut memory, grants.is_empty(), row,original)?;
-                    grants.push(crate::memory_accounting::preparation_copy_values(&row.values)?);
+        let prepare = |mut memory: crate::memory_accounting::OwnedMemoryReservation,
+                       original: bool| {
+            let mut grants = Vec::new();
+            let deleted = |row: RowId| {
+                ws.relational_deletes
+                    .iter()
+                    .any(|(table, id, _)| table == &acl_ref.ref_table && *id == row)
+            };
+            let visited = self.visit_writer_rows::<Error>(
+                &acl_ref.ref_table,
+                |row| {
+                    if row.visible_at(snapshot)
+                        && !deleted(row.row_id)
+                        && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
+                    {
+                        Self::admit_event_grant_copy(
+                            &mut memory,
+                            grants.is_empty(),
+                            row,
+                            original,
+                        )?;
+                        grants.push(crate::memory_accounting::preparation_copy_values(
+                            &row.values,
+                        )?);
+                    }
+                    Ok(())
+                },
+                read_memory,
+            )?;
+            if !visited {
+                let tables = self.relational_store.tables.read();
+                for row in tables.get(&acl_ref.ref_table).into_iter().flatten() {
+                    if row.visible_at(snapshot)
+                        && !deleted(row.row_id)
+                        && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
+                    {
+                        Self::admit_event_grant_copy(
+                            &mut memory,
+                            grants.is_empty(),
+                            row,
+                            original,
+                        )?;
+                        grants.push(crate::memory_accounting::preparation_copy_values(
+                            &row.values,
+                        )?);
+                    }
                 }
             }
-        }
 
-        for (table, row) in &ws.relational_inserts {
-            if table == &acl_ref.ref_table
-                && row.deleted_tx.is_none()
-                && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
-            {
-                Self::admit_event_grant_copy(&mut memory, grants.is_empty(), row,original)?;
-                grants.push(crate::memory_accounting::preparation_copy_values(&row.values)?);
+            for (table, row) in &ws.relational_inserts {
+                if table == &acl_ref.ref_table
+                    && row.deleted_tx.is_none()
+                    && row.values.get(&acl_ref.ref_column) == Some(&Value::Uuid(acl_id))
+                {
+                    Self::admit_event_grant_copy(&mut memory, grants.is_empty(), row, original)?;
+                    grants.push(crate::memory_accounting::preparation_copy_values(
+                        &row.values,
+                    )?);
+                }
             }
-        }
-        Ok(EventGrantRows::new(grants, Some(memory)))
+            Ok(EventGrantRows::new(grants, Some(memory)))
         };
-        if let Some(source)=crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
-            source.with_original(|original|prepare(crate::memory_accounting::reserve_preparation_from_original(
-                original,0,"writer_source","event_grants","Raise MEMORY_LIMIT to prepare these sink grants.")?,true))
-        }else{
-            prepare(crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone()),false)
+        if let Some(source) =
+            crate::persistence::received_working_source::WorkingReadSource::current_for(
+                self.tx_mgr.identity(),
+            )?
+        {
+            source.with_original(|original| {
+                prepare(
+                    crate::memory_accounting::reserve_preparation_from_original(
+                        original,
+                        0,
+                        "writer_source",
+                        "event_grants",
+                        "Raise MEMORY_LIMIT to prepare these sink grants.",
+                    )?,
+                    true,
+                )
+            })
+        } else {
+            prepare(
+                crate::memory_accounting::OwnedMemoryReservation::new(self.accountant.clone()),
+                false,
+            )
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn admit_event_grant_copy(
         memory: &mut crate::memory_accounting::OwnedMemoryReservation,
         first: bool,
         row: &VersionedRow,
-        original:bool,
+        original: bool,
     ) -> Result<()> {
-        let bytes=
-            row.estimated_bytes().max(crate::memory_accounting::preparation_values_copy_bytes(&row.values)?)
-                .saturating_add(128)
-                .saturating_add(if first {
-                    std::mem::size_of::<AdmittedEventGrants>().saturating_add(32)
-                } else {
-                    0
-                });
+        let bytes = row
+            .estimated_bytes()
+            .max(crate::memory_accounting::preparation_values_copy_bytes(
+                &row.values,
+            )?)
+            .saturating_add(128)
+            .saturating_add(if first {
+                std::mem::size_of::<AdmittedEventGrants>().saturating_add(32)
+            } else {
+                0
+            });
         if original {
-            crate::memory_accounting::grow_preparation_from_original(memory,bytes,
-                "writer_source","event_grants","Raise MEMORY_LIMIT to prepare these sink grants.")
-        }else{
-            memory.try_grow_for(bytes,"writer_source","event_grants",
-                "Raise MEMORY_LIMIT to prepare these sink grants.")
+            crate::memory_accounting::grow_preparation_from_original(
+                memory,
+                bytes,
+                "writer_source",
+                "event_grants",
+                "Raise MEMORY_LIMIT to prepare these sink grants.",
+            )
+        } else {
+            memory.try_grow_for(
+                bytes,
+                "writer_source",
+                "event_grants",
+                "Raise MEMORY_LIMIT to prepare these sink grants.",
+            )
         }
     }
 
@@ -2942,7 +3276,10 @@ impl Database {
         true
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn ensure_sink_dispatcher_running(&self, sink: &str) -> Result<()> {
         #[cfg(target_os = "linux")]
         crate::owned_worker::ensure_finisher()?;
@@ -2953,18 +3290,37 @@ impl Database {
             return handle.with_host(|host| {
                 // Admission/copy happens before the runtime-map guard. Both
                 // persistent and memory delivery use the exact owning host.
-                let persistent_worker = self.persistence.as_ref().map(|persistence| {
-                    OwnedEventBusWorker::try_new(host.events.clone(), sink, persistence.clone(),
-                        self.tx_mgr.clone(), &self.finalization.accountant)
-                }).transpose()?;
+                let persistent_worker = self
+                    .persistence
+                    .as_ref()
+                    .map(|persistence| {
+                        OwnedEventBusWorker::try_new(
+                            host.events.clone(),
+                            sink,
+                            persistence.clone(),
+                            self.tx_mgr.clone(),
+                            &self.finalization.accountant,
+                        )
+                    })
+                    .transpose()?;
                 let memory_worker = if persistent_worker.is_none() {
-                    Some(OwnedEventBusWorker::try_new(host.events.clone(), sink,
-                        OwnedMemoryQueuePersistence, self.tx_mgr.clone(), &self.finalization.accountant)?)
-                } else { None };
+                    Some(OwnedEventBusWorker::try_new(
+                        host.events.clone(),
+                        sink,
+                        OwnedMemoryQueuePersistence,
+                        self.tx_mgr.clone(),
+                        &self.finalization.accountant,
+                    )?)
+                } else {
+                    None
+                };
                 match persistent_worker {
                     Some(worker) => self.start_owned_sink_worker(&host.events, sink, worker),
-                    None => self.start_owned_sink_worker(&host.events, sink,
-                        memory_worker.expect("prepared native memory worker")),
+                    None => self.start_owned_sink_worker(
+                        &host.events,
+                        sink,
+                        memory_worker.expect("prepared native memory worker"),
+                    ),
                 }
             });
         }
@@ -3004,16 +3360,23 @@ impl Database {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn require_admin_event_bus_ddl(&self) -> Result<()> {
         if self.has_access_constraints_for_query() {
-            return Err(Error::Other((
-                "event bus DDL requires an admin database handle".to_string()).into()));
+            return Err(Error::Other(
+                ("event bus DDL requires an admin database handle".to_string()).into(),
+            ));
         }
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn commit_event_bus_definitions_and_log_batch(
         &self,
         definitions: EventBusDefinitions,
@@ -3028,7 +3391,10 @@ impl Database {
         self.commit_event_bus_ddl_changes(ddl, read_memory.clone())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn commit_event_bus_ddl_changes(
         &self,
         ddl: Vec<DdlChange>,
@@ -3104,13 +3470,19 @@ impl Database {
 
     /// Encoded event-bus definitions for checkpoint export of in-memory
     /// sources, serialized exactly as file-backed DDL persistence would have.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn export_event_bus_config_values(&self) -> Result<EncodedConfigValues> {
         let definitions = self.event_bus.definitions.lock().clone();
         Self::encoded_event_bus_config_values(&definitions)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn encoded_event_bus_config_values(
         definitions: &EventBusDefinitions,
     ) -> Result<EncodedConfigValues> {
@@ -3137,7 +3509,10 @@ impl Database {
         ])
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn row_event_candidates(
         &self,
         ws: &contextdb_tx::WriteSet,
@@ -3736,7 +4111,10 @@ impl EventBusWorker {
         state.uncertain += uncertain;
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn transition_attempt(&self, entry_id: u64, start: bool, uncertain: bool) -> Result<u32> {
         self.tx_mgr.with_maintenance_publication(|publication| {
             let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
@@ -3750,9 +4128,9 @@ impl EventBusWorker {
             let attempts = entry.attempts & ATTEMPT_COUNT_MASK;
             let rewritten = if start {
                 if entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
-                    return Err(Error::Other((format!(
-                        "sink action has an unresolved attempt: {entry_id}"
-                    )).into()));
+                    return Err(Error::Other(
+                        (format!("sink action has an unresolved attempt: {entry_id}")).into(),
+                    ));
                 }
                 attempts.saturating_add(1).min(ATTEMPT_COUNT_MASK) | UNCONFIRMED_ATTEMPT
             } else {
@@ -3800,7 +4178,10 @@ impl EventBusWorker {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn ack_front_entries(&self, entry_ids: &[u64]) -> Result<()> {
         if entry_ids.is_empty() {
             return Ok(());
@@ -3860,15 +4241,18 @@ impl EventBusWorker {
 }
 
 impl EventTrigger {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn from_ddl_trigger(trigger: &str) -> Result<Self> {
         match trigger.to_ascii_uppercase().as_str() {
             "INSERT" => Ok(Self::Insert),
             "UPDATE" => Ok(Self::Update),
             "DELETE" => Ok(Self::Delete),
-            _ => Err(Error::Other((format!(
-                "invalid event type trigger: {trigger}"
-            )).into())),
+            _ => Err(Error::Other(
+                (format!("invalid event type trigger: {trigger}")).into(),
+            )),
         }
     }
 
@@ -3882,12 +4266,17 @@ impl EventTrigger {
 }
 
 impl PersistedSinkType {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn from_ddl_sink_type(sink_type: &str) -> Result<Self> {
         match sink_type.to_ascii_uppercase().as_str() {
             "WEBHOOK" => Ok(Self::Webhook),
             "CALLBACK" => Ok(Self::Callback),
-            _ => Err(Error::Other((format!("invalid sink type: {sink_type}")).into())),
+            _ => Err(Error::Other(
+                (format!("invalid sink type: {sink_type}")).into(),
+            )),
         }
     }
 
@@ -4064,7 +4453,10 @@ fn principal_matches_grant(principal: &Principal, grant: &HashMap<String, Value>
         && grant.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn persist_sink_queue_update(
     persistence: &Option<Arc<RedbPersistence>>,
     sink: &str,
@@ -4085,7 +4477,10 @@ fn persist_sink_queue_update(
     )
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn persist_sink_queue_removals(
     persistence: &Option<Arc<RedbPersistence>>,
     sink: &str,
@@ -4192,7 +4587,10 @@ impl Database {
     /// Append the original next-action config body only after its actual writer
     /// has admitted the key and encoded value. The guarded splice retains that
     /// same reservation through publication and original source retirement.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn stage_next_action_id_in_prepared_write_set(
         &self,
         guard: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -4259,7 +4657,10 @@ impl Database {
 /// queue/stage/state guards; the borrowing private handle retains that physical
 /// storage for the whole callback. The actual handle impl is composed only
 /// after its frozen definition is available.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn with_owned_persistence_original_seed<R>(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     f: impl for<'o> FnOnce(&'o crate::memory_accounting::OwnedMemoryReservation) -> Result<R>,
@@ -4281,17 +4682,26 @@ use contextdb_tx::{OriginalAuxInvoice, OriginalCopyGrant, SourceFunder};
 fn owned_event_overflow() -> Error {
     Error::Other("event preparation allocation size overflow".into())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owned_event_add(a: usize, b: usize) -> Result<usize> {
     a.checked_add(b).ok_or_else(owned_event_overflow)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owned_event_array<T>(count: usize) -> Result<usize> {
     std::alloc::Layout::array::<T>(count)
         .map(|layout| layout.size())
         .map_err(|_| owned_event_overflow())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reserve_owned_event_bytes(
     original: &OwnedMemoryReservation,
     bytes: usize,
@@ -4317,7 +4727,10 @@ pub(super) struct OwnedEventSharedWeak<T> {
     credit: Option<Arc<OriginalAuxInvoice>>,
 }
 impl<T> OwnedEventShared<T> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_new(
         body: T,
         original: &OwnedMemoryReservation,
@@ -4428,7 +4841,10 @@ pub(super) struct OwnedEventValueCredits {
     key_array: OwnedMemoryReservation,
     value_array: OwnedMemoryReservation,
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn copy_owned_event_values(
     original: &OwnedMemoryReservation,
     source: &HashMap<String, Value>,
@@ -4467,7 +4883,10 @@ pub(super) struct OwnedEventGateCredits {
     child_array: OwnedMemoryReservation,
     metadata: OwnedMemoryReservation,
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owned_gate_metadata_bytes(gate: &EventGateSnapshot) -> Result<usize> {
     let mut bytes = gate.context_column.as_ref().map_or(0, String::len);
     if let Some(scope) = &gate.scope_read {
@@ -4489,7 +4908,10 @@ fn owned_gate_metadata_bytes(gate: &EventGateSnapshot) -> Result<usize> {
     }
     Ok(bytes)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn copy_owned_prepaid_text(text: &str) -> Result<String> {
     let copy = text.to_owned();
     if copy.capacity() != text.len() {
@@ -4497,7 +4919,10 @@ fn copy_owned_prepaid_text(text: &str) -> Result<String> {
     }
     Ok(copy)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn copy_owned_event_gate(
     original: &OwnedMemoryReservation,
     source: &EventGateSnapshot,
@@ -4575,7 +5000,10 @@ pub(super) struct OwnedSinkQueueEntry {
     pub(super) entry: SinkQueueEntry,
     credit: OwnedSinkEventCredit,
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn copy_owned_sink_queue_entry(
     original: &OwnedMemoryReservation,
     source: &SinkQueueEntry,
@@ -4628,7 +5056,10 @@ impl OwnedPreparedSinkEvents {
     pub(super) fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_copy(
         original: &OwnedMemoryReservation,
         source: &[PreparedSinkEvent],
@@ -4658,7 +5089,10 @@ impl OwnedPreparedSinkEvents {
         }
         Ok(owner)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn empty(original: &OwnedMemoryReservation) -> Result<Self> {
         Self::try_copy(original, &[])
     }
@@ -4678,8 +5112,14 @@ struct OwnedColdQueueState {
 }
 impl OwnedColdQueueState {
     fn empty() -> Self {
-        Self { depth: 0, through: 0, upper: 0, generation: 0,
-            pending_refill: None, window_root: None }
+        Self {
+            depth: 0,
+            through: 0,
+            upper: 0,
+            generation: 0,
+            pending_refill: None,
+            window_root: None,
+        }
     }
 }
 
@@ -4777,7 +5217,10 @@ impl OwnedEventBusHandle {
         Arc::ptr_eq(&self.storage.get().common, common)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_new_for_writer(
         common: Arc<EventBusState>,
         writer: &WriterBudget,
@@ -4787,7 +5230,10 @@ impl OwnedEventBusHandle {
         Self::try_new(common, original, &writer.accountant(), funder)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_new(
         common: Arc<EventBusState>,
         original: OwnedMemoryReservation,
@@ -4807,7 +5253,8 @@ impl OwnedEventBusHandle {
             || !common.runtimes.lock().is_empty()
         {
             return Err(Error::Other(
-                "owning event assembly requires empty Legacy bodies".into()));
+                "owning event assembly requires empty Legacy bodies".into(),
+            ));
         }
         let (stages, stage_memory) = new_owned_native_map(&original, 0)?;
         let (queues, queue_memory) = new_owned_native_map(&original, 0)?;
@@ -4891,7 +5338,10 @@ impl OwnedEventBusHandle {
             window_refused: state.is_some_and(|s| s.window_refused),
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn with_owned_queue_entries<R>(
         &self,
         sink: &str,
@@ -4928,7 +5378,10 @@ impl OwnedEventBusHandle {
             return f(present.then_some(&snapshot.body));
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn stage_owned_commit_events(
         &self,
         lsn: Lsn,
@@ -4945,7 +5398,8 @@ impl OwnedEventBusHandle {
             OwnedAppendCustody::Ordinary(token) => {
                 if !token.storage.matches(self) || token.state != OwnedEscrowState::Active {
                     return Err(Error::Other(
-                        "owning stage requires its active original escrow".into()));
+                        "owning stage requires its active original escrow".into(),
+                    ));
                 }
                 OwnedDiscardAppendHandle {
                     control: OwnedEventShared::try_new(
@@ -5020,7 +5474,10 @@ impl OwnedEventBusHandle {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn with_owned_commit_events<R>(
         &self,
         lsn: Lsn,
@@ -5193,7 +5650,10 @@ pub(super) struct OwnedQueuePreparation {
     )>,
 }
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_owned_queue_name(
         &self,
         name: &str,
@@ -5218,7 +5678,10 @@ impl OwnedEventBusHandle {
             MAX_SINK_QUEUE_DEPTH
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reserve_owned_queue_publication(
         &self,
         events: &OwnedPreparedSinkEvents,
@@ -5237,7 +5700,10 @@ impl OwnedEventBusHandle {
         std::mem::swap(&mut token.entries, &mut pins);
         Ok(token)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve_owned_queue_names(
         &self,
         events: &[PreparedSinkEvent],
@@ -5246,7 +5712,8 @@ impl OwnedEventBusHandle {
     ) -> Result<OwnedSinkQueuePublication> {
         if !Arc::ptr_eq(&lease.state, &self.data().common.queue_mutation_state) {
             return Err(Error::Other(
-                "queue lease belongs to another event bus".into()));
+                "queue lease belongs to another event bus".into(),
+            ));
         }
         let original = &self.data().original;
         // Arrays are sized for the worst-case distinct keys before creating any
@@ -5324,8 +5791,11 @@ impl OwnedEventBusHandle {
                     let queue = queues.values.get(&plan.sink);
                     plan.absent = queue.is_none();
                     absent += usize::from(plan.absent);
-                    let depth = queue.map_or(Some(0), |q| q.cold.map_or(
-                        Some(q.entries.len()), |cold| usize::try_from(cold.depth).ok()));
+                    let depth = queue.map_or(Some(0), |q| {
+                        q.cold.map_or(Some(q.entries.len()), |cold| {
+                            usize::try_from(cold.depth).ok()
+                        })
+                    });
                     let required = depth
                         .and_then(|n| n.checked_add(queue.map_or(0, |q| q.pending)))
                         .and_then(|n| n.checked_add(plan.count));
@@ -5333,8 +5803,11 @@ impl OwnedEventBusHandle {
                         || self.data().common.durable_windows.load(Ordering::SeqCst),
                         |q| q.cold.is_some(),
                     );
-                    plan.required = if cold { queue.map_or(0, |q| q.entries.len()) }
-                        else { required.unwrap_or(usize::MAX) };
+                    plan.required = if cold {
+                        queue.map_or(0, |q| q.entries.len())
+                    } else {
+                        required.unwrap_or(usize::MAX)
+                    };
                     plan.replace_ring = queue.is_none()
                         || plan.required > queue.map_or(0, |q| q.entries.capacity());
                     if required.is_none_or(|n| n > self.queue_limit()) {
@@ -5349,10 +5822,9 @@ impl OwnedEventBusHandle {
                 if overflow {
                     return Err(owned_event_overflow());
                 }
-                return Err(Error::Other((format!(
-                    "sink queue is full: {}",
-                    plans.body[index].sink
-                )).into()));
+                return Err(Error::Other(
+                    (format!("sink queue is full: {}", plans.body[index].sink)).into(),
+                ));
             }
             let required_map = required_map.ok_or_else(owned_event_overflow)?;
             // Constructors (including their capacity-refusal and unwind paths)
@@ -5380,20 +5852,29 @@ impl OwnedEventBusHandle {
                     .map_or(queues.values.capacity(), |q| q.values.capacity())
                 && plans.body.iter().all(|p| {
                     let queue = queues.values.get(&p.sink);
-                    let depth = queue.map_or(Some(0), |q| q.cold.map_or(
-                        Some(q.entries.len()), |cold| usize::try_from(cold.depth).ok()));
+                    let depth = queue.map_or(Some(0), |q| {
+                        q.cold.map_or(Some(q.entries.len()), |cold| {
+                            usize::try_from(cold.depth).ok()
+                        })
+                    });
                     let cold = queue.map_or_else(
                         || self.data().common.durable_windows.load(Ordering::SeqCst),
                         |q| q.cold.is_some(),
                     );
-                    depth.and_then(|n| n.checked_add(queue.map_or(0, |q| q.pending)))
+                    depth
+                        .and_then(|n| n.checked_add(queue.map_or(0, |q| q.pending)))
                         .and_then(|n| n.checked_add(p.count))
                         .is_some_and(|n| {
-                            let resident = if cold { queue.map_or(0, |q| q.entries.len()) } else { n };
-                            n <= self.queue_limit() && match &p.replacement {
-                                Some((ring, _)) => resident <= ring.capacity(),
-                                None => queue.is_some_and(|q| resident <= q.entries.capacity()),
-                            }
+                            let resident = if cold {
+                                queue.map_or(0, |q| q.entries.len())
+                            } else {
+                                n
+                            };
+                            n <= self.queue_limit()
+                                && match &p.replacement {
+                                    Some((ring, _)) => resident <= ring.capacity(),
+                                    None => queue.is_some_and(|q| resident <= q.entries.capacity()),
+                                }
                         })
                 });
             if !valid {
@@ -5427,7 +5908,11 @@ impl OwnedEventBusHandle {
                     let vacant = queues.values.entry(std::mem::take(&mut plan.sink));
                     let (entries, buffer) = plan.replacement.take().expect("prepared new ring");
                     vacant.or_insert(OwnedSinkQueue {
-                        cold: self.data().common.durable_windows.load(Ordering::SeqCst)
+                        cold: self
+                            .data()
+                            .common
+                            .durable_windows
+                            .load(Ordering::SeqCst)
                             .then(OwnedColdQueueState::empty),
                         entries,
                         buffer,
@@ -5449,7 +5934,10 @@ impl OwnedEventBusHandle {
         drop(plans);
         Ok(token)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_sink_events(
         &self,
         source: &[PreparedSinkEvent],
@@ -5489,7 +5977,9 @@ impl OwnedEventBusHandle {
                 cold.depth = cold.depth.checked_add(1).expect("admitted durable depth");
             } else {
                 assert!(queue.entries.len() < queue.entries.capacity());
-                queue.entries.push_back(entry.take().expect("prepared append pin"));
+                queue
+                    .entries
+                    .push_back(entry.take().expect("prepared append pin"));
             }
             queue.pending -= 1;
             queue.present = true;
@@ -5507,7 +5997,10 @@ impl OwnedEventBusHandle {
         drop(events);
         self.data().common.waiters.notify_all();
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn suspend_owned_append_for_discard(
         &self,
         events: &mut OwnedPreparedSinkEvents,
@@ -5519,7 +6012,8 @@ impl OwnedEventBusHandle {
             .take_token();
         if !token.storage.matches(self) || token.state != OwnedEscrowState::Active {
             return Err(Error::Other(
-                "discard append is not active on its original companion".into()));
+                "discard append is not active on its original companion".into(),
+            ));
         }
         // Admit and build the actual shared transfer control BEFORE cancelling
         // this terminal's pending count or dropping its normal mutation lease.
@@ -5608,11 +6102,17 @@ pub(super) struct OwnedPurgeQueuePublication {
     token: AuthoritativePurgeQueueMutationToken,
 }
 impl OwnedPurgeQueuePublication {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn visit_unconfirmed(
-        &self, mut visit: impl FnMut(&str, u64) -> Result<()>,
+        &self,
+        mut visit: impl FnMut(&str, u64) -> Result<()>,
     ) -> Result<()> {
-        for counter in &self.counters.body { visit(&counter.name.body, counter.unconfirmed)?; }
+        for counter in &self.counters.body {
+            visit(&counter.name.body, counter.unconfirmed)?;
+        }
         Ok(())
     }
     pub(super) fn with_sink_names<R>(&self, f: impl FnOnce(&[String]) -> R) -> R {
@@ -5620,7 +6120,10 @@ impl OwnedPurgeQueuePublication {
     }
 }
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_purge_queue_replacement(
         &self,
         token: AuthoritativePurgeQueueMutationToken,
@@ -5632,7 +6135,8 @@ impl OwnedEventBusHandle {
         let original = &self.data().original;
         if !Arc::ptr_eq(&token.state, &self.data().common.queue_mutation_state) {
             return Err(Error::Other(
-                "purge token belongs to another event bus".into()));
+                "purge token belongs to another event bus".into(),
+            ));
         }
         {
             let state = token.state.lock();
@@ -5644,7 +6148,8 @@ impl OwnedEventBusHandle {
             Some(OwnedAppendCustody::Discard(handle)) => Some(handle.clone()),
             Some(OwnedAppendCustody::Ordinary(_)) => {
                 return Err(Error::Other(
-                    "discard must suspend its own lease before freeze".into()));
+                    "discard must suspend its own lease before freeze".into(),
+                ));
             }
             None => None,
         };
@@ -5752,10 +6257,13 @@ impl OwnedEventBusHandle {
                     .is_some_and(|ids| ids.contains(&entry.entry.row_id))
             };
             let cold = source.map_or_else(
-                || self.data().common.durable_windows.load(Ordering::SeqCst), |q| q.cold);
+                || self.data().common.durable_windows.load(Ordering::SeqCst),
+                |q| q.cold,
+            );
             let durable_survivors = if cold {
-                let persistence = persistence.ok_or_else(|| Error::Other(
-                    "cold purge requires its actual durable queue source".into()))?;
+                let persistence = persistence.ok_or_else(|| {
+                    Error::Other("cold purge requires its actual durable queue source".into())
+                })?;
                 persistence.with_owned_cold_event_source(original, |encoded| {
                     let (_, newest, _) = encoded.extent(original, name)?;
                     let mut survivors = 0u64;
@@ -5763,23 +6271,38 @@ impl OwnedEventBusHandle {
                     encoded.visit_range(original, name, None, newest, |id, bytes| {
                         let entry = OwnedPersistentEventEntryDecoder.decode(original, bytes)?;
                         if entry.entry.id != id {
-                            return Err(Error::Other("sink queue key/content identity mismatch".into()));
+                            return Err(Error::Other(
+                                "sink queue key/content identity mismatch".into(),
+                            ));
                         }
-                        if !selections.get(&entry.entry.event.table)
+                        if !selections
+                            .get(&entry.entry.event.table)
                             .is_some_and(|ids| ids.contains(&entry.entry.row_id))
                         {
-                            survivors = survivors.checked_add(1).ok_or_else(owned_event_overflow)?;
+                            survivors =
+                                survivors.checked_add(1).ok_or_else(owned_event_overflow)?;
                             if entry.entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
-                                unconfirmed = unconfirmed.checked_add(1).ok_or_else(owned_event_overflow)?;
+                                unconfirmed = unconfirmed
+                                    .checked_add(1)
+                                    .ok_or_else(owned_event_overflow)?;
                             }
                         }
                         Ok(true)
                     })?;
-                    Ok((usize::try_from(survivors).map_err(|_| owned_event_overflow())?, unconfirmed))
+                    Ok((
+                        usize::try_from(survivors).map_err(|_| owned_event_overflow())?,
+                        unconfirmed,
+                    ))
                 })?
-            } else { (0, 0) };
+            } else {
+                (0, 0)
+            };
             let (durable_survivors, durable_unconfirmed) = durable_survivors;
-            let survivors = if cold { durable_survivors } else { source_entries.iter().filter(keep).count() };
+            let survivors = if cold {
+                durable_survivors
+            } else {
+                source_entries.iter().filter(keep).count()
+            };
             let pending = suspended.token.as_ref().map_or(Ok(0), |append| {
                 append
                     .slots
@@ -5793,10 +6316,13 @@ impl OwnedEventBusHandle {
             }
             let (body, credit) = copy_owned_native_string(original, name)?;
             let key = OwnedEventBody { body, credit };
-            let (entries, buffer) = new_owned_native_ring(original, if cold { 0 } else { required })?;
+            let (entries, buffer) =
+                new_owned_native_ring(original, if cold { 0 } else { required })?;
             let mut queue = OwnedSinkQueue {
-                cold: cold.then(|| OwnedColdQueueState { depth: durable_survivors as u64,
-                    ..OwnedColdQueueState::empty() }),
+                cold: cold.then(|| OwnedColdQueueState {
+                    depth: durable_survivors as u64,
+                    ..OwnedColdQueueState::empty()
+                }),
                 entries,
                 buffer,
                 name: self.prepare_owned_queue_name(name)?,
@@ -5823,8 +6349,10 @@ impl OwnedEventBusHandle {
                 queue.entries.push_back(pin);
             }
             if cold {
-                counters.body.push(OwnedPurgeQueueCounter { name: queue.name.clone(),
-                    unconfirmed: durable_unconfirmed });
+                counters.body.push(OwnedPurgeQueueCounter {
+                    name: queue.name.clone(),
+                    unconfirmed: durable_unconfirmed,
+                });
             }
             queue.key = Some(key.credit);
             successor.values.insert(key.body, queue);
@@ -5919,7 +6447,10 @@ pub(super) struct OwnedEventBTreeInternal<K, V> {
     data: OwnedEventBTreeLeaf<K, V>,
     edges: [std::mem::MaybeUninit<std::ptr::NonNull<OwnedEventBTreeLeaf<K, V>>>; 12],
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owned_event_btree_bytes<K, V>(members: usize) -> Result<usize> {
     if members == 0 {
         return Ok(0);
@@ -5963,7 +6494,10 @@ pub(super) struct OwnedDefinitionsProjection {
     allocation: OwnedMemoryReservation,
 }
 impl OwnedDefinitionsProjection {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_copy_filtered(
         original: &OwnedMemoryReservation,
         source: &EventBusDefinitions,
@@ -6106,25 +6640,61 @@ impl<T: Serialize> Serialize for OwnedEventSequence<'_, T> {
         sequence.end()
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-fn encode_owned_event_value<T: Serialize>(original: &OwnedMemoryReservation, value: &T,
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn encode_owned_event_value<T: Serialize>(
+    original: &OwnedMemoryReservation,
+    value: &T,
 ) -> Result<OwnedEventBody<Vec<u8>, OwnedMemoryReservation>> {
-    let mut diagnostic = Some(OriginalError::prepare(original,
-        "relational", "statement_overlay", "Reduce prepared event bodies or raise MEMORY_LIMIT.")
-        .map_err(|failure| crate::persistence::native_storage_admission::original_storage_error(
-            crate::persistence::native_storage_admission::NativeStorageFailure::Refused(failure)))?);
-    encode_owned_event_value_in(original, value,
-        |error| diagnostic.take().expect("one failed encoding pass")
-            .encode(error, crate::memory_accounting::retain_preparation_original(original))
-            .into_public_prepared(), |error| error)
+    let mut diagnostic = Some(
+        OriginalError::prepare(
+            original,
+            "relational",
+            "statement_overlay",
+            "Reduce prepared event bodies or raise MEMORY_LIMIT.",
+        )
+        .map_err(|failure| {
+            crate::persistence::native_storage_admission::original_storage_error(
+                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                    failure,
+                ),
+            )
+        })?,
+    );
+    encode_owned_event_value_in(
+        original,
+        value,
+        |error| {
+            diagnostic
+                .take()
+                .expect("one failed encoding pass")
+                .encode(
+                    error,
+                    crate::memory_accounting::retain_preparation_original(original),
+                )
+                .into_public_prepared()
+        },
+        |error| error,
+    )
 }
-fn encode_owned_event_value_funded<T: Serialize>(original: &OwnedMemoryReservation, value: &T,
+fn encode_owned_event_value_funded<T: Serialize>(
+    original: &OwnedMemoryReservation,
+    value: &T,
 ) -> OriginalResult<OwnedEventBody<Vec<u8>, OwnedMemoryReservation>> {
     let diagnostic = OriginalError::prepare_route(original)?;
-    encode_owned_event_value_in(original, value,
-        |error| diagnostic.encode(error,
-            crate::memory_accounting::retain_preparation_original(original)),
-        |error| diagnostic.error(error))
+    encode_owned_event_value_in(
+        original,
+        value,
+        |error| {
+            diagnostic.encode(
+                error,
+                crate::memory_accounting::retain_preparation_original(original),
+            )
+        },
+        |error| diagnostic.error(error),
+    )
 }
 fn encode_owned_event_value_in<T: Serialize, E>(
     original: &OwnedMemoryReservation,
@@ -6135,7 +6705,8 @@ fn encode_owned_event_value_in<T: Serialize, E>(
     let mut count = bincode::enc::write::SizeWriter::default();
     bincode::serde::encode_into_writer(value, &mut count, bincode::config::standard())
         .map_err(&mut codec)?;
-    let (body, credit) = new_owned_native_vec::<u8>(original, count.bytes_written).map_err(&existing)?;
+    let (body, credit) =
+        new_owned_native_vec::<u8>(original, count.bytes_written).map_err(&existing)?;
     let mut owner = OwnedEventBody { body, credit };
     owner.body.resize(count.bytes_written, 0);
     let written =
@@ -6147,14 +6718,20 @@ fn encode_owned_event_value_in<T: Serialize, E>(
     Ok(owner)
 }
 impl OwnedEncodedEventBusConfig {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_new(
         original: &OwnedMemoryReservation,
         definitions: &EventBusDefinitions,
     ) -> Result<Self> {
         Self::try_new_capacity(original, definitions, 0)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_empty(original: &OwnedMemoryReservation) -> Result<Self> {
         let (body, credit) = new_owned_native_vec(original, 0)?;
         let values = OwnedEventBody { body, credit };
@@ -6166,7 +6743,10 @@ impl OwnedEncodedEventBusConfig {
             body_array: credit,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_new_capacity(
         original: &OwnedMemoryReservation,
         definitions: &EventBusDefinitions,
@@ -6210,7 +6790,10 @@ impl OwnedEncodedEventBusConfig {
         )?;
         Ok(owner)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn push<T: Serialize>(
         &mut self,
         original: &OwnedMemoryReservation,
@@ -6246,7 +6829,10 @@ pub(super) struct OwnedDefinitionPublication {
     retirement: OwnedEventBody<Option<(String, OwnedSinkQueue)>, Option<OwnedMemoryReservation>>,
 }
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_definition_publication(
         &self,
         projection: OwnedDefinitionsProjection,
@@ -6255,7 +6841,10 @@ impl OwnedEventBusHandle {
     ) -> Result<OwnedDefinitionPublication> {
         self.prepare_owned_definition_publication_with_extra_config(projection, mode, lease, 0)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_owned_definition_publication_with_extra_config(
         &self,
         projection: OwnedDefinitionsProjection,
@@ -6265,7 +6854,8 @@ impl OwnedEventBusHandle {
     ) -> Result<OwnedDefinitionPublication> {
         if !Arc::ptr_eq(&lease.state, &self.data().common.queue_mutation_state) {
             return Err(Error::Other(
-                "definition lease belongs to another event bus".into()));
+                "definition lease belongs to another event bus".into(),
+            ));
         }
         let original = &self.data().original;
         let config =
@@ -6441,7 +7031,10 @@ impl OwnedEventBusHandle {
         drop(publication.retirement);
         self.data().common.waiters.notify_all();
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_event_bus_without_table(
         &self,
         table: &str,
@@ -6465,7 +7058,10 @@ impl OwnedEventBusHandle {
         self.prepare_owned_definition_publication(projection, OwnedDefinitionMode::Additive, lease)
             .map(Some)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn export_owned_event_bus_config_values(
         &self,
     ) -> Result<OwnedEncodedEventBusConfig> {
@@ -6664,19 +7260,34 @@ pub(crate) struct OwnedQueueCommitToken<'a> {
     _source: &'a OwnedQueueMutationClaim,
 }
 impl OwnedQueueMutationClaim {
-    fn commit_token<'a>(&'a self, committed: &'a Cell<bool>,
+    fn commit_token<'a>(
+        &'a self,
+        committed: &'a Cell<bool>,
         settle: &'a dyn Fn(Option<crate::persistence::WriterSnapshotHandle>),
-        snapshot: contextdb_core::SnapshotId, lsn: contextdb_core::Lsn,
+        snapshot: contextdb_core::SnapshotId,
+        lsn: contextdb_core::Lsn,
     ) -> OwnedQueueCommitToken<'a> {
         assert!(self.active);
-        OwnedQueueCommitToken { committed, settle, snapshot, lsn, _source: self }
+        OwnedQueueCommitToken {
+            committed,
+            settle,
+            snapshot,
+            lsn,
+            _source: self,
+        }
     }
 }
 impl OwnedQueueCommitToken<'_> {
-    pub(crate) fn mark_success(&self) { self.settle(None); }
-    pub(crate) fn settle_root(&self, root: crate::persistence::WriterSnapshotHandle) { self.settle(Some(root)); }
+    pub(crate) fn mark_success(&self) {
+        self.settle(None);
+    }
+    pub(crate) fn settle_root(&self, root: crate::persistence::WriterSnapshotHandle) {
+        self.settle(Some(root));
+    }
     fn settle(&self, root: Option<crate::persistence::WriterSnapshotHandle>) {
-        if !self.committed.replace(true) { (self.settle)(root); }
+        if !self.committed.replace(true) {
+            (self.settle)(root);
+        }
     }
 }
 
@@ -6689,8 +7300,11 @@ fn retire_owned_queue_phase<T, R>(
     secondary: &mut Option<Box<dyn std::any::Any + Send>>,
 ) {
     if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))) {
-        if matches!(outcome, Ok(Ok(_))) { *outcome = Err(panic); }
-        else { *secondary = Some(panic); }
+        if matches!(outcome, Ok(Ok(_))) {
+            *outcome = Err(panic);
+        } else {
+            *secondary = Some(panic);
+        }
     }
 }
 
@@ -6735,12 +7349,23 @@ impl OwnedNativeQueueFailure {
     fn prepare(original: &OwnedMemoryReservation) -> Self {
         let carrier = match OriginalError::prepare_route(original) {
             Ok(carrier) => carrier,
-            Err(error) => return Self { error: Some(error), carrier: None,
-                cleanup: OwnedQueueCommitCleanup::default(), control: None, diagnostic: None },
+            Err(error) => {
+                return Self {
+                    error: Some(error),
+                    carrier: None,
+                    cleanup: OwnedQueueCommitCleanup::default(),
+                    control: None,
+                    diagnostic: None,
+                };
+            }
         };
         let failure = match crate::memory_accounting::reserve_preparation_original_native(
-            original, std::mem::size_of::<Self>(), "relational", "statement_overlay",
-            "Reduce prepared event bodies or raise MEMORY_LIMIT.") {
+            original,
+            std::mem::size_of::<Self>(),
+            "relational",
+            "statement_overlay",
+            "Reduce prepared event bodies or raise MEMORY_LIMIT.",
+        ) {
             Ok(control) => Self {
                 error: None,
                 carrier: Some(carrier),
@@ -6764,8 +7389,12 @@ impl OwnedNativeQueueFailure {
         {
             let mut failure = failure;
             match crate::memory_accounting::reserve_preparation_original_native(
-                original, "injected currency cleanup failure".len(), "relational", "statement_overlay",
-                "Reduce prepared event bodies or raise MEMORY_LIMIT.") {
+                original,
+                "injected currency cleanup failure".len(),
+                "relational",
+                "statement_overlay",
+                "Reduce prepared event bodies or raise MEMORY_LIMIT.",
+            ) {
                 Ok(credit) => failure.diagnostic = Some(credit),
                 Err(error) => failure.error = Some(OriginalError::native(error)),
             }
@@ -6776,10 +7405,16 @@ impl OwnedNativeQueueFailure {
             failure
         }
     }
-    pub(crate) fn has_error(&self) -> bool { self.error.is_some() }
+    pub(crate) fn has_error(&self) -> bool {
+        self.error.is_some()
+    }
     pub(crate) fn capture(&mut self, result: Result<()>) {
-        let result = result.map_err(|error| self.carrier.take()
-            .expect("failure carrier prepared before callback").error(error));
+        let result = result.map_err(|error| {
+            self.carrier
+                .take()
+                .expect("failure carrier prepared before callback")
+                .error(error)
+        });
         self.capture_funded(result);
     }
     pub(crate) fn capture_funded(&mut self, result: OriginalResult<()>) {
@@ -6813,15 +7448,23 @@ impl OwnedNativeQueueFailure {
 }
 
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn claim_owned_checked_out(
         &self,
         sink: &str,
         lookup: &OwnedCheckoutLookup,
     ) -> Result<OwnedQueueMutationClaim> {
         let queue_output = OriginalError::prepare_queue(&self.data().original, lookup.key.1)
-            .map_err(|refusal| crate::persistence::native_storage_admission::original_storage_error(
-                crate::persistence::native_storage_admission::NativeStorageFailure::Refused(refusal)))?;
+            .map_err(|refusal| {
+                crate::persistence::native_storage_admission::original_storage_error(
+                    crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                        refusal,
+                    ),
+                )
+            })?;
         let control = reserve_owned_event_bytes(
             &self.data().original,
             std::mem::size_of::<OwnedQueueMutationClaim>(),
@@ -6857,7 +7500,11 @@ impl OwnedEventBusHandle {
             if !current {
                 drop(queues);
                 drop(state);
-                return Err(OriginalError::queue_public(queue_output, lookup.key.1, false));
+                return Err(OriginalError::queue_public(
+                    queue_output,
+                    lookup.key.1,
+                    false,
+                ));
             }
             if queues
                 .values
@@ -6880,13 +7527,14 @@ impl OwnedEventBusHandle {
             return Ok(claim);
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn empty_owned_dispatch_batch(&self, maximum: usize) -> Result<OwnedSinkDispatchBatch> {
         let original = &self.data().original;
-        let control = reserve_owned_event_bytes(
-            original,
-            std::mem::size_of::<OwnedCheckoutBodyLifetime>(),
-        )?;
+        let control =
+            reserve_owned_event_bytes(original, std::mem::size_of::<OwnedCheckoutBodyLifetime>())?;
         let body_lifetime = OwnedCheckoutBodyLifetime {
             storage: self.clone(),
             active: false,
@@ -6923,7 +7571,10 @@ impl OwnedEventBusHandle {
             body_lifetime,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn checkout_owned_sink_batch(
         &self,
         sink: &str,
@@ -6984,9 +7635,13 @@ impl OwnedEventBusHandle {
                 }
                 let mut skipped = 0u64;
                 for entry in &queue.entries {
-                    if pins.body.len() == maximum { break; }
+                    if pins.body.len() == maximum {
+                        break;
+                    }
                     if !owned_event_visible(access, &entry.entry) {
-                        if queue.cold.is_none() { break; }
+                        if queue.cold.is_none() {
+                            break;
+                        }
                         skipped = skipped.saturating_add(1);
                         continue;
                     }
@@ -7001,9 +7656,13 @@ impl OwnedEventBusHandle {
                 }
                 drop(queues);
                 drop(state);
-                if skipped != 0 { self.record_owned_batch_outcome(sink, 0, 0, skipped, 0, 0); }
+                if skipped != 0 {
+                    self.record_owned_batch_outcome(sink, 0, 0, skipped, 0, 0);
+                }
             }
-            if pins.body.is_empty() { return Ok(batch); }
+            if pins.body.is_empty() {
+                return Ok(batch);
+            }
             // Every deep copy and key constructor sees a retained paid pin,
             // outside both guards. Helper-local unwind now retires unlocked.
             for (source, name) in pins.body.drain(..) {
@@ -7089,12 +7748,17 @@ impl OwnedEventBusHandle {
                     .is_some_and(|q| {
                         q.entries.len() >= batch.lookups.len()
                             && batch.lookups.iter().enumerate().all(|(index, lookup)| {
-                                let matches = |entry: &OwnedEventShared<OwnedSinkQueueEntry>| Arc::ptr_eq(
-                                    entry.data.as_ref().expect("live queue pin"),
-                                    lookup.source.data.as_ref().expect("captured queue pin"),
-                                );
-                                if q.cold.is_some() { q.entries.iter().any(matches) }
-                                else { q.entries.get(index).is_some_and(matches) }
+                                let matches = |entry: &OwnedEventShared<OwnedSinkQueueEntry>| {
+                                    Arc::ptr_eq(
+                                        entry.data.as_ref().expect("live queue pin"),
+                                        lookup.source.data.as_ref().expect("captured queue pin"),
+                                    )
+                                };
+                                if q.cold.is_some() {
+                                    q.entries.iter().any(matches)
+                                } else {
+                                    q.entries.get(index).is_some_and(matches)
+                                }
                             })
                     });
                 if !unchanged {
@@ -7238,133 +7902,186 @@ impl OwnedEventBusHandle {
         let mut joint_control = None;
         let mut outer_claim = None;
         let mut outer_lease = None;
-        let mut outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+        let mut outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tx_mgr.with_original_maintenance_publication(&self.data().original, |publication| {
-            outer_lease = Some(self.data().common.begin_dispatcher_queue_mutation().map_err(|error| diagnostic.error(error))?);
-            let entry_id = lookup.key.1;
-            outer_claim = Some(self.claim_owned_checked_out(sink, lookup).map_err(|error| diagnostic.error(error))?);
-            let _claim = outer_claim.as_ref().expect("one actual source claim");
-            // The lookup pins the ACTUAL checked-out entry, including its
-            // original invoice. No new root/key lookup chooses a funding seed.
-            let initially_current = {
-                let state = self.data().common.queue_mutation_state.lock();
-                let queues = self.data().queues.lock();
-                !lookup.finished.get()
-                    && state.checked_out.contains(&lookup.key)
-                    && queues.values.get(sink).is_some_and(|q| {
-                        q.entries.iter().skip(q.retiring).any(|entry| {
-                            Arc::ptr_eq(
-                                entry.data.as_ref().expect("live queue entry"),
-                                lookup.source.data.as_ref().expect("checked-out source"),
-                            )
+                outer_lease = Some(
+                    self.data()
+                        .common
+                        .begin_dispatcher_queue_mutation()
+                        .map_err(|error| diagnostic.error(error))?,
+                );
+                let entry_id = lookup.key.1;
+                outer_claim = Some(
+                    self.claim_owned_checked_out(sink, lookup)
+                        .map_err(|error| diagnostic.error(error))?,
+                );
+                let _claim = outer_claim.as_ref().expect("one actual source claim");
+                // The lookup pins the ACTUAL checked-out entry, including its
+                // original invoice. No new root/key lookup chooses a funding seed.
+                let initially_current = {
+                    let state = self.data().common.queue_mutation_state.lock();
+                    let queues = self.data().queues.lock();
+                    !lookup.finished.get()
+                        && state.checked_out.contains(&lookup.key)
+                        && queues.values.get(sink).is_some_and(|q| {
+                            q.entries.iter().skip(q.retiring).any(|entry| {
+                                Arc::ptr_eq(
+                                    entry.data.as_ref().expect("live queue entry"),
+                                    lookup.source.data.as_ref().expect("checked-out source"),
+                                )
+                            })
                         })
-                    })
-            };
-            if !initially_current {
-                return Err(OriginalError::queue(queue_output, entry_id, false));
-            }
-            let source = &lookup.source;
-            let mut updated =
-                copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry).map_err(|error| diagnostic.error(error))?;
-            let attempts = updated.entry.attempts & ATTEMPT_COUNT_MASK;
-            updated.entry.attempts = if start {
-                if updated.entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
-                    return Err(OriginalError::queue(queue_output, entry_id, true));
+                };
+                if !initially_current {
+                    return Err(OriginalError::queue(queue_output, entry_id, false));
                 }
-                attempts.saturating_add(1).min(ATTEMPT_COUNT_MASK) | UNCONFIRMED_ATTEMPT
-            } else {
-                attempts
-            };
-            let was_unconfirmed = source.entry.attempts & UNCONFIRMED_ATTEMPT != 0;
-            let delta = if start {
-                1
-            } else if was_unconfirmed {
-                -1
-            } else {
-                0
-            };
-            let encoded = encode_owned_event_value_funded(&source.get().credit.metadata, &updated.entry)?;
-            let successor = OwnedEventShared::try_new(
-                updated,
-                &source.get().credit.metadata,
-                &self.data().funder,
-            ).map_err(|error| diagnostic.error(error))?;
-            let prepared = persistence.prepare_update_funded(
-                &self.data().original,
-                sink,
-                entry_id,
-                &encoded.body,
-                uncertain,
-                delta,
-            )?;
-            let current = {
-                let state = self.data().common.queue_mutation_state.lock();
-                let queues = self.data().queues.lock();
-                !lookup.finished.get()
-                    && state.checked_out.contains(&lookup.key)
-                    && queues.values.get(sink).is_some_and(|q| {
-                        q.entries.iter().skip(q.retiring).any(|entry| {
-                            Arc::ptr_eq(
-                                entry.data.as_ref().expect("live queue entry"),
-                                source.data.as_ref().expect("checked-out source"),
-                            )
+                let source = &lookup.source;
+                let mut updated =
+                    copy_owned_sink_queue_entry(&source.get().credit.metadata, &source.entry)
+                        .map_err(|error| diagnostic.error(error))?;
+                let attempts = updated.entry.attempts & ATTEMPT_COUNT_MASK;
+                updated.entry.attempts = if start {
+                    if updated.entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
+                        return Err(OriginalError::queue(queue_output, entry_id, true));
+                    }
+                    attempts.saturating_add(1).min(ATTEMPT_COUNT_MASK) | UNCONFIRMED_ATTEMPT
+                } else {
+                    attempts
+                };
+                let was_unconfirmed = source.entry.attempts & UNCONFIRMED_ATTEMPT != 0;
+                let delta = if start {
+                    1
+                } else if was_unconfirmed {
+                    -1
+                } else {
+                    0
+                };
+                let encoded =
+                    encode_owned_event_value_funded(&source.get().credit.metadata, &updated.entry)?;
+                let successor = OwnedEventShared::try_new(
+                    updated,
+                    &source.get().credit.metadata,
+                    &self.data().funder,
+                )
+                .map_err(|error| diagnostic.error(error))?;
+                let prepared = persistence.prepare_update_funded(
+                    &self.data().original,
+                    sink,
+                    entry_id,
+                    &encoded.body,
+                    uncertain,
+                    delta,
+                )?;
+                let current = {
+                    let state = self.data().common.queue_mutation_state.lock();
+                    let queues = self.data().queues.lock();
+                    !lookup.finished.get()
+                        && state.checked_out.contains(&lookup.key)
+                        && queues.values.get(sink).is_some_and(|q| {
+                            q.entries.iter().skip(q.retiring).any(|entry| {
+                                Arc::ptr_eq(
+                                    entry.data.as_ref().expect("live queue entry"),
+                                    source.data.as_ref().expect("checked-out source"),
+                                )
+                            })
                         })
+                };
+                if !current {
+                    return Err(OriginalError::queue(queue_output, entry_id, false));
+                }
+                // Acquire every settlement lock before entering storage. The
+                // source claim fixes this generation while the physical write runs.
+                let mut published = publication
+                    .prepare_exact_root()
+                    .map_err(|error| diagnostic.error(error))?;
+                let snapshot = published.snapshot();
+                let lsn = published.lsn();
+                let mut queues = self.data().queues.lock();
+                let queue = queues.values.get_mut(sink).expect("claimed attempt queue");
+                let position = queue
+                    .entries
+                    .iter()
+                    .position(|entry| {
+                        Arc::ptr_eq(
+                            entry.data.as_ref().expect("live queue entry"),
+                            _claim.source.data.as_ref().expect("claimed source"),
+                        )
                     })
-            };
-            if !current {
-                return Err(OriginalError::queue(queue_output, entry_id, false));
-            }
-            // Acquire every settlement lock before entering storage. The
-            // source claim fixes this generation while the physical write runs.
-            let mut published = publication.prepare_exact_root().map_err(|error| diagnostic.error(error))?;
-            let snapshot = published.snapshot();
-            let lsn = published.lsn();
-            let mut queues = self.data().queues.lock();
-            let queue = queues.values.get_mut(sink).expect("claimed attempt queue");
-            let position = queue.entries.iter().position(|entry| Arc::ptr_eq(
-                entry.data.as_ref().expect("live queue entry"),
-                _claim.source.data.as_ref().expect("claimed source"))).expect("claimed attempt source");
-            let mut metrics = self.data().common.metrics.lock();
-            let state = metrics.get_mut(sink).expect("paid owning sink metrics");
-            let next_unconfirmed = if start { state.unconfirmed + 1 }
-                else if was_unconfirmed { state.unconfirmed.saturating_sub(1) } else { state.unconfirmed };
-            let next_uncertain = state.uncertain + u64::from(uncertain);
-            let mut successor = Some(successor);
-            let committed = Cell::new(false);
-            let durable = persistence.is_durable();
-            let settle = std::cell::RefCell::new(|root: Option<crate::persistence::WriterSnapshotHandle>| {
-                if durable {
-                    published.settle(root.expect("actual durable root receipt").into_capture());
-                    retired_publication = published.take_retired_handle();
-                }
-                let next = successor.take().expect("one attempt successor");
-                retired = Some(std::mem::replace(&mut queue.entries[position], next.clone()));
-                old_lookup = Some(std::mem::replace(&mut lookup.source, next));
-                if let Some(cold) = &mut queue.cold {
-                    cold.generation = cold.generation.wrapping_add(1);
-                    cold.pending_refill = None;
-                }
-                state.unconfirmed = next_unconfirmed;
-                state.uncertain = next_uncertain;
-            });
-            joint_control = Some(reserve_owned_event_bytes(&self.data().original,
-                std::mem::size_of_val(&settle) + std::mem::size_of::<contextdb_tx::manager::PreparedMaintenanceRead<'_>>()
-                + 2 * std::mem::size_of::<Option<OwnedEventShared<OwnedSinkQueueEntry>>>()
-                + std::mem::size_of::<Option<contextdb_tx::native_capture::CaptureHandle>>()).map_err(|error| diagnostic.error(error))?);
-            let settle_joint = |root| (settle.borrow_mut())(root);
-            let token = _claim.commit_token(&committed, &settle_joint, snapshot, lsn);
-            persistence.commit_update_at_boundary(prepared, &token, &mut failure);
-            drop(metrics);
-            drop(queues);
-            drop(published);
-            failure.loan_result(attempts.max(1))
-        })));
+                    .expect("claimed attempt source");
+                let mut metrics = self.data().common.metrics.lock();
+                let state = metrics.get_mut(sink).expect("paid owning sink metrics");
+                let next_unconfirmed = if start {
+                    state.unconfirmed + 1
+                } else if was_unconfirmed {
+                    state.unconfirmed.saturating_sub(1)
+                } else {
+                    state.unconfirmed
+                };
+                let next_uncertain = state.uncertain + u64::from(uncertain);
+                let mut successor = Some(successor);
+                let committed = Cell::new(false);
+                let durable = persistence.is_durable();
+                let settle = std::cell::RefCell::new(
+                    |root: Option<crate::persistence::WriterSnapshotHandle>| {
+                        if durable {
+                            published
+                                .settle(root.expect("actual durable root receipt").into_capture());
+                            retired_publication = published.take_retired_handle();
+                        }
+                        let next = successor.take().expect("one attempt successor");
+                        retired = Some(std::mem::replace(
+                            &mut queue.entries[position],
+                            next.clone(),
+                        ));
+                        old_lookup = Some(std::mem::replace(&mut lookup.source, next));
+                        if let Some(cold) = &mut queue.cold {
+                            cold.generation = cold.generation.wrapping_add(1);
+                            cold.pending_refill = None;
+                        }
+                        state.unconfirmed = next_unconfirmed;
+                        state.uncertain = next_uncertain;
+                    },
+                );
+                joint_control =
+                    Some(
+                        reserve_owned_event_bytes(
+                            &self.data().original,
+                            std::mem::size_of_val(&settle)
+                                + std::mem::size_of::<
+                                    contextdb_tx::manager::PreparedMaintenanceRead<'_>,
+                                >()
+                                + 2 * std::mem::size_of::<
+                                    Option<OwnedEventShared<OwnedSinkQueueEntry>>,
+                                >()
+                                + std::mem::size_of::<
+                                    Option<contextdb_tx::native_capture::CaptureHandle>,
+                                >(),
+                        )
+                        .map_err(|error| diagnostic.error(error))?,
+                    );
+                let settle_joint = |root| (settle.borrow_mut())(root);
+                let token = _claim.commit_token(&committed, &settle_joint, snapshot, lsn);
+                persistence.commit_update_at_boundary(prepared, &token, &mut failure);
+                drop(metrics);
+                drop(queues);
+                drop(published);
+                failure.loan_result(attempts.max(1))
+            })
+        }));
         retire_owned_queue_phase(&mut outcome, outer_claim, &mut failure.cleanup.claim_unwind);
         retire_owned_queue_phase(&mut outcome, old_lookup, &mut failure.cleanup.lookup_unwind);
         retire_owned_queue_phase(&mut outcome, retired, &mut failure.cleanup.entry_unwind);
-        retire_owned_queue_phase(&mut outcome, retired_publication, &mut failure.cleanup.publication_unwind);
+        retire_owned_queue_phase(
+            &mut outcome,
+            retired_publication,
+            &mut failure.cleanup.publication_unwind,
+        );
         retire_owned_queue_phase(&mut outcome, outer_lease, &mut failure.cleanup.lease_unwind);
-        retire_owned_queue_phase(&mut outcome, joint_control, &mut failure.cleanup.control_unwind);
+        retire_owned_queue_phase(
+            &mut outcome,
+            joint_control,
+            &mut failure.cleanup.control_unwind,
+        );
         match outcome {
             Ok(result) => failure.finish(result),
             Err(panic) => std::panic::resume_unwind(panic),
@@ -7390,7 +8107,11 @@ impl OwnedEventBusHandle {
         }
         // All candidate IDs are already known. Decimal width is monotonic,
         // so one exact buffer for the largest actual member covers the batch.
-        let largest_id = *batch.acked.iter().max().expect("nonempty acknowledged batch");
+        let largest_id = *batch
+            .acked
+            .iter()
+            .max()
+            .expect("nonempty acknowledged batch");
         let queue_output = match OriginalError::prepare_queue(&self.data().original, largest_id) {
             Ok(output) => output,
             Err(refusal) => return failure.finish(Err(OriginalError::native(refusal))),
@@ -7403,150 +8124,185 @@ impl OwnedEventBusHandle {
         let mut joint_control = None;
         let mut outer_claim = None;
         let mut outer_lease = None;
-        let mut outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+        let mut outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tx_mgr.with_original_maintenance_publication(&self.data().original, |publication| {
-            outer_lease = Some(self.data().common.begin_dispatcher_queue_mutation().map_err(|error| diagnostic.error(error))?);
-            batch.removable.clear();
-            // Qualify the actual first source before preparing any durable ack.
-            // An absent prefix retains the original no-op behavior; an equal
-            // ID with a different source generation is an ordinary error.
-            let first = batch.acked[0];
-            let Some(first_lookup) = batch
-                .lookups
-                .iter()
-                .find(|lookup| lookup.key.1 == first)
-            else {
-                return Err(OriginalError::queue(queue_output, first, false));
-            };
-            let (front_id_matches, front_matches) = {
-                let queues = self.data().queues.lock();
-                queues
-                    .values
-                    .get(sink)
-                    .filter(|q| q.retiring == 0)
-                    .and_then(|q| if q.cold.is_some() {
-                        q.entries.iter().find(|entry| entry.entry.id == first)
-                    } else { q.entries.front() })
-                    .map_or((false, false), |entry| {
-                        (
-                            entry.entry.id == first,
-                            entry.entry.id == first
-                                && Arc::ptr_eq(
-                                    entry.data.as_ref().expect("ack front source"),
-                                    first_lookup
-                                        .source
-                                        .data
-                                        .as_ref()
-                                        .expect("ack checkout generation"),
-                                ),
-                        )
-                    })
-            };
-            if !front_id_matches {
-                return Ok(());
-            }
-            if !front_matches {
-                return Err(OriginalError::queue(queue_output, first, false));
-            }
-            outer_claim = Some(self.claim_owned_checked_out(sink, first_lookup).map_err(|error| diagnostic.error(error))?);
-            let _claim = outer_claim.as_ref().expect("one actual source claim");
-            let unconfirmed;
-            let mut stale = None;
-            {
-                let queues = self.data().queues.lock();
-                if let Some(queue) = queues.values.get(sink).filter(|q| q.retiring == 0) {
-                    for (index, id) in batch.acked.iter().enumerate() {
-                        if queue.cold.is_some() && batch.removable.contains(id) { continue; }
-                        let entry = if queue.cold.is_some() {
-                            queue.entries.iter().find(|entry| entry.entry.id == *id)
-                        } else { queue.entries.get(index) };
-                        let Some(entry) = entry else { break; };
-                        let exact = batch
-                            .lookups
-                            .iter()
-                            .find(|lookup| lookup.key.1 == *id)
-                            .is_some_and(|lookup| {
-                                !lookup.finished.get()
+                outer_lease = Some(
+                    self.data()
+                        .common
+                        .begin_dispatcher_queue_mutation()
+                        .map_err(|error| diagnostic.error(error))?,
+                );
+                batch.removable.clear();
+                // Qualify the actual first source before preparing any durable ack.
+                // An absent prefix retains the original no-op behavior; an equal
+                // ID with a different source generation is an ordinary error.
+                let first = batch.acked[0];
+                let Some(first_lookup) = batch.lookups.iter().find(|lookup| lookup.key.1 == first)
+                else {
+                    return Err(OriginalError::queue(queue_output, first, false));
+                };
+                let (front_id_matches, front_matches) = {
+                    let queues = self.data().queues.lock();
+                    queues
+                        .values
+                        .get(sink)
+                        .filter(|q| q.retiring == 0)
+                        .and_then(|q| {
+                            if q.cold.is_some() {
+                                q.entries.iter().find(|entry| entry.entry.id == first)
+                            } else {
+                                q.entries.front()
+                            }
+                        })
+                        .map_or((false, false), |entry| {
+                            (
+                                entry.entry.id == first,
+                                entry.entry.id == first
                                     && Arc::ptr_eq(
-                                        entry.data.as_ref().expect("ack source"),
-                                        lookup.source.data.as_ref().expect("ack generation"),
-                                    )
-                            });
-                        if *id != entry.entry.id {
-                            break;
+                                        entry.data.as_ref().expect("ack front source"),
+                                        first_lookup
+                                            .source
+                                            .data
+                                            .as_ref()
+                                            .expect("ack checkout generation"),
+                                    ),
+                            )
+                        })
+                };
+                if !front_id_matches {
+                    return Ok(());
+                }
+                if !front_matches {
+                    return Err(OriginalError::queue(queue_output, first, false));
+                }
+                outer_claim = Some(
+                    self.claim_owned_checked_out(sink, first_lookup)
+                        .map_err(|error| diagnostic.error(error))?,
+                );
+                let _claim = outer_claim.as_ref().expect("one actual source claim");
+                let unconfirmed;
+                let mut stale = None;
+                {
+                    let queues = self.data().queues.lock();
+                    if let Some(queue) = queues.values.get(sink).filter(|q| q.retiring == 0) {
+                        for (index, id) in batch.acked.iter().enumerate() {
+                            if queue.cold.is_some() && batch.removable.contains(id) {
+                                continue;
+                            }
+                            let entry = if queue.cold.is_some() {
+                                queue.entries.iter().find(|entry| entry.entry.id == *id)
+                            } else {
+                                queue.entries.get(index)
+                            };
+                            let Some(entry) = entry else {
+                                break;
+                            };
+                            let exact = batch
+                                .lookups
+                                .iter()
+                                .find(|lookup| lookup.key.1 == *id)
+                                .is_some_and(|lookup| {
+                                    !lookup.finished.get()
+                                        && Arc::ptr_eq(
+                                            entry.data.as_ref().expect("ack source"),
+                                            lookup.source.data.as_ref().expect("ack generation"),
+                                        )
+                                });
+                            if *id != entry.entry.id {
+                                break;
+                            }
+                            if !exact {
+                                stale = Some(*id);
+                                break;
+                            }
+                            batch.removable.push(*id);
                         }
-                        if !exact {
-                            stale = Some(*id);
-                            break;
-                        }
-                        batch.removable.push(*id);
+                        unconfirmed = queue
+                            .entries
+                            .iter()
+                            .filter(|entry| batch.removable.contains(&entry.entry.id))
+                            .filter(|entry| entry.entry.attempts & UNCONFIRMED_ATTEMPT != 0)
+                            .count() as u64;
+                    } else {
+                        unconfirmed = 0;
                     }
-                    unconfirmed = queue
-                        .entries
-                        .iter()
-                        .filter(|entry| batch.removable.contains(&entry.entry.id))
-                        .filter(|entry| entry.entry.attempts & UNCONFIRMED_ATTEMPT != 0)
-                        .count() as u64;
-                } else {
-                    unconfirmed = 0;
                 }
-            }
-            if let Some(id) = stale {
-                return Err(OriginalError::queue(queue_output, id, false));
-            }
-            if batch.removable.is_empty() {
-                return Ok(());
-            }
-            let prepared = persistence.prepare_removals(
-                &self.data().original,
-                sink,
-                &batch.removable,
-                unconfirmed,
-            ).map_err(|error| diagnostic.error(error))?;
-            let removable = &batch.removable;
-            let retired = &mut batch.retired;
-            let mut published = publication.prepare_exact_root().map_err(|error| diagnostic.error(error))?;
-            let snapshot = published.snapshot();
-            let lsn = published.lsn();
-            let mut queues = self.data().queues.lock();
-            let queue = queues.values.get_mut(sink).expect("claimed ack queue");
-            // The paid batch has room for the complete prefix before flush.
-            assert!(retired.capacity() - retired.len() >= removable.len());
-            let next_depth = queue.cold.as_ref().map(|cold| cold.depth.checked_sub(removable.len() as u64)
-                .expect("durable acknowledgements were resident"));
-            let mut metrics = self.data().common.metrics.lock();
-            let state = metrics.get_mut(sink).expect("paid owning sink metrics");
-            let next_unconfirmed = state.unconfirmed.saturating_sub(unconfirmed);
-            let committed = Cell::new(false);
-            let durable = persistence.is_durable();
-            let settle = std::cell::RefCell::new(|root: Option<crate::persistence::WriterSnapshotHandle>| {
-                if durable {
-                    published.settle(root.expect("actual durable root receipt").into_capture());
-                    retired_publication = published.take_retired_handle();
+                if let Some(id) = stale {
+                    return Err(OriginalError::queue(queue_output, id, false));
                 }
-                for id in removable {
-                    let position = queue.entries.iter().position(|entry| entry.entry.id == *id)
-                        .expect("claimed ack identity remains installed");
-                    retired.push(queue.entries.remove(position).expect("ack identity"));
+                if batch.removable.is_empty() {
+                    return Ok(());
                 }
-                if let Some(cold) = &mut queue.cold {
-                    cold.depth = next_depth.expect("prepared cold depth");
-                    cold.generation = cold.generation.wrapping_add(1);
-                    cold.pending_refill = None;
-                }
-                state.unconfirmed = next_unconfirmed;
-            });
-            joint_control = Some(reserve_owned_event_bytes(&self.data().original,
-                std::mem::size_of_val(&settle) + std::mem::size_of::<contextdb_tx::manager::PreparedMaintenanceRead<'_>>()
-                + std::mem::size_of::<Option<contextdb_tx::native_capture::CaptureHandle>>()).map_err(|error| diagnostic.error(error))?);
-            let settle_joint = |root| (settle.borrow_mut())(root);
-            let token = _claim.commit_token(&committed, &settle_joint, snapshot, lsn);
-            persistence.commit_removals_at_boundary(prepared, &token, &mut failure);
-            drop(metrics);
-            drop(queues);
-            drop(published);
-            failure.loan_result(())
-        })));
+                let prepared = persistence
+                    .prepare_removals(&self.data().original, sink, &batch.removable, unconfirmed)
+                    .map_err(|error| diagnostic.error(error))?;
+                let removable = &batch.removable;
+                let retired = &mut batch.retired;
+                let mut published = publication
+                    .prepare_exact_root()
+                    .map_err(|error| diagnostic.error(error))?;
+                let snapshot = published.snapshot();
+                let lsn = published.lsn();
+                let mut queues = self.data().queues.lock();
+                let queue = queues.values.get_mut(sink).expect("claimed ack queue");
+                // The paid batch has room for the complete prefix before flush.
+                assert!(retired.capacity() - retired.len() >= removable.len());
+                let next_depth = queue.cold.as_ref().map(|cold| {
+                    cold.depth
+                        .checked_sub(removable.len() as u64)
+                        .expect("durable acknowledgements were resident")
+                });
+                let mut metrics = self.data().common.metrics.lock();
+                let state = metrics.get_mut(sink).expect("paid owning sink metrics");
+                let next_unconfirmed = state.unconfirmed.saturating_sub(unconfirmed);
+                let committed = Cell::new(false);
+                let durable = persistence.is_durable();
+                let settle = std::cell::RefCell::new(
+                    |root: Option<crate::persistence::WriterSnapshotHandle>| {
+                        if durable {
+                            published
+                                .settle(root.expect("actual durable root receipt").into_capture());
+                            retired_publication = published.take_retired_handle();
+                        }
+                        for id in removable {
+                            let position = queue
+                                .entries
+                                .iter()
+                                .position(|entry| entry.entry.id == *id)
+                                .expect("claimed ack identity remains installed");
+                            retired.push(queue.entries.remove(position).expect("ack identity"));
+                        }
+                        if let Some(cold) = &mut queue.cold {
+                            cold.depth = next_depth.expect("prepared cold depth");
+                            cold.generation = cold.generation.wrapping_add(1);
+                            cold.pending_refill = None;
+                        }
+                        state.unconfirmed = next_unconfirmed;
+                    },
+                );
+                joint_control =
+                    Some(
+                        reserve_owned_event_bytes(
+                            &self.data().original,
+                            std::mem::size_of_val(&settle)
+                                + std::mem::size_of::<
+                                    contextdb_tx::manager::PreparedMaintenanceRead<'_>,
+                                >()
+                                + std::mem::size_of::<
+                                    Option<contextdb_tx::native_capture::CaptureHandle>,
+                                >(),
+                        )
+                        .map_err(|error| diagnostic.error(error))?,
+                    );
+                let settle_joint = |root| (settle.borrow_mut())(root);
+                let token = _claim.commit_token(&committed, &settle_joint, snapshot, lsn);
+                persistence.commit_removals_at_boundary(prepared, &token, &mut failure);
+                drop(metrics);
+                drop(queues);
+                drop(published);
+                failure.loan_result(())
+            })
+        }));
         retire_owned_queue_phase(&mut outcome, outer_claim, &mut failure.cleanup.claim_unwind);
         if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for lookup in &batch.lookups {
@@ -7555,17 +8311,33 @@ impl OwnedEventBusHandle {
                 }
             }
         })) {
-            if matches!(&outcome, Ok(Ok(_))) { outcome = Err(panic); }
-            else { failure.cleanup.checkout_unwind = Some(panic); }
+            if matches!(&outcome, Ok(Ok(_))) {
+                outcome = Err(panic);
+            } else {
+                failure.cleanup.checkout_unwind = Some(panic);
+            }
         }
-        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch.retired.clear())) {
-            if matches!(&outcome, Ok(Ok(_))) { outcome = Err(panic); }
-            else { failure.cleanup.entry_unwind = Some(panic); }
+        if let Err(panic) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| batch.retired.clear()))
+        {
+            if matches!(&outcome, Ok(Ok(_))) {
+                outcome = Err(panic);
+            } else {
+                failure.cleanup.entry_unwind = Some(panic);
+            }
         }
-        retire_owned_queue_phase(&mut outcome, retired_publication, &mut failure.cleanup.publication_unwind);
+        retire_owned_queue_phase(
+            &mut outcome,
+            retired_publication,
+            &mut failure.cleanup.publication_unwind,
+        );
         self.data().common.waiters.notify_all();
         retire_owned_queue_phase(&mut outcome, outer_lease, &mut failure.cleanup.lease_unwind);
-        retire_owned_queue_phase(&mut outcome, joint_control, &mut failure.cleanup.control_unwind);
+        retire_owned_queue_phase(
+            &mut outcome,
+            joint_control,
+            &mut failure.cleanup.control_unwind,
+        );
         match outcome {
             Ok(result) => failure.finish(result),
             Err(panic) => std::panic::resume_unwind(panic),
@@ -7579,24 +8351,36 @@ pub(crate) trait OwnedSinkQueuePersistence {
     type Update<'o>;
     type Removals<'o>;
     fn is_durable(&self) -> bool;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_cold_source<R>(
         &self,
         _original: &OwnedMemoryReservation,
         _visit: impl for<'s> FnOnce(&crate::persistence::OwnedColdEventSource<'s>) -> Result<R>,
     ) -> Result<R> {
-        Err(Error::Other("native queue persistence has no cold source capability".into()))
+        Err(Error::Other(
+            "native queue persistence has no cold source capability".into(),
+        ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_cold_source_funded<R>(
-        &self, original: &OwnedMemoryReservation,
+        &self,
+        original: &OwnedMemoryReservation,
         visit: impl for<'s> FnOnce(&crate::persistence::OwnedColdEventSource<'s>) -> OriginalResult<R>,
     ) -> OriginalResult<R> {
         let diagnostic = OriginalError::prepare_route(original)?;
         self.with_cold_source(original, |source| Ok(visit(source)))
             .map_err(|error| diagnostic.error(error))?
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_update<'o>(
         &self,
         original: &'o OwnedMemoryReservation,
@@ -7606,14 +8390,30 @@ pub(crate) trait OwnedSinkQueuePersistence {
         uncertain: bool,
         unconfirmed_delta: i8,
     ) -> Result<Self::Update<'o>>;
-    fn prepare_update_funded<'o>(&self, original: &'o OwnedMemoryReservation,
-        sink: &'o str, entry_id: u64, encoded: &[u8], uncertain: bool, unconfirmed_delta: i8,
+    fn prepare_update_funded<'o>(
+        &self,
+        original: &'o OwnedMemoryReservation,
+        sink: &'o str,
+        entry_id: u64,
+        encoded: &[u8],
+        uncertain: bool,
+        unconfirmed_delta: i8,
     ) -> OriginalResult<Self::Update<'o>> {
         let diagnostic = OriginalError::prepare_route(original)?;
-        self.prepare_update(original, sink, entry_id, encoded, uncertain, unconfirmed_delta)
-            .map_err(|error| diagnostic.error(error))
+        self.prepare_update(
+            original,
+            sink,
+            entry_id,
+            encoded,
+            uncertain,
+            unconfirmed_delta,
+        )
+        .map_err(|error| diagnostic.error(error))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn commit_update(&self, prepared: Self::Update<'_>) -> Result<()>;
     fn commit_update_at_boundary(
         &self,
@@ -7631,7 +8431,10 @@ pub(crate) trait OwnedSinkQueuePersistence {
         }
         failure.capture(result);
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_removals<'o>(
         &self,
         original: &'o OwnedMemoryReservation,
@@ -7639,7 +8442,10 @@ pub(crate) trait OwnedSinkQueuePersistence {
         ids: &'o [u64],
         unconfirmed: u64,
     ) -> Result<Self::Removals<'o>>;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn commit_removals(&self, prepared: Self::Removals<'_>) -> Result<()>;
     fn commit_removals_at_boundary(
         &self,
@@ -7663,19 +8469,37 @@ struct OwnedMemoryQueuePersistence;
 impl OwnedSinkQueuePersistence for OwnedMemoryQueuePersistence {
     type Update<'o> = ();
     type Removals<'o> = ();
-    fn is_durable(&self) -> bool { false }
-    fn prepare_update<'o>(&self, original: &'o OwnedMemoryReservation, _sink: &'o str,
-        _id: u64, _encoded: &[u8], _uncertain: bool, _delta: i8) -> Result<()> {
+    fn is_durable(&self) -> bool {
+        false
+    }
+    fn prepare_update<'o>(
+        &self,
+        original: &'o OwnedMemoryReservation,
+        _sink: &'o str,
+        _id: u64,
+        _encoded: &[u8],
+        _uncertain: bool,
+        _delta: i8,
+    ) -> Result<()> {
         crate::memory_accounting::persistence_original_projection(original)?;
         Ok(())
     }
-    fn commit_update(&self, _: ()) -> Result<()> { Ok(()) }
-    fn prepare_removals<'o>(&self, original: &'o OwnedMemoryReservation, _sink: &'o str,
-        _ids: &'o [u64], _unconfirmed: u64) -> Result<()> {
+    fn commit_update(&self, _: ()) -> Result<()> {
+        Ok(())
+    }
+    fn prepare_removals<'o>(
+        &self,
+        original: &'o OwnedMemoryReservation,
+        _sink: &'o str,
+        _ids: &'o [u64],
+        _unconfirmed: u64,
+    ) -> Result<()> {
         crate::memory_accounting::persistence_original_projection(original)?;
         Ok(())
     }
-    fn commit_removals(&self, _: ()) -> Result<()> { Ok(()) }
+    fn commit_removals(&self, _: ()) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct OwnedRuntimeAllocation {
@@ -7696,7 +8520,10 @@ struct OwnedRuntimeLaunch {
     control: OwnedMemoryReservation,
 }
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn start_owned_sink_worker<P: OwnedSinkQueuePersistence + Send + 'static>(
         &self,
         events: &OwnedEventBusHandle,
@@ -7706,56 +8533,85 @@ impl Database {
         let original = &events.data().original;
         // The same live keys move on growth. Only the new keys and shutdown
         // Arc are copied; all admissions precede construction and guards.
-        let control = reserve_owned_event_bytes(original, owned_event_add(
-            owned_event_add(sink.len(), sink.len())?,
+        let control = reserve_owned_event_bytes(
+            original,
             owned_event_add(
-                contextdb_tx::staged_source::source_arc_layout::<AtomicBool>().size(),
-                std::mem::size_of::<Arc<AtomicBool>>(),
+                owned_event_add(sink.len(), sink.len())?,
+                owned_event_add(
+                    contextdb_tx::staged_source::source_arc_layout::<AtomicBool>().size(),
+                    std::mem::size_of::<Arc<AtomicBool>>(),
+                )?,
             )?,
-        )?)?;
+        )?;
         let mut launch = OwnedRuntimeLaunch {
-            key: Some(copy_owned_prepaid_text(sink)?), start_key: None,
-            shutdown: None, control,
+            key: Some(copy_owned_prepaid_text(sink)?),
+            start_key: None,
+            shutdown: None,
+            control,
         };
         launch.start_key = Some(copy_owned_prepaid_text(sink)?);
         launch.shutdown = Some(Arc::new(AtomicBool::new(false)));
         loop {
             let (runtime_count, starts_count, controls_count) = {
                 let runtimes = self.event_bus.runtimes.lock();
-                if runtimes.contains_key(sink) { return Ok(()); }
+                if runtimes.contains_key(sink) {
+                    return Ok(());
+                }
                 let starts = self.event_bus.runtime_starts.lock();
                 let credit = events.data().runtime_allocation.lock();
-                (runtimes.len(), starts.len(), credit.as_ref().map_or(0, |c| c.controls.len()))
+                (
+                    runtimes.len(),
+                    starts.len(),
+                    credit.as_ref().map_or(0, |c| c.controls.len()),
+                )
             };
-            let (body, credit) = new_owned_native_map(original, owned_event_add(runtime_count, 1)?)?;
+            let (body, credit) =
+                new_owned_native_map(original, owned_event_add(runtime_count, 1)?)?;
             let mut next_runtime = OwnedEventBody { body, credit };
             let (body, credit) = new_owned_native_map(original, owned_event_add(starts_count, 1)?)?;
             let mut next_starts = OwnedEventBody { body, credit };
-            let (body, credit) = new_owned_native_vec(original, owned_event_add(controls_count, 1)?)?;
+            let (body, credit) =
+                new_owned_native_vec(original, owned_event_add(controls_count, 1)?)?;
             let mut next_controls = OwnedEventBody { body, credit };
-            let mut retired = OwnedRuntimeRetirement { runtimes: None, starts: None, credit: None };
+            let mut retired = OwnedRuntimeRetirement {
+                runtimes: None,
+                starts: None,
+                credit: None,
+            };
             let mut runtimes = self.event_bus.runtimes.lock();
-            if runtimes.contains_key(sink) { return Ok(()); }
+            if runtimes.contains_key(sink) {
+                return Ok(());
+            }
             let mut starts = self.event_bus.runtime_starts.lock();
             let mut credits = events.data().runtime_allocation.lock();
             if runtimes.len() >= next_runtime.body.capacity()
                 || starts.len() >= next_starts.body.capacity()
                 || credits.as_ref().map_or(0, |c| c.controls.len()) >= next_controls.body.capacity()
             {
-                drop(credits); drop(starts); drop(runtimes);
+                drop(credits);
+                drop(starts);
+                drop(runtimes);
                 continue;
             }
-            for (key, value) in runtimes.drain() { next_runtime.body.insert(key, value); }
-            for (key, value) in starts.drain() { next_starts.body.insert(key, value); }
+            for (key, value) in runtimes.drain() {
+                next_runtime.body.insert(key, value);
+            }
+            for (key, value) in starts.drain() {
+                next_starts.body.insert(key, value);
+            }
             std::mem::swap(&mut *runtimes, &mut next_runtime.body);
             std::mem::swap(&mut *starts, &mut next_starts.body);
-            if let Some(old) = credits.as_mut() { next_controls.body.append(&mut old.controls); }
+            if let Some(old) = credits.as_mut() {
+                next_controls.body.append(&mut old.controls);
+            }
             next_controls.body.push(launch.control);
             retired.runtimes = Some(next_runtime.body);
             retired.starts = Some(next_starts.body);
             retired.credit = credits.replace(OwnedRuntimeAllocation {
-                controls: next_controls.body, array: next_controls.credit,
-                runtime_buckets: next_runtime.credit, starts_buckets: next_starts.credit,
+                controls: next_controls.body,
+                array: next_controls.credit,
+                runtime_buckets: next_runtime.credit,
+                starts_buckets: next_starts.credit,
             });
             // Runtime map and both copied keys already have their own Original
             // admissions. Move the same shutdown Arc to the runtime and thread.
@@ -7766,12 +8622,24 @@ impl Database {
             #[cfg(any(test, feature = "test-seams"))]
             crate::read_probe::note_background_worker_start();
             let handle = crate::owned_worker::OwnedWorker::spawn(
-            self.finalization.accountant.read_budget()?, move || worker.dispatch_loop(thread_shutdown))?;
-            if let Some(count) = starts.get_mut(sink) { *count += 1; }
-            else { starts.insert(launch.start_key.take().expect("paid native start key"), 1); }
-            runtimes.insert(launch.key.take().expect("paid native runtime key"),
-                SinkRuntime { shutdown, handle: Some(handle) });
-            drop(credits); drop(starts); drop(runtimes);
+                self.finalization.accountant.read_budget()?,
+                move || worker.dispatch_loop(thread_shutdown),
+            )?;
+            if let Some(count) = starts.get_mut(sink) {
+                *count += 1;
+            } else {
+                starts.insert(launch.start_key.take().expect("paid native start key"), 1);
+            }
+            runtimes.insert(
+                launch.key.take().expect("paid native runtime key"),
+                SinkRuntime {
+                    shutdown,
+                    handle: Some(handle),
+                },
+            );
+            drop(credits);
+            drop(starts);
+            drop(runtimes);
             // Old buckets are physically released before their old invoices.
             drop(retired);
             return Ok(());
@@ -7785,7 +8653,10 @@ pub(super) struct OwnedMetricsAllocation {
     buckets: OwnedMemoryReservation,
 }
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_owned_metrics_slots(&self, names: &[String]) -> Result<()> {
         let original = &self.data().original;
         loop {
@@ -7899,7 +8770,10 @@ impl OwnedEventBusHandle {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn copy_owned_sink_registration(
         &self,
         sink: &str,
@@ -7969,7 +8843,10 @@ pub(super) struct OwnedEventBusWorker<P> {
     control: OwnedMemoryReservation,
 }
 impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_new(
         events: OwnedEventBusHandle,
         sink: &str,
@@ -7983,7 +8860,8 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
             })?,
             DatabaseTransactionHost::Legacy(_) => {
                 return Err(Error::Other(
-                    "owning worker requires its actual native host".into()));
+                    "owning worker requires its actual native host".into(),
+                ));
             }
         }
         let (name, memory) = copy_owned_native_string(&events.data().original, sink)?;
@@ -8055,14 +8933,19 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
                 drop(batch);
                 if just_refilled {
                     self.wait(&shutdown, Duration::from_millis(250));
-                    if shutdown.load(Ordering::SeqCst) { break; }
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let mut metrics = self.events.data().common.metrics.lock();
                     if let Some(state) = metrics.get_mut(&self.sink.body) {
                         state.window_idle_pauses = state.window_idle_pauses.saturating_add(1);
                     }
                 }
                 just_refilled = match self.events.refill_owned_sink_window(
-                    &self.persistence, &self.tx_mgr, &self.sink.body, &registration.registration.access,
+                    &self.persistence,
+                    &self.tx_mgr,
+                    &self.sink.body,
+                    &registration.registration.access,
                 ) {
                     Ok(installed) => installed,
                     Err(error) => {
@@ -8071,7 +8954,10 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
                     }
                 };
                 if !just_refilled {
-                    self.wait(&shutdown, Duration::from_millis(if denied_rotation { 10 } else { 250 }));
+                    self.wait(
+                        &shutdown,
+                        Duration::from_millis(if denied_rotation { 10 } else { 250 }),
+                    );
                 }
                 continue;
             }
@@ -8098,12 +8984,13 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
                         &mut batch.lookups[position],
                         false,
                         true,
-                    ) {
-                        tracing::warn!(%error, "sink attempt reconciliation reported an error");
-                        drop(batch);
-                        self.wait(&shutdown, Duration::from_millis(50));
-                        continue 'dispatch;
-                    }
+                    )
+                {
+                    tracing::warn!(%error, "sink attempt reconciliation reported an error");
+                    drop(batch);
+                    self.wait(&shutdown, Duration::from_millis(50));
+                    continue 'dispatch;
+                }
                 let attempts = match self.events.transition_owned_sink_attempt(
                     &self.persistence,
                     &self.tx_mgr,
@@ -8244,7 +9131,10 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
 }
 
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn merge_owned_commit_escrow(
         &self,
         stage: &mut OwnedCommitEventStage,
@@ -8264,7 +9154,8 @@ impl OwnedEventBusHandle {
         }
         let Some(OwnedAppendCustody::Ordinary(events)) = &mut stage.events.publication else {
             return Err(Error::Other(
-                "combined stage must join ordinary escrow before discard".into()));
+                "combined stage must join ordinary escrow before discard".into(),
+            ));
         };
         let maximum = owned_event_add(events.slots.len(), additional)?;
         let (body, credit) = new_owned_native_vec(&self.data().original, maximum)?;
@@ -8310,17 +9201,24 @@ pub(super) trait OwnedEncodedEventSource<E = Error> {
     fn next_action_id(&self) -> std::result::Result<u64, E>;
 }
 pub(super) trait OwnedEventEntryDecoder {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn decode(
         &self,
         original: &OwnedMemoryReservation,
         encoded: &[u8],
     ) -> Result<OwnedSinkQueueEntry>;
-    fn decode_funded(&self, original: &OwnedMemoryReservation, encoded: &[u8]) -> OriginalResult<OwnedSinkQueueEntry> {
+    fn decode_funded(
+        &self,
+        original: &OwnedMemoryReservation,
+        encoded: &[u8],
+    ) -> OriginalResult<OwnedSinkQueueEntry> {
         let diagnostic = OriginalError::prepare_route(original)?;
-        self.decode(original, encoded).map_err(|error| diagnostic.error(error))
+        self.decode(original, encoded)
+            .map_err(|error| diagnostic.error(error))
     }
-
 }
 /// This private adapter borrows the persistence loan and the actual event
 /// companion's original. Every pass, setting and counter uses that same read.
@@ -8337,7 +9235,10 @@ impl OwnedEncodedEventSource for OwnedPersistentEventStartupSource<'_, '_> {
         self.encoded.visit(sink, visit)
     }
     fn unloaded_extent(&self, sink: &str) -> Result<Option<(u64, u64)>> {
-        let (depth, newest, _) = self.encoded.cold_queue_source().extent(self.original, sink)?;
+        let (depth, newest, _) = self
+            .encoded
+            .cold_queue_source()
+            .extent(self.original, sink)?;
         Ok(Some((depth, newest)))
     }
     fn cold_source(&self) -> Option<crate::persistence::OwnedColdEventSource<'_>> {
@@ -8345,48 +9246,84 @@ impl OwnedEncodedEventSource for OwnedPersistentEventStartupSource<'_, '_> {
     }
     fn counters(&self, sink: &str) -> Result<(u64, u64)> {
         Ok((
-            self.encoded.decode_owned_counter(self.original, UNCERTAIN_COUNT_CONFIG_PREFIX, sink)?,
-            self.encoded.decode_owned_counter(self.original, UNCONFIRMED_COUNT_CONFIG_PREFIX, sink)?,
+            self.encoded.decode_owned_counter(
+                self.original,
+                UNCERTAIN_COUNT_CONFIG_PREFIX,
+                sink,
+            )?,
+            self.encoded.decode_owned_counter(
+                self.original,
+                UNCONFIRMED_COUNT_CONFIG_PREFIX,
+                sink,
+            )?,
         ))
     }
     fn next_action_id(&self) -> Result<u64> {
-        Ok(self.encoded.decode_owned_config::<u64>(self.original, NEXT_ACTION_ID_CONFIG_KEY)?
+        Ok(self
+            .encoded
+            .decode_owned_config::<u64>(self.original, NEXT_ACTION_ID_CONFIG_KEY)?
             .map_or(1, |decoded| decoded.value))
     }
 }
 
 impl OwnedEncodedEventSource<OriginalError> for OwnedPersistentEventStartupSource<'_, '_> {
-    fn visit(&self, sink: &str,
+    fn visit(
+        &self,
+        sink: &str,
         visit: impl for<'e> FnMut(u64, &'e [u8]) -> OriginalResult<()>,
     ) -> OriginalResult<()> {
         self.encoded.visit_funded(self.original, sink, visit)
     }
     fn unloaded_extent(&self, sink: &str) -> OriginalResult<Option<(u64, u64)>> {
         let diagnostic = OriginalError::prepare_route(self.original)?;
-        let (depth, newest, _) = self.encoded.cold_queue_source().extent_in(self.original, sink,
-            |error| diagnostic.storage(self.original, error), |error| diagnostic.error(error))?;
+        let (depth, newest, _) = self.encoded.cold_queue_source().extent_in(
+            self.original,
+            sink,
+            |error| diagnostic.storage(self.original, error),
+            |error| diagnostic.error(error),
+        )?;
         Ok(Some((depth, newest)))
     }
     fn cold_source(&self) -> Option<crate::persistence::OwnedColdEventSource<'_>> {
         Some(self.encoded.cold_queue_source())
     }
     fn counters(&self, sink: &str) -> OriginalResult<(u64, u64)> {
-        Ok((self.encoded.decode_owned_counter_funded(self.original, UNCERTAIN_COUNT_CONFIG_PREFIX, sink)?,
-            self.encoded.decode_owned_counter_funded(self.original, UNCONFIRMED_COUNT_CONFIG_PREFIX, sink)?))
+        Ok((
+            self.encoded.decode_owned_counter_funded(
+                self.original,
+                UNCERTAIN_COUNT_CONFIG_PREFIX,
+                sink,
+            )?,
+            self.encoded.decode_owned_counter_funded(
+                self.original,
+                UNCONFIRMED_COUNT_CONFIG_PREFIX,
+                sink,
+            )?,
+        ))
     }
     fn next_action_id(&self) -> OriginalResult<u64> {
-        Ok(self.encoded.decode_owned_config_funded::<u64>(self.original, NEXT_ACTION_ID_CONFIG_KEY)?
+        Ok(self
+            .encoded
+            .decode_owned_config_funded::<u64>(self.original, NEXT_ACTION_ID_CONFIG_KEY)?
             .map_or(1, |decoded| decoded.value))
     }
 }
 
-fn new_owned_error_ring<T>(original: &OwnedMemoryReservation, required: usize,
+fn new_owned_error_ring<T>(
+    original: &OwnedMemoryReservation,
+    required: usize,
 ) -> OriginalResult<(VecDeque<T>, OwnedMemoryReservation)> {
-        let diagnostic = OriginalError::prepare_route(original)?;
-    let (capacity, layout) = crate::memory_accounting::native_ring_plan::<T>(required).map_err(|error| diagnostic.error(error))?;
-    let memory = crate::memory_accounting::reserve_preparation_original_native(original, layout.size(),
-        "relational", "statement_overlay", "Reduce prepared bodies or raise MEMORY_LIMIT.")
-        .map_err(OriginalError::native)?;
+    let diagnostic = OriginalError::prepare_route(original)?;
+    let (capacity, layout) = crate::memory_accounting::native_ring_plan::<T>(required)
+        .map_err(|error| diagnostic.error(error))?;
+    let memory = crate::memory_accounting::reserve_preparation_original_native(
+        original,
+        layout.size(),
+        "relational",
+        "statement_overlay",
+        "Reduce prepared bodies or raise MEMORY_LIMIT.",
+    )
+    .map_err(OriginalError::native)?;
     let ring = VecDeque::with_capacity(capacity);
     if let Err(error) = crate::memory_accounting::validate_native_ring_capacity(&ring, capacity) {
         drop(ring);
@@ -8402,21 +9339,48 @@ struct OwnedColdWindow<E = Error> {
     refusal: Option<E>,
 }
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn read_owned_cold_window(&self, source: &crate::persistence::OwnedColdEventSource<'_>,
-        sink: &str, after: Option<u64>, upper: Option<u64>) -> Result<OwnedColdWindow> {
-        self.read_owned_cold_window_in(source, sink, after, upper,
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn read_owned_cold_window(
+        &self,
+        source: &crate::persistence::OwnedColdEventSource<'_>,
+        sink: &str,
+        after: Option<u64>,
+        upper: Option<u64>,
+    ) -> Result<OwnedColdWindow> {
+        self.read_owned_cold_window_in(
+            source,
+            sink,
+            after,
+            upper,
             |original, bytes| OwnedPersistentEventEntryDecoder.decode(original, bytes),
-            RedbPersistence::storage_error, new_owned_native_ring,
-            crate::read_image_memory::is_memory_refusal, |error| error)
+            RedbPersistence::storage_error,
+            new_owned_native_ring,
+            crate::read_image_memory::is_memory_refusal,
+            |error| error,
+        )
     }
-    fn read_owned_cold_window_funded(&self, source: &crate::persistence::OwnedColdEventSource<'_>,
-        sink: &str, after: Option<u64>, upper: Option<u64>) -> OriginalResult<OwnedColdWindow<OriginalError>> {
+    fn read_owned_cold_window_funded(
+        &self,
+        source: &crate::persistence::OwnedColdEventSource<'_>,
+        sink: &str,
+        after: Option<u64>,
+        upper: Option<u64>,
+    ) -> OriginalResult<OwnedColdWindow<OriginalError>> {
         let diagnostic = OriginalError::prepare_route(&self.data().original)?;
-        self.read_owned_cold_window_in(source, sink, after, upper,
+        self.read_owned_cold_window_in(
+            source,
+            sink,
+            after,
+            upper,
             |original, bytes| OwnedPersistentEventEntryDecoder.decode_funded(original, bytes),
             |error| diagnostic.storage(&self.data().original, error),
-            new_owned_error_ring, OriginalError::is_memory_refusal, |error| diagnostic.error(error))
+            new_owned_error_ring,
+            OriginalError::is_memory_refusal,
+            |error| diagnostic.error(error),
+        )
     }
 
     fn read_owned_cold_window_in<E>(
@@ -8425,10 +9389,21 @@ impl OwnedEventBusHandle {
         sink: &str,
         after: Option<u64>,
         upper: Option<u64>,
-        mut decode: impl FnMut(&OwnedMemoryReservation, &[u8]) -> std::result::Result<OwnedSinkQueueEntry, E>,
+        mut decode: impl FnMut(
+            &OwnedMemoryReservation,
+            &[u8],
+        ) -> std::result::Result<OwnedSinkQueueEntry, E>,
         storage: impl Fn(redb::Error) -> E,
-        ring: impl Fn(&OwnedMemoryReservation, usize) -> std::result::Result<
-            (VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>, OwnedMemoryReservation), E>,
+        ring: impl Fn(
+            &OwnedMemoryReservation,
+            usize,
+        ) -> std::result::Result<
+            (
+                VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
+                OwnedMemoryReservation,
+            ),
+            E,
+        >,
         is_memory: fn(&E) -> bool,
         existing: impl Fn(Error) -> E,
     ) -> std::result::Result<OwnedColdWindow<E>, E> {
@@ -8445,49 +9420,76 @@ impl OwnedEventBusHandle {
             Err(error) => return Err(error),
         };
         let mut window = OwnedColdWindow {
-            entries, buffer,
+            entries,
+            buffer,
             state: OwnedColdQueueState {
-                depth, upper, through: after.unwrap_or(0), generation: 0,
-                pending_refill: None, window_root: Some(root),
+                depth,
+                upper,
+                through: after.unwrap_or(0),
+                generation: 0,
+                pending_refill: None,
+                window_root: Some(root),
             },
             refusal,
         };
-        if window.refusal.is_some() { return Ok(window); }
+        if window.refusal.is_some() {
+            return Ok(window);
+        }
         let mut held = 0usize;
-        let exhausted = source.visit_range_in(original, sink, after, upper, |id, bytes| {
-            if window.entries.len() >= SINK_WINDOW_ENTRIES { return Ok(false); }
-            let mut entry = match decode(original, bytes) {
-                Ok(entry) => entry,
-                Err(error) if is_memory(&error) => {
-                    if window.entries.is_empty() { window.refusal = Some(error); }
+        let exhausted = source.visit_range_in(
+            original,
+            sink,
+            after,
+            upper,
+            |id, bytes| {
+                if window.entries.len() >= SINK_WINDOW_ENTRIES {
                     return Ok(false);
                 }
-                Err(error) => return Err(error),
-            };
-            if entry.entry.id != id {
-                return Err(existing(Error::Other("sink queue key/content identity mismatch".into())));
-            }
-            let bytes = entry.credit.metadata.bytes();
-            if !window.entries.is_empty() && held.saturating_add(bytes) > SINK_WINDOW_BYTES {
-                // The candidate is independently funded while inspected and
-                // physically destroyed before returning its own credit.
-                return Ok(false);
-            }
-            entry.entry.event.action_id = id;
-            let pin = match OwnedEventShared::try_new(entry, original, &self.data().funder).map_err(&existing) {
-                Ok(pin) => pin,
-                Err(error) if is_memory(&error) => {
-                    if window.entries.is_empty() { window.refusal = Some(error); }
+                let mut entry = match decode(original, bytes) {
+                    Ok(entry) => entry,
+                    Err(error) if is_memory(&error) => {
+                        if window.entries.is_empty() {
+                            window.refusal = Some(error);
+                        }
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if entry.entry.id != id {
+                    return Err(existing(Error::Other(
+                        "sink queue key/content identity mismatch".into(),
+                    )));
+                }
+                let bytes = entry.credit.metadata.bytes();
+                if !window.entries.is_empty() && held.saturating_add(bytes) > SINK_WINDOW_BYTES {
+                    // The candidate is independently funded while inspected and
+                    // physically destroyed before returning its own credit.
                     return Ok(false);
                 }
-                Err(error) => return Err(error),
-            };
-            held = held.saturating_add(bytes);
-            window.entries.push_back(pin);
-            window.state.through = id;
-            Ok(true)
-        }, &storage, &existing)?;
-        if exhausted { window.state.through = upper; }
+                entry.entry.event.action_id = id;
+                let pin = match OwnedEventShared::try_new(entry, original, &self.data().funder)
+                    .map_err(&existing)
+                {
+                    Ok(pin) => pin,
+                    Err(error) if is_memory(&error) => {
+                        if window.entries.is_empty() {
+                            window.refusal = Some(error);
+                        }
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                };
+                held = held.saturating_add(bytes);
+                window.entries.push_back(pin);
+                window.state.through = id;
+                Ok(true)
+            },
+            &storage,
+            &existing,
+        )?;
+        if exhausted {
+            window.state.through = upper;
+        }
         Ok(window)
     }
 }
@@ -8505,8 +9507,10 @@ impl Drop for OwnedColdRefillClaim {
     fn drop(&mut self) {
         let mut queues = self.events.data().queues.lock();
         if let Some(queue) = queues.values.get_mut(&self.name.body)
-            && Arc::ptr_eq(queue.name.data.as_ref().expect("queue lifecycle"),
-                self.name.data.as_ref().expect("refill lifecycle"))
+            && Arc::ptr_eq(
+                queue.name.data.as_ref().expect("queue lifecycle"),
+                self.name.data.as_ref().expect("refill lifecycle"),
+            )
             && let Some(cold) = &mut queue.cold
             && cold.pending_refill == Some(self.token)
         {
@@ -8553,9 +9557,16 @@ impl OwnedEventBusHandle {
         let diagnostic = OriginalError::prepare_route(&self.data().original)?;
         // The lease spans the pinned read, all copied bodies, installation and
         // physical retirement. Purge cannot certify erasure in that interval.
-        let _lease = self.data().common.begin_dispatcher_queue_mutation().map_err(|error| diagnostic.error(error))?;
-        let control = reserve_owned_event_bytes(&self.data().original,
-            std::mem::size_of::<OwnedColdRefillClaim>()).map_err(|error| diagnostic.error(error))?;
+        let _lease = self
+            .data()
+            .common
+            .begin_dispatcher_queue_mutation()
+            .map_err(|error| diagnostic.error(error))?;
+        let control = reserve_owned_event_bytes(
+            &self.data().original,
+            std::mem::size_of::<OwnedColdRefillClaim>(),
+        )
+        .map_err(|error| diagnostic.error(error))?;
         let claim = {
             let state = self.data().common.queue_mutation_state.lock();
             // Never wait for checkout admission while holding a mutation lease:
@@ -8564,23 +9575,40 @@ impl OwnedEventBusHandle {
                 return Ok(false);
             }
             let mut queues = self.data().queues.lock();
-            let Some(queue) = queues.values.get_mut(sink)
+            let Some(queue) = queues
+                .values
+                .get_mut(sink)
                 .filter(|q| q.present && q.retiring == 0 && q.mutation.is_none())
-            else { return Ok(false); };
-            let Some(cold) = &mut queue.cold else { return Ok(false); };
-            if cold.pending_refill.is_some() || cold.depth == 0
-                || queue.entries.iter().any(|entry| owned_event_visible(access, &entry.entry))
+            else {
+                return Ok(false);
+            };
+            let Some(cold) = &mut queue.cold else {
+                return Ok(false);
+            };
+            if cold.pending_refill.is_some()
+                || cold.depth == 0
+                || queue
+                    .entries
+                    .iter()
+                    .any(|entry| owned_event_visible(access, &entry.entry))
                 || (!queue.entries.is_empty() && cold.depth == queue.entries.len() as u64)
             {
                 return Ok(false);
             }
-            let token = self.data().common.next_refill_token.fetch_add(1, Ordering::SeqCst);
+            let token = self
+                .data()
+                .common
+                .next_refill_token
+                .fetch_add(1, Ordering::SeqCst);
             let wrap = cold.through >= cold.upper;
             let claim = OwnedColdRefillClaim {
-                name: queue.name.clone(), events: self.clone(), token,
+                name: queue.name.clone(),
+                events: self.clone(),
+                token,
                 generation: cold.generation,
                 after: (!wrap).then_some(cold.through),
-                upper: (!wrap).then_some(cold.upper), control,
+                upper: (!wrap).then_some(cold.upper),
+                control,
             };
             cold.pending_refill = Some(token);
             claim
@@ -8605,15 +9633,21 @@ impl OwnedEventBusHandle {
             let state = self.data().common.queue_mutation_state.lock();
             let mut queues = self.data().queues.lock();
             let queue = queues.values.get_mut(sink).filter(|q| {
-                q.present && q.retiring == 0 && q.mutation.is_none()
-                    && Arc::ptr_eq(q.name.data.as_ref().expect("queue lifecycle"),
-                        claim.name.data.as_ref().expect("refill lifecycle"))
+                q.present
+                    && q.retiring == 0
+                    && q.mutation.is_none()
+                    && Arc::ptr_eq(
+                        q.name.data.as_ref().expect("queue lifecycle"),
+                        claim.name.data.as_ref().expect("refill lifecycle"),
+                    )
             });
             if state.checked_out.iter().any(|(name, _)| name == sink) {
                 false
             } else if let Some(queue) = queue {
                 if let Some(cold) = &mut queue.cold {
-                    if cold.pending_refill == Some(claim.token) && cold.generation == claim.generation {
+                    if cold.pending_refill == Some(claim.token)
+                        && cold.generation == claim.generation
+                    {
                         // Keep the published live depth; the commit boundary
                         // excludes append/ack while the new root is captured.
                         cold.through = window.state.through;
@@ -8623,9 +9657,15 @@ impl OwnedEventBusHandle {
                         std::mem::swap(&mut queue.entries, &mut window.entries);
                         std::mem::swap(&mut queue.buffer, &mut window.buffer);
                         true
-                    } else { false }
-                } else { false }
-            } else { false }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
         };
         // Old window bodies die unlocked, before their original buffer invoice.
         drop(window);
@@ -8661,15 +9701,28 @@ impl OwnedEventEntryDecoder for OwnedPersistentEventEntryDecoder {
             },
         })
     }
-    fn decode_funded(&self, original: &OwnedMemoryReservation, encoded: &[u8]) -> OriginalResult<OwnedSinkQueueEntry> {
-        let decoded = RedbPersistence::decode_owned_event_funded::<SinkQueueEntry>(original, encoded)?;
-        Ok(OwnedSinkQueueEntry { entry: decoded.value,
-            credit: OwnedSinkEventCredit { row: None, gate: None, metadata: decoded.allocation } })
+    fn decode_funded(
+        &self,
+        original: &OwnedMemoryReservation,
+        encoded: &[u8],
+    ) -> OriginalResult<OwnedSinkQueueEntry> {
+        let decoded =
+            RedbPersistence::decode_owned_event_funded::<SinkQueueEntry>(original, encoded)?;
+        Ok(OwnedSinkQueueEntry {
+            entry: decoded.value,
+            credit: OwnedSinkEventCredit {
+                row: None,
+                gate: None,
+                metadata: decoded.allocation,
+            },
+        })
     }
-
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_owned_startup_definitions<T: serde::de::DeserializeOwned>(
     source: &crate::persistence::OwnedEncodedEventSource<'_>,
     original: &OwnedMemoryReservation,
@@ -8686,29 +9739,60 @@ fn decode_owned_startup_definitions<T: serde::de::DeserializeOwned>(
 
 fn decode_owned_startup_definitions_funded<T: serde::de::DeserializeOwned>(
     source: &crate::persistence::OwnedEncodedEventSource<'_>,
-    original: &OwnedMemoryReservation, key: &str,
+    original: &OwnedMemoryReservation,
+    key: &str,
 ) -> OriginalResult<crate::persistence::OriginalDecoded<Vec<T>>> {
     match source.decode_owned_config_funded(original, key)? {
         Some(decoded) => Ok(decoded),
         None => Ok(crate::persistence::OriginalDecoded {
-            value: Vec::new(), allocation: crate::memory_accounting::reserve_preparation_original_native(original, 0, "relational", "statement_overlay", "Reduce prepared event bodies or raise MEMORY_LIMIT.").map_err(OriginalError::native)?,
+            value: Vec::new(),
+            allocation: crate::memory_accounting::reserve_preparation_original_native(
+                original,
+                0,
+                "relational",
+                "statement_overlay",
+                "Reduce prepared event bodies or raise MEMORY_LIMIT.",
+            )
+            .map_err(OriginalError::native)?,
         }),
     }
 }
 
 impl OwnedDefinitionsProjection {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn decode_persistent_startup(
         source: &crate::persistence::OwnedEncodedEventSource<'_>,
         original: &OwnedMemoryReservation,
         live_tables: &HashMap<String, TableMeta>,
     ) -> Result<Self> {
-        Self::decode_persistent_startup_in::<Error>(source, original, live_tables,
-            |source, original| Ok((
-                decode_owned_startup_definitions::<EventTypeDef>(source, original, EVENT_TYPES_CONFIG_KEY)?,
-                decode_owned_startup_definitions::<SinkDef>(source, original, SINKS_CONFIG_KEY)?,
-                decode_owned_startup_definitions::<RouteDef>(source, original, ROUTES_CONFIG_KEY)?,
-            )), |error| error)
+        Self::decode_persistent_startup_in::<Error>(
+            source,
+            original,
+            live_tables,
+            |source, original| {
+                Ok((
+                    decode_owned_startup_definitions::<EventTypeDef>(
+                        source,
+                        original,
+                        EVENT_TYPES_CONFIG_KEY,
+                    )?,
+                    decode_owned_startup_definitions::<SinkDef>(
+                        source,
+                        original,
+                        SINKS_CONFIG_KEY,
+                    )?,
+                    decode_owned_startup_definitions::<RouteDef>(
+                        source,
+                        original,
+                        ROUTES_CONFIG_KEY,
+                    )?,
+                ))
+            },
+            |error| error,
+        )
     }
     fn decode_persistent_startup_funded(
         source: &crate::persistence::OwnedEncodedEventSource<'_>,
@@ -8716,23 +9800,47 @@ impl OwnedDefinitionsProjection {
         live_tables: &HashMap<String, TableMeta>,
     ) -> OriginalResult<Self> {
         let diagnostic = OriginalError::prepare_route(original)?;
-        Self::decode_persistent_startup_in(source, original, live_tables,
-            |source, original| Ok((
-                decode_owned_startup_definitions_funded::<EventTypeDef>(source, original, EVENT_TYPES_CONFIG_KEY)?,
-                decode_owned_startup_definitions_funded::<SinkDef>(source, original, SINKS_CONFIG_KEY)?,
-                decode_owned_startup_definitions_funded::<RouteDef>(source, original, ROUTES_CONFIG_KEY)?,
-            )), |error| diagnostic.error(error))
+        Self::decode_persistent_startup_in(
+            source,
+            original,
+            live_tables,
+            |source, original| {
+                Ok((
+                    decode_owned_startup_definitions_funded::<EventTypeDef>(
+                        source,
+                        original,
+                        EVENT_TYPES_CONFIG_KEY,
+                    )?,
+                    decode_owned_startup_definitions_funded::<SinkDef>(
+                        source,
+                        original,
+                        SINKS_CONFIG_KEY,
+                    )?,
+                    decode_owned_startup_definitions_funded::<RouteDef>(
+                        source,
+                        original,
+                        ROUTES_CONFIG_KEY,
+                    )?,
+                ))
+            },
+            |error| diagnostic.error(error),
+        )
     }
     fn decode_persistent_startup_in<E>(
         source: &crate::persistence::OwnedEncodedEventSource<'_>,
         original: &OwnedMemoryReservation,
         live_tables: &HashMap<String, TableMeta>,
-        decode: impl FnOnce(&crate::persistence::OwnedEncodedEventSource<'_>, &OwnedMemoryReservation)
-            -> std::result::Result<(
+        decode: impl FnOnce(
+            &crate::persistence::OwnedEncodedEventSource<'_>,
+            &OwnedMemoryReservation,
+        ) -> std::result::Result<
+            (
                 crate::persistence::OriginalDecoded<Vec<EventTypeDef>>,
                 crate::persistence::OriginalDecoded<Vec<SinkDef>>,
                 crate::persistence::OriginalDecoded<Vec<RouteDef>>,
-            ), E>,
+            ),
+            E,
+        >,
         existing: impl Fn(Error) -> E,
     ) -> std::result::Result<Self, E> {
         // Declare the final invoice BEFORE all temporary decoded containers:
@@ -8747,20 +9855,36 @@ impl OwnedDefinitionsProjection {
         // sorting also preserves the last declaration for duplicate names.
         // Each sort's temporary buffer is at most the sequence's full array;
         // the three sorts run sequentially under one maximum-sized invoice.
-        let sort_bytes = owned_event_array::<EventTypeDef>(types.value.len()).map_err(&existing)?
+        let sort_bytes = owned_event_array::<EventTypeDef>(types.value.len())
+            .map_err(&existing)?
             .max(owned_event_array::<SinkDef>(sinks.value.len()).map_err(&existing)?)
             .max(owned_event_array::<RouteDef>(routes.value.len()).map_err(&existing)?);
         let sort_workspace = reserve_owned_event_bytes(original, sort_bytes).map_err(&existing)?;
-        types.value.sort_by(|left, right| left.name.cmp(&right.name));
-        sinks.value.sort_by(|left, right| left.name.cmp(&right.name));
-        routes.value.sort_by(|left, right| left.name.cmp(&right.name));
+        types
+            .value
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        sinks
+            .value
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        routes
+            .value
+            .sort_by(|left, right| left.name.cmp(&right.name));
         drop(sort_workspace);
         let mut bytes = owned_event_add(
-            owned_event_btree_bytes::<String, EventTypeDef>(types.value.len()).map_err(&existing)?,
+            owned_event_btree_bytes::<String, EventTypeDef>(types.value.len())
+                .map_err(&existing)?,
             owned_event_btree_bytes::<String, SinkDef>(sinks.value.len()).map_err(&existing)?,
-        ).map_err(&existing)?;
-        bytes = owned_event_add(bytes, owned_event_btree_bytes::<String, RouteDef>(routes.value.len()).map_err(&existing)?).map_err(&existing)?;
-        for name in types.value.iter().map(|def| &def.name)
+        )
+        .map_err(&existing)?;
+        bytes = owned_event_add(
+            bytes,
+            owned_event_btree_bytes::<String, RouteDef>(routes.value.len()).map_err(&existing)?,
+        )
+        .map_err(&existing)?;
+        for name in types
+            .value
+            .iter()
+            .map(|def| &def.name)
             .chain(sinks.value.iter().map(|def| &def.name))
             .chain(routes.value.iter().map(|def| &def.name))
         {
@@ -8768,18 +9892,40 @@ impl OwnedDefinitionsProjection {
         }
         // Admit the BTree nodes and independent map keys before allocating.
         let mut maps = reserve_owned_event_bytes(original, bytes).map_err(&existing)?;
-        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut maps).map_err(&existing)?;
-        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut types.allocation).map_err(&existing)?;
-        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut sinks.allocation).map_err(&existing)?;
-        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut routes.allocation).map_err(&existing)?;
+        crate::memory_accounting::merge_preparation_original(&mut projection.allocation, &mut maps)
+            .map_err(&existing)?;
+        crate::memory_accounting::merge_preparation_original(
+            &mut projection.allocation,
+            &mut types.allocation,
+        )
+        .map_err(&existing)?;
+        crate::memory_accounting::merge_preparation_original(
+            &mut projection.allocation,
+            &mut sinks.allocation,
+        )
+        .map_err(&existing)?;
+        crate::memory_accounting::merge_preparation_original(
+            &mut projection.allocation,
+            &mut routes.allocation,
+        )
+        .map_err(&existing)?;
         for def in types.value.drain(..) {
-            projection.definitions.event_types.insert(copy_owned_prepaid_text(&def.name).map_err(&existing)?, def);
+            projection
+                .definitions
+                .event_types
+                .insert(copy_owned_prepaid_text(&def.name).map_err(&existing)?, def);
         }
         for def in sinks.value.drain(..) {
-            projection.definitions.sinks.insert(copy_owned_prepaid_text(&def.name).map_err(&existing)?, def);
+            projection
+                .definitions
+                .sinks
+                .insert(copy_owned_prepaid_text(&def.name).map_err(&existing)?, def);
         }
         for def in routes.value.drain(..) {
-            projection.definitions.routes.insert(copy_owned_prepaid_text(&def.name).map_err(&existing)?, def);
+            projection
+                .definitions
+                .routes
+                .insert(copy_owned_prepaid_text(&def.name).map_err(&existing)?, def);
         }
         // Same sanitation as ordinary startup, without an unfunded table-name
         // set or a Legacy definition projection.
@@ -8790,47 +9936,74 @@ impl OwnedDefinitionsProjection {
 
 impl OwnedEventBusHandle {
     fn load_owned_persistent_startup_funded(
-        &self, persistence: &RedbPersistence,
+        &self,
+        persistence: &RedbPersistence,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         live_tables: &HashMap<String, TableMeta>,
     ) -> OriginalResult<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        persistence.with_owned_encoded_event_source_funded(&self.data().original, read_memory,
-            |source| self.install_owned_persistent_startup_funded(source, live_tables))
+        persistence.with_owned_encoded_event_source_funded(
+            &self.data().original,
+            read_memory,
+            |source| self.install_owned_persistent_startup_funded(source, live_tables),
+        )
     }
 
     fn install_owned_persistent_startup_funded(
-        &self, encoded: &crate::persistence::OwnedEncodedEventSource<'_>,
+        &self,
+        encoded: &crate::persistence::OwnedEncodedEventSource<'_>,
         live_tables: &HashMap<String, TableMeta>,
     ) -> OriginalResult<()> {
         let original = &self.data().original;
         let diagnostic = OriginalError::prepare_route(original)?;
-        let definitions = OwnedDefinitionsProjection::decode_persistent_startup_funded(encoded, original, live_tables)?;
+        let definitions = OwnedDefinitionsProjection::decode_persistent_startup_funded(
+            encoded,
+            original,
+            live_tables,
+        )?;
         let source = OwnedPersistentEventStartupSource { encoded, original };
         let image = self.prepare_owned_event_bus_image_funded(
-            &source, &OwnedPersistentEventEntryDecoder, definitions, true)?;
-        self.install_owned_event_bus_image(image).map_err(|error| diagnostic.error(error))?;
-        self.data().common.durable_windows.store(true, Ordering::SeqCst);
+            &source,
+            &OwnedPersistentEventEntryDecoder,
+            definitions,
+            true,
+        )?;
+        self.install_owned_event_bus_image(image)
+            .map_err(|error| diagnostic.error(error))?;
+        self.data()
+            .common
+            .durable_windows
+            .store(true, Ordering::SeqCst);
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn install_owned_persistent_startup(
         &self,
         encoded: &crate::persistence::OwnedEncodedEventSource<'_>,
         live_tables: &HashMap<String, TableMeta>,
     ) -> Result<()> {
         let original = &self.data().original;
-        let definitions = OwnedDefinitionsProjection::decode_persistent_startup(encoded, original, live_tables)?;
+        let definitions =
+            OwnedDefinitionsProjection::decode_persistent_startup(encoded, original, live_tables)?;
         let source = OwnedPersistentEventStartupSource { encoded, original };
         let image = self.prepare_owned_event_bus_image(
-            &source, &OwnedPersistentEventEntryDecoder, definitions, true,
+            &source,
+            &OwnedPersistentEventEntryDecoder,
+            definitions,
+            true,
         )?;
         // Still inside the one persistence loan; nothing is published unless
         // every definition, counter, queue body and shared control is funded.
         self.install_owned_event_bus_image(image)?;
-        self.data().common.durable_windows.store(true, Ordering::SeqCst);
+        self.data()
+            .common
+            .durable_windows
+            .store(true, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -8845,7 +10018,10 @@ pub(super) struct OwnedEventStartupImage {
     next_action_id: u64,
 }
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_event_bus_image<
         S: OwnedEncodedEventSource,
         D: OwnedEventEntryDecoder,
@@ -8856,26 +10032,50 @@ impl OwnedEventBusHandle {
         definitions: OwnedDefinitionsProjection,
         writable: bool,
     ) -> Result<OwnedEventStartupImage> {
-        self.prepare_owned_event_bus_image_in(source, definitions, writable,
+        self.prepare_owned_event_bus_image_in(
+            source,
+            definitions,
+            writable,
             |original, bytes| decoder.decode(original, bytes),
-            |cold, name| self.read_owned_cold_window(cold, name, None, None), |error| error)
+            |cold, name| self.read_owned_cold_window(cold, name, None, None),
+            |error| error,
+        )
     }
-    fn prepare_owned_event_bus_image_funded<S: OwnedEncodedEventSource<OriginalError>, D: OwnedEventEntryDecoder>(
-        &self, source: &S, decoder: &D, definitions: OwnedDefinitionsProjection, writable: bool,
+    fn prepare_owned_event_bus_image_funded<
+        S: OwnedEncodedEventSource<OriginalError>,
+        D: OwnedEventEntryDecoder,
+    >(
+        &self,
+        source: &S,
+        decoder: &D,
+        definitions: OwnedDefinitionsProjection,
+        writable: bool,
     ) -> OriginalResult<OwnedEventStartupImage> {
         let diagnostic = OriginalError::prepare_route(&self.data().original)?;
-        self.prepare_owned_event_bus_image_in(source, definitions, writable,
+        self.prepare_owned_event_bus_image_in(
+            source,
+            definitions,
+            writable,
             |original, bytes| decoder.decode_funded(original, bytes),
-            |cold, name| self.read_owned_cold_window_funded(cold, name, None, None), |error| diagnostic.error(error))
+            |cold, name| self.read_owned_cold_window_funded(cold, name, None, None),
+            |error| diagnostic.error(error),
+        )
     }
     fn prepare_owned_event_bus_image_in<E, S: OwnedEncodedEventSource<E>>(
-        &self, source: &S, definitions: OwnedDefinitionsProjection, writable: bool,
+        &self,
+        source: &S,
+        definitions: OwnedDefinitionsProjection,
+        writable: bool,
         decode: impl Fn(&OwnedMemoryReservation, &[u8]) -> std::result::Result<OwnedSinkQueueEntry, E>,
-        window: impl Fn(&crate::persistence::OwnedColdEventSource<'_>, &str)
-            -> std::result::Result<OwnedColdWindow<E>, E>,
+        window: impl Fn(
+            &crate::persistence::OwnedColdEventSource<'_>,
+            &str,
+        ) -> std::result::Result<OwnedColdWindow<E>, E>,
         existing: impl Fn(Error) -> E,
     ) -> std::result::Result<OwnedEventStartupImage, E>
-    where E: std::fmt::Display {
+    where
+        E: std::fmt::Display,
+    {
         let original = &self.data().original;
         let count = definitions.definitions.sinks.len();
         let (queues, allocation) = new_owned_native_map(original, count).map_err(&existing)?;
@@ -8887,9 +10087,11 @@ impl OwnedEventBusHandle {
         let metrics = OwnedEventBody { body, credit };
         let (body, credit) = new_owned_native_vec(original, count).map_err(&existing)?;
         let metric_keys = OwnedEventBody { body, credit };
-        let (body, credit) = new_owned_native_map(original, if writable { 0 } else { count }).map_err(&existing)?;
+        let (body, credit) =
+            new_owned_native_map(original, if writable { 0 } else { count }).map_err(&existing)?;
         let unloaded = OwnedEventBody { body, credit };
-        let (body, credit) = new_owned_native_vec(original, if writable { 0 } else { count }).map_err(&existing)?;
+        let (body, credit) =
+            new_owned_native_vec(original, if writable { 0 } else { count }).map_err(&existing)?;
         let unloaded_keys = OwnedEventBody { body, credit };
         let next_action_id = source.next_action_id()?.max(1);
         let mut image = OwnedEventStartupImage {
@@ -8915,7 +10117,8 @@ impl OwnedEventBusHandle {
             let cold_source = writable.then(|| source.cold_source()).flatten();
             if writable && extent.is_some() && cold_source.is_none() {
                 return Err(existing(Error::Other(
-                    "writable owning queue cannot retain an unloaded extent".into())));
+                    "writable owning queue cannot retain an unloaded extent".into(),
+                )));
             }
             let mut entries_count = 0usize;
             if extent.is_none() {
@@ -8926,7 +10129,8 @@ impl OwnedEventBusHandle {
             }
             let (body, credit) = copy_owned_native_string(original, name).map_err(&existing)?;
             let key = OwnedEventBody { body, credit };
-            let (entries, buffer) = new_owned_native_ring(original, entries_count).map_err(&existing)?;
+            let (entries, buffer) =
+                new_owned_native_ring(original, entries_count).map_err(&existing)?;
             let mut queue = OwnedSinkQueue {
                 cold: None,
                 entries,
@@ -8946,7 +10150,9 @@ impl OwnedEventBusHandle {
                     tracing::warn!(sink = %name, %error, "cannot admit initial native sink window");
                     window_refusal = true;
                 }
-                image.next_action_id = image.next_action_id.max(window.state.upper.saturating_add(1));
+                image.next_action_id = image
+                    .next_action_id
+                    .max(window.state.upper.saturating_add(1));
                 // Empty startup ring dies before its own credit. The real
                 // bounded window and its authentic extent replace it together.
                 let old_entries = std::mem::replace(&mut queue.entries, window.entries);
@@ -8957,21 +10163,27 @@ impl OwnedEventBusHandle {
             } else if extent.is_none() {
                 source.visit(name, |id, bytes| {
                     if queue.entries.len() == entries_count {
-                        return Err(existing(Error::Other("pinned event source count changed".into())));
+                        return Err(existing(Error::Other(
+                            "pinned event source count changed".into(),
+                        )));
                     }
                     let mut entry = decode(original, bytes)?;
                     if entry.entry.id != id {
                         return Err(existing(Error::Other(
-                            "sink queue key/content identity mismatch".into())));
+                            "sink queue key/content identity mismatch".into(),
+                        )));
                     }
                     entry.entry.event.action_id = entry.entry.id;
                     image.next_action_id = image.next_action_id.max(id.saturating_add(1));
-                    let pin = OwnedEventShared::try_new(entry, original, &self.data().funder).map_err(&existing)?;
+                    let pin = OwnedEventShared::try_new(entry, original, &self.data().funder)
+                        .map_err(&existing)?;
                     queue.entries.push_back(pin);
                     Ok(())
                 })?;
                 if queue.entries.len() != entries_count {
-                    return Err(existing(Error::Other("pinned event source count changed".into())));
+                    return Err(existing(Error::Other(
+                        "pinned event source count changed".into(),
+                    )));
                 }
             } else {
                 let (key, credit) = copy_owned_native_string(original, name).map_err(&existing)?;
@@ -9000,7 +10212,10 @@ impl OwnedEventBusHandle {
         }
         Ok(image)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn install_owned_event_bus_image(
         &self,
         mut image: OwnedEventStartupImage,
@@ -9014,7 +10229,8 @@ impl OwnedEventBusHandle {
             || !self.data().stages.lock().values.is_empty()
         {
             return Err(Error::Other(
-                "owning event load requires inactive assembly".into()));
+                "owning event load requires inactive assembly".into(),
+            ));
         }
         let mut queues = self.data().queues.lock();
         if queues
@@ -9023,11 +10239,15 @@ impl OwnedEventBusHandle {
             .any(|queue| queue.pending != 0 || queue.reservations != 0 || queue.mutation.is_some())
         {
             return Err(Error::Other(
-                "owning event load cannot replace escrow".into()));
+                "owning event load cannot replace escrow".into(),
+            ));
         }
         let cold = image.queues.values.values().any(|q| q.cold.is_some());
         std::mem::swap(&mut *queues, &mut image.queues);
-        self.data().common.durable_windows.store(cold, Ordering::SeqCst);
+        self.data()
+            .common
+            .durable_windows
+            .store(cold, Ordering::SeqCst);
         drop(queues);
         drop(state);
         let old_defs = std::mem::replace(
@@ -9092,7 +10312,10 @@ pub(super) struct OwnedRouteView<'a> {
     where_in: Option<(&'a str, &'a [String])>,
 }
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_definition_projection_with_ddl(
         &self,
         ddl: &[DdlChange],
@@ -9346,18 +10569,21 @@ impl OwnedEventBusHandle {
                     } else if trigger.eq_ignore_ascii_case("DELETE") {
                         EventTrigger::Delete
                     } else {
-                        return Err(Error::Other((format!(
-                            "invalid event type trigger: {trigger}"
-                        )).into()));
+                        return Err(Error::Other(
+                            (format!("invalid event type trigger: {trigger}")).into(),
+                        ));
                     };
                     if let Some(existing) = types.body.iter().find(|def| def.key == name) {
                         if existing.name != name
                             || existing.trigger != trigger
                             || existing.table != table
                         {
-                            return Err(Error::Other((format!(
-                                "event type already exists with a different definition: {name}"
-                            )).into()));
+                            return Err(Error::Other(
+                                (format!(
+                                    "event type already exists with a different definition: {name}"
+                                ))
+                                .into(),
+                            ));
                         }
                     } else {
                         types.body.push(OwnedEventTypeView {
@@ -9378,16 +10604,21 @@ impl OwnedEventBusHandle {
                     } else if sink_type.eq_ignore_ascii_case("CALLBACK") {
                         PersistedSinkType::Callback
                     } else {
-                        return Err(Error::Other((format!("invalid sink type: {sink_type}")).into()));
+                        return Err(Error::Other(
+                            (format!("invalid sink type: {sink_type}")).into(),
+                        ));
                     };
                     if let Some(existing) = sinks.body.iter().find(|def| def.key == name) {
                         if existing.name != name
                             || existing.sink_type != sink_type
                             || existing.url != url.as_deref()
                         {
-                            return Err(Error::Other((format!(
-                                "sink already exists with a different definition: {name}"
-                            )).into()));
+                            return Err(Error::Other(
+                                (format!(
+                                    "sink already exists with a different definition: {name}"
+                                ))
+                                .into(),
+                            ));
                         }
                     } else {
                         sinks.body.push(OwnedSinkView {
@@ -9425,9 +10656,12 @@ impl OwnedEventBusHandle {
                             || existing.sink != sink
                             || existing.where_in != filter
                         {
-                            return Err(Error::Other((format!(
-                                "route already exists with a different definition: {name}"
-                            )).into()));
+                            return Err(Error::Other(
+                                (format!(
+                                    "route already exists with a different definition: {name}"
+                                ))
+                                .into(),
+                            ));
                         }
                     } else {
                         routes.body.push(OwnedRouteView {
@@ -9553,7 +10787,10 @@ pub(super) struct OwnedEventDdlInput {
     array: OwnedMemoryReservation,
 }
 impl OwnedEventDdlInput {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_copy(original: &OwnedMemoryReservation, ddl: &[DdlChange]) -> Result<Self> {
         let mut bytes = 0;
         for change in ddl {
@@ -9599,7 +10836,8 @@ impl OwnedEventDdlInput {
                 DdlChange::DropTable { name } => bytes = owned_event_add(bytes, name.len())?,
                 _ => return Err(Error::Other(
                     "owning event DDL requires the original producer for non-event declarations"
-                        .into())),
+                        .into(),
+                )),
             }
         }
         let bodies = reserve_owned_event_bytes(original, bytes)?;
@@ -9670,7 +10908,10 @@ impl OwnedEventDdlInput {
         Ok(owner)
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owned_ddl_sidecar_key(
     original: &OwnedMemoryReservation,
     lsn: Lsn,
@@ -9700,7 +10941,10 @@ fn owned_ddl_sidecar_key(
     Ok(owner)
 }
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn stage_owned_event_bus_ddl_for_commit(
         &self,
         events: &OwnedEventBusHandle,
@@ -9731,7 +10975,8 @@ impl Database {
             })?,
             DatabaseTransactionHost::Legacy(_) => {
                 return Err(Error::Other(
-                    "owning event DDL requires its native database host".into()));
+                    "owning event DDL requires its native database host".into(),
+                ));
             }
         }
         let original = &events.data().original;
@@ -9776,7 +11021,12 @@ impl Database {
         };
         let empty_config = OwnedEncodedEventBusConfig::try_empty(original)?;
         let persistence_credit = std::mem::replace(&mut publication.config, empty_config);
-        let memory_history = self.prepare_staged_memory_schema_history(lsn, 0, &persistence.ddl, &persistence.generation_sidecars)?;
+        let memory_history = self.prepare_staged_memory_schema_history(
+            lsn,
+            0,
+            &persistence.ddl,
+            &persistence.generation_sidecars,
+        )?;
         Ok((
             count,
             Some(OwnedStagedEventBusDdlCommit {
@@ -9790,7 +11040,10 @@ impl Database {
             }),
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn commit_owned_event_bus_ddl_changes<P: OwnedEventDdlPersistence>(
         &self,
         events: &OwnedEventBusHandle,
@@ -9802,7 +11055,8 @@ impl Database {
 
         if !matches!(&self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
             return Err(Error::Other(
-                "owning event DDL requires its native database host".into()));
+                "owning event DDL requires its native database host".into(),
+            ));
         }
         let initial = events.prepare_owned_definition_projection_with_ddl(ddl, |table| {
             self.table_meta(table).is_some()
@@ -9855,14 +11109,20 @@ pub(super) struct OwnedEventDdlLogBodies {
 }
 pub(super) trait OwnedEventDdlPersistence {
     type Log;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_log(
         &self,
         original: &OwnedMemoryReservation,
         lsn: Lsn,
         commit: &EventBusPersistenceCommit,
     ) -> Result<Self::Log>;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn flush(&self, lsn: Lsn, commit: &EventBusPersistenceCommit) -> Result<()>;
     fn publish_log(&self, log: Self::Log, lsn: Lsn, bodies: OwnedEventDdlLogBodies);
 }
@@ -9871,7 +11131,10 @@ pub(super) trait OwnedEventDdlPersistence {
 // the original insertion/update/delete traversal, including ACL grant rows.
 // No implementation here calls an allocating Legacy candidate/gate builder.
 pub(super) trait OwnedEventCandidateSource {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visit(
         &self,
         visit: impl for<'r> FnMut(
@@ -9881,7 +11144,10 @@ pub(super) trait OwnedEventCandidateSource {
     ) -> Result<()>;
 }
 impl OwnedPreparedSinkEvents {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn with_capacity(
         original: &OwnedMemoryReservation,
         capacity: usize,
@@ -9904,7 +11170,10 @@ impl OwnedPreparedSinkEvents {
     }
 }
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_candidate_events<S: OwnedEventCandidateSource>(
         &self,
         source: &S,
@@ -10010,7 +11279,10 @@ pub(super) struct OwnedDeleteReleaseBytes {
     vector_array: OwnedMemoryReservation,
 }
 impl OwnedDeleteReleaseBytes {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_copy(
         original: &OwnedMemoryReservation,
         relational: &[usize],
@@ -10037,7 +11309,10 @@ impl Database {
         // simply destroys these arrays; it never calls this settlement door.
         drop(bytes);
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn apply_owned_event_bus_ddl_from_user<P: OwnedEventDdlPersistence>(
         &self,
         events: &OwnedEventBusHandle,
@@ -10078,7 +11353,10 @@ pub(super) struct OwnedPreparedEventGate {
     credit: OwnedEventGateCredits,
 }
 impl OwnedPreparedEventGate {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_from_meta(original: &OwnedMemoryReservation, meta: Option<&TableMeta>) -> Result<Self> {
         let context = meta
             .and_then(|meta| meta.columns.iter().find(|column| column.context_id))
@@ -10132,7 +11410,10 @@ impl OwnedPreparedEventGate {
         }
         Ok(owner)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn try_from_projection(
         original: &OwnedMemoryReservation,
         meta: Option<&TableMeta>,
@@ -10189,7 +11470,8 @@ impl OwnedPreparedEventGate {
         let mut grants = Vec::with_capacity(count);
         if grants.capacity() != count {
             return Err(Error::Other(
-                "event projected grant capacity mismatch".into()));
+                "event projected grant capacity mismatch".into(),
+            ));
         }
         if let Some(source) = projected_rows.get(&acl.ref_table) {
             for row in source.iter().filter(matches) {
@@ -10288,7 +11570,10 @@ impl OwnedEventCandidateSource for OwnedReceivedEventCandidates<'_> {
     }
 }
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_received_owned_sink_events_from_projection(
         &self,
         events: &OwnedEventBusHandle,
@@ -10329,7 +11614,10 @@ impl Database {
 }
 
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn suspend_owned_registered_append_for_discard(
         &self,
         registration: &OwnedEventStageRegistration,
@@ -10347,7 +11635,8 @@ impl OwnedEventBusHandle {
         if !token.storage.matches(self) || token.state != OwnedEscrowState::Active {
             *handle.control.get().token.lock() = Some(token);
             return Err(Error::Other(
-                "registered discard requires its active original escrow".into()));
+                "registered discard requires its active original escrow".into(),
+            ));
         }
         let mut queues = self.data().queues.lock();
         cancel_owned_slots_locked(&mut queues, &mut token.slots);
@@ -10414,7 +11703,10 @@ struct OwnedEventCopiedSet<K> {
     buckets: OwnedMemoryReservation,
 }
 impl OwnedEventBusHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn with_owned_registered_stage_identity<R>(
         &self,
         registration: &OwnedEventStageRegistration,
@@ -10588,7 +11880,10 @@ impl OwnedEventCandidateSource for OwnedOrdinaryEventCandidates<'_> {
     }
 }
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_owned_event_preimage<R>(
         &self,
         original: &OwnedMemoryReservation,
@@ -10621,7 +11916,10 @@ impl Database {
         drop(lookup_memory);
         f(row)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visit_owned_event_grants(
         &self,
         acl: &AclRef,
@@ -10667,7 +11965,10 @@ impl Database {
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_event_gate(
         &self,
         original: &OwnedMemoryReservation,
@@ -10779,7 +12080,10 @@ impl Database {
             Ok(owner)
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_sink_events_in_prepared_write_set(
         &self,
         events: &OwnedEventBusHandle,
@@ -10856,7 +12160,10 @@ impl Database {
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_owned_event_meta_pair<R>(
         &self,
         table: &str,
@@ -10890,17 +12197,28 @@ impl Database {
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn validate_owned_received_event_host(&self,events:&OwnedEventBusHandle,
-        host:&EngineDatabaseTransactions)->Result<()> {
-        self.validate_owned_event_host(events,host)?;
-        if !Arc::ptr_eq(&events.data().common,&self.event_bus) {
-            return Err(Error::Other("received preparation requires this database's selected event companion".into()));
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn validate_owned_received_event_host(
+        &self,
+        events: &OwnedEventBusHandle,
+        host: &EngineDatabaseTransactions,
+    ) -> Result<()> {
+        self.validate_owned_event_host(events, host)?;
+        if !Arc::ptr_eq(&events.data().common, &self.event_bus) {
+            return Err(Error::Other(
+                "received preparation requires this database's selected event companion".into(),
+            ));
         }
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn validate_owned_event_host(
         &self,
         events: &OwnedEventBusHandle,
@@ -10910,7 +12228,8 @@ impl Database {
             DatabaseTransactionHost::Owned(handle) => handle.with_host(|actual| {
                 if !std::ptr::eq(actual, host) {
                     return Err(Error::Other(
-                        "owning events require the selected original transaction host".into()));
+                        "owning events require the selected original transaction host".into(),
+                    ));
                 }
                 validate_owned_original(
                     &events.data().original,
@@ -10919,7 +12238,8 @@ impl Database {
                 )
             }),
             DatabaseTransactionHost::Legacy(_) => Err(Error::Other(
-                "owning events require the selected native transaction host".into())),
+                "owning events require the selected native transaction host".into(),
+            )),
         }
     }
 }
@@ -10928,7 +12248,10 @@ impl OwnedEventBusHandle {
     /// The companion owns this immutable seed outside every mutable queue,
     /// stage and state guard. The shared storage cannot retire while self is
     /// lent, including callback failure and unwinding.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn with_owned_persistence_original<R>(
         &self,
         f: impl for<'o> FnOnce(&'o OwnedMemoryReservation) -> Result<R>,
@@ -10938,7 +12261,10 @@ impl OwnedEventBusHandle {
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn validate_owned_cron_store(
         &self,
         events: &OwnedEventBusHandle,
@@ -10948,7 +12274,8 @@ impl Database {
         self.validate_owned_event_host(events, host)?;
         if !Arc::ptr_eq(&events.data().common, &self.event_bus) {
             return Err(Error::Other(
-                "native cron requires this database's event companion".into()));
+                "native cron requires this database's event companion".into(),
+            ));
         }
         host.transactions.with_transactions(|lower| {
             let installed: &dyn contextdb_tx::WriteSetApplicator = lower.store().as_ref();
@@ -10956,13 +12283,17 @@ impl Database {
                 != store as *const _ as *const ()
             {
                 return Err(Error::Other(
-                    "native cron requires its host's installed store".into()));
+                    "native cron requires its host's installed store".into(),
+                ));
             }
             Ok(())
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_owned_delete_release_bytes_in_prepared_write_set(
         &self,
         events: &OwnedEventBusHandle,
@@ -11018,7 +12349,8 @@ impl Database {
                         };
                         if array.len() == count {
                             return Err(Error::Other(
-                                "native delete release source changed".into()));
+                                "native delete release source changed".into(),
+                            ));
                         }
                         array.push(bytes);
                         Ok(())
@@ -11034,7 +12366,10 @@ impl Database {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visit_owned_delete_release_bytes(
         &self,
         original: &OwnedMemoryReservation,
@@ -11104,107 +12439,243 @@ impl Database {
     /// Final paged replay already installed its adjudicated rows in scratch.
     /// Gates therefore read that completed source without overlaying the same
     /// WriteSet a second time. Only changed-row lookup state is retained.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_received_sink_events_from_source(
-        &self,ws:&contextdb_tx::WriteSet,definitions:&EventBusDefinitions,
-        write:&crate::persistence::received_working::ReceivedWorkingWrite,
-        original:&crate::memory_accounting::OwnedMemoryReservation,
-        mut next_queue_id:u64,owner:&mut contextdb_vector::VectorCopyAdmission,
+        &self,
+        ws: &contextdb_tx::WriteSet,
+        definitions: &EventBusDefinitions,
+        write: &crate::persistence::received_working::ReceivedWorkingWrite,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        mut next_queue_id: u64,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    )->Result<PreparedReceivedSinkEvents> {
+    ) -> Result<PreparedReceivedSinkEvents> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let Some(lsn)=ws.commit_lsn else{return Ok(PreparedReceivedSinkEvents {events:Vec::new(),next_queue_id});};
+        let Some(lsn) = ws.commit_lsn else {
+            return Ok(PreparedReceivedSinkEvents {
+                events: Vec::new(),
+                next_queue_id,
+            });
+        };
         if definitions.event_types.is_empty() || definitions.routes.is_empty() {
-            return Ok(PreparedReceivedSinkEvents {events:Vec::new(),next_queue_id});
+            return Ok(PreparedReceivedSinkEvents {
+                events: Vec::new(),
+                next_queue_id,
+            });
         }
-        let metadata_bytes=self.relational_store.table_meta.read().iter()
-            .map(|(table,meta)|meta.estimated_bytes().saturating_add(table.len()).saturating_mul(8)).fold(0usize,usize::saturating_add);
-        owner.reserve(metadata_bytes.saturating_add(ws.relational_deletes.len().saturating_mul(256)))?;
-        let mut deleted=HashMap::new();
-        for (table,row_id,_) in &ws.relational_deletes {
-            if let Some(row)=write.latest_row(original,table,*row_id)? {
-                owner.reserve(crate::memory_accounting::preparation_row_copy_bytes(row.value())?
-                    .saturating_add(table.len().saturating_mul(2)).saturating_add(512))?;
-                deleted.insert((table.clone(),*row_id),crate::memory_accounting::preparation_copy_row(row.value())?);
+        let metadata_bytes = self
+            .relational_store
+            .table_meta
+            .read()
+            .iter()
+            .map(|(table, meta)| {
+                meta.estimated_bytes()
+                    .saturating_add(table.len())
+                    .saturating_mul(8)
+            })
+            .fold(0usize, usize::saturating_add);
+        owner.reserve(
+            metadata_bytes.saturating_add(ws.relational_deletes.len().saturating_mul(256)),
+        )?;
+        let mut deleted = HashMap::new();
+        for (table, row_id, _) in &ws.relational_deletes {
+            if let Some(row) = write.latest_row(original, table, *row_id)? {
+                owner.reserve(
+                    crate::memory_accounting::preparation_row_copy_bytes(row.value())?
+                        .saturating_add(table.len().saturating_mul(2))
+                        .saturating_add(512),
+                )?;
+                deleted.insert(
+                    (table.clone(), *row_id),
+                    crate::memory_accounting::preparation_copy_row(row.value())?,
+                );
             }
         }
-        let mut consumed=HashSet::new();
-        let mut cache=HashMap::new();
-        let mut events=Vec::new();
-        for (table,row) in &ws.relational_inserts {
-            let same=(table.clone(),row.row_id);
-            let identity=deleted.iter().find_map(|((old_table,old_id),old):(&(String,RowId),&VersionedRow)|
-                (old_table==table && old.values.contains_key("id")
-                    && old.values.get("id")==row.values.get("id")).then_some((old_table.clone(),*old_id)));
-            let replaced=deleted.contains_key(&same).then_some(same).or(identity);
-            let trigger=if let Some(key)=replaced {consumed.insert(key);EventTrigger::Update}else{EventTrigger::Insert};
-            self.append_received_sink_candidate_from_source(&mut events,definitions,
-                RowEventCandidateRef {table,trigger,row_id:row.row_id,values:&row.values},lsn,
-                &mut cache,&mut next_queue_id,owner,read_memory.clone())?;
+        let mut consumed = HashSet::new();
+        let mut cache = HashMap::new();
+        let mut events = Vec::new();
+        for (table, row) in &ws.relational_inserts {
+            let same = (table.clone(), row.row_id);
+            let identity = deleted.iter().find_map(
+                |((old_table, old_id), old): (&(String, RowId), &VersionedRow)| {
+                    (old_table == table
+                        && old.values.contains_key("id")
+                        && old.values.get("id") == row.values.get("id"))
+                    .then_some((old_table.clone(), *old_id))
+                },
+            );
+            let replaced = deleted.contains_key(&same).then_some(same).or(identity);
+            let trigger = if let Some(key) = replaced {
+                consumed.insert(key);
+                EventTrigger::Update
+            } else {
+                EventTrigger::Insert
+            };
+            self.append_received_sink_candidate_from_source(
+                &mut events,
+                definitions,
+                RowEventCandidateRef {
+                    table,
+                    trigger,
+                    row_id: row.row_id,
+                    values: &row.values,
+                },
+                lsn,
+                &mut cache,
+                &mut next_queue_id,
+                owner,
+                read_memory.clone(),
+            )?;
         }
-        for ((table,row_id),row) in deleted {
-            if consumed.contains(&(table.clone(),row_id)) {continue;}
-            self.append_received_sink_candidate_from_source(&mut events,definitions,
-                RowEventCandidateRef {table:&table,trigger:EventTrigger::Delete,row_id,values:&row.values},lsn,
-                &mut cache,&mut next_queue_id,owner,read_memory.clone())?;
+        for ((table, row_id), row) in deleted {
+            if consumed.contains(&(table.clone(), row_id)) {
+                continue;
+            }
+            self.append_received_sink_candidate_from_source(
+                &mut events,
+                definitions,
+                RowEventCandidateRef {
+                    table: &table,
+                    trigger: EventTrigger::Delete,
+                    row_id,
+                    values: &row.values,
+                },
+                lsn,
+                &mut cache,
+                &mut next_queue_id,
+                owner,
+                read_memory.clone(),
+            )?;
         }
-        Ok(PreparedReceivedSinkEvents {events,next_queue_id})
+        Ok(PreparedReceivedSinkEvents {
+            events,
+            next_queue_id,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn append_received_sink_candidate_from_source(
-        &self,out:&mut Vec<PreparedSinkEvent>,definitions:&EventBusDefinitions,
-        candidate:RowEventCandidateRef<'_>,lsn:Lsn,cache:&mut HashMap<String,EventGateSnapshot>,
-        next_queue_id:&mut u64,owner:&mut contextdb_vector::VectorCopyAdmission,
+        &self,
+        out: &mut Vec<PreparedSinkEvent>,
+        definitions: &EventBusDefinitions,
+        candidate: RowEventCandidateRef<'_>,
+        lsn: Lsn,
+        cache: &mut HashMap<String, EventGateSnapshot>,
+        next_queue_id: &mut u64,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    )->Result<()> {
+    ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         for event_type in definitions.event_types.values() {
-            if event_type.table!=candidate.table || event_type.trigger!=candidate.trigger {continue;}
-            let severity=candidate.values.get("severity").and_then(Value::as_text).unwrap_or("");
-            let gate=self.event_gate_snapshot_cached(candidate.table,candidate.values,
-                &contextdb_tx::WriteSet::default(),cache,read_memory.clone())?;
-            let mut json=owner.scratch();
-            let json_bytes=gate.acl.as_ref().map(|acl|acl.grant_rows.iter().try_fold(0usize,|bytes,row| {
-                let (needed,_)=crate::memory_accounting::preparation_json_work_bytes(row.values())?;
-                Ok::<_,Error>(bytes.max(needed))
-            })).transpose()?.unwrap_or(0);
+            if event_type.table != candidate.table || event_type.trigger != candidate.trigger {
+                continue;
+            }
+            let severity = candidate
+                .values
+                .get("severity")
+                .and_then(Value::as_text)
+                .unwrap_or("");
+            let gate = self.event_gate_snapshot_cached(
+                candidate.table,
+                candidate.values,
+                &contextdb_tx::WriteSet::default(),
+                cache,
+                read_memory.clone(),
+            )?;
+            let mut json = owner.scratch();
+            let json_bytes = gate
+                .acl
+                .as_ref()
+                .map(|acl| {
+                    acl.grant_rows.iter().try_fold(0usize, |bytes, row| {
+                        let (needed, _) =
+                            crate::memory_accounting::preparation_json_work_bytes(row.values())?;
+                        Ok::<_, Error>(bytes.max(needed))
+                    })
+                })
+                .transpose()?
+                .unwrap_or(0);
             json.reserve(json_bytes)?;
-            let gate_bytes=owned_gate_metadata_bytes(&gate)?;
-            for route in definitions.routes.values().filter(|route|route.event_type==event_type.name) {
-                if !route_matches(route,candidate.values) {continue;}
-                owner.reserve(crate::memory_accounting::preparation_values_copy_bytes(candidate.values)?
-                    .saturating_add(event_type.name.len()).saturating_add(candidate.table.len())
-                    .saturating_add(severity.len()).saturating_add(route.sink.len())
-                    .saturating_add(gate_bytes.saturating_mul(4))
-                    .saturating_add(std::mem::size_of::<PreparedSinkEvent>().saturating_mul(4)).saturating_add(512))?;
-                let id=*next_queue_id;
-                out.push((route.sink.clone(),SinkQueueEntry {id,event:SinkEvent {action_id:id,
-                    event_type:event_type.name.clone(),table:candidate.table.to_owned(),severity:severity.to_owned(),
-                    row_values:crate::memory_accounting::preparation_copy_values(candidate.values)?,at_lsn:lsn},
-                    row_id:candidate.row_id,attempts:0,gate:gate.clone()}));
-                *next_queue_id=next_queue_id.saturating_add(1);
+            let gate_bytes = owned_gate_metadata_bytes(&gate)?;
+            for route in definitions
+                .routes
+                .values()
+                .filter(|route| route.event_type == event_type.name)
+            {
+                if !route_matches(route, candidate.values) {
+                    continue;
+                }
+                owner.reserve(
+                    crate::memory_accounting::preparation_values_copy_bytes(candidate.values)?
+                        .saturating_add(event_type.name.len())
+                        .saturating_add(candidate.table.len())
+                        .saturating_add(severity.len())
+                        .saturating_add(route.sink.len())
+                        .saturating_add(gate_bytes.saturating_mul(4))
+                        .saturating_add(std::mem::size_of::<PreparedSinkEvent>().saturating_mul(4))
+                        .saturating_add(512),
+                )?;
+                let id = *next_queue_id;
+                out.push((
+                    route.sink.clone(),
+                    SinkQueueEntry {
+                        id,
+                        event: SinkEvent {
+                            action_id: id,
+                            event_type: event_type.name.clone(),
+                            table: candidate.table.to_owned(),
+                            severity: severity.to_owned(),
+                            row_values: crate::memory_accounting::preparation_copy_values(
+                                candidate.values,
+                            )?,
+                            at_lsn: lsn,
+                        },
+                        row_id: candidate.row_id,
+                        attempts: 0,
+                        gate: gate.clone(),
+                    },
+                ));
+                *next_queue_id = next_queue_id.saturating_add(1);
             }
         }
         Ok(())
     }
 }
 
-
 impl Database {
     // Ordinary Native data/DDL share this exact registered escrow. File-backed
     // history is read from its durable root; no duplicate in-memory DDL body
     // population is retained after that history has consumed its invoice.
-    pub(super) fn publish_owned_event_ddl_after_apply(&self, events: &OwnedEventBusHandle,
-        _lsn: Lsn, stage: OwnedStagedEventBusDdlCommit) {
-        let OwnedStagedEventBusDdlCommit { memory_history, persistence, persistence_credit, publication,
-            buffers, ddl_array, sidecar_array } = stage;
+    pub(super) fn publish_owned_event_ddl_after_apply(
+        &self,
+        events: &OwnedEventBusHandle,
+        _lsn: Lsn,
+        stage: OwnedStagedEventBusDdlCommit,
+    ) {
+        let OwnedStagedEventBusDdlCommit {
+            memory_history,
+            persistence,
+            persistence_credit,
+            publication,
+            buffers,
+            ddl_array,
+            sidecar_array,
+        } = stage;
         events.publish_owned_definition_only(publication);
         self.publish_memory_schema_history(memory_history);
         drop(persistence);
-        drop(persistence_credit); drop(buffers); drop(ddl_array); drop(sidecar_array);
+        drop(persistence_credit);
+        drop(buffers);
+        drop(ddl_array);
+        drop(sidecar_array);
     }
 }

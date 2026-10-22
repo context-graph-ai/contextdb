@@ -7,7 +7,10 @@ use crate::{
 };
 use contextdb_core::{Error, Result, TenantId};
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn manifested_request(
     db: &Database,
     tenant: &TenantId,
@@ -16,7 +19,7 @@ pub(crate) fn manifested_request(
     signer: &LineageSigner,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<crate::protocol::PushRequest> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     use crate::protocol::*;
     let m = current_manifest(db, table, key, read_memory.clone())?.ok_or_else(|| {
@@ -114,14 +117,20 @@ pub(crate) fn manifested_request(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn wire_packet(packet: &SignedOutcomePacket) -> Result<WireDeliveryOutcome> {
     let mut wire = packet.record.wire(&packet.block)?;
     wire.lookup_source = rmp_serde::to_vec_named(packet).map_err(|_| invalid())?;
     Ok(wire)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn read_packet(
     wire: &WireDeliveryOutcome,
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -133,14 +142,17 @@ pub(crate) fn read_packet(
     Ok(packet)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn packet_for(
     db: &Database,
     t: &TerminalRecord,
     signer: &LineageSigner,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<SignedOutcomePacket> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -170,7 +182,10 @@ pub(crate) fn packet_for(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn attach(
     db: &Database,
     tenant: &TenantId,
@@ -178,7 +193,7 @@ pub(crate) fn attach(
     signer: &LineageSigner,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<WireDeliveryManifest>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut out = Vec::new();
     for row in &changes.rows {
@@ -212,7 +227,10 @@ pub(crate) struct DeliveryRoute<'a> {
 }
 
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn apply(
     db: &Database,
     route: DeliveryRoute<'_>,
@@ -223,7 +241,7 @@ pub(crate) fn apply(
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(ApplyResult, Vec<WireDeliveryOutcome>)> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let decoded_memory = crate::read_image_memory::ImageMemory::admitted_reader_for(
         db.bounded_read_accountant(),
@@ -489,7 +507,10 @@ pub(crate) fn apply(
     Ok((result, outcomes))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn missing_manifest(
     db: &Database,
     tenant: &TenantId,
@@ -499,7 +520,7 @@ fn missing_manifest(
     changes: &ChangeSet,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(ApplyResult, Vec<WireDeliveryOutcome>)> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -643,7 +664,10 @@ fn missing_manifest(
     ))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn fetch(
     db: &Database,
     tenant: &TenantId,
@@ -653,7 +677,7 @@ pub(crate) fn fetch(
     since: Option<&[u8]>,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Vec<WireDeliveryOutcome>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let decoded_memory = crate::read_image_memory::ImageMemory::admitted_reader_for(
         db.bounded_read_accountant(),
@@ -723,13 +747,16 @@ pub(crate) fn fetch(
 
 // Resend and status share the durable outcome decision.
 // Watermarks can retire ordinary history but cannot retire an unanswered unit.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn pending_changes(
     db: &Database,
     mut changes: ChangeSet,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ChangeSet> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -828,7 +855,7 @@ fn missing_rows(
     changes: &ChangeSet,
     _read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> std::collections::BTreeSet<(String, Vec<u8>)> {
-        let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
+    let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
 
     let identity = |r: &RowChange| {
         RowRef {
@@ -896,7 +923,7 @@ fn remove_missing_units(
     changes: &mut ChangeSet,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let missing = missing_rows(db, changes, read_memory.clone());
     changes.rows.retain(|r| {
@@ -910,7 +937,10 @@ fn remove_missing_units(
     });
 }
 #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply_remainder(
     db: &Database,
     route: DeliveryRoute<'_>,
@@ -921,7 +951,7 @@ fn apply_remainder(
     dependency_complete: bool,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ApplyResult> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut retained_vector_copy = crate::vector_read_memory::admission(read_memory.clone());
     let vector_copy_owner = &mut retained_vector_copy;

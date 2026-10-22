@@ -190,7 +190,11 @@ fn install_refusal_after_successful_t2_keeps_publication_and_retries_without_jou
     let reopened = Database::open(&path).unwrap();
     reopened.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     assert_eq!(
-        reopened.execute(query, &HashMap::new()).unwrap().rows().len(),
+        reopened
+            .execute(query, &HashMap::new())
+            .unwrap()
+            .rows()
+            .len(),
         3
     );
     assert_eq!(

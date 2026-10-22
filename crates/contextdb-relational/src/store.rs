@@ -335,8 +335,17 @@ pub struct PreparedRelationalPublication {
 
 impl PreparedRelationalPublication {
     #[doc(hidden)]
-    pub fn with_history(mut self, history: crate::schema_generation::PreparedSchemaHistoryErasure) -> Self { self.history = Some(history.into_generation()); self }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    pub fn with_history(
+        mut self,
+        history: crate::schema_generation::PreparedSchemaHistoryErasure,
+    ) -> Self {
+        self.history = Some(history.into_generation());
+        self
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn admit_current_memberships(
         &mut self,
         budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -353,7 +362,10 @@ impl PreparedRelationalPublication {
 }
 
 impl TableProjection {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn admit_current_memberships(
         &mut self,
         budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -484,7 +496,10 @@ impl IndexStorage {
             .expect("unbudgeted index insertion");
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_insert_posting(
         &mut self,
         key: IndexKey,
@@ -589,7 +604,10 @@ impl IndexStorage {
             .then_some(&self.current)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn admit_current(
         &mut self,
         budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -612,7 +630,10 @@ impl IndexStorage {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn current_for_preparation(
         &self,
         budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -628,7 +649,10 @@ impl IndexStorage {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reconstruct_current(
         &self,
         budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1104,7 +1128,10 @@ impl RelationalStore {
             .map(|(_, root)| root.image.clone())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn prepare_retention_expiries(
         &self,
         identities: Vec<(TableName, RowId, TxId, Lsn)>,
@@ -1159,7 +1186,10 @@ impl RelationalStore {
         reclaimed.difference(&surviving).copied().collect()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn prepare_memberships(
         &self,
         deletes: &[(TableName, RowId, TxId)],
@@ -1969,7 +1999,10 @@ impl RelationalStore {
         self.table_meta.write().insert(name.to_string(), meta);
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert_loaded_row(&self, name: &str, row: VersionedRow) -> contextdb_core::Result<()> {
         if self.uses_disk_backed_committed_bodies() {
             return Ok(());
@@ -2199,7 +2232,10 @@ impl RelationalStore {
             .cloned()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_live_row(
         &self,
         table: &str,
@@ -2402,63 +2438,120 @@ impl RelationalStore {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn prepare_schema_generation(&self, names: impl Iterator<Item=impl AsRef<str>>, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaGeneration> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn prepare_schema_generation(
+        &self,
+        names: impl Iterator<Item = impl AsRef<str>>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaGeneration> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
         let tables = self.tables.read();
         let metadata = self.table_meta.read();
-        self.schema_history.read().prepare(names.filter_map(|name| {
-            let (name, meta) = metadata.get_key_value(name.as_ref())?;
-            Some((name.as_str(), meta, tables.get(name)?.as_slice()))
-        }), owner)
+        self.schema_history.read().prepare(
+            names.filter_map(|name| {
+                let (name, meta) = metadata.get_key_value(name.as_ref())?;
+                Some((name.as_str(), meta, tables.get(name)?.as_slice()))
+            }),
+            owner,
+        )
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn prepare_schema_history_erasure(&self, keys: impl IntoIterator<Item=(RowId,Lsn)>, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaHistoryErasure> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn prepare_schema_history_erasure(
+        &self,
+        keys: impl IntoIterator<Item = (RowId, Lsn)>,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> contextdb_core::Result<crate::schema_generation::PreparedSchemaHistoryErasure> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
         self.schema_history.read().prepare_erasure(keys, owner)
     }
 
     #[doc(hidden)]
-    pub fn publish_schema_history_erasure(&self, prepared: crate::schema_generation::PreparedSchemaHistoryErasure) {
+    pub fn publish_schema_history_erasure(
+        &self,
+        prepared: crate::schema_generation::PreparedSchemaHistoryErasure,
+    ) {
         self.schema_history.write().publish_erasure(prepared);
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn visit_authored_history(&self, consume: impl FnMut(&str, &TableMeta, &VersionedRow) -> contextdb_core::Result<()>) -> contextdb_core::Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn visit_authored_history(
+        &self,
+        consume: impl FnMut(&str, &TableMeta, &VersionedRow) -> contextdb_core::Result<()>,
+    ) -> contextdb_core::Result<()> {
         self.schema_history.read().visit_all(consume)
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn visit_authored_row_versions(&self, table: &str, row: RowId, consume: impl FnMut(&VersionedRow) -> contextdb_core::Result<()>) -> contextdb_core::Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn visit_authored_row_versions(
+        &self,
+        table: &str,
+        row: RowId,
+        consume: impl FnMut(&VersionedRow) -> contextdb_core::Result<()>,
+    ) -> contextdb_core::Result<()> {
         self.schema_history.read().visit_row(table, row, consume)
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn with_authored_row<T>(&self, table: &str, row: RowId, lsn: Lsn, consume: impl FnOnce(Option<(&TableMeta,&VersionedRow)>)->contextdb_core::Result<T>) -> contextdb_core::Result<T> {
-        self.schema_history.read().with_row(table, row, lsn, consume)
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn with_authored_row<T>(
+        &self,
+        table: &str,
+        row: RowId,
+        lsn: Lsn,
+        consume: impl FnOnce(Option<(&TableMeta, &VersionedRow)>) -> contextdb_core::Result<T>,
+    ) -> contextdb_core::Result<T> {
+        self.schema_history
+            .read()
+            .with_row(table, row, lsn, consume)
     }
 
-    pub fn drop_table(&self, name: &str) { self.drop_table_with_generation(name, None); }
+    pub fn drop_table(&self, name: &str) {
+        self.drop_table_with_generation(name, None);
+    }
 
     #[doc(hidden)]
-    pub fn drop_table_with_generation(&self, name: &str, history: Option<crate::schema_generation::PreparedSchemaGeneration>) {
+    pub fn drop_table_with_generation(
+        &self,
+        name: &str,
+        history: Option<crate::schema_generation::PreparedSchemaGeneration>,
+    ) {
         let mut indexes = self.indexes.write();
         let mut tables = self.tables.write();
         let mut metadata = self.table_meta.write();
         let mut positions = self.row_positions.write();
         let mut versions = self.row_version_positions.write();
-        if let Some(history) = history { self.schema_history.write().publish(history, &mut tables); }
-        indexes.remove(name); tables.remove(name); metadata.remove(name);
-        positions.retain(|(table,_),_| table != name);
-        versions.retain(|(table,_),_| table != name);
-        self.retention_expiries.write().retain(|(table,_,_),_| table != name);
+        if let Some(history) = history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
+        indexes.remove(name);
+        tables.remove(name);
+        metadata.remove(name);
+        positions.retain(|(table, _), _| table != name);
+        versions.retain(|(table, _), _| table != name);
+        self.retention_expiries
+            .write()
+            .retain(|(table, _, _), _| table != name);
         self.sync_source_lsns.write().remove(name);
         self.sync_source_kinds.write().remove(name);
     }
@@ -2648,7 +2741,10 @@ impl RelationalStore {
         Self::projected_index_storage_inner(meta, rows, None).expect("unbudgeted index projection")
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn projected_index_storage_with_budget(
         meta: &TableMeta,
         rows: &[VersionedRow],
@@ -2659,7 +2755,10 @@ impl RelationalStore {
         Self::projected_index_storage_inner(meta, rows, Some(budget))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn projected_index_storage_inner(
         meta: &TableMeta,
         rows: &[VersionedRow],
@@ -2867,7 +2966,10 @@ impl RelationalStore {
     /// The caller holds the commit gate until this delta is published. All
     /// derived maps and any destination growth are prepared before durability.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn prepare_erasure_publication(
         &self,
         replacements: Vec<(String, Vec<VersionedRow>)>,
@@ -3081,11 +3183,16 @@ impl RelationalStore {
     /// has no validation or allocation path: callers prepare the complete
     /// projections before Redb commits, so once durability succeeds this is
     /// only lock-ordered memory replacement.
-    pub fn publish_table_projections(&self, projections: Vec<TableProjection>) { self.publish_table_projections_with_generation(projections, None) }
+    pub fn publish_table_projections(&self, projections: Vec<TableProjection>) {
+        self.publish_table_projections_with_generation(projections, None)
+    }
 
     #[doc(hidden)]
-    pub fn publish_table_projections_with_generation(&self, projections: Vec<TableProjection>, history: Option<crate::schema_generation::PreparedSchemaGeneration>,
-) {
+    pub fn publish_table_projections_with_generation(
+        &self,
+        projections: Vec<TableProjection>,
+        history: Option<crate::schema_generation::PreparedSchemaGeneration>,
+    ) {
         if self.uses_disk_backed_committed_bodies() {
             self.publish_source_projections(projections, &HashSet::new());
             return;
@@ -3103,7 +3210,9 @@ impl RelationalStore {
         let mut table_meta = self.table_meta.write();
         let mut positions = self.row_positions.write();
         let mut version_positions = self.row_version_positions.write();
-        if let Some(history) = history { self.schema_history.write().publish(history, &mut tables); }
+        if let Some(history) = history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
         for projection in projections {
             let table = projection.table;
             let rows = Self::compact_projection_rows(
@@ -3131,7 +3240,13 @@ impl RelationalStore {
     /// order as the complete-image path. Sync provenance belongs to each
     /// selected table, and dropped members disappear in this same memory
     /// publication after their durable transaction has committed.
-    pub fn publish_received_table_projections(&self, projections: Vec<TableProjection>, dropped: &std::collections::HashSet<String>) { self.publish_received_table_projections_with_generation(projections, dropped, None) }
+    pub fn publish_received_table_projections(
+        &self,
+        projections: Vec<TableProjection>,
+        dropped: &std::collections::HashSet<String>,
+    ) {
+        self.publish_received_table_projections_with_generation(projections, dropped, None)
+    }
 
     #[doc(hidden)]
     pub fn publish_received_table_projections_with_generation(
@@ -3139,7 +3254,7 @@ impl RelationalStore {
         projections: Vec<TableProjection>,
         dropped: &std::collections::HashSet<String>,
         history: Option<crate::schema_generation::PreparedSchemaGeneration>,
-) {
+    ) {
         if self.uses_disk_backed_committed_bodies() {
             self.publish_source_projections(projections, dropped);
             return;
@@ -3153,7 +3268,9 @@ impl RelationalStore {
         let mut table_meta = self.table_meta.write();
         let mut positions = self.row_positions.write();
         let mut version_positions = self.row_version_positions.write();
-        if let Some(history) = history { self.schema_history.write().publish(history, &mut tables); }
+        if let Some(history) = history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
         let mut source_lsns = self.sync_source_lsns.write();
         let mut source_kinds = self.sync_source_kinds.write();
         for table in dropped {
@@ -3213,7 +3330,15 @@ impl RelationalStore {
     /// Replace one table's rows, metadata and physical indexes as one
     /// publication.  The expensive index construction is deliberately done
     /// by `projected_index_storage` before this method acquires the locks.
-    pub fn publish_table_projection(&self, table: &str, meta: TableMeta, rows: Vec<VersionedRow>, indexes: HashMap<String, IndexStorage>) -> bool { self.publish_table_projection_with_generation(table, meta, rows, indexes, None) }
+    pub fn publish_table_projection(
+        &self,
+        table: &str,
+        meta: TableMeta,
+        rows: Vec<VersionedRow>,
+        indexes: HashMap<String, IndexStorage>,
+    ) -> bool {
+        self.publish_table_projection_with_generation(table, meta, rows, indexes, None)
+    }
 
     #[doc(hidden)]
     pub fn publish_table_projection_with_generation(
@@ -3223,7 +3348,7 @@ impl RelationalStore {
         rows: Vec<VersionedRow>,
         indexes: HashMap<String, IndexStorage>,
         history: Option<crate::schema_generation::PreparedSchemaGeneration>,
-) -> bool {
+    ) -> bool {
         if self.uses_disk_backed_committed_bodies() {
             let mut all_indexes = self.indexes.write();
             let mut table_meta = self.table_meta.write();
@@ -3247,7 +3372,9 @@ impl RelationalStore {
         let mut table_meta = self.table_meta.write();
         let mut positions = self.row_positions.write();
         let mut version_positions = self.row_version_positions.write();
-        if let Some(history) = history { self.schema_history.write().publish(history, &mut tables); }
+        if let Some(history) = history {
+            self.schema_history.write().publish(history, &mut tables);
+        }
         if !table_meta.contains_key(table) {
             return false;
         }
@@ -3475,7 +3602,8 @@ impl RelationalStore {
     /// counts and admits its projection. No owning name escapes this borrow.
     #[doc(hidden)]
     pub fn with_table_name_view<R>(
-        &self, consume: impl FnOnce(&mut dyn ExactSizeIterator<Item = &str>) -> R,
+        &self,
+        consume: impl FnOnce(&mut dyn ExactSizeIterator<Item = &str>) -> R,
     ) -> R {
         if self.uses_disk_backed_committed_bodies() {
             let tables = self.table_meta.read();
@@ -3686,13 +3814,16 @@ impl RelationalStore {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn membership_key_credit(
     columns: &[(String, SortDirection)],
     values: &HashMap<String, Value>,
     budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<ReadCredit> {
-        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+    let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
 
     let bytes = columns
         .iter()
@@ -3704,12 +3835,15 @@ fn membership_key_credit(
     membership_credit(budget, bytes)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn membership_credit(
     budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     bytes: usize,
 ) -> contextdb_core::Result<ReadCredit> {
-        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+    let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
 
     ReadCredit::try_new(
         budget,

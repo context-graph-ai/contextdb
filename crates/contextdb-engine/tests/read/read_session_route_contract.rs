@@ -323,8 +323,10 @@ fn file_and_owner_routes_select_once_and_return_canonical_equivalent_results() {
     );
     assert_eq!(file_result.rows().len(), row_count);
     assert_eq!(
-        encode_query_result(&file_result, file_result.encoding_owner_for_test()).expect("encode file result canonically"),
-        encode_query_result(&owner_result, owner_result.encoding_owner_for_test()).expect("encode owner result canonically"),
+        encode_query_result(&file_result, file_result.encoding_owner_for_test())
+            .expect("encode file result canonically"),
+        encode_query_result(&owner_result, owner_result.encoding_owner_for_test())
+            .expect("encode owner result canonically"),
     );
     assert!(matches!(
         (file_error, owner_error),
@@ -963,16 +965,40 @@ impl KernelCancellationGate {
         // The final callback is BEFORE the item cancelled at N-1. Every
         // earlier callback in this successful prefix completed one source item.
         let prefix = &state.source_events[..state.source_events.len() - 1];
-        let categories = [ReadKernelSource::TableRow, ReadKernelSource::IndexEntry,
-            ReadKernelSource::SortCandidate, ReadKernelSource::GraphEdge,
-            ReadKernelSource::BruteForceVectorCandidate, ReadKernelSource::HnswCandidate,
-            ReadKernelSource::RankCandidate, ReadKernelSource::AccessRow];
-        let completed_by_category: Vec<_> = categories.iter().map(|source| {
-            (*source, u64::try_from(prefix.iter().filter(|event| event.source == *source).count()).unwrap())
-        }).collect();
-        let total = completed_by_category.iter().map(|(_, completed)| *completed).sum();
-        assert_eq!(total, u64::try_from(prefix.len()).unwrap(),
-            "every completed observed source belongs to the reconciled categories");
+        let categories = [
+            ReadKernelSource::TableRow,
+            ReadKernelSource::IndexEntry,
+            ReadKernelSource::SortCandidate,
+            ReadKernelSource::GraphEdge,
+            ReadKernelSource::BruteForceVectorCandidate,
+            ReadKernelSource::HnswCandidate,
+            ReadKernelSource::RankCandidate,
+            ReadKernelSource::AccessRow,
+        ];
+        let completed_by_category: Vec<_> = categories
+            .iter()
+            .map(|source| {
+                (
+                    *source,
+                    u64::try_from(
+                        prefix
+                            .iter()
+                            .filter(|event| event.source == *source)
+                            .count(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let total = completed_by_category
+            .iter()
+            .map(|(_, completed)| *completed)
+            .sum();
+        assert_eq!(
+            total,
+            u64::try_from(prefix.len()).unwrap(),
+            "every completed observed source belongs to the reconciled categories"
+        );
         total
     }
 
@@ -997,7 +1023,10 @@ impl ReadKernelTestObserver for KernelCancellationGate {
         if !state.armed {
             return;
         }
-        assert!(state.entered.is_none(), "no source attempt follows the cancellation trigger");
+        assert!(
+            state.entered.is_none(),
+            "no source attempt follows the cancellation trigger"
+        );
         state.source_events.push(event);
         if event.source == ReadKernelSource::TableRow
             && event.completed_items == cancellation_batch_rows().saturating_sub(1)
@@ -1076,9 +1105,14 @@ fn cancel_execute_inside_kernel(
     wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
     assert_eq!(
-        session.route_resources_for_test().expect("source state at acknowledgment")
+        session
+            .route_resources_for_test()
+            .expect("source state at acknowledgment")
             .bounded_source_items_completed,
-        blocked.as_ref().expect("source state at trigger").bounded_source_items_completed,
+        blocked
+            .as_ref()
+            .expect("source state at trigger")
+            .bounded_source_items_completed,
         "exactly zero additional source work before releasing the acknowledged kernel",
     );
     gate.release();
@@ -1152,9 +1186,14 @@ fn cancel_cursor_open_inside_kernel(
     wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
     assert_eq!(
-        session.route_resources_for_test().expect("source state at acknowledgment")
+        session
+            .route_resources_for_test()
+            .expect("source state at acknowledgment")
             .bounded_source_items_completed,
-        blocked.as_ref().expect("source state at trigger").bounded_source_items_completed,
+        blocked
+            .as_ref()
+            .expect("source state at trigger")
+            .bounded_source_items_completed,
         "exactly zero additional source work before releasing the acknowledged kernel",
     );
     gate.release();
@@ -1258,9 +1297,14 @@ fn cancel_cursor_fetch_inside_kernel(
     wait_for_kernel_cancellation(&kernel_token);
     let identical_token_observed = kernel_token.is_cancelled();
     assert_eq!(
-        session.route_resources_for_test().expect("source state at acknowledgment")
+        session
+            .route_resources_for_test()
+            .expect("source state at acknowledgment")
             .bounded_source_items_completed,
-        blocked.as_ref().expect("source state at trigger").bounded_source_items_completed,
+        blocked
+            .as_ref()
+            .expect("source state at trigger")
+            .bounded_source_items_completed,
         "exactly zero additional source work before releasing the acknowledged kernel",
     );
     gate.release();
@@ -1310,7 +1354,10 @@ fn cancel_cursor_fetch_inside_kernel(
             .collect::<Vec<_>>(),
         "a cancelled unpublished page must not advance the suspended continuation",
     );
-    assert!(next_page.has_more(), "the cursor remains genuinely suspended");
+    assert!(
+        next_page.has_more(),
+        "the cursor remains genuinely suspended"
+    );
     let after_resume = session
         .route_resources_for_test()
         .expect("inspect the selected route after cursor resume");

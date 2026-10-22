@@ -477,7 +477,8 @@ fn a_bounded_read_names_the_stored_column_a_query_vector_came_from() {
         .execute(sql, &anchor)
         .expect("a bounded read answers");
     assert_eq!(
-        bounded.trace().query_vector_source, eager.trace().query_vector_source,
+        bounded.trace().query_vector_source,
+        eager.trace().query_vector_source,
         "a bounded read names the same stored column the executor names"
     );
 }
@@ -566,7 +567,8 @@ fn a_bounded_read_probes_adjacency_when_only_the_end_of_a_hop_is_pinned() {
         // The oracle itself is checked, so this case cannot degrade into two
         // doors agreeing on a full scan.
         assert_eq!(
-            eager.trace().physical_plan, "AdjacencyProbe",
+            eager.trace().physical_plan,
+            "AdjacencyProbe",
             "the executor probes adjacency for {what} rather than walking every edge: {:?}",
             eager.trace()
         );
@@ -616,7 +618,8 @@ fn a_bounded_read_probes_adjacency_when_only_the_end_of_a_hop_is_pinned() {
         if bounded.trace().rows_examined != eager.trace().rows_examined {
             disagreements.push(format!(
                 "{what}: the executor examined {} rows and a bounded read reports {}",
-                eager.trace().rows_examined, bounded.trace().rows_examined
+                eager.trace().rows_examined,
+                bounded.trace().rows_examined
             ));
         }
     }
@@ -785,7 +788,8 @@ fn a_bounded_read_probes_adjacency_when_the_start_is_named_by_something_other_th
         // The oracle itself is checked, so this case cannot degrade into two
         // doors agreeing on a full scan.
         assert_eq!(
-            eager.trace().physical_plan, "AdjacencyProbe",
+            eager.trace().physical_plan,
+            "AdjacencyProbe",
             "the executor resolves the start and then probes adjacency for {what}: {:?}",
             eager.trace()
         );
@@ -830,7 +834,8 @@ fn a_bounded_read_probes_adjacency_when_the_start_is_named_by_something_other_th
         if bounded.trace().rows_examined != eager.trace().rows_examined {
             disagreements.push(format!(
                 "{what}: the executor examined {} rows and a bounded read reports {}",
-                eager.trace().rows_examined, bounded.trace().rows_examined
+                eager.trace().rows_examined,
+                bounded.trace().rows_examined
             ));
         }
     }
@@ -911,7 +916,8 @@ fn a_bounded_probe_counts_the_entries_in_its_answer_not_the_ones_it_stepped_over
         "the probe returns only the live edges of the type it asked for"
     );
     assert_eq!(
-        eager.trace().rows_examined as u128, LIVE_LINKS,
+        eager.trace().rows_examined as u128,
+        LIVE_LINKS,
         "the executor counts what it returned, not the removed and wrong-typed entries it \
          skipped past: {:?}",
         eager.trace()
@@ -925,7 +931,8 @@ fn a_bounded_probe_counts_the_entries_in_its_answer_not_the_ones_it_stepped_over
     println!(
         "OBSERVED a crowded adjacency list ({LIVE_LINKS} live, {REMOVED_LINKS} removed, \
          {OTHER_TYPE_EDGES} of another type): executor examined {} | bounded examined {}",
-        eager.trace().rows_examined, bounded.trace().rows_examined
+        eager.trace().rows_examined,
+        bounded.trace().rows_examined
     );
 
     assert_eq!(
@@ -934,10 +941,12 @@ fn a_bounded_probe_counts_the_entries_in_its_answer_not_the_ones_it_stepped_over
         "both doors return the same live edges"
     );
     assert_eq!(
-        bounded.trace().rows_examined, eager.trace().rows_examined,
+        bounded.trace().rows_examined,
+        eager.trace().rows_examined,
         "rows examined is what an operator reads to tell a probe that touched a handful of edges \
          from one that walked a list: the executor reports {} and a bounded read reports {}, \
          which is every entry it stepped over rather than the ones its answer is made of",
-        eager.trace().rows_examined, bounded.trace().rows_examined
+        eager.trace().rows_examined,
+        bounded.trace().rows_examined
     );
 }

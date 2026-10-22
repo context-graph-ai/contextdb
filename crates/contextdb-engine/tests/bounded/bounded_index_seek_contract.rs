@@ -217,7 +217,8 @@ fn the_trace_of_an_indexed_equality_read_reports_the_entries_it_examined() {
     .expect("an indexed equality read must be served");
 
     assert_eq!(
-        outcome.result.trace().physical_plan, "IndexScan",
+        outcome.result.trace().physical_plan,
+        "IndexScan",
         "the equality predicate is answered through the declared index"
     );
     assert!(

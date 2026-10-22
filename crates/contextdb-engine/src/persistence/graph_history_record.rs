@@ -1,18 +1,26 @@
 //! Exact private durable history bytes; public change-log bytes stay unchanged.
 use super::*;
 
-const CONNECTED_GRAPH_KEY_BYTES: usize = crate::database::connected_replay::MEMBERSHIP_PREFIX.len() + 20;
+const CONNECTED_GRAPH_KEY_BYTES: usize =
+    crate::database::connected_replay::MEMBERSHIP_PREFIX.len() + 20;
 /// The existing fixed-width receiver key, rendered without a heap String.
-pub(super) fn connected_graph_membership_key(lsn: Lsn) -> [u8;CONNECTED_GRAPH_KEY_BYTES] {
+pub(super) fn connected_graph_membership_key(lsn: Lsn) -> [u8; CONNECTED_GRAPH_KEY_BYTES] {
     let prefix = crate::database::connected_replay::MEMBERSHIP_PREFIX.as_bytes();
-    let mut key = [b'0';CONNECTED_GRAPH_KEY_BYTES];
+    let mut key = [b'0'; CONNECTED_GRAPH_KEY_BYTES];
     key[..prefix.len()].copy_from_slice(prefix);
     let mut value = lsn.0;
-    for digit in key[prefix.len()..].iter_mut().rev() { *digit = b'0' + (value % 10) as u8; value /= 10; }
+    for digit in key[prefix.len()..].iter_mut().rev() {
+        *digit = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
     key
 }
-pub(super) fn connected_graph_interval(bytes: &[u8]) -> Option<(u64,u64)> {
-    let (value,consumed) = bincode::serde::borrow_decode_from_slice::<(u64,u64),_>(bytes,bincode::config::standard()).ok()?;
+pub(super) fn connected_graph_interval(bytes: &[u8]) -> Option<(u64, u64)> {
+    let (value, consumed) = bincode::serde::borrow_decode_from_slice::<(u64, u64), _>(
+        bytes,
+        bincode::config::standard(),
+    )
+    .ok()?;
     (consumed == bytes.len()).then_some(value)
 }
 
@@ -62,19 +70,32 @@ fn malformed(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error 
 
 /// The separator is at the fixed end offset, so embedded NULs in an edge
 /// type do not change the physical identity or transaction interpretation.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-pub(super) fn parse_physical_predecessor(p: &[u8]) -> Result<(NodeId,NodeId,String,TxId,Lsn)> {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn parse_physical_predecessor(p: &[u8]) -> Result<(NodeId, NodeId, String, TxId, Lsn)> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
-    parse_physical_predecessor_with(p,crate::read_image_memory::reserve)
+    parse_physical_predecessor_with(p, crate::read_image_memory::reserve)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-pub(super) fn parse_physical_predecessor_original(frame: &OriginalPersistenceFrame<'_>,p: &[u8])
-    -> Result<(NodeId,NodeId,String,TxId,Lsn)> {
-    parse_physical_predecessor_with(p,|bytes| frame.reserve(bytes))
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(super) fn parse_physical_predecessor_original(
+    frame: &OriginalPersistenceFrame<'_>,
+    p: &[u8],
+) -> Result<(NodeId, NodeId, String, TxId, Lsn)> {
+    parse_physical_predecessor_with(p, |bytes| frame.reserve(bytes))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-fn parse_physical_predecessor_with(p: &[u8],mut reserve: impl FnMut(usize) -> Result<()>)
-    -> Result<(NodeId,NodeId,String,TxId,Lsn)> {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn parse_physical_predecessor_with(
+    p: &[u8],
+    mut reserve: impl FnMut(usize) -> Result<()>,
+) -> Result<(NodeId, NodeId, String, TxId, Lsn)> {
     if p.len() < 49 || p[p.len() - 17] != 0 {
         return Err(malformed("malformed physical graph predecessor key"));
     }
@@ -99,14 +120,26 @@ fn parse_physical_predecessor_with(p: &[u8],mut reserve: impl FnMut(usize) -> Re
     ))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-fn validate_parts(entry: &ChangeLogEntry,tag: u8,witness: Option<&GraphDeletionWitness>) -> Result<()> {
-    validate_parts_with(entry,tag,witness,parse_physical_predecessor)
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn validate_parts(
+    entry: &ChangeLogEntry,
+    tag: u8,
+    witness: Option<&GraphDeletionWitness>,
+) -> Result<()> {
+    validate_parts_with(entry, tag, witness, parse_physical_predecessor)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_parts_with(
-    entry: &ChangeLogEntry,tag: u8,witness: Option<&GraphDeletionWitness>,
-    mut parse: impl FnMut(&[u8]) -> Result<(NodeId,NodeId,String,TxId,Lsn)>,
+    entry: &ChangeLogEntry,
+    tag: u8,
+    witness: Option<&GraphDeletionWitness>,
+    mut parse: impl FnMut(&[u8]) -> Result<(NodeId, NodeId, String, TxId, Lsn)>,
 ) -> Result<()> {
     match (entry, tag, witness) {
         (ChangeLogEntry::EdgeDelete { .. }, 1, None) => Ok(()),
@@ -163,40 +196,72 @@ impl std::io::Write for PublicLength {
 }
 
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn decode_stored_change_log(bytes: &[u8]) -> Result<StoredChangeLogEntry> {
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_graph("history", "private_history_decode", &[], None, None);
 
-        Self::decode_stored_change_log_with(bytes,|public| {
-            let (entry,consumed): (ChangeLogEntry,usize) = crate::read_image_memory::decode(public)
-                .map_err(|error| match error { Error::Other(reason) => malformed(reason), other => other })?;
-            if consumed != public.len() { return Err(malformed("public history bytes have trailing data")); }
-            Ok(entry)
-        },|predecessor| {
-            crate::read_image_memory::reserve(predecessor.len())?;
-            Ok(predecessor.to_vec())
-        },validate_parts)
+        Self::decode_stored_change_log_with(
+            bytes,
+            |public| {
+                let (entry, consumed): (ChangeLogEntry, usize) =
+                    crate::read_image_memory::decode(public).map_err(|error| match error {
+                        Error::Other(reason) => malformed(reason),
+                        other => other,
+                    })?;
+                if consumed != public.len() {
+                    return Err(malformed("public history bytes have trailing data"));
+                }
+                Ok(entry)
+            },
+            |predecessor| {
+                crate::read_image_memory::reserve(predecessor.len())?;
+                Ok(predecessor.to_vec())
+            },
+            validate_parts,
+        )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn decode_stored_change_log_original(frame: &OriginalPersistenceFrame<'_>,
-        bytes: &[u8]) -> Result<StoredChangeLogEntry> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn decode_stored_change_log_original(
+        frame: &OriginalPersistenceFrame<'_>,
+        bytes: &[u8],
+    ) -> Result<StoredChangeLogEntry> {
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_work_probe::note_graph("history", "private_history_decode", &[], None, None);
-        Self::decode_stored_change_log_with(bytes,
-            |public| frame.decode(public).map_err(|error| match error {
-                Error::Other(reason) => malformed(reason), other => other,
-            }), |predecessor| frame.copy_bytes(predecessor),|entry,tag,witness|
-                validate_parts_with(entry,tag,witness,|p| parse_physical_predecessor_original(frame,p)))
+        Self::decode_stored_change_log_with(
+            bytes,
+            |public| {
+                frame.decode(public).map_err(|error| match error {
+                    Error::Other(reason) => malformed(reason),
+                    other => other,
+                })
+            },
+            |predecessor| frame.copy_bytes(predecessor),
+            |entry, tag, witness| {
+                validate_parts_with(entry, tag, witness, |p| {
+                    parse_physical_predecessor_original(frame, p)
+                })
+            },
+        )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn decode_stored_change_log_with(bytes: &[u8],
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn decode_stored_change_log_with(
+        bytes: &[u8],
         mut decode_public: impl FnMut(&[u8]) -> Result<ChangeLogEntry>,
         mut copy_predecessor: impl FnMut(&[u8]) -> Result<Vec<u8>>,
-        mut validate: impl FnMut(&ChangeLogEntry,u8,Option<&GraphDeletionWitness>) -> Result<()>,
+        mut validate: impl FnMut(&ChangeLogEntry, u8, Option<&GraphDeletionWitness>) -> Result<()>,
     ) -> Result<StoredChangeLogEntry> {
         if bytes.len() < 6 || bytes[0] != VERSION {
             return Err(malformed("invalid private history version or length"));
@@ -250,7 +315,10 @@ impl RedbPersistence {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn encode_stored_change_log_parts(
         entry: &ChangeLogEntry,
         tag: u8,
@@ -314,7 +382,10 @@ impl RedbPersistence {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn stored_change_log_mutation(
         key: &str,
         bytes: &[u8],
@@ -324,25 +395,40 @@ impl RedbPersistence {
         content_identity::private_history_mutation(key, bytes)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn stored_change_log_value_hash(bytes: &[u8]) -> Result<[u8; 32]> {
         Self::decode_stored_change_log(bytes)?;
         Ok(content_identity::private_history_value_hash(bytes))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn stored_change_log_mutation_in_write_original(
-        frame: &OriginalPersistenceFrame<'_>, write: &redb::WriteTransaction, key: &str,
+        frame: &OriginalPersistenceFrame<'_>,
+        write: &redb::WriteTransaction,
+        key: &str,
     ) -> Result<content_identity::ContentIdentityMutation> {
-        let table = write.open_table(writer_history::WRITER_CHANGE_LOG_TABLE).map_err(Self::storage_error)?;
+        let table = write
+            .open_table(writer_history::WRITER_CHANGE_LOG_TABLE)
+            .map_err(Self::storage_error)?;
         let position = Self::numeric_change_key(key)?;
-        let value = table.get(observed_graph_key!("history", "get", position.as_slice()))
-            .map_err(Self::storage_error)?.ok_or_else(|| malformed("new history occurrence is absent from its selector"))?;
-        let _record = Self::decode_stored_change_log_original(frame,value.value())?;
-        content_identity::original_producers::private_history_mutation(frame,key,value.value())
+        let value = table
+            .get(observed_graph_key!("history", "get", position.as_slice()))
+            .map_err(Self::storage_error)?
+            .ok_or_else(|| malformed("new history occurrence is absent from its selector"))?;
+        let _record = Self::decode_stored_change_log_original(frame, value.value())?;
+        content_identity::original_producers::private_history_mutation(frame, key, value.value())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn stored_change_log_mutation_in_write(
         write: &redb::WriteTransaction,
         key: &str,
@@ -359,7 +445,10 @@ impl RedbPersistence {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn creation_contribution_key(p: &[u8]) -> Result<Vec<u8>> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     let (_, _, _, tx, lsn) = parse_physical_predecessor(p)?;
@@ -400,7 +489,10 @@ pub(super) fn location_key(id: u64) -> [u8; 9] {
     key
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn lifecycle_key(p: &[u8]) -> Result<Vec<u8>> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     parse_physical_predecessor(p)?;
@@ -418,7 +510,10 @@ pub(super) fn lifecycle_key(p: &[u8]) -> Result<Vec<u8>> {
     Ok(key)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn contribution_digest(creation: bool, key: &[u8], value: &[u8]) -> Result<[u8; 32]> {
     let key_len = u32::try_from(key.len())
         .map_err(|_| malformed("contribution digest key exceeds u32 length"))?;

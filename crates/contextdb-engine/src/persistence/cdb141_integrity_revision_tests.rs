@@ -96,7 +96,12 @@ fn empty_index_and_maintained_groups_refuse_both_roots_on_both_public_routes() {
         let before = {
             let file = ReadSession::open(&path).unwrap();
             assert_eq!(file.route(), ReadRoute::File);
-            queries.map(|query| file.execute(query, &HashMap::new()).unwrap().rows().to_vec())
+            queries.map(|query| {
+                file.execute(query, &HashMap::new())
+                    .unwrap()
+                    .rows()
+                    .to_vec()
+            })
         };
         assert!(
             before[0].is_empty()
@@ -367,7 +372,11 @@ fn actual_current_point_list_and_index_work_stays_bounded_at_n_2n_4n_on_both_rou
         for query in queries {
             observation.0.store(0, Ordering::Relaxed);
             assert_eq!(
-                session.execute(query, &HashMap::new()).unwrap().rows().len(),
+                session
+                    .execute(query, &HashMap::new())
+                    .unwrap()
+                    .rows()
+                    .len(),
                 1
             );
             let touches = observation.0.load(Ordering::Relaxed);

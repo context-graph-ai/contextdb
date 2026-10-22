@@ -4,7 +4,10 @@
 //! persistence, channel framing, deadline waiting, and query execution are performed by the
 //! route and transport layers that consume this vocabulary.
 
-#![expect(clippy::result_large_err, reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating.")]
+#![expect(
+    clippy::result_large_err,
+    reason = "Public Error retains inline NativeRefusal diagnostics so exhausted memory budgets can refuse without allocating."
+)]
 
 use crate::Value;
 use crate::read_memory::{
@@ -492,14 +495,18 @@ pub trait DeadlineClock: Send + Sync + 'static {
     /// the engine never retrospectively charges that application allocation.
     #[doc(hidden)]
     fn try_owned_wait(
-        &self, _deadline_ms: u64, _owner: &ReadMemoryOwner,
+        &self,
+        _deadline_ms: u64,
+        _owner: &ReadMemoryOwner,
     ) -> crate::Result<Option<crate::read_memory::ReadOwnedFuture<'_, ()>>> {
         Ok(None)
     }
 
     /// Paid intrusive waits are driven by the existing caller/connection.
     #[doc(hidden)]
-    fn native_next_deadline_ms(&self) -> Option<u64> { None }
+    fn native_next_deadline_ms(&self) -> Option<u64> {
+        None
+    }
     #[doc(hidden)]
     fn drive_native_deadlines(&self) {}
     #[doc(hidden)]
@@ -559,7 +566,10 @@ impl NativeClockBinding {
         if !source.is_funded_by(standing) {
             return Err(crate::Error::ReadSessionNotImplemented);
         }
-        Ok(Self { source, clock: Arc::clone(clock) })
+        Ok(Self {
+            source,
+            clock: Arc::clone(clock),
+        })
     }
 
     #[doc(hidden)]
@@ -569,7 +579,9 @@ impl NativeClockBinding {
 
     #[doc(hidden)]
     pub fn park_until(&self, deadline_ms: u64, park: &dyn NativeDriverPark) -> crate::Result<()> {
-        let deadline_ms = self.clock.native_next_deadline_ms()
+        let deadline_ms = self
+            .clock
+            .native_next_deadline_ms()
             .map_or(deadline_ms, |next| next.min(deadline_ms));
         let now_ms = self.clock.now_ms();
         if now_ms < deadline_ms {
@@ -589,7 +601,10 @@ enum ListenerCallback {
 }
 impl ListenerCallback {
     fn call(&self) {
-        match self { Self::Host(told) => told(), Self::Paid(told) => told.call() }
+        match self {
+            Self::Host(told) => told(),
+            Self::Paid(told) => told.call(),
+        }
     }
 }
 struct ListenerNode {
@@ -612,12 +627,17 @@ struct ListenerDirectory {
 }
 impl ListenerDirectory {
     fn advance(&mut self) -> u64 {
-        self.epoch = self.epoch.checked_add(1).expect("cancellation listener epoch exhausted");
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("cancellation listener epoch exhausted");
         self.epoch
     }
     fn sweep(&mut self) -> RetiredListeners {
         let mut removed = RetiredListeners(None);
-        if self.snapshots != 0 { return removed; }
+        if self.snapshots != 0 {
+            return removed;
+        }
         let mut link = &mut self.head;
         while link.is_some() {
             if link.as_ref().unwrap().node.retired.is_some() {
@@ -642,7 +662,9 @@ impl Drop for RetiredListeners {
     }
 }
 impl Drop for ListenerDirectory {
-    fn drop(&mut self) { drop(RetiredListeners(self.head.take())); }
+    fn drop(&mut self) {
+        drop(RetiredListeners(self.head.take()));
+    }
 }
 struct CancellationToken {
     cancelled: AtomicBool,
@@ -652,15 +674,20 @@ struct CancellationToken {
 }
 impl CancellationToken {
     fn new(owner: Option<ReadMemoryOwner>) -> Self {
-        Self { cancelled: AtomicBool::new(false),
+        Self {
+            cancelled: AtomicBool::new(false),
             identity: NEXT_CANCELLATION_IDENTITY.fetch_add(1, Ordering::SeqCst),
-            listeners: Mutex::new(ListenerDirectory::default()), owner }
+            listeners: Mutex::new(ListenerDirectory::default()),
+            owner,
+        }
     }
 }
 impl std::fmt::Debug for CancellationToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CancellationToken").field("cancelled", &self.cancelled)
-            .field("identity", &self.identity).finish_non_exhaustive()
+        f.debug_struct("CancellationToken")
+            .field("cancelled", &self.cancelled)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
     }
 }
 #[derive(Debug, Clone)]
@@ -671,7 +698,10 @@ enum CancellationTokenHandle {
 impl std::ops::Deref for CancellationTokenHandle {
     type Target = CancellationToken;
     fn deref(&self) -> &CancellationToken {
-        match self { Self::Host(token) => token, Self::Paid(token) => token }
+        match self {
+            Self::Host(token) => token,
+            Self::Paid(token) => token,
+        }
     }
 }
 static NEXT_CANCELLATION_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -684,14 +714,19 @@ pub struct CancellationListener {
 }
 impl std::fmt::Debug for CancellationListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CancellationListener").field("listener", &self.listener)
+        f.debug_struct("CancellationListener")
+            .field("listener", &self.listener)
             .finish_non_exhaustive()
     }
 }
 impl Drop for CancellationListener {
     fn drop(&mut self) {
         let retired = {
-            let mut directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
+            let mut directory = self
+                .token
+                .listeners
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let epoch = directory.advance();
             let mut entry = directory.head.as_mut();
             while let Some(current) = entry {
@@ -714,26 +749,40 @@ struct CancellationSnapshot<'a> {
 }
 impl CancellationSnapshot<'_> {
     fn next(&mut self) -> Option<ListenerCallback> {
-        let directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
+        let directory = self
+            .token
+            .listeners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut entry = directory.head.as_ref();
         let mut selected: Option<&ListenerNode> = None;
         while let Some(current) = entry {
             let node = &current.node;
-            if node.born > self.cursor && node.born <= self.epoch
+            if node.born > self.cursor
+                && node.born <= self.epoch
                 && node.retired.is_none_or(|retired| retired > self.epoch)
                 && selected.is_none_or(|old| node.born < old.born)
-            { selected = Some(node); }
+            {
+                selected = Some(node);
+            }
             entry = node.next.as_ref();
         }
         let selected = selected.map(|node| (node.born, node.callback.clone()));
         drop(directory);
-        selected.map(|(born, callback)| { self.cursor = born; callback })
+        selected.map(|(born, callback)| {
+            self.cursor = born;
+            callback
+        })
     }
 }
 impl Drop for CancellationSnapshot<'_> {
     fn drop(&mut self) {
         let retired = {
-            let mut directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
+            let mut directory = self
+                .token
+                .listeners
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             directory.snapshots -= 1;
             directory.sweep()
         };
@@ -744,10 +793,16 @@ impl Drop for CancellationSnapshot<'_> {
 pub struct OwnerReadCancellation {
     token: CancellationTokenHandle,
 }
-impl Default for OwnerReadCancellation { fn default() -> Self { Self::new() } }
+impl Default for OwnerReadCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl OwnerReadCancellation {
     pub fn new() -> Self {
-        Self { token: CancellationTokenHandle::Host(Arc::new(CancellationToken::new(None))) }
+        Self {
+            token: CancellationTokenHandle::Host(Arc::new(CancellationToken::new(None))),
+        }
     }
     /// Original concrete token and independent final-consumer invoice blocks.
     #[doc(hidden)]
@@ -759,8 +814,12 @@ impl OwnerReadCancellation {
         if !invoice.is_funded_by(&owner) {
             panic!("cancellation invoice belongs to another owner");
         }
-        Self { token: CancellationTokenHandle::Paid(
-            crate::read_memory::ReadPaidArc::from_prepaid(CancellationToken::new(Some(owner)), invoice)) }
+        Self {
+            token: CancellationTokenHandle::Paid(crate::read_memory::ReadPaidArc::from_prepaid(
+                CancellationToken::new(Some(owner)),
+                invoice,
+            )),
+        }
     }
     /// Private standing-refusal reuse: all old strong aliases retire first.
     /// There is no raw or Weak token escape and no reservation is refunded.
@@ -776,32 +835,68 @@ impl OwnerReadCancellation {
     pub fn cancel(&self) {
         self.token.cancelled.store(true, Ordering::SeqCst);
         let mut snapshot = {
-            let mut directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
-            directory.snapshots = directory.snapshots.checked_add(1)
+            let mut directory = self
+                .token
+                .listeners
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            directory.snapshots = directory
+                .snapshots
+                .checked_add(1)
                 .expect("cancellation snapshot count exhausted");
-            CancellationSnapshot { token: &self.token, epoch: directory.epoch, cursor: 0 }
+            CancellationSnapshot {
+                token: &self.token,
+                epoch: directory.epoch,
+                cursor: 0,
+            }
         };
         // Exactly the listeners present at capture, in registration order.
         // Recursive/concurrent cancellation requires no new snapshot allocation.
-        while let Some(told) = snapshot.next() { told.call(); }
+        while let Some(told) = snapshot.next() {
+            told.call();
+        }
     }
-    fn register(&self, callback: ListenerCallback, credit: Option<ReadCredit>) -> CancellationListener {
+    fn register(
+        &self,
+        callback: ListenerCallback,
+        credit: Option<ReadCredit>,
+    ) -> CancellationListener {
         let listener = NEXT_CANCELLATION_LISTENER.fetch_add(1, Ordering::SeqCst);
-        let entry = ListenerStorage { node: Box::new(ListenerNode {
-            identity: listener, born: 0, retired: None, callback: callback.clone(), next: None,
-        }), _credit: credit };
+        let entry = ListenerStorage {
+            node: Box::new(ListenerNode {
+                identity: listener,
+                born: 0,
+                retired: None,
+                callback: callback.clone(),
+                next: None,
+            }),
+            _credit: credit,
+        };
         self.register_entry(callback, entry)
     }
-    fn register_entry(&self, callback: ListenerCallback, mut entry: ListenerStorage) -> CancellationListener {
+    fn register_entry(
+        &self,
+        callback: ListenerCallback,
+        mut entry: ListenerStorage,
+    ) -> CancellationListener {
         let listener = entry.node.identity;
         {
-            let mut directory = self.token.listeners.lock().unwrap_or_else(|p| p.into_inner());
+            let mut directory = self
+                .token
+                .listeners
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             entry.node.born = directory.advance();
             entry.node.next = directory.head.take();
             directory.head = Some(entry);
         }
-        let registration = CancellationListener { token: self.token.clone(), listener };
-        if self.is_cancelled() { callback.call(); }
+        let registration = CancellationListener {
+            token: self.token.clone(),
+            listener,
+        };
+        if self.is_cancelled() {
+            callback.call();
+        }
         registration
     }
     /// Public caller-supplied listeners retain their host-funded API and
@@ -812,12 +907,21 @@ impl OwnerReadCancellation {
     /// Admit actual callback and list-node layouts on the token's original
     /// payer before either allocation. Legacy host tokens keep their host path.
     #[doc(hidden)]
-    pub fn try_tell_on_cancel<F: Fn() + Send + Sync + 'static>(&self, told: F) -> crate::Result<CancellationListener> {
-        let Some(owner) = self.token.owner.clone() else { return Ok(self.tell_on_cancel(told)); };
+    pub fn try_tell_on_cancel<F: Fn() + Send + Sync + 'static>(
+        &self,
+        told: F,
+    ) -> crate::Result<CancellationListener> {
+        let Some(owner) = self.token.owner.clone() else {
+            return Ok(self.tell_on_cancel(told));
+        };
         let callback_bytes = ReadShared::<F>::layout().size();
-        let mut invoice = ReadCredit::try_new_owned(owner,
-            callback_bytes + std::mem::size_of::<ListenerNode>(), "reader", "cancellation_listener",
-            "Reduce simultaneous read listeners or raise the declared reader limit.")?;
+        let mut invoice = ReadCredit::try_new_owned(
+            owner,
+            callback_bytes + std::mem::size_of::<ListenerNode>(),
+            "reader",
+            "cancellation_listener",
+            "Reduce simultaneous read listeners or raise the declared reader limit.",
+        )?;
         let callback = invoice.try_split_off(callback_bytes)?;
         let callback = match ReadShared::try_from_prepaid(told, callback) {
             Ok(callback) => callback.into_cancellation_callback(),
@@ -871,9 +975,13 @@ impl OwnerReadCancellation {
             },
         ))
     }
-    pub fn is_cancelled(&self) -> bool { self.token.cancelled.load(Ordering::SeqCst) }
+    pub fn is_cancelled(&self) -> bool {
+        self.token.cancelled.load(Ordering::SeqCst)
+    }
     /// Clones retain one identity; separately minted tokens never share it.
-    pub fn identity(&self) -> u64 { self.token.identity }
+    pub fn identity(&self) -> u64 {
+        self.token.identity
+    }
 }
 
 pub trait OwnerRequestHandler: Send + Sync {
@@ -1879,9 +1987,7 @@ impl ReadFailure {
         Self {
             kind: ReadFailureKind::OwnerRouteUnsupported,
             detail: ReadFailureStorage::Inline(ReadFailureDetail::OwnerRouteUnsupported(
-                OwnerRouteUnsupportedDetail {
-                    inspection,
-                },
+                OwnerRouteUnsupportedDetail { inspection },
             )),
         }
     }
@@ -2165,11 +2271,14 @@ impl std::fmt::Display for ReadFailure {
             ReadFailureDetail::OwnerRouteUnsupported(detail) => {
                 write!(formatter, "{}: ", self.kind.stated())?;
                 for (index, segment) in detail.inspection.split('_').enumerate() {
-                    if index != 0 { formatter.write_str(" ")?; }
+                    if index != 0 {
+                        formatter.write_str(" ")?;
+                    }
                     formatter.write_str(segment)?;
                 }
-                formatter.write_str("; a direct file session answers it once no writer holds the store")
-            },
+                formatter
+                    .write_str("; a direct file session answers it once no writer holds the store")
+            }
             ReadFailureDetail::CursorExpired { expiry } => formatter.write_str(expiry.stated()),
             ReadFailureDetail::None => formatter.write_str(self.kind.stated()),
             ReadFailureDetail::Reason { reason } => {
@@ -2229,13 +2338,21 @@ impl Drop for CursorPageHandle {
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug)]
 struct FixtureCursorPage {
-    columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool,
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    has_more: bool,
 }
 #[cfg(any(test, feature = "test-seams"))]
 impl CursorPageStorage for FixtureCursorPage {
-    fn columns(&self) -> &[String] { &self.columns }
-    fn rows(&self) -> &[Vec<Value>] { &self.rows }
-    fn has_more(&self) -> bool { self.has_more }
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    fn rows(&self) -> &[Vec<Value>] {
+        &self.rows
+    }
+    fn has_more(&self) -> bool {
+        self.has_more
+    }
 }
 impl CursorPage {
     /// Move test-owned parts into the real immutable carrier, including invalid
@@ -2244,10 +2361,16 @@ impl CursorPage {
     #[doc(hidden)]
     pub fn from_owned_parts_for_test(
         owner: crate::read_memory::ReadMemoryOwner,
-        columns: Vec<String>, rows: Vec<Vec<Value>>, has_more: bool,
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        has_more: bool,
     ) -> crate::Result<Self> {
         let prepared = Self::try_prepare::<FixtureCursorPage>(owner)?;
-        Ok(prepared.publish(FixtureCursorPage { columns, rows, has_more }))
+        Ok(prepared.publish(FixtureCursorPage {
+            columns,
+            rows,
+            has_more,
+        }))
     }
 
     pub fn empty() -> Self {
@@ -2262,7 +2385,9 @@ impl CursorPage {
     /// Retain the actual original publication invoice owner for encoding.
     #[doc(hidden)]
     pub fn encoding_owner(&self) -> Option<ReadMemoryOwner> {
-        self.storage.as_ref().map(|handle| unsafe { (handle.encoding_owner)(handle.block) })
+        self.storage
+            .as_ref()
+            .map(|handle| unsafe { (handle.encoding_owner)(handle.block) })
     }
     pub fn columns(&self) -> &[String] {
         self.storage().map_or(&[], |page| page.columns())
@@ -2293,7 +2418,10 @@ impl CursorPage {
     /// Prepare a cell whose original invoice also retains admission counters.
     /// The producer prepays ReadShared::<T, I>::layout(), including I itself.
     #[doc(hidden)]
-    pub fn try_prepare_invoice<T: CursorPageStorage, I: crate::read_memory::ReadSharedInvoice + 'static>(
+    pub fn try_prepare_invoice<
+        T: CursorPageStorage,
+        I: crate::read_memory::ReadSharedInvoice + 'static,
+    >(
         invoice: I,
     ) -> crate::Result<PreparedCursorPage<T, I>> {
         let storage = crate::read_memory::ReadShared::try_prepare_invoice_native(invoice)
@@ -2316,12 +2444,19 @@ impl CursorPage {
 /// Unpublished page control; publication only moves an already funded builder.
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct PreparedCursorPage<T: CursorPageStorage, I: Send + Sync + 'static = crate::read_memory::ReadCredit> {
+pub struct PreparedCursorPage<
+    T: CursorPageStorage,
+    I: Send + Sync + 'static = crate::read_memory::ReadCredit,
+> {
     storage: crate::read_memory::ReadPrepared<T, I>,
 }
-impl<T: CursorPageStorage, I: crate::read_memory::ReadSharedInvoice + 'static> PreparedCursorPage<T, I> {
+impl<T: CursorPageStorage, I: crate::read_memory::ReadSharedInvoice + 'static>
+    PreparedCursorPage<T, I>
+{
     #[doc(hidden)]
-    pub fn invoice(&self) -> &I { self.storage.invoice() }
+    pub fn invoice(&self) -> &I {
+        self.storage.invoice()
+    }
 
     pub fn publish(self, page: T) -> CursorPage {
         CursorPage {

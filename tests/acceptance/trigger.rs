@@ -3132,9 +3132,9 @@ fn t3_reg_introspection_and_delete_event_rejection() {
             || ctx.table != "host_writes"
             || ctx.event != TriggerEvent::Insert
         {
-            return Err(Error::Other(format!(
-                "unexpected INSERT trigger context identity: {ctx:?}"
-            ).into()));
+            return Err(Error::Other(
+                format!("unexpected INSERT trigger context identity: {ctx:?}").into(),
+            ));
         }
         captured_insert_contexts.lock().unwrap().push((
             ctx.event,
@@ -3528,9 +3528,9 @@ fn t3_reg_introspection_and_delete_event_rejection() {
                     if content == "before-drop" || content == "before-drop-update"
             )
         {
-            return Err(Error::Other(format!(
-                "unexpected sync trigger context: {ctx:?}"
-            ).into()));
+            return Err(Error::Other(
+                format!("unexpected sync trigger context: {ctx:?}").into(),
+            ));
         }
         sync_contexts
             .lock()
@@ -4944,10 +4944,9 @@ fn t3_trigger_dispatch_uses_commit_final_write_set() {
         let events = events.clone();
         db.register_trigger_callback(trigger_name, move |db_handle, ctx| {
             if ctx.event != expected_event {
-                return Err(Error::Other(format!(
-                    "{trigger_name} saw wrong event {:?}",
-                    ctx.event
-                ).into()));
+                return Err(Error::Other(
+                    format!("{trigger_name} saw wrong event {:?}", ctx.event).into(),
+                ));
             }
             let slug = ctx
                 .row_values
@@ -5232,9 +5231,9 @@ fn t3_sibling_callback_cascades_validate_after_all_triggers_stage() {
                 )?;
             }
             other => {
-                return Err(Error::Other(format!(
-                    "unexpected sibling source kind {other}"
-                ).into()));
+                return Err(Error::Other(
+                    format!("unexpected sibling source kind {other}").into(),
+                ));
             }
         }
         Ok(())
@@ -5909,11 +5908,10 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
             host_insert_sql(),
             &insert_host_params(uuid(24), "conditional"),
         );
-        let counter_result = db
-            .execute(
-                "SELECT value FROM cascade_counters WHERE id = $id",
-                &HashMap::from([("id".into(), Value::Uuid(counter_id))]),
-            );
+        let counter_result = db.execute(
+            "SELECT value FROM cascade_counters WHERE id = $id",
+            &HashMap::from([("id".into(), Value::Uuid(counter_id))]),
+        );
         let rows = counter_result
             .as_ref()
             .map(|result| result.rows())

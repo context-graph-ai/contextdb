@@ -183,11 +183,11 @@ fn absorb(suffix_rows: usize) -> Absorbed {
     );
     let rows = {
         let fixture_answer_33 = db
-        .execute(
-            "SELECT COUNT(*) FROM points WHERE bucket = 1",
-            &HashMap::new(),
-        )
-        .unwrap();
+            .execute(
+                "SELECT COUNT(*) FROM points WHERE bucket = 1",
+                &HashMap::new(),
+            )
+            .unwrap();
         fixture_answer_33.rows().to_vec()
     };
     assert_eq!(

@@ -435,7 +435,10 @@ impl Default for ServerResourcePolicy {
 
 impl ServerResourcePolicy {
     /// Validate values before any identity, socket, or database resource is opened.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn validate(&self) -> TransportResult<()> {
         if self.response_staging_bytes == Some(0) {
             return Err(TransportError::Unreachable(
@@ -2165,7 +2168,10 @@ impl PreAdmissionGuardrails {
         self.connection_permits.clone().try_acquire_owned().ok()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_reserve_payload(&self, bytes: usize) -> TransportResult<OwnedSemaphorePermit> {
         let permits = u32::try_from(bytes.max(1)).map_err(|_| {
             TransportError::IncompleteReply(
@@ -2401,7 +2407,10 @@ impl IrohServer {
         Self::bind_with_resource_policy(spec, ServerResourcePolicy::default()).await
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     async fn bind_with_validated_resource_policy(
         spec: &str,
         policy: ServerResourcePolicy,
@@ -2557,9 +2566,7 @@ impl IrohServer {
             })
             .await
             .map_err(|err| {
-                TransportError::Other(
-                    format!("response staging cleanup task failed: {err}"),
-                )
+                TransportError::Other(format!("response staging cleanup task failed: {err}"))
             })
             .and_then(|result| result);
             if let Err(err) = cleanup {
@@ -2660,7 +2667,10 @@ impl IrohServer {
             .unwrap_or_else(|error| error.into_inner()) = Some(admission);
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lineage_signer(&self) -> LineageSigner {
         let identity = self.identity.clone();
         Arc::new(move |bytes| Ok(identity.sign_lineage(bytes)))
@@ -3027,7 +3037,10 @@ pub(super) fn client(spec: &str) -> Arc<dyn ClientTransport> {
     client_with_lineage_signer(spec).0
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn client_with_lineage_signer(
     spec: &str,
 ) -> (Arc<dyn ClientTransport>, Option<LineageSigner>) {
@@ -3058,7 +3071,10 @@ pub(super) fn client_with_lineage_signer(
 /// Construct the database-owned sync client. An explicit endpoint identity
 /// wins over the adjacent database identity; without either, this transport
 /// refuses before opening a connection and produces no lineage signer.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn sync_client_with_lineage_signer(
     spec: &str,
     default_identity_path: Option<PathBuf>,
@@ -3313,9 +3329,9 @@ impl IrohClientTransport {
         let transfer_digest = manifest.transfer_digest()?;
         let mut assembled = Vec::new();
         assembled.try_reserve_exact(total).map_err(|err| {
-            TransportError::Other(
-                format!("cannot reserve {total} bytes for oversized response: {err}"),
-            )
+            TransportError::Other(format!(
+                "cannot reserve {total} bytes for oversized response: {err}"
+            ))
         })?;
         for sequence in 0..manifest.total_chunks {
             let chunk_offset = usize::try_from(sequence)
@@ -3339,9 +3355,9 @@ impl IrohClientTransport {
                 sequence,
             })
             .map_err(|err| {
-                TransportError::Other(
-                    format!("cannot encode oversized response chunk request: {err}"),
-                )
+                TransportError::Other(format!(
+                    "cannot encode oversized response chunk request: {err}"
+                ))
             })?;
             let mut last_error = None;
             for attempt in 0..2 {
@@ -3434,9 +3450,9 @@ impl IrohClientTransport {
             manifest: manifest.clone(),
         })
         .map_err(|err| {
-            TransportError::Other(
-                format!("cannot encode oversized response completion: {err}"),
-            )
+            TransportError::Other(format!(
+                "cannot encode oversized response completion: {err}"
+            ))
         })?;
         let mut last_error = None;
         for _ in 0..2 {
@@ -3465,9 +3481,9 @@ impl IrohClientTransport {
                         manifest: manifest.clone(),
                     })
                     .map_err(|err| {
-                        TransportError::Other(
-                            format!("cannot encode oversized response release: {err}"),
-                        )
+                        TransportError::Other(format!(
+                            "cannot encode oversized response release: {err}"
+                        ))
                     })?;
                     if let Ok(connection) = self.connected_state().await {
                         let _ = tokio::time::timeout(
@@ -3693,7 +3709,10 @@ impl ClientTransport for IrohClientTransport {
 impl IrohClientTransport {
     /// One admitted exchange; a failed transport drops the connection so the
     /// next request redials, while a reader refusal keeps it.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     async fn request_once_admitted(
         &self,
         subject: &str,
@@ -3908,9 +3927,8 @@ impl ServerTransport for IrohServerTransport {
             let endpoint = {
                 let mut lease = self.endpoint.lock().await;
                 let endpoint = lease.take().ok_or_else(|| {
-                    TransportError::Other((
-                        "a bound sync endpoint may be served only once; bind a new endpoint before restarting"
-                            .to_string()))
+                    TransportError::Other("a bound sync endpoint may be served only once; bind a new endpoint before restarting"
+                            .to_string())
                 })?;
                 self.serve_lifecycle.begin(endpoint)
             };
@@ -4002,7 +4020,10 @@ impl ServerTransport for IrohServerTransport {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn response_transfer_key(
     remote_node_id: &str,
     control: &LargeResponseControl,
@@ -4015,7 +4036,10 @@ fn response_transfer_key(
     Ok((remote_node_id.to_string(), manifest.transfer_digest()?))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn serve_sync_connection(
     connection: Connection,
     sync_routes: SyncRoutes,
@@ -4168,9 +4192,9 @@ async fn serve_sync_connection(
                         })
                         .await
                         .map_err(|err| {
-                            TransportError::Other(
-                                format!("oversized response chunk task failed: {err}"),
-                            )
+                            TransportError::Other(format!(
+                                "oversized response chunk task failed: {err}"
+                            ))
                         })
                         .and_then(|result| result)
                         .and_then(|chunk| {
@@ -4182,8 +4206,7 @@ async fn serve_sync_connection(
                             } else {
                                 Err(TransportError::Other(
                                     ("too many unfinished oversized response transfers"
-                                        .to_string())
-                                    .into(),
+                                        .to_string()),
                                 ))
                             }
                         })
@@ -4197,21 +4220,20 @@ async fn serve_sync_connection(
                         let validation_root = stage_root.clone();
                         let validation_node = authenticated_node_id.clone();
                         let validation_manifest = manifest.clone();
-                        let validation =
-                            tokio::task::spawn_blocking(move || {
-                                validate_large_response_completion(
-                                    &validation_root,
-                                    &validation_node,
-                                    &validation_manifest,
-                                )
-                            })
-                            .await
-                            .map_err(|err| {
-                                TransportError::Other(format!(
+                        let validation = tokio::task::spawn_blocking(move || {
+                            validate_large_response_completion(
+                                &validation_root,
+                                &validation_node,
+                                &validation_manifest,
+                            )
+                        })
+                        .await
+                        .map_err(|err| {
+                            TransportError::Other(format!(
                                 "oversized response completion validation task failed: {err}"
                             ))
-                            })
-                            .and_then(|result| result);
+                        })
+                        .and_then(|result| result);
                         match validation {
                             Err(err) => Err(err),
                             Ok(())
@@ -4222,8 +4244,7 @@ async fn serve_sync_connection(
                             {
                                 Err(TransportError::Other(
                                     ("too many unfinished oversized response transfers"
-                                        .to_string())
-                                    .into(),
+                                        .to_string()),
                                 ))
                             }
                             Ok(()) => tokio::task::spawn_blocking(move || {
@@ -4235,9 +4256,9 @@ async fn serve_sync_connection(
                             })
                             .await
                             .map_err(|err| {
-                                TransportError::Other(
-                                    format!("oversized response completion task failed: {err}"),
-                                )
+                                TransportError::Other(format!(
+                                    "oversized response completion task failed: {err}"
+                                ))
                             })
                             .and_then(|result| result)
                             .and_then(|()| {
@@ -4270,9 +4291,9 @@ async fn serve_sync_connection(
                         })
                         .await
                         .map_err(|err| {
-                            TransportError::Other(
-                                format!("oversized response release task failed: {err}"),
-                            )
+                            TransportError::Other(format!(
+                                "oversized response release task failed: {err}"
+                            ))
                         })
                         .and_then(|result| result)
                         .map(|()| {
@@ -4290,15 +4311,15 @@ async fn serve_sync_connection(
                 Ok(LargeResponseControlReply::Chunk(chunk)) => {
                     match rmp_serde::to_vec_named(&chunk)
                         .map_err(|err| {
-                            TransportError::Other(
-                                format!("cannot encode oversized response chunk: {err}"),
-                            )
+                            TransportError::Other(format!(
+                                "cannot encode oversized response chunk: {err}"
+                            ))
                         })
                         .and_then(|bytes| {
                             if bytes.len() > MAX_RESPONSE_CHUNK_ENVELOPE_BYTES {
                                 Err(TransportError::Other(
-                                    ("oversized response chunk envelope exceeds its ceiling"
-                                        .to_string()),
+                                    "oversized response chunk envelope exceeds its ceiling"
+                                        .to_string(),
                                 ))
                             } else {
                                 Ok(bytes)
@@ -4461,9 +4482,9 @@ async fn serve_sync_connection(
                 .await
                 {
                     Ok(outcome) => outcome,
-                    Err(err) => Err(TransportError::Other(
-                        format!("oversized request staging task failed: {err}"),
-                    )),
+                    Err(err) => Err(TransportError::Other(format!(
+                        "oversized request staging task failed: {err}"
+                    ))),
                 }
             };
             #[cfg(feature = "test-seams")]
@@ -4854,7 +4875,10 @@ async fn answer_native_refusal(
 /// unanswered, exactly as the registry closes a Legacy reply that has not
 /// started.
 #[allow(clippy::too_many_arguments)] // The admitted request's parts stay explicit.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn serve_paid_native_request(
     (mut send, mut recv): (SendStream, RecvStream),
     lease: ActiveSyncRequest,
@@ -5006,7 +5030,10 @@ pub(crate) fn reply_writer_bytes_for_test() -> usize {
 }
 
 impl SyncReplyWriter {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     async fn write(self, response_bytes: Vec<u8>) -> TransportResult<()> {
         let Self {
             parts,
@@ -5033,7 +5060,7 @@ impl SyncReplyWriter {
                         .reserve_response_transfer()
                         .ok_or_else(|| {
                             TransportError::Other(
-                                ("too many unfinished oversized response transfers".to_string()),
+                                "too many unfinished oversized response transfers".to_string(),
                             )
                         })?,
                 )
@@ -5043,7 +5070,7 @@ impl SyncReplyWriter {
             let mut slot = send_slot.lock().await;
             let Some((mut send, mut recv)) = slot.take() else {
                 return Err(TransportError::Other(
-                    ("reply already sent on this stream".to_string()),
+                    "reply already sent on this stream".to_string(),
                 ));
             };
             #[cfg(feature = "test-seams")]
@@ -5113,9 +5140,9 @@ impl SyncReplyWriter {
                         Ok(encoded)
                     }
                     Ok(Err(err)) => Err(err),
-                    Err(err) => Err(TransportError::Other(
-                        format!("oversized response staging task failed: {err}"),
-                    )),
+                    Err(err) => Err(TransportError::Other(format!(
+                        "oversized response staging task failed: {err}"
+                    ))),
                 }
             } else {
                 Ok(response_bytes)
@@ -5235,7 +5262,10 @@ enum NativeAdmission {
 /// Read one request frame. For a subject the native root serves, the provider
 /// is consulted once, after the subject and length and before any body byte is
 /// read, and a Native body lands in its admitted allocation with no copy.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn read_request_frame_routed(
     recv: &mut iroh::endpoint::RecvStream,
     pre_admission: &PreAdmissionGuardrails,
@@ -5419,7 +5449,10 @@ async fn serve_native_subject(
     future.await
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_large_response_control_frame(bytes: &[u8]) -> TransportResult<LargeResponseControl> {
     if bytes.len() > MAX_RESPONSE_CONTROL_BYTES {
         return Err(TransportError::IncompleteReply(
@@ -5569,7 +5602,10 @@ async fn wait_for_direct_addrs(endpoint: &Endpoint) -> TransportResult<EndpointA
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_dial_target(spec: &str) -> TransportResult<(EndpointAddr, EndpointSpec)> {
     let parsed = EndpointSpec::parse(spec)
         .ok_or_else(|| TransportError::Unreachable("not a dialable endpoint spec".to_string()))?;
@@ -5586,7 +5622,10 @@ fn parse_dial_target(spec: &str) -> TransportResult<(EndpointAddr, EndpointSpec)
 
 /// Load the operator-supplied relay CA certificate(s): PEM (possibly a
 /// bundle) or a single DER certificate.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn load_relay_ca_certs(
     path: &Path,
 ) -> TransportResult<Vec<rustls_pki_types::CertificateDer<'static>>> {
@@ -5613,7 +5652,10 @@ fn load_relay_ca_certs(
 /// one, else ephemeral. Durable sync construction refuses the latter
 /// case through its separate factory; raw transport callers retain it for
 /// protocol-level anonymous-refusal coverage without a database participant.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn dialing_identity(identity_path: Option<&Path>) -> TransportResult<FabricIdentity> {
     match identity_path {
         Some(path) => FabricIdentity::load_or_generate(path)
@@ -5667,13 +5709,12 @@ async fn exchange_frame(
     if let Some(subject) = subject {
         let subject_bytes = subject.as_bytes();
         let subject_len = u16::try_from(subject_bytes.len())
-            .map_err(|_| TransportError::Other(("channel name too long".to_string())))?;
+            .map_err(|_| TransportError::Other("channel name too long".to_string()))?;
         write_all(&mut send, &subject_len.to_be_bytes()).await?;
         write_all(&mut send, subject_bytes).await?;
     }
-    let payload_len = u32::try_from(payload.len()).map_err(|_| {
-        TransportError::Other(("request exceeds the frame ceiling".to_string()))
-    })?;
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| TransportError::Other("request exceeds the frame ceiling".to_string()))?;
     write_all(&mut send, &payload_len.to_be_bytes()).await?;
     write_all(&mut send, payload).await?;
     let mut status = [0u8; 1];
@@ -5702,9 +5743,9 @@ async fn exchange_frame(
             String::from_utf8_lossy(&reply).into_owned(),
         )),
         REPLY_ADMISSION_REFUSED => Err(TransportError::Refused(decode_admission_refusal(&reply))),
-        other => Err(TransportError::Other(
-            format!("unknown reply status byte {other}"),
-        )),
+        other => Err(TransportError::Other(format!(
+            "unknown reply status byte {other}"
+        ))),
     }
 }
 
@@ -5892,9 +5933,9 @@ async fn exchange_large_request(
         )?;
         let encoded =
             LargeRequestControl::FragmentV1(rmp_serde::from_slice(&encoded).map_err(|err| {
-                TransportError::Other(
-                    format!("cannot decode encoded oversized request fragment: {err}"),
-                )
+                TransportError::Other(format!(
+                    "cannot decode encoded oversized request fragment: {err}"
+                ))
             })?)
             .encode()?;
         let reply = await_large_request_fragment_reply(
@@ -5915,7 +5956,7 @@ async fn exchange_large_request(
                             begin.total_fragments,
                             Some(u32::try_from(sequence + 1).map_err(|_| {
                                 TransportError::Other(
-                                    ("oversized request has too many fragments".to_string()),
+                                    "oversized request has too many fragments".to_string(),
                                 )
                             })?),
                         )?;
@@ -5953,7 +5994,7 @@ async fn exchange_large_request(
         ));
     }
     Err(TransportError::Other(
-        ("oversized request contained no fragments".to_string()),
+        "oversized request contained no fragments".to_string(),
     ))
 }
 
@@ -5980,7 +6021,10 @@ async fn await_large_request_fragment_reply(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_large_request_progress(
     progress: &LargeRequestProgress,
     local_node_id: &str,
@@ -6002,7 +6046,10 @@ fn validate_large_request_progress(
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn remove_stage_after_reply(stage: &DurableLargeRequestStage, path: PathBuf) {
     let _guard = stage.lock.lock().await;
     let stage_path = path.clone();
@@ -6148,9 +6195,8 @@ async fn write_reply(
     payload: &[u8],
 ) -> TransportResult<()> {
     write_all(send, &[status]).await?;
-    let len = u32::try_from(payload.len()).map_err(|_| {
-        TransportError::Other(("reply exceeds the frame ceiling".to_string()))
-    })?;
+    let len = u32::try_from(payload.len())
+        .map_err(|_| TransportError::Other("reply exceeds the frame ceiling".to_string()))?;
     write_all(send, &len.to_be_bytes()).await?;
     write_all(send, payload).await?;
     send.finish()
@@ -6164,12 +6210,12 @@ async fn write_reply(
         })?;
         if receipt[0] != REPLY_RECEIVED_ACK {
             return Err(TransportError::Other(
-                ("sync peer returned an invalid reply receipt".to_string()),
+                "sync peer returned an invalid reply receipt".to_string(),
             ));
         }
         recv.read_to_end(0).await.map_err(|err| match err {
             iroh::endpoint::ReadToEndError::TooLong => TransportError::Other(
-                ("sync peer sent trailing bytes after the reply receipt".to_string()),
+                "sync peer sent trailing bytes after the reply receipt".to_string(),
             ),
             iroh::endpoint::ReadToEndError::Read(_) => TransportError::Unreachable(
                 "sync endpoint connection lost before the reply receipt stream finished"

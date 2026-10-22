@@ -372,45 +372,130 @@ fn captured_graph_authorization_survives_mutation(operation: &str) {
         ("other".into(), Value::Uuid(NodeId::from_u128(502))),
     ]);
     db.execute("CREATE TABLE acl_grants (id INTEGER PRIMARY KEY, principal_kind TEXT, principal_id TEXT, acl_id UUID)", &p).unwrap();
-    db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id))", &p).unwrap();
+    db.execute(
+        "CREATE TABLE nodes (id UUID PRIMARY KEY, acl_id UUID ACL REFERENCES acl_grants(acl_id))",
+        &p,
+    )
+    .unwrap();
     db.execute("CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id UUID, target_id UUID, edge_type TEXT, acl_id UUID ACL REFERENCES acl_grants(acl_id))", &p).unwrap();
     let tx = db.begin_or_panic();
-    db.execute_in_tx(tx, "INSERT INTO acl_grants VALUES (1, 'Agent', 'reader', $acl)", &p).unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO acl_grants VALUES (1, 'Agent', 'reader', $acl)",
+        &p,
+    )
+    .unwrap();
     if operation == "grant" {
-        db.execute_in_tx(tx, "INSERT INTO acl_grants VALUES (2, 'Agent', 'reader', $other)", &p).unwrap();
+        db.execute_in_tx(
+            tx,
+            "INSERT INTO acl_grants VALUES (2, 'Agent', 'reader', $other)",
+            &p,
+        )
+        .unwrap();
     }
-    db.execute_in_tx(tx, "INSERT INTO nodes VALUES ($source, $acl)", &p).unwrap();
-    db.execute_in_tx(tx, if operation == "grant" { "INSERT INTO nodes VALUES ($target, $other)" } else { "INSERT INTO nodes VALUES ($target, $acl)" }, &p).unwrap();
-    db.execute_in_tx(tx, "INSERT INTO edges VALUES (1, $source, $target, 'LINKS', $acl)", &p).unwrap();
-    let scoped = db.scoped_with_constraints(None, None, Some(contextdb_core::Principal::Agent("reader".into())));
+    db.execute_in_tx(tx, "INSERT INTO nodes VALUES ($source, $acl)", &p)
+        .unwrap();
+    db.execute_in_tx(
+        tx,
+        if operation == "grant" {
+            "INSERT INTO nodes VALUES ($target, $other)"
+        } else {
+            "INSERT INTO nodes VALUES ($target, $acl)"
+        },
+        &p,
+    )
+    .unwrap();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO edges VALUES (1, $source, $target, 'LINKS', $acl)",
+        &p,
+    )
+    .unwrap();
+    let scoped = db.scoped_with_constraints(
+        None,
+        None,
+        Some(contextdb_core::Principal::Agent("reader".into())),
+    );
     let memory = scoped.declared_reader_memory().unwrap();
-    let open = || scoped.bounded_graph_bfs_cursor(Some(tx), NodeId::from_u128(101), Some(&["LINKS".into()]), Direction::Outgoing, 1, 8,
-        scoped.snapshot_for_read(), &mut |_| Ok::<_, Error>(()), &mut |_| Ok::<_, Error>(()), &mut |_| {}, memory.clone()).unwrap().unwrap();
+    let open = || {
+        scoped
+            .bounded_graph_bfs_cursor(
+                Some(tx),
+                NodeId::from_u128(101),
+                Some(&["LINKS".into()]),
+                Direction::Outgoing,
+                1,
+                8,
+                scoped.snapshot_for_read(),
+                &mut |_| Ok::<_, Error>(()),
+                &mut |_| Ok::<_, Error>(()),
+                &mut |_| {},
+                memory.clone(),
+            )
+            .unwrap()
+            .unwrap()
+    };
     let mut old = open();
-    db.execute_in_tx(tx, match operation {
-        "grant" => "DELETE FROM acl_grants WHERE id = 2",
-        "node" => "UPDATE nodes SET acl_id = $other WHERE id = $target",
-        "edge" => "UPDATE edges SET acl_id = $other WHERE id = 1",
-        _ => unreachable!(),
-    }, &p).unwrap();
+    db.execute_in_tx(
+        tx,
+        match operation {
+            "grant" => "DELETE FROM acl_grants WHERE id = 2",
+            "node" => "UPDATE nodes SET acl_id = $other WHERE id = $target",
+            "edge" => "UPDATE edges SET acl_id = $other WHERE id = 1",
+            _ => unreachable!(),
+        },
+        &p,
+    )
+    .unwrap();
     let mut new = open();
     let collect = |cursor: &mut _| {
         let mut result = Vec::new();
-        while let Some(node) = scoped.bounded_graph_bfs_next(cursor,
-            &mut || Ok::<_, Error>(()), &mut || Ok::<_, Error>(()), &mut |_| Ok::<_, Error>(()),
-            &mut |_| Ok::<_, Error>(()), &mut |_| {}, &mut || Ok::<_, Error>(()),
-            &mut |_| Ok::<_, Error>(()), &mut |_| {}, &mut || {}, None, Some(tx), memory.clone()).unwrap() {
-            result.push(node.node.id); assert!(result.len() <= 1);
+        while let Some(node) = scoped
+            .bounded_graph_bfs_next(
+                cursor,
+                &mut || Ok::<_, Error>(()),
+                &mut || Ok::<_, Error>(()),
+                &mut |_| Ok::<_, Error>(()),
+                &mut |_| Ok::<_, Error>(()),
+                &mut |_| {},
+                &mut || Ok::<_, Error>(()),
+                &mut |_| Ok::<_, Error>(()),
+                &mut |_| {},
+                &mut || {},
+                None,
+                Some(tx),
+                memory.clone(),
+            )
+            .unwrap()
+        {
+            result.push(node.node.id);
+            assert!(result.len() <= 1);
         }
         result
     };
-    assert_eq!(collect(&mut old), vec![NodeId::from_u128(201)], "captured authorization retains the originally granted body");
-    assert_eq!(collect(&mut new), Vec::<NodeId>::new(), "the new capture enforces the changed authorization revision");
-    drop(old); drop(new); db.rollback(tx).unwrap();
+    assert_eq!(
+        collect(&mut old),
+        vec![NodeId::from_u128(201)],
+        "captured authorization retains the originally granted body"
+    );
+    assert_eq!(
+        collect(&mut new),
+        Vec::<NodeId>::new(),
+        "the new capture enforces the changed authorization revision"
+    );
+    drop(old);
+    drop(new);
+    db.rollback(tx).unwrap();
 }
 #[test]
-fn graph_capture_keeps_grant_revision_after_revocation() { captured_graph_authorization_survives_mutation("grant"); }
+fn graph_capture_keeps_grant_revision_after_revocation() {
+    captured_graph_authorization_survives_mutation("grant");
+}
 #[test]
-fn graph_capture_keeps_node_acl_revision_after_mutation() { captured_graph_authorization_survives_mutation("node"); }
+fn graph_capture_keeps_node_acl_revision_after_mutation() {
+    captured_graph_authorization_survives_mutation("node");
+}
 #[test]
-fn graph_capture_keeps_edge_acl_revision_after_mutation() { captured_graph_authorization_survives_mutation("edge"); }
+fn graph_capture_keeps_edge_acl_revision_after_mutation() {
+    captured_graph_authorization_survives_mutation("edge");
+}

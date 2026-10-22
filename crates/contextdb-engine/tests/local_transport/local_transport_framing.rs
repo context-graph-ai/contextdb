@@ -1,4 +1,5 @@
 use super::wire_fixture_test_support::FixtureFrame;
+use super::wire_fixture_test_support::QueryFixture as QueryResult;
 use super::wire_fixture_test_support::{encode_message, encode_payload_frame, encode_query_result};
 use contextdb_core::Value;
 use contextdb_core::read_contract::{ReadFailure, ReadFailureDetail, ReadFailureKind, ReadLimits};
@@ -6,14 +7,15 @@ use contextdb_engine::local_transport::{
     FrameBufferAllocator, FrameReader, FrameViolation, LocalInboundKind, LocalOutboundMessage,
     LocalProtocolBoundary, LocalResponse, LocalResponseExpectation, LocalTransportError,
     MAX_FRAME_BYTES, OrdinaryResultReceiver, PayloadViolation, ResultChunk, ResultReceiveOutcome,
-    ResultReceiveState, TerminalSuccess, decode_frame_exact, frame_length_prefix, read_payload_with_admission, split_canonical_result,
+    ResultReceiveState, TerminalSuccess, decode_frame_exact, frame_length_prefix,
+    read_payload_with_admission, split_canonical_result,
 };
 #[cfg(unix)]
 use contextdb_engine::local_transport::{ManualDeadlineClock, UnixLocalCarrier};
 use contextdb_engine::read_contract::{
-    CanonicalIndexCandidate, CanonicalQueryResult, decode_query_result, };
+    CanonicalIndexCandidate, CanonicalQueryResult, decode_query_result,
+};
 use contextdb_engine::{CascadeReport, IndexCandidate, QueryTrace};
-use super::wire_fixture_test_support::QueryFixture as QueryResult;
 
 struct InstrumentedReader {
     prefix: [u8; 4],

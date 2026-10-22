@@ -115,8 +115,12 @@ fn cached_source_hands_charge_to_fixed_cache_and_nested_scope_restores_callback(
     // Prime bounded table metadata, then release its uncached root page.
     drop(read.open_table(GENERATIONS).unwrap());
     let accountant = Arc::new(MemoryAccountant::with_budget(2 * CACHE_BYTES));
-    let (cache_owner, fixed_invoice) = crate::persistence::install_source_fixture_cache_reserve_for_test(
-        &db, &accountant.clone().into(), CACHE_BYTES);
+    let (cache_owner, fixed_invoice) =
+        crate::persistence::install_source_fixture_cache_reserve_for_test(
+            &db,
+            &accountant.clone().into(),
+            CACHE_BYTES,
+        );
     assert!(fixed_invoice > CACHE_BYTES);
     assert_eq!(accountant.usage().used, fixed_invoice);
     let outer_calls = Arc::new(AtomicUsize::new(0));
@@ -260,36 +264,39 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
         assert!(matches!(
             &outer,
             redb::TableError::Storage(redb::StorageError::Native(
-                redb::NativeColdReadError::AdmissionRefusedAt(_)))
+                redb::NativeColdReadError::AdmissionRefusedAt(_)
+            ))
         ));
-        let redb::TableError::Storage(ref outer_carrier) = outer else { panic!("{outer:?}") };
+        let redb::TableError::Storage(ref outer_carrier) = outer else {
+            panic!("{outer:?}")
+        };
         let outer_cause = native_source_refusal(outer_carrier);
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let inner_accountant = Arc::new(MemoryAccountant::with_budget(PREPARATION_BUDGET));
-            let _: Result<()> = with_source_page_admission(
-                inner_accountant.clone().into(),
-                || {
-                    let _inner_pressure = leave_payload_credit(&inner_accountant, 7);
-                    let inner = read.open_table(GENERATIONS).err().unwrap();
-                    assert!(matches!(
-                        &inner,
-                        redb::TableError::Storage(redb::StorageError::Native(
-                redb::NativeColdReadError::AdmissionRefusedAt(_)))
-                    ));
-                    let redb::TableError::Storage(ref inner_carrier) = inner else { panic!("{inner:?}") };
-                    let inner_cause = native_source_refusal(inner_carrier);
-                    let typed = crate::persistence::RedbPersistence::storage_error(inner);
-                    assert_exact_source_fields(&typed, inner_cause);
-                    assert!(matches!(
-                        typed,
-                        Error::MemoryBudgetExceeded {
-                            available_bytes: 7,
-                            ..
-                        }
-                    ));
-                    panic!("exercise scope restoration");
-                },
-            );
+            let _: Result<()> = with_source_page_admission(inner_accountant.clone().into(), || {
+                let _inner_pressure = leave_payload_credit(&inner_accountant, 7);
+                let inner = read.open_table(GENERATIONS).err().unwrap();
+                assert!(matches!(
+                    &inner,
+                    redb::TableError::Storage(redb::StorageError::Native(
+                        redb::NativeColdReadError::AdmissionRefusedAt(_)
+                    ))
+                ));
+                let redb::TableError::Storage(ref inner_carrier) = inner else {
+                    panic!("{inner:?}")
+                };
+                let inner_cause = native_source_refusal(inner_carrier);
+                let typed = crate::persistence::RedbPersistence::storage_error(inner);
+                assert_exact_source_fields(&typed, inner_cause);
+                assert!(matches!(
+                    typed,
+                    Error::MemoryBudgetExceeded {
+                        available_bytes: 7,
+                        ..
+                    }
+                ));
+                panic!("exercise scope restoration");
+            });
         }));
         assert!(unwind.is_err());
         let independent = crate::persistence::RedbPersistence::storage_error(
@@ -307,9 +314,14 @@ fn nested_refusals_recover_only_the_current_scope_and_restore_after_unwind() {
         ));
         assert!(read.open_table(GENERATIONS).is_err());
         let restored = read.open_table(GENERATIONS).err().unwrap();
-        let redb::TableError::Storage(ref carrier) = restored else { panic!("{restored:?}") };
-        assert_eq!(native_source_refusal(carrier), outer_cause,
-            "nested unwind restores the actual outer callback and first cause");
+        let redb::TableError::Storage(ref carrier) = restored else {
+            panic!("{restored:?}")
+        };
+        assert_eq!(
+            native_source_refusal(carrier),
+            outer_cause,
+            "nested unwind restores the actual outer callback and first cause"
+        );
         Ok(())
     })
     .unwrap();
@@ -527,7 +539,11 @@ fn source_refusal_after_durable_publication_keeps_built_count_and_cleanup_detail
         ready
     );
     assert_eq!(
-        reopened.execute(query, &HashMap::new()).unwrap().rows().len(),
+        reopened
+            .execute(query, &HashMap::new())
+            .unwrap()
+            .rows()
+            .len(),
         3
     );
     reopened.close().unwrap();
@@ -637,11 +653,15 @@ fn source_page_callback_returns_original_refusal_in_storage_carrier() {
     // constructor holds the real descriptor without eagerly loading the giant
     // root/body; the target below remains ordinary table.get, not get_bounded.
     let table = with_source_page_admission(accountant.clone().into(), || {
-        read.open_byte_table_bounded(GENERATIONS).map_err(storage_error)
-    }).unwrap();
+        read.open_byte_table_bounded(GENERATIONS)
+            .map_err(storage_error)
+    })
+    .unwrap();
     let preparation_held = accountant.usage().used;
-    assert!(preparation_held <= CACHE_BYTES,
-        "real retained preparation must fit the original baseline");
+    assert!(
+        preparation_held <= CACHE_BYTES,
+        "real retained preparation must fit the original baseline"
+    );
     let remaining_fill = CACHE_BYTES - preparation_held;
     accountant.try_allocate(remaining_fill).unwrap();
     assert_eq!(accountant.usage().used, CACHE_BYTES);
@@ -649,7 +669,8 @@ fn source_page_callback_returns_original_refusal_in_storage_carrier() {
         let available_at_payload = CACHE_BYTES + 1024 - accountant.usage().used;
         let error = table.get(b"old-authoritative".as_slice()).err().unwrap();
         let refusal = native_source_refusal(&error);
-        assert!(matches!(refusal, contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+        assert!(
+            matches!(refusal, contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
             subsystem, operation, requested_bytes, available_bytes,
             budget_limit_bytes, hint,
         } if subsystem == "vector_maintenance"
@@ -658,7 +679,8 @@ fn source_page_callback_returns_original_refusal_in_storage_carrier() {
             && requested_bytes > GRAPH_BYTES
             && available_bytes == available_at_payload
             && available_bytes < 1024
-            && budget_limit_bytes == CACHE_BYTES + 1024));
+            && budget_limit_bytes == CACHE_BYTES + 1024)
+        );
         let adapted = storage_error(error);
         assert_exact_source_fields(&adapted, refusal);
         Ok(())
@@ -670,8 +692,11 @@ fn source_page_callback_returns_original_refusal_in_storage_carrier() {
     // transaction/cache owners before requiring the preparation refund.
     drop(read);
     drop(db);
-    assert_eq!(accountant.usage().used, remaining_fill,
-        "actual metadata credits release once after the body");
+    assert_eq!(
+        accountant.usage().used,
+        remaining_fill,
+        "actual metadata credits release once after the body"
+    );
     accountant.release(remaining_fill);
     assert_eq!(accountant.usage().used, 0);
 }
@@ -688,23 +713,34 @@ fn leave_payload_credit(
 ) -> crate::memory_accounting::OwnedMemoryReservation {
     let available = accountant.usage().limit.unwrap() - accountant.usage().used;
     let pressure = crate::memory_accounting::OwnedMemoryReservation::try_new_for_native(
-        accountant.clone().into(), available.checked_sub(remaining).unwrap(),
-        "test", "independent_payload_pressure", "Release independent test pressure.",
-    ).unwrap();
-    assert_eq!(accountant.usage().limit.unwrap() - accountant.usage().used, remaining);
+        accountant.clone().into(),
+        available.checked_sub(remaining).unwrap(),
+        "test",
+        "independent_payload_pressure",
+        "Release independent test pressure.",
+    )
+    .unwrap();
+    assert_eq!(
+        accountant.usage().limit.unwrap() - accountant.usage().used,
+        remaining
+    );
     pressure
 }
 
 fn native_source_refusal(error: &redb::StorageError) -> contextdb_core::read_memory::NativeRefusal {
-    let redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefusedAt(owner)) = error else {
+    let redb::StorageError::Native(redb::NativeColdReadError::AdmissionRefusedAt(owner)) = error
+    else {
         panic!("expected authentic retained source refusal, got {error:?}");
     };
     owner.inspect_failure(|cause| {
-        let cause = cause.expect("actual source marker has a cause")
+        let cause = cause
+            .expect("actual source marker has a cause")
             .downcast_ref::<crate::persistence::native_storage_admission::NativeStorageFailure>()
             .expect("actual source producer retains its native scalar cause");
         match cause {
-            crate::persistence::native_storage_admission::NativeStorageFailure::Refused(refusal) => *refusal,
+            crate::persistence::native_storage_admission::NativeStorageFailure::Refused(
+                refusal,
+            ) => *refusal,
             other => panic!("budget refusal was replaced with {other:?}"),
         }
     })
@@ -712,12 +748,25 @@ fn native_source_refusal(error: &redb::StorageError) -> contextdb_core::read_mem
 
 fn assert_exact_source_fields(error: &Error, refusal: contextdb_core::read_memory::NativeRefusal) {
     let contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-        subsystem: expected_subsystem, operation: expected_operation,
-        requested_bytes: expected_requested, available_bytes: expected_available,
-        budget_limit_bytes: expected_limit, hint: expected_hint,
-    } = refusal else { panic!("expected actual budget cause: {refusal:?}") };
-    let Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes,
-        available_bytes, budget_limit_bytes, hint } = error else {
+        subsystem: expected_subsystem,
+        operation: expected_operation,
+        requested_bytes: expected_requested,
+        available_bytes: expected_available,
+        budget_limit_bytes: expected_limit,
+        hint: expected_hint,
+    } = refusal
+    else {
+        panic!("expected actual budget cause: {refusal:?}")
+    };
+    let Error::MemoryBudgetExceeded {
+        subsystem,
+        operation,
+        requested_bytes,
+        available_bytes,
+        budget_limit_bytes,
+        hint,
+    } = error
+    else {
         panic!("typed source cause was lost: {error:?}");
     };
     assert_eq!(subsystem, expected_subsystem);
@@ -741,16 +790,20 @@ fn tiny_source_budgets_refuse_bootstrap_without_entering_the_payload() {
         let error = with_source_page_admission(accountant.clone().into(), || {
             entered = true;
             Ok(())
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(!entered, "unfunded controls cannot invoke the payload");
         assert_eq!(reads.load(Ordering::SeqCst), 0);
-        assert!(matches!(&error, Error::MemoryBudgetExceeded {
+        assert!(
+            matches!(&error, Error::MemoryBudgetExceeded {
             subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint,
         } if subsystem == "vector_maintenance"
             && operation == "read_vector_generation_source_page"
             && *requested_bytes == std::alloc::Layout::new::<SourceRefusalBlock>().size()
             && *available_bytes == ceiling && *budget_limit_bytes == ceiling
-            && hint == SOURCE_HINT), "first bootstrap cause: {error:?}");
+            && hint == SOURCE_HINT),
+            "first bootstrap cause: {error:?}"
+        );
         assert_eq!(accountant.usage().used, 0);
         assert_eq!(accountant.underflow_count_for_test(), 0);
     }
@@ -770,19 +823,25 @@ fn funded_source_preparation_preserves_exact_tiny_payload_causes() {
             assert!(preparation >= std::alloc::Layout::new::<SourceRefusalBlock>().size());
             let _pressure = leave_payload_credit(&accountant, remaining);
             let error = read.open_table(GENERATIONS).err().unwrap();
-            let redb::TableError::Storage(ref carrier) = error else { panic!("{error:?}") };
+            let redb::TableError::Storage(ref carrier) = error else {
+                panic!("{error:?}")
+            };
             let refusal = native_source_refusal(carrier);
-            assert!(matches!(refusal, contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+            assert!(
+                matches!(refusal, contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
                 subsystem: "vector_maintenance", operation: "read_vector_generation_source_page",
                 requested_bytes, available_bytes, budget_limit_bytes: PREPARATION_BUDGET, hint: SOURCE_HINT,
-            } if requested_bytes > remaining && available_bytes == remaining));
+            } if requested_bytes > remaining && available_bytes == remaining)
+            );
             let typed = storage_error(error);
             assert_exact_source_fields(&typed, refusal);
             Err(typed)
         });
         assert!(entered);
-        assert!(matches!(result, Err(Error::MemoryBudgetExceeded { available_bytes, .. })
-            if available_bytes == remaining));
+        assert!(
+            matches!(result, Err(Error::MemoryBudgetExceeded { available_bytes, .. })
+            if available_bytes == remaining)
+        );
         assert_eq!(accountant.usage().used, 0);
         assert_eq!(accountant.underflow_count_for_test(), 0);
     }
@@ -792,16 +851,23 @@ fn funded_source_preparation_preserves_exact_tiny_payload_causes() {
 fn allocator_null_and_backend_causes_are_distinct_from_source_budget_refusal() {
     let layout = std::alloc::Layout::new::<SourceRefusalBlock>();
     let error = storage_error(redb::StorageError::Native(
-        redb::NativeColdReadError::AllocatorFailed { site: "independent allocator-null sentinel", layout }));
+        redb::NativeColdReadError::AllocatorFailed {
+            site: "independent allocator-null sentinel",
+            layout,
+        },
+    ));
     assert!(matches!(error, Error::NativeEngineOther(
         contextdb_core::read_memory::NativeRefusal::AllocatorFailed { site, layout: actual })
         if site == "independent allocator-null sentinel" && actual == layout));
     let accountant = Arc::new(MemoryAccountant::with_budget(PREPARATION_BUDGET));
     let error: Error = with_source_page_admission(accountant.clone().into(), || -> Result<()> {
         Err(storage_error(std::io::Error::from_raw_os_error(28)))
-    }).unwrap_err();
-    assert!(matches!(error, Error::Other(ref message) if message.contains(
-        &std::io::Error::from_raw_os_error(28).to_string())));
+    })
+    .unwrap_err();
+    assert!(
+        matches!(error, Error::Other(ref message) if message.contains(
+        &std::io::Error::from_raw_os_error(28).to_string()))
+    );
     assert_eq!(accountant.usage().used, 0);
 }
 
@@ -812,7 +878,9 @@ thread_local! {
 // allocator records its own returned pointer; the receipt later moves to the
 // stack before Drop, so a destructor address would not identify its backing.
 pub(super) fn observe_source_charge_allocation(charge: &SourcePageCharge) {
-    if !WATCH_SOURCE_BOX.with(std::cell::Cell::get) { return; }
+    if !WATCH_SOURCE_BOX.with(std::cell::Cell::get) {
+        return;
+    }
     let accountant = charge.accountant.as_ref().unwrap();
     crate::persistence::content_identity::proof_allocation_oracle_tests::watch_next_exact_free_for_test(
         std::alloc::Layout::new::<SourcePageCharge>(),
@@ -838,19 +906,32 @@ fn source_charge_box_keeps_its_genuine_control_invoice_through_system_free() {
     WATCH_SOURCE_BOX.with(|slot| assert!(!slot.replace(true)));
     let _watch = Watch;
     let value = with_source_page_admission(accountant.clone().into(), || {
-        read.open_table(GENERATIONS).map_err(storage_error)?
-            .get(b"old-authoritative".as_slice()).map_err(storage_error)
-    }).unwrap().unwrap();
+        read.open_table(GENERATIONS)
+            .map_err(storage_error)?
+            .get(b"old-authoritative".as_slice())
+            .map_err(storage_error)
+    })
+    .unwrap()
+    .unwrap();
     assert!(accountant.usage().used > GRAPH_BYTES);
     assert_eq!(value.value().len(), GRAPH_BYTES);
     WATCH_SOURCE_BOX.with(|slot| slot.set(false));
-    assert_eq!(oracle::source_free_for_test(1)[0].2, 0,
-        "the actual concrete source control is still live before the value drops");
+    assert_eq!(
+        oracle::source_free_for_test(1)[0].2,
+        0,
+        "the actual concrete source control is still live before the value drops"
+    );
     drop(value);
     let (before, after, frees) = oracle::source_free_for_test(1)[0];
-    assert_eq!(frees, 1, "the actual opaque SourcePageCharge Box must physically free");
+    assert_eq!(
+        frees, 1,
+        "the actual opaque SourcePageCharge Box must physically free"
+    );
     let control = std::alloc::Layout::new::<SourcePageCharge>().size();
-    assert!(before >= control, "BUG: source control invoice was refunded before its Box free");
+    assert!(
+        before >= control,
+        "BUG: source control invoice was refunded before its Box free"
+    );
     assert_eq!(after, before, "System free precedes the control refund");
     assert_eq!(accountant.usage().used, 0);
     assert_eq!(accountant.underflow_count_for_test(), 0);
@@ -867,7 +948,10 @@ fn prepaid_callback_bootstrap_refusal_reports_the_actual_first_allocation_phase(
         with_source_page_admission(accountant.clone().into(), || Ok(()))
     });
     success.unwrap();
-    assert_eq!(count, 2, "actual scope cell and actual callback Arc are separate allocations");
+    assert_eq!(
+        count, 2,
+        "actual scope cell and actual callback Arc are separate allocations"
+    );
     let cell = std::alloc::Layout::new::<SourceRefusalBlock>();
     assert_eq!((requests[0].1, requests[0].2), (cell.size(), cell.align()));
     let actual_callback_bytes = requests[1].1;
@@ -880,14 +964,19 @@ fn prepaid_callback_bootstrap_refusal_reports_the_actual_first_allocation_phase(
         let error = with_source_page_admission(accountant.clone().into(), || {
             entered = true;
             Ok(())
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(!entered);
         assert!(matches!(error, Error::MemoryBudgetExceeded {
             subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint,
         } if subsystem == "vector_maintenance" && operation == "read_vector_generation_source_page"
             && requested_bytes == actual_callback_bytes && available_bytes == available
             && budget_limit_bytes == ceiling && hint == SOURCE_HINT));
-        assert_eq!(accountant.usage().used, 0, "earlier funded cell rolls back after callback refusal");
+        assert_eq!(
+            accountant.usage().used,
+            0,
+            "earlier funded cell rolls back after callback refusal"
+        );
         assert_eq!(accountant.underflow_count_for_test(), 0);
     }
 }
@@ -900,8 +989,12 @@ fn source_bootstrap_allocator_null_rolls_back_its_genuine_prepaid_invoice() {
     let mut entered = false;
     let (result, _, allocations) = oracle::native_requests_for_test(|| {
         crate::vector_read_memory::native_ownership_proof::arm_refuse_one_live_layout(
-            std::alloc::Layout::new::<SourceRefusalBlock>());
-        with_source_page_admission(accountant.clone().into(), || { entered = true; Ok(()) })
+            std::alloc::Layout::new::<SourceRefusalBlock>(),
+        );
+        with_source_page_admission(accountant.clone().into(), || {
+            entered = true;
+            Ok(())
+        })
     });
     assert!(!crate::vector_read_memory::native_ownership_proof::refusal_armed_for_test());
     assert!(!entered);
@@ -923,13 +1016,19 @@ fn a_caught_source_refusal_does_not_replace_a_successful_classification() {
     let result = with_source_page_admission(accountant.clone().into(), || {
         let _pressure = leave_payload_credit(&accountant, 1);
         let error = read.open_table(GENERATIONS).err().unwrap();
-        let redb::TableError::Storage(ref carrier) = error else { panic!("{error:?}") };
+        let redb::TableError::Storage(ref carrier) = error else {
+            panic!("{error:?}")
+        };
         let cause = native_source_refusal(carrier);
         let typed = storage_error(error);
         assert_exact_source_fields(&typed, cause);
         Ok(17)
     });
-    assert_eq!(result.unwrap(), 17, "original successful classification must survive a caught refusal");
+    assert_eq!(
+        result.unwrap(),
+        17,
+        "original successful classification must survive a caught refusal"
+    );
     assert_eq!(accountant.usage().used, 0);
 }
 
@@ -944,7 +1043,9 @@ fn a_caught_source_refusal_does_not_replace_the_original_unrelated_error() {
         assert!(read.open_table(GENERATIONS).is_err());
         Err(Error::Other("independent storage failure".into()))
     });
-    assert!(matches!(result, Err(Error::Other(ref message)) if message == "independent storage failure"));
+    assert!(
+        matches!(result, Err(Error::Other(ref message)) if message == "independent storage failure")
+    );
     assert_eq!(accountant.usage().used, 0);
 }
 
@@ -960,9 +1061,16 @@ fn source_page_control_refusal_preserves_the_first_cause_after_payload_admission
     let error: Error = with_source_page_admission(probe.clone().into(), || -> Result<()> {
         let _pressure = leave_payload_credit(&probe, 3);
         Err(storage_error(read.open_table(GENERATIONS).err().unwrap()))
-    }).unwrap_err();
-    let Error::MemoryBudgetExceeded { requested_bytes: actual_extent, available_bytes: 3, .. } = error
-        else { panic!("probe must preserve its actual first extent denial: {error:?}") };
+    })
+    .unwrap_err();
+    let Error::MemoryBudgetExceeded {
+        requested_bytes: actual_extent,
+        available_bytes: 3,
+        ..
+    } = error
+    else {
+        panic!("probe must preserve its actual first extent denial: {error:?}")
+    };
     assert!(actual_extent > 3);
     assert_eq!(probe.usage().used, 0);
     const BUDGET: usize = 128 * 1024 * 1024;
@@ -976,21 +1084,38 @@ fn source_page_control_refusal_preserves_the_first_cause_after_payload_admission
         let _pressure = leave_payload_credit(&accountant, actual_extent);
         let before = accountant.usage().used;
         let error = read.open_table(GENERATIONS).err().unwrap();
-        let redb::TableError::Storage(ref carrier) = error else { panic!("{error:?}") };
+        let redb::TableError::Storage(ref carrier) = error else {
+            panic!("{error:?}")
+        };
         let cause = native_source_refusal(carrier);
-        assert!(matches!(cause, NativeRefusal::MemoryBudgetExceeded {
+        assert!(
+            matches!(cause, NativeRefusal::MemoryBudgetExceeded {
             subsystem: "vector_maintenance", operation: "read_vector_generation_source_page",
             requested_bytes, available_bytes: 0, budget_limit_bytes: BUDGET, hint: SOURCE_HINT,
         } if requested_bytes == std::alloc::Layout::new::<SourcePageCharge>().size()),
-            "the actual FIRST failure is the charge Box, after extent admission: {cause:?}");
-        assert_eq!(accountant.usage().used, before,
-            "failed control admission rolls back the previously admitted extent");
+            "the actual FIRST failure is the charge Box, after extent admission: {cause:?}"
+        );
+        assert_eq!(
+            accountant.usage().used,
+            before,
+            "failed control admission rolls back the previously admitted extent"
+        );
         let typed = storage_error(error);
         assert_exact_source_fields(&typed, cause);
         Err(typed)
     });
-    assert!(matches!(result, Err(Error::MemoryBudgetExceeded { available_bytes: 0, .. })));
-    assert_eq!(reads.load(Ordering::SeqCst), 0, "control refusal precedes page allocation/backend read");
+    assert!(matches!(
+        result,
+        Err(Error::MemoryBudgetExceeded {
+            available_bytes: 0,
+            ..
+        })
+    ));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "control refusal precedes page allocation/backend read"
+    );
     assert_eq!(accountant.usage().used, 0);
     assert_eq!(accountant.underflow_count_for_test(), 0);
 }

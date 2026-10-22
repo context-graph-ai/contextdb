@@ -303,7 +303,11 @@ fn both_routes_describe_the_same_store_the_same_way() {
         let events = session
             .metadata(MetadataRequest::EventsStatus, None)
             .expect("the owner answers");
-        (tables.body.clone(), schema.body.clone(), events.body.clone())
+        (
+            tables.body.clone(),
+            schema.body.clone(),
+            events.body.clone(),
+        )
     };
 
     // The same store, now idle, asked the same questions.
@@ -317,7 +321,8 @@ fn both_routes_describe_the_same_store_the_same_way() {
         session
             .metadata(MetadataRequest::Tables, None)
             .expect("the file answers")
-            .body.clone(),
+            .body
+            .clone(),
         session
             .metadata(
                 MetadataRequest::Schema {
@@ -326,11 +331,13 @@ fn both_routes_describe_the_same_store_the_same_way() {
                 None,
             )
             .expect("the file answers")
-            .body.clone(),
+            .body
+            .clone(),
         session
             .metadata(MetadataRequest::EventsStatus, None)
             .expect("the file answers")
-            .body.clone(),
+            .body
+            .clone(),
     );
 
     assert_eq!(
@@ -582,7 +589,10 @@ fn a_live_owner_returns_the_same_bounded_redacted_vector_trace_as_local_executio
     let file_result = file
         .execute(sql, &params)
         .expect("the committed file executes the same query");
-    assert_eq!(file_result.trace().vector_search.as_ref(), Some(&local_trace));
+    assert_eq!(
+        file_result.trace().vector_search.as_ref(),
+        Some(&local_trace)
+    );
 }
 
 #[test]
@@ -641,7 +651,8 @@ fn a_continuation_is_refused_by_a_question_that_never_issues_one() {
     let issued = paging
         .metadata(MetadataRequest::Tables, None)
         .expect("the table inventory answers")
-        .continuation.clone()
+        .continuation
+        .clone()
         .expect("this ceiling stops the inventory early, so it issues a token");
 
     let crossed = paging.metadata(MetadataRequest::EventsStatus, Some(&issued));
@@ -827,7 +838,10 @@ fn a_continuation_from_one_route_resumes_the_same_place_on_the_other() {
             .expect("the owner's first page");
         (
             table_names(&answer.body),
-            answer.continuation.clone().expect("the owner has more to give"),
+            answer
+                .continuation
+                .clone()
+                .expect("the owner has more to give"),
         )
     };
 

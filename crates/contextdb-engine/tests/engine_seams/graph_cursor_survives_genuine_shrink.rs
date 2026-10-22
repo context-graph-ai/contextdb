@@ -345,7 +345,12 @@ fn a_graph_edge_cursor_emits_every_visible_edge_when_retention_compacts_entries_
          receive every deferred edge"
     );
 
-    emitted.extend(drain(&mut opened.cursor, 2, second.page.has_more(), journey));
+    emitted.extend(drain(
+        &mut opened.cursor,
+        2,
+        second.page.has_more(),
+        journey,
+    ));
 
     assert_emitted_exactly_once(&emitted, &visible, journey);
 

@@ -335,15 +335,23 @@ fn encoded_response_field_escape_keeps_exact_original_invoices_until_physical_fr
         // Keep it live until both output invoices have been physically released.
         let metadata_fixture = metadata.then(|| {
             crate::read_session::MetadataAnswer::try_new(
-                body, None, Default::default(), owner.clone(),
-            ).unwrap()
+                body,
+                None,
+                Default::default(),
+                owner.clone(),
+            )
+            .unwrap()
         });
         let baseline = accountant.usage().used;
         let admitted = accountant.admitted_bytes_for_test();
         let counter = accountant.used_counter_for_observation();
         let (encoded, requests, count) = physical::source_requests_for_test(counter, || {
             let funded = if metadata {
-                encode_metadata_body_funded(&metadata_fixture.as_ref().unwrap().body, owner.clone(), CEILING)
+                encode_metadata_body_funded(
+                    &metadata_fixture.as_ref().unwrap().body,
+                    owner.clone(),
+                    CEILING,
+                )
             } else {
                 encode_query_result_funded(&data, owner.clone(), CEILING)
             }
@@ -759,9 +767,10 @@ fn funded_output_rolls_back_on_second_pass_serializer_failure_and_unwind() {
 fn encoded_output_retains_the_original_native_request_without_an_observer_alias() {
     let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(CEILING).unwrap();
     let root_only = parent.retained_bytes_for_test();
-    let (child, _) = crate::vector_read_memory::statement_child_proof::observe(
-        &parent, CEILING, || parent.child().unwrap(),
-    );
+    let (child, _) =
+        crate::vector_read_memory::statement_child_proof::observe(&parent, CEILING, || {
+            parent.child().unwrap()
+        });
     let observer = crate::vector_read_memory::declared_child_observer(child.clone()).unwrap();
     let standing = parent.retained_bytes_for_test();
     let initial = observer.sample();
@@ -804,9 +813,10 @@ fn encoded_output_retains_the_original_native_request_without_an_observer_alias(
 
     // A new, normally admitted request can be filled with real storage; refusal
     // must occur at its output leaf rather than at root/child construction.
-    let (child, _) = crate::vector_read_memory::statement_child_proof::observe(
-        &parent, CEILING, || parent.child().unwrap(),
-    );
+    let (child, _) =
+        crate::vector_read_memory::statement_child_proof::observe(&parent, CEILING, || {
+            parent.child().unwrap()
+        });
     let observer = crate::vector_read_memory::declared_child_observer(child.clone()).unwrap();
     let pressure_bytes =
         CEILING as usize - parent.retained_bytes_for_test() as usize - (expected.len() - 1);

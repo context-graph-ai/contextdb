@@ -10,7 +10,10 @@ const DEFAULT_MATCH_DEPTH: u32 = 5;
 const ENGINE_MAX_BFS_DEPTH: u32 = 10;
 const DEFAULT_PROPAGATION_MAX_DEPTH: u32 = 10;
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
     match stmt {
         Statement::CreateTable(ct) => Ok(PhysicalPlan::CreateTable(CreateTablePlan {
@@ -152,7 +155,10 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
 /// Map one parsed `MAINTAIN COUNT` declaration onto the engine's own sort
 /// direction. `DEFAULT` never reaches a CREATE (the parser refuses it there)
 /// and clears the declaration on an ALTER, so it has no projected form.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn map_maintained_counts_declaration(
     declared: &contextdb_parser::ast::MaintainedCountsDecl,
 ) -> Result<contextdb_core::MaintainedCounts> {
@@ -182,7 +188,10 @@ pub fn map_maintained_counts_declaration(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn extract_propagation_rules(
     ct: &contextdb_parser::ast::CreateTable,
 ) -> Result<Vec<PropagationRule>> {
@@ -257,7 +266,10 @@ fn extract_propagation_rules(
 /// `COUNT(*)` per group over one table. The parser admits only that shape;
 /// whether the table maintains a count over these columns is decided by the
 /// engine at runtime, against the declaration.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn plan_grouped_count(
     body: &SelectBody,
     cte_env: &HashMap<String, PhysicalPlan>,
@@ -295,7 +307,10 @@ fn plan_grouped_count(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     let mut cte_env = HashMap::new();
     let mut visible_ctes = Vec::new();
@@ -321,7 +336,10 @@ fn plan_select(sel: &SelectStatement) -> Result<PhysicalPlan> {
     plan_select_body(&sel.body, &cte_env, &visible_ctes)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn plan_select_body(
     body: &SelectBody,
     cte_env: &HashMap<String, PhysicalPlan>,
@@ -670,7 +688,10 @@ fn resolve_order_by_output_alias(
         .map_or_else(|| expr.clone(), |select| select.expr.clone())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn vector_search_parts(expr: &Expr) -> Result<(String, Expr)> {
     match expr {
         Expr::CosineDistance { left, right } => match left.as_ref() {
@@ -729,7 +750,10 @@ fn select_body_contains_row_vector_source(body: &SelectBody) -> bool {
             .any(|order| expr_contains_row_vector_source(&order.expr))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn vector_base_table(plan: &PhysicalPlan) -> Result<Option<String>> {
     match plan {
         PhysicalPlan::Scan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
@@ -768,7 +792,10 @@ fn vector_base_table(plan: &PhysicalPlan) -> Result<Option<String>> {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn graph_plan_from_from_item(from_item: &FromItem, visible_ctes: &[Cte]) -> Result<PhysicalPlan> {
     match from_item {
         FromItem::GraphTable {
@@ -800,7 +827,10 @@ fn graph_plan_from_from_item(from_item: &FromItem, visible_ctes: &[Cte]) -> Resu
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn graph_bfs_from_match(
     match_clause: &contextdb_parser::ast::MatchClause,
     visible_ctes: &[Cte],
@@ -854,7 +884,10 @@ fn graph_bfs_from_match(
 /// Stub bridge from parser-AST `SortDirection` (Asc/Desc/CosineDistance) to
 /// core engine `SortDirection` (Asc/Desc). CosineDistance is not meaningful
 /// for B-tree indexes; reject it as a parse-level error.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn map_parser_to_core_sort_direction(
     dir: contextdb_parser::ast::SortDirection,
 ) -> Result<contextdb_core::SortDirection> {
@@ -896,7 +929,10 @@ fn contains_window(expr: &Expr) -> bool {
 
 /// A single typed binding serves repeated identical windows in this SELECT.
 /// Specification equality uses parsed identifiers and defaulted directions.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn lower_window(expr: &mut Expr, window: &mut Option<RowNumberWindow>) -> Result<()> {
     match expr {
         Expr::RowNumber(spec) => {

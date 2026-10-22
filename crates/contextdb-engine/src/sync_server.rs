@@ -139,7 +139,10 @@ struct PerEdgeAppliedPushWatermarks {
 impl PerEdgeAppliedPushWatermarks {
     /// What this hub holds from this life of `node_id`, `Lsn(0)` when it holds
     /// nothing.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn load(
         &self,
         db: &Database,
@@ -165,7 +168,10 @@ impl PerEdgeAppliedPushWatermarks {
             .or_insert(candidate);
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn load_locked(
         cache: &mut HashMap<(String, Incarnation), Lsn>,
         db: &Database,
@@ -405,7 +411,10 @@ impl SyncServer {
     }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn build(
         db: Arc<Database>,
         transport: Arc<dyn ServerTransport>,
@@ -415,7 +424,8 @@ impl SyncServer {
         local_node_id: Option<String>,
         read_budget_provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
     ) -> Result<Self, Error> {
-        let read_budget_provider: crate::vector_read_memory::ReadRequestProvider = read_budget_provider.into();
+        let read_budget_provider: crate::vector_read_memory::ReadRequestProvider =
+            read_budget_provider.into();
         assert!(
             !tenant_id.as_str().is_empty()
                 && tenant_id
@@ -506,7 +516,12 @@ impl SyncServer {
         tenant_id: TenantId,
         read_budget_provider: Arc<dyn crate::vector_read_memory::ReadRequestBudgetProvider>,
     ) -> Result<Self, Error> {
-        Self::with_authenticated_transport_for_test_with_read_budget_provider_handle(db, transport, tenant_id, read_budget_provider.into())
+        Self::with_authenticated_transport_for_test_with_read_budget_provider_handle(
+            db,
+            transport,
+            tenant_id,
+            read_budget_provider.into(),
+        )
     }
 
     #[cfg(feature = "test-seams")]
@@ -559,7 +574,14 @@ impl SyncServer {
         identity: Arc<crate::identity::FabricIdentity>,
         read_budget_provider: impl Into<crate::vector_read_memory::ReadRequestProvider>,
     ) -> Result<Self, Error> {
-        Self::with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(db, transport, tenant_id, local_node_id, identity, read_budget_provider.into())
+        Self::with_authenticated_transport_and_identity_for_test_with_read_budget_provider_handle(
+            db,
+            transport,
+            tenant_id,
+            local_node_id,
+            identity,
+            read_budget_provider.into(),
+        )
     }
 
     #[cfg(feature = "test-seams")]
@@ -838,7 +860,8 @@ impl SyncServer {
                         || request.tenant_id != tenant.as_str()
                     {
                         return Err(TransportError::Other(
-                            "invalid authenticated policy request".into()));
+                            "invalid authenticated policy request".into(),
+                        ));
                     }
                     let edge = req.node_id.ok_or_else(|| {
                         TransportError::Other("authenticated edge required".into())
@@ -958,16 +981,19 @@ impl SyncServer {
                         "Reduce the request or raise the declared reader memory limit.",
                     );
                     let edge_node_id = req.node_id.clone().ok_or_else(|| {
-                        TransportError::Other((
-                            "fixture binding requires an authenticated edge".to_string()).into())
+                        TransportError::Other(
+                            ("fixture binding requires an authenticated edge".to_string()).into(),
+                        )
                     })?;
                     let hub_node_id = local_node_id.ok_or_else(|| {
-                        TransportError::Other((
-                            "fixture binding requires an authenticated hub".to_string()).into())
+                        TransportError::Other(
+                            ("fixture binding requires an authenticated hub".to_string()).into(),
+                        )
                     })?;
                     let signer = signer.ok_or_else(|| {
-                        TransportError::Other((
-                            "fixture binding requires the hub signing key".to_string()).into())
+                        TransportError::Other(
+                            ("fixture binding requires the hub signing key".to_string()).into(),
+                        )
                     })?;
                     let request = decoded_memory
                         .decode_msgpack(&req.bytes)
@@ -1013,16 +1039,19 @@ impl SyncServer {
                         "Reduce the request or raise the declared reader memory limit.",
                     );
                     let edge_node_id = req.node_id.clone().ok_or_else(|| {
-                        TransportError::Other((
-                            "fixture outcome requires an authenticated edge".to_string()).into())
+                        TransportError::Other(
+                            ("fixture outcome requires an authenticated edge".to_string()).into(),
+                        )
                     })?;
                     let hub_node_id = local_node_id.ok_or_else(|| {
-                        TransportError::Other((
-                            "fixture outcome requires an authenticated hub".to_string()).into())
+                        TransportError::Other(
+                            ("fixture outcome requires an authenticated hub".to_string()).into(),
+                        )
                     })?;
                     let signer = signer.ok_or_else(|| {
-                        TransportError::Other((
-                            "fixture outcome requires the hub signing key".to_string()).into())
+                        TransportError::Other(
+                            ("fixture outcome requires the hub signing key".to_string()).into(),
+                        )
                     })?;
                     let request = decoded_memory
                         .decode_msgpack(&req.bytes)
@@ -1072,16 +1101,19 @@ impl SyncServer {
                         "Reduce the request or raise the declared reader memory limit.",
                     );
                     let edge_node_id = req.node_id.clone().ok_or_else(|| {
-                        TransportError::Other((
-                            "fixture outcome requires an authenticated edge".to_string()).into())
+                        TransportError::Other(
+                            ("fixture outcome requires an authenticated edge".to_string()).into(),
+                        )
                     })?;
                     let hub_node_id = local_node_id.ok_or_else(|| {
-                        TransportError::Other((
-                            "fixture outcome requires an authenticated hub".to_string()).into())
+                        TransportError::Other(
+                            ("fixture outcome requires an authenticated hub".to_string()).into(),
+                        )
                     })?;
                     let signer = signer.ok_or_else(|| {
-                        TransportError::Other((
-                            "fixture outcome requires the hub signing key".to_string()).into())
+                        TransportError::Other(
+                            ("fixture outcome requires the hub signing key".to_string()).into(),
+                        )
                     })?;
                     let request = decoded_memory
                         .decode_msgpack(&req.bytes)
@@ -1211,7 +1243,7 @@ async fn handle_status(
     req: IncomingRequest,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
         db.bounded_read_accountant(),
@@ -1227,8 +1259,9 @@ async fn handle_status(
     let envelope = crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)?;
     let protocol_version = envelope.version;
     if !matches!(envelope.message_type, MessageType::StatusRequest) {
-        return Err(contextdb_core::Error::SyncError((
-            "unexpected message type on status subject".to_string()).into()));
+        return Err(contextdb_core::Error::SyncError(
+            ("unexpected message type on status subject".to_string()).into(),
+        ));
     }
     let request: crate::custody::incarnation::StatusProbe =
         decoded_memory.decode_msgpack(&envelope.payload)?;
@@ -1258,7 +1291,8 @@ async fn handle_status(
         (Some(edge), Some(hub)) => (edge, hub),
         _ => {
             return Err(contextdb_core::Error::SyncError(
-                "exact refused schema lookup requires authenticated identities".into()));
+                "exact refused schema lookup requires authenticated identities".into(),
+            ));
         }
     };
     let (refused_schema_units, refusal_lease) = db.refused_schema_unit_outcomes_for_digests(
@@ -1295,7 +1329,10 @@ async fn handle_status(
 /// Select only exact signed units from this request, in this authenticated
 /// pushing peer's tenant and store lives. Historical refusals never describe
 /// a later correction, even if it touches the same table.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn refused_outcomes_for_request(
     db: &Database,
     tenant: &TenantId,
@@ -1308,7 +1345,7 @@ fn refused_outcomes_for_request(
     Vec<crate::protocol::RefusedSchemaUnitOutcome>,
     Vec<crate::read_image_memory::ImageMemoryHandle>,
 )> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let Some(context) = context else {
         return Ok((Vec::new(), Vec::new()));
@@ -1386,7 +1423,7 @@ async fn refuse_push_for_memory(
     error: contextdb_core::Error,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let contextdb_core::Error::MemoryBudgetExceeded {
         subsystem,
@@ -1416,7 +1453,10 @@ async fn refuse_push_for_memory(
     publish_push_response(responder, response, protocol_version, read_memory).await
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn handle_push(
     state: Arc<PushHandlerState>,
     req: IncomingRequest,
@@ -1450,8 +1490,9 @@ async fn handle_push(
         MessageType::PushRequest => false,
         MessageType::DependencyCompletePushRequest => true,
         _ => {
-            return Err(contextdb_core::Error::SyncError((
-                "unexpected message type on push subject".to_string()).into()));
+            return Err(contextdb_core::Error::SyncError(
+                ("unexpected message type on push subject".to_string()).into(),
+            ));
         }
     };
     let request: PushRequest = match decoded_memory.decode_msgpack(&envelope.payload) {
@@ -1484,8 +1525,10 @@ async fn handle_push(
     };
     if !request.changeset.purges.is_empty() {
         let hub_node_id = state.local_node_id.clone().ok_or_else(|| {
-            contextdb_core::Error::SyncError((
-                "authenticated sync push requires the hub's authenticated identity".to_string()).into())
+            contextdb_core::Error::SyncError(
+                ("authenticated sync push requires the hub's authenticated identity".to_string())
+                    .into(),
+            )
         })?;
         let response = PushResponse {
             result: None,
@@ -1719,7 +1762,8 @@ async fn handle_push(
         if let Some(source_lsn) = changeset.max_lsn() {
             let hub = state.local_node_id.as_deref().ok_or_else(|| {
                 contextdb_core::Error::SyncError(
-                    "policy hold requires authenticated hub identity".into())
+                    "policy hold requires authenticated hub identity".into(),
+                )
             })?;
             state.db.stage_policy_held_received_data(
                 &changeset,
@@ -1914,7 +1958,10 @@ async fn handle_push(
 // These separate inputs jointly determine one atomic sync-page decision;
 // keeping them explicit preserves the page's holdback, cursor, and wire rules.
 #[allow(clippy::too_many_arguments)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn handle_pull(
     db: Arc<Database>,
     lineage_signer: Option<LineageSigner>,
@@ -1926,7 +1973,7 @@ async fn handle_pull(
     req: IncomingRequest,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
         db.bounded_read_accountant(),
@@ -1944,8 +1991,9 @@ async fn handle_pull(
     let envelope = crate::sync_client::decode_sync_envelope(&decoded_memory, &req.bytes, None)?;
     let protocol_version = envelope.version;
     if !matches!(envelope.message_type, MessageType::PullRequest) {
-        return Err(contextdb_core::Error::SyncError((
-            "unexpected message type on pull subject".to_string()).into()));
+        return Err(contextdb_core::Error::SyncError(
+            ("unexpected message type on pull subject".to_string()).into(),
+        ));
     }
 
     let request: PullRequest = decoded_memory.decode_msgpack(&envelope.payload)?;
@@ -1988,8 +2036,10 @@ async fn handle_pull(
             )).into()));
         }
         let peer = peer_node_id.as_deref().ok_or_else(|| {
-            contextdb_core::Error::SyncError((
-                "schema-recovery acknowledgement requires an authenticated receiver".to_string()).into())
+            contextdb_core::Error::SyncError(
+                ("schema-recovery acknowledgement requires an authenticated receiver".to_string())
+                    .into(),
+            )
         })?;
         let CapabilityHoldbackSplit {
             recoverable: recovered_tables,
@@ -2062,16 +2112,21 @@ async fn handle_pull(
                 after_lsn,
             }) => {
                 if *requested_target != target_lsn || *after_lsn > target_lsn {
-                    return Err(contextdb_core::Error::SyncError((format!(
-                        "schema-recovery continuation does not match held frontier {}",
-                        target_lsn.0
-                    )).into()));
+                    return Err(contextdb_core::Error::SyncError(
+                        (format!(
+                            "schema-recovery continuation does not match held frontier {}",
+                            target_lsn.0
+                        ))
+                        .into(),
+                    ));
                 }
                 *after_lsn
             }
             Some(SchemaRecoveryRequest::Acknowledge { .. }) => {
-                return Err(contextdb_core::Error::SyncError((
-                    "schema-recovery acknowledgement did not clear its held image".to_string()).into()));
+                return Err(contextdb_core::Error::SyncError(
+                    ("schema-recovery acknowledgement did not clear its held image".to_string())
+                        .into(),
+                ));
             }
         }
     } else {
@@ -2079,8 +2134,10 @@ async fn handle_pull(
             request.schema_recovery,
             Some(SchemaRecoveryRequest::Continue { .. })
         ) {
-            return Err(contextdb_core::Error::SyncError((
-                "schema-recovery continuation has no held table on this sender".to_string()).into()));
+            return Err(contextdb_core::Error::SyncError(
+                ("schema-recovery continuation has no held table on this sender".to_string())
+                    .into(),
+            ));
         }
         request.since_lsn
     };
@@ -2168,12 +2225,12 @@ async fn handle_pull(
             .expect("recovery tables come from a schema holdback")
             .compatible_through;
         let mut held_groups = changes.ddl_lsn_groups_for_tables(anchor_tables);
-        db.expand_connected_positions(&mut held_groups,vector_copy_owner,read_memory.clone())?;
+        db.expand_connected_positions(&mut held_groups, vector_copy_owner, read_memory.clone())?;
         let mut tables = changes.tables_in_ddl_lsn_groups(&held_groups);
         tables.extend(anchor_tables.iter().cloned());
         changes = changes
             .for_schema_recovery_with_ddl_groups(&tables, &held_groups, compatible_through)
-            .through_lsn(db.connected_delivery_ceiling(target,read_memory.clone())?);
+            .through_lsn(db.connected_delivery_ceiling(target, read_memory.clone())?);
         purge_items.retain(|item| tables.contains(&item.table) && item.frontier <= target);
     }
 
@@ -2198,7 +2255,7 @@ async fn handle_pull(
             .cloned()
             .collect::<HashSet<_>>();
         let mut held_groups = changes.ddl_lsn_groups_for_tables(&capability_tables);
-        db.expand_connected_positions(&mut held_groups,vector_copy_owner,read_memory.clone())?;
+        db.expand_connected_positions(&mut held_groups, vector_copy_owner, read_memory.clone())?;
         let mut held_tables = changes.tables_in_ddl_lsn_groups(&held_groups);
         held_tables.extend(capability_tables);
         if !held_tables.is_empty() {
@@ -2235,12 +2292,18 @@ async fn handle_pull(
     let mut has_more = false;
     if let Some(max_entries) = request.max_entries {
         let max = max_entries as usize;
-        let change_groups = db.connected_delivery_groups(changes.clone(),vector_copy_owner,read_memory.clone())?
-            .into_iter().map(|(group,_)|group)
-            .filter(|group| group.data_entry_count() > 0 || !group.ddl.is_empty()).collect::<Vec<_>>();
+        let change_groups = db
+            .connected_delivery_groups(changes.clone(), vector_copy_owner, read_memory.clone())?
+            .into_iter()
+            .map(|(group, _)| group)
+            .filter(|group| group.data_entry_count() > 0 || !group.ddl.is_empty())
+            .collect::<Vec<_>>();
         let mut groups = BTreeMap::<Lsn, (Vec<ChangeSet>, Vec<_>)>::new();
         for group in change_groups {
-            let frontier = db.connected_history_end(group.max_lsn().unwrap_or_else(|| db.current_lsn()),read_memory.clone())?;
+            let frontier = db.connected_history_end(
+                group.max_lsn().unwrap_or_else(|| db.current_lsn()),
+                read_memory.clone(),
+            )?;
             groups.entry(frontier).or_default().0.push(group);
         }
         for item in purge_items {
@@ -2314,8 +2377,11 @@ async fn handle_pull(
             purge_items.retain(|item| item.frontier == purge_frontier);
             has_more = true;
         }
-        let groups = db.connected_delivery_groups(changes.clone(),vector_copy_owner,read_memory.clone())?
-            .into_iter().map(|(group,_)|group).collect::<Vec<_>>();
+        let groups = db
+            .connected_delivery_groups(changes.clone(), vector_copy_owner, read_memory.clone())?
+            .into_iter()
+            .map(|(group, _)| group)
+            .collect::<Vec<_>>();
         if groups.iter().any(|group| {
             group
                 .max_lsn()
@@ -2337,14 +2403,24 @@ async fn handle_pull(
     }
     let mut bootstrap_batches = changes.clone().split_at_trigger_bootstrap_barriers();
     if bootstrap_batches.len() > 1 {
-        let first_end = db.connected_history_end(bootstrap_batches[0].max_lsn().unwrap_or(effective_since),read_memory.clone())?;
+        let first_end = db.connected_history_end(
+            bootstrap_batches[0].max_lsn().unwrap_or(effective_since),
+            read_memory.clone(),
+        )?;
         let mut complete = Vec::new();
         while !bootstrap_batches.is_empty() {
-            let next_start = bootstrap_batches[0].rows.iter().map(|row|row.lsn)
-                .chain(bootstrap_batches[0].edges.iter().map(|edge|edge.lsn))
-                .chain(bootstrap_batches[0].vectors.iter().map(|vector|vector.lsn))
-                .chain(bootstrap_batches[0].ddl_lsn.iter().copied()).min().unwrap_or(first_end);
-            if !complete.is_empty() && next_start > first_end { break; }
+            let next_start = bootstrap_batches[0]
+                .rows
+                .iter()
+                .map(|row| row.lsn)
+                .chain(bootstrap_batches[0].edges.iter().map(|edge| edge.lsn))
+                .chain(bootstrap_batches[0].vectors.iter().map(|vector| vector.lsn))
+                .chain(bootstrap_batches[0].ddl_lsn.iter().copied())
+                .min()
+                .unwrap_or(first_end);
+            if !complete.is_empty() && next_start > first_end {
+                break;
+            }
             complete.push(bootstrap_batches.remove(0));
         }
         changes = merge_changeset_groups(complete);
@@ -2378,7 +2454,9 @@ async fn handle_pull(
                 Some(db.current_lsn())
             }
         });
-    cursor = cursor.map(|lsn|db.connected_history_end(lsn,read_memory.clone())).transpose()?;
+    cursor = cursor
+        .map(|lsn| db.connected_history_end(lsn, read_memory.clone()))
+        .transpose()?;
     // A selection that stopped at the page budget ends this page at its last
     // complete group. The cursor names that group even when hub bookkeeping or
     // filtering left none of its rows on the wire, so the next page starts
@@ -2498,13 +2576,17 @@ async fn handle_pull(
         None
     } else {
         Some(local_node_id.as_deref().ok_or_else(|| {
-            contextdb_core::Error::SyncError((
-                "authenticated sync pull requires the hub's authenticated identity".to_string()).into())
+            contextdb_core::Error::SyncError(
+                ("authenticated sync pull requires the hub's authenticated identity".to_string())
+                    .into(),
+            )
         })?)
     };
     let signer = lineage_signer.as_ref().ok_or_else(|| {
-        contextdb_core::Error::SyncError((
-            "authenticated sync pull requires the hub transport's creator signer".to_string()).into())
+        contextdb_core::Error::SyncError(
+            ("authenticated sync pull requires the hub transport's creator signer".to_string())
+                .into(),
+        )
     })?;
     let ordinary_lineages = authenticated_local_node
         .map(|node_id| {
@@ -2529,9 +2611,11 @@ async fn handle_pull(
         local_node_id
             .as_deref()
             .ok_or_else(|| {
-                contextdb_core::Error::SyncError((
-                    "serving authenticated schema requires the hub's authenticated identity"
-                        .to_string()).into())
+                contextdb_core::Error::SyncError(
+                    ("serving authenticated schema requires the hub's authenticated identity"
+                        .to_string())
+                    .into(),
+                )
             })
             .map(Some)
     };
@@ -2735,14 +2819,17 @@ impl PeerSchemaCapabilities {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn unsupported_schema_capabilities_for_table(
     db: &Database,
     table: &str,
     capabilities: SchemaCapabilities,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<BTreeSet<SchemaSyncCapability>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut declared = db.authored_schema_capabilities(table, read_memory.clone())?;
     if let Some(meta) = db.table_meta(table) {
@@ -2757,14 +2844,17 @@ pub(crate) fn unsupported_schema_capabilities_for_table(
 /// Include the vocabulary of immutable authored history, even when a later
 /// ALTER or DROP removed it from the current schema. A peer must be able to
 /// replay the entire source vector before this table can leave holdback.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn unsupported_schema_capabilities_in_changes(
     db: &Database,
     changes: &ChangeSet,
     capabilities: SchemaCapabilities,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<BTreeMap<String, BTreeSet<SchemaSyncCapability>>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut tables = HashSet::new();
     tables.extend(changes.rows.iter().map(|row| row.table.clone()));
@@ -2805,14 +2895,17 @@ struct CapabilityHoldbackSplit {
     remaining: BTreeMap<String, BTreeSet<SchemaSyncCapability>>,
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn holdback_for_capabilities(
     db: &Database,
     state: &PeerSchemaSyncHoldbackState,
     capabilities: SchemaCapabilities,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<CapabilityHoldbackSplit> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut recoverable = HashSet::new();
     let mut remaining = BTreeMap::new();
@@ -2874,7 +2967,10 @@ fn drop_rows_past_retention_window(db: &Database, changes: ChangeSet) -> ChangeS
     changes
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 async fn spawn_apply_and_reply(work: PushApplyWork) -> contextdb_core::Result<()> {
     let PushApplyWork {
         read_memory,
@@ -3257,7 +3353,7 @@ async fn admit_push_request(
     protocol_version: u8,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<PushAdmission> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut in_flight = in_flight_push_applies.lock().await;
     if let Some(responders) = in_flight.get_mut(&request_key) {
@@ -3303,7 +3399,7 @@ async fn publish_in_flight_push_response(
     protocol_version: u8,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     loop {
         let responders = {
@@ -3339,7 +3435,7 @@ async fn publish_push_response(
     protocol_version: u8,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let (payload, _encoded_credit) = crate::protocol::encode_for_version_with_read_owner(
         protocol_version,
@@ -3363,13 +3459,23 @@ pub(crate) fn without_hub_local_bookkeeping(changes: ChangeSet) -> ChangeSet {
 // shaping. Preserve the existing per-source-transaction entry count while
 // treating a connected acceptance as indivisible.
 fn source_group_entry_count(changes: &ChangeSet) -> usize {
-    let mut counts = BTreeMap::<Lsn,(usize,usize)>::new();
-    for lsn in changes.rows.iter().map(|row|row.lsn).chain(changes.edges.iter().map(|edge|edge.lsn))
-        .chain(changes.vectors.iter().map(|vector|vector.lsn)) {
+    let mut counts = BTreeMap::<Lsn, (usize, usize)>::new();
+    for lsn in changes
+        .rows
+        .iter()
+        .map(|row| row.lsn)
+        .chain(changes.edges.iter().map(|edge| edge.lsn))
+        .chain(changes.vectors.iter().map(|vector| vector.lsn))
+    {
         counts.entry(lsn).or_default().0 += 1;
     }
-    for lsn in &changes.ddl_lsn { counts.entry(*lsn).or_default().1 += 1; }
-    counts.into_values().map(|(data,ddl)|data.max(ddl).max(1)).sum()
+    for lsn in &changes.ddl_lsn {
+        counts.entry(*lsn).or_default().1 += 1;
+    }
+    counts
+        .into_values()
+        .map(|(data, ddl)| data.max(ddl).max(1))
+        .sum()
 }
 
 fn merge_changeset_groups(groups: Vec<ChangeSet>) -> ChangeSet {
@@ -3468,7 +3574,10 @@ mod tests {
 /// The Legacy delivery answer: decode, fetch through the custody cache, encode.
 /// Shared by the ordinary route and by the native installation's Legacy arm,
 /// so a host-provided Legacy reader keeps exactly today's reply bytes.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_delivery_reply(
     db: &Database,
     tenant: &TenantId,
@@ -3477,7 +3586,7 @@ fn legacy_delivery_reply(
     bytes: &[u8],
     node_id: Option<String>,
 ) -> Result<Vec<u8>, TransportError> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
         db.bounded_read_accountant(),
@@ -3497,7 +3606,8 @@ fn legacy_delivery_reply(
         || request.tenant_id != tenant.as_str()
     {
         return Err(TransportError::Other(
-            "invalid authenticated outcome request".into()));
+            "invalid authenticated outcome request".into(),
+        ));
     }
     let hub = hub.ok_or_else(|| TransportError::Other("authenticated hub required".into()))?;
     let edge =
@@ -3537,7 +3647,10 @@ fn legacy_delivery_reply(
 /// Explicit-owner Legacy arm of the native delivery route. The installation's
 /// begin_request supplies the exact capability; this arm never reacquires it,
 /// and its reply is admitted on that same reader before the responder sees it.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn legacy_delivery_arm(
     db: Arc<Database>,
     tenant: TenantId,
@@ -3601,7 +3714,10 @@ impl SyncServer {
     /// every other subject on its Legacy handler, unchanged; bounded delivery
     /// is not claimed for in-memory hubs.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn native_stop(
         &self,
         flag: Arc<AtomicBool>,

@@ -330,7 +330,8 @@ fn a_replacement_swaps_one_lifetime_for_another() {
     let writer = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
         1_610_612_736,
     ));
-    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824).expect("admit the declared fixture root");
+    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824)
+        .expect("admit the declared fixture root");
     let child = parent.child().unwrap();
     let child_control = parent.retained_bytes_for_test();
     let spy = MaintenanceReaderSpy::new(child.clone(), writer.clone().into());
@@ -545,7 +546,8 @@ fn removing_the_only_membership_of_a_route_clears_its_rows() {
             .unwrap()
     };
     let before = snapshot();
-    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824).expect("admit the declared fixture root");
+    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824)
+        .expect("admit the declared fixture root");
     let child = parent.child().unwrap();
     let child_control = parent.retained_bytes_for_test();
     let spy = MaintenanceReaderSpy::new(child.clone(), handle.clone());
@@ -840,7 +842,8 @@ fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() 
             let handle: crate::memory_accounting::AccountantHandle = writer.clone().into();
             let writer_baseline = writer.usage().used;
             let parent =
-                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824).expect("admit the declared fixture root");
+                crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824)
+                    .expect("admit the declared fixture root");
             let child = parent.child().unwrap();
             let child_control = parent.retained_bytes_for_test();
             let child_observer =
@@ -898,7 +901,8 @@ fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() 
             // the old durable rows and dirty marker for the correct child.
             let small_parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
                 child_control + reader_peak as u64 - 1,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
             let small_child = small_parent.child().unwrap();
             let small_spy = MaintenanceReaderSpy::new(small_child.clone(), handle.clone());
             let small_owner =

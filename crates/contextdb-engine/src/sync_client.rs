@@ -215,7 +215,10 @@ impl ChargedOutcomes {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn admit(&mut self, bytes: usize) -> contextdb_core::Result<()> {
         if bytes == 0 {
             return Ok(());
@@ -253,7 +256,10 @@ impl ChargedOutcomes {
     /// Admit `decoded` bytes for `count` projections and the vector's exact
     /// growth, and reserve that growth. Called before the page's custody
     /// effects commit, so a result refusal leaves no durable change.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve_projected(&mut self, decoded: usize, count: usize) -> contextdb_core::Result<()> {
         let needed = self.outcomes.len().saturating_add(count);
         let growth = needed.saturating_sub(self.outcomes.capacity());
@@ -269,7 +275,10 @@ impl ChargedOutcomes {
 
     /// Build the projections `reserve_projected` admitted, into its exact
     /// reservation; the vector never grows here.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn extend_reserved(
         &mut self,
         projections: impl Iterator<Item = DeliveryOutcome>,
@@ -285,7 +294,10 @@ impl ChargedOutcomes {
     }
 
     /// The last outcome's cursor, with its strings admitted first.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn last_cursor(
         &self,
     ) -> contextdb_core::Result<(
@@ -351,7 +363,10 @@ impl Drop for PostPushReplyEffectsPause {
 }
 
 /// Decode an envelope under the actual requesting read's admitted image.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_sync_envelope(
     memory: &crate::read_image_memory::ImageMemoryHandle,
     data: &[u8],
@@ -369,13 +384,15 @@ pub(crate) fn decode_sync_envelope(
     if !crate::protocol::supports_protocol_version(envelope.version)
         || expected.is_some_and(|version| envelope.version != version)
     {
-        return Err(Error::SyncError((
-            crate::error::SyncError::ProtocolVersionMismatch {
+        return Err(Error::SyncError(
+            (crate::error::SyncError::ProtocolVersionMismatch {
                 received: envelope.version,
                 oldest_supported: oldest,
                 newest_supported: newest,
             }
-            .to_string()).into()));
+            .to_string())
+            .into(),
+        ));
     }
     Ok(envelope)
 }
@@ -415,13 +432,13 @@ fn page_awaits_trigger_callback_registration(db: &Database, changes: &ChangeSet)
 }
 
 fn malformed_purge_page(detail: impl Into<String>) -> Error {
-    Error::SyncError((format!(
-        "malformed authoritative purge page: {}",
-        detail.into()
-    )).into())
+    Error::SyncError((format!("malformed authoritative purge page: {}", detail.into())).into())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn take_validated_ordinary_purges(
     changeset: &mut WireChangeSet,
     since_lsn: Lsn,
@@ -700,7 +717,10 @@ impl SyncClient {
             .await
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub async fn bind_application_table_policy_with_read_memory(
         &self,
         expectation: ApplicationTablePolicyExpectation,
@@ -730,7 +750,8 @@ impl SyncClient {
             .is_some_and(|registered| registered != hub)
         {
             return Err(Error::SyncError(
-                "policy request destination is not the registered hub".into()));
+                "policy request destination is not the registered hub".into(),
+            ));
         }
         // The comparison phase can fail without spending a durable incarnation or writing a binding.
         let request = BindApplicationTablePolicyRequest {
@@ -893,7 +914,10 @@ impl SyncClient {
 
     // A hub's typed refusal or cancellation reaches the caller as that same
     // error kind; only transport failures become sync errors.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     async fn fetch_delivery_page(
         &self,
         since: Option<DeliveryOutcomeCursor>,
@@ -1478,8 +1502,8 @@ impl SyncClient {
             });
         }
         let count = requests.len();
-        let bytes =
-            rmp_serde::to_vec_named(&requests).map_err(|e| Error::SyncError((e.to_string()).into()))?;
+        let bytes = rmp_serde::to_vec_named(&requests)
+            .map_err(|e| Error::SyncError((e.to_string()).into()))?;
         let response = self
             .transport
             .request(
@@ -1494,13 +1518,19 @@ impl SyncClient {
         Ok(count)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn new(db: Arc<Database>, endpoint: &str, tenant_id: TenantId) -> Result<Self, Error> {
         let read_memory = db.declared_reader_memory()?;
         Self::new_with_read_memory(db, endpoint, tenant_id, read_memory)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn new_with_read_memory(
         db: Arc<Database>,
         endpoint: &str,
@@ -1527,7 +1557,10 @@ impl SyncClient {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn build(
         db: Arc<Database>,
         transport: Arc<dyn ClientTransport>,
@@ -1823,7 +1856,10 @@ impl SyncClient {
         holdbacks
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn persist_schema_sync_holdback(
         &self,
         hub_node_id: &str,
@@ -1879,11 +1915,17 @@ impl SyncClient {
     /// retained delivery. The existing retention binding is that authority's
     /// single source of truth; a different peer is refused before connection
     /// activity or row mutation.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn bind_authenticated_hub(&self) -> Result<(), Error> {
         let hub = self.hub_node_id().ok_or_else(|| {
-            Error::SyncError((
-                "sync requires the transport-authenticated authoritative hub identity".to_string()).into())
+            Error::SyncError(
+                ("sync requires the transport-authenticated authoritative hub identity"
+                    .to_string())
+                .into(),
+            )
         })?;
         self.db.register_retention_sync_peer(&hub)
     }
@@ -1892,7 +1934,10 @@ impl SyncClient {
     /// unit is engine sync work funded by the store's writer budget
     /// (`MEMORY_LIMIT`), as in [`Self::push_with_read_memory`]; this
     /// inspection makes no other read, so it takes no read budget.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn has_pending_push_changes(&self) -> Result<bool, Error> {
         self.with_pending_unit_changes(|changes| !changes.is_empty())
     }
@@ -1900,13 +1945,19 @@ impl SyncClient {
     /// The exact number of entries this client currently considers eligible
     /// for push from its durable/in-memory push watermark. Funded like
     /// [`Self::has_pending_push_changes`].
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn pending_push_change_count(&self) -> Result<usize, Error> {
         self.with_pending_unit_changes(|changes| changes.data_entry_count() + changes.ddl.len())
     }
 
     /// Inspect the pending unit while its selection is still charged.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_pending_unit_changes<T>(
         &self,
         inspect: impl FnOnce(&ChangeSet) -> T,
@@ -1925,7 +1976,10 @@ impl SyncClient {
 
     /// One local snapshot feeds both pending-work inspection APIs, so the
     /// boolean and exact count cannot diverge on direction or arrival policy.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn pending_push_changes(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -1986,7 +2040,10 @@ impl SyncClient {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn destination_reupload_epoch(&self) -> Result<Option<(Lsn, uuid::Uuid)>, Error> {
         let Some(hub_node_id) = self.hub_node_id() else {
             return Ok(None);
@@ -2094,7 +2151,8 @@ impl SyncClient {
                 })
             {
                 return Err(Error::SyncError(
-                    "restore status requires authenticated edge identity".into()));
+                    "restore status requires authenticated edge identity".into(),
+                ));
             }
             crate::custody::incarnation::StatusProbe {
                 incarnation,
@@ -2137,7 +2195,8 @@ impl SyncClient {
                 let envelope = decode_sync_envelope(&decoded_memory, &reply, Some(version))?;
                 if !matches!(envelope.message_type, MessageType::StatusResponse) {
                     return Err(Error::SyncError(
-                        "unexpected restore status response".into()));
+                        "unexpected restore status response".into(),
+                    ));
                 }
                 decoded_memory.decode_msgpack::<SyncStatusResponse>(&envelope.payload)
             }
@@ -2150,15 +2209,18 @@ impl SyncClient {
             };
             if status.refused_schema_unit_digests_ack.as_deref() != Some(&[]) {
                 return Err(Error::SyncError(
-                    "hub did not acknowledge exact refused schema lookup".into()));
+                    "hub did not acknowledge exact refused schema lookup".into(),
+                ));
             }
             if !status.refused_schema_units.is_empty() {
                 return Err(Error::SyncError(
-                    "empty refused schema lookup returned an unrelated outcome".into()));
+                    "empty refused schema lookup returned an unrelated outcome".into(),
+                ));
             }
             if verification_required && status.hub_incarnation.is_none() {
                 return Err(Error::SyncError(
-                    "restore status omitted hub incarnation".into()));
+                    "restore status omitted hub incarnation".into(),
+                ));
             }
             if let Some(current) = status.hub_incarnation {
                 let records =
@@ -2197,7 +2259,8 @@ impl SyncClient {
                 && previous.hub_incarnation != status.hub_incarnation
             {
                 return Err(Error::SyncError(
-                    "hub incarnation changed during refusal status paging".into()));
+                    "hub incarnation changed during refusal status paging".into(),
+                ));
             }
             last = Some(status);
         }
@@ -2214,7 +2277,10 @@ impl SyncClient {
     /// Query authored units one prepared batch at a time. The durable position
     /// names a unit in this deterministic traversal; neither audit history nor
     /// all candidate keys are materialized for a push.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     async fn fetch_candidate_refusals(
         &self,
         incarnation: Incarnation,
@@ -2274,8 +2340,8 @@ impl SyncClient {
             Self::next_authored_unit_batch(prepared_batches, &mut prepared_index, &mut pending)?
         {
             for key in batch {
-                let encoded =
-                    rmp_serde::to_vec(&key).map_err(|e| Error::SyncError((e.to_string()).into()))?;
+                let encoded = rmp_serde::to_vec(&key)
+                    .map_err(|e| Error::SyncError((e.to_string()).into()))?;
                 hasher.update(&(encoded.len() as u64).to_le_bytes());
                 hasher.update(&encoded);
                 candidate_count = candidate_count
@@ -2332,7 +2398,8 @@ impl SyncClient {
                         .any(|outcome| !batch.contains(&AuthoredSchemaUnitKey::from(outcome)))
                     {
                         return Err(Error::SyncError(
-                            "local refused schema fact names another unit".into()));
+                            "local refused schema fact names another unit".into(),
+                        ));
                     }
                     confirmed.extend(local);
                 }
@@ -2341,7 +2408,8 @@ impl SyncClient {
             }
             if position < checkpoint.next_index {
                 return Err(Error::SyncError(
-                    "refusal checkpoint is not at a batch boundary".into()));
+                    "refusal checkpoint is not at a batch boundary".into(),
+                ));
             }
             let digests = batch.iter().map(|key| key.digest).collect::<Vec<_>>();
             let (local, _lease) = self.db.refused_schema_local_facts(
@@ -2359,7 +2427,8 @@ impl SyncClient {
                 .any(|outcome| !batch.contains(&AuthoredSchemaUnitKey::from(outcome)))
             {
                 return Err(Error::SyncError(
-                    "local refused schema fact names another unit".into()));
+                    "local refused schema fact names another unit".into(),
+                ));
             }
             let known = local
                 .iter()
@@ -2410,16 +2479,19 @@ impl SyncClient {
             let envelope = decode_sync_envelope(&decoded_memory, &reply, Some(PROTOCOL_VERSION))?;
             if !matches!(envelope.message_type, MessageType::StatusResponse) {
                 return Err(Error::SyncError(
-                    "unexpected refused schema lookup response".into()));
+                    "unexpected refused schema lookup response".into(),
+                ));
             }
             let status: SyncStatusResponse = decoded_memory.decode_msgpack(&envelope.payload)?;
             if status.refused_schema_unit_digests_ack.as_ref() != Some(&requested) {
                 return Err(Error::SyncError(
-                    "hub did not acknowledge exact refused schema lookup".into()));
+                    "hub did not acknowledge exact refused schema lookup".into(),
+                ));
             }
             if status.hub_incarnation != Some(hub_incarnation) {
                 return Err(Error::SyncError(
-                    "hub incarnation changed during refused schema lookup".into()));
+                    "hub incarnation changed during refused schema lookup".into(),
+                ));
             }
             self.validate_refused_schema_units(
                 &status.refused_schema_units,
@@ -2431,7 +2503,8 @@ impl SyncClient {
                     || !batch.contains(&AuthoredSchemaUnitKey::from(outcome))
             }) {
                 return Err(Error::SyncError(
-                    "refused schema lookup returned an unrelated outcome".into()));
+                    "refused schema lookup returned an unrelated outcome".into(),
+                ));
             }
             #[cfg(feature = "test-seams")]
             {
@@ -2469,7 +2542,10 @@ impl SyncClient {
         Ok(hub_incarnation)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn authored_unit_keys(
         provenance: &[crate::protocol::WireDdlProvenance],
     ) -> Result<Vec<AuthoredSchemaUnitKey>, Error> {
@@ -2480,7 +2556,10 @@ impl SyncClient {
         Ok(keys)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next_authored_unit_batch(
         prepared_batches: &[PreparedPushBatch],
         prepared_index: &mut usize,
@@ -2503,7 +2582,10 @@ impl SyncClient {
         Ok((!batch.is_empty()).then_some(batch))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate_refused_schema_units(
         &self,
         outcomes: &[RefusedSchemaUnitOutcome],
@@ -2525,12 +2607,16 @@ impl SyncClient {
                 || Some(outcome.hub_incarnation) != hub_incarnation
         }) {
             return Err(Error::SyncError(
-                "refused schema outcome names another peer or store life".into()));
+                "refused schema outcome names another peer or store life".into(),
+            ));
         }
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn authored_ddl_units(
         provenance: &[crate::protocol::WireDdlProvenance],
     ) -> Result<HashMap<AuthoredSchemaUnitKey, Vec<usize>>, Error> {
@@ -2568,7 +2654,10 @@ impl SyncClient {
         Ok(units)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn refused_ddl_indexes(
         &self,
         provenance: &[crate::protocol::WireDdlProvenance],
@@ -2613,7 +2702,8 @@ impl SyncClient {
                     refused.extend(indexes);
                 } else {
                     return Err(Error::SyncError(
-                        "local refused schema fact names another unit".into()));
+                        "local refused schema fact names another unit".into(),
+                    ));
                 }
             }
         }
@@ -2629,7 +2719,10 @@ impl SyncClient {
             .clone()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn decode_push_reply(
         &self,
         reply: &[u8],
@@ -2663,11 +2756,13 @@ impl SyncClient {
         if !response.refused_schema_units.is_empty() {
             let hub = self.hub_node_id().ok_or_else(|| {
                 PushReplyError::Terminal(Error::SyncError(
-                    "refused reply lacks authenticated hub".into()))
+                    "refused reply lacks authenticated hub".into(),
+                ))
             })?;
             let edge = self.transport.local_node_id().ok_or_else(|| {
                 PushReplyError::Terminal(Error::SyncError(
-                    "refused reply lacks authenticated edge".into()))
+                    "refused reply lacks authenticated edge".into(),
+                ))
             })?;
             let incarnation = self
                 .db
@@ -2759,9 +2854,9 @@ impl SyncClient {
                 // The hub refused before handling anything: a definite,
                 // typed answer that leaves the unit pending for a retry.
                 TransportError::Refused(error) => PushRequestError::Terminal(error),
-                err => PushRequestError::Ambiguous(Error::SyncError((format!(
-                    "single-attempt push failed: {err}"
-                )).into())),
+                err => PushRequestError::Ambiguous(Error::SyncError(
+                    (format!("single-attempt push failed: {err}")).into(),
+                )),
             })?;
         self.decode_push_reply(&reply, protocol_version, read_memory.clone())
             .map_err(PushReplyError::into_request_error)
@@ -2789,9 +2884,9 @@ impl SyncClient {
                     .await;
             }
             Err(err) => {
-                return Err(PushRequestError::Terminal(Error::SyncError((format!(
-                    "push failed: {err}"
-                )).into())));
+                return Err(PushRequestError::Terminal(Error::SyncError(
+                    (format!("push failed: {err}")).into(),
+                )));
             }
         }
 
@@ -2848,20 +2943,21 @@ impl SyncClient {
                     return Err(PushRequestError::Terminal(error));
                 }
                 Err(TransportError::IncompleteReply(detail)) => {
-                    return Err(PushRequestError::Ambiguous(Error::SyncError((format!(
-                        "push response incomplete: {detail}"
-                    )).into())));
+                    return Err(PushRequestError::Ambiguous(Error::SyncError(
+                        (format!("push response incomplete: {detail}")).into(),
+                    )));
                 }
                 Err(err) => {
-                    return Err(PushRequestError::Ambiguous(Error::SyncError((format!(
-                        "push failed: {err}"
-                    )).into())));
+                    return Err(PushRequestError::Ambiguous(Error::SyncError(
+                        (format!("push failed: {err}")).into(),
+                    )));
                 }
             }
         }
         push_result.ok_or_else(|| {
-            PushRequestError::Ambiguous(Error::SyncError((
-                "push failed after retries: no response from server".to_string()).into()))
+            PushRequestError::Ambiguous(Error::SyncError(
+                ("push failed after retries: no response from server".to_string()).into(),
+            ))
         })
     }
 
@@ -2918,9 +3014,9 @@ impl SyncClient {
                     continue;
                 }
                 Err(TransportError::IncompleteReply(detail)) => {
-                    return Err(Error::SyncError((format!(
-                        "pull response incomplete: {detail}"
-                    )).into()));
+                    return Err(Error::SyncError(
+                        (format!("pull response incomplete: {detail}")).into(),
+                    ));
                 }
                 Err(err) => return Err(Error::SyncError((format!("pull failed: {err}")).into())),
             }
@@ -2950,8 +3046,9 @@ impl SyncClient {
                     _image_memory: decoded_memory.clone(),
                 })
             }
-            _ => Err(Error::SyncError((
-                "unexpected message type in pull response".to_string()).into())),
+            _ => Err(Error::SyncError(
+                ("unexpected message type in pull response".to_string()).into(),
+            )),
         }
     }
 
@@ -2977,7 +3074,10 @@ impl SyncClient {
     /// committed it the edge can always record that outcome. If even the
     /// writer budget cannot fit the unit, the push refuses with that budget's
     /// typed memory error before sending anything.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub async fn push_with_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -2994,8 +3094,11 @@ impl SyncClient {
 
         self.bind_authenticated_hub()?;
         let authenticated_hub = self.hub_node_id().ok_or_else(|| {
-            Error::SyncError((
-                "sync requires the transport-authenticated authoritative hub identity".to_string()).into())
+            Error::SyncError(
+                ("sync requires the transport-authenticated authoritative hub identity"
+                    .to_string())
+                .into(),
+            )
         })?;
         let push_lock = self
             .db
@@ -3009,7 +3112,9 @@ impl SyncClient {
             .cloned();
         // Verify connectivity only after the durable authority gate accepts
         // this authenticated ticket, even for an otherwise empty push.
-        self.ensure_connected().await.map_err(|error| Error::SyncError(error.into()))?;
+        self.ensure_connected()
+            .await
+            .map_err(|error| Error::SyncError(error.into()))?;
 
         // This life's incarnation, stamped on both the status probe and every
         // push below so the hub keys its per-edge record by (node_id,
@@ -3444,15 +3549,18 @@ impl SyncClient {
             let lineages = if batch.rows.is_empty() {
                 HashMap::new()
             } else {
-                let node_id = self.transport.local_node_id().ok_or_else(|| {
-                    Error::SyncError((
+                let node_id =
+                    self.transport.local_node_id().ok_or_else(|| {
+                        Error::SyncError((
                         "authenticated sync push requires the stable authenticated edge identity"
                             .to_string()).into())
-                })?;
+                    })?;
                 let signer = self.lineage_signer.as_ref().ok_or_else(|| {
-                    Error::SyncError((
-                        "authenticated sync push requires the transport's creator signer"
-                            .to_string()).into())
+                    Error::SyncError(
+                        ("authenticated sync push requires the transport's creator signer"
+                            .to_string())
+                        .into(),
+                    )
                 })?;
                 self.db.outbound_row_lineages(
                     &batch,
@@ -3488,9 +3596,11 @@ impl SyncClient {
                             .to_string()).into())
                 })?;
                 let signer = self.lineage_signer.as_ref().ok_or_else(|| {
-                    Error::SyncError((
-                        "authenticated schema push requires the transport's creator signer"
-                            .to_string()).into())
+                    Error::SyncError(
+                        ("authenticated schema push requires the transport's creator signer"
+                            .to_string())
+                        .into(),
+                    )
                 })?;
                 self.db.outbound_ddl_provenance(
                     &batch,
@@ -3790,14 +3900,17 @@ impl SyncClient {
                     | (false, true, (false, false)) => {}
                     (false, false, (false, false)) => {
                         if conflict.table.is_some() || conflict.mutation_kind.is_some() {
-                            return Err(Error::SyncError((
-                                "ordinary accounting conflict claims a terminal row".to_string()).into()));
+                            return Err(Error::SyncError(
+                                ("ordinary accounting conflict claims a terminal row".to_string())
+                                    .into(),
+                            ));
                         }
                         continue;
                     }
                     _ => {
-                        return Err(Error::SyncError((
-                            "terminal refusal has invalid winner diagnostics".to_string()).into()));
+                        return Err(Error::SyncError(
+                            ("terminal refusal has invalid winner diagnostics".to_string()).into(),
+                        ));
                     }
                 }
                 let matching_rows = batch
@@ -3813,13 +3926,15 @@ impl SyncClient {
                     .map(|(index, _)| index)
                     .collect::<Vec<_>>();
                 if matching_rows.len() != 1 {
-                    return Err(Error::SyncError((
-                        "terminal refusal lacks unique exact row coverage".to_string()).into()));
+                    return Err(Error::SyncError(
+                        ("terminal refusal lacks unique exact row coverage".to_string()).into(),
+                    ));
                 }
                 let row_index = matching_rows[0];
                 if !refused_indexes.insert(row_index) {
-                    return Err(Error::SyncError((
-                        "terminal refusal repeats a row diagnostic".to_string()).into()));
+                    return Err(Error::SyncError(
+                        ("terminal refusal repeats a row diagnostic".to_string()).into(),
+                    ));
                 }
                 if purged_lineage {
                     purge_refused_rows.push(batch.rows[row_index].clone());
@@ -3838,8 +3953,9 @@ impl SyncClient {
                 && !refused_indexes.is_empty()
                 && refused_indexes.len() != batch.rows.len()
             {
-                return Err(Error::SyncError((
-                    "dependency-complete refusal covers only part of the unit".to_string()).into()));
+                return Err(Error::SyncError(
+                    ("dependency-complete refusal covers only part of the unit".to_string()).into(),
+                ));
             }
             let accepted_rows = batch
                 .rows
@@ -4048,7 +4164,10 @@ impl SyncClient {
     // These are the exact transmitted batch and its existing progress bounds;
     // recovery must not replace any of them with later local state.
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     async fn finish_single_attempt_interrupted_push(
         &self,
         transport_err: Error,
@@ -4110,8 +4229,10 @@ impl SyncClient {
 
         if confirmed {
             let hub_node_id = hub.ok_or_else(|| {
-                Error::SyncError((
-                    "confirmed push did not retain its authenticated hub identity".to_string()).into())
+                Error::SyncError(
+                    ("confirmed push did not retain its authenticated hub identity".to_string())
+                        .into(),
+                )
             })?;
             if batch.rows.iter().any(|row| row.deleted) {
                 // Status proves only that this source-LSN group was consumed;
@@ -4232,8 +4353,12 @@ impl SyncClient {
                 "the hub did not acknowledge the push and its status could not confirm the batch \
                  landed ({transport_err}); status frontier={:?}, required batch={}, transmitted ceiling={}; \
                  the data may or may not have committed — run the push again to reconcile",
-                status.as_ref().and_then(|status|status.applied_push_watermark).map(|lsn|lsn.0),
-                batch_max_lsn.0, transmitted_ceiling.0
+                status
+                    .as_ref()
+                    .and_then(|status| status.applied_push_watermark)
+                    .map(|lsn| lsn.0),
+                batch_max_lsn.0,
+                transmitted_ceiling.0
             ),
         })
     }
@@ -4275,14 +4400,18 @@ impl SyncClient {
         .await
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     async fn pull_with_initial_adoption_and_status_probe(
         &self,
         initial_adoption: SyncAdoption,
         probe_status: bool,
         _caller_read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, Error> {
-        let _caller_read_memory: contextdb_core::read_memory::ReadMemoryOwner = _caller_read_memory.into();
+        let _caller_read_memory: contextdb_core::read_memory::ReadMemoryOwner =
+            _caller_read_memory.into();
 
         // Receiving and applying a pulled page is this edge's own sync work:
         // the rows it carries are funded by the writer budget (MEMORY_LIMIT),
@@ -4300,12 +4429,15 @@ impl SyncClient {
             flag: &self.pull_in_progress,
         };
         self.bind_authenticated_hub()?;
-        self.ensure_connected().await.map_err(|error| Error::SyncError(error.into()))?;
-        let authenticated_hub = self.hub_node_id().ok_or_else(|| {
-            Error::SyncError((
+        self.ensure_connected()
+            .await
+            .map_err(|error| Error::SyncError(error.into()))?;
+        let authenticated_hub =
+            self.hub_node_id().ok_or_else(|| {
+                Error::SyncError((
                 "authenticated sync pull requires the authenticated authoritative hub identity"
                     .to_string()).into())
-        })?;
+            })?;
         // Pull-side regression safety (contract item 4): a server whose
         // LSN clock is behind our pull watermark was restored from a stale
         // artifact — the watermark refers to a lost server history, and any
@@ -4489,8 +4621,10 @@ impl SyncClient {
                 Some(SchemaRecoveryRequest::Continue { .. })
             ) && schema_recovery_page.is_none()
             {
-                return Err(Error::SyncError((
-                    "held-table recovery continuation returned no recovery page".to_string()).into()));
+                return Err(Error::SyncError(
+                    ("held-table recovery continuation returned no recovery page".to_string())
+                        .into(),
+                ));
             }
 
             if first_page
@@ -4563,11 +4697,14 @@ impl SyncClient {
                     // Cursor is bound to a source, but the response carries no
                     // source identity. Can't validate that the response addresses
                     // the same store, so refuse the pull request entirely.
-                    return Err(Error::SyncError((format!(
-                        "pull response missing source identity for tenant {}: \
+                    return Err(Error::SyncError(
+                        (format!(
+                            "pull response missing source identity for tenant {}: \
                          cursor is bound to source {}, but response carries no source",
-                        self.tenant_id, expected
-                    )).into()));
+                            self.tenant_id, expected
+                        ))
+                        .into(),
+                    ));
                 }
             } else if let Some(served) = served_source {
                 // First page: bind to the served source
@@ -4592,9 +4729,11 @@ impl SyncClient {
                 take_validated_ordinary_purges(&mut response.changeset, purge_since, purge_cursor)?;
             let ddl_context = if !response.changeset.ddl.is_empty() {
                 let source_incarnation = served_source.ok_or_else(|| {
-                    Error::SyncError((
-                        "authenticated pull DDL requires the serving source incarnation"
-                            .to_string()).into())
+                    Error::SyncError(
+                        ("authenticated pull DDL requires the serving source incarnation"
+                            .to_string())
+                        .into(),
+                    )
                 })?;
                 crate::protocol::received_ddl_context(
                     &response.changeset,
@@ -4622,11 +4761,12 @@ impl SyncClient {
                 .enumerate()
                 .map(|(unit_index, wire)| {
                     let ddl_context = if !wire.ddl.is_empty() {
-                        let source_incarnation = served_source.ok_or_else(|| {
-                            Error::SyncError((
+                        let source_incarnation =
+                            served_source.ok_or_else(|| {
+                                Error::SyncError((
                                 "authenticated pull DDL requires the serving source incarnation"
                                     .to_string()).into())
-                        })?;
+                            })?;
                         crate::protocol::received_ddl_context(
                             &wire,
                             &self.tenant_id,
@@ -4648,13 +4788,27 @@ impl SyncClient {
             // The two wire containers describe delivery membership, not replay
             // order. Keep a connected unit intact and merge ordinary source
             // transactions around it by their sender transport positions.
-            let mut ordered_page_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
-            let ordinary_members = changes.rows.len().saturating_add(changes.edges.len()).saturating_add(changes.vectors.len());
-            ordered_page_credit.try_grow_for(ordinary_members.saturating_add(dependency_units.len()).saturating_mul(768).saturating_add(256),
-                "sync","ordered_pull_groups","Raise the declared reader memory limit to receive this page.")?;
-            let mut ordered_units = dependency_units.into_iter()
-                .map(|(index, changes, arrivals, lineages, ddl)|
-                    (index, changes, arrivals, lineages, ddl, true))
+            let mut ordered_page_credit =
+                contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
+            let ordinary_members = changes
+                .rows
+                .len()
+                .saturating_add(changes.edges.len())
+                .saturating_add(changes.vectors.len());
+            ordered_page_credit.try_grow_for(
+                ordinary_members
+                    .saturating_add(dependency_units.len())
+                    .saturating_mul(768)
+                    .saturating_add(256),
+                "sync",
+                "ordered_pull_groups",
+                "Raise the declared reader memory limit to receive this page.",
+            )?;
+            let mut ordered_units = dependency_units
+                .into_iter()
+                .map(|(index, changes, arrivals, lineages, ddl)| {
+                    (index, changes, arrivals, lineages, ddl, true)
+                })
                 .collect::<Vec<_>>();
             if changes.ddl.is_empty() {
                 let mut arrivals = arrivals;
@@ -4663,13 +4817,22 @@ impl SyncClient {
                     lineage_groups.entry(lineage.2).or_default().push(lineage);
                 }
                 for group in changes.split_by_data_lsn() {
-                    if group.is_empty() { continue; }
+                    if group.is_empty() {
+                        continue;
+                    }
                     let lsn = group.max_lsn().expect("nonempty source group");
-                    let group_arrivals = arrivals.remove(&lsn)
+                    let group_arrivals = arrivals
+                        .remove(&lsn)
                         .map(|arrival| HashMap::from([(lsn, arrival)]))
                         .unwrap_or_default();
-                    ordered_units.push((usize::MAX, group, group_arrivals,
-                        lineage_groups.remove(&lsn).unwrap_or_default(), None, false));
+                    ordered_units.push((
+                        usize::MAX,
+                        group,
+                        group_arrivals,
+                        lineage_groups.remove(&lsn).unwrap_or_default(),
+                        None,
+                        false,
+                    ));
                 }
             } else {
                 // Older ordinary-schema responses retain their established
@@ -4677,10 +4840,14 @@ impl SyncClient {
                 ordered_units.push((usize::MAX, changes, arrivals, lineages, ddl_context, false));
             }
             ordered_units.sort_by_key(|(_, changes, _, _, _, _)| {
-                changes.rows.iter().map(|row| row.lsn)
+                changes
+                    .rows
+                    .iter()
+                    .map(|row| row.lsn)
                     .chain(changes.edges.iter().map(|edge| edge.lsn))
                     .chain(changes.vectors.iter().map(|vector| vector.lsn))
-                    .chain(changes.ddl_lsn.iter().copied()).min()
+                    .chain(changes.ddl_lsn.iter().copied())
+                    .min()
             });
             let applied_page = self.db.with_authoritative_hub_received_apply(
                 &authenticated_hub, |db| {
@@ -4790,17 +4957,23 @@ impl SyncClient {
 
             if let Some(page) = schema_recovery_page {
                 if page.next_lsn > page.target_lsn {
-                    return Err(Error::SyncError((format!(
-                        "held-table recovery page cursor {} exceeds target {}",
-                        page.next_lsn.0, page.target_lsn.0
-                    )).into()));
+                    return Err(Error::SyncError(
+                        (format!(
+                            "held-table recovery page cursor {} exceeds target {}",
+                            page.next_lsn.0, page.target_lsn.0
+                        ))
+                        .into(),
+                    ));
                 }
                 if let Some((expected_target, previous_next)) = recovery_progress {
                     if page.target_lsn != expected_target {
-                        return Err(Error::SyncError((format!(
-                            "held-table recovery target changed from {} to {} mid-pull",
-                            expected_target.0, page.target_lsn.0
-                        )).into()));
+                        return Err(Error::SyncError(
+                            (format!(
+                                "held-table recovery target changed from {} to {} mid-pull",
+                                expected_target.0, page.target_lsn.0
+                            ))
+                            .into(),
+                        ));
                     }
                     if !page.complete && page.next_lsn <= previous_next {
                         return Err(Error::SyncError((format!(
@@ -4838,11 +5011,12 @@ impl SyncClient {
             }
             if stop_for_trigger_bootstrap {
                 if let Some(context) = terminal_refusal_context.as_ref() {
-                    let source = served_source.ok_or_else(|| {
-                        Error::SyncError((
+                    let source =
+                        served_source.ok_or_else(|| {
+                            Error::SyncError((
                             "terminal reconciliation trigger page omitted its source identity"
                                 .to_string()).into())
-                    })?;
+                        })?;
                     self.db
                         .with_authoritative_hub_reply(&authenticated_hub, |db| {
                             db.persist_terminal_refusal_scan_state(
@@ -4992,7 +5166,10 @@ impl SyncClient {
     /// new destination from everything the edge holds — including rows older
     /// than the previous destination's last confirmation — and no local row is
     /// deleted until the new destination confirms receipt.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn change_destination(&self, new_node_id: &str) -> Result<(), Error> {
         let result = self
             .db
@@ -5063,15 +5240,19 @@ fn decode_push_response(reply: &[u8], protocol_version: u8) -> Result<ApplyResul
     let envelope = decode_for_version(reply, protocol_version)
         .map_err(|e| PushReplyError::Malformed(Error::SyncError((e.to_string()).into())))?;
     if !matches!(envelope.message_type, MessageType::PushResponse) {
-        return Err(PushReplyError::Malformed(Error::SyncError((
-            "unexpected message type in push response".to_string()).into())));
+        return Err(PushReplyError::Malformed(Error::SyncError(
+            ("unexpected message type in push response".to_string()).into(),
+        )));
     }
     let response: PushResponse = rmp_serde::from_slice(&envelope.payload)
         .map_err(|e| PushReplyError::Malformed(Error::SyncError((e.to_string()).into())))?;
     apply_from_push_response(response)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn apply_from_push_response(response: PushResponse) -> Result<ApplyResult, PushReplyError> {
     if let Some(application_error) = response.application_error {
         return Err(PushReplyError::Terminal(match application_error {
@@ -5104,7 +5285,9 @@ fn apply_from_push_response(response: PushResponse) -> Result<ApplyResult, PushR
     response
         .result
         .ok_or_else(|| {
-            PushReplyError::Terminal(Error::SyncError(("push response missing result".to_string()).into()))
+            PushReplyError::Terminal(Error::SyncError(
+                ("push response missing result".to_string()).into(),
+            ))
         })
         .map(Into::into)
 }
@@ -5145,7 +5328,10 @@ fn table_has_usable_sync_identity(db: &Database, table: &str, meta: &TableMeta) 
 /// rows quietly dropped (the fixed silent-omission defect). A keyless table
 /// declared `SYNC OFF` is unaffected: it was never eligible to leave this
 /// machine either way, so there is nothing to refuse.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn refuse_keyless_tables_with_no_identity_fallback(
     db: &Database,
     directions: &HashMap<String, SyncDirection>,
@@ -5170,13 +5356,16 @@ pub(crate) fn refuse_keyless_tables_with_no_identity_fallback(
         if table_has_usable_sync_identity(db, &table, &meta) {
             continue;
         }
-        return Err(Error::SyncError((format!(
-            "table '{table}' has no usable sync identity — no declared PRIMARY KEY and no \
+        return Err(Error::SyncError(
+            (format!(
+                "table '{table}' has no usable sync identity — no declared PRIMARY KEY and no \
              indexed `id`-column fallback — so its rows cannot be told apart across the wire. \
              Push refuses rather than silently omitting them while reporting success. Fix one \
              of: declare a PRIMARY KEY on '{table}'; add an indexed `id` column as the fallback \
              identity; or declare '{table}' SYNC OFF."
-        )).into()));
+            ))
+            .into(),
+        ));
     }
     Ok(())
 }
@@ -5222,7 +5411,10 @@ fn drop_rows_that_arrived_by_sync_after(
 /// edge already held when it made the move. A pull from the new hub can land
 /// before the rebuild push; those later arrivals remain ordinary self-echoes
 /// and must not ride the one-time re-upload.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn checked_drop_rows_that_arrived_by_sync_after(
     db: &Database,
     changes: ChangeSet,
@@ -5230,7 +5422,7 @@ fn checked_drop_rows_that_arrived_by_sync_after(
 
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<ChangeSet, Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut changes = changes;
     // A changeset can include the older local insert that preceded a pulled
@@ -6571,6 +6763,8 @@ fn delivery_transport_error(error: crate::transport::WireError) -> Error {
         crate::transport::WireError::Resource(error) => error,
         // The caller handoff: a native terminal's strings are first built here.
         crate::transport::WireError::Native(terminal) => terminal.into_error(),
-        crate::transport::WireError::Transport(error) => Error::SyncError((error.to_string()).into()),
+        crate::transport::WireError::Transport(error) => {
+            Error::SyncError((error.to_string()).into())
+        }
     }
 }

@@ -47,7 +47,10 @@ impl Database {
     /// Import completion seam: completed routes have durable graph coverage.
     /// Replacement work remains owned by the ordinary maintenance scheduler.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn persist_import_vector_tails(&self) -> Result<bool> {
         let read_memory = self.declared_reader_memory()?;
         let mut operation = self.assert_open_operation();
@@ -180,7 +183,10 @@ impl MaintenanceContext {
     /// declared memory limit. Without an active owner, persistence opens a
     /// private reader at the shipped default reader memory and refuses any
     /// suffix whose vectors exceed it, whatever the consumer declared.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn writer_maintenance_decode(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
         crate::read_image_memory::ImageMemory::enter_writer_operation(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
@@ -195,7 +201,10 @@ impl MaintenanceContext {
     /// control and any quantized scratch -- is charged to the declared writer
     /// limit by a per-call owner, live for that one value and returned when
     /// the next value's decode begins, never accumulated across values.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn load_import_cohort(
         &self,
         site: &'static str,
@@ -216,11 +225,19 @@ impl MaintenanceContext {
         }
         #[cfg(feature = "test-seams")]
         let observed = match &owner {
-            crate::read_image_memory::ImageMemoryHandle::Arc(image) => Observation::Legacy(std::sync::Arc::downgrade(image)),
-            crate::read_image_memory::ImageMemoryHandle::Native(_) => Observation::Native(crate::read_image_memory::ImageMemoryObservation::new(&owner)),
+            crate::read_image_memory::ImageMemoryHandle::Arc(image) => {
+                Observation::Legacy(std::sync::Arc::downgrade(image))
+            }
+            crate::read_image_memory::ImageMemoryHandle::Native(_) => Observation::Native(
+                crate::read_image_memory::ImageMemoryObservation::new(&owner),
+            ),
         };
         #[cfg(feature = "test-seams")]
-        let owner_properties = (owner.labels(), owner.funded_by_writer(&self.finalization.accountant), owner.is_per_call());
+        let owner_properties = (
+            owner.labels(),
+            owner.funded_by_writer(&self.finalization.accountant),
+            owner.is_per_call(),
+        );
         let loaded = {
             let _decode = owner.enter();
             #[cfg(feature = "test-seams")]
@@ -258,12 +275,22 @@ impl MaintenanceContext {
                 Observation::Native(_) => None,
             };
             let survivor = match observed {
-                Observation::Legacy(_) => legacy_survivor.as_ref().map(|owner|
-                    ((owner.labels(), owner.funded_by_writer(&self.finalization.accountant), owner.is_per_call()), owner.held_with_call())),
+                Observation::Legacy(_) => legacy_survivor.as_ref().map(|owner| {
+                    (
+                        (
+                            owner.labels(),
+                            owner.funded_by_writer(&self.finalization.accountant),
+                            owner.is_per_call(),
+                        ),
+                        owner.held_with_call(),
+                    )
+                }),
                 // Dropping a non-final native handle changes no payload fields.
                 // The producer token observes whether that exact block survived;
                 // the immediately preceding sample adds no strong alias.
-                Observation::Native(observed) => observed.is_alive().then_some((owner_properties, held_after_load)),
+                Observation::Native(observed) => observed
+                    .is_alive()
+                    .then_some((owner_properties, held_after_load)),
             };
             self.observe_import_cohort_load(
                 site,
@@ -302,8 +329,7 @@ impl MaintenanceContext {
             cohort_through,
             workspace_bytes,
             decode_owner: owner.map_or(("", ""), |owner| owner.0.0),
-            decode_owner_funded_by_writer: owner
-                .is_some_and(|owner| owner.0.1),
+            decode_owner_funded_by_writer: owner.is_some_and(|owner| owner.0.1),
             decode_owner_per_call: owner.is_some_and(|owner| owner.0.2),
             decode_held: owner.map_or(0, |owner| owner.1),
         };
@@ -327,7 +353,10 @@ impl MaintenanceContext {
     }
 
     /// The transaction the commit index records at exactly `lsn`.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn commit_tx_at(&self, lsn: Lsn) -> Result<TxId> {
         match self
             .tx_mgr
@@ -335,14 +364,18 @@ impl MaintenanceContext {
         {
             Some((found, tx)) if found == lsn => Ok(tx),
             _ => Err(Error::Other(
-                "an import cohort's last commit is missing from the commit index".into())),
+                "an import cohort's last commit is missing from the commit index".into(),
+            )),
         }
     }
 
     /// The next cohort of a route's uncovered suffix after `covered`, never
     /// past the import's fixed `target`: whole committed LSNs, oldest first,
     /// while their decoded vectors fit this writer's cohort share.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn import_cohort_plan(
         &self,
         persistence: &RedbPersistence,
@@ -372,7 +405,10 @@ impl MaintenanceContext {
     /// target until a publication moves its coverage. Returns false when the
     /// route cannot advance now (quarantined, no build possible, no durable
     /// progress, or superseded twice): the import reports it incomplete.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn rebuild_route_to_target(
         &self,
         persistence: &Arc<RedbPersistence>,
@@ -431,7 +467,10 @@ impl MaintenanceContext {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn persist_import_vector_tails(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -491,7 +530,10 @@ impl MaintenanceContext {
         Ok(complete)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn persist_import_vector_tail_cohort(
         &self,
         persistence: &Arc<RedbPersistence>,
@@ -694,7 +736,8 @@ impl MaintenanceContext {
             })?;
         if entries.len() > count || through_lsn != cohort_through {
             return Err(Error::Other(
-                "import suffix grew beyond its admitted frontier".into()));
+                "import suffix grew beyond its admitted frontier".into(),
+            ));
         }
         let storage = match &saved {
             Some(meta) => meta.storage_id,
@@ -791,7 +834,8 @@ impl MaintenanceContext {
         )?;
         if published.change.map(|change| change.covered_lsn) <= Some(covered) {
             return Err(Error::Other(
-                "import cohort publication did not advance its coverage".into()));
+                "import cohort publication did not advance its coverage".into(),
+            ));
         }
         self.install_published_vector_catalog(&published, read_memory.clone())?;
         Ok(ImportCohort::Absorbed)
@@ -801,7 +845,10 @@ impl MaintenanceContext {
 impl MaintenanceContext {
     /// Absorb one committed cohort into the completed replacement, leaving
     /// every later cohort for a future finite scheduler wake.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn catch_up_native_import_candidate(
         &self,
         partition: &VectorPartitionRef,
@@ -875,7 +922,8 @@ impl MaintenanceContext {
             )?;
             if loaded_through != through_lsn || entries.len() > count {
                 return Err(Error::Other(
-                    "native candidate cohort changed during admission".into()));
+                    "native candidate cohort changed during admission".into(),
+                ));
             }
             Ok::<_, Error>((entries, tx, pin))
         })?;
@@ -958,7 +1006,10 @@ impl MaintenanceContext {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn native_tail_write_bound(
     plan: contextdb_vector::hnsw::paged_builder::PagedVectorBatchPlan,
 ) -> Result<usize> {
@@ -1371,11 +1422,11 @@ mod complete_candidate_catch_up_tests {
         let newest = 100_000 + LATE_COMMITS - 1;
         let nearest = {
             let fixture_answer_56 = db
-            .execute(
-                "SELECT id FROM points ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
-                &HashMap::from([("q".into(), Value::Vector(vector_for(newest)))]),
-            )
-            .unwrap();
+                .execute(
+                    "SELECT id FROM points ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1",
+                    &HashMap::from([("q".into(), Value::Vector(vector_for(newest)))]),
+                )
+                .unwrap();
             fixture_answer_56.rows().to_vec()
         };
         assert_eq!(nearest, vec![vec![Value::Int64(newest)]]);

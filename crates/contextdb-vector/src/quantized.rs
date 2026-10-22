@@ -113,8 +113,10 @@ struct RawPayloadCharge {
     header_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
     live_body_bytes: Arc<AtomicUsize>,
     live_header_bytes: Arc<AtomicUsize>,
-    _body_control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
-    _header_control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    _body_control_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    _header_control_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 
 impl Drop for RawPayloadCharge {
@@ -204,7 +206,10 @@ impl<T> SharedVectorPayload<T> {
     }
 
     /// The caller has admitted the shared header before this allocation.
-    fn promote_to_shared(&mut self, header_accountant: Option<crate::memory_budget::MemoryBudgetOwner>) {
+    fn promote_to_shared(
+        &mut self,
+        header_accountant: Option<crate::memory_budget::MemoryBudgetOwner>,
+    ) {
         if let Self::Owned(payload) = self {
             let mut charge = payload.charge.get_mut().take();
             if let Some(charge) = charge.as_mut() {
@@ -216,7 +221,9 @@ impl<T> SharedVectorPayload<T> {
                         accountant.as_ref(),
                     )
                 });
-                charge._header_control_invoice = charge.header_accountant.as_ref()
+                charge._header_control_invoice = charge
+                    .header_accountant
+                    .as_ref()
                     .and_then(|owner| owner.control_invoice());
                 charge
                     .live_header_bytes
@@ -332,17 +339,26 @@ pub fn stored_vector_value(vector: &[f32], quantization: VectorQuantization) -> 
             // A row-value projection needs the floats, not a retained stored
             // payload. Use the same grid and dequantizer directly so this
             // copy allocates only its final float vector.
-            let levels = if quantization == VectorQuantization::SQ8 { 255.0 } else { 15.0 };
+            let levels = if quantization == VectorQuantization::SQ8 {
+                255.0
+            } else {
+                15.0
+            };
             let (min, max) = vector_min_max(vector);
             let range = max - min;
-            vector.iter().map(|value| {
-                let q = if range <= f32::EPSILON {
-                    0
-                } else {
-                    (((*value - min) / range) * levels).round().clamp(0.0, levels) as u8
-                };
-                dequantize(q, levels, min, max)
-            }).collect()
+            vector
+                .iter()
+                .map(|value| {
+                    let q = if range <= f32::EPSILON {
+                        0
+                    } else {
+                        (((*value - min) / range) * levels)
+                            .round()
+                            .clamp(0.0, levels) as u8
+                    };
+                    dequantize(q, levels, min, max)
+                })
+                .collect()
         }
     }
 }

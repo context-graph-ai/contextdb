@@ -5,7 +5,10 @@ use contextdb_tx::OwnedAdjEntry;
 impl Database {
     /// Materialize only a resident selected image. Durable source-backed
     /// graphs have no resident accounting image and must not be scanned here.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn received_row_graph_image(
         graph: &GraphStore,
         affected_types: &HashSet<String>,
@@ -40,7 +43,10 @@ impl Database {
 
     /// Prepare both directions while the admitted borrowed source image
     /// remains available for durable projection and memory delta accounting.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_received_row_graph_image(
         edges: &[contextdb_graph::GraphAdjEntry],
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -77,7 +83,10 @@ impl Database {
     /// Copy only witnesses belonging to the affected retained row versions.
     /// The rows have already entered `working`; unrelated graph history is
     /// never enumerated, and equal endpoint siblings are resolved separately.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn copy_received_row_graph_witnesses(
         &self,
         working: &Database,
@@ -111,7 +120,9 @@ impl Database {
                         );
                         let charge = StagedCopyCharge::admit(
                             &self.finalization.accountant,
-                            contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
+                            contextdb_vector::MemoryBudgetOwner::clone(
+                                &self.finalization.vector_accountant,
+                            ),
                             bytes,
                             "stage_received_unit_row_edge_image",
                         )?;
@@ -135,7 +146,10 @@ impl Database {
     /// Select dropped owners before any detached DDL can discard their rows.
     /// `copy_owner` is retained by the received-schema stage through durable
     /// and memory publication, including the vector's backing allocation.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn received_row_graph_drop_witnesses(
         &self,
         working: &Database,
@@ -188,7 +202,10 @@ impl Database {
     /// Restamp the accepted detached mutations, never their immutable delete
     /// before-owner. Call before the ordinary received-schema restamp rewrites
     /// the row insert identities. Its canonical reverse rebuild follows this.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn restamp_received_row_graph(
         working: &Database,
         finalized: &mut WriteSet,
@@ -200,7 +217,9 @@ impl Database {
         let _read_memory: contextdb_core::read_memory::ReadMemoryOwner = _read_memory.into();
 
         let position = |owner: &contextdb_tx::RowEdgeOwner| {
-            accepted_positions.iter().find(|((table, row), _)| table == &owner.table && *row == owner.row_id)
+            accepted_positions
+                .iter()
+                .find(|((table, row), _)| table == &owner.table && *row == owner.row_id)
                 .map_or(local_lsn, |(_, lsn)| *lsn)
         };
         // A paged working graph stores its row authority in the private row
@@ -211,12 +230,21 @@ impl Database {
                 // The canonical prepared row is still in its original source
                 // custody. The paged physical replacement is installed only
                 // after this joint row/edge identity validation and restamp.
-                let row = finalized.relational_inserts.iter().rev().find_map(|(table, row)| {
-                    (table == &owned.owner.table && row.row_id == owned.owner.row_id)
-                        .then_some(row)
-                }).ok_or_else(|| Error::SyncError("received row graph has no canonical row authority".into()))?;
+                let row = finalized
+                    .relational_inserts
+                    .iter()
+                    .rev()
+                    .find_map(|(table, row)| {
+                        (table == &owned.owner.table && row.row_id == owned.owner.row_id)
+                            .then_some(row)
+                    })
+                    .ok_or_else(|| {
+                        Error::SyncError("received row graph has no canonical row authority".into())
+                    })?;
                 if !super::row_graph::row_graph_matches_final_row(owned, &owned.owner.table, row) {
-                    return Err(Error::SyncError("received row graph differs from its private row authority".into()));
+                    return Err(Error::SyncError(
+                        "received row graph differs from its private row authority".into(),
+                    ));
                 }
             }
         }
@@ -230,7 +258,8 @@ impl Database {
                     != Some(owned.owner.table_generation)
                 {
                     return Err(Error::SyncError(
-                        "received row witness has the wrong receiver table generation".into()));
+                        "received row witness has the wrong receiver table generation".into(),
+                    ));
                 }
             }
         }
@@ -270,14 +299,18 @@ impl Database {
             || deletes.windows(2).any(|p| p[0].0.owner == p[1].0.owner)
         {
             return Err(Error::SyncError(
-                "received row graph repeats an exact owner".into()));
+                "received row graph repeats an exact owner".into(),
+            ));
         }
         // Both directions are still private. No live graph state changes if
         // validation refuses; the detached image is simply discarded.
         for adjacency in [
             &working.graph_store.forward_adj,
             &working.graph_store.reverse_adj,
-        ].into_iter().filter(|_| !working.graph_store.is_source_backed()) {
+        ]
+        .into_iter()
+        .filter(|_| !working.graph_store.is_source_backed())
+        {
             seen.fill(0);
             for graph in adjacency.write().values_mut().flatten() {
                 let Some(owner) = graph.row_owner.as_mut() else {
@@ -286,13 +319,15 @@ impl Database {
                 if let Ok(at) = inserts.binary_search_by(|edge| edge.owner.cmp(owner)) {
                     if seen[at] != 0 {
                         return Err(Error::SyncError(
-                            "received graph image repeats an inserted owner".into()));
+                            "received graph image repeats an inserted owner".into(),
+                        ));
                     }
                     seen[at] = 1;
                     let before = inserts[at];
                     if graph.entry != before.entry {
                         return Err(Error::SyncError(
-                            "received insert witness differs from its exact staged owner".into()));
+                            "received insert witness differs from its exact staged owner".into(),
+                        ));
                     }
                     let accepted_lsn = position(owner);
                     owner.created_tx = receiver_tx;
@@ -304,7 +339,8 @@ impl Database {
                     let marker = inserts.len() + at;
                     if seen[marker] != 0 {
                         return Err(Error::SyncError(
-                            "received graph image repeats a deleted owner".into()));
+                            "received graph image repeats a deleted owner".into(),
+                        ));
                     }
                     seen[marker] = 1;
                     let (before, detached_tx) = deletes[at];
@@ -317,14 +353,16 @@ impl Database {
                         || !graph.entry.properties.is_empty()
                     {
                         return Err(Error::SyncError(
-                            "received delete witness differs from its exact staged owner".into()));
+                            "received delete witness differs from its exact staged owner".into(),
+                        ));
                     }
                     graph.entry.deleted_tx = Some(receiver_tx);
                 }
             }
             if seen.iter().any(|mark| *mark != 1) {
                 return Err(Error::SyncError(
-                    "received graph image is missing a finalized owner".into()));
+                    "received graph image is missing a finalized owner".into(),
+                ));
             }
         }
         drop(inserts);

@@ -292,7 +292,10 @@ impl StatementRows {
                 })
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn make_mut<'a>(
         snapshot: &'a mut Arc<Self>,
         reserve: &mut impl FnMut(usize) -> Result<Arc<dyn StagedPostingCharge>>,
@@ -311,7 +314,10 @@ impl StatementRows {
         }
         Ok(Arc::get_mut(snapshot).expect("private statement row owner"))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare(
         snapshot: &Arc<Self>,
         row: &VersionedRow,
@@ -530,7 +536,10 @@ impl StatementRows {
         }
         self.indexes.retain(|_, index| !index.postings.is_empty());
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve_removal_control(
         &self,
         bytes: usize,
@@ -542,7 +551,10 @@ impl StatementRows {
             ._charge
             .reserve_copy(bytes)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_removal(snapshot: &Arc<Self>) -> Result<PreparedStatementRemoval> {
         let replacement = if Self::image_shared(snapshot) {
             let Some(owner) = snapshot.rows.values().next() else {
@@ -557,7 +569,10 @@ impl StatementRows {
         };
         Ok(PreparedStatementRemoval { replacement })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_delete(
         snapshot: &Arc<Self>,
         row: RowId,
@@ -640,7 +655,10 @@ impl StatementRows {
         }
         private.reconcile(false);
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove(snapshot: &mut Arc<Self>, row: RowId) -> Result<()> {
         let Some(owner) = snapshot.rows.get(&row) else {
             return Ok(());
@@ -673,7 +691,10 @@ impl NativeEagerRow {
     /// The caller first pairs the genuine copied body, invoice and original
     /// reservation metadata in `original`. Every subsequent refusal leaves
     /// that complete owner on the stack; no published source is changed.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare(
         original: crate::staged_source::AdmittedEagerSourceRow,
         sequence: usize,
@@ -686,7 +707,8 @@ impl NativeEagerRow {
         let mut owned_keys = crate::staged_source::SourceBuffer::with_capacity(keys.len(), funder)?;
         if owned_keys.capacity() != keys.len() {
             return Err(contextdb_core::Error::Other(
-                "eager key buffer allocation capacity mismatch".into()));
+                "eager key buffer allocation capacity mismatch".into(),
+            ));
         }
         for (name, key) in keys {
             let name = crate::staged_source::SourceName::new(name, funder)?;
@@ -738,7 +760,10 @@ impl NativeEagerRow {
         &self.0.schema
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve_private_original_copy(
         &self,
         bytes: usize,
@@ -792,7 +817,10 @@ struct NativeImageBody<T> {
 }
 
 impl<T> NativeImage<T> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare(value: T, funder: &crate::staged_source::SourceFunder) -> Result<Self> {
         let control =
             crate::staged_source::FundedArc::<NativeImageBody<T>>::prepare(funder.clone())?;
@@ -904,7 +932,10 @@ struct NativeStatementKeyBody {
     _charge: crate::staged_source::SourceCharge,
 }
 impl NativeStatementKey {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare(
         key: &IndexKey,
         row: RowId,
@@ -1052,7 +1083,10 @@ impl NativeStatementRoot {
         })?;
         Some((key.position(), self.row(*row)?.row()))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_insert(
         &self,
         row: NativeEagerRow,
@@ -1143,7 +1177,10 @@ impl NativeStatementRoot {
             funder,
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_remove(
         &self,
         id: RowId,
@@ -1170,7 +1207,10 @@ impl NativeStatementRoot {
             funder,
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn remove_postings(
         mut indexes: crate::staged_source::Link<
             crate::staged_source::SourceName,
@@ -2207,7 +2247,10 @@ impl NativeStatementBorrow<'_> {
 }
 
 impl NativeStatementRoot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_exact_row(
         &self,
         row: NativeEagerRow,
@@ -2216,7 +2259,8 @@ impl NativeStatementRoot {
         use crate::staged_source::{Entry, FundedArc, insert, remove_by};
         if row.sequence() >= self.next_sequence {
             return Err(contextdb_core::Error::Other(
-                "exact statement sequence mismatch".into()));
+                "exact statement sequence mismatch".into(),
+            ));
         }
         let next_sequence = self.next_sequence;
         let id = row.row().row_id;
@@ -2297,7 +2341,10 @@ impl NativeStatementRoot {
 }
 
 impl NativeEagerRow {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_exact_cell(
         cell: &crate::staged_source::RowCellHandle,
         funder: &crate::staged_source::SourceFunder,
@@ -2305,7 +2352,8 @@ impl NativeEagerRow {
         let custody = cell.custody.lock();
         let Some(crate::staged_source::RowCustody::Sealed { row, .. }) = custody.as_ref() else {
             return Err(contextdb_core::Error::Other(
-                "unsealed native exact cell".into()));
+                "unsealed native exact cell".into(),
+            ));
         };
         let original = funder.copy_eager_row(row)?;
         let control =
@@ -2327,21 +2375,28 @@ impl NativeEagerRow {
 }
 
 impl NativeEagerRow {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn validate_exact_funder(
         &self,
         funder: &crate::staged_source::SourceFunder,
     ) -> Result<()> {
         if !self.0.is_funded_by(funder) {
             return Err(contextdb_core::Error::Other(
-                "native exact row control funding mismatch".into()));
+                "native exact row control funding mismatch".into(),
+            ));
         }
         self.0.original.validate_exact_funder(funder)
     }
 }
 
 impl NativeEagerRow {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_original_row_for(
         &self,
         funder: &crate::staged_source::SourceFunder,
@@ -2355,7 +2410,10 @@ impl NativeEagerRow {
 }
 
 impl NativeEagerRow {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_original_vector_input_for(
         &self,
         input: crate::staged_source::BorrowedOriginalVectorCopyInput<'_>,
@@ -2382,7 +2440,10 @@ impl NativeEagerRow {
 }
 
 impl NativeEagerRow {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_changed_original_row_for(
         &self,
         expected: &VersionedRow,
@@ -2399,7 +2460,10 @@ impl NativeEagerRow {
             .copy_original_row_for(replacement, funder)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_changed_original_eager_row_for(
         &self,
         expected: &VersionedRow,
@@ -2414,7 +2478,10 @@ impl NativeEagerRow {
         ))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_changed_exact_cell(
         cell: &crate::staged_source::RowCellHandle,
         original: crate::staged_source::AdmittedEagerSourceRow,

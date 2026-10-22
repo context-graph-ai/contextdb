@@ -206,7 +206,10 @@ fn a_filtered_identity_candidate_binds_the_saved_body_to_its_physical_key() {
         2,
         "both matching identities are selected"
     );
-    assert_eq!(intact.trace().index_used.as_deref(), Some("candidates_label"));
+    assert_eq!(
+        intact.trace().index_used.as_deref(),
+        Some("candidates_label")
+    );
     owner
         .__damage_first_saved_row_for_test("candidates", true)
         .expect("swap the first saved body after owner open");

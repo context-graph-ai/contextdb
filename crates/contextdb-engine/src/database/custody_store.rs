@@ -38,7 +38,10 @@ pub(crate) struct CustodyDelta {
 
 impl Database {
     // The existing outbound builder delegates manifested membership.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn dependency_complete_outbound_units(
         &self,
         changes: ChangeSet,
@@ -50,26 +53,48 @@ impl Database {
 
         let mut ordinary = ChangeSet::default();
         let mut connected = Vec::new();
-        for (group,is_connected) in self.connected_delivery_groups(changes,vector_copy_owner,read_memory.clone())? {
+        for (group, is_connected) in
+            self.connected_delivery_groups(changes, vector_copy_owner, read_memory.clone())?
+        {
             if is_connected {
-                connected.push(OutboundSyncUnit { changes: group, dependency_complete: true });
+                connected.push(OutboundSyncUnit {
+                    changes: group,
+                    dependency_complete: true,
+                });
             } else {
-                ordinary.rows.extend(group.rows); ordinary.edges.extend(group.edges);
-                ordinary.vectors.extend(group.vectors); ordinary.ddl.extend(group.ddl); ordinary.ddl_lsn.extend(group.ddl_lsn);
+                ordinary.rows.extend(group.rows);
+                ordinary.edges.extend(group.edges);
+                ordinary.vectors.extend(group.vectors);
+                ordinary.ddl.extend(group.ddl);
+                ordinary.ddl_lsn.extend(group.ddl_lsn);
             }
         }
         if !ordinary.is_empty() {
-            connected.extend(crate::custody::outbound::units(self,ordinary,confirmed,
-                vector_copy_owner,read_memory.clone())?);
+            connected.extend(crate::custody::outbound::units(
+                self,
+                ordinary,
+                confirmed,
+                vector_copy_owner,
+                read_memory.clone(),
+            )?);
         }
-        connected.sort_by_key(|unit| unit.changes.rows.iter().map(|row|row.lsn)
-            .chain(unit.changes.edges.iter().map(|edge|edge.lsn))
-            .chain(unit.changes.vectors.iter().map(|vector|vector.lsn))
-            .chain(unit.changes.ddl_lsn.iter().copied()).min());
+        connected.sort_by_key(|unit| {
+            unit.changes
+                .rows
+                .iter()
+                .map(|row| row.lsn)
+                .chain(unit.changes.edges.iter().map(|edge| edge.lsn))
+                .chain(unit.changes.vectors.iter().map(|vector| vector.lsn))
+                .chain(unit.changes.ddl_lsn.iter().copied())
+                .min()
+        });
         Ok(connected)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_parent_refs(
         &self,
         row: &RowChange,
@@ -125,7 +150,10 @@ impl Database {
         }
         Ok(parents)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn with_custody_store<T>(
         &self,
         f: impl FnOnce(&mut Store) -> Result<T>,
@@ -134,14 +162,20 @@ impl Database {
     }
     /// The latest published writer root. Commit preparation validates and
     /// retires against it, so it sees every commit published before this one.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn latest_custody_root(
         &self,
     ) -> Result<crate::persistence::writer_source::WriterSnapshotHandle> {
         super::writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?
             .ok_or_else(|| Error::Other("writer publication has no durable root".into()))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_custody_store_at<T>(
         &self,
         at: CustodyRoot,
@@ -478,9 +512,9 @@ impl Database {
         };
         let unused = accountant.usage().used;
         if unused != 0 {
-            return Err(Error::Other((format!(
-                "an unused durable store holds {unused} bytes"
-            )).into()));
+            return Err(Error::Other(
+                (format!("an unused durable store holds {unused} bytes")).into(),
+            ));
         }
         // The first durable read creates the memo.
         store.ensure_companion_memo()?;
@@ -601,7 +635,11 @@ impl Database {
             ("admission_certificate", Record::ObjectAdmission(admission)) => {
                 admission.certificate[0] ^= 1;
             }
-            _ => return Err(Error::Other((format!("no mutation {mutation} for {key}")).into())),
+            _ => {
+                return Err(Error::Other(
+                    (format!("no mutation {mutation} for {key}")).into(),
+                ));
+            }
         }
         encode(&record)
     }
@@ -854,7 +892,10 @@ impl Database {
         ));
         Ok(Some(out))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_records(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -867,7 +908,10 @@ impl Database {
             read_memory.clone(),
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_records_in(
         &self,
         selectors: &[String],
@@ -879,7 +923,10 @@ impl Database {
     }
     /// The operation memory of one custody read: its own control is admitted
     /// to the reader before the shared owner exists.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn custody_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -891,7 +938,10 @@ impl Database {
             read_memory,
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn custody_records_in_at<S: AsRef<str>>(
         &self,
         at: CustodyRoot,
@@ -903,7 +953,10 @@ impl Database {
         let memory = self.custody_read_memory(read_memory)?;
         self.custody_select_at(at, memory, selectors)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn custody_select_at<S: AsRef<str>>(
         &self,
         at: CustodyRoot,
@@ -916,7 +969,10 @@ impl Database {
             Ok(records)
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verify_selected_custody_records(&self, store: &Store, records: &[Record]) -> Result<()> {
         // A durable answer was decoded and verified from the persisted bytes.
         if store.is_durable() {
@@ -942,7 +998,10 @@ impl Database {
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_table(
         &self,
         table: &str,
@@ -957,7 +1016,10 @@ impl Database {
             Ok(records)
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_rows(
         &self,
         rows: &[crate::custody::records::RowRef],
@@ -972,7 +1034,10 @@ impl Database {
             Ok(records)
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_authority(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -985,7 +1050,10 @@ impl Database {
             read_memory.clone(),
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_submission(
         &self,
         submission: uuid::Uuid,
@@ -999,7 +1067,10 @@ impl Database {
             read_memory.clone(),
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_root(
         &self,
         root: &crate::custody::records::RowRef,
@@ -1039,7 +1110,10 @@ impl Database {
         let answer_memory = self.custody_read_memory(read_memory)?;
         self.custody_select_at(CustodyRoot::Operation, answer_memory, selectors.as_slice())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_pending_manifests(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1050,7 +1124,10 @@ impl Database {
         self.with_custody_store(|store| store.pending(memory, self))
     }
     // Only complete adjudication may publish a batch bookmark.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn finish_custody_push(
         &self,
         receipt: &SyncApplyReceipt,
@@ -1077,7 +1154,10 @@ impl Database {
     // Retain ordinary arbitration, provenance and diagnostics
     // while holding its receipt at the already-adjudicated batch frontier.
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_custody_remainder(
         &self,
         changes: ChangeSet,
@@ -1122,7 +1202,10 @@ impl Database {
             read_memory.clone(),
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn custody_row(
         &self,
         reference: &crate::custody::records::RowRef,
@@ -1156,7 +1239,10 @@ impl Database {
     // A replacement or deletion ends ownership of the
     // previous committed manifest. Preserve its signed history and terminals;
     // current rows require a registration from their own writing transaction.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn retire_changed_custody_roots(
         &self,
         ws: &mut WriteSet,
@@ -1348,7 +1434,10 @@ impl Database {
     }
 
     /// The resident form, for a store without a durable writer root.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn retire_changed_custody_roots_resident(
         &self,
         ws: &mut WriteSet,
@@ -1455,7 +1544,10 @@ impl Database {
     /// is lent before source/peer guards and its commit boundary fixes the
     /// published base. No mutable ordinary WriteSet or old custody debit is
     /// used to price the independently allocated native delete targets.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn retire_changed_custody_roots_in_prepared_write_set(
         &self,
         original: &OwnedMemoryReservation,
@@ -1464,78 +1556,174 @@ impl Database {
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        use crate::custody::canonical::{finite_bytes_owned, prepare_string_owned};
         use crate::custody::preparation::{BorrowedHex, OwnedPreparationValue};
         use crate::custody::records::RowRef;
-        use crate::custody::canonical::{finite_bytes_owned, prepare_string_owned};
         let count = held.read().relational_deletes.len();
-        if count == 0 { return Ok(()); }
+        if count == 0 {
+            return Ok(());
+        }
         let delivery_table = |table: &str| {
-            self.relational_store.table_meta.read().iter().any(|(name, meta)|
-                meta.delivery_manifest_tables.as_ref().is_some_and(|members|
-                    name == table || members.iter().any(|member| member == table)))
+            self.relational_store
+                .table_meta
+                .read()
+                .iter()
+                .any(|(name, meta)| {
+                    meta.delivery_manifest_tables
+                        .as_ref()
+                        .is_some_and(|members| {
+                            name == table || members.iter().any(|member| member == table)
+                        })
+                })
         };
-        if !held.read().relational_deletes.iter().any(|(table, _, _)| delivery_table(table)) {
+        if !held
+            .read()
+            .relational_deletes
+            .iter()
+            .any(|(table, _, _)| delivery_table(table))
+        {
             return Ok(());
         }
         let published = self.tx_mgr.capture_published_read();
         let snapshot = published.snapshot;
-        let _read = self.enter_writer_read(writer_read::durable_root(published.handle)?, read_memory.clone());
+        let _read = self.enter_writer_read(
+            writer_read::durable_root(published.handle)?,
+            read_memory.clone(),
+        );
         let mut selectors = OwnedPreparationValue::<Vec<String>>::prepare_names(self, count)?;
         for (table, row_id, _) in held.read().relational_deletes {
-            if !delivery_table(table) { continue; }
+            if !delivery_table(table) {
+                continue;
+            }
             let mut row_credit = contextdb_core::read_memory::ReadCredit::new(read_memory.clone());
-            let Some(row) = self.committed_row_at_admitted(table, *row_id, snapshot,
-                &mut row_credit, read_memory.clone())? else { continue; };
+            let Some(row) = self.committed_row_at_admitted(
+                table,
+                *row_id,
+                snapshot,
+                &mut row_credit,
+                read_memory.clone(),
+            )?
+            else {
+                continue;
+            };
             self.with_owned_delivery_meta(table, |meta| {
                 let key_memory = std::cell::RefCell::new(
-                    crate::memory_accounting::reserve_preparation_from_original(original, 0,
-                        "delivery", "custody_retire_identity", "Reduce selected metadata or raise MEMORY_LIMIT.")?);
-                let key = crate::sync_types::natural_key_from_row_values_admitted(meta, &row.values, &|bytes|
-                    crate::memory_accounting::grow_preparation_from_original(&mut key_memory.borrow_mut(), bytes,
-                        "delivery", "custody_retire_identity", "Reduce selected metadata or raise MEMORY_LIMIT."))?;
-                let Some(key) = key else { return Ok(()); };
-                crate::memory_accounting::grow_preparation_from_original(&mut key_memory.borrow_mut(), table.len(),
-                    "delivery", "custody_retire_identity", "Reduce selected metadata or raise MEMORY_LIMIT.")?;
-                let reference = RowRef { table: crate::memory_accounting::preparation_copy_string(table)?, key };
-                let bytes = finite_bytes_owned(self, |encoder| { reference.encode_finite(encoder); Ok(()) })?;
-                let selector = bytes.with_value(|bytes|
-                    prepare_string_owned(self, format_args!("@row:{}", BorrowedHex(bytes))))?;
+                    crate::memory_accounting::reserve_preparation_from_original(
+                        original,
+                        0,
+                        "delivery",
+                        "custody_retire_identity",
+                        "Reduce selected metadata or raise MEMORY_LIMIT.",
+                    )?,
+                );
+                let key = crate::sync_types::natural_key_from_row_values_admitted(
+                    meta,
+                    &row.values,
+                    &|bytes| {
+                        crate::memory_accounting::grow_preparation_from_original(
+                            &mut key_memory.borrow_mut(),
+                            bytes,
+                            "delivery",
+                            "custody_retire_identity",
+                            "Reduce selected metadata or raise MEMORY_LIMIT.",
+                        )
+                    },
+                )?;
+                let Some(key) = key else {
+                    return Ok(());
+                };
+                crate::memory_accounting::grow_preparation_from_original(
+                    &mut key_memory.borrow_mut(),
+                    table.len(),
+                    "delivery",
+                    "custody_retire_identity",
+                    "Reduce selected metadata or raise MEMORY_LIMIT.",
+                )?;
+                let reference = RowRef {
+                    table: crate::memory_accounting::preparation_copy_string(table)?,
+                    key,
+                };
+                let bytes = finite_bytes_owned(self, |encoder| {
+                    reference.encode_finite(encoder);
+                    Ok(())
+                })?;
+                let selector = bytes.with_value(|bytes| {
+                    prepare_string_owned(self, format_args!("@row:{}", BorrowedHex(bytes)))
+                })?;
                 selector.with_value(|name| selectors.push_name(name))
             })?;
         }
         selectors.sort_dedup_names()?;
-        if selectors.with_value(Vec::is_empty) { return Ok(()); }
-        let selected = selectors.with_value(|keys|
-            self.custody_records_in_at(CustodyRoot::Latest, keys.as_slice(), read_memory.clone()))?;
-        let capacity = selected.iter().filter(|record| matches!(record, Record::Manifest(_))).count();
+        if selectors.with_value(Vec::is_empty) {
+            return Ok(());
+        }
+        let selected = selectors.with_value(|keys| {
+            self.custody_records_in_at(CustodyRoot::Latest, keys.as_slice(), read_memory.clone())
+        })?;
+        let capacity = selected
+            .iter()
+            .filter(|record| matches!(record, Record::Manifest(_)))
+            .count();
         let mut retired = OwnedPreparationValue::<Vec<String>>::prepare_names(self, capacity)?;
         for record in selected.iter() {
-            let Record::Manifest(manifest) = record else { continue; };
-            let owned = self.custody_select_at(CustodyRoot::Latest,
+            let Record::Manifest(manifest) = record else {
+                continue;
+            };
+            let owned = self.custody_select_at(
+                CustodyRoot::Latest,
                 self.custody_read_memory(read_memory.clone())?,
-                &[crate::custody::store::Selector::submission(manifest.id)?])?;
-            if !owned.iter().any(|record| matches!(record, Record::Root { life, submission }
-                if *life == manifest.root_life && *submission == manifest.id)) { continue; }
-            let bytes = finite_bytes_owned(self, |encoder| { manifest.root_life.encode_finite(encoder); Ok(()) })?;
-            let key = bytes.with_value(|bytes|
-                prepare_string_owned(self, format_args!("delivery_root.v1.{}", BorrowedHex(bytes))))?;
+                &[crate::custody::store::Selector::submission(manifest.id)?],
+            )?;
+            if !owned.iter().any(|record| {
+                matches!(record, Record::Root { life, submission }
+                if *life == manifest.root_life && *submission == manifest.id)
+            }) {
+                continue;
+            }
+            let bytes = finite_bytes_owned(self, |encoder| {
+                manifest.root_life.encode_finite(encoder);
+                Ok(())
+            })?;
+            let key = bytes.with_value(|bytes| {
+                prepare_string_owned(
+                    self,
+                    format_args!("delivery_root.v1.{}", BorrowedHex(bytes)),
+                )
+            })?;
             key.with_value(|key| {
-                if held.read().config_writes.iter().any(|(written, _)| written == key)
-                    || held.read().config_deletes.iter().any(|deleted| deleted == key)
-                    || retired.with_value(|keys| keys.contains(key)) { return Ok(()); }
+                if held
+                    .read()
+                    .config_writes
+                    .iter()
+                    .any(|(written, _)| written == key)
+                    || held
+                        .read()
+                        .config_deletes
+                        .iter()
+                        .any(|deleted| deleted == key)
+                    || retired.with_value(|keys| keys.contains(key))
+                {
+                    return Ok(());
+                }
                 retired.push_name(key)
             })?;
         }
         // Legacy KeyList pops in reverse order. Preserve that source order,
         // then copy each input to a separately admitted original target.
-        retired.with_value(|keys| held.with_tx_checkpoint(|held| {
-            for key in keys.iter().rev() {
-                let target = held.copy_aux(contextdb_tx::staged_source::AuxBorrow::ConfigDeletes(std::slice::from_ref(key)))?;
-                let prepared = held.prepare_aux_splice(held.read().config_deletes.len(), &[], target)?;
-                held.publish_tx(prepared);
-            }
-            Ok(())
-        }))
+        retired.with_value(|keys| {
+            held.with_tx_checkpoint(|held| {
+                for key in keys.iter().rev() {
+                    let target =
+                        held.copy_aux(contextdb_tx::staged_source::AuxBorrow::ConfigDeletes(
+                            std::slice::from_ref(key),
+                        ))?;
+                    let prepared =
+                        held.prepare_aux_splice(held.read().config_deletes.len(), &[], target)?;
+                    held.publish_tx(prepared);
+                }
+                Ok(())
+            })
+        })
     }
 
     /// Retire changed roots, then validate the commit's custody delta.
@@ -1544,7 +1732,10 @@ impl Database {
     /// so it is released only after the write set is dropped. Its own list
     /// holds at most one entry per preparation of the commit (two when a
     /// discard drain is present).
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_custody_commit(
         &self,
         ws: &mut WriteSet,
@@ -1600,7 +1791,10 @@ impl Database {
         self.prepare_custody_delta(&ws.config_writes, &ws.config_deletes, memory)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_custody_commit_in_prepared_write_set(
         &self,
         host: &EngineDatabaseTransactions,
@@ -1610,30 +1804,54 @@ impl Database {
     ) -> Result<Option<CustodyDelta>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        crate::memory_accounting::validate_owned_original(original, &self.finalization.accountant, &host.funder)?;
+        crate::memory_accounting::validate_owned_original(
+            original,
+            &self.finalization.accountant,
+            &host.funder,
+        )?;
         #[cfg(feature = "test-seams")]
-        if SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.get()) { return Ok(None); }
+        if SKIP_CUSTODY_VALIDATION_FOR_TEST.with(|skip| skip.get()) {
+            return Ok(None);
+        }
         held.with_tx_checkpoint(|held| {
             self.retire_changed_custody_roots_in_prepared_write_set(original, held, read_memory)?;
-            if !held.read().config_writes.iter().any(|(key, _)| owned_key(key))
-                && !held.read().config_deletes.iter().any(|key| owned_key(key)) { return Ok(None); }
+            if !held
+                .read()
+                .config_writes
+                .iter()
+                .any(|(key, _)| owned_key(key))
+                && !held.read().config_deletes.iter().any(|key| owned_key(key))
+            {
+                return Ok(None);
+            }
             let projection = crate::memory_accounting::persistence_original_projection(original)?;
             let memory = crate::read_image_memory::ImageMemory::operation_reader(
-                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant), projection.read_budget()?)?;
+                crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                projection.read_budget()?,
+            )?;
             #[cfg(feature = "test-seams")]
             let memory = match CUSTODY_VALIDATION_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
-                Some(limit) => crate::read_image_memory::ImageMemory::new(Some(limit))?, None => memory,
+                Some(limit) => crate::read_image_memory::ImageMemory::new(Some(limit))?,
+                None => memory,
             };
             #[cfg(feature = "test-seams")]
             {
                 LAST_RETIRED_FUNDING_FOR_TEST.with(|last| last.set(0));
-                LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST.with(|last| *last.borrow_mut() = Some(memory.clone()));
+                LAST_CUSTODY_VALIDATION_MEMORY_FOR_TEST
+                    .with(|last| *last.borrow_mut() = Some(memory.clone()));
             }
-            self.prepare_custody_delta(held.read().config_writes, held.read().config_deletes, memory)
+            self.prepare_custody_delta(
+                held.read().config_writes,
+                held.read().config_deletes,
+                memory,
+            )
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_custody_delta(
         &self,
         writes: &[(String, Vec<u8>)],
@@ -1699,7 +1917,10 @@ pub(super) struct OwnedCustodyDelta {
     changes: crate::custody::preparation::OwnedPreparationValue<Vec<OwnedCustodyChange>>,
     _publication: crate::custody::store::Publication,
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn custody_groups_owned(
     db: &Database,
     record: &Record,
@@ -1805,7 +2026,10 @@ fn custody_groups_owned(
         },
     )
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn custody_record_matches_group(db: &Database, record: &Record, group: &str) -> Result<bool> {
     custody_groups_owned(db, record)?
         .with_value(|groups| Ok(groups.iter().any(|g| g.with_value(|g| g == group))))

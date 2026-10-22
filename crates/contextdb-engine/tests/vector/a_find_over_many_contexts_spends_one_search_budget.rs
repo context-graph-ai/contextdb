@@ -304,10 +304,15 @@ fn measure_within(
     });
     let counters = work.counters();
     drop(work);
-    assert_eq!(answer.rows().len(), LIMIT, "every scope answers a full page");
+    assert_eq!(
+        answer.rows().len(),
+        LIMIT,
+        "every scope answers a full page"
+    );
     println!(
         "budget route contexts={selected} vector_search={:?} rows_examined={}",
-        answer.trace().vector_search, answer.trace().rows_examined,
+        answer.trace().vector_search,
+        answer.trace().rows_examined,
     );
     Observed {
         evaluations: counts.evaluations.load(Ordering::Relaxed),
@@ -472,7 +477,11 @@ fn expansion_work_does_not_grow_with_context_count() {
             .expect("the first find answers");
         let (answer, searched) =
             with_union_search_receipts(|| reader.execute(&sql, &params).expect("warm find"));
-        assert_eq!(answer.rows().len(), LIMIT, "every scope answers a full page");
+        assert_eq!(
+            answer.rows().len(),
+            LIMIT,
+            "every scope answers a full page"
+        );
         assert_eq!(
             searched.len(),
             1,

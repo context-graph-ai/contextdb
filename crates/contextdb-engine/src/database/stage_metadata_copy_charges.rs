@@ -44,29 +44,51 @@ impl MetadataCopyCharges {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn from_original(original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<Self> {
-        let seed = crate::memory_accounting::reserve_preparation_from_original(original, 0,
-            "sync", "received_metadata_controls", "Raise MEMORY_LIMIT to prepare received metadata.")?;
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn from_original(
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<Self> {
+        let seed = crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            0,
+            "sync",
+            "received_metadata_controls",
+            "Raise MEMORY_LIMIT to prepare received metadata.",
+        )?;
         Ok(Self {
-            charges: ManuallyDrop::new(Vec::new()), backing: None,
-            accountant: ManuallyDrop::new(crate::memory_accounting::AccountantHandle::clone(original.accountant())),
-            writer_use: ManuallyDrop::new(None), native_backing: Some(seed),
+            charges: ManuallyDrop::new(Vec::new()),
+            backing: None,
+            accountant: ManuallyDrop::new(crate::memory_accounting::AccountantHandle::clone(
+                original.accountant(),
+            )),
+            writer_use: ManuallyDrop::new(None),
+            native_backing: Some(seed),
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn from_original_array<const N: usize>(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         charges: [StagedCopyCharge; N],
     ) -> Result<Self> {
         let mut owner = Self::from_original(original)?;
         owner.grow_to(N)?;
-        for charge in charges { owner.charges.push(charge); }
+        for charge in charges {
+            owner.charges.push(charge);
+        }
         Ok(owner)
     }
 
     /// Preserve vec![a, b, c]'s exact initial capacity in the no-op stage.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn from_array<const N: usize>(
         accountant: &crate::memory_accounting::AccountantHandle,
         charges: [StagedCopyCharge; N],
@@ -80,7 +102,10 @@ impl MetadataCopyCharges {
         Ok(owner)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn push(&mut self, charge: StagedCopyCharge) -> Result<()> {
         if self.charges.len() == self.charges.capacity() {
             let required = self
@@ -107,7 +132,10 @@ impl MetadataCopyCharges {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn grow_to(&mut self, capacity: usize) -> Result<()> {
         if capacity == 0 || std::mem::size_of::<StagedCopyCharge>() == 0 {
             // Vec's zero-capacity and ZST paths make no physical allocation.
@@ -115,13 +143,19 @@ impl MetadataCopyCharges {
         }
         let layout = Layout::array::<StagedCopyCharge>(capacity).map_err(|_| capacity_error())?;
         if let Some(original) = self.native_backing.as_ref() {
-            let admission = crate::memory_accounting::reserve_preparation_from_original(original,
-                layout.size(), "sync", "received_metadata_charge_vec_growth",
-                "Raise MEMORY_LIMIT to prepare received metadata.")?;
+            let admission = crate::memory_accounting::reserve_preparation_from_original(
+                original,
+                layout.size(),
+                "sync",
+                "received_metadata_charge_vec_growth",
+                "Raise MEMORY_LIMIT to prepare received metadata.",
+            )?;
             let mut replacement = Self::from_original(original)?;
             replacement.native_backing = Some(admission);
             replacement.charges = ManuallyDrop::new(Vec::with_capacity(capacity));
-            if replacement.charges.capacity() != capacity { return Err(capacity_error()); }
+            if replacement.charges.capacity() != capacity {
+                return Err(capacity_error());
+            }
             replacement.charges.append(&mut self.charges);
             std::mem::swap(&mut self.charges, &mut replacement.charges);
             std::mem::swap(&mut self.native_backing, &mut replacement.native_backing);

@@ -11,7 +11,10 @@ pub(crate) struct StatusProbe {
     pub refused_schema_unit_digests: Vec<[u8; 32]>,
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn probe(
     db: &Database,
     tenant: &TenantId,
@@ -20,7 +23,7 @@ pub(crate) fn probe(
     incarnation: Incarnation,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<StatusProbe> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut custody_hold = crate::custody::store::SelectionHold::new(read_memory.clone());
 
@@ -54,7 +57,10 @@ pub(crate) fn probe(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn check(
     db: &Database,
     tenant: &TenantId,
@@ -64,7 +70,7 @@ pub(crate) fn check(
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<Option<Incarnation>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let Some(current) = db.existing_sync_incarnation(tenant, read_memory.clone())? else {
         return Ok(None);
@@ -97,7 +103,10 @@ pub(crate) fn check(
     db.existing_sync_incarnation(tenant, read_memory.clone())
 }
 impl StatusProbe {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn pages(
         self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,

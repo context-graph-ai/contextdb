@@ -291,7 +291,8 @@ fn t15_06_non_immutable_sequential_duplicate_insert_returns_zero_affected() {
         )
         .unwrap();
     assert_eq!(
-        second.rows_affected(), 0,
+        second.rows_affected(),
+        0,
         "non-IMMUTABLE duplicate-insert keeps the no-op semantic"
     );
     assert_eq!(row_count(db, "entities"), 1);

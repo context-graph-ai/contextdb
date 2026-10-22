@@ -28,7 +28,10 @@ impl<'a> ReadCommitContext<'a> {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn checkpoint(&self) -> Result<()> {
         (self.checkpoint)()
     }
@@ -37,7 +40,10 @@ impl<'a> ReadCommitContext<'a> {
 /// One captured pair at a time. The engine admits and owns any output copy.
 #[doc(hidden)]
 pub trait ReadCommitCursor: Send {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next_entry(&mut self, context: &ReadCommitContext<'_>) -> Result<Option<(Lsn, TxId)>>;
 }
 
@@ -45,21 +51,36 @@ pub trait ReadCommitCursor: Send {
 /// authenticate membership, absence, range completion, and durable census.
 #[doc(hidden)]
 pub trait ReadCommitDirectory: Send + Sync {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn get(&self, lsn: Lsn, context: &ReadCommitContext<'_>) -> Result<Option<TxId>>;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn contains(&self, lsn: Lsn, context: &ReadCommitContext<'_>) -> Result<bool> {
         self.get(lsn, context).map(|entry| entry.is_some())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn floor(
         &self,
         upper: Bound<Lsn>,
         context: &ReadCommitContext<'_>,
     ) -> Result<Option<(Lsn, TxId)>>;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn census(&self, context: &ReadCommitContext<'_>) -> Result<(usize, Lsn)>;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn cursor(
         &self,
         lower: Bound<Lsn>,
@@ -78,7 +99,10 @@ pub(crate) struct WritableReadCursor {
 }
 
 impl WritableReadCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn open<D: CommitDirectory + ?Sized>(
         directory: &D,
         lower: Bound<Lsn>,
@@ -117,7 +141,10 @@ pub(crate) struct CapturedLegacyCursor {
 }
 
 impl CapturedLegacyCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn open(
         directory: &dyn ReadCommitDirectory,
         lower: Bound<Lsn>,
@@ -144,7 +171,10 @@ impl CapturedLegacyCursor {
 }
 
 impl CommitDirectoryCursor for CapturedLegacyCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next_entry(&mut self) -> Result<Option<(Lsn, TxId)>> {
         self.cursor.next_entry(&ReadCommitContext::new(
             self.read_memory.clone(),
@@ -154,7 +184,10 @@ impl CommitDirectoryCursor for CapturedLegacyCursor {
 }
 
 pub trait CommitDirectoryCursor: Send {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next_entry(&mut self) -> Result<Option<(Lsn, TxId)>>;
 }
 
@@ -162,14 +195,20 @@ pub trait CommitDirectoryCursor: Send {
 /// a time. Counts and endpoint probes must not enumerate history. Mutations
 /// are bounded by their supplied candidates, not by directory length.
 pub trait CommitDirectory: Send + Sync {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn cursor(
         &self,
         lower: Bound<Lsn>,
         upper: Bound<Lsn>,
     ) -> Result<Box<dyn CommitDirectoryCursor>>;
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn cursor_with_read_context(
         &self,
         lower: Bound<Lsn>,
@@ -178,15 +217,30 @@ pub trait CommitDirectory: Send + Sync {
     ) -> Result<Box<dyn ReadCommitCursor>> {
         WritableReadCursor::open(self, lower, upper, context)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn floor(&self, upper: Bound<Lsn>) -> Result<Option<(Lsn, TxId)>>;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn census(&self) -> Result<(usize, Lsn)>;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn contains(&self, lsn: Lsn) -> Result<bool>;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn remove(&self, lsns: &[Lsn]) -> Result<u64>;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn replace(&self, retained: BTreeMap<Lsn, TxId>) -> Result<u64>;
     /// File-backed apply has already written this entry in its atomic durable
     /// transaction. Its adapter does nothing here; the memory backend inserts.
@@ -243,7 +297,10 @@ impl ReadCommitCursor for EngineMemoryReadCursor {
 }
 
 impl EngineMemoryCommitDirectory {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new(funder: SourceFunder) -> Result<Self> {
         let charge = FundedArc::<Mutex<MutableSourceMap<Lsn, TxId>>>::prepare(funder.clone())?;
         Ok(Self {
@@ -256,7 +313,10 @@ impl EngineMemoryCommitDirectory {
         &*self.state as *const Mutex<MutableSourceMap<Lsn, TxId>> as usize
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_record(&self, lsn: Lsn, tx: TxId) -> Result<PreparedMemoryCommitRecord> {
         Ok(PreparedMemoryCommitRecord {
             directory_identity: self.identity(),
@@ -282,7 +342,10 @@ impl EngineMemoryCommitDirectory {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn cursor_with_read_context(
         &self,
         lower: Bound<Lsn>,
@@ -328,7 +391,10 @@ impl EngineMemoryCommitDirectory {
             .count() as u64
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn replace(&self, retained: BTreeMap<Lsn, TxId>) -> Result<u64> {
         // Admit every replacement node before mutating the live directory.
         let mut replacement = MutableSourceMap::default();

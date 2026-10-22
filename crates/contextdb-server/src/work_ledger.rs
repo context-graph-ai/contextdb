@@ -69,7 +69,7 @@ pub fn install_node_contacts_schema_with_read_memory(
     db: &contextdb_engine::Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(), Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     if !db
         .table_names()
@@ -126,7 +126,7 @@ pub fn record_node_contact_with_read_memory(
     node_id: &str,
     now_ms: i64,
 ) -> Result<(), Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     install_node_contacts_schema_with_read_memory(db, read_memory.clone())?;
     let mut params = HashMap::new();
@@ -295,7 +295,7 @@ pub async fn claim_job_with_read_memory(
     lease_deadline_ms: i64,
     now_ms: i64,
 ) -> Result<ClaimOutcome, Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     match ledger::insert_claim_with_read_memory(
         client.db(),
@@ -384,7 +384,7 @@ fn job_has_failure_rows(
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     job_id: &str,
 ) -> Result<bool, Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), Value::Text(job_id.to_string()));
@@ -408,7 +408,7 @@ fn defers_own_submission(
     job: &JobSnapshot,
     now_ms: i64,
 ) -> Result<bool, Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     if !config.defer_own_submissions_until_deadline {
         return Ok(false);
@@ -432,10 +432,13 @@ fn defers_own_submission(
 /// table directly and decodes with the identical convention.
 fn decode_hex_payload(encoded: &str) -> Result<Vec<u8>, Error> {
     if !encoded.len().is_multiple_of(2) {
-        return Err(Error::Other((format!(
-            "work ledger: malformed payload encoding (odd length {})",
-            encoded.len()
-        )).into()));
+        return Err(Error::Other(
+            (format!(
+                "work ledger: malformed payload encoding (odd length {})",
+                encoded.len()
+            ))
+            .into(),
+        ));
     }
     let mut out = Vec::with_capacity(encoded.len() / 2);
     let bytes = encoded.as_bytes();
@@ -445,8 +448,9 @@ fn decode_hex_payload(encoded: &str) -> Result<Vec<u8>, Error> {
         match (hi, lo) {
             (Some(hi), Some(lo)) => out.push((hi * 16 + lo) as u8),
             _ => {
-                return Err(Error::Other((
-                    "work ledger: malformed payload encoding (non-hex byte)".to_string()).into()));
+                return Err(Error::Other(
+                    ("work ledger: malformed payload encoding (non-hex byte)".to_string()).into(),
+                ));
             }
         }
     }
@@ -463,7 +467,7 @@ fn read_ledger_input_rows(
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     job_id: &str,
 ) -> Result<HashMap<i64, Vec<u8>>, Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut params = HashMap::new();
     params.insert("job_id".to_string(), Value::Text(job_id.to_string()));
@@ -472,11 +476,13 @@ fn read_ledger_input_rows(
         &params,
         read_memory.clone(),
     )?;
-    let seq_idx = result.columns()
+    let seq_idx = result
+        .columns()
         .iter()
         .position(|c| c == "seq")
         .ok_or_else(|| Error::Other(("work_inputs: missing column seq".to_string()).into()))?;
-    let payload_idx = result.columns()
+    let payload_idx = result
+        .columns()
         .iter()
         .position(|c| c == "payload")
         .ok_or_else(|| Error::Other(("work_inputs: missing column payload".to_string()).into()))?;
@@ -486,17 +492,17 @@ fn read_ledger_input_rows(
             Value::Int64(n) => *n,
             Value::Timestamp(n) => *n,
             other => {
-                return Err(Error::Other((format!(
-                    "work_inputs: seq must be a number, found {other:?}"
-                )).into()));
+                return Err(Error::Other(
+                    (format!("work_inputs: seq must be a number, found {other:?}")).into(),
+                ));
             }
         };
         let payload = match &row[payload_idx] {
             Value::Text(s) => decode_hex_payload(s)?,
             other => {
-                return Err(Error::Other((format!(
-                    "work_inputs: payload must be TEXT, found {other:?}"
-                )).into()));
+                return Err(Error::Other(
+                    (format!("work_inputs: payload must be TEXT, found {other:?}")).into(),
+                ));
             }
         };
         out.insert(seq, payload);
@@ -519,7 +525,7 @@ async fn resolve_blob_job_inputs(
     job: &JobSnapshot,
     blob_store: &crate::blob_resolver::BlobStore,
 ) -> Result<ExecutionInputs, Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     let mut assembled: ExecutionInputs = Vec::new();
     let mut ledger_rows: Option<HashMap<i64, Vec<u8>>> = None;
@@ -531,10 +537,13 @@ async fn resolve_blob_job_inputs(
                 .get("hash")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    Error::Other((format!(
-                        "work ledger: blob_ref input on job {} carries no hash detail",
-                        job.job_id
-                    )).into())
+                    Error::Other(
+                        (format!(
+                            "work ledger: blob_ref input on job {} carries no hash detail",
+                            job.job_id
+                        ))
+                        .into(),
+                    )
                 })?;
             let hash = ledger::BlobHash::from_hex(hash_hex)?;
             let ticket = contextdb_engine::peer_directory::lookup_peer_ticket_with_read_memory(
@@ -543,10 +552,13 @@ async fn resolve_blob_job_inputs(
                 read_memory.clone(),
             )?
             .ok_or_else(|| {
-                Error::Other((format!(
-                    "work ledger: no peer_directory ticket enrolled for submitter {}",
-                    job.submitter_node_id
-                )).into())
+                Error::Other(
+                    (format!(
+                        "work ledger: no peer_directory ticket enrolled for submitter {}",
+                        job.submitter_node_id
+                    ))
+                    .into(),
+                )
             })?;
             let mut sink: Vec<u8> = Vec::new();
             blob_store
@@ -554,10 +566,13 @@ async fn resolve_blob_job_inputs(
                 .await
                 .map_err(|err| match err {
                     crate::blob_resolver::ResolveError::LedgerRead(err) => err,
-                    err => Error::Other((format!(
-                        "work ledger: blob_ref resolve failed for job {}: {err}",
-                        job.job_id
-                    )).into()),
+                    err => Error::Other(
+                        (format!(
+                            "work ledger: blob_ref resolve failed for job {}: {err}",
+                            job.job_id
+                        ))
+                        .into(),
+                    ),
                 })?;
             assembled.push((idx as i64, sink));
         } else {
@@ -601,7 +616,7 @@ pub async fn poll_and_execute_once_with_read_memory(
     executor: Arc<dyn WorkExecutor>,
     now_ms: i64,
 ) -> Result<PollOutcome, Error> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     tolerate_offline_sync(
         client
@@ -942,8 +957,14 @@ pub async fn run_worker_loop_with_read_budget_provider(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Error> {
     run_worker_loop_with_provider(
-        client, read_budgets.into(), config, executor, poll_interval, shutdown,
-    ).await
+        client,
+        read_budgets.into(),
+        config,
+        executor,
+        poll_interval,
+        shutdown,
+    )
+    .await
 }
 
 async fn run_worker_loop_with_provider(

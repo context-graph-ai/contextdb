@@ -1,7 +1,10 @@
 //! Verify only the selected persisted custody keys on read.
 use super::*;
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn load_custody_records_raw(
         &self,
         keys: &[String],

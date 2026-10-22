@@ -883,44 +883,97 @@ fn committed_graph_cursor_lifecycle(action: &str) {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     let s = store();
-    let edges = [Edge { id: Uuid::new_v4(), subtype: "one" }, Edge { id: Uuid::new_v4(), subtype: "two" }, Edge { id: Uuid::new_v4(), subtype: "three" }];
-    for edge in &edges { s.insert(edge); }
-    let limits = ReadLimits { cursor_page_rows: 1, cursor_idle_ms: 10, cursor_lifetime_ms: 100, ..ReadLimits::default() };
+    let edges = [
+        Edge {
+            id: Uuid::new_v4(),
+            subtype: "one",
+        },
+        Edge {
+            id: Uuid::new_v4(),
+            subtype: "two",
+        },
+        Edge {
+            id: Uuid::new_v4(),
+            subtype: "three",
+        },
+    ];
+    for edge in &edges {
+        s.insert(edge);
+    }
+    let limits = ReadLimits {
+        cursor_page_rows: 1,
+        cursor_idle_ms: 10,
+        cursor_lifetime_ms: 100,
+        ..ReadLimits::default()
+    };
     let clock = Arc::new(ManualDeadlineClock::at(1000));
-    let session = s.database.read_session_with_clock_for_test(limits, clock.clone()).unwrap();
+    let session = s
+        .database
+        .read_session_with_clock_for_test(limits, clock.clone())
+        .unwrap();
     let mut cursor = session.open_cursor(TRAVERSE, &s.key("one")).unwrap();
     assert_eq!(cursor.first_page().rows, vec![vec![Value::Uuid(s.target)]]);
-    assert!(cursor.first_page().has_more); assert!(cursor.is_live());
+    assert!(cursor.first_page().has_more);
+    assert!(cursor.is_live());
     match action {
         "purge" => {
             s.purge_one(&edges[1]);
             let error = cursor.fetch(NonZeroUsize::new(1)).unwrap_err();
-            assert!(matches!(&error, contextdb_core::Error::ReadFailure(f) if f.kind() == ReadFailureKind::AuthoritativeErasure), "held graph fetch must report typed authoritative erasure; observed {error:?}");
-            assert!(!cursor.is_live(), "purge destroys the held graph kernel before a later fetch can emit");
-            assert_eq!(s.row_count(&s.database), 2); assert_eq!(s.reachable(&s.database), vec![Value::Uuid(s.target), Value::Uuid(s.target)]);
+            assert!(
+                matches!(&error, contextdb_core::Error::ReadFailure(f) if f.kind() == ReadFailureKind::AuthoritativeErasure),
+                "held graph fetch must report typed authoritative erasure; observed {error:?}"
+            );
+            assert!(
+                !cursor.is_live(),
+                "purge destroys the held graph kernel before a later fetch can emit"
+            );
+            assert_eq!(s.row_count(&s.database), 2);
+            assert_eq!(
+                s.reachable(&s.database),
+                vec![Value::Uuid(s.target), Value::Uuid(s.target)]
+            );
         }
         "cancel" => {
-            let cancelled = OwnerReadCancellation::new(); cancelled.cancel();
-            assert!(cursor.fetch_with_cancellation(NonZeroUsize::new(1), &cancelled).is_err());
-            assert!(cursor.is_live(), "fetch cancellation preserves the existing resumable cursor contract");
+            let cancelled = OwnerReadCancellation::new();
+            cancelled.cancel();
+            assert!(
+                cursor
+                    .fetch_with_cancellation(NonZeroUsize::new(1), &cancelled)
+                    .is_err()
+            );
+            assert!(
+                cursor.is_live(),
+                "fetch cancellation preserves the existing resumable cursor contract"
+            );
             let page = cursor.fetch(NonZeroUsize::new(1)).unwrap();
-            assert_eq!(page.rows, vec![vec![Value::Uuid(s.target)]]); assert!(page.has_more);
+            assert_eq!(page.rows, vec![vec![Value::Uuid(s.target)]]);
+            assert!(page.has_more);
             let last = cursor.fetch(NonZeroUsize::new(1)).unwrap();
-            assert_eq!(last.rows, vec![vec![Value::Uuid(s.target)]]); assert!(!last.has_more);
+            assert_eq!(last.rows, vec![vec![Value::Uuid(s.target)]]);
+            assert!(!last.has_more);
         }
         "expiry" => {
             clock.advance_to(1011);
             let error = cursor.fetch(NonZeroUsize::new(1)).unwrap_err();
-            assert!(matches!(error, contextdb_core::Error::ReadFailure(f) if f.kind() == ReadFailureKind::CursorExpired));
+            assert!(
+                matches!(error, contextdb_core::Error::ReadFailure(f) if f.kind() == ReadFailureKind::CursorExpired)
+            );
             assert!(!cursor.is_live());
         }
         _ => unreachable!(),
     }
-    drop(cursor); drop(session);
+    drop(cursor);
+    drop(session);
 }
 #[test]
-fn committed_graph_cursor_purge_fences_held_results() { committed_graph_cursor_lifecycle("purge"); }
+fn committed_graph_cursor_purge_fences_held_results() {
+    committed_graph_cursor_lifecycle("purge");
+}
 #[test]
-fn committed_graph_cursor_cancellation_preserves_continuation() { committed_graph_cursor_lifecycle("cancel"); }
+fn committed_graph_cursor_cancellation_preserves_continuation() {
+    committed_graph_cursor_lifecycle("cancel");
+}
 #[test]
-fn committed_graph_cursor_expiry_is_terminal() { committed_graph_cursor_lifecycle("expiry"); }
+fn committed_graph_cursor_expiry_is_terminal() {
+    committed_graph_cursor_lifecycle("expiry");
+}

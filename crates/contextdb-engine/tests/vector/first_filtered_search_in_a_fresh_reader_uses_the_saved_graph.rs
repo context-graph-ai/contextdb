@@ -308,7 +308,8 @@ fn fresh_reader_child(path: &std::path::Path) {
     .expect("the full exact oracle completes");
     assert_eq!(eight_first.result.rows(), eight_warm.result.rows());
     assert_eq!(
-        eight_first.result.rows(), eight_exact.rows(),
+        eight_first.result.rows(),
+        eight_exact.rows(),
         "the fresh eight-Context answer preserves exact result identities"
     );
     assert!(eight_first.work <= eight_warm.work);

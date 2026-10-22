@@ -33,8 +33,12 @@ impl From<NativeConfigFailure> for Failure {
             NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e)) => {
                 Self::Unqualified(e)
             }
-            NativeConfigFailure::Storage(NativeStorageFailure::AllocatorFailed { site, layout }) =>
-                Self::ColdUnqualified(redb::NativeColdReadError::AllocatorFailed { site, layout }),
+            NativeConfigFailure::Storage(NativeStorageFailure::AllocatorFailed {
+                site,
+                layout,
+            }) => {
+                Self::ColdUnqualified(redb::NativeColdReadError::AllocatorFailed { site, layout })
+            }
             NativeConfigFailure::ColdUnqualified(e) => Self::ColdUnqualified(e),
             NativeConfigFailure::InvalidStoredText | NativeConfigFailure::InvalidIncarnation => {
                 Self::Invalid(Invalid::Codec)
@@ -52,7 +56,10 @@ pub(crate) struct NativeSelectionHold<T> {
     slots: usize,
 }
 impl<T> NativeSelectionHold<T> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new(owner: &ReadMemoryOwner, slots: usize) -> Selected<Self> {
         let layout = std::alloc::Layout::array::<T>(slots).map_err(|_| {
             Failure::Refused(NativeRefusal::Other("custody selection layout overflow"))
@@ -69,7 +76,10 @@ impl<T> NativeSelectionHold<T> {
             Vec::new()
         } else {
             let p = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }.cast::<T>())
-                .ok_or(Failure::Refused(NativeRefusal::AllocatorFailed { site: "custody selection", layout }))?;
+                .ok_or(Failure::Refused(NativeRefusal::AllocatorFailed {
+                    site: "custody selection",
+                    layout,
+                }))?;
             // The exact array is prepaid; only the empty initialized prefix is
             // adopted. retain never grows or reallocates the fixed capacity.
             unsafe { Vec::from_raw_parts(p.as_ptr(), 0, slots) }
@@ -80,7 +90,10 @@ impl<T> NativeSelectionHold<T> {
             slots,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn retain(&mut self, value: T) -> Selected<()> {
         if self.values.len() == self.slots {
             return Err(Failure::Refused(NativeRefusal::Other(
@@ -108,7 +121,10 @@ pub(crate) struct NativeBuffer {
     invoice: ReadCredit,
 }
 impl NativeBuffer {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn allocate(owner: &ReadMemoryOwner, len: usize) -> Selected<Self> {
         let layout = std::alloc::Layout::array::<u8>(len).map_err(|_| {
             Failure::Refused(NativeRefusal::Other("custody buffer layout overflow"))
@@ -125,7 +141,10 @@ impl NativeBuffer {
             Vec::new()
         } else {
             let p = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }).ok_or(
-                Failure::Refused(NativeRefusal::AllocatorFailed { site: "custody buffer", layout }),
+                Failure::Refused(NativeRefusal::AllocatorFailed {
+                    site: "custody buffer",
+                    layout,
+                }),
             )?;
             unsafe {
                 std::ptr::write_bytes(p.as_ptr(), 0, len);
@@ -138,7 +157,10 @@ impl NativeBuffer {
         self.invoice.is_funded_by(owner)
     }
     // Transfer the same already-paid exact physical bytes; no text copy occurs.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_text_parts(self) -> Selected<(String, ReadCredit)> {
         let Self { bytes, invoice } = self;
         let text = String::from_utf8(bytes).map_err(|_| Failure::Invalid(Invalid::Codec))?;
@@ -152,7 +174,10 @@ impl NativeBuffer {
     }
     /// Adopt bytes whose exact allocation `owner` already paid for. A foreign
     /// or inexact invoice refuses; the refused bytes free before their invoice.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn from_prepaid(
         bytes: Vec<u8>,
         invoice: ReadCredit,
@@ -169,7 +194,10 @@ impl NativeBuffer {
         Ok(Self { bytes, invoice })
     }
     /// Exact paid copy of borrowed bytes on the original request owner.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_from(owner: &ReadMemoryOwner, source: &[u8]) -> Selected<Self> {
         let mut copy = Self::allocate(owner, source.len())?;
         copy.bytes.copy_from_slice(source);
@@ -181,13 +209,19 @@ impl NativeBuffer {
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.bytes
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn text(&self) -> Selected<&str> {
         std::str::from_utf8(&self.bytes).map_err(|_| Failure::Invalid(Invalid::Codec))
     }
 }
 impl NativeBuffer {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn format(owner: &ReadMemoryOwner, args: std::fmt::Arguments<'_>) -> Selected<Self> {
         use std::fmt::Write;
         struct Count(usize);

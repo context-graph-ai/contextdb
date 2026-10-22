@@ -7,7 +7,10 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 pub trait StagedPostingAdmission: Send + Sync {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve(&self, bytes: usize) -> Result<Arc<dyn contextdb_tx::StagedPostingCharge>>;
 }
 
@@ -23,7 +26,10 @@ impl<S: WriteSetApplicator> ExecutorTransactions<S> {
         }
     }
     // Existing standalone/public mutations retain their genuine Legacy route.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_write_set<R>(
         &self,
         tx: TxId,
@@ -228,7 +234,8 @@ impl BoundedOrderedRowCursor {
 
         if store.uses_disk_backed_committed_bodies() {
             return Err(E::from(Error::Other(
-                "durable index capture requires a captured source".into())));
+                "durable index capture requires a captured source".into(),
+            )));
         }
 
         let indexes = store.indexes.read();
@@ -633,7 +640,10 @@ impl BoundedOrderedRowCursor {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn source_advance_charged(
         &mut self,
         position: Vec<u8>,
@@ -873,7 +883,8 @@ impl BoundedExactIndexCursor {
 
         if store.uses_disk_backed_committed_bodies() {
             return Err(E::from(Error::Other(
-                "durable index capture requires a captured source".into())));
+                "durable index capture requires a captured source".into(),
+            )));
         }
 
         let indexes = store.indexes.read();
@@ -1010,7 +1021,10 @@ fn bounded_run_bound_bytes(bound: &Bound<IndexKey>) -> usize {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bounded_index_key_heap_bytes(key: &IndexKey) -> Result<usize> {
     let mut bytes = key
         .len()
@@ -1029,14 +1043,20 @@ fn bounded_index_key_heap_bytes(key: &IndexKey) -> Result<usize> {
     Ok(bytes)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bounded_index_key_owned_bytes(key: &IndexKey) -> Result<usize> {
     std::mem::size_of::<IndexKey>()
         .checked_add(bounded_index_key_heap_bytes(key)?)
         .ok_or_else(|| Error::Other(("bounded owned index key size overflow".to_string()).into()))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn push_admitted_source_row(
     rows: &mut Vec<VersionedRow>,
     row: &VersionedRow,
@@ -1076,7 +1096,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         }
     }
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn stage_engine_row(
         &self,
         tx: TxId,
@@ -1126,7 +1149,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     }
 
     /// Stage admitted positions before publishing a row into its write set.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn stage_ordered_row(
         &self,
         ws: &mut contextdb_tx::WriteSet,
@@ -1143,7 +1169,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             .ok_or_else(|| Error::TableNotFound(table.into()))?;
         self.stage_ordered_row_from_descriptor(ws, table, row, position, meta)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn stage_ordered_row_from_descriptor(
         &self,
         ws: &mut contextdb_tx::WriteSet,
@@ -1229,7 +1258,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     /// including the overlay. Output admission must outlive the returned
     /// collection; on error the caller releases its operation reservations
     /// after this method has dropped all partial output and source windows.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn scan_with_source(
         &self,
         tx: Option<TxId>,
@@ -1243,7 +1275,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
 
     /// Filter borrowed windows before copying output; unrelated row bodies
     /// never become retained operation output.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn scan_filter_with_source(
         &self,
         tx: Option<TxId>,
@@ -1256,7 +1291,8 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         source.validate_table(table)?;
         if snapshot.0 > source.snapshot().0 {
             return Err(Error::Other(
-                "relational snapshot exceeds the captured source frontier".into()));
+                "relational snapshot exceeds the captured source frontier".into(),
+            ));
         }
         let mut cursor = source.row_cursor(table, Bound::Unbounded, Bound::Unbounded, false)?;
         let mut result = Vec::new();
@@ -1358,7 +1394,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     }
 
     /// Open a source continuation without a table-history census.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bounded_physical_cursor_from_source(
         &self,
         table: &str,
@@ -1375,17 +1414,24 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn ensure_memory_reads(&self) -> Result<()> {
         if self.store.uses_disk_backed_committed_bodies() {
             Err(Error::Other(
-                "durable relational reads require a captured source".into()))
+                "durable relational reads require a captured source".into(),
+            ))
         } else {
             Ok(())
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn ensure_table_exists(&self, table: &str) -> Result<()> {
         if self.store.table_meta.read().contains_key(table) {
             Ok(())
@@ -1398,7 +1444,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     /// Validation happens before that lock, so an error leaves both the row and
     /// its admission record in place. The callback prices only rows actually removed.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn delete_retiring_staged_charge(
         &self,
         tx: TxId,
@@ -1420,7 +1469,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn delete_retiring_staged_charge_with_presence(
         &self,
         tx: TxId,
@@ -1440,7 +1492,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn delete_retiring_staged_charge_with_undo(
         &self,
         tx: TxId,
@@ -1504,7 +1559,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     /// Number of physical versions currently addressable by a pull scan.
     /// Capturing this once gives a cursor a stable end position; later commits
     /// are outside its snapshot and do not extend its source.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bounded_table_len(&self, table: &str) -> Result<usize> {
         self.ensure_memory_reads()?;
 
@@ -1519,7 +1577,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     /// now. Later commits append past the captured end and are outside the
     /// caller's snapshot; maintenance compaction only shrinks the vector, and
     /// the pull path re-anchors by identity when it does.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn bounded_physical_cursor(&self, table: &str) -> Result<BoundedPhysicalCursor> {
         Ok(BoundedPhysicalCursor {
             position: 0,
@@ -1632,9 +1693,11 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                     }
                     None => {
                         if cursor.last_emitted.is_some() {
-                            return Err(E::from(Error::Other((
-                                "bounded physical scan lost its emitted continuation row"
-                                    .to_string()).into())));
+                            return Err(E::from(Error::Other(
+                                ("bounded physical scan lost its emitted continuation row"
+                                    .to_string())
+                                .into(),
+                            )));
                         }
                         cursor.position = 0;
                         cursor.last_inspected = None;
@@ -1736,8 +1799,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             .is_none_or(|current| current.as_slice() != key.as_slice());
         let next_generation = if key_changed {
             Some(cursor.key_generation.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded index key generation overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded index key generation overflow".to_string()).into(),
+                ))
             })?)
         } else {
             None
@@ -1752,8 +1816,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             .checked_add(output_key_bytes)
             .and_then(|bytes| bytes.checked_add(new_cursor_key_bytes))
             .ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded index clone size overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded index clone size overflow".to_string()).into(),
+                ))
             })?;
         before_clone(clone_bytes)?;
         let replacement_key = if key_changed { Some(key.clone()) } else { None };
@@ -1930,8 +1995,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 .len()
                 .checked_mul(std::mem::size_of::<crate::store::IndexEntry>())
                 .ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded exact posting size overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded exact posting size overflow".to_string()).into(),
+                    ))
                 })?;
             before_retain(retained)?;
             cursor.postings = postings.to_vec();
@@ -2017,8 +2083,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             };
             let generation = if key_changed {
                 cursor.key_generation.checked_add(1).ok_or_else(|| {
-                    E::from(Error::Other((
-                        "bounded ordered key generation overflow".to_string()).into()))
+                    E::from(Error::Other(
+                        ("bounded ordered key generation overflow".to_string()).into(),
+                    ))
                 })?
             } else {
                 cursor.key_generation
@@ -2035,8 +2102,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                         .estimated_bytes()
                         .checked_add(key_bytes)
                         .ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded ordered clone size overflow".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded ordered clone size overflow".to_string()).into(),
+                            ))
                         })?;
                     before_clone.take().expect("one membership row charge")(bytes)
                 },
@@ -2066,8 +2134,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             .get(table)
             .ok_or_else(|| E::from(Error::TableNotFound(table.to_string())))?;
         let index_name = cursor.index.as_deref().ok_or_else(|| {
-            E::from(Error::Other((
-                "bounded ordered cursor requires a selected index".to_string()).into()))
+            E::from(Error::Other(
+                ("bounded ordered cursor requires a selected index".to_string()).into(),
+            ))
         })?;
         let storage = table_indexes.get(index_name).ok_or_else(|| {
             E::from(Error::IndexNotFound {
@@ -2081,15 +2150,15 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                 .first()
                 .is_none_or(|(candidate, _)| candidate != column)
         {
-            return Err(E::from(Error::Other((format!(
-                "index {index_name} cannot order {table}.{column}"
-            )).into())));
+            return Err(E::from(Error::Other(
+                (format!("index {index_name} cannot order {table}.{column}")).into(),
+            )));
         }
         let expected_reverse = storage.columns[0].1 != direction;
         if cursor.reverse != expected_reverse {
-            return Err(E::from(Error::Other((format!(
-                "ordered cursor direction does not match index {index_name}"
-            )).into())));
+            return Err(E::from(Error::Other(
+                (format!("ordered cursor direction does not match index {index_name}")).into(),
+            )));
         }
 
         if cursor.image.is_none() {
@@ -2197,8 +2266,9 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
             .is_none_or(|current| current.as_slice() != key.as_slice());
         let next_generation = if key_changed {
             Some(cursor.key_generation.checked_add(1).ok_or_else(|| {
-                E::from(Error::Other((
-                    "bounded ordered key generation overflow".to_string()).into()))
+                E::from(Error::Other(
+                    ("bounded ordered key generation overflow".to_string()).into(),
+                ))
             })?)
         } else {
             None
@@ -2238,12 +2308,14 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
                         .estimated_bytes()
                         .checked_add(new_cursor_key_bytes)
                         .ok_or_else(|| {
-                            E::from(Error::Other((
-                                "bounded ordered clone size overflow".to_string()).into()))
+                            E::from(Error::Other(
+                                ("bounded ordered clone size overflow".to_string()).into(),
+                            ))
                         })?;
                     let before_clone = before_clone.take().ok_or_else(|| {
-                        E::from(Error::Other((
-                            "bounded ordered row charged twice".to_string()).into()))
+                        E::from(Error::Other(
+                            ("bounded ordered row charged twice".to_string()).into(),
+                        ))
                     })?;
                     before_clone(clone_bytes)
                 })?;
@@ -2280,7 +2352,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         Ok(row)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn scan_with_tx(
         &self,
         tx: Option<TxId>,
@@ -2346,7 +2421,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         Ok(result)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn scan_filter_with_tx(
         &self,
         tx: Option<TxId>,
@@ -2358,7 +2436,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         Ok(all.into_iter().filter(|r| predicate(r)).collect())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn point_lookup_with_tx(
         &self,
         tx: Option<TxId>,
@@ -2488,7 +2569,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         Some(row_id.and_then(|row_id| self.store.row_by_id(table, row_id, snapshot)))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate_state_transition(
         &self,
         tx: TxId,
@@ -2532,7 +2616,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert_with_tx(
         &self,
         tx: TxId,
@@ -2562,7 +2649,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         Ok(row_id)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert_with_row_id(
         &self,
         tx: TxId,
@@ -2579,7 +2669,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     /// As [`Self::insert_with_row_id`], but stamping the row with a birth time
     /// the caller carries rather than reading the clock. The sync-apply path
     /// uses it so a replicated row keeps the age it was written with.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert_with_row_id_at(
         &self,
         tx: TxId,
@@ -2597,7 +2690,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
     /// Stage through the normal insertion owner using the caller's captured
     /// schema and visible base-plus-overlay row, without a resident lookup.
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert_with_row_id_from_descriptor(
         &self,
         tx: TxId,
@@ -2648,7 +2744,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         Ok(row_id)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert_with_row_id_assume_no_state_machine(
         &self,
         tx: TxId,
@@ -2659,7 +2758,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         self.stage_insert_with_row_id(tx, table, row_id, values)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert_with_row_id_assume_no_state_machine_at(
         &self,
         tx: TxId,
@@ -2671,7 +2773,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         self.stage_insert_with_row_id_at(tx, table, row_id, values, created_at)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn stage_insert_with_row_id(
         &self,
         tx: TxId,
@@ -2682,7 +2787,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         self.stage_insert_with_row_id_at(tx, table, row_id, values, Wallclock::now())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn stage_insert_with_row_id_at(
         &self,
         tx: TxId,
@@ -2709,7 +2817,10 @@ impl<S: WriteSetApplicator> MemRelationalExecutor<S> {
         Ok(row_id)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn upsert_with_tx(
         &self,
         tx: TxId,
@@ -2794,7 +2905,10 @@ impl<S: WriteSetApplicator> RelationalExecutor for MemRelationalExecutor<S> {
         self.upsert_with_tx(tx, table, conflict_col, values, snapshot)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn delete(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
         self.ensure_table_exists(table)?;
         if self.store.is_immutable(table) {

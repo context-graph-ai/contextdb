@@ -73,11 +73,14 @@ struct NavigationCache {
     tick: usize,
     table_bytes: usize,
     payload_bytes: usize,
-    _control_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    _control_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 impl NavigationCache {
     fn new(accountant: Option<crate::memory_budget::MemoryBudgetOwner>) -> Self {
-        let control_invoice = accountant.as_ref().and_then(|owner| owner.control_invoice());
+        let control_invoice = accountant
+            .as_ref()
+            .and_then(|owner| owner.control_invoice());
         Self {
             accountant,
             _control_invoice: control_invoice,
@@ -403,7 +406,10 @@ impl NavigationSession {
             .try_lock()
             .is_some_and(|mut cache| cache.evict_lru())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve_for(
         &self,
         token: &mut crate::memory_budget::VectorCopyAdmission,
@@ -420,7 +426,10 @@ impl NavigationSession {
             }
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve_for_static(
         &self,
         token: &mut crate::memory_budget::VectorCopyAdmission,
@@ -437,7 +446,10 @@ impl NavigationSession {
             }
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve(
         &self,
         token: &mut crate::memory_budget::VectorCopyAdmission,
@@ -803,9 +815,15 @@ impl<'a, 's> OpenLayer<'a, 's> {
     fn bit(&self, point: PointId) -> Option<usize> {
         let index = point.0 as usize;
         let end = *self.level_ends.get(index)?;
-        let start = if index == 0 { 0 } else { self.level_ends[index - 1] };
+        let start = if index == 0 {
+            0
+        } else {
+            self.level_ends[index - 1]
+        };
         let rank = usize::try_from(point.1).ok()?;
-        if rank >= end.checked_sub(start)? { return None; }
+        if rank >= end.checked_sub(start)? {
+            return None;
+        }
         Some(self.first_bit + start + rank)
     }
 
@@ -1108,7 +1126,8 @@ impl<'a, 's> OpenLayer<'a, 's> {
                             };
                             if edges.len() > wanted {
                                 return Err(E::from(Error::Other(
-                                    "paged graph degree exceeds its policy".into())));
+                                    "paged graph degree exceeds its policy".into(),
+                                )));
                             }
                             scratch.ids.clear();
                             scratch.ids.extend_from_slice(edges);
@@ -1134,7 +1153,8 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     };
                     if edges.len() > wanted {
                         return Err(E::from(Error::Other(
-                            "paged graph degree exceeds its policy".into())));
+                            "paged graph degree exceeds its policy".into(),
+                        )));
                     }
                     scratch.ids.clear();
                     scratch
@@ -1207,7 +1227,8 @@ impl<'a, 's> OpenLayer<'a, 's> {
                         let distance = hnsw_f32_distance().eval(query.values, values);
                         if !distance.is_finite() {
                             return Err(E::from(Error::Other(
-                                "invalid paged graph distance".into())));
+                                "invalid paged graph distance".into(),
+                            )));
                         }
                         return Ok(Some(distance));
                     }
@@ -1235,7 +1256,8 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     .eval(
                         query.encoded.ok_or_else(|| {
                             E::from(Error::Other(
-                                "paged quantized graph requires an encoded query".into()))
+                                "paged quantized graph requires an encoded query".into(),
+                            ))
                         })?,
                         &point.values,
                     ),
@@ -1275,9 +1297,11 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     return Ok(None);
                 };
                 let encoded = query.encoded.ok_or_else(|| {
-                    E::from(Error::Other((
-                        "a union search opened a quantized layer without an encoded query"
-                            .to_string()).into()))
+                    E::from(Error::Other(
+                        ("a union search opened a quantized layer without an encoded query"
+                            .to_string())
+                        .into(),
+                    ))
                 })?;
                 before_distance()?;
                 Ok(Some(distance.eval(encoded, stored.get_v())))
@@ -1303,7 +1327,9 @@ struct PointVisit {
     marked: bool,
 }
 impl PointVisit {
-    fn distance(&self) -> Option<f32> { self.scored.then_some(self.score) }
+    fn distance(&self) -> Option<f32> {
+        self.scored.then_some(self.score)
+    }
     fn cache_distance(&mut self, distance: f32) {
         self.score = distance;
         self.scored = true;
@@ -1475,7 +1501,8 @@ impl Walk<'_> {
             let buckets = wanted.saturating_mul(8).div_ceil(7).next_power_of_two();
             // Hash-table growth allocates the replacement before freeing the
             // old buckets. Fund both, including the trailing control group.
-            let bytes = buckets.checked_mul(VISIT_ELEMENT_BYTES)
+            let bytes = buckets
+                .checked_mul(VISIT_ELEMENT_BYTES)
                 .and_then(|n| n.checked_add(16))
                 .ok_or_else(|| E::from(Error::Other("graph visit allocation overflow".into())))?;
             acquire(HnswSearchScratchEvent::Reserve {
@@ -1484,17 +1511,25 @@ impl Walk<'_> {
                 requested_capacity: bytes,
                 element_bytes: 1,
             })?;
-            if self.reached.try_reserve(wanted.saturating_sub(self.reached.len())).is_err() {
+            if self
+                .reached
+                .try_reserve(wanted.saturating_sub(self.reached.len()))
+                .is_err()
+            {
                 release(HnswSearchScratchEvent::Release {
                     container: HnswSearchScratchContainer::VisitedPoints,
-                    capacity: bytes, element_bytes: 1,
+                    capacity: bytes,
+                    element_bytes: 1,
                 });
-                return Err(E::from(Error::Other("cannot allocate admitted graph visit scratch".into())));
+                return Err(E::from(Error::Other(
+                    "cannot allocate admitted graph visit scratch".into(),
+                )));
             }
             if self.visit_bytes != 0 {
                 release(HnswSearchScratchEvent::Release {
                     container: HnswSearchScratchContainer::VisitedPoints,
-                    capacity: self.visit_bytes, element_bytes: 1,
+                    capacity: self.visit_bytes,
+                    element_bytes: 1,
                 });
             }
             self.visit_bytes = bytes;
@@ -1502,7 +1537,10 @@ impl Walk<'_> {
         Ok(self.reached.entry(bit).or_default())
     }
     fn mark<E, A, R>(
-        &mut self, bit: usize, acquire: &mut A, release: &mut R,
+        &mut self,
+        bit: usize,
+        acquire: &mut A,
+        release: &mut R,
     ) -> std::result::Result<bool, E>
     where
         E: From<Error>,
@@ -1519,13 +1557,23 @@ impl Walk<'_> {
     /// not enter it.
     #[cfg(test)]
     fn keep(&mut self, kept: Kept) -> KeepOutcome {
-        self.keep_resolved::<Error, _, _>(kept, None, &mut |_| Ok(()), &mut |_| {}).unwrap()
+        self.keep_resolved::<Error, _, _>(kept, None, &mut |_| Ok(()), &mut |_| {})
+            .unwrap()
     }
 
     /// Keep `kept` at its answer distance, recording the visible stored score
     /// that distance was taken from, if it was.
-    fn keep_resolved<E, A, R>(&mut self, kept: Kept, resolved: Option<f32>, acquire: &mut A, release: &mut R) -> std::result::Result<KeepOutcome, E>
-    where E: From<Error>, A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>, R: FnMut(HnswSearchScratchEvent),
+    fn keep_resolved<E, A, R>(
+        &mut self,
+        kept: Kept,
+        resolved: Option<f32>,
+        acquire: &mut A,
+        release: &mut R,
+    ) -> std::result::Result<KeepOutcome, E>
+    where
+        E: From<Error>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
     {
         let key = (kept.partition, kept.row_id);
         let distance = kept.reached.distance;
@@ -1572,8 +1620,11 @@ impl Walk<'_> {
                 KeptRowInfo {
                     distance,
                     resolved_score: resolved.or(existing.and_then(|entry| entry.resolved_score)),
-                    score_checked: resolved.is_some() || existing.is_some_and(|entry| entry.score_checked),
-                }, acquire, release,
+                    score_checked: resolved.is_some()
+                        || existing.is_some_and(|entry| entry.score_checked),
+                },
+                acquire,
+                release,
             )?;
             self.kept.push(Farthest(kept));
             if previous_worst.is_some_and(|worst| distance.total_cmp(&worst) == CmpOrdering::Equal)
@@ -1599,8 +1650,11 @@ impl Walk<'_> {
                 KeptRowInfo {
                     distance,
                     resolved_score: resolved.or(existing.and_then(|entry| entry.resolved_score)),
-                    score_checked: resolved.is_some() || existing.is_some_and(|entry| entry.score_checked),
-                }, acquire, release,
+                    score_checked: resolved.is_some()
+                        || existing.is_some_and(|entry| entry.score_checked),
+                },
+                acquire,
+                release,
             )?;
             self.kept.push(Farthest(kept));
             if previous_worst.is_some_and(|worst| distance.total_cmp(&worst) == CmpOrdering::Equal)
@@ -1631,26 +1685,45 @@ impl Walk<'_> {
         Ok(KeepOutcome::Kept)
     }
 
-    fn insert_kept_row<E, A, R>(&mut self, key: (usize, RowId), value: KeptRowInfo,
-        acquire: &mut A, release: &mut R) -> std::result::Result<(), E>
-    where E: From<Error>, A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>, R: FnMut(HnswSearchScratchEvent),
+    fn insert_kept_row<E, A, R>(
+        &mut self,
+        key: (usize, RowId),
+        value: KeptRowInfo,
+        acquire: &mut A,
+        release: &mut R,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<Error>,
+        A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
+        R: FnMut(HnswSearchScratchEvent),
     {
         if self.kept_rows.len() == self.kept_rows.capacity() && !self.kept_rows.contains_key(&key) {
             let wanted = self.kept_rows.len().saturating_mul(2).max(4);
             let buckets = wanted.saturating_mul(8).div_ceil(7).next_power_of_two();
-            let bytes = buckets.checked_mul(std::mem::size_of::<((usize, RowId), KeptRowInfo)>() + 1)
+            let bytes = buckets
+                .checked_mul(std::mem::size_of::<((usize, RowId), KeptRowInfo)>() + 1)
                 .and_then(|n| n.checked_add(16))
-                .ok_or_else(|| E::from(Error::Other("graph retained-row allocation overflow".into())))?;
+                .ok_or_else(|| {
+                    E::from(Error::Other(
+                        "graph retained-row allocation overflow".into(),
+                    ))
+                })?;
             acquire(HnswSearchScratchEvent::Reserve {
                 container: HnswSearchScratchContainer::SeenRows,
-                previous_capacity: 0, requested_capacity: bytes, element_bytes: 1,
+                previous_capacity: 0,
+                requested_capacity: bytes,
+                element_bytes: 1,
             })?;
             let mut replacement = HashMap::new();
             if replacement.try_reserve(wanted).is_err() {
                 release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::SeenRows, capacity: bytes, element_bytes: 1,
+                    container: HnswSearchScratchContainer::SeenRows,
+                    capacity: bytes,
+                    element_bytes: 1,
                 });
-                return Err(E::from(Error::Other("cannot allocate retained-row scratch".into())));
+                return Err(E::from(Error::Other(
+                    "cannot allocate retained-row scratch".into(),
+                )));
             }
             let old = std::mem::replace(&mut self.kept_rows, replacement);
             self.kept_rows.extend(old);
@@ -1658,7 +1731,8 @@ impl Walk<'_> {
             if self.kept_rows_bytes != 0 {
                 release(HnswSearchScratchEvent::Release {
                     container: HnswSearchScratchContainer::SeenRows,
-                    capacity: self.kept_rows_bytes, element_bytes: 1,
+                    capacity: self.kept_rows_bytes,
+                    element_bytes: 1,
                 });
             }
             self.kept_rows_bytes = bytes;
@@ -1693,17 +1767,25 @@ impl Walk<'_> {
                 requested_capacity: grown,
                 element_bytes: std::mem::size_of::<Nearest>(),
             })?;
-            if self.frontier.try_reserve_exact(grown.saturating_sub(self.frontier.len())).is_err() {
+            if self
+                .frontier
+                .try_reserve_exact(grown.saturating_sub(self.frontier.len()))
+                .is_err()
+            {
                 release(HnswSearchScratchEvent::Release {
                     container: HnswSearchScratchContainer::CandidateHeap,
-                    capacity: grown, element_bytes: std::mem::size_of::<Nearest>(),
+                    capacity: grown,
+                    element_bytes: std::mem::size_of::<Nearest>(),
                 });
-                return Err(E::from(Error::Other("cannot allocate graph frontier".into())));
+                return Err(E::from(Error::Other(
+                    "cannot allocate graph frontier".into(),
+                )));
             }
             if self.frontier_charged != 0 {
                 release(HnswSearchScratchEvent::Release {
                     container: HnswSearchScratchContainer::CandidateHeap,
-                    capacity: self.frontier_charged, element_bytes: std::mem::size_of::<Nearest>(),
+                    capacity: self.frontier_charged,
+                    element_bytes: std::mem::size_of::<Nearest>(),
                 });
             }
             self.frontier_charged = grown;
@@ -1888,14 +1970,11 @@ pub(crate) fn merge_layer_searches_with_settled<E>(
                 .capacity()
                 .saturating_mul(std::mem::size_of::<HnswUnionCandidate>());
             all.candidates.reserve(incoming.len());
-            all.retained_bytes = all
-                .retained_bytes
-                .saturating_sub(previous)
-                .saturating_add(
-                    all.candidates
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<HnswUnionCandidate>()),
-                );
+            all.retained_bytes = all.retained_bytes.saturating_sub(previous).saturating_add(
+                all.candidates
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<HnswUnionCandidate>()),
+            );
             Ok(())
         },
         |_| {},
@@ -1923,8 +2002,15 @@ pub(crate) fn merge_layer_searches_with_custody<E>(
     ) -> std::result::Result<(), E>,
     release_retained: impl FnMut(usize),
 ) -> std::result::Result<HnswUnionSearchResult, E> {
-    merge_layer_searches_with_candidate_limit(layers, cap, k, usize::MAX,
-        search_layer, grow_candidates, release_retained)
+    merge_layer_searches_with_candidate_limit(
+        layers,
+        cap,
+        k,
+        usize::MAX,
+        search_layer,
+        grow_candidates,
+        release_retained,
+    )
 }
 
 /// Each partition still searches independently. The merged statement retains
@@ -2034,11 +2120,13 @@ pub(crate) fn merge_layer_searches_with_candidate_limit<E>(
             && all.candidates.len() > candidate_limit
         {
             // Resolve score ties by the public row-id ordering across scopes.
-            all.candidates.select_nth_unstable_by(candidate_limit, |left, right| {
-                left.distance.total_cmp(&right.distance)
-                    .then(left.row_id.cmp(&right.row_id))
-                    .then(left.partition.cmp(&right.partition))
-            });
+            all.candidates
+                .select_nth_unstable_by(candidate_limit, |left, right| {
+                    left.distance
+                        .total_cmp(&right.distance)
+                        .then(left.row_id.cmp(&right.row_id))
+                        .then(left.partition.cmp(&right.partition))
+                });
             all.candidates.truncate(candidate_limit);
             // The actual capacity still exists and keeps its original invoice.
         }
@@ -2093,7 +2181,8 @@ fn sort_merged_candidates(values: &mut [HnswUnionCandidate]) {
             .then(left.row_id.cmp(&right.row_id))
     }
     fn merge(values: &mut [HnswUnionCandidate], middle: usize) {
-        if middle == 0 || middle == values.len()
+        if middle == 0
+            || middle == values.len()
             || compare(&values[middle - 1], &values[middle]) != CmpOrdering::Greater
         {
             return;
@@ -2104,9 +2193,10 @@ fn sort_merged_candidates(values: &mut [HnswUnionCandidate]) {
         }
         let (left_cut, right_cut) = if middle > values.len() - middle {
             let left_cut = middle / 2;
-            let right_cut = middle + values[middle..].partition_point(|value| {
-                compare(value, &values[left_cut]) == CmpOrdering::Less
-            });
+            let right_cut = middle
+                + values[middle..].partition_point(|value| {
+                    compare(value, &values[left_cut]) == CmpOrdering::Less
+                });
             (left_cut, right_cut)
         } else {
             let right_cut = middle + (values.len() - middle) / 2;
@@ -2333,7 +2423,10 @@ where
         acquire: &mut acquire,
         release: &mut release,
     }
-    .free_vec(counted_partitions, HnswSearchScratchContainer::ServingPageDirectory);
+    .free_vec(
+        counted_partitions,
+        HnswSearchScratchContainer::ServingPageDirectory,
+    );
     // A filter checked row by row has no allowed count: the walk needs `k`
     // rows, stops only by its proof, its budget or its frontier, and never
     // compares what it reached with a count it does not have.
@@ -2940,7 +3033,7 @@ where
         };
         let key = exact_score.and(key);
         let mut ties = match key {
-            Some(_) => match scratch.allocate_vec::<(usize, RowId, Option<Option<f32>>) >(
+            Some(_) => match scratch.allocate_vec::<(usize, RowId, Option<Option<f32>>)>(
                 HnswSearchScratchContainer::Result,
                 kept_capacity,
                 "union exact ties",
@@ -2979,7 +3072,8 @@ where
                         };
                         if after.is_some_and(|last| row_id <= last) {
                             return Err(E::from(Error::Other(
-                                "paged exact directory did not advance".into())));
+                                "paged exact directory did not advance".into(),
+                            )));
                         }
                         after = Some(row_id);
                         if layer.seed_rows.is_some_and(|rows| !rows.contains(row_id.0))
@@ -3126,11 +3220,13 @@ where
                     .get(&(partition, row_id))
                     .filter(|entry| entry.score_checked)
                     .map(|entry| entry.resolved_score)
-                    .or_else(|| ties[..index].iter().find_map(|(prior, row, score)| {
-                        (layers[*prior].partition == partition && *row == row_id)
-                            .then_some(*score).flatten()
-                    }))
-                {
+                    .or_else(|| {
+                        ties[..index].iter().find_map(|(prior, row, score)| {
+                            (layers[*prior].partition == partition && *row == row_id)
+                                .then_some(*score)
+                                .flatten()
+                        })
+                    }) {
                     Some(score) => score,
                     // Each score read is paid from the walk's rescoring
                     // allowance; once it is spent the search is refused,
@@ -3166,9 +3262,9 @@ where
                 index += 1;
             }
             ties.retain(|(_, _, score)| {
-                score.is_some_and(|score| score.is_some_and(|score| {
-                    score.total_cmp(&exact_score) == CmpOrdering::Equal
-                }))
+                score.is_some_and(|score| {
+                    score.is_some_and(|score| score.total_cmp(&exact_score) == CmpOrdering::Equal)
+                })
             });
             if let Err(error) = retained {
                 VectorSearchScratch {
@@ -3187,10 +3283,12 @@ where
             .iter()
             .enumerate()
             .filter(|(ordinal, (position, row, _))| {
-                !ties[..*ordinal].iter().any(|(prior_position, prior_row, _)| {
-                    layers[*prior_position].partition == layers[*position].partition
-                        && prior_row == row
-                })
+                !ties[..*ordinal]
+                    .iter()
+                    .any(|(prior_position, prior_row, _)| {
+                        layers[*prior_position].partition == layers[*position].partition
+                            && prior_row == row
+                    })
             })
             .count();
         if below_floor.is_none()
@@ -3239,10 +3337,16 @@ where
                 origin: None,
                 row_id,
                 distance: tie_distance,
-                resolved_score: tie_score.flatten().or_else(|| walk.kept_rows.get(&(partition, row_id))
-                    .and_then(|entry| entry.resolved_score)),
-                score_checked: tie_score.is_some() || walk.kept_rows.get(&(partition, row_id))
-                    .is_some_and(|entry| entry.score_checked),
+                resolved_score: tie_score.flatten().or_else(|| {
+                    walk.kept_rows
+                        .get(&(partition, row_id))
+                        .and_then(|entry| entry.resolved_score)
+                }),
+                score_checked: tie_score.is_some()
+                    || walk
+                        .kept_rows
+                        .get(&(partition, row_id))
+                        .is_some_and(|entry| entry.score_checked),
             });
         }
         VectorSearchScratch {
@@ -3268,7 +3372,9 @@ where
                     .kept_rows
                     .get(&(open_layer.partition, row_id))
                     .and_then(|entry| entry.resolved_score),
-                score_checked: walk.kept_rows.get(&(open_layer.partition, row_id))
+                score_checked: walk
+                    .kept_rows
+                    .get(&(open_layer.partition, row_id))
                     .is_some_and(|entry| entry.score_checked),
             });
         }
@@ -3400,7 +3506,8 @@ where
     };
     walk.visited += 1;
     walk.evaluations += 1;
-    walk.visit_entry(bit, acquire, release)?.cache_distance(distance);
+    walk.visit_entry(bit, acquire, release)?
+        .cache_distance(distance);
     Ok(Ok(Some(distance)))
 }
 
@@ -3492,7 +3599,11 @@ where
             {
                 let mut oldest = None;
                 for (level, end) in layer.level_ends.iter().copied().enumerate() {
-                    let start = if level == 0 { 0 } else { layer.level_ends[level - 1] };
+                    let start = if level == 0 {
+                        0
+                    } else {
+                        layer.level_ends[level - 1]
+                    };
                     if end == start {
                         continue;
                     }
@@ -3525,7 +3636,11 @@ where
             release,
         )? {
             Ok(Some(distance)) => distance,
-            Ok(None) => return Err(E::from(Error::Other(("graph entry point".to_string()).into()))),
+            Ok(None) => {
+                return Err(E::from(Error::Other(
+                    ("graph entry point".to_string()).into(),
+                )));
+            }
             Err(stop) => {
                 return Ok(Admitted {
                     layers,
@@ -3569,7 +3684,9 @@ where
                         before_source_entry,
                     )?
                     .ok_or_else(|| {
-                        E::from(Error::Other(("graph admission neighbours".to_string()).into()))
+                        E::from(Error::Other(
+                            ("graph admission neighbours".to_string()).into(),
+                        ))
                     })?;
                 for hop in 0..neighbours.len() {
                     let (neighbour_id, neighbour_origin) = neighbours.get(hop);
@@ -3591,7 +3708,9 @@ where
                         release,
                     )? {
                         Ok(Some(distance)) => distance,
-                        Ok(None) => return Err(E::from(Error::Other(("graph edge".to_string()).into()))),
+                        Ok(None) => {
+                            return Err(E::from(Error::Other(("graph edge".to_string()).into())));
+                        }
                         Err(stop) => {
                             return Ok(Admitted {
                                 layers,
@@ -3688,8 +3807,8 @@ where
                     resolve_score,
                     before_source_entry,
                     before_distance,
-
-                    acquire, release,
+                    acquire,
+                    release,
                 )? {
                     return Ok(Some(stop));
                 }
@@ -4009,7 +4128,11 @@ where
             let layer = &mut open[candidate.layer as usize];
             let neighbours = layer
                 .neighbours(candidate.point, 0, &mut hops, acquire, before_source_entry)?
-                .ok_or_else(|| E::from(Error::Other(("graph layer-zero neighbours".to_string()).into())))?;
+                .ok_or_else(|| {
+                    E::from(Error::Other(
+                        ("graph layer-zero neighbours".to_string()).into(),
+                    ))
+                })?;
             for hop in 0..neighbours.len() {
                 let (neighbour_id, _) = neighbours.get(hop);
                 match consider(
@@ -4154,7 +4277,11 @@ where
             let Some(level) = layer.level_ends.iter().position(|end| offset < *end) else {
                 continue;
             };
-            let start = if level == 0 { 0 } else { layer.level_ends[level - 1] };
+            let start = if level == 0 {
+                0
+            } else {
+                layer.level_ends[level - 1]
+            };
             let point = PointId(level as u8, (offset - start) as i32);
             if layer.bit(point) != Some(*bit) {
                 continue;
@@ -4380,8 +4507,8 @@ where
         resolve_score,
         before_source_entry,
         before_distance,
-
-        acquire, release,
+        acquire,
+        release,
     )
     .map(|stop| stop.map_or(Considered::Passed, Considered::Stopped))
 }
@@ -4442,7 +4569,9 @@ where
                     partition,
                     row_id,
                 },
-                resolved, acquire, release,
+                resolved,
+                acquire,
+                release,
             )?;
         }
     }
@@ -4455,8 +4584,8 @@ where
         is_allowed,
         resolve_score,
         before_distance,
-
-        acquire, release,
+        acquire,
+        release,
     )
 }
 
@@ -4528,7 +4657,9 @@ where
                     partition,
                     row_id: member,
                 },
-                resolved, acquire, release,
+                resolved,
+                acquire,
+                release,
             )?;
             Ok(!(outcome == KeepOutcome::Full && in_row_order))
         },
@@ -5455,7 +5586,7 @@ mod canonical_tie_tests {
                 kept: BinaryHeap::new(),
                 kept_capacity: breadth,
                 kept_rows: HashMap::new(),
-            kept_rows_bytes: 0,
+                kept_rows_bytes: 0,
                 worst_ties: 0,
                 failed_resolved_stop_distance: None,
                 stop_distance_comparisons: std::cell::Cell::new(0),
@@ -5763,7 +5894,9 @@ mod settled_scratch_tests {
                                     .set(ledger.merge_reserves_by_partition[partition].get() + 1);
                                 if ledger.refuse_element_bytes == Some(element_bytes) {
                                     ledger.refused_in_partition.set(Some(partition));
-                                    return Err(Error::Other(("merge scratch refused".to_string()).into()));
+                                    return Err(Error::Other(
+                                        ("merge scratch refused".to_string()).into(),
+                                    ));
                                 }
                                 ledger.merge_balance.set(ledger.merge_balance.get() + bytes);
                             }

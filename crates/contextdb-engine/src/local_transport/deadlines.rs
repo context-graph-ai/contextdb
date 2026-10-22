@@ -183,26 +183,44 @@ impl ManualDeadlineClock {
 }
 
 impl DeadlineClock for ManualDeadlineClock {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_owned_wait(
-        &self, deadline_ms: u64, owner: &contextdb_core::read_memory::ReadMemoryOwner,
+        &self,
+        deadline_ms: u64,
+        owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<Option<contextdb_core::read_memory::ReadOwnedFuture<'_, ()>>> {
         contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
-            let wake = owned_shared(owner.clone(), || Ok(ManualFutureWake {
-                waker: Mutex::new(None), reached: std::sync::atomic::AtomicBool::new(false),
-            }))?;
+            let wake = owned_shared(owner.clone(), || {
+                Ok(ManualFutureWake {
+                    waker: Mutex::new(None),
+                    reached: std::sync::atomic::AtomicBool::new(false),
+                })
+            })?;
             Ok(OwnedManualWait {
                 state: self.state.clone(),
-                node: NativeParkNode { deadline_ms, wake: wake.clone().into_native_wake_lease(),
-                    links: std::cell::UnsafeCell::new(NativeParkLinks { next: std::ptr::null(), linked: false }),
-                    _pin: std::marker::PhantomPinned },
+                node: NativeParkNode {
+                    deadline_ms,
+                    wake: wake.clone().into_native_wake_lease(),
+                    links: std::cell::UnsafeCell::new(NativeParkLinks {
+                        next: std::ptr::null(),
+                        linked: false,
+                    }),
+                    _pin: std::marker::PhantomPinned,
+                },
                 wake,
             })
-        }).map(Some)
+        })
+        .map(Some)
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_native_source(
         &self,
         _standing: &contextdb_core::read_memory::ReadMemoryOwner,
@@ -413,7 +431,9 @@ pub struct MonotonicDeadlineClock {
     origin: std::time::Instant,
     owned_waits: Mutex<MonotonicWaitList>,
     #[cfg(target_os = "linux")]
-    owned_driver_wake: Mutex<Option<contextdb_core::read_memory::ReadShared<super::native_driver::NativeCallerWake>>>,
+    owned_driver_wake: Mutex<
+        Option<contextdb_core::read_memory::ReadShared<super::native_driver::NativeCallerWake>>,
+    >,
     #[cfg(target_os = "linux")]
     owned_driver_stopped: std::sync::atomic::AtomicBool,
     #[cfg(feature = "test-seams")]
@@ -546,16 +566,33 @@ impl contextdb_core::read_contract::NativeDeadlineSource for MonotonicNativeSour
 }
 
 impl DeadlineClock for MonotonicDeadlineClock {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_owned_wait(
-        &self, deadline_ms: u64, owner: &contextdb_core::read_memory::ReadMemoryOwner,
+        &self,
+        deadline_ms: u64,
+        owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<Option<contextdb_core::read_memory::ReadOwnedFuture<'_, ()>>> {
         #[cfg(target_os = "linux")]
-        if self.owned_driver_stopped.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .owned_driver_stopped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err(contextdb_core::Error::NativeEngineOther(
-                contextdb_core::read_memory::NativeRefusal::Other("session deadline driver stopped")));
+                contextdb_core::read_memory::NativeRefusal::Other(
+                    "session deadline driver stopped",
+                ),
+            ));
         }
-        if self.owned_waits.lock().unwrap_or_else(|p| p.into_inner()).drivers == 0 {
+        if self
+            .owned_waits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drivers
+            == 0
+        {
             return self.legacy_owned_wait(deadline_ms, owner);
         }
         contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
@@ -566,23 +603,35 @@ impl DeadlineClock for MonotonicDeadlineClock {
                 node: MonotonicWaitNode {
                     deadline_ms,
                     links: std::cell::UnsafeCell::new(MonotonicWaitLinks {
-                        next: std::ptr::null(), linked: false, driver_departed: false, waker: None,
+                        next: std::ptr::null(),
+                        linked: false,
+                        driver_departed: false,
+                        waker: None,
                     }),
                     _pin: std::marker::PhantomPinned,
                 },
             })
-        }).map(Some)
+        })
+        .map(Some)
     }
 
     fn native_driver_started(&self) {
         let mut list = self.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
-        list.drivers = list.drivers.checked_add(1).expect("native driver count overflow");
+        list.drivers = list
+            .drivers
+            .checked_add(1)
+            .expect("native driver count overflow");
     }
     fn native_driver_ended(&self) {
         {
             let mut list = self.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
-            list.drivers = list.drivers.checked_sub(1).expect("native driver lease missing");
-            if list.drivers != 0 { return; }
+            list.drivers = list
+                .drivers
+                .checked_sub(1)
+                .expect("native driver lease missing");
+            if list.drivers != 0 {
+                return;
+            }
             // Mark precisely this departure's pending set while registration
             // and new driver entry are excluded. New registrations never join
             // this drain, even if their callbacks re-enter the clock.
@@ -612,14 +661,22 @@ impl DeadlineClock for MonotonicDeadlineClock {
                 }
                 next
             };
-            let Some(waker) = next else { break; };
+            let Some(waker) = next else {
+                break;
+            };
             // No pinned node pointer survives unlock. Unlink before invoking
             // arbitrary wake/drop code, and finish draining even on unwind.
             if let Some(waker) = waker
-                && let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()))
-                    && panic.is_none() { panic = Some(error); }
+                && let Err(error) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()))
+                && panic.is_none()
+            {
+                panic = Some(error);
+            }
         }
-        if let Some(panic) = panic { std::panic::resume_unwind(panic); }
+        if let Some(panic) = panic {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn native_next_deadline_ms(&self) -> Option<u64> {
@@ -656,14 +713,19 @@ impl DeadlineClock for MonotonicDeadlineClock {
                 }
                 due
             };
-            let Some(waker) = waker else { return; };
+            let Some(waker) = waker else {
+                return;
+            };
             // A callback may re-enter the clock or retire its own wait.
             waker.wake();
         }
     }
 
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn try_native_source(
         &self,
         _standing: &contextdb_core::read_memory::ReadMemoryOwner,
@@ -855,7 +917,9 @@ impl<T> Future for DeadlineOperationWait<'_, T> {
     /// result instead of taking the caller down.
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if let Some(error) = this.admission_error.take() { return Poll::Ready(Err(error)); }
+        if let Some(error) = this.admission_error.take() {
+            return Poll::Ready(Err(error));
+        }
         let Some(inner) = this.inner.as_mut() else {
             return Poll::Ready(Err(operation_already_completed()));
         };
@@ -895,7 +959,8 @@ fn deadline_operation<'a, T: Send + 'a>(
 ) -> DeadlineOperationWait<'a, T> {
     DeadlineOperationWait {
         stage,
-        inner: Some(DeadlineInner::Host(operation)), admission_error: None,
+        inner: Some(DeadlineInner::Host(operation)),
+        admission_error: None,
         clock,
         deadline_ms,
         deadline: Some(OperationDeadlineWait::Host(clock.wait_until(deadline_ms))),
@@ -928,7 +993,10 @@ deadline_operation!(drain_shutdown_with_deadline, ShutdownDrain);
 
 // Concrete source erasure preserves one allocation and its original invoice.
 #[cfg(target_os = "linux")]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn native_source_with<S: contextdb_core::read_contract::NativeDeadlineSource + 'static>(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     make: impl FnOnce() -> contextdb_core::Result<S>,
@@ -949,13 +1017,14 @@ fn native_source_with<S: contextdb_core::read_contract::NativeDeadlineSource + '
     let block = if layout.size() == 0 {
         std::ptr::NonNull::<S>::dangling()
     } else {
-        std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }.cast::<S>())
-            .ok_or(contextdb_core::Error::NativeEngineOther(
+        std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }.cast::<S>()).ok_or(
+            contextdb_core::Error::NativeEngineOther(
                 contextdb_core::read_memory::NativeRefusal::AllocatorFailed {
                     site: "native deadline source",
                     layout,
                 },
-            ))?
+            ),
+        )?
     };
     struct Guard<S> {
         block: std::ptr::NonNull<S>,
@@ -1000,25 +1069,39 @@ impl Future for OperationDeadlineWait<'_> {
         }
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn wait_until_owned<'a>(
-    clock: &'a dyn DeadlineClock, deadline_ms: u64,
+    clock: &'a dyn DeadlineClock,
+    deadline_ms: u64,
     owner: &contextdb_core::read_memory::ReadMemoryOwner,
 ) -> contextdb_core::Result<OperationDeadlineWait<'a>> {
     match clock.try_owned_wait(deadline_ms, owner)? {
         Some(wait) if wait.is_funded_by(owner) => Ok(OperationDeadlineWait::Engine(wait)),
-        Some(_) => Err(contextdb_core::Error::Other("deadline wait has different memory ownership".into())),
+        Some(_) => Err(contextdb_core::Error::Other(
+            "deadline wait has different memory ownership".into(),
+        )),
         None => Ok(OperationDeadlineWait::Host(clock.wait_until(deadline_ms))),
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn owned_shared<T>(
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     make: impl FnOnce() -> contextdb_core::Result<T>,
 ) -> contextdb_core::Result<contextdb_core::read_memory::ReadShared<T>> {
-    use contextdb_core::read_memory::{ReadCredit, ReadShared, NativeProduce};
-    let invoice = ReadCredit::try_new_owned(owner, ReadShared::<T>::layout().size(),
-        "reader", "deadline_control", "Raise the reader memory limit.")?;
+    use contextdb_core::read_memory::{NativeProduce, ReadCredit, ReadShared};
+    let invoice = ReadCredit::try_new_owned(
+        owner,
+        ReadShared::<T>::layout().size(),
+        "reader",
+        "deadline_control",
+        "Raise the reader memory limit.",
+    )?;
     ReadShared::try_from_prepaid_with_native(invoice, make).map_err(|error| match error {
         NativeProduce::Refused(error) => contextdb_core::Error::NativeEngineOther(error),
         NativeProduce::Producer(error) => error,
@@ -1030,9 +1113,12 @@ struct ManualFutureWake {
 }
 impl contextdb_core::read_memory::NativeReadWake for ManualFutureWake {
     fn wake_read(&self) {
-        self.reached.store(true, std::sync::atomic::Ordering::Release);
+        self.reached
+            .store(true, std::sync::atomic::Ordering::Release);
         let waker = self.waker.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(waker) = waker { waker.wake(); }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 struct OwnedManualWait {
@@ -1049,8 +1135,12 @@ impl Future for OwnedManualWait {
         let this = unsafe { self.get_unchecked_mut() };
         *this.wake.waker.lock().unwrap_or_else(|p| p.into_inner()) = Some(cx.waker().clone());
         let mut state = ManualDeadlineClock::locked(&this.state);
-        if state.now_ms >= this.node.deadline_ms || this.wake.reached.load(std::sync::atomic::Ordering::Acquire) {
-            unsafe { state.native_parked.unlink(&this.node); }
+        if state.now_ms >= this.node.deadline_ms
+            || this.wake.reached.load(std::sync::atomic::Ordering::Acquire)
+        {
+            unsafe {
+                state.native_parked.unlink(&this.node);
+            }
             return Poll::Ready(());
         }
         unsafe {
@@ -1066,13 +1156,18 @@ impl Future for OwnedManualWait {
 impl Drop for OwnedManualWait {
     fn drop(&mut self) {
         let mut state = ManualDeadlineClock::locked(&self.state);
-        unsafe { state.native_parked.unlink(&self.node); }
+        unsafe {
+            state.native_parked.unlink(&self.node);
+        }
     }
 }
 // All links and wakers are protected by the clock mutex. The owning future
 // is pinned in an admitted frame before linking and unlinks before free.
 #[derive(Debug, Default)]
-struct MonotonicWaitList { head: *const MonotonicWaitNode, drivers: usize }
+struct MonotonicWaitList {
+    head: *const MonotonicWaitNode,
+    drivers: usize,
+}
 unsafe impl Send for MonotonicWaitList {}
 struct MonotonicWaitLinks {
     next: *const MonotonicWaitNode,
@@ -1117,29 +1212,49 @@ impl Future for OwnedMonotonicWait<'_> {
             return Pin::new(fallback).poll(cx);
         }
         let next_waker = cx.waker().clone();
-        let mut list = this.clock.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
+        let mut list = this
+            .clock
+            .owned_waits
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if this.clock.now_ms() >= this.node.deadline_ms {
-            let previous = unsafe { list.unlink(&this.node); (*this.node.links.get()).waker.take() };
+            let previous = unsafe {
+                list.unlink(&this.node);
+                (*this.node.links.get()).waker.take()
+            };
             drop(list);
             drop(previous);
             return Poll::Ready(());
         }
         if list.drivers == 0 || unsafe { (*this.node.links.get()).driver_departed } {
-            let previous = unsafe { list.unlink(&this.node); (*this.node.links.get()).waker.take() };
+            let previous = unsafe {
+                list.unlink(&this.node);
+                (*this.node.links.get()).waker.take()
+            };
             drop(list);
             drop(previous);
             // Preserve the existing autonomous timer, original owner, origin,
             // deadline and one-shot arm-failure semantics. This inherited std
             // thread route still owes proof of physical startup funding.
             #[cfg(target_os = "linux")]
-            if this.clock.owned_driver_stopped.load(std::sync::atomic::Ordering::Acquire) {
+            if this
+                .clock
+                .owned_driver_stopped
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
                 return Poll::Ready(());
             }
-            this.fallback = match this.clock.legacy_owned_wait(this.node.deadline_ms, &this.owner) {
+            this.fallback = match this
+                .clock
+                .legacy_owned_wait(this.node.deadline_ms, &this.owner)
+            {
                 Ok(wait) => wait,
                 Err(_) => return Poll::Ready(()),
             };
-            return this.fallback.as_mut().map_or(Poll::Ready(()), |wait| Pin::new(wait).poll(cx));
+            return this
+                .fallback
+                .as_mut()
+                .map_or(Poll::Ready(()), |wait| Pin::new(wait).poll(cx));
         }
         unsafe {
             let links = &mut *this.node.links.get();
@@ -1156,7 +1271,12 @@ impl Future for OwnedMonotonicWait<'_> {
         // current park. The paid wake cell latches a wake across park entry.
         #[cfg(target_os = "linux")]
         {
-            let wake = this.clock.owned_driver_wake.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let wake = this
+                .clock
+                .owned_driver_wake
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
             if let Some(wake) = wake {
                 contextdb_core::read_memory::NativeReadWake::wake_read(&*wake);
             }
@@ -1167,22 +1287,41 @@ impl Future for OwnedMonotonicWait<'_> {
 impl Drop for OwnedMonotonicWait<'_> {
     fn drop(&mut self) {
         let waker = {
-            let mut list = self.clock.owned_waits.lock().unwrap_or_else(|p| p.into_inner());
-            unsafe { list.unlink(&self.node); (*self.node.links.get()).waker.take() }
+            let mut list = self
+                .clock
+                .owned_waits
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            unsafe {
+                list.unlink(&self.node);
+                (*self.node.links.get()).waker.take()
+            }
         };
         drop(waker);
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn deadline_operation_owned<'a, T: Send + 'a>(
-    clock: &'a dyn DeadlineClock, stage: DeadlineStage, deadline_ms: u64,
+    clock: &'a dyn DeadlineClock,
+    stage: DeadlineStage,
+    deadline_ms: u64,
     operation: LocalDeadlineOperation<'a, T>,
     owner: &contextdb_core::read_memory::ReadMemoryOwner,
 ) -> Result<DeadlineOperationWait<'a, T>, LocalTransportError> {
     let deadline = wait_until_owned(clock, deadline_ms, owner)
         .map_err(|error| super::query_funding::transport_error(error, u64::MAX))?;
-    Ok(DeadlineOperationWait { stage, inner: Some(DeadlineInner::Host(operation)), admission_error: None, clock, deadline_ms, deadline: Some(deadline) })
+    Ok(DeadlineOperationWait {
+        stage,
+        inner: Some(DeadlineInner::Host(operation)),
+        admission_error: None,
+        clock,
+        deadline_ms,
+        deadline: Some(deadline),
+    })
 }
 
 enum DeadlineInner<'a, T> {
@@ -1198,20 +1337,43 @@ impl<T> Future for DeadlineInner<'_, T> {
         }
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn deadline_operation_funded<'a, T, F>(
-    clock: &'a dyn DeadlineClock, stage: DeadlineStage, deadline_ms: u64,
-    owner: contextdb_core::read_memory::ReadMemoryOwner, make: impl FnOnce() -> F,
+    clock: &'a dyn DeadlineClock,
+    stage: DeadlineStage,
+    deadline_ms: u64,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+    make: impl FnOnce() -> F,
 ) -> DeadlineOperationWait<'a, T>
-where T: Send + 'a, F: Future<Output = Result<T, LocalTransportError>> + Send + 'a {
-    let prepared = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || Ok(make()))
-        .and_then(|future| wait_until_owned(clock, deadline_ms, &owner).map(|deadline| (future, deadline)));
+where
+    T: Send + 'a,
+    F: Future<Output = Result<T, LocalTransportError>> + Send + 'a,
+{
+    let prepared =
+        contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || Ok(make()))
+            .and_then(|future| {
+                wait_until_owned(clock, deadline_ms, &owner).map(|deadline| (future, deadline))
+            });
     match prepared {
-        Ok((future, deadline)) => DeadlineOperationWait { stage, inner: Some(DeadlineInner::Engine(future)),
-            admission_error: None, clock, deadline_ms, deadline: Some(deadline) },
-        Err(error) => DeadlineOperationWait { stage, inner: None,
+        Ok((future, deadline)) => DeadlineOperationWait {
+            stage,
+            inner: Some(DeadlineInner::Engine(future)),
+            admission_error: None,
+            clock,
+            deadline_ms,
+            deadline: Some(deadline),
+        },
+        Err(error) => DeadlineOperationWait {
+            stage,
+            inner: None,
             admission_error: Some(super::query_funding::transport_error(error, u64::MAX)),
-            clock, deadline_ms, deadline: None },
+            clock,
+            deadline_ms,
+            deadline: None,
+        },
     }
 }
 
@@ -1219,7 +1381,9 @@ where T: Send + 'a, F: Future<Output = Result<T, LocalTransportError>> + Send + 
 struct NativeDriverLease(Arc<dyn DeadlineClock>);
 #[cfg(target_os = "linux")]
 impl Drop for NativeDriverLease {
-    fn drop(&mut self) { self.0.native_driver_ended(); }
+    fn drop(&mut self) {
+        self.0.native_driver_ended();
+    }
 }
 
 // The complete driver, including binding, clock lease, wake handle and the
@@ -1234,7 +1398,9 @@ struct DrivenLocalFuture<F> {
 }
 #[cfg(target_os = "linux")]
 impl<F, T> Future for DrivenLocalFuture<F>
-where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> {
+where
+    F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>>,
+{
     type Output = crate::owner_read::OwnerReadScaffoldResult<T>;
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         use contextdb_core::read_contract::NativeDriverPark;
@@ -1252,8 +1418,11 @@ where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> {
                 };
                 match result {
                     Ok(()) => Poll::Pending,
-                    Err(error) => Poll::Ready(Err(crate::owner_read::OwnerReadScaffoldError::from_local(
-                        super::LocalTransportError::OriginalAdmission(error)))),
+                    Err(error) => {
+                        Poll::Ready(Err(crate::owner_read::OwnerReadScaffoldError::from_local(
+                            super::LocalTransportError::OriginalAdmission(error),
+                        )))
+                    }
                 }
             }
         }
@@ -1263,100 +1432,153 @@ where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> {
 /// Drive an admitted operation on the caller's existing thread. Engine clock
 /// waits contribute their earliest deadline; host waits retain their own wake.
 #[cfg(target_os = "linux")]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn drive_local<F, T>(
-    future: F, clock: &Arc<dyn DeadlineClock>,
+    future: F,
+    clock: &Arc<dyn DeadlineClock>,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> crate::owner_read::OwnerReadScaffoldResult<T>
-where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
-    use contextdb_core::read_contract::NativeClockBinding;
+where
+    F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send,
+{
     use crate::owner_read::OwnerReadScaffoldError as E;
-    let mut driver = contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
-        let binding = match NativeClockBinding::try_select(clock, &owner) {
-            Ok(binding) => Some(binding),
-            Err(contextdb_core::Error::ReadSessionNotImplemented) => None,
-            Err(error) => return Err(error),
-        };
-        let park = super::native_driver::NativeCallerPark::try_new(owner)?;
-        // A selected source alone is not an active driver. This admitted
-        // poll-and-park frame is the actual caller/connection responsible.
-        let driving = binding.as_ref().map(|_| {
-            clock.native_driver_started();
-            NativeDriverLease(clock.clone())
-        });
-        Ok(DrivenLocalFuture { future, binding, park, _driving: driving })
-    }).map_err(|error| E::from_local(super::LocalTransportError::OriginalAdmission(error)))?;
+    use contextdb_core::read_contract::NativeClockBinding;
+    let mut driver =
+        contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
+            let binding = match NativeClockBinding::try_select(clock, &owner) {
+                Ok(binding) => Some(binding),
+                Err(contextdb_core::Error::ReadSessionNotImplemented) => None,
+                Err(error) => return Err(error),
+            };
+            let park = super::native_driver::NativeCallerPark::try_new(owner)?;
+            // A selected source alone is not an active driver. This admitted
+            // poll-and-park frame is the actual caller/connection responsible.
+            let driving = binding.as_ref().map(|_| {
+                clock.native_driver_started();
+                NativeDriverLease(clock.clone())
+            });
+            Ok(DrivenLocalFuture {
+                future,
+                binding,
+                park,
+                _driving: driving,
+            })
+        })
+        .map_err(|error| E::from_local(super::LocalTransportError::OriginalAdmission(error)))?;
     let mut cx = Context::from_waker(Waker::noop());
     loop {
-        if let Poll::Ready(result) = Pin::new(&mut driver).poll(&mut cx) { return result; }
+        if let Poll::Ready(result) = Pin::new(&mut driver).poll(&mut cx) {
+            return result;
+        }
     }
 }
 
 impl MonotonicDeadlineClock {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn legacy_owned_wait(
-        &self, deadline_ms: u64, owner: &contextdb_core::read_memory::ReadMemoryOwner,
+        &self,
+        deadline_ms: u64,
+        owner: &contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<Option<contextdb_core::read_memory::ReadOwnedFuture<'_, ()>>> {
         // The complete concrete frame is admitted before state, name, source,
         // or worker creation. Genuine custom clocks use the trait default.
         contextdb_core::read_memory::ReadOwnedFuture::try_new_with(owner.clone(), || {
             let remaining = deadline_ms.saturating_sub(self.now_ms());
-            if remaining == 0 { return Ok(LegacyMonotonicWait::Ready); }
+            if remaining == 0 {
+                return Ok(LegacyMonotonicWait::Ready);
+            }
             #[cfg(any(test, feature = "test-seams"))]
-            if self.fail_timer_arm || FAILED_TIMER_ARMS.with(|remaining| {
-                let count = remaining.get(); remaining.set(count.saturating_sub(1)); count != 0
-            }) {
+            if self.fail_timer_arm
+                || FAILED_TIMER_ARMS.with(|remaining| {
+                    let count = remaining.get();
+                    remaining.set(count.saturating_sub(1));
+                    count != 0
+                })
+            {
                 self.timer_arm_failure_waits.fetch_add(1, Ordering::SeqCst);
                 return Ok(LegacyMonotonicWait::Injected(InjectedTimerArmFailureWait {
-                    completed: false, polls: &self.timer_arm_failure_polls,
+                    completed: false,
+                    polls: &self.timer_arm_failure_polls,
                 }));
             }
-            let state = owned_shared(owner.clone(), || Ok((Mutex::new(TimerState::default()), std::sync::Condvar::new())))?;
+            let state = owned_shared(owner.clone(), || {
+                Ok((Mutex::new(TimerState::default()), std::sync::Condvar::new()))
+            })?;
             let invoice = contextdb_core::read_memory::ReadCredit::try_new_owned(
-                owner.clone(), std::mem::size_of::<OwnedTimerSource>(),
-                "reader", "deadline_thread_source", "Raise the reader memory limit.")?;
-            let source = contextdb_core::read_memory::OwnedReadBox::try_from_prepaid_with(invoice, || Ok(OwnedTimerSource {
-                state: state.clone(), remaining,
-                #[cfg(feature = "test-seams")] lifecycle: self.thread_lifecycle.clone(),
-            }))?;
+                owner.clone(),
+                std::mem::size_of::<OwnedTimerSource>(),
+                "reader",
+                "deadline_thread_source",
+                "Raise the reader memory limit.",
+            )?;
+            let source =
+                contextdb_core::read_memory::OwnedReadBox::try_from_prepaid_with(invoice, || {
+                    Ok(OwnedTimerSource {
+                        state: state.clone(),
+                        remaining,
+                        #[cfg(feature = "test-seams")]
+                        lifecycle: self.thread_lifecycle.clone(),
+                    })
+                })?;
             // This internal worker needs no owned debug-name allocation.
             // Public host-created waits keep their existing named path.
             match std::thread::Builder::new().spawn(move || source.run()) {
                 Ok(thread) => {
-                    #[cfg(any(test, feature = "test-seams"))] note_timer_thread_started_for_test();
-                    Ok(LegacyMonotonicWait::Timer(OwnedTimerWait { state, thread: Some(thread) }))
+                    #[cfg(any(test, feature = "test-seams"))]
+                    note_timer_thread_started_for_test();
+                    Ok(LegacyMonotonicWait::Timer(OwnedTimerWait {
+                        state,
+                        thread: Some(thread),
+                    }))
                 }
                 Err(_) => Ok(LegacyMonotonicWait::Ready),
             }
-        }).map(Some)
+        })
+        .map(Some)
     }
-
 }
 struct OwnedTimerSource {
     state: contextdb_core::read_memory::ReadShared<(Mutex<TimerState>, std::sync::Condvar)>,
     remaining: u64,
-    #[cfg(feature = "test-seams")] lifecycle: Option<DeadlineThreadLifecycle>,
+    #[cfg(feature = "test-seams")]
+    lifecycle: Option<DeadlineThreadLifecycle>,
 }
 impl OwnedTimerSource {
     fn run(&self) {
         #[cfg(feature = "test-seams")]
         let _exited = self.lifecycle.as_ref().map(|lifecycle| {
-            let _ = lifecycle.started.send(()); DeadlineThreadExit(Some(lifecycle.exited.clone()))
+            let _ = lifecycle.started.send(());
+            DeadlineThreadExit(Some(lifecycle.exited.clone()))
         });
         let (lock, changed) = &*self.state;
         let until = std::time::Instant::now() + std::time::Duration::from_millis(self.remaining);
         let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
         state.owner = Some(crate::owned_worker::current_thread_id());
         loop {
-            if state.abandoned { return; }
+            if state.abandoned {
+                return;
+            }
             let now = std::time::Instant::now();
-            if now >= until { break; }
-            state = changed.wait_timeout(state, until - now).map(|(state, _)| state)
+            if now >= until {
+                break;
+            }
+            state = changed
+                .wait_timeout(state, until - now)
+                .map(|(state, _)| state)
                 .unwrap_or_else(|p| p.into_inner().0);
         }
         state.reached = true;
-        let waker = state.waker.take(); drop(state);
-        if let Some(waker) = waker { waker.wake(); }
+        let waker = state.waker.take();
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 struct OwnedTimerWait {
@@ -1367,49 +1589,69 @@ impl Future for OwnedTimerWait {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
-        if state.reached { Poll::Ready(()) }
-        else { state.waker = Some(cx.waker().clone()); Poll::Pending }
+        if state.reached {
+            Poll::Ready(())
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }
 impl Drop for OwnedTimerWait {
     fn drop(&mut self) {
-        { let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
-          state.abandoned = true; state.waker = None; }
+        {
+            let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+            state.abandoned = true;
+            state.waker = None;
+        }
         self.state.1.notify_all();
         if let Some(thread) = self.thread.take()
             && self.state.0.lock().unwrap_or_else(|p| p.into_inner()).owner
                 != Some(crate::owned_worker::current_thread_id())
-            {
-                let _ = thread.join();
-            }
+        {
+            let _ = thread.join();
+        }
     }
 }
 enum LegacyMonotonicWait<'a> {
     Ready,
     Timer(OwnedTimerWait),
-    #[cfg(any(test, feature = "test-seams"))] Injected(InjectedTimerArmFailureWait<'a>),
-    #[cfg(not(any(test, feature = "test-seams")))] Lifetime(std::marker::PhantomData<&'a ()>),
+    #[cfg(any(test, feature = "test-seams"))]
+    Injected(InjectedTimerArmFailureWait<'a>),
+    #[cfg(not(any(test, feature = "test-seams")))]
+    Lifetime(std::marker::PhantomData<&'a ()>),
 }
 impl Future for LegacyMonotonicWait<'_> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         match self.get_mut() {
-            Self::Ready => Poll::Ready(()), Self::Timer(wait) => Pin::new(wait).poll(cx),
-            #[cfg(any(test, feature = "test-seams"))] Self::Injected(wait) => Pin::new(wait).poll(cx),
-            #[cfg(not(any(test, feature = "test-seams")))] Self::Lifetime(_) => Poll::Ready(()),
+            Self::Ready => Poll::Ready(()),
+            Self::Timer(wait) => Pin::new(wait).poll(cx),
+            #[cfg(any(test, feature = "test-seams"))]
+            Self::Injected(wait) => Pin::new(wait).poll(cx),
+            #[cfg(not(any(test, feature = "test-seams")))]
+            Self::Lifetime(_) => Poll::Ready(()),
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn drive_local<F, T>(
-    future: F, _clock: &Arc<dyn DeadlineClock>, _owner: contextdb_core::read_memory::ReadMemoryOwner,
+    future: F,
+    _clock: &Arc<dyn DeadlineClock>,
+    _owner: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> crate::owner_read::OwnerReadScaffoldResult<T>
-where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
+where
+    F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send,
+{
     struct Caller(std::thread::Thread);
     impl std::task::Wake for Caller {
-        fn wake(self: Arc<Self>) { self.0.unpark(); }
-        fn wake_by_ref(self: &Arc<Self>) { self.0.unpark(); }
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
     }
     let waker = Waker::from(Arc::new(Caller(std::thread::current())));
     let mut cx = Context::from_waker(&waker);
@@ -1422,7 +1664,6 @@ where F: Future<Output = crate::owner_read::OwnerReadScaffoldResult<T>> + Send {
     }
 }
 
-
 /// One fixed driver retained by a standalone session's resource owner. The
 /// existing clock/list remain the only deadline source and pending-wait queue.
 #[cfg(target_os = "linux")]
@@ -1434,32 +1675,50 @@ pub(crate) struct OwnedClockDriver {
 }
 #[cfg(target_os = "linux")]
 impl MonotonicDeadlineClock {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn start_owned_driver(
-        self: &Arc<Self>, owner: contextdb_core::read_memory::ReadMemoryOwner,
+        self: &Arc<Self>,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<OwnedClockDriver> {
         use contextdb_core::read_memory::{ReadCredit, ReadShared};
         let wake = super::native_driver::NativeCallerWake::try_new_owned(owner.clone())?;
-        let stop = ReadShared::try_from_prepaid(std::sync::atomic::AtomicBool::new(false),
-            ReadCredit::try_new_owned(owner.clone(), ReadShared::<std::sync::atomic::AtomicBool>::layout().size(),
-                "reader", "session_expiry_stop", "Raise the reader memory limit.")?)?;
+        let stop = ReadShared::try_from_prepaid(
+            std::sync::atomic::AtomicBool::new(false),
+            ReadCredit::try_new_owned(
+                owner.clone(),
+                ReadShared::<std::sync::atomic::AtomicBool>::layout().size(),
+                "reader",
+                "session_expiry_stop",
+                "Raise the reader memory limit.",
+            )?,
+        )?;
         let clock: Arc<dyn DeadlineClock> = self.clone();
-        let binding = contextdb_core::read_contract::NativeClockBinding::try_select(&clock, &owner)?;
+        let binding =
+            contextdb_core::read_contract::NativeClockBinding::try_select(&clock, &owner)?;
         let thread_clock = self.clone();
         let thread_stop = stop.clone();
         let park = super::native_driver::NativeCallerPark { wake: wake.clone() };
         // Publish the permanent driver before a foreground caller can arm a
         // cursor. The session serializes startup; failure removes this lease.
-        self.owned_driver_stopped.store(false, std::sync::atomic::Ordering::Release);
+        self.owned_driver_stopped
+            .store(false, std::sync::atomic::Ordering::Release);
         self.native_driver_started();
-        *self.owned_driver_wake.lock().unwrap_or_else(|p| p.into_inner()) = Some(wake.clone());
+        *self
+            .owned_driver_wake
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(wake.clone());
         let worker = crate::owned_worker::OwnedWorker::spawn(owner, move || {
             struct Lease(Arc<MonotonicDeadlineClock>);
             impl Drop for Lease {
                 fn drop(&mut self) {
                     // Wake the exact pending set, but do not let callbacks
                     // replace this stopped fixed driver with a per-wait thread.
-                    self.0.owned_driver_stopped.store(true, std::sync::atomic::Ordering::Release);
+                    self.0
+                        .owned_driver_stopped
+                        .store(true, std::sync::atomic::Ordering::Release);
                     self.0.native_driver_ended();
                 }
             }
@@ -1467,14 +1726,25 @@ impl MonotonicDeadlineClock {
             while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
                 thread_clock.drive_native_deadlines();
                 let deadline = thread_clock.native_next_deadline_ms().unwrap_or(u64::MAX);
-                if binding.park_until(deadline, &park).is_err() { break; }
+                if binding.park_until(deadline, &park).is_err() {
+                    break;
+                }
             }
         });
         match worker {
-            Ok(worker) => Ok(OwnedClockDriver { clock: self.clone(), stop, wake, worker: Some(worker) }),
+            Ok(worker) => Ok(OwnedClockDriver {
+                clock: self.clone(),
+                stop,
+                wake,
+                worker: Some(worker),
+            }),
             Err(error) => {
-                self.owned_driver_stopped.store(true, std::sync::atomic::Ordering::Release);
-                self.owned_driver_wake.lock().unwrap_or_else(|p| p.into_inner()).take();
+                self.owned_driver_stopped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.owned_driver_wake
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take();
                 self.native_driver_ended();
                 Err(error)
             }
@@ -1486,8 +1756,14 @@ impl Drop for OwnedClockDriver {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         contextdb_core::read_memory::NativeReadWake::wake_read(&*self.wake);
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
-        self.clock.owned_driver_wake.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.clock
+            .owned_driver_wake
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
     }
 }
 
@@ -1497,7 +1773,9 @@ mod independent_owned_driver_tests {
     use crate::memory_accounting::MemoryAccountant;
     use std::sync::Arc;
 
-    fn threads() -> usize { std::fs::read_dir("/proc/self/task").unwrap().count() }
+    fn threads() -> usize {
+        std::fs::read_dir("/proc/self/task").unwrap().count()
+    }
     fn linked(clock: &MonotonicDeadlineClock) -> (usize, usize) {
         let list = clock.owned_waits.lock().unwrap();
         let mut count = 0;
@@ -1523,7 +1801,9 @@ mod independent_owned_driver_tests {
         // worker from the clock driver's own creation/release delta.
         crate::owned_worker::ensure_finisher().unwrap();
         let before = threads();
-        let actual = Arc::new(MemoryAccountant::with_budget(contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY as usize));
+        let actual = Arc::new(MemoryAccountant::with_budget(
+            contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY as usize,
+        ));
         let owner: contextdb_core::read_memory::ReadMemoryOwner = actual.clone().into();
         let clock = Arc::new(MonotonicDeadlineClock::new());
         let worker = clock.start_owned_driver(owner.clone()).unwrap();
@@ -1533,22 +1813,41 @@ mod independent_owned_driver_tests {
             let mut waits = Vec::new();
             for _ in 0..size {
                 let mut wait = clock.try_owned_wait(u64::MAX, &owner).unwrap().unwrap();
-                assert!(Pin::new(&mut wait).poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                assert!(
+                    Pin::new(&mut wait)
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
                 waits.push(wait);
             }
             assert_eq!(linked(&clock), (1, size));
             assert_eq!(threads(), before + 1);
             assert_eq!(timer_threads_started_for_test(), timer_before);
-            drive_local(std::future::ready(Ok::<(), crate::owner_read::OwnerReadScaffoldError>(())), &dynamic, owner.clone()).unwrap();
-            assert_eq!(linked(&clock), (1, size), "normal departure leaves every wait with the fixed worker");
+            drive_local(
+                std::future::ready(Ok::<(), crate::owner_read::OwnerReadScaffoldError>(())),
+                &dynamic,
+                owner.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                linked(&clock),
+                (1, size),
+                "normal departure leaves every wait with the fixed worker"
+            );
             let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let pending = std::future::poll_fn(|_| -> Poll<crate::owner_read::OwnerReadScaffoldResult<()>> {
-                    panic!("application driver callback unwinds")
-                });
+                let pending = std::future::poll_fn(
+                    |_| -> Poll<crate::owner_read::OwnerReadScaffoldResult<()>> {
+                        panic!("application driver callback unwinds")
+                    },
+                );
                 let _ = drive_local(pending, &dynamic, owner.clone());
             }));
             assert!(unwind.is_err());
-            assert_eq!(linked(&clock), (1, size), "unwind does not orphan a registered wait");
+            assert_eq!(
+                linked(&clock),
+                (1, size),
+                "unwind does not orphan a registered wait"
+            );
             assert_eq!(threads(), before + 1);
             assert_eq!(timer_threads_started_for_test(), timer_before);
             drop(waits);
@@ -1558,7 +1857,9 @@ mod independent_owned_driver_tests {
         assert_eq!(linked(&clock), (0, 0));
         assert_eq!(actual.usage().used, 0);
         for _ in 0..100_000 {
-            if threads() == before { break; }
+            if threads() == before {
+                break;
+            }
             std::thread::yield_now();
         }
         assert_eq!(threads(), before);

@@ -237,11 +237,13 @@ fn composite_prefix_newest_row_examines_constant_entries() {
     );
 
     assert_eq!(
-        small_result.trace().rows_examined, large_result.trace().rows_examined,
+        small_result.trace().rows_examined,
+        large_result.trace().rows_examined,
         "the 10- and 20,010-event streams examine the same number of index entries"
     );
     assert_eq!(
-        small_result.trace().rows_examined, neighbour_result.trace().rows_examined,
+        small_result.trace().rows_examined,
+        neighbour_result.trace().rows_examined,
         "a stream's lookup ignores the 20,000 same-context events in another stream"
     );
 
@@ -268,11 +270,13 @@ fn composite_prefix_newest_row_examines_constant_entries() {
     );
 
     assert_eq!(
-        small_staged.trace().rows_examined, large_staged.trace().rows_examined,
+        small_staged.trace().rows_examined,
+        large_staged.trace().rows_examined,
         "transactional lookup examines the same number of entries for 10 and 20,010 committed stream rows"
     );
     assert_eq!(
-        small_staged.trace().rows_examined, neighbour_staged.trace().rows_examined,
+        small_staged.trace().rows_examined,
+        neighbour_staged.trace().rows_examined,
         "transactional lookup ignores 20,000 same-context rows in another stream"
     );
     for (outside, staged, arm) in [
@@ -359,7 +363,8 @@ fn historical_in_list_rebuild_seeks_each_declared_run_from_its_own_edge() {
         Some("historical_members_key")
     );
     assert_eq!(
-        result.trace().rows_examined, 4,
+        result.trace().rows_examined,
+        4,
         "the rebuild and answer each touch exactly the two listed postings, never the gap or the newer root"
     );
 }

@@ -2354,7 +2354,10 @@ fn hydration_without_a_companion_leaves_every_store_adjacent_companion_absent() 
     // A companionless store has no erasure fence to retain. Its final
     // reader removes the runtime child it created; the operator's runtime
     // directory and every store-adjacent byte stay unchanged.
-    assert!(runtime_directory.is_dir(), "last-reader cleanup preserves the operator runtime base");
+    assert!(
+        runtime_directory.is_dir(),
+        "last-reader cleanup preserves the operator runtime base"
+    );
     let runtime_after = inventory_directory(&runtime_directory);
     assert!(runtime_after.keys().all(|path| {
         path.extension().and_then(|extension| extension.to_str()) != Some("reader")
@@ -2364,17 +2367,32 @@ fn hydration_without_a_companion_leaves_every_store_adjacent_companion_absent() 
         "a finished companionless read leaves no runtime child"
     );
     drop(restore);
-    for case in ["clear", "held", "pending", "unreadable", "replaced", "unknown-sibling", "live-registration", "gate"] {
+    for case in [
+        "clear",
+        "held",
+        "pending",
+        "unreadable",
+        "replaced",
+        "unknown-sibling",
+        "live-registration",
+        "gate",
+    ] {
         let private_runtime = tempfile::tempdir().unwrap();
         fs::set_permissions(private_runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let filter = crate::child_test_filter(module_path!(),
-            "hydration_without_a_companion_leaves_every_store_adjacent_companion_absent");
+        let filter = crate::child_test_filter(
+            module_path!(),
+            "hydration_without_a_companion_leaves_every_store_adjacent_companion_absent",
+        );
         let status = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &filter, "--nocapture"])
             .env("CONTEXTDB_RUNTIME_CLEANUP_CASE", case)
             .env("XDG_RUNTIME_DIR", private_runtime.path())
-            .status().unwrap();
-        assert!(status.success(), "real runtime cleanup row {case}: {status}");
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "real runtime cleanup row {case}: {status}"
+        );
     }
 }
 
@@ -2382,10 +2400,17 @@ fn hydration_without_a_companion_leaves_every_store_adjacent_companion_absent() 
 fn runtime_cleanup_case(case: &str) {
     if case == "purge-pending" {
         let path = PathBuf::from(std::env::var_os("CONTEXTDB_RUNTIME_CLEANUP_STORE").unwrap());
-        let writer = Database::open_with_options(&path, contextdb_engine::DatabaseOpenOptions {
-            owner_reads: contextdb_engine::OwnerReadConfig { enabled: false, ..Default::default() },
-            ..Default::default()
-        }).unwrap();
+        let writer = Database::open_with_options(
+            &path,
+            contextdb_engine::DatabaseOpenOptions {
+                owner_reads: contextdb_engine::OwnerReadConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let _ = writer.execute("PURGE FROM proof WHERE id = 1", &HashMap::new());
         panic!("real pre-durable crash boundary must exit 86");
     }
@@ -2394,19 +2419,34 @@ fn runtime_cleanup_case(case: &str) {
     let path = directory.path().join("cleanup.db");
     seed_store(&path);
     let seed = Database::open(&path).unwrap();
-    seed.execute("INSERT INTO proof VALUES (1, 'retained')", &HashMap::new()).unwrap();
+    seed.execute("INSERT INTO proof VALUES (1, 'retained')", &HashMap::new())
+        .unwrap();
     seed.close().unwrap();
     drop(seed);
     let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
     let operator_bytes = runtime.join("operator-owned");
     fs::write(&operator_bytes, b"operator-owned bytes").unwrap();
     let reader = ReadSession::open(&path).unwrap();
-    let registration = reader.file_storage_registration_for_test().unwrap().registration_path.unwrap();
+    let registration = reader
+        .file_storage_registration_for_test()
+        .unwrap()
+        .registration_path
+        .unwrap();
     let registry = registration.parent().unwrap().to_path_buf();
-    let fences: Vec<_> = fs::read_dir(&registry).unwrap().map(|entry| entry.unwrap().path())
-        .filter(|entry| entry.file_name().unwrap().to_str().is_some_and(|name|
-            name.starts_with("purge-publication-") && name.ends_with(".fence"))).collect();
-    assert_eq!(fences.len(), 1, "production reader created exactly its authenticated incarnation fence");
+    let fences: Vec<_> = fs::read_dir(&registry)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|entry| {
+            entry.file_name().unwrap().to_str().is_some_and(|name| {
+                name.starts_with("purge-publication-") && name.ends_with(".fence")
+            })
+        })
+        .collect();
+    assert_eq!(
+        fences.len(),
+        1,
+        "production reader created exactly its authenticated incarnation fence"
+    );
     let fence = &fences[0];
     let mut expected_fence = fs::read(fence).unwrap();
     let mut sibling = None;
@@ -2431,57 +2471,104 @@ fn runtime_cleanup_case(case: &str) {
             #[cfg(target_os = "linux")]
             {
                 use std::os::fd::AsRawFd;
-                let file = OpenOptions::new().read(true).write(true).open(fence).unwrap();
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(fence)
+                    .unwrap();
                 // Same OFD publication range used by the real fence, not flock.
                 let mut lock: libc::flock = unsafe { std::mem::zeroed() };
                 lock.l_type = libc::F_WRLCK as _;
                 lock.l_whence = libc::SEEK_SET as _;
                 lock.l_start = 1 << 40;
                 lock.l_len = 1;
-                assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) }, 0);
+                assert_eq!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) },
+                    0
+                );
                 held_file = Some(file);
             }
             #[cfg(not(target_os = "linux"))]
             return; // This exact OFD range-lock control is Linux-only.
         }
         "gate" => {
-            writer = Some(Database::open_with_options(&path, contextdb_engine::DatabaseOpenOptions {
-                owner_reads: contextdb_engine::OwnerReadConfig { enabled: false, ..Default::default() },
-                ..Default::default()
-            }).unwrap());
+            writer = Some(
+                Database::open_with_options(
+                    &path,
+                    contextdb_engine::DatabaseOpenOptions {
+                        owner_reads: contextdb_engine::OwnerReadConfig {
+                            enabled: false,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            );
         }
         "pending" => {
-            let filter = crate::child_test_filter(module_path!(),
-                "hydration_without_a_companion_leaves_every_store_adjacent_companion_absent");
+            let filter = crate::child_test_filter(
+                module_path!(),
+                "hydration_without_a_companion_leaves_every_store_adjacent_companion_absent",
+            );
             let status = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &filter, "--nocapture"])
                 .env("CONTEXTDB_RUNTIME_CLEANUP_CASE", "purge-pending")
                 .env("CONTEXTDB_RUNTIME_CLEANUP_STORE", &path)
-                .env("CONTEXTDB_PURGE_PUBLICATION_CRASH_AT", "before-durable-commit")
-                .status().unwrap();
-            assert_eq!(status.code(), Some(86), "real purge left authenticated unheld Pending crash state");
+                .env(
+                    "CONTEXTDB_PURGE_PUBLICATION_CRASH_AT",
+                    "before-durable-commit",
+                )
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.code(),
+                Some(86),
+                "real purge left authenticated unheld Pending crash state"
+            );
             let pending = fs::read(fence).unwrap();
-            assert_ne!(pending, expected_fence, "the production prepare wrote Pending state");
+            assert_ne!(
+                pending, expected_fence,
+                "the production prepare wrote Pending state"
+            );
             expected_fence = pending;
         }
         other => panic!("unknown cleanup row {other}"),
     }
     drop(reader);
-    assert!(!registration.exists(), "last reader always releases its own authenticated registration");
-    assert!(runtime.is_dir(), "operator runtime base survives every cleanup branch");
+    assert!(
+        !registration.exists(),
+        "last reader always releases its own authenticated registration"
+    );
+    assert!(
+        runtime.is_dir(),
+        "operator runtime base survives every cleanup branch"
+    );
     assert_eq!(fs::read(&operator_bytes).unwrap(), b"operator-owned bytes");
     if case == "clear" {
         assert!(!fence.exists(), "Clear/unheld authentic fence is removable");
         assert!(!registry.exists(), "empty per-store registry is removed");
         return;
     }
-    assert!(fs::symlink_metadata(fence).is_ok(), "unsafe cleanup predicate preserves the fence");
+    assert!(
+        fs::symlink_metadata(fence).is_ok(),
+        "unsafe cleanup predicate preserves the fence"
+    );
     if case == "unreadable" {
         fs::set_permissions(fence, fs::Permissions::from_mode(0o600)).unwrap();
     }
-    assert_eq!(fs::read(fence).unwrap(), expected_fence, "fence bytes survive failed cleanup exactly");
+    assert_eq!(
+        fs::read(fence).unwrap(),
+        expected_fence,
+        "fence bytes survive failed cleanup exactly"
+    );
     if case == "replaced" {
-        assert!(fs::symlink_metadata(fence).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(fence)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         fs::remove_file(fence).unwrap();
         fs::rename(&moved, fence).unwrap();
     }
@@ -2490,26 +2577,55 @@ fn runtime_cleanup_case(case: &str) {
         fs::remove_file(unknown).unwrap();
     }
     if let Some(reader) = live_reader {
-        assert_eq!(reader.execute("SELECT id FROM proof", &HashMap::new()).unwrap().rows(),
-            vec![vec![Value::Int64(1)]], "other live registration remains usable");
+        assert_eq!(
+            reader
+                .execute("SELECT id FROM proof", &HashMap::new())
+                .unwrap()
+                .rows(),
+            vec![vec![Value::Int64(1)]],
+            "other live registration remains usable"
+        );
         drop(reader);
     }
     drop(held_file);
-    if let Some(writer) = writer { writer.close().unwrap(); }
+    if let Some(writer) = writer {
+        writer.close().unwrap();
+    }
     if case == "pending" {
-        let recovery = Database::open_with_options(&path, contextdb_engine::DatabaseOpenOptions {
-            owner_reads: contextdb_engine::OwnerReadConfig { enabled: false, ..Default::default() },
-            ..Default::default()
-        }).expect("writer recovers real Pending crash state");
-        assert_eq!(recovery.execute("SELECT id FROM proof", &HashMap::new()).unwrap().rows(),
-            vec![vec![Value::Int64(1)]], "pre-durable failed purge erases no row");
+        let recovery = Database::open_with_options(
+            &path,
+            contextdb_engine::DatabaseOpenOptions {
+                owner_reads: contextdb_engine::OwnerReadConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .expect("writer recovers real Pending crash state");
+        assert_eq!(
+            recovery
+                .execute("SELECT id FROM proof", &HashMap::new())
+                .unwrap()
+                .rows(),
+            vec![vec![Value::Int64(1)]],
+            "pre-durable failed purge erases no row"
+        );
         recovery.close().unwrap();
     }
     let final_reader = ReadSession::open(&path).expect("restored coordination is usable");
-    assert_eq!(final_reader.execute("SELECT id FROM proof", &HashMap::new()).unwrap().rows(),
-        vec![vec![Value::Int64(1)]]);
+    assert_eq!(
+        final_reader
+            .execute("SELECT id FROM proof", &HashMap::new())
+            .unwrap()
+            .rows(),
+        vec![vec![Value::Int64(1)]]
+    );
     drop(final_reader);
-    assert!(!fence.exists(), "later safe cleanup removes the now-Clear unheld fence");
+    assert!(
+        !fence.exists(),
+        "later safe cleanup removes the now-Clear unheld fence"
+    );
     assert!(!registry.exists());
     assert!(runtime.is_dir());
     assert_eq!(fs::read(&operator_bytes).unwrap(), b"operator-owned bytes");

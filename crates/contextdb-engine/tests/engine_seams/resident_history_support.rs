@@ -20,7 +20,8 @@ pub fn open(path: &Path, limit: Option<usize>) -> Database {
 pub fn exec(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     db.execute(sql, &empty())
         .unwrap_or_else(|e| panic!("fixture SQL {sql}: {e:?}"))
-        .rows().to_vec()
+        .rows()
+        .to_vec()
 }
 pub fn partition(scope: i64) -> VectorPartitionKey {
     VectorPartitionKey::from_values(&[Value::Int64(scope)]).unwrap()
@@ -62,7 +63,8 @@ pub fn query_vector(
         &HashMap::from([("v".into(), Value::Vector(vector(id, dim)))]),
     )
     .expect("vector query")
-    .rows().to_vec()
+    .rows()
+    .to_vec()
 }
 #[cfg(target_os = "linux")]
 pub fn anonymous_bytes() -> u64 {
@@ -96,7 +98,8 @@ pub fn vector_rows(
         snapshot,
     )
     .expect("read every vector body at the fixture frontier")
-    .rows().to_vec()
+    .rows()
+    .to_vec()
 }
 pub fn vector_oracle(ids: impl IntoIterator<Item = usize>, dim: usize) -> Vec<Vec<Value>> {
     ids.into_iter()

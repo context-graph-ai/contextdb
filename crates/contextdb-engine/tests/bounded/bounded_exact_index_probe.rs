@@ -108,7 +108,8 @@ fn a_bounded_primary_key_read_reaches_its_row_instead_of_walking_the_table() {
         "the equality predicate names exactly one stored row"
     );
     assert_eq!(
-        outcome.result.trace().physical_plan, "IndexScan",
+        outcome.result.trace().physical_plan,
+        "IndexScan",
         "a primary-key equality is answered through the key's own index"
     );
     assert!(
@@ -160,7 +161,8 @@ fn a_bounded_primary_key_read_answers_the_same_rows_as_a_full_scan() {
 
     assert_eq!(seek.result.columns(), scan.result.columns());
     assert_eq!(
-        seek.result.rows(), scan.result.rows(),
+        seek.result.rows(),
+        scan.result.rows(),
         "a seek and a scan must answer the same rows for the same predicate"
     );
 }
@@ -184,12 +186,14 @@ fn a_range_over_a_synthesized_index_keeps_scanning() {
         "the range names the two rows above its bound"
     );
     assert_eq!(
-        outcome.result.trace().physical_plan, "Scan",
+        outcome.result.trace().physical_plan,
+        "Scan",
         "a range names no whole key, so an exact-lookup index cannot answer it and the read \
          stays on the scan path"
     );
     assert_eq!(
-        outcome.result.trace().index_used, None,
+        outcome.result.trace().index_used,
+        None,
         "a read that scanned must not report an index it did not use"
     );
 }

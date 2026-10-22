@@ -45,7 +45,10 @@ impl PrepaidVectorCopyCharge for Prepaid {
         self.0.transfer();
     }
 }
-fn credit(budget: impl Into<contextdb_vector::MemoryBudgetOwner>, bytes: usize) -> Arc<VectorCopyAdmission> {
+fn credit(
+    budget: impl Into<contextdb_vector::MemoryBudgetOwner>,
+    bytes: usize,
+) -> Arc<VectorCopyAdmission> {
     let mut credit = VectorCopyAdmission::new(budget);
     credit.reserve(bytes).unwrap();
     Arc::new(credit)
@@ -53,7 +56,10 @@ fn credit(budget: impl Into<contextdb_vector::MemoryBudgetOwner>, bytes: usize) 
 
 // Real received-body installation followed by loaded-state header promotion
 // drives quantized funder matching and directory settlement without test seams.
-fn mixed_payload_owners(body: impl Into<contextdb_vector::MemoryBudgetOwner>, header: impl Into<contextdb_vector::MemoryBudgetOwner>) -> VectorStore {
+fn mixed_payload_owners(
+    body: impl Into<contextdb_vector::MemoryBudgetOwner>,
+    header: impl Into<contextdb_vector::MemoryBudgetOwner>,
+) -> VectorStore {
     let body = body.into();
     let header = header.into();
     let store = VectorStore::default();
@@ -140,14 +146,12 @@ fn default_funder_identity_preserves_trait_data_address() {
     drop(adapter_b);
     drop(root);
     assert_eq!(first.usage().used, 0);
-    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_000_000).unwrap();
+    let parent =
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_000_000).unwrap();
     let child = parent.child().unwrap();
     let child_identity = child.accounting_identity();
     let reader = crate::vector_read_memory::budget(child);
-    assert_eq!(
-        reader.stable_funder_identity(),
-        child_identity
-    );
+    assert_eq!(reader.stable_funder_identity(), child_identity);
     println!(
         "CDB127_DEFAULT_COMPAT raw_accountant=unchanged reader_impl=unchanged clones=equal distinct_objects=distinct"
     );
@@ -188,7 +192,10 @@ fn independent_writer_invocations_keep_caller_credit_and_allocation_dedup() {
     let (mut adopted, actual_requests, request_count) =
         crate::persistence::content_identity::proof_allocation_oracle_tests::native_requests_for_test(||
             VectorCopyAdmission::from_prepaid(second.clone(), Prepaid(prepaid)).unwrap());
-    assert_eq!(request_count, 1, "the prepaid control is one actual Box allocation");
+    assert_eq!(
+        request_count, 1,
+        "the prepaid control is one actual Box allocation"
+    );
     assert_eq!(actual_requests[0].1, std::mem::size_of::<Prepaid>());
     adopted.reserve(41).unwrap();
     assert_eq!(
@@ -342,7 +349,8 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
     drop(payload);
     assert_eq!(first.usage().used, first_baseline + 13);
     assert_eq!(second.usage().used, second_baseline + 29);
-    let parent = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_000_000).unwrap();
+    let parent =
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_000_000).unwrap();
     let reader_a = crate::vector_read_memory::budget(parent.child().unwrap());
     let reader_b = crate::vector_read_memory::budget(parent.child().unwrap());
     let controls = parent.retained_bytes_for_test();
@@ -394,15 +402,18 @@ fn distinct_writer_and_reader_funders_refuse_foreign_prepaid_and_refund_original
     );
 }
 
-
 // Public embedding ruling: a search uses its operation child, even with no
 // writer headroom. This row belongs to the existing distinct-funder proof;
 // integration tests cannot call the private explicit-owner entry point.
 fn embedded_graph_reader_scratch_rows() {
+    use crate::vector_read_memory::{
+        DeclaredReadChildObserver, DeclaredReadMemory, declared_child_observer,
+    };
     use contextdb_core::read_memory::ReadMemoryBudget;
-    use crate::vector_read_memory::{DeclaredReadMemory, DeclaredReadChildObserver, declared_child_observer};
+    use contextdb_vector::hnsw::{
+        HnswCandidateDistanceEvent, HnswCandidateObserver, with_hnsw_candidate_observer,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use contextdb_vector::hnsw::{HnswCandidateObserver, HnswCandidateDistanceEvent, with_hnsw_candidate_observer};
     struct Distances(AtomicUsize);
     impl HnswCandidateObserver for Distances {
         fn before_candidate_distance(&self, _: HnswCandidateDistanceEvent) {
@@ -426,45 +437,89 @@ fn embedded_graph_reader_scratch_rows() {
         body_frees: AtomicUsize,
     }
     impl std::fmt::Debug for ReaderSpy {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ReaderSpy") }
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ReaderSpy")
+        }
     }
     impl MemoryBudget for ReaderSpy {
-        fn control_invoice(&self) -> Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>> { self.inner.control_invoice() }
-        fn stable_funder_identity(&self) -> usize { self.inner.stable_funder_identity() }
-        fn try_allocate_for(&self, bytes: usize, subsystem: &str, operation: &str, hint: &str) -> Result<()> {
+        fn control_invoice(
+            &self,
+        ) -> Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>
+        {
+            self.inner.control_invoice()
+        }
+        fn stable_funder_identity(&self) -> usize {
+            self.inner.stable_funder_identity()
+        }
+        fn try_allocate_for(
+            &self,
+            bytes: usize,
+            subsystem: &str,
+            operation: &str,
+            hint: &str,
+        ) -> Result<()> {
             if bytes != 0 && operation == "graph_scratch" {
                 let ordinal = self.graph_calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if ordinal == self.refuse_at {
-                    let available = 8 * 1024 * 1024 - self.parent.retained_bytes_for_test() as usize;
-                    let pressure = available.checked_sub(bytes - 1).expect("clean reader has room for graph scratch");
-                    self.parent.try_reserve(pressure, "proof", "competing_reader", "test pressure")?;
+                    let available =
+                        8 * 1024 * 1024 - self.parent.retained_bytes_for_test() as usize;
+                    let pressure = available
+                        .checked_sub(bytes - 1)
+                        .expect("clean reader has room for graph scratch");
+                    self.parent.try_reserve(
+                        pressure,
+                        "proof",
+                        "competing_reader",
+                        "test pressure",
+                    )?;
                     self.pressure.store(pressure, Ordering::SeqCst);
-                    self.refused_distances.store(self.distances.0.load(Ordering::SeqCst), Ordering::SeqCst);
+                    self.refused_distances
+                        .store(self.distances.0.load(Ordering::SeqCst), Ordering::SeqCst);
                 }
             }
             let before = self.child.sample();
-            let result = self.inner.try_allocate_for(bytes, subsystem, operation, hint);
+            let result = self
+                .inner
+                .try_allocate_for(bytes, subsystem, operation, hint);
             let after = self.child.sample();
-            assert_ne!(after.owner_identity, after.parent_identity, "operation is a child, not its parent");
+            assert_ne!(
+                after.owner_identity, after.parent_identity,
+                "operation is a child, not its parent"
+            );
             assert_ne!(after.owner_identity, self.sibling.sample().owner_identity);
-            assert_eq!(self.sibling.sample().charged_bytes, 0, "sibling is never the executing owner");
-            assert_eq!(after.charged_bytes - before.charged_bytes,
-                if result.is_ok() { bytes as u64 } else { 0 }, "the actual child receives every vector debit");
-            if result.is_ok() { self.debit.fetch_add(bytes, Ordering::SeqCst); }
+            assert_eq!(
+                self.sibling.sample().charged_bytes,
+                0,
+                "sibling is never the executing owner"
+            );
+            assert_eq!(
+                after.charged_bytes - before.charged_bytes,
+                if result.is_ok() { bytes as u64 } else { 0 },
+                "the actual child receives every vector debit"
+            );
+            if result.is_ok() {
+                self.debit.fetch_add(bytes, Ordering::SeqCst);
+            }
             result
         }
         fn release(&self, bytes: usize) {
             let body = self.body_invoice.load(Ordering::SeqCst);
             if body != 0 && body == bytes {
                 let freed = crate::persistence::content_identity::proof_allocation_oracle_tests::source_free_for_test(1);
-                assert_eq!(freed[0].2, 1, "the actual body invoice refunds only after its F32 allocation physically frees");
+                assert_eq!(
+                    freed[0].2, 1,
+                    "the actual body invoice refunds only after its F32 allocation physically frees"
+                );
                 self.body_invoice.store(0, Ordering::SeqCst);
                 self.body_frees.fetch_add(1, Ordering::SeqCst);
             }
             let before = self.child.sample().charged_bytes;
             self.inner.release(bytes);
-            assert_eq!(before - self.child.sample().charged_bytes, bytes as u64,
-                "refund returns to the actual child");
+            assert_eq!(
+                before - self.child.sample().charged_bytes,
+                bytes as u64,
+                "refund returns to the actual child"
+            );
             self.refund.fetch_add(bytes, Ordering::SeqCst);
         }
     }
@@ -473,8 +528,11 @@ fn embedded_graph_reader_scratch_rows() {
         fn before_native_vector_score(&self) {}
         fn after_native_vector_score(&self, event: contextdb_vector::mem::NativeVectorScoreEvent) {
             if let Some((pointer, bytes, invoice)) = event.body_allocation() {
-                assert_eq!(self.0.body_invoice.swap(invoice, Ordering::SeqCst), 0,
-                    "a previous physical body must refund before another body is scored");
+                assert_eq!(
+                    self.0.body_invoice.swap(invoice, Ordering::SeqCst),
+                    0,
+                    "a previous physical body must refund before another body is scored"
+                );
                 crate::persistence::content_identity::proof_allocation_oracle_tests::watch_source_free_for_test(
                     &[(pointer, bytes, std::mem::align_of::<f32>())], 0);
                 self.0.body_seen.fetch_add(1, Ordering::SeqCst);
@@ -483,124 +541,223 @@ fn embedded_graph_reader_scratch_rows() {
     }
     let vector = |seed: u64| {
         let mut state = seed.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(17);
-        (0..32).map(|_| {
-            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
-            ((state >> 40) as i32 - (1 << 23)) as f32 / (1 << 23) as f32
-        }).collect::<Vec<_>>()
+        (0..32)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as i32 - (1 << 23)) as f32 / (1 << 23) as f32
+            })
+            .collect::<Vec<_>>()
     };
     for file_backed in [false, true] {
-    let directory = tempfile::tempdir().unwrap();
-    let db = if file_backed {
-        Database::open(directory.path().join("reader-physical.db")).unwrap()
-    } else { Database::open_memory() };
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute("CREATE TABLE items (id INT PRIMARY KEY, embedding VECTOR(32))", &HashMap::new()).unwrap();
-    for id in 1..=256 {
-        db.execute("INSERT INTO items (id, embedding) VALUES ($id, $v)", &HashMap::from([
-            ("id".into(), Value::Int64(id)), ("v".into(), Value::Vector(vector(id as u64))),
-        ])).unwrap();
-    }
-    for _ in 0..32 { db.run_maintenance_cycle().unwrap(); }
-    let mut query = SemanticQuery::new("items", "embedding", vector(10_000), 10);
-    query.search_mode = Some(contextdb_core::VectorSearchMode::Indexed);
-    let control = db.semantic_search(query.clone()).unwrap();
-    let answer = |rows: &[SearchResult]| rows.iter().map(|row| (row.row_id, row.vector_score.to_bits())).collect::<Vec<_>>();
-    assert_eq!(control.len(), 10);
-    let mut exact_query = query.clone();
-    exact_query.search_mode = Some(contextdb_core::VectorSearchMode::Exact);
-    let exact_control = db.semantic_search(exact_query).unwrap();
-    let writer = db.accountant.usage().used;
-    db.set_memory_limit(Some(writer)).unwrap();
-    assert_eq!(answer(&db.semantic_search(query.clone()).unwrap()), answer(&control));
-    let mut successful_graph_calls = 0;
-    for (mode, refuse_at) in [
-        (contextdb_core::VectorSearchMode::Indexed, 0),
-        (contextdb_core::VectorSearchMode::Indexed, 1),
-        (contextdb_core::VectorSearchMode::Indexed, 3),
-        (contextdb_core::VectorSearchMode::Indexed, 0),
-        (contextdb_core::VectorSearchMode::Exact, 0),
-    ] {
-        let expected = if mode == contextdb_core::VectorSearchMode::Exact { &exact_control } else { &control };
-        let parent = DeclaredReadMemory::from_reader_limit(8 * 1024 * 1024).unwrap();
-        let root_baseline = parent.retained_bytes_for_test();
-        let child = parent.child().unwrap();
-        let sibling = parent.child().unwrap();
-        let observer = declared_child_observer(&child).unwrap();
-        let standing = parent.retained_bytes_for_test();
-        let distances = Arc::new(Distances(AtomicUsize::new(0)));
-        let spy = Arc::new(ReaderSpy {
-            inner: crate::vector_read_memory::budget(child.clone()),
-            child: observer.clone(), sibling: declared_child_observer(&sibling).unwrap(),
-            parent: parent.clone(), graph_calls: AtomicUsize::new(0),
-            debit: AtomicUsize::new(0), refund: AtomicUsize::new(0), refuse_at,
-            pressure: AtomicUsize::new(0), distances: distances.clone(),
-            refused_distances: AtomicUsize::new(usize::MAX),
-            body_invoice: AtomicUsize::new(0), body_seen: AtomicUsize::new(0), body_frees: AtomicUsize::new(0),
-        });
-        let mut owner = VectorCopyAdmission::new(spy.clone());
-        // Public answer equivalence was checked above. Measure the same native
-        // graph-search operation, including its owned scores and trace through
-        // physical destruction; legacy SearchResult value copying is outside
-        // the graph-scratch contract and retains its separate failed receipt.
-        let operation_index = VectorIndexRef::new("items", "embedding");
-        let source_scope = db.writer_read_scope(child.clone()).unwrap();
-        let vector_scope = db.vector_read_scope(db.snapshot(), child.clone(), &mut owner).unwrap();
-        let physical_bodies = Arc::new(PhysicalBodies(spy.clone()));
-        let operation = || contextdb_vector::mem::with_native_vector_score_observer_for_test(
-            physical_bodies.clone(), || with_hnsw_candidate_observer(distances.clone(), || {
-            let (rows, trace) = db.owner_vector_search(
-                operation_index, &query.query, 10, None, db.snapshot(),
-                mode, spy.clone(), child.clone(), &mut owner)?;
-            assert_eq!(rows.len(), expected.len());
-            assert!(rows.iter().zip(expected).all(|((id, score), expected)|
-                *id == expected.row_id && score.to_bits() == expected.vector_score.to_bits()));
-            drop(rows);
-            drop(trace);
-            Ok::<(), Error>(())
-        }));
-        let result = if refuse_at == 0 {
-            let result = crate::persistence::content_identity::proof_allocation_oracle_tests::reader_requests_for_test(
-                observer.physical_funding_counter_for_test(), operation);
-            let physical = crate::persistence::content_identity::proof_allocation_oracle_tests::source_unfunded_peak_for_test();
-            assert_eq!(physical.0, 0, "actual operation allocations stay paid through physical free (file={file_backed}, mode={mode:?}): {physical:?}");
-            result
-        } else { operation() };
-        if refuse_at == 0 {
-            result.unwrap();
-            if mode == contextdb_core::VectorSearchMode::Indexed {
-                successful_graph_calls = spy.graph_calls.load(Ordering::SeqCst);
-                assert!(successful_graph_calls >= 3, "real graph reservations executed");
-                assert!(distances.0.load(Ordering::SeqCst) > 0, "real graph distances executed");
-            } else {
-                assert_eq!(spy.graph_calls.load(Ordering::SeqCst), 0, "exhaustive bodies do not allocate graph scratch");
-            }
+        let directory = tempfile::tempdir().unwrap();
+        let db = if file_backed {
+            Database::open(directory.path().join("reader-physical.db")).unwrap()
         } else {
-            assert!(matches!(result, Err(Error::MemoryBudgetExceeded { ref operation, .. }) if operation == "graph_scratch"), "real reader pressure must refuse graph scratch: {result:?}");
-            assert_eq!(spy.graph_calls.load(Ordering::SeqCst), refuse_at,
-                "no later graph reservation after refusal");
-            assert_eq!(distances.0.load(Ordering::SeqCst), spy.refused_distances.load(Ordering::SeqCst),
-                "no later distance after refused reservation");
+            Database::open_memory()
+        };
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.execute(
+            "CREATE TABLE items (id INT PRIMARY KEY, embedding VECTOR(32))",
+            &HashMap::new(),
+        )
+        .unwrap();
+        for id in 1..=256 {
+            db.execute(
+                "INSERT INTO items (id, embedding) VALUES ($id, $v)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("v".into(), Value::Vector(vector(id as u64))),
+                ]),
+            )
+            .unwrap();
         }
-        assert_eq!(spy.body_invoice.load(Ordering::SeqCst), 0);
-        assert_eq!(spy.body_seen.load(Ordering::SeqCst), spy.body_frees.load(Ordering::SeqCst),
-            "every real copied body physically frees before its matching invoice refunds");
-        if file_backed && mode == contextdb_core::VectorSearchMode::Exact {
-            assert_eq!(spy.body_frees.load(Ordering::SeqCst), 256, "all real file-backed exhaustive bodies are physically witnessed");
+        for _ in 0..32 {
+            db.run_maintenance_cycle().unwrap();
         }
-        db.clear_last_vector_search_trace();
-        drop(vector_scope);
-        drop(source_scope);
-        drop(owner);
-        let pressure = spy.pressure.swap(0, Ordering::SeqCst);
-        parent.release(pressure);
-        assert_eq!(spy.debit.load(Ordering::SeqCst), spy.refund.load(Ordering::SeqCst));
-        assert_eq!(observer.sample().charged_bytes, 0);
-        assert_eq!(parent.retained_bytes_for_test(), standing);
-        assert_eq!(db.accountant.usage().used, writer, "reader neither debits nor refunds writer");
-        drop(physical_bodies);
-        drop(spy); drop(child); drop(sibling);
-        assert_eq!(parent.retained_bytes_for_test(), root_baseline, "operation controls also retire");
-    }
-    assert!(successful_graph_calls >= 3);
+        let mut query = SemanticQuery::new("items", "embedding", vector(10_000), 10);
+        query.search_mode = Some(contextdb_core::VectorSearchMode::Indexed);
+        let control = db.semantic_search(query.clone()).unwrap();
+        let answer = |rows: &[SearchResult]| {
+            rows.iter()
+                .map(|row| (row.row_id, row.vector_score.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(control.len(), 10);
+        let mut exact_query = query.clone();
+        exact_query.search_mode = Some(contextdb_core::VectorSearchMode::Exact);
+        let exact_control = db.semantic_search(exact_query).unwrap();
+        let writer = db.accountant.usage().used;
+        db.set_memory_limit(Some(writer)).unwrap();
+        assert_eq!(
+            answer(&db.semantic_search(query.clone()).unwrap()),
+            answer(&control)
+        );
+        let mut successful_graph_calls = 0;
+        for (mode, refuse_at) in [
+            (contextdb_core::VectorSearchMode::Indexed, 0),
+            (contextdb_core::VectorSearchMode::Indexed, 1),
+            (contextdb_core::VectorSearchMode::Indexed, 3),
+            (contextdb_core::VectorSearchMode::Indexed, 0),
+            (contextdb_core::VectorSearchMode::Exact, 0),
+        ] {
+            let expected = if mode == contextdb_core::VectorSearchMode::Exact {
+                &exact_control
+            } else {
+                &control
+            };
+            let parent = DeclaredReadMemory::from_reader_limit(8 * 1024 * 1024).unwrap();
+            let root_baseline = parent.retained_bytes_for_test();
+            let child = parent.child().unwrap();
+            let sibling = parent.child().unwrap();
+            let observer = declared_child_observer(&child).unwrap();
+            let standing = parent.retained_bytes_for_test();
+            let distances = Arc::new(Distances(AtomicUsize::new(0)));
+            let spy = Arc::new(ReaderSpy {
+                inner: crate::vector_read_memory::budget(child.clone()),
+                child: observer.clone(),
+                sibling: declared_child_observer(&sibling).unwrap(),
+                parent: parent.clone(),
+                graph_calls: AtomicUsize::new(0),
+                debit: AtomicUsize::new(0),
+                refund: AtomicUsize::new(0),
+                refuse_at,
+                pressure: AtomicUsize::new(0),
+                distances: distances.clone(),
+                refused_distances: AtomicUsize::new(usize::MAX),
+                body_invoice: AtomicUsize::new(0),
+                body_seen: AtomicUsize::new(0),
+                body_frees: AtomicUsize::new(0),
+            });
+            let mut owner = VectorCopyAdmission::new(spy.clone());
+            // Public answer equivalence was checked above. Measure the same native
+            // graph-search operation, including its owned scores and trace through
+            // physical destruction; legacy SearchResult value copying is outside
+            // the graph-scratch contract and retains its separate failed receipt.
+            let operation_index = VectorIndexRef::new("items", "embedding");
+            let source_scope = db.writer_read_scope(child.clone()).unwrap();
+            let vector_scope = db
+                .vector_read_scope(db.snapshot(), child.clone(), &mut owner)
+                .unwrap();
+            let physical_bodies = Arc::new(PhysicalBodies(spy.clone()));
+            let operation = || {
+                contextdb_vector::mem::with_native_vector_score_observer_for_test(
+                    physical_bodies.clone(),
+                    || {
+                        with_hnsw_candidate_observer(distances.clone(), || {
+                            let (rows, trace) = db.owner_vector_search(
+                                operation_index,
+                                &query.query,
+                                10,
+                                None,
+                                db.snapshot(),
+                                mode,
+                                spy.clone(),
+                                child.clone(),
+                                &mut owner,
+                            )?;
+                            assert_eq!(rows.len(), expected.len());
+                            assert!(
+                                rows.iter()
+                                    .zip(expected)
+                                    .all(|((id, score), expected)| *id == expected.row_id
+                                        && score.to_bits() == expected.vector_score.to_bits())
+                            );
+                            drop(rows);
+                            drop(trace);
+                            Ok::<(), Error>(())
+                        })
+                    },
+                )
+            };
+            let result = if refuse_at == 0 {
+                let result = crate::persistence::content_identity::proof_allocation_oracle_tests::reader_requests_for_test(
+                observer.physical_funding_counter_for_test(), operation);
+                let physical = crate::persistence::content_identity::proof_allocation_oracle_tests::source_unfunded_peak_for_test();
+                assert_eq!(
+                    physical.0, 0,
+                    "actual operation allocations stay paid through physical free (file={file_backed}, mode={mode:?}): {physical:?}"
+                );
+                result
+            } else {
+                operation()
+            };
+            if refuse_at == 0 {
+                result.unwrap();
+                if mode == contextdb_core::VectorSearchMode::Indexed {
+                    successful_graph_calls = spy.graph_calls.load(Ordering::SeqCst);
+                    assert!(
+                        successful_graph_calls >= 3,
+                        "real graph reservations executed"
+                    );
+                    assert!(
+                        distances.0.load(Ordering::SeqCst) > 0,
+                        "real graph distances executed"
+                    );
+                } else {
+                    assert_eq!(
+                        spy.graph_calls.load(Ordering::SeqCst),
+                        0,
+                        "exhaustive bodies do not allocate graph scratch"
+                    );
+                }
+            } else {
+                assert!(
+                    matches!(result, Err(Error::MemoryBudgetExceeded { ref operation, .. }) if operation == "graph_scratch"),
+                    "real reader pressure must refuse graph scratch: {result:?}"
+                );
+                assert_eq!(
+                    spy.graph_calls.load(Ordering::SeqCst),
+                    refuse_at,
+                    "no later graph reservation after refusal"
+                );
+                assert_eq!(
+                    distances.0.load(Ordering::SeqCst),
+                    spy.refused_distances.load(Ordering::SeqCst),
+                    "no later distance after refused reservation"
+                );
+            }
+            assert_eq!(spy.body_invoice.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                spy.body_seen.load(Ordering::SeqCst),
+                spy.body_frees.load(Ordering::SeqCst),
+                "every real copied body physically frees before its matching invoice refunds"
+            );
+            if file_backed && mode == contextdb_core::VectorSearchMode::Exact {
+                assert_eq!(
+                    spy.body_frees.load(Ordering::SeqCst),
+                    256,
+                    "all real file-backed exhaustive bodies are physically witnessed"
+                );
+            }
+            db.clear_last_vector_search_trace();
+            drop(vector_scope);
+            drop(source_scope);
+            drop(owner);
+            let pressure = spy.pressure.swap(0, Ordering::SeqCst);
+            parent.release(pressure);
+            assert_eq!(
+                spy.debit.load(Ordering::SeqCst),
+                spy.refund.load(Ordering::SeqCst)
+            );
+            assert_eq!(observer.sample().charged_bytes, 0);
+            assert_eq!(parent.retained_bytes_for_test(), standing);
+            assert_eq!(
+                db.accountant.usage().used,
+                writer,
+                "reader neither debits nor refunds writer"
+            );
+            drop(physical_bodies);
+            drop(spy);
+            drop(child);
+            drop(sibling);
+            assert_eq!(
+                parent.retained_bytes_for_test(),
+                root_baseline,
+                "operation controls also retire"
+            );
+        }
+        assert!(successful_graph_calls >= 3);
     }
 }

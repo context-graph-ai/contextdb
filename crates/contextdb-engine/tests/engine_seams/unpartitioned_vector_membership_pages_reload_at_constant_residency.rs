@@ -92,11 +92,14 @@ fn membership_parent_equation(reader: &statement::Observation, inline: u64, pare
     assert_eq!(reader.parent_funding_mismatches, 0);
 }
 
-fn membership_retained_and_final_free(db: &contextdb_engine::Database, window: Window,
-    parent: &vector_read_memory::DeclaredReadRoot) {
+fn membership_retained_and_final_free(
+    db: &contextdb_engine::Database,
+    window: Window,
+    parent: &vector_read_memory::DeclaredReadRoot,
+) {
     let reader = statement::current().expect("original statement observation stays active");
-    let trace =
-        read_work_probe::retained_trace_invoice(db, |_| {}).expect("genuine retained trace required");
+    let trace = read_work_probe::retained_trace_invoice(db, |_| {})
+        .expect("genuine retained trace required");
     assert_eq!(
         reader
             .trace_new
@@ -119,11 +122,16 @@ fn membership_retained_and_final_free(db: &contextdb_engine::Database, window: W
         .expect("original trace-provider receipts required");
     let block = membership_control_request(&window, native.block);
     let expected_child = vector_read_memory::native_control_layouts_for_test().1;
-    assert_eq!((block.bytes, block.align), (expected_child.size(), expected_child.align()),
-        "typed native child/invoice inventory is independent of the observed request");
-    assert_eq!(block.funding_before_system,
+    assert_eq!(
+        (block.bytes, block.align),
+        (expected_child.size(), expected_child.align()),
+        "typed native child/invoice inventory is independent of the observed request"
+    );
+    assert_eq!(
+        block.funding_before_system,
         Some((native.parent_counter, native.parent_after_block)),
-        "the actual allocator samples the original root BEFORE requesting the child block");
+        "the actual allocator samples the original root BEFORE requesting the child block"
+    );
     let keeper = native.keeper.expect("original native keeper required");
     let adapter = native.adapter.expect("original native adapter required");
     let native_keeper = membership_control_request(&window, keeper);
@@ -182,8 +190,11 @@ fn membership_retained_and_final_free(db: &contextdb_engine::Database, window: W
         .adapter_after
         .expect("native adapter admission completion");
     for request in [native_keeper, native_adapter] {
-        assert_eq!(request.funding_before_system, Some((native.counter, aa.child_bytes)),
-            "both real native controls were fully admitted before either System request");
+        assert_eq!(
+            request.funding_before_system,
+            Some((native.counter, aa.child_bytes)),
+            "both real native controls were fully admitted before either System request"
+        );
     }
     for sample in [kb, ka, ab, aa] {
         assert_eq!(sample.child_counter, native.counter);
@@ -242,8 +253,11 @@ fn membership_retained_and_final_free(db: &contextdb_engine::Database, window: W
         membership_request(&window, provider.provider_payload, provider.provider_layout);
     let trace_keeper = membership_request(&window, provider.keeper_payload, provider.keeper_layout);
     for request in [trace_provider, trace_keeper] {
-        assert_eq!(request.funding_before_system, Some((native.counter, provider.after_admission)),
-            "both real trace controls were paid on the original child before System");
+        assert_eq!(
+            request.funding_before_system,
+            Some((native.counter, provider.after_admission)),
+            "both real trace controls were paid on the original child before System"
+        );
     }
     assert_eq!(
         provider.after_admission,
@@ -258,8 +272,10 @@ fn membership_retained_and_final_free(db: &contextdb_engine::Database, window: W
         trace.prepaid_control.0,
         (trace.prepaid_control.1, trace.prepaid_control.2),
     );
-    assert!(token.funding_before_system.is_some(),
-        "prepaid token requires an independent pre-System original-payer sample");
+    assert!(
+        token.funding_before_system.is_some(),
+        "prepaid token requires an independent pre-System original-payer sample"
+    );
     assert_eq!(token.funding_before_system.unwrap().0, native.counter);
     assert_eq!(token.pointer, trace.prepaid_control.0);
     assert_eq!(token.bytes, trace.prepaid_control_bytes);
@@ -324,8 +340,10 @@ fn membership_retained_and_final_free(db: &contextdb_engine::Database, window: W
     for index in 0..window.request_count().unwrap() {
         let request = window.request(index).unwrap();
         if window.physical_free_event(index).unwrap().is_none() {
-            assert!(request == block || child[..count].iter().any(|entry| *entry == Some(request)),
-                "orphan live selected request is outside the actual retained control/payload graph: {request:?}");
+            assert!(
+                request == block || child[..count].iter().any(|entry| *entry == Some(request)),
+                "orphan live selected request is outside the actual retained control/payload graph: {request:?}"
+            );
         }
     }
     let debit = trace
@@ -347,10 +365,14 @@ fn membership_retained_and_final_free(db: &contextdb_engine::Database, window: W
     let mut pins = None;
     let pinned_trace = read_work_probe::retained_trace_invoice(db, |owner| {
         pins = vector_read_memory::pin_original_native_for_test(&window, native, parent, owner);
-    }).expect("borrow the genuine retained trace payer at the original pin cut");
-    assert_eq!(pinned_trace, trace, "pin the same retained trace, without replacement");
-    let (native_pin, parent_pin) = pins
-        .expect("pin the genuine original native owner and its original parent separately");
+    })
+    .expect("borrow the genuine retained trace payer at the original pin cut");
+    assert_eq!(
+        pinned_trace, trace,
+        "pin the same retained trace, without replacement"
+    );
+    let (native_pin, parent_pin) =
+        pins.expect("pin the genuine original native owner and its original parent separately");
     let funding = native_pin.sample();
     assert!(funding.alive && funding.parent_alive);
     assert_eq!(funding.owner_identity, native.owner);

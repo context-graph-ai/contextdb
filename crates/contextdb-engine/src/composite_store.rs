@@ -141,14 +141,21 @@ impl PreparedVectorPartitionMutationBatch {
         self._deferred_copy_owner = Some(completed.owner);
     }
 
-    pub(crate) fn reclaimable_partitions(&self) -> impl Iterator<Item = &contextdb_vector::VectorPartitionRef> {
-        self.vector_publication.iter().flat_map(|publication| publication.reclaimable_partitions())
+    pub(crate) fn reclaimable_partitions(
+        &self,
+    ) -> impl Iterator<Item = &contextdb_vector::VectorPartitionRef> {
+        self.vector_publication
+            .iter()
+            .flat_map(|publication| publication.reclaimable_partitions())
     }
     pub(crate) fn is_empty(&self) -> bool {
         self.mutations.is_empty()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn resolve_insert<'w>(
         &self,
         ws: &'w WriteSet,
@@ -188,7 +195,10 @@ impl PreparedVectorPartitionMutationBatch {
 /// key and a predicate literal meet under the same `=` the row filter
 /// applies. A key value no component of the declared type is `=`-equal to
 /// is refused rather than stored as a partition no query can name.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn vector_partition_key_for_row(
     index: &VectorIndexRef,
     meta: &TableMeta,
@@ -497,7 +507,7 @@ pub(crate) fn build_received_schema_change_log_entries(
             lsn: entry.lsn,
         });
     }
-    if entries.windows(2).any(|pair|pair[0].lsn() > pair[1].lsn()) {
+    if entries.windows(2).any(|pair| pair[0].lsn() > pair[1].lsn()) {
         entries.sort_by_key(ChangeLogEntry::lsn);
     }
     entries
@@ -849,7 +859,10 @@ impl CompositeStore {
         NaturalKey::single("id".to_string(), Value::Int64(row_id.0 as i64))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn vector_table_meta<'meta>(
         table_meta: &'meta HashMap<String, TableMeta>,
         index: &VectorIndexRef,
@@ -861,7 +874,10 @@ impl CompositeStore {
             })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn vector_declaration<'m>(
         table_meta: &'m HashMap<String, TableMeta>,
         index: &VectorIndexRef,
@@ -879,7 +895,10 @@ impl CompositeStore {
             })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate_registered_vector_declaration(
         &self,
         index: &VectorIndexRef,
@@ -897,15 +916,21 @@ impl CompositeStore {
             .vector
             .with_index_layout(index, |layout| layout == &expected)?
         {
-            return Err(Error::Other((format!(
-                "registered vector layout does not match the durable declaration for {}.{}",
-                index.table, index.column
-            )).into()));
+            return Err(Error::Other(
+                (format!(
+                    "registered vector layout does not match the durable declaration for {}.{}",
+                    index.table, index.column
+                ))
+                .into(),
+            ));
         }
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn live_accepted_row(
         &self,
         table: &str,
@@ -954,7 +979,10 @@ impl CompositeStore {
         Ok(Some(row.clone()))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn old_accepted_row<'a>(
         &self,
         table: &str,
@@ -972,7 +1000,10 @@ impl CompositeStore {
             .map(|row| row.map(std::borrow::Cow::Owned))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn current_vector_for_partition(
         &self,
         index: &VectorIndexRef,
@@ -985,10 +1016,7 @@ impl CompositeStore {
 
         let (root, durable) = {
             let captured = self.precommit_vector_root.lock();
-            (
-                captured.upgrade(),
-                captured.is_registered(),
-            )
+            (captured.upgrade(), captured.is_registered())
         };
         if let Some(root) = root {
             return crate::persistence::vector_current_identity::accepted_identity(
@@ -1002,7 +1030,8 @@ impl CompositeStore {
         }
         if durable {
             return Err(Error::Other(
-                "writer publication no longer owns its commit source".into()));
+                "writer publication no longer owns its commit source".into(),
+            ));
         }
         let Some(current_key) =
             self.vector
@@ -1011,10 +1040,13 @@ impl CompositeStore {
             return Ok(None);
         };
         if &current_key != partition_key {
-            return Err(Error::Other((format!(
-                "vector partition membership disagrees with the accepted row for {}.{}",
-                index.table, index.column
-            )).into()));
+            return Err(Error::Other(
+                (format!(
+                    "vector partition membership disagrees with the accepted row for {}.{}",
+                    index.table, index.column
+                ))
+                .into(),
+            ));
         }
         self.vector
             .try_live_entry_for_row_in_partition(
@@ -1028,7 +1060,10 @@ impl CompositeStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepared_binding(
         index: &VectorIndexRef,
         meta: &TableMeta,
@@ -1120,7 +1155,10 @@ impl CompositeStore {
     /// then ask the vector store to validate the complete keyed batch without
     /// mutating it. A relational key-only replacement synthesizes a local
     /// move for each unchanged live vector column.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_vector_partition_mutations(
         &self,
         ws: &WriteSet,
@@ -1147,7 +1185,10 @@ impl CompositeStore {
     /// Database supplies only states it has proved reclaimable while holding
     /// its snapshot-removal guard through durable and memory publication.
     /// This layer never infers that proof from current rows.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_vector_partition_mutations_with_reclaimable_partitions(
         &self,
         ws: &WriteSet,
@@ -1172,7 +1213,10 @@ impl CompositeStore {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_vector_partition_mutations_with_registered_snapshots(
         &self,
         ws: &WriteSet,
@@ -1219,7 +1263,10 @@ impl CompositeStore {
     }
 
     #[allow(clippy::too_many_arguments)] // Keep this established input list explicit without changing its API.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_vector_partition_mutations_with_reclamation(
         &self,
         ws: &WriteSet,
@@ -1413,10 +1460,13 @@ impl CompositeStore {
             let row = self
                 .old_accepted_row(&index.table, *row_id, deleted_rows, &mut source_owner)?
                 .ok_or_else(|| {
-                    Error::Other((format!(
-                        "accepted source row is missing for vector delete on {}.{}",
-                        index.table, index.column
-                    )).into())
+                    Error::Other(
+                        (format!(
+                            "accepted source row is missing for vector delete on {}.{}",
+                            index.table, index.column
+                        ))
+                        .into(),
+                    )
                 })?;
             let partition_key = vector_partition_key_for_row(index, meta, declaration, &row)?;
             let vector = self
@@ -1467,10 +1517,13 @@ impl CompositeStore {
             }
             let row = accepted_new_row(&entry.index.table, entry.row_id, &mut source_owner)?
                 .ok_or_else(|| {
-                    Error::Other((format!(
-                        "accepted destination row is missing for vector insert on {}.{}",
-                        entry.index.table, entry.index.column
-                    )).into())
+                    Error::Other(
+                        (format!(
+                            "accepted destination row is missing for vector insert on {}.{}",
+                            entry.index.table, entry.index.column
+                        ))
+                        .into(),
+                    )
                 })?;
             let after = Self::prepared_binding(
                 &entry.index,
@@ -1483,7 +1536,12 @@ impl CompositeStore {
                 &mut insert_copy_owner,
             )?;
             if !defer_publication {
-                Self::copy_partition_insert(entry, &after, &mut keyed_inserts, &mut insert_copy_owner)?;
+                Self::copy_partition_insert(
+                    entry,
+                    &after,
+                    &mut keyed_inserts,
+                    &mut insert_copy_owner,
+                )?;
             }
             mutations.push(PreparedVectorPartitionMutation::Insert {
                 index: entry.index.clone(),
@@ -1507,17 +1565,23 @@ impl CompositeStore {
             let old_row = self
                 .old_accepted_row(&index.table, *old_row_id, deleted_rows, &mut source_owner)?
                 .ok_or_else(|| {
-                    Error::Other((format!(
-                        "accepted source row is missing for vector move on {}.{}",
-                        index.table, index.column
-                    )).into())
+                    Error::Other(
+                        (format!(
+                            "accepted source row is missing for vector move on {}.{}",
+                            index.table, index.column
+                        ))
+                        .into(),
+                    )
                 })?;
             let new_row = accepted_new_row(&index.table, *new_row_id, &mut source_owner)?
                 .ok_or_else(|| {
-                    Error::Other((format!(
-                        "accepted destination row is missing for vector move on {}.{}",
-                        index.table, index.column
-                    )).into())
+                    Error::Other(
+                        (format!(
+                            "accepted destination row is missing for vector move on {}.{}",
+                            index.table, index.column
+                        ))
+                        .into(),
+                    )
                 })?;
             let source_key = vector_partition_key_for_row(index, meta, declaration, &old_row)?;
             let vector = self
@@ -1699,57 +1763,70 @@ impl CompositeStore {
         }
         if fresh_publication {
             fresh_publication = mutations.iter().all(|mutation| match mutation {
-                PreparedVectorPartitionMutation::Insert { index, after, .. } => {
-                    self.vector.partition_graph_generation_status(
-                        &contextdb_vector::VectorPartitionRef::new(index.clone(), after.partition_key.clone()),
-                    ).is_none()
-                }
+                PreparedVectorPartitionMutation::Insert { index, after, .. } => self
+                    .vector
+                    .partition_graph_generation_status(&contextdb_vector::VectorPartitionRef::new(
+                        index.clone(),
+                        after.partition_key.clone(),
+                    ))
+                    .is_none(),
                 _ => false,
             });
         }
         if defer_publication && !fresh_publication {
             for mutation in &mutations {
                 if let PreparedVectorPartitionMutation::Insert { after, entry, .. } = mutation {
-                    Self::copy_partition_insert(&ws.vector_inserts[*entry], after, &mut keyed_inserts, &mut insert_copy_owner)?;
+                    Self::copy_partition_insert(
+                        &ws.vector_inserts[*entry],
+                        after,
+                        &mut keyed_inserts,
+                        &mut insert_copy_owner,
+                    )?;
                 }
             }
         }
         let (vector_publication, deferred_publication) = if fresh_publication {
-            (None, Some(DeferredVectorPublication {
-                deletes: keyed_deletes,
-                inserts: keyed_inserts,
-                moves: keyed_moves,
-                reclaimable: reclaimable_partitions,
-            }))
+            (
+                None,
+                Some(DeferredVectorPublication {
+                    deletes: keyed_deletes,
+                    inserts: keyed_inserts,
+                    moves: keyed_moves,
+                    reclaimable: reclaimable_partitions,
+                }),
+            )
         } else {
             let vector_publication = if mutations.is_empty() {
-            None
-        } else {
-            let expected_moves = keyed_moves.len();
-            let prepared = match registered_snapshots {
-                Some(registered_snapshots) => self
-                    .vector
-                    .prepare_partitioned_batch_with_registered_snapshots(
+                None
+            } else {
+                let expected_moves = keyed_moves.len();
+                let prepared = match registered_snapshots {
+                    Some(registered_snapshots) => self
+                        .vector
+                        .prepare_partitioned_batch_with_registered_snapshots(
+                            keyed_deletes,
+                            keyed_inserts,
+                            keyed_moves,
+                            registered_snapshots,
+                            vector_copy_owner.scratch(),
+                        )?,
+                    None => self.vector.prepare_partitioned_batch(
                         keyed_deletes,
                         keyed_inserts,
                         keyed_moves,
-                        registered_snapshots,
+                        reclaimable_partitions,
                         vector_copy_owner.scratch(),
                     )?,
-                None => self.vector.prepare_partitioned_batch(
-                    keyed_deletes,
-                    keyed_inserts,
-                    keyed_moves,
-                    reclaimable_partitions,
-                    vector_copy_owner.scratch(),
-                )?,
+                };
+                if prepared.valid_move_count() != expected_moves {
+                    return Err(Error::Other(
+                        ("prepared vector partition batch lost a validated move source"
+                            .to_string())
+                        .into(),
+                    ));
+                }
+                Some(prepared)
             };
-            if prepared.valid_move_count() != expected_moves {
-                return Err(Error::Other((
-                    "prepared vector partition batch lost a validated move source".to_string()).into()));
-            }
-            Some(prepared)
-        };
             (vector_publication, None)
         };
         let retention_identities = ws
@@ -1775,7 +1852,10 @@ impl CompositeStore {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy_partition_insert(
         entry: &contextdb_core::VectorEntry,
         after: &PreparedVectorPartitionBinding,
@@ -1788,9 +1868,7 @@ impl CompositeStore {
             .checked_mul(std::mem::size_of::<f32>())
             .and_then(|bytes| bytes.checked_add(entry.index.table.len()))
             .and_then(|bytes| bytes.checked_add(entry.index.column.len()))
-            .and_then(|bytes| {
-                bytes.checked_add(std::mem::size_of::<contextdb_core::VectorEntry>())
-            })
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<contextdb_core::VectorEntry>()))
             .and_then(|bytes| bytes.checked_add(after.partition_key.estimated_bytes()))
             .ok_or_else(|| Error::Other("vector input copy size overflow".into()))?;
         owner.reserve_for(
@@ -1814,7 +1892,10 @@ impl CompositeStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_vector_partition_projection(
         &self,
         ws: &WriteSet,
@@ -1828,11 +1909,22 @@ impl CompositeStore {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         self.prepare_vector_partition_mutations_with_reclamation(
-            ws, table_meta, deleted_rows, reclaimable, snapshots, false, true, owner, read_memory,
+            ws,
+            table_meta,
+            deleted_rows,
+            reclaimable,
+            snapshots,
+            false,
+            true,
+            owner,
+            read_memory,
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_deferred_vector_publication(
         &self,
         ws: &WriteSet,
@@ -1846,7 +1938,12 @@ impl CompositeStore {
         );
         let mut deferred = deferred;
         for mutation in &batch.mutations {
-            if let PreparedVectorPartitionMutation::Insert { index, after, entry } = mutation {
+            if let PreparedVectorPartitionMutation::Insert {
+                index,
+                after,
+                entry,
+            } = mutation
+            {
                 let entry = batch.resolve_insert(ws, *entry, index, after)?;
                 Self::copy_partition_insert(entry, after, &mut deferred.inserts, &mut owner)?;
             }
@@ -1856,22 +1953,37 @@ impl CompositeStore {
         } else {
             let expected_moves = deferred.moves.len();
             let prepared = match snapshots {
-                Some(snapshots) => self.vector.prepare_partitioned_batch_with_registered_snapshots(
-                    deferred.deletes, deferred.inserts, deferred.moves, snapshots, owner.scratch(),
-                )?,
+                Some(snapshots) => self
+                    .vector
+                    .prepare_partitioned_batch_with_registered_snapshots(
+                        deferred.deletes,
+                        deferred.inserts,
+                        deferred.moves,
+                        snapshots,
+                        owner.scratch(),
+                    )?,
                 None => self.vector.prepare_partitioned_batch(
-                    deferred.deletes, deferred.inserts, deferred.moves, deferred.reclaimable, owner.scratch(),
+                    deferred.deletes,
+                    deferred.inserts,
+                    deferred.moves,
+                    deferred.reclaimable,
+                    owner.scratch(),
                 )?,
             };
             if prepared.valid_move_count() != expected_moves {
-                return Err(Error::Other("prepared vector partition batch lost a validated move source".into()));
+                return Err(Error::Other(
+                    "prepared vector partition batch lost a validated move source".into(),
+                ));
             }
             Some(prepared)
         };
         Ok(CompletedVectorPublication { publication, owner })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_exact(
         &self,
         ws: &WriteSet,
@@ -1933,7 +2045,10 @@ impl CompositeStore {
         self
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_exact_with_log_entries(
         &self,
         ws: &WriteSet,
@@ -1943,7 +2058,9 @@ impl CompositeStore {
         let working_graph = if self.private_working_graph {
             Some(crate::persistence::received_working_source::WorkingReadSource::current_for_relational(self.relational.as_ref())?
                 .ok_or_else(|| Error::Other("private graph apply is outside its working loan".into()))?)
-        } else { None };
+        } else {
+            None
+        };
         if let Some(source) = &working_graph {
             self.vector.validate_private_paged_columns()?;
             source.apply_private_vector_plan(&partition_mutations, ws)?;
@@ -1963,7 +2080,9 @@ impl CompositeStore {
         self.relational
             .publish_retention_expiries(partition_mutations.retention_expiries);
         self.apply_phase_pause.maybe_pause();
-        if let Some(source) = &working_graph { source.apply_private_graph(ws)?; }
+        if let Some(source) = &working_graph {
+            source.apply_private_graph(ws)?;
+        }
         self.graph.apply_deletes_ref(&ws.adj_deletes);
         self.graph.apply_inserts_ref(&ws.adj_inserts);
         self.graph.apply_row_deletes_ref(&ws.row_adj_deletes);
@@ -1985,7 +2104,9 @@ impl CompositeStore {
                 );
             }
         }
-        if working_graph.is_some() { self.vector.retire_private_working_partitions(); }
+        if working_graph.is_some() {
+            self.vector.retire_private_working_partitions();
+        }
         let (clear_source_lsns, set_source_lsns) = sync_source_lsn_updates(ws);
         if !clear_source_lsns.is_empty() {
             self.relational.clear_sync_source_lsns(clear_source_lsns);
@@ -2050,40 +2171,76 @@ pub(crate) fn sync_source_lsn_update_cardinality(ws: &WriteSet) -> Option<usize>
         .and_then(|count| count.checked_add(ws.sync_source_provenance_marks.len()))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn sync_source_lsn_updates(
     ws: &WriteSet,
 ) -> (Vec<SyncSourceLsnClear>, Vec<SyncSourceLsnSet>) {
-    let mut clear=Vec::new();
-    let mut set=Vec::new();
-    visit_sync_source_lsn_updates(ws,
-        |table,row| {clear.push((table.to_owned(),row));Ok(())},
-        |table,row,lsn,kind| {set.push((table.to_owned(),row,lsn,kind));Ok(())})
-        .expect("collecting provenance updates is infallible");
-    (clear,set)
+    let mut clear = Vec::new();
+    let mut set = Vec::new();
+    visit_sync_source_lsn_updates(
+        ws,
+        |table, row| {
+            clear.push((table.to_owned(), row));
+            Ok(())
+        },
+        |table, row, lsn, kind| {
+            set.push((table.to_owned(), row, lsn, kind));
+            Ok(())
+        },
+    )
+    .expect("collecting provenance updates is infallible");
+    (clear, set)
 }
 
 /// Borrow the same update order without building a second unit-sized image.
 /// Every clear precedes every set, and explicit marks follow inserted rows.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-pub(crate) fn visit_sync_source_lsn_updates(ws:&WriteSet,
-    mut clear:impl FnMut(&str,RowId)->Result<()>,
-    mut set:impl FnMut(&str,RowId,Lsn,u8)->Result<()>)->Result<()> {
-    if is_retention_expiry(ws) {return Ok(());}
-    for (table,row,_) in &ws.relational_deletes {clear(table,*row)?;}
-    for (table,row) in &ws.relational_inserts {
-        if ws.relational_insert_source_lsns.get(table).and_then(|rows|rows.get(&row.row_id)).is_none() {
-            clear(table,row.row_id)?;
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn visit_sync_source_lsn_updates(
+    ws: &WriteSet,
+    mut clear: impl FnMut(&str, RowId) -> Result<()>,
+    mut set: impl FnMut(&str, RowId, Lsn, u8) -> Result<()>,
+) -> Result<()> {
+    if is_retention_expiry(ws) {
+        return Ok(());
+    }
+    for (table, row, _) in &ws.relational_deletes {
+        clear(table, *row)?;
+    }
+    for (table, row) in &ws.relational_inserts {
+        if ws
+            .relational_insert_source_lsns
+            .get(table)
+            .and_then(|rows| rows.get(&row.row_id))
+            .is_none()
+        {
+            clear(table, row.row_id)?;
         }
     }
-    for (table,row) in &ws.relational_inserts {
-        if let Some(lsn)=ws.relational_insert_source_lsns.get(table).and_then(|rows|rows.get(&row.row_id)).copied() {
-            let kind=ws.relational_insert_source_kinds.get(table)
-                .and_then(|rows|rows.get(&row.row_id)).copied().unwrap_or(0);
-            set(table,row.row_id,lsn,kind)?;
+    for (table, row) in &ws.relational_inserts {
+        if let Some(lsn) = ws
+            .relational_insert_source_lsns
+            .get(table)
+            .and_then(|rows| rows.get(&row.row_id))
+            .copied()
+        {
+            let kind = ws
+                .relational_insert_source_kinds
+                .get(table)
+                .and_then(|rows| rows.get(&row.row_id))
+                .copied()
+                .unwrap_or(0);
+            set(table, row.row_id, lsn, kind)?;
         }
     }
-    for (table,row,lsn,kind) in &ws.sync_source_provenance_marks {set(table,*row,*lsn,*kind)?;}
+    for (table, row, lsn, kind) in &ws.sync_source_provenance_marks {
+        set(table, *row, *lsn, *kind)?;
+    }
     Ok(())
 }
 
@@ -2299,7 +2456,10 @@ fn abort_before_vector_publication_for_test() {
 /// Lend the single finalized event/DDL slot to a synchronous persistence
 /// consumer. The result cannot retain the stage borrow; all guards have ended
 /// when this bridge returns to its memory-publication caller.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn with_owned_commit_events_for_apply<R>(
     events: &crate::database::event_bus::OwnedEventBusHandle,
     lsn: Option<Lsn>,
@@ -2321,20 +2481,36 @@ pub(crate) struct OwnedPreparedMemoryApply {
     _preparation: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl OwnedPreparedMemoryApply {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit_resident_copies(
-        &mut self, original: &crate::memory_accounting::OwnedMemoryReservation, bytes: usize,
+        &mut self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        bytes: usize,
     ) -> Result<()> {
         let mut admission = crate::memory_accounting::reserve_preparation_from_original(
-            original, bytes, "writer_source", "memory_committed_copies",
+            original,
+            bytes,
+            "writer_source",
+            "memory_committed_copies",
             "Reduce committed memory contents or raise MEMORY_LIMIT.",
         )?;
-        self.resident_memory = Some(crate::database::PreparedMemorySwap::from_original_preparation(
-            &mut admission, 0, bytes, 0,
-        )?);
+        self.resident_memory = Some(
+            crate::database::PreparedMemorySwap::from_original_preparation(
+                &mut admission,
+                0,
+                bytes,
+                0,
+            )?,
+        );
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         ws: &WriteSet,
@@ -2365,7 +2541,10 @@ impl OwnedPreparedMemoryApply {
     }
 }
 impl CompositeStore {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_owned_change_log_entries_with_snapshots(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -2429,7 +2608,10 @@ impl CompositeStore {
         let entries = self.build_change_log_entries_with_snapshots(ws, table_meta, deleted_rows);
         Ok((entries, frame.into_reservation()))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_owned_exact_with_log_entries(
         &self,
         ws: &WriteSet,

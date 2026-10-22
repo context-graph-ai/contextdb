@@ -417,7 +417,10 @@ pub struct SavedTopologyBoundaryForTest {
     pub max_exact_key_bytes: usize,
 }
 #[doc(hidden)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn saved_topology_boundary_for_test(
     bytes: &[u8],
     dimension: usize,
@@ -446,7 +449,9 @@ pub fn saved_topology_boundary_for_test(
             }
         };
         result.map_err(|error| {
-            contextdb_core::Error::Other(format!("saved point boundary encoding failed: {error}").into())
+            contextdb_core::Error::Other(
+                format!("saved point boundary encoding failed: {error}").into(),
+            )
         })?;
         encoded = encoded.max(bytes.len());
     }

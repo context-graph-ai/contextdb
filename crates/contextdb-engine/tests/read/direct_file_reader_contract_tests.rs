@@ -1283,11 +1283,17 @@ fn assert_query(reader: &DirectFileReader, expected: &ExpectedQuery) -> (Vec<u8>
         .execute(&expected.sql, &expected.params)
         .unwrap_or_else(|error| panic!("execute {}: {error}", expected.label));
     assert_eq!(
-        result.result.columns(), expected.columns,
+        result.result.columns(),
+        expected.columns,
         "{} columns",
         expected.label
     );
-    assert_eq!(result.result.rows(), expected.rows, "{} rows", expected.label);
+    assert_eq!(
+        result.result.rows(),
+        expected.rows,
+        "{} rows",
+        expected.label
+    );
     assert_eq!(
         result.canonical_bytes,
         encode_query_result(&result.result, result.result.encoding_owner_for_test())
@@ -1402,8 +1408,13 @@ fn metadata_responses(fixture: &Fixture, reader: &DirectFileReader) -> Vec<Direc
     for response in &responses {
         assert_eq!(
             response.canonical_bytes,
-            canonical_metadata_bytes_for_test(&response.body, reader.request_read_memory_for_test().expect("fixture operation owner"))
-                .expect("shared route-neutral metadata encoder supplies exact bytes")
+            canonical_metadata_bytes_for_test(
+                &response.body,
+                reader
+                    .request_read_memory_for_test()
+                    .expect("fixture operation owner")
+            )
+            .expect("shared route-neutral metadata encoder supplies exact bytes")
         );
     }
     responses
@@ -1472,7 +1483,8 @@ fn assert_complete_public_image_state(
             kind: DirectImageMetadataKind::ChangeLog,
         })
         .expect("the change history answers on request")
-        .body.clone()
+        .body
+        .clone()
     {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(changes),
@@ -1486,8 +1498,18 @@ fn assert_complete_public_image_state(
     image.snapshot
 }
 
-fn exact_empty_page(columns: &[String], snapshot: DirectSnapshot, reader: &DirectFileReader) -> DirectCursorPage {
-    DirectCursorPage::new_for_test(columns.to_vec(), snapshot, reader.request_read_memory_for_test().expect("fixture operation owner"))
+fn exact_empty_page(
+    columns: &[String],
+    snapshot: DirectSnapshot,
+    reader: &DirectFileReader,
+) -> DirectCursorPage {
+    DirectCursorPage::new_for_test(
+        columns.to_vec(),
+        snapshot,
+        reader
+            .request_read_memory_for_test()
+            .expect("fixture operation owner"),
+    )
 }
 
 fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCursorPage> {
@@ -1496,7 +1518,12 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
         .open_cursor(&fixture.cursor_sql, &HashMap::new(), one)
         .unwrap_or_else(|error| panic!("open direct cursor: {error}"));
     let mut pages = vec![opened.first_page];
-    while pages.last().expect("first cursor page").page_for_test().has_more {
+    while pages
+        .last()
+        .expect("first cursor page")
+        .page_for_test()
+        .has_more
+    {
         pages.push(
             opened
                 .cursor
@@ -1507,12 +1534,18 @@ fn cursor_pages(fixture: &Fixture, reader: &DirectFileReader) -> Vec<DirectCurso
     assert_eq!(pages.len(), fixture.cursor_rows.len());
     for (ordinal, page) in pages.iter().enumerate() {
         assert_eq!(page.page_for_test().columns, fixture.cursor_columns);
-        assert_eq!(&*page.page_for_test().rows, &[fixture.cursor_rows[ordinal].clone()]);
-        assert_eq!(page.page_for_test().has_more, ordinal + 1 < fixture.cursor_rows.len());
+        assert_eq!(
+            &*page.page_for_test().rows,
+            &[fixture.cursor_rows[ordinal].clone()]
+        );
+        assert_eq!(
+            page.page_for_test().has_more,
+            ordinal + 1 < fixture.cursor_rows.len()
+        );
         assert_eq!(
             page.canonical_bytes,
             page.encode_page_for_test()
-            .expect("shared encoder supplies cursor bytes")
+                .expect("shared encoder supplies cursor bytes")
         );
     }
     let snapshot = pages[0].snapshot;
@@ -2358,17 +2391,26 @@ fn assert_no_use_alias_or_glob(tree: &syn::UseTree, source: &Path) {
                 prefix.pop();
             }
             syn::UseTree::Group(group) => {
-                for item in &group.items { inspect(item, source, prefix); }
+                for item in &group.items {
+                    inspect(item, source, prefix);
+                }
             }
             syn::UseTree::Name(_) => {}
             syn::UseTree::Rename(rename) => {
-                assert!(prefix == &["crate", "owned_cursor_page"]
-                    && rename.ident == "OwnedCursorPage" && rename.rename == "CursorPage",
+                assert!(
+                    prefix == &["crate", "owned_cursor_page"]
+                        && rename.ident == "OwnedCursorPage"
+                        && rename.rename == "CursorPage",
                     "{} aliases dependency {} as {}; direct dependencies must remain AST-visible",
-                    source.display(), rename.ident, rename.rename);
+                    source.display(),
+                    rename.ident,
+                    rename.rename
+                );
             }
             syn::UseTree::Glob(_) => panic!(
-                "{} uses a glob import; the direct dependency allowlist requires exact names", source.display()),
+                "{} uses a glob import; the direct dependency allowlist requires exact names",
+                source.display()
+            ),
         }
     }
     inspect(tree, source, &mut Vec::new());
@@ -3617,7 +3659,8 @@ fn direct_file_damage_child() {
         let tables = match reader
             .metadata(DirectMetadataRequest::Tables)
             .expect("list damaged fixture tables")
-            .body.clone()
+            .body
+            .clone()
         {
             DirectMetadataBody::Tables { items, .. } => items,
             other => panic!("table inventory has the wrong body: {other:?}"),
@@ -3641,7 +3684,8 @@ fn direct_file_damage_child() {
                     table: table.clone(),
                 })
                 .expect("inspect damaged fixture schema")
-                .body.clone()
+                .body
+                .clone()
             {
                 DirectMetadataBody::Schema { schema } => schema,
                 other => panic!("schema inspection has the wrong body: {other:?}"),
@@ -3743,7 +3787,12 @@ fn existing_readers_and_cursor_keep_original_snapshot_and_canonical_bytes_after_
         .expect("open cursor before source change");
     let mut pages = vec![existing.first_page];
     let changed = change_source_row(&fixture);
-    while pages.last().expect("cursor first page").page_for_test().has_more {
+    while pages
+        .last()
+        .expect("cursor first page")
+        .page_for_test()
+        .has_more
+    {
         pages.push(
             existing
                 .cursor
@@ -3895,7 +3944,10 @@ fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() 
         .cursor
         .fetch(Some(one))
         .expect("cancelled cursor resumes");
-    assert_eq!(&*resumed.page_for_test().rows, &[fixture.cursor_rows[1].clone()]);
+    assert_eq!(
+        &*resumed.page_for_test().rows,
+        &[fixture.cursor_rows[1].clone()]
+    );
     opened.cursor.close().expect("close resumed cursor");
     assert_cursor_resources_released(&witness);
 }
@@ -4172,7 +4224,10 @@ fn manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources(
         .cursor
         .fetch(Some(one))
         .expect("activity refreshes idle deadline");
-    assert_eq!(&*active_page.page_for_test().rows, &[fixture.cursor_rows[1].clone()]);
+    assert_eq!(
+        &*active_page.page_for_test().rows,
+        &[fixture.cursor_rows[1].clone()]
+    );
     assert_cursor_resources_retained(&witness);
     clock.advance(5);
     let failure = match opened.cursor.fetch(Some(one)) {
@@ -4345,10 +4400,7 @@ fn assert_loaded_embedding_corruption(
         Err(DirectFileReaderError::CorruptStore(
             DirectStoreDiagnostic::MalformedRecord,
             reason,
-        )) => assert!(
-            !(reason == ""),
-            "{expected} carries a concrete diagnosis"
-        ),
+        )) => assert!(!(reason == ""), "{expected} carries a concrete diagnosis"),
         Ok(_) => panic!("{expected} must not contribute an answer"),
         Err(other) => panic!("{expected} has the wrong diagnosis: {other:?}"),
     }
@@ -4397,7 +4449,8 @@ fn a_row_with_no_embedding_keeps_the_store_directly_readable() {
                     .limits
                     .limits
                     .memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -4668,7 +4721,8 @@ fn a_required_quantized_column_reads_back_directly_when_its_vector_is_there() {
                         .limits
                         .limits
                         .memory,
-                ).expect("admit the declared fixture root");
+                )
+                .expect("admit the declared fixture root");
             let operation_read_memory = declared_read_memory
                 .child()
                 .expect("admit the committed-content observation owner");
@@ -4879,7 +4933,8 @@ fn a_nullable_quantized_column_with_no_embedding_stays_directly_readable() {
                         .limits
                         .limits
                         .memory,
-                ).expect("admit the declared fixture root");
+                )
+                .expect("admit the declared fixture root");
             let operation_read_memory = declared_read_memory
                 .child()
                 .expect("admit the committed-content observation owner");

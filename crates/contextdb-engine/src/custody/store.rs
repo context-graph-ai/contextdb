@@ -35,13 +35,18 @@ pub(crate) struct SelectionHold {
     credit: contextdb_core::read_memory::ReadCredit,
 }
 impl SelectionHold {
-    pub(crate) fn new(read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Self {
+    pub(crate) fn new(
+        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Self {
         Self {
             images: Vec::new(),
             credit: contextdb_core::read_memory::ReadCredit::new(read_memory),
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn retain(&mut self, selected: AdmittedRecords) -> Result<Vec<Record>> {
         if self.images.len() == self.images.capacity() {
             self.credit.try_grow_for(
@@ -69,7 +74,10 @@ struct KeyScratch {
     bytes: usize,
 }
 impl KeyScratch {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn new(memory: crate::read_image_memory::ImageMemoryHandle, count: usize) -> Result<Self> {
         let bytes = if count == 0 {
             0
@@ -105,7 +113,10 @@ impl std::io::Write for EncodedLen {
 }
 /// One answer record, copied under `memory` exactly as every custody answer
 /// is: its wire form is admitted, then decoded into the answer's image.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn copy_record(
     record: &Record,
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -134,7 +145,10 @@ fn copy_record(
     memory.release(credit);
     decoded
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn copy_records<'a>(
     source: impl Iterator<Item = &'a Record> + Clone,
     memory: crate::read_image_memory::ImageMemoryHandle,
@@ -294,7 +308,10 @@ impl MirrorCharge {
         self.bytes
     }
     /// Admit `bytes` before the allocation they fund.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit(&mut self, label: &'static str, bytes: usize) -> Result<()> {
         bracket(label, PROBE_PRE, bytes, self.bytes);
         if refusal_injected(label) {
@@ -318,14 +335,20 @@ impl MirrorCharge {
         bracket(label, PROBE_POST, 0, self.bytes);
     }
     /// Release `bytes` after what they funded is freed.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn release(&mut self, bytes: usize) -> Result<()> {
         self.bytes = self.bytes.checked_sub(bytes).ok_or_else(invalid)?;
         self.writer.release(bytes);
         Ok(())
     }
     /// Take over `other`'s admission on the same writer, without a refund.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn adopt(&mut self, mut other: MirrorCharge) -> Result<()> {
         if !std::ptr::eq(self.writer.as_ptr(), other.writer.as_ptr()) {
             return Err(invalid());
@@ -354,7 +377,10 @@ fn node_bytes<K, V>() -> usize {
 /// The bytes one mirrored tenant entry may hold: its key copies, its decoded
 /// body (`decoded`, as the charged decoder measured it), its group names and
 /// memberships, its size record, and a node per tree insertion.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn mirror_entry_bytes(key: &str, record: &Record, decoded: usize) -> Result<usize> {
     let mut bytes = key
         .len()
@@ -402,7 +428,10 @@ fn certificate_group(digest: &Digest) -> String {
     format!("certificate:{}", hex(digest))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn groups(r: &Record) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let submission = match r {
@@ -626,7 +655,10 @@ impl Store {
         bytes += (self.local_roots.len() + self.pending.len()) * std::mem::size_of::<uuid::Uuid>();
         (records, bytes as u64)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn from_entries(entries: BTreeMap<String, Vec<u8>>) -> Result<Self> {
         let mut store = Self::default();
         for (key, bytes) in entries {
@@ -656,7 +688,10 @@ impl Store {
     /// Its companion memo is created after the first durable read that decodes
     /// delivery records, admitted to `writer` before it is allocated, so a
     /// store that never reads its delivery journal holds nothing for it.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn durable(
         tenant_entries: BTreeMap<String, Vec<u8>>,
         writer: crate::memory_accounting::AccountantHandle,
@@ -675,7 +710,10 @@ impl Store {
     /// entry is decoded on a charged decoder, checked natively, its mirror
     /// size admitted before it is inserted, and only then the decoder's
     /// transient charge released (acquire, then release).
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn durable_admitted(
         parts: [Vec<(String, Vec<u8>)>; 2],
         writer: crate::memory_accounting::AccountantHandle,
@@ -725,7 +763,10 @@ impl Store {
     }
     /// Publish a validated delta: its tenant growth is adopted first, then
     /// each entry is inserted with the size its validation admitted.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn publish(
         &mut self,
         records: DeltaRecords,
@@ -750,7 +791,10 @@ impl Store {
         Ok(())
     }
     /// Take over a validated delta's tenant growth at publication.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn adopt_tenant_growth(&mut self, growth: MirrorCharge) -> Result<()> {
         match &mut self.tenant_mirror {
             Some(mirror) => mirror.adopt(growth),
@@ -758,7 +802,10 @@ impl Store {
         }
     }
     /// Publish one validated tenant entry whose size its delta admitted.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn insert_sized(&mut self, key: String, record: Record, size: usize) -> Result<()> {
         if self.tenant_mirror.is_some() && self.mirrors(&key) {
             self.insert(key.clone(), record)?;
@@ -773,7 +820,10 @@ impl Store {
         self.tenant_mirror.as_ref().map_or(0, MirrorCharge::bytes)
     }
     /// The companion memo, admitted to the store's writer before it exists.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn ensure_companion_memo(&mut self) -> Result<()> {
         if self.checked.is_some() {
             return Ok(());
@@ -793,7 +843,10 @@ impl Store {
         Ok(())
     }
     /// A durable view that reads only `root`, whoever asks.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn durable_pinned(
         root: crate::persistence::writer_source::WriterSnapshotHandle,
         writer: crate::memory_accounting::AccountantHandle,
@@ -829,7 +882,10 @@ impl Store {
     /// Run one durable read at this call's captured root. A root whose group
     /// index is incomplete refuses with the typed incomplete-index error; the
     /// journal is never loaded whole in its place.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn durable_read<T>(
         &mut self,
         read: impl FnOnce(&crate::persistence::custody_source::CustodyReader) -> Result<T>,
@@ -858,7 +914,10 @@ impl Store {
     fn mirrors(&self, key: &str) -> bool {
         self.durable.is_none() || !key.starts_with("delivery_")
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn insert(&mut self, key: String, record: Record) -> Result<()> {
         if !self.mirrors(&key) {
             return Ok(());
@@ -891,7 +950,10 @@ impl Store {
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn remove(&mut self, key: &str) -> Result<()> {
         self.remove_unsized(key)?;
         // The entry's record, key copies and memberships are freed: release
@@ -903,7 +965,10 @@ impl Store {
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn remove_unsized(&mut self, key: &str) -> Result<()> {
         if let Some(record) = self.records.remove(key) {
             if let Record::Root { submission, .. } = &record {
@@ -939,7 +1004,10 @@ impl Store {
             self.pending.insert(id);
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn pending(
         &mut self,
         memory: crate::read_image_memory::ImageMemoryHandle,
@@ -962,7 +1030,10 @@ impl Store {
             memory,
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn select<S: AsRef<str>>(
         &mut self,
         selectors: &[S],
@@ -1033,7 +1104,10 @@ impl Store {
         self.read_visits += count as u64;
         answer
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn select_table(
         &mut self,
         table: &str,
@@ -1096,7 +1170,10 @@ impl Store {
         self.selected_records += count as u64;
         answer
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn select_rows(
         &mut self,
         rows: &[RowRef],
@@ -1170,7 +1247,10 @@ impl Store {
         }
         keys
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn companions<'a>(
         &'a self,
         record: &'a Record,
@@ -1234,7 +1314,10 @@ impl Store {
         .ok_or_else(invalid)?;
         Ok(count)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn validate_delta(
         &mut self,
         writes: &[(String, Vec<u8>)],
@@ -1432,7 +1515,10 @@ impl contextdb_core::read_memory::ReadMemoryBudget for VerificationFunds {
 /// the record names, and its signature unless these exact stored bytes were
 /// verified before. The key and signature inputs are rendered into native
 /// buffers `memory` admits first through the admitted `VerificationFunds`.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn native_check(
     memory: &crate::read_image_memory::ImageMemoryHandle,
     key: &str,
@@ -1516,10 +1602,13 @@ fn native_check(
         Err(Failure::Invalid(_)) => Err(invalid()),
         Err(Failure::Unqualified(error)) => Err(error),
         Err(other) => Err(refusal.unwrap_or_else(|| {
-            contextdb_core::Error::Other((match other {
-                Failure::Refused(refusal) => refusal.to_string(),
-                _ => "custody signature verification failed".into(),
-            }).into())
+            contextdb_core::Error::Other(
+                (match other {
+                    Failure::Refused(refusal) => refusal.to_string(),
+                    _ => "custody signature verification failed".into(),
+                })
+                .into(),
+            )
         })),
     }
 }
@@ -1576,7 +1665,10 @@ mod durable {
         }
         /// Admit `bytes` under `label` before the allocation they fund. The
         /// caller reports the allocation's completion with [`Self::post`].
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn admit_at(&mut self, label: &'static str, bytes: usize) -> Result<()> {
             bracket(label, PROBE_PRE, bytes, self.memory.held());
             if refusal_injected(label) {
@@ -1608,13 +1700,19 @@ mod durable {
         }
         /// Take over `bytes` this owner's memory already holds charged (a
         /// charged decode's result), to release with the rest on drop.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn adopt(&mut self, bytes: usize) -> Result<()> {
             self.bytes = self.bytes.checked_add(bytes).ok_or_else(invalid)?;
             Ok(())
         }
         /// Detach `bytes` of this owner's charge without a refund.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn detach(&mut self, bytes: usize) -> Result<Debit> {
             self.bytes = self.bytes.checked_sub(bytes).ok_or_else(invalid)?;
             Ok(Debit {
@@ -1623,7 +1721,10 @@ mod durable {
             })
         }
         /// Adopt a detached debit on the same memory, without a reservation.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn adopt_debit(&mut self, debit: Debit) -> Result<()> {
             if !std::ptr::eq(self.memory.as_ref(), debit.memory.as_ref()) {
                 return Err(invalid());
@@ -1633,7 +1734,10 @@ mod durable {
             Ok(())
         }
         /// A copy of `key` admitted at exactly its length.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn own_key(&mut self, label: &'static str, key: &str) -> Result<String> {
             self.admit_at(label, key.len())?;
             let owned = key.to_owned();
@@ -1659,7 +1763,10 @@ mod durable {
     }
 
     /// Bytes of `n` slots of `T` plus one allocation header, checked.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn slot_bytes<T>(n: usize) -> Result<usize> {
         n.checked_mul(std::mem::size_of::<T>().max(1))
             .and_then(|bytes| bytes.checked_add(ALLOCATION_BYTES))
@@ -1677,14 +1784,20 @@ mod durable {
         label: &'static str,
     }
     impl<T> AdmittedVec<T> {
-        pub(crate) fn new(memory: crate::read_image_memory::ImageMemoryHandle, label: &'static str) -> Self {
+        pub(crate) fn new(
+            memory: crate::read_image_memory::ImageMemoryHandle,
+            label: &'static str,
+        ) -> Self {
             Self {
                 items: Vec::new(),
                 owner: Scratch::new(memory),
                 label,
             }
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn with_exact(
             memory: crate::read_image_memory::ImageMemoryHandle,
             label: &'static str,
@@ -1705,7 +1818,10 @@ mod durable {
         }
         /// Grow to twice the capacity (at least four), admitting the new
         /// buffer while the old one still exists, then releasing the old one.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn grow(&mut self) -> Result<()> {
             let old = self.items.capacity();
             let new = old.checked_mul(2).ok_or_else(invalid)?.max(4);
@@ -1724,7 +1840,10 @@ mod durable {
             self.owner.post(self.label);
             Ok(())
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn reserve_one(&mut self) -> Result<()> {
             if self.items.len() == self.items.capacity() {
                 self.grow()?;
@@ -1732,14 +1851,20 @@ mod durable {
             Ok(())
         }
         /// Push after capacity is admitted; never reallocates unfunded.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn push(&mut self, value: T) -> Result<()> {
             self.reserve_one()?;
             self.items.push(value);
             Ok(())
         }
         /// Push into already admitted capacity only.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn push_within(&mut self, value: T) -> Result<()> {
             if self.items.len() == self.items.capacity() {
                 return Err(invalid());
@@ -1762,7 +1887,10 @@ mod durable {
         pub(crate) fn clear(&mut self) {
             self.items.clear();
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn insert(&mut self, index: usize, value: T) -> Result<()> {
             self.reserve_one()?;
             self.items.insert(index, value);
@@ -1785,13 +1913,19 @@ mod durable {
         keys: Scratch,
     }
     impl KeyList {
-        pub(crate) fn new(memory: crate::read_image_memory::ImageMemoryHandle, label: &'static str) -> Self {
+        pub(crate) fn new(
+            memory: crate::read_image_memory::ImageMemoryHandle,
+            label: &'static str,
+        ) -> Self {
             Self {
                 items: AdmittedVec::new(memory.clone(), label),
                 keys: Scratch::new(memory),
             }
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn with_exact(
             memory: crate::read_image_memory::ImageMemoryHandle,
             label: &'static str,
@@ -1802,14 +1936,20 @@ mod durable {
                 keys: Scratch::new(memory),
             })
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn push(&mut self, key: &str) -> Result<()> {
             self.items.reserve_one()?;
             let owned = self.keys.own_key(self.items.label, key)?;
             self.items.push_within(owned)
         }
         /// Move a key owned by another list's key owner on the same memory.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn push_owned(&mut self, key: String, debit: Debit) -> Result<()> {
             self.items.reserve_one()?;
             self.keys.adopt_debit(debit)?;
@@ -1845,7 +1985,10 @@ mod durable {
             self.items.len()
         }
         /// Move every key out with its debit into `into`.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn drain_into(&mut self, into: &mut KeyList) -> Result<()> {
             while let Some((key, debit)) = self.pop() {
                 into.push_owned(key, debit)?;
@@ -1879,7 +2022,10 @@ mod durable {
         keys: Scratch,
     }
     impl<K: KeyBytes, V> AdmittedKeys<K, V> {
-        pub(crate) fn new(memory: crate::read_image_memory::ImageMemoryHandle, label: &'static str) -> Self {
+        pub(crate) fn new(
+            memory: crate::read_image_memory::ImageMemoryHandle,
+            label: &'static str,
+        ) -> Self {
             Self {
                 entries: AdmittedVec::new(memory.clone(), label),
                 order: AdmittedVec::new(memory.clone(), label),
@@ -1910,7 +2056,10 @@ mod durable {
         }
         /// Insert `key` (built by `make` after its `heap` bytes are admitted)
         /// unless present. Answers whether it was inserted.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn insert_with<Q: Ord + ?Sized>(
             &mut self,
             probe: &Q,
@@ -2007,7 +2156,10 @@ mod durable {
         }
     }
     impl<K: KeyBytes> AdmittedKeys<K, ()> {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn insert_key(&mut self, key: &str) -> Result<bool>
         where
             K: std::borrow::Borrow<str> + From<String>,
@@ -2042,8 +2194,13 @@ mod durable {
     /// The operation's error reserve, admitted at entry by its outermost
     /// owner and released at the public return, where a returned error's
     /// ownership passes to the caller.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn error_reserve(memory: &crate::read_image_memory::ImageMemoryHandle) -> Result<Scratch> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn error_reserve(
+        memory: &crate::read_image_memory::ImageMemoryHandle,
+    ) -> Result<Scratch> {
         let mut reserve = Scratch::new(memory.clone());
         reserve.admit_at("custody_error_reserve", ERROR_RESERVE)?;
         reserve.post("custody_error_reserve");
@@ -2053,7 +2210,10 @@ mod durable {
     /// Decode one stored record into an answer charged to `owner`, once:
     /// the charged decode first (malformed input keeps the established codec
     /// diagnostic), then the native canonical, key and signature checks.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn decode_stored(
         memory: &crate::read_image_memory::ImageMemoryHandle,
         owner: &mut Scratch,
@@ -2072,7 +2232,10 @@ mod durable {
     /// allocated. Answers the record and the bytes it holds charged. A
     /// malformed record refuses with the custody codec's established
     /// diagnostic; an admission refusal passes through unchanged.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn decode_charged(
         memory: &crate::read_image_memory::ImageMemoryHandle,
         bytes: &[u8],
@@ -2108,10 +2271,9 @@ mod durable {
                         while !detail.is_char_boundary(end) {
                             end -= 1;
                         }
-                        contextdb_core::Error::SyncError((format!(
-                            "delivery metadata decode: {}",
-                            &detail[..end]
-                        )).into())
+                        contextdb_core::Error::SyncError(
+                            (format!("delivery metadata decode: {}", &detail[..end])).into(),
+                        )
                     }
                     None => contextdb_core::Error::SyncError(message),
                 }
@@ -2122,8 +2284,15 @@ mod durable {
 
     /// A transient check of one stored record (canonical, keyed, signed):
     /// charged as it decodes and released when the caller drops it.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn probe_stored(memory: &crate::read_image_memory::ImageMemoryHandle, key: &str, bytes: &[u8]) -> Result<Probed> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn probe_stored(
+        memory: &crate::read_image_memory::ImageMemoryHandle,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<Probed> {
         let mut probed = Probed {
             owner: Scratch::new(memory.clone()),
             record: None,
@@ -2149,14 +2318,25 @@ mod durable {
     }
 
     #[cfg(feature = "test-seams")]
-    pub(crate) fn probe_for_test(memory: &crate::read_image_memory::ImageMemoryHandle, key: &str, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn probe_for_test(
+        memory: &crate::read_image_memory::ImageMemoryHandle,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
         let _errors = error_reserve(memory)?;
         probe_stored(memory, key, bytes).map(drop)
     }
 
     /// The committed record at `key`, transiently.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn load(r: &CustodyReader, memory: &crate::read_image_memory::ImageMemoryHandle, key: &str) -> Result<Option<Probed>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn load(
+        r: &CustodyReader,
+        memory: &crate::read_image_memory::ImageMemoryHandle,
+        key: &str,
+    ) -> Result<Option<Probed>> {
         r.get(key, |value| {
             value
                 .map(|bytes| probe_stored(memory, key, bytes))
@@ -2174,7 +2354,10 @@ mod durable {
         len: usize,
     }
     impl Selector {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn text(text: &str) -> Result<Self> {
             let mut this = Self {
                 bytes: [0; SELECTOR_MAX],
@@ -2183,7 +2366,10 @@ mod durable {
             this.push(text.as_bytes())?;
             Ok(this)
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn push(&mut self, part: &[u8]) -> Result<()> {
             let end = self.len.checked_add(part.len()).ok_or_else(invalid)?;
             if end > SELECTOR_MAX {
@@ -2193,7 +2379,10 @@ mod durable {
             self.len = end;
             Ok(())
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn push_hex(&mut self, digest: &[u8]) -> Result<()> {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             for byte in digest {
@@ -2201,20 +2390,29 @@ mod durable {
             }
             Ok(())
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn submission(id: uuid::Uuid) -> Result<Self> {
             let mut this = Self::text("@submission:")?;
             let mut buffer = uuid::Uuid::encode_buffer();
             this.push(id.hyphenated().encode_lower(&mut buffer).as_bytes())?;
             Ok(this)
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn object(digest: &[u8; 32]) -> Result<Self> {
             let mut this = Self::text("@object:")?;
             this.push_hex(digest)?;
             Ok(this)
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn certificate_key(digest: &[u8; 32]) -> Result<Self> {
             let mut this = Self::text("delivery_peer_evidence.v1.")?;
             this.push_hex(digest)?;
@@ -2232,7 +2430,10 @@ mod durable {
     }
 
     /// The companion selectors the resident index answers, on the stack.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn companion_selectors(record: &Record) -> Result<([Option<Selector>; 2], usize)> {
         let (first, second) = match record {
             Record::Control(_) => (Some(Selector::text("@authority")?), None),
@@ -2261,7 +2462,10 @@ mod durable {
     /// Whether `record` (stored at `key`) is a member of `selector`, decided
     /// from its fields without building its group list. Mirrors `groups()`
     /// for the selector families companions use.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn joins(key: &str, record: &Record, selector: &str) -> Result<bool> {
         let Some(group) = selector.strip_prefix('@') else {
             return Ok(key.starts_with(selector));
@@ -2319,7 +2523,10 @@ mod durable {
     }
 
     /// Visit the keys a selector names.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visit_selector(
         r: &CustodyReader,
         selector: &str,
@@ -2333,7 +2540,10 @@ mod durable {
     }
 
     /// Admitted, sorted and deduplicated key list for `selectors`.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn selected_keys<S: AsRef<str>>(
         r: &CustodyReader,
         selectors: &[S],
@@ -2369,7 +2579,10 @@ mod durable {
 
     /// Decode `keys` into one answer charged to `memory`, in key order, and
     /// validate its whole evidence closure.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn answer(
         r: &CustodyReader,
         keys: &[String],
@@ -2421,7 +2634,10 @@ mod durable {
     /// way through leaves none behind. A missing or damaged record anywhere in
     /// the closure refuses with the custody corruption error. The verifier
     /// itself is the admitted one.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate_answer(
         r: &CustodyReader,
         keys: &[String],
@@ -2634,7 +2850,10 @@ mod durable {
         LAST_MEMO_KEY_BYTES.with(std::cell::Cell::get)
     }
     impl MemoRing {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn new(memory: &crate::read_image_memory::ImageMemoryHandle) -> Result<Self> {
             let mut slots = Scratch::new(memory.clone());
             slots.admit_at(
@@ -2660,7 +2879,10 @@ mod durable {
         }
         /// Keep `key`'s record, adopting its key bytes' `debit`; when full,
         /// the oldest entry is freed before its key bytes are released.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn push(&mut self, key: String, probed: Probed, debit: Debit) -> Result<()> {
             if self.entries.len() == COMPANION_MEMO
                 && let Some((evicted, evicted_probe)) = self.entries.pop_front()
@@ -2679,7 +2901,10 @@ mod durable {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn select<S: AsRef<str>>(
         r: &CustodyReader,
         selectors: &[S],
@@ -2697,7 +2922,10 @@ mod durable {
     /// Every submission group with a record of `table`, plus authority.
     /// This administrative count is proportional to the table's units by
     /// definition; it holds only the relevant keys, never the journal.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn select_table(
         r: &CustodyReader,
         table: &str,
@@ -2754,7 +2982,10 @@ mod durable {
     /// The group name `prefix` + hex of `row`'s canonical reference bytes,
     /// rendered into `buffer` (admitted, grown by doubling) from the finite
     /// encoding: no intermediate `RowRef::bytes()` or hex string.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn render_row_group<'b>(
         buffer: &'b mut AdmittedVec<u8>,
         prefix: &str,
@@ -2768,7 +2999,10 @@ mod durable {
 
     /// The local ownership key `delivery_root.v1.` + hex of `life`'s
     /// canonical encoding, rendered like [`render_row_group`].
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn render_root_key<'b>(
         buffer: &'b mut AdmittedVec<u8>,
         life: &LocalLifeAnchor,
@@ -2782,7 +3016,10 @@ mod durable {
     /// `prefix` + hex of the finite encoding `encode` emits, in `buffer`
     /// (admitted, grown by doubling): the raw bytes land in the tail and
     /// expand to hex in place from the back, so no second buffer exists.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn render_finite_hex<'b>(
         buffer: &'b mut AdmittedVec<u8>,
         prefix: &str,
@@ -2814,7 +3051,10 @@ mod durable {
         std::str::from_utf8(&buffer.items[..total]).map_err(|_| invalid())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn select_rows(
         r: &CustodyReader,
         rows: &[RowRef],
@@ -2901,7 +3141,10 @@ mod durable {
     /// The answer is not: it materializes every pending manifest, each key
     /// and decoded record admitted to the reader's memory, so a large pending
     /// set is refused by the reader limit rather than held unadmitted.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn pending(
         r: &CustodyReader,
         memory: crate::read_image_memory::ImageMemoryHandle,
@@ -2947,7 +3190,10 @@ mod durable {
 
     /// Decode, check and verify one stored body under `memory`, its decoded
     /// allocations taken over by `owner`.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn decode_checked(
         memory: &crate::read_image_memory::ImageMemoryHandle,
         owner: &mut Scratch,
@@ -2964,7 +3210,10 @@ mod durable {
     /// Visit, one at a time, the group names `record` joins (as `groups()`
     /// lists them), rendering row groups into the admitted `buffer` and
     /// every other group on the stack. No group list is built.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn for_each_group(
         record: &Record,
         buffer: &mut AdmittedVec<u8>,
@@ -3055,7 +3304,10 @@ mod durable {
     /// map entry, decoded body, group name, plan and verification workspace
     /// is admitted before it is allocated. The returned delta's own bytes
     /// stay admitted in its own charges until the caller publishes or aborts.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn validate_delta(
         r: &CustodyReader,
         writes: &[(String, Vec<u8>)],
@@ -3235,7 +3487,10 @@ mod durable {
     /// The companion keys of `record` (stored at `key`): the durable members
     /// of its stack-rendered selectors, overlaid with the in-commit delta's
     /// members decided by the allocation-free `joins` predicate.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn companion_keys(
         r: &CustodyReader,
         _key: &str,
@@ -3301,7 +3556,10 @@ pub(crate) struct NativeCustodyWindow {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeCustodyWindow {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit(
         raw: crate::persistence::writer_source::NativeRawConfigWindow,
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
@@ -3323,7 +3581,10 @@ impl NativeCustodyWindow {
             .text()
             .expect("admitted UTF-8 canonical custody key")
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn view(&self) -> super::native_selection::Selected<NativeCustodyView<'_>> {
         Ok(NativeCustodyView {
             raw: self.raw.view()?,
@@ -3345,7 +3606,10 @@ pub(crate) struct NativeCustodySelection {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeCustodySelection {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new(
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
         slots: usize,
@@ -3354,7 +3618,10 @@ impl NativeCustodySelection {
             windows: super::native_selection::NativeSelectionHold::try_new(owner, slots)?,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn retain(
         &mut self,
         window: NativeCustodyWindow,

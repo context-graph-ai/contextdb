@@ -53,7 +53,10 @@ impl PersistentCompositeStore {
         self._precommit_source_memory.bytes
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn new(
         inner: CompositeStore,
         persistence: Arc<RedbPersistence>,
@@ -66,9 +69,8 @@ impl PersistentCompositeStore {
         // Like the initial published root, startup charges this fixed control
         // without refusing open under a smaller persisted limit. Subsequent
         // commit admission still sees every retained byte.
-        let source_bytes = std::mem::size_of::<
-            parking_lot::Mutex<crate::persistence::WriterSnapshotWeak>,
-        >();
+        let source_bytes =
+            std::mem::size_of::<parking_lot::Mutex<crate::persistence::WriterSnapshotWeak>>();
         *inner.precommit_vector_root.lock() = initial_root.downgrade();
         inner.accountant.charge_retained(source_bytes);
         let source_memory = PersistentSourceMemory {
@@ -94,7 +96,10 @@ impl PersistentCompositeStore {
     /// while its snapshot-removal guard is held. Explicit refs remain for the
     /// low-level prepared-store contract; ordinary commits supply the exact
     /// registered-snapshot sample staged under this commit's LSN.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn apply_with_vector_reclamation(
         &self,
         ws: &WriteSet,
@@ -229,7 +234,10 @@ impl PersistentCompositeStore {
             || {
                 if let Some(deferred_publication) = deferred_publication {
                     completed_publication = Some(self.inner.prepare_deferred_vector_publication(
-                        ws, &partition_mutations, deferred_publication, registered_snapshots,
+                        ws,
+                        &partition_mutations,
+                        deferred_publication,
+                        registered_snapshots,
                     )?);
                 }
                 Ok(())
@@ -251,7 +259,10 @@ impl PersistentCompositeStore {
     /// Retain admitted current bodies only for row/vector identities this commit
     /// touches. The same prepared publication owner supplies the precommit
     /// physical source; no resident row directory or history walk is needed.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn deleted_rows_snapshot_for_write_set(
         &self,
         ws: &WriteSet,
@@ -265,7 +276,8 @@ impl PersistentCompositeStore {
             >,
         >,
     > {
-        let _statement_read_memory: contextdb_core::read_memory::ReadMemoryOwner = _statement_read_memory.into();
+        let _statement_read_memory: contextdb_core::read_memory::ReadMemoryOwner =
+            _statement_read_memory.into();
 
         use crate::sync_types::held;
         use contextdb_relational::source::{RelationalReadSource, visible_row};
@@ -384,7 +396,8 @@ impl PersistentCompositeStore {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 panic!("durable publication root preparation failed: {error}");
             });
-        *self.inner.precommit_vector_root.lock() = crate::persistence::WriterSnapshotHandle::from(root.clone()).downgrade();
+        *self.inner.precommit_vector_root.lock() =
+            crate::persistence::WriterSnapshotHandle::from(root.clone()).downgrade();
         *self.prepared_publication.lock() = Some(root.into());
     }
 }
@@ -422,15 +435,17 @@ impl WriteSetApplicator for PersistentCompositeStore {
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if FAIL_NEXT_LOCAL_APPLY.with(|armed| armed.replace(false)) {
-            return Err(Error::Other((
-                "injected local durable commit failure".to_string()).into()));
+            return Err(Error::Other(
+                ("injected local durable commit failure".to_string()).into(),
+            ));
         }
         let registered_snapshots = self
             .inner
             .take_vector_partition_snapshot_stage(ws.commit_lsn);
         let snapshot = SnapshotId::from_tx(ws.finalized_tx.ok_or_else(|| {
             contextdb_core::Error::Other(
-                "durable commit has no finalized transaction identity".into())
+                "durable commit has no finalized transaction identity".into(),
+            )
         })?);
         let lsn = ws.commit_lsn.ok_or_else(|| {
             contextdb_core::Error::Other("durable commit has no finalized LSN".into())
@@ -488,24 +503,41 @@ pub(crate) fn with_owned_terminal_apply_scope<R>(store: usize, f: impl FnOnce() 
             OWNED_TERMINAL_APPLY.with(|slot| slot.set(self.0));
         }
     }
-    let prior = OWNED_TERMINAL_APPLY.with(|slot| slot.replace(Some(
-        OwnedTerminalApplyBinding { store, terminal: None },
-    )));
+    let prior = OWNED_TERMINAL_APPLY.with(|slot| {
+        slot.replace(Some(OwnedTerminalApplyBinding {
+            store,
+            terminal: None,
+        }))
+    });
     let restore = Restore(prior);
     let result = f();
     drop(restore);
     result
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn bind_owned_terminal_apply(
-    store: usize, lsn: Lsn, identity: contextdb_tx::manager::EngineTerminalIdentity,
+    store: usize,
+    lsn: Lsn,
+    identity: contextdb_tx::manager::EngineTerminalIdentity,
 ) -> Result<()> {
     OWNED_TERMINAL_APPLY.with(|slot| {
-        let mut binding = slot.get().filter(|binding| binding.store == store)
-            .ok_or_else(|| Error::Other("native terminal requires its owning store scope".into()))?;
-        if binding.terminal.is_some_and(|existing| existing != (lsn, identity)) {
-            return Err(Error::Other("native terminal identity changed inside apply scope".into()));
+        let mut binding = slot
+            .get()
+            .filter(|binding| binding.store == store)
+            .ok_or_else(|| {
+                Error::Other("native terminal requires its owning store scope".into())
+            })?;
+        if binding
+            .terminal
+            .is_some_and(|existing| existing != (lsn, identity))
+        {
+            return Err(Error::Other(
+                "native terminal identity changed inside apply scope".into(),
+            ));
         }
         binding.terminal = Some((lsn, identity));
         slot.set(Some(binding));
@@ -514,18 +546,30 @@ pub(crate) fn bind_owned_terminal_apply(
 }
 
 impl OwnedPersistentCompositeStore {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn try_new(
         legacy: PersistentCompositeStore,
         events: crate::database::event_bus::OwnedEventBusHandle,
     ) -> Result<Self> {
-        if !legacy.event_bus.as_ref().is_some_and(|common| events.matches_common(common)) {
-            return Err(Error::Other("owning persistent assembly requires its exact event companion".into()));
+        if !legacy
+            .event_bus
+            .as_ref()
+            .is_some_and(|common| events.matches_common(common))
+        {
+            return Err(Error::Other(
+                "owning persistent assembly requires its exact event companion".into(),
+            ));
         }
         Ok(Self { legacy, events })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn owned_terminal_apply_identity(
         &self,
         ws: &WriteSet,
@@ -539,11 +583,13 @@ impl OwnedPersistentCompositeStore {
                 })?;
             let (lsn, identity) = binding.terminal.ok_or_else(|| {
                 Error::Other(
-                    "native event apply requires original transaction and generation".into())
+                    "native event apply requires original transaction and generation".into(),
+                )
             })?;
             if ws.commit_lsn != Some(lsn) {
                 return Err(Error::Other(
-                    "native event apply terminal LSN mismatch".into()));
+                    "native event apply terminal LSN mismatch".into(),
+                ));
             }
             Ok(identity)
         })
@@ -552,7 +598,10 @@ impl OwnedPersistentCompositeStore {
     /// event getters with one synchronous combined-stage loan. The supplied
     /// consumer may flush only: memory apply, take, Drop and callbacks happen
     /// after this method returns and releases its stage guards.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn with_owned_flush_inputs<R>(
         &self,
         ws: &WriteSet,
@@ -619,7 +668,10 @@ impl OwnedPersistentCompositeStore {
 }
 
 impl OwnedPersistentCompositeStore {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn deleted_rows_snapshot_for_owned_write_set(
         &self,
         ws: &WriteSet,
@@ -633,7 +685,8 @@ impl OwnedPersistentCompositeStore {
             >,
         >,
     > {
-        let _statement_read_memory: contextdb_core::read_memory::ReadMemoryOwner = _statement_read_memory.into();
+        let _statement_read_memory: contextdb_core::read_memory::ReadMemoryOwner =
+            _statement_read_memory.into();
 
         use contextdb_relational::source::{RelationalReadSource, visible_row};
         if ws.relational_deletes.is_empty()
@@ -810,7 +863,9 @@ impl Drop for OriginalMetadataPublicationScope {
         // Restore before destroying any invoice so reentry sees its parent.
         ORIGINAL_METADATA_PUBLICATION.with(|slot| slot.set(self.prior));
         let owner = unsafe { &mut *self.owner };
-        if !owner.box_live { return; }
+        if !owner.box_live {
+            return;
+        }
         let mut parent = self.prior;
         while !parent.is_null() {
             let target = unsafe { &mut *parent };
@@ -834,7 +889,10 @@ impl Drop for OriginalMetadataPublicationScope {
             }
             parent = target.parent;
         }
-        assert!(!owner.box_live, "deferred publication must finish inside its outer owner");
+        assert!(
+            !owner.box_live,
+            "deferred publication must finish inside its outer owner"
+        );
     }
 }
 impl Drop for OriginalMetadataPublicationReservation {
@@ -868,12 +926,17 @@ pub(crate) struct PreparedQueueSourceLink<'a> {
     link: parking_lot::MutexGuard<'a, crate::persistence::WriterSnapshotWeak>,
 }
 impl PreparedQueueSourceLink<'_> {
-    pub(crate) fn settle(&mut self, root: &crate::persistence::WriterSnapshotHandle)
-        -> crate::persistence::WriterSnapshotWeak {
+    pub(crate) fn settle(
+        &mut self,
+        root: &crate::persistence::WriterSnapshotHandle,
+    ) -> crate::persistence::WriterSnapshotWeak {
         std::mem::replace(&mut *self.link, root.downgrade())
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn with_exact_queue_source_link<R>(
     persistence: &RedbPersistence,
     operation: impl FnOnce(&mut PreparedQueueSourceLink<'_>) -> R,
@@ -881,14 +944,18 @@ pub(crate) fn with_exact_queue_source_link<R>(
     ORIGINAL_METADATA_PUBLICATION.with(|slot| {
         let owner = slot.get();
         if owner.is_null() {
-            return Err(Error::Other("native queue publication requires its actual host scope".into()));
+            return Err(Error::Other(
+                "native queue publication requires its actual host scope".into(),
+            ));
         }
         // SAFETY: the existing synchronous metadata scope is installed by the
         // host owning this pinned concrete store, never by a public caller.
         let address = unsafe { (*owner).store };
         let store = unsafe { &*(address as *const OwnedPersistentCompositeStore) };
         if !std::ptr::eq(store.legacy.persistence.as_ref(), persistence) {
-            return Err(Error::Other("native queue publication persistence identity mismatch".into()));
+            return Err(Error::Other(
+                "native queue publication persistence identity mismatch".into(),
+            ));
         }
         let mut source = PreparedQueueSourceLink {
             link: store.legacy.inner.precommit_vector_root.lock(),
@@ -900,11 +967,20 @@ pub(crate) fn with_exact_queue_source_link<R>(
 pub(crate) fn with_owned_metadata_publication_scope<R>(store: usize, f: impl FnOnce() -> R) -> R {
     let prior = ORIGINAL_METADATA_PUBLICATION.with(|slot| slot.get());
     let mut owner = OriginalMetadataPublicationOwner {
-        store, box_pointer: None, box_credit: None, box_live: false,
-        owed_pointer: None, owed_credit: None, owed_live: false, parent: prior,
+        store,
+        box_pointer: None,
+        box_credit: None,
+        box_live: false,
+        owed_pointer: None,
+        owed_credit: None,
+        owed_live: false,
+        parent: prior,
     };
     ORIGINAL_METADATA_PUBLICATION.with(|slot| slot.set(&mut owner));
-    let scope = OriginalMetadataPublicationScope { prior, owner: &mut owner };
+    let scope = OriginalMetadataPublicationScope {
+        prior,
+        owner: &mut owner,
+    };
     let result = f();
     drop(scope);
     drop(owner);
@@ -922,7 +998,10 @@ impl OwnedPersistentCompositeStore {
         with_owned_metadata_publication_scope(self as *const Self as usize, f)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_owned_with_vector_reclamation(
         &self,
         ws: &WriteSet,
@@ -941,7 +1020,10 @@ impl OwnedPersistentCompositeStore {
             read_memory,
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_owned_with_vector_reclamation_for_terminal(
         &self,
         ws: &WriteSet,
@@ -971,7 +1053,8 @@ impl OwnedPersistentCompositeStore {
                 return self.with_owned_flush_inputs(ws, identity, |input, stage| {
                     let OwnedFlushInput::Local(projection) = input else {
                         return Err(Error::Other(
-                            "local native flush input changed while lending".into()));
+                            "local native flush input changed while lending".into(),
+                        ));
                     };
                     self.legacy.persistence.flush_owned_local_schema_stage(
                         original,
@@ -996,7 +1079,8 @@ impl OwnedPersistentCompositeStore {
                     } = input
                     else {
                         return Err(Error::Other(
-                            "received native flush input changed while lending".into()));
+                            "received native flush input changed while lending".into(),
+                        ));
                     };
                     self.legacy.persistence.flush_owned_received_schema_stage(
                         original,
@@ -1014,7 +1098,9 @@ impl OwnedPersistentCompositeStore {
                 });
             }
             let trigger_ddl = match (ws.commit_lsn, self.legacy.trigger.as_ref()) {
-                (Some(lsn), Some(trigger)) => trigger.original_trigger_persistence_commit(lsn, identity)?,
+                (Some(lsn), Some(trigger)) => {
+                    trigger.original_trigger_persistence_commit(lsn, identity)?
+                }
                 _ => None,
             };
             let trigger_audits = ws
@@ -1092,7 +1178,8 @@ impl OwnedPersistentCompositeStore {
             self.with_owned_flush_inputs(ws, identity, |input, stage| {
                 if !matches!(input, OwnedFlushInput::Ordinary) {
                     return Err(Error::Other(
-                        "ordinary native flush input changed while lending".into()));
+                        "ordinary native flush input changed while lending".into(),
+                    ));
                 }
                 self.legacy
                     .persistence
@@ -1140,7 +1227,10 @@ impl OwnedPersistentCompositeStore {
 }
 
 impl WriteSetApplicator for OwnedPersistentCompositeStore {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve_metadata_publication(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
         let store = self as *const Self as usize;
         self.events.with_owned_persistence_original(|original| {
@@ -1149,7 +1239,8 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
                 if pointer.is_null() {
                     return Err(Error::Other(
                         "native metadata publication requires its scoped external Box control"
-                            .into()));
+                            .into(),
+                    ));
                 }
                 // SAFETY: with_owned_metadata_publication retains the concrete
                 // stack owner synchronously through this existing host gate.
@@ -1165,7 +1256,8 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
                 }
                 if owner.box_live {
                     return Err(Error::Other(
-                        "native metadata publication control identity mismatch".into()));
+                        "native metadata publication control identity mismatch".into(),
+                    ));
                 }
                 let root = self
                     .legacy
@@ -1237,9 +1329,16 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
     fn native_publication_handle(&self) -> Option<contextdb_tx::native_capture::NativeCapture> {
-        self.legacy.prepared_publication.lock().take().map(|root| root.into_native())
+        self.legacy
+            .prepared_publication
+            .lock()
+            .take()
+            .map(|root| root.into_native())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn apply(
         &self,
         ws: &WriteSet,
@@ -1247,8 +1346,9 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         if FAIL_NEXT_LOCAL_APPLY.with(|armed| armed.replace(false)) {
-            return Err(Error::Other((
-                "injected local durable commit failure".to_string()).into()));
+            return Err(Error::Other(
+                ("injected local durable commit failure".to_string()).into(),
+            ));
         }
         let identity = self.owned_terminal_apply_identity(ws)?;
         let snapshots = self
@@ -1288,14 +1388,17 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
     dead_code,
     reason = "native delivery code is staged ahead of its first non-test caller"
 )]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn apply_owned_memory_store(
     store: &CompositeStore,
     events: &crate::database::event_bus::OwnedEventBusHandle,
     ws: &WriteSet,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<()> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
     events.with_owned_persistence_original(|original| {
         crate::database::discard::validate_original_discard_for_apply(
@@ -1317,14 +1420,18 @@ pub(crate) fn apply_owned_memory_store(
         // as on the ordinary memory applicator. Never append a second log
         // restamped to the receiver's terminal LSN.
         let (entries, credit) = if resolving_staged_arrival {
-            (Vec::new(), crate::memory_accounting::reserve_preparation_from_original(
-                original, 0, "writer_source", "received_history_owner",
-                "Raise MEMORY_LIMIT to prepare received history.",
-            )?)
+            (
+                Vec::new(),
+                crate::memory_accounting::reserve_preparation_from_original(
+                    original,
+                    0,
+                    "writer_source",
+                    "received_history_owner",
+                    "Raise MEMORY_LIMIT to prepare received history.",
+                )?,
+            )
         } else {
-            store.prepare_owned_change_log_entries_with_snapshots(
-                original, ws, Some(meta), None,
-            )?
+            store.prepare_owned_change_log_entries_with_snapshots(original, ws, Some(meta), None)?
         };
         let original_projection =
             crate::memory_accounting::persistence_original_projection(original)?;
@@ -1332,24 +1439,57 @@ pub(crate) fn apply_owned_memory_store(
             crate::vector_read_memory::admission(original_projection.read_budget()?);
         let snapshots = store.take_vector_partition_snapshot_stage(ws.commit_lsn);
         let batch = store.prepare_vector_partition_mutations_with_reclamation(
-            ws, meta, None, HashSet::new(), snapshots.as_deref(),
-            resolving_staged_arrival, false, &mut vector_copy_owner, read_memory,
+            ws,
+            meta,
+            None,
+            HashSet::new(),
+            snapshots.as_deref(),
+            resolving_staged_arrival,
+            false,
+            &mut vector_copy_owner,
+            read_memory,
         )?;
         let mut prepared = crate::composite_store::OwnedPreparedMemoryApply::prepare(
             original, ws, entries, batch, credit,
         )?;
-        let resident_rows = ws.relational_inserts.iter().try_fold(0usize, |bytes, (table, row)| {
-            bytes.checked_add(crate::database::retained_row_bytes_with_optional_meta(table, row, meta.get(table)))
-                .ok_or_else(|| Error::Other("committed row copy size overflow".into()))
-        })?;
-        let resident_edges = ws.adj_inserts.iter().map(|edge| edge.estimated_bytes().saturating_add(
-            std::mem::size_of::<Option<contextdb_tx::RowEdgeOwner>>().saturating_mul(2)))
-            .chain(ws.row_adj_inserts.iter().map(|owned| owned.entry.estimated_bytes().saturating_add(
-                std::mem::size_of::<Option<contextdb_tx::RowEdgeOwner>>().saturating_add(owned.owner.table.len()).saturating_mul(2))))
-            .try_fold(0usize, |bytes, next| bytes.checked_add(next)
-                .ok_or_else(|| Error::Other("committed edge copy size overflow".into())))?;
-        prepared.admit_resident_copies(original, resident_rows.checked_add(resident_edges)
-            .ok_or_else(|| Error::Other("committed copy size overflow".into()))?)?;
+        let resident_rows =
+            ws.relational_inserts
+                .iter()
+                .try_fold(0usize, |bytes, (table, row)| {
+                    bytes
+                        .checked_add(crate::database::retained_row_bytes_with_optional_meta(
+                            table,
+                            row,
+                            meta.get(table),
+                        ))
+                        .ok_or_else(|| Error::Other("committed row copy size overflow".into()))
+                })?;
+        let resident_edges = ws
+            .adj_inserts
+            .iter()
+            .map(|edge| {
+                edge.estimated_bytes().saturating_add(
+                    std::mem::size_of::<Option<contextdb_tx::RowEdgeOwner>>().saturating_mul(2),
+                )
+            })
+            .chain(ws.row_adj_inserts.iter().map(|owned| {
+                owned.entry.estimated_bytes().saturating_add(
+                    std::mem::size_of::<Option<contextdb_tx::RowEdgeOwner>>()
+                        .saturating_add(owned.owner.table.len())
+                        .saturating_mul(2),
+                )
+            }))
+            .try_fold(0usize, |bytes, next| {
+                bytes
+                    .checked_add(next)
+                    .ok_or_else(|| Error::Other("committed edge copy size overflow".into()))
+            })?;
+        prepared.admit_resident_copies(
+            original,
+            resident_rows
+                .checked_add(resident_edges)
+                .ok_or_else(|| Error::Other("committed copy size overflow".into()))?,
+        )?;
         drop(live_meta);
         store.apply_owned_exact_with_log_entries(ws, prepared)
     })
@@ -1385,8 +1525,11 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for RedbPersistence {
         self.with_owned_cold_event_source(original, visit)
     }
     fn with_cold_source_funded<R>(
-        &self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        visit: impl for<'s> FnOnce(&crate::persistence::OwnedColdEventSource<'s>) -> crate::funded_error::OriginalResult<R>,
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        visit: impl for<'s> FnOnce(
+            &crate::persistence::OwnedColdEventSource<'s>,
+        ) -> crate::funded_error::OriginalResult<R>,
     ) -> crate::funded_error::OriginalResult<R> {
         self.with_owned_cold_event_source_funded(original, visit)
     }
@@ -1404,7 +1547,8 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for RedbPersistence {
         )?;
         if decoded.value.id != entry_id {
             return Err(Error::Other(
-                "prepared native sink entry identity mismatch".into()));
+                "prepared native sink entry identity mismatch".into(),
+            ));
         }
         Ok(OwnedDurableQueueUpdate {
             original,
@@ -1415,16 +1559,32 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for RedbPersistence {
             unconfirmed_delta,
         })
     }
-    fn prepare_update_funded<'o>(&self,
+    fn prepare_update_funded<'o>(
+        &self,
         original: &'o crate::memory_accounting::OwnedMemoryReservation,
-        sink: &'o str, entry_id: u64, encoded: &[u8], uncertain: bool, unconfirmed_delta: i8,
+        sink: &'o str,
+        entry_id: u64,
+        encoded: &[u8],
+        uncertain: bool,
+        unconfirmed_delta: i8,
     ) -> crate::funded_error::OriginalResult<Self::Update<'o>> {
         let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
-        let decoded = Self::decode_owned_event_funded::<crate::database::event_bus::SinkQueueEntry>(original, encoded)?;
+        let decoded = Self::decode_owned_event_funded::<crate::database::event_bus::SinkQueueEntry>(
+            original, encoded,
+        )?;
         if decoded.value.id != entry_id {
-            return Err(diagnostic.error(Error::Other("prepared native sink entry identity mismatch".into())));
+            return Err(diagnostic.error(Error::Other(
+                "prepared native sink entry identity mismatch".into(),
+            )));
         }
-        Ok(OwnedDurableQueueUpdate { original, sink, entry_id, decoded, uncertain, unconfirmed_delta })
+        Ok(OwnedDurableQueueUpdate {
+            original,
+            sink,
+            entry_id,
+            decoded,
+            uncertain,
+            unconfirmed_delta,
+        })
     }
     fn commit_update(&self, prepared: Self::Update<'_>) -> Result<()> {
         self.update_owned_sink_queue_entry(
@@ -1442,12 +1602,24 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for RedbPersistence {
         completion: &crate::database::event_bus::OwnedQueueCommitToken<'_>,
         failure: &mut crate::database::event_bus::OwnedNativeQueueFailure,
     ) {
-        let OwnedDurableQueueUpdate { original, sink, entry_id, decoded,
-            uncertain, unconfirmed_delta } = prepared;
+        let OwnedDurableQueueUpdate {
+            original,
+            sink,
+            entry_id,
+            decoded,
+            uncertain,
+            unconfirmed_delta,
+        } = prepared;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.update_owned_sink_queue_entry_at_boundary(
-                original, sink, Some(entry_id), Some((entry_id, &decoded.value)),
-                uncertain, unconfirmed_delta, completion, &mut failure.cleanup,
+                original,
+                sink,
+                Some(entry_id),
+                Some((entry_id, &decoded.value)),
+                uncertain,
+                unconfirmed_delta,
+                completion,
+                &mut failure.cleanup,
             )
         }));
         // Capture only the completed scoped Result, before its decoding owner
@@ -1455,15 +1627,19 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for RedbPersistence {
         match outcome {
             Ok(result) => {
                 failure.capture_funded(result);
-                let retirement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(decoded)));
+                let retirement =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(decoded)));
                 if let Err(panic) = retirement {
-                    if failure.has_error() { failure.cleanup.adapter_unwind = Some(panic); }
-                    else { std::panic::resume_unwind(panic); }
+                    if failure.has_error() {
+                        failure.cleanup.adapter_unwind = Some(panic);
+                    } else {
+                        std::panic::resume_unwind(panic);
+                    }
                 }
             }
             Err(panic) => {
-                failure.cleanup.adapter_unwind = std::panic::catch_unwind(
-                    std::panic::AssertUnwindSafe(|| drop(decoded))).err();
+                failure.cleanup.adapter_unwind =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(decoded))).err();
                 std::panic::resume_unwind(panic);
             }
         }
@@ -1528,8 +1704,11 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for std::sync::Arc<Re
         self.as_ref().with_owned_cold_event_source(original, visit)
     }
     fn with_cold_source_funded<R>(
-        &self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        visit: impl for<'s> FnOnce(&crate::persistence::OwnedColdEventSource<'s>) -> crate::funded_error::OriginalResult<R>,
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        visit: impl for<'s> FnOnce(
+            &crate::persistence::OwnedColdEventSource<'s>,
+        ) -> crate::funded_error::OriginalResult<R>,
     ) -> crate::funded_error::OriginalResult<R> {
         self.with_owned_cold_event_source_funded(original, visit)
     }
@@ -1552,9 +1731,14 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for std::sync::Arc<Re
             delta,
         )
     }
-    fn prepare_update_funded<'o>(&self,
+    fn prepare_update_funded<'o>(
+        &self,
         original: &'o crate::memory_accounting::OwnedMemoryReservation,
-        sink: &'o str, entry_id: u64, encoded: &[u8], uncertain: bool, unconfirmed_delta: i8,
+        sink: &'o str,
+        entry_id: u64,
+        encoded: &[u8],
+        uncertain: bool,
+        unconfirmed_delta: i8,
     ) -> crate::funded_error::OriginalResult<Self::Update<'o>> {
         <RedbPersistence as crate::database::event_bus::OwnedSinkQueuePersistence>::prepare_update_funded(
             self.as_ref(), original, sink, entry_id, encoded, uncertain, unconfirmed_delta)
@@ -1605,11 +1789,20 @@ impl crate::database::event_bus::OwnedSinkQueuePersistence for std::sync::Arc<Re
 }
 
 impl OwnedPersistentCompositeStore {
-    fn prepare_native_publication(&self, control: crate::memory_accounting::OwnedMemoryReservation,
-        snapshot: SnapshotId, lsn: Lsn) {
-        let root = self.legacy.persistence.prepare_native_writer_snapshot(control, snapshot, lsn)
+    fn prepare_native_publication(
+        &self,
+        control: crate::memory_accounting::OwnedMemoryReservation,
+        snapshot: SnapshotId,
+        lsn: Lsn,
+    ) {
+        let root = self
+            .legacy
+            .persistence
+            .prepare_native_writer_snapshot(control, snapshot, lsn)
             .unwrap_or_else(|error| {
-                self.legacy.publication_interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.legacy
+                    .publication_interrupted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 panic!("durable publication root preparation failed: {error}");
             });
         *self.legacy.inner.precommit_vector_root.lock() = root.downgrade();

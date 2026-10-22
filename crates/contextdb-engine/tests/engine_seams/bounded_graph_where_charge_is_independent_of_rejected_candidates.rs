@@ -130,7 +130,10 @@ fn bounded_graph_where_charge_is_independent_of_rejected_candidates() {
             let baseline = db.accountant().usage().used;
             db.accountant().reset_high_water_for_test();
             let rows = if mode == 0 {
-                db.execute(&identity_sql, &identity_params).unwrap().rows().to_vec()
+                db.execute(&identity_sql, &identity_params)
+                    .unwrap()
+                    .rows()
+                    .to_vec()
             } else {
                 let mut request = bounded::BoundedReadRequest::new(
                     &identity_sql,

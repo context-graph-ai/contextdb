@@ -115,7 +115,8 @@ fn inspect(db: &Database, id: Uuid, place: &str) -> Result<(RowId, f32), String>
         != [vec![
             Value::Text("owner-first".to_string()),
             Value::Vector(vec![1.0, 0.0, 0.0]),
-        ]].as_slice()
+        ]]
+        .as_slice()
     {
         return Err(format!(
             "SQL did not return the exact enriched owner at {place}"

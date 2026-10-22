@@ -434,10 +434,13 @@ impl DatabasePlugin for CrossHandleClosedReadPlugin {
                 *self.observed_closed.lock().unwrap() = true;
                 Ok(())
             }
-            Ok(rows) => Err(Error::Other(format!(
-                "closed cross-handle scan unexpectedly returned {} rows",
-                rows.len()
-            ).into())),
+            Ok(rows) => Err(Error::Other(
+                format!(
+                    "closed cross-handle scan unexpectedly returned {} rows",
+                    rows.len()
+                )
+                .into(),
+            )),
             Err(err) => Err(err),
         }
     }

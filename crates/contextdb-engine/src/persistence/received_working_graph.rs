@@ -1,21 +1,33 @@
 //! Graph versions in the same unpublished write as the received row image.
 //! Initialization preserves authenticated physical bytes and never gathers an
 //! adjacency list; read windows free every table guard before their consumer.
-use super::*;
 use super::received_working::ReceivedWorkingWrite;
+use super::*;
 use std::ops::Bound;
 
-pub(super) const WORKING_GRAPH_FWD: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_fwd");
-pub(super) const WORKING_GRAPH_REV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_rev");
+pub(super) const WORKING_GRAPH_FWD: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_fwd");
+pub(super) const WORKING_GRAPH_REV: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_rev");
 
 pub(super) fn graph_key_matches(key: &[u8], edge: &AdjEntry, reverse: bool) -> bool {
-    let Some(length) = edge.edge_type.len().checked_add(49) else { return false; };
-    if key.len() != length { return false; }
-    let (first, second) = if reverse { (edge.target, edge.source) } else { (edge.source, edge.target) };
-    &key[..16] == first.as_bytes() && &key[16..32] == second.as_bytes()
-        && &key[32..length-17] == edge.edge_type.as_bytes() && key[length-17] == 0
-        && key[length-16..length-8] == edge.created_tx.0.to_be_bytes()
-        && key[length-8..] == edge.lsn.0.to_be_bytes()
+    let Some(length) = edge.edge_type.len().checked_add(49) else {
+        return false;
+    };
+    if key.len() != length {
+        return false;
+    }
+    let (first, second) = if reverse {
+        (edge.target, edge.source)
+    } else {
+        (edge.source, edge.target)
+    };
+    &key[..16] == first.as_bytes()
+        && &key[16..32] == second.as_bytes()
+        && &key[32..length - 17] == edge.edge_type.as_bytes()
+        && key[length - 17] == 0
+        && key[length - 16..length - 8] == edge.created_tx.0.to_be_bytes()
+        && key[length - 8..] == edge.lsn.0.to_be_bytes()
 }
 
 pub(crate) struct WorkingEdge {
@@ -25,21 +37,43 @@ pub(crate) struct WorkingEdge {
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl WorkingEdge {
-    pub(crate) fn value(&self) -> &AdjEntry { &self.edge }
-    pub(crate) fn position(&self) -> &[u8] { &self.key }
-    pub(super) fn encoded(&self) -> &[u8] { &self.encoded }
+    pub(crate) fn value(&self) -> &AdjEntry {
+        &self.edge
+    }
+    pub(crate) fn position(&self) -> &[u8] {
+        &self.key
+    }
+    pub(super) fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
 }
-impl Drop for WorkingEdge { fn drop(&mut self) {} }
+impl Drop for WorkingEdge {
+    fn drop(&mut self) {}
+}
 
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn graph_prepared(&self) -> Result<bool> {
-        if !self.graph_is_ready() { return Ok(false); }
-        self.with_write(|write| Ok(write.table_exists(WORKING_GRAPH_FWD).map_err(RedbPersistence::storage_error)?
-            && write.table_exists(WORKING_GRAPH_REV).map_err(RedbPersistence::storage_error)?))
+        if !self.graph_is_ready() {
+            return Ok(false);
+        }
+        self.with_write(|write| {
+            Ok(write
+                .table_exists(WORKING_GRAPH_FWD)
+                .map_err(RedbPersistence::storage_error)?
+                && write
+                    .table_exists(WORKING_GRAPH_REV)
+                    .map_err(RedbPersistence::storage_error)?)
+        })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_graph(
         &self,
         store: &RedbPersistence,
@@ -49,31 +83,49 @@ impl ReceivedWorkingWrite {
         self.require_original(original)?;
         self.require_store(store)?;
         root.require_working_store(store)?;
-        if self.graph_prepared()? { return Ok(()); }
+        if self.graph_prepared()? {
+            return Ok(());
+        }
         self.prepare_graph_state(original)?;
-        let read_memory = crate::memory_accounting::persistence_original_projection(original)?.read_budget()?;
-        for (public, destination) in [(GRAPH_FWD_TABLE, WORKING_GRAPH_FWD), (GRAPH_REV_TABLE, WORKING_GRAPH_REV)] {
+        let read_memory =
+            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?;
+        for (public, destination) in [
+            (GRAPH_FWD_TABLE, WORKING_GRAPH_FWD),
+            (GRAPH_REV_TABLE, WORKING_GRAPH_REV),
+        ] {
             let frame = OriginalPersistenceFrame::new(original)?;
             frame.reserve(destination.name().len())?;
             let name = crate::memory_accounting::preparation_copy_string(destination.name())?;
             self.keep_scratch_name(name, frame.into_reservation())?;
             self.with_write(|write| {
                 match write.delete_table(destination) {
-                    Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {},
+                    Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                     Err(error) => return Err(RedbPersistence::storage_error(error)),
                 }
-                write.open_table(destination).map(|_| ()).map_err(RedbPersistence::storage_error)
+                write
+                    .open_table(destination)
+                    .map(|_| ())
+                    .map_err(RedbPersistence::storage_error)
             })?;
-            let mut cursor = root.cursor(writer_source::SourceWindowOwner::Read(read_memory.clone()),
-                public.name(), writer_source::WriterCursorFamily::Bytes,
-                Bound::Unbounded, Bound::Unbounded, false)?;
+            let mut cursor = root.cursor(
+                writer_source::SourceWindowOwner::Read(read_memory.clone()),
+                public.name(),
+                writer_source::WriterCursorFamily::Bytes,
+                Bound::Unbounded,
+                Bound::Unbounded,
+                false,
+            )?;
             while let Some(window) = cursor.next_edge_for_working()? {
                 // Both directions use the existing graph proof/counterpart
                 // verifier. The exact authenticated bytes, not a normalized
                 // serialization, become the private physical version.
                 self.with_write(|write| {
-                    let mut target = write.open_table(destination).map_err(RedbPersistence::storage_error)?;
-                    target.insert(window.position(), window.value.1.as_slice()).map_err(RedbPersistence::storage_error)?;
+                    let mut target = write
+                        .open_table(destination)
+                        .map_err(RedbPersistence::storage_error)?;
+                    target
+                        .insert(window.position(), window.value.1.as_slice())
+                        .map_err(RedbPersistence::storage_error)?;
                     Ok(())
                 })?;
             }
@@ -82,7 +134,10 @@ impl ReceivedWorkingWrite {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_graph_edge(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -99,91 +154,162 @@ struct GraphPosition {
     key: Vec<u8>,
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-fn original_graph_key(frame: &OriginalPersistenceFrame<'_>, edge: &AdjEntry, reverse: bool) -> Result<Vec<u8>> {
-    let length = edge.edge_type.len().checked_add(49).ok_or_else(|| Error::Other("working graph key overflow".into()))?;
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn original_graph_key(
+    frame: &OriginalPersistenceFrame<'_>,
+    edge: &AdjEntry,
+    reverse: bool,
+) -> Result<Vec<u8>> {
+    let length = edge
+        .edge_type
+        .len()
+        .checked_add(49)
+        .ok_or_else(|| Error::Other("working graph key overflow".into()))?;
     frame.reserve(length)?;
     let mut key = Vec::with_capacity(length);
-    let (first, second) = if reverse { (edge.target, edge.source) } else { (edge.source, edge.target) };
-    key.extend_from_slice(first.as_bytes()); key.extend_from_slice(second.as_bytes());
-    key.extend_from_slice(edge.edge_type.as_bytes()); key.push(0);
-    key.extend_from_slice(&edge.created_tx.0.to_be_bytes()); key.extend_from_slice(&edge.lsn.0.to_be_bytes());
-    if key.len() != length || key.capacity() != length { return Err(Error::Other("working graph key capacity differs from admission".into())); }
+    let (first, second) = if reverse {
+        (edge.target, edge.source)
+    } else {
+        (edge.source, edge.target)
+    };
+    key.extend_from_slice(first.as_bytes());
+    key.extend_from_slice(second.as_bytes());
+    key.extend_from_slice(edge.edge_type.as_bytes());
+    key.push(0);
+    key.extend_from_slice(&edge.created_tx.0.to_be_bytes());
+    key.extend_from_slice(&edge.lsn.0.to_be_bytes());
+    if key.len() != length || key.capacity() != length {
+        return Err(Error::Other(
+            "working graph key capacity differs from admission".into(),
+        ));
+    }
     Ok(key)
 }
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn put_working_graph_edge(&self, original: &crate::memory_accounting::OwnedMemoryReservation, edge: &AdjEntry) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn put_working_graph_edge(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        edge: &AdjEntry,
+    ) -> Result<()> {
         let frame = OriginalPersistenceFrame::new(original)?;
         let encoded = frame.encode(edge)?;
         let forward = original_graph_key(&frame, edge, false)?;
         let reverse = original_graph_key(&frame, edge, true)?;
         // All original admission and encoding precede mutable native guards.
         self.with_write(|write| {
-            let mut fwd = write.open_table(WORKING_GRAPH_FWD).map_err(RedbPersistence::storage_error)?;
-            let mut rev = write.open_table(WORKING_GRAPH_REV).map_err(RedbPersistence::storage_error)?;
-            fwd.insert(forward.as_slice(), encoded.as_slice()).map_err(RedbPersistence::storage_error)?;
-            rev.insert(reverse.as_slice(), encoded.as_slice()).map_err(RedbPersistence::storage_error)?;
+            let mut fwd = write
+                .open_table(WORKING_GRAPH_FWD)
+                .map_err(RedbPersistence::storage_error)?;
+            let mut rev = write
+                .open_table(WORKING_GRAPH_REV)
+                .map_err(RedbPersistence::storage_error)?;
+            fwd.insert(forward.as_slice(), encoded.as_slice())
+                .map_err(RedbPersistence::storage_error)?;
+            rev.insert(reverse.as_slice(), encoded.as_slice())
+                .map_err(RedbPersistence::storage_error)?;
             Ok(())
         })
     }
 
     /// Remove only versions of the exact pre-DROP row identity. The bounded
     /// prefix seek avoids rewriting or gathering unrelated graph history.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_graph_identity(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
-        source: NodeId, kind: &str, target: NodeId,
+        source: NodeId,
+        kind: &str,
+        target: NodeId,
     ) -> Result<()> {
         self.require_original(original)?;
         if !self.graph_prepared()? {
-            return Err(Error::Other("private graph DROP has no completed private image".into()));
+            return Err(Error::Other(
+                "private graph DROP has no completed private image".into(),
+            ));
         }
         self.select_graph_type(original, kind)?;
         self.retire_graph_occurrences(original, source, kind, target)?;
         let frame = OriginalPersistenceFrame::new(original)?;
-        let length = kind.len().checked_add(33)
+        let length = kind
+            .len()
+            .checked_add(33)
             .ok_or_else(|| Error::Other("working graph identity overflow".into()))?;
-        frame.reserve(length.checked_mul(2)
-            .ok_or_else(|| Error::Other("working graph identity overflow".into()))?)?;
+        frame.reserve(
+            length
+                .checked_mul(2)
+                .ok_or_else(|| Error::Other("working graph identity overflow".into()))?,
+        )?;
         let mut prefix = Vec::with_capacity(length);
         prefix.extend_from_slice(source.as_bytes());
         prefix.extend_from_slice(target.as_bytes());
         prefix.extend_from_slice(kind.as_bytes());
         prefix.push(0);
         if prefix.capacity() != length {
-            return Err(Error::Other("working graph identity capacity differs from admission".into()));
+            return Err(Error::Other(
+                "working graph identity capacity differs from admission".into(),
+            ));
         }
         let upper = writer_source::prefix_end(&prefix);
         let mut after = None::<GraphPosition>;
         loop {
-            let lower = after.as_ref().map_or(Bound::Included(prefix.as_slice()),
-                |position| Bound::Excluded(position.key.as_slice()));
-            let upper = upper.as_ref().map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_slice()));
-            let Some(window) = self.next_graph_edge(original, false, lower, upper)? else { break; };
+            let lower = after
+                .as_ref()
+                .map_or(Bound::Included(prefix.as_slice()), |position| {
+                    Bound::Excluded(position.key.as_slice())
+                });
+            let upper = upper
+                .as_ref()
+                .map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_slice()));
+            let Some(window) = self.next_graph_edge(original, false, lower, upper)? else {
+                break;
+            };
             let next = OriginalPersistenceFrame::new(original)?;
             let key = next.copy_bytes(window.position())?;
-            after = Some(GraphPosition { key, _owner: next.into_reservation() });
+            after = Some(GraphPosition {
+                key,
+                _owner: next.into_reservation(),
+            });
             // An edge type containing a NUL can share this byte prefix. The
             // decoded identity, not prefix inclusion, authorizes its removal.
-            if window.edge.source != source || window.edge.target != target || window.edge.edge_type != kind {
+            if window.edge.source != source
+                || window.edge.target != target
+                || window.edge.edge_type != kind
+            {
                 continue;
             }
             let removal = OriginalPersistenceFrame::new(original)?;
             let reverse = original_graph_key(&removal, &window.edge, true)?;
             self.with_write(|write| {
-                write.open_table(WORKING_GRAPH_FWD).map_err(RedbPersistence::storage_error)?
-                    .remove(window.position()).map_err(RedbPersistence::storage_error)?;
-                write.open_table(WORKING_GRAPH_REV).map_err(RedbPersistence::storage_error)?
-                    .remove(reverse.as_slice()).map_err(RedbPersistence::storage_error)?;
+                write
+                    .open_table(WORKING_GRAPH_FWD)
+                    .map_err(RedbPersistence::storage_error)?
+                    .remove(window.position())
+                    .map_err(RedbPersistence::storage_error)?;
+                write
+                    .open_table(WORKING_GRAPH_REV)
+                    .map_err(RedbPersistence::storage_error)?
+                    .remove(reverse.as_slice())
+                    .map_err(RedbPersistence::storage_error)?;
                 Ok(())
             })?;
         }
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_graph_replacements(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -191,28 +317,61 @@ impl ReceivedWorkingWrite {
         inserts: &[AdjEntry],
     ) -> Result<()> {
         self.require_original(original)?;
-        if deletes.is_empty() && inserts.is_empty() { return Ok(()); }
-        if !self.graph_prepared()? { return Err(Error::Other("received graph source has no completed private image".into())); }
+        if deletes.is_empty() && inserts.is_empty() {
+            return Ok(());
+        }
+        if !self.graph_prepared()? {
+            return Err(Error::Other(
+                "received graph source has no completed private image".into(),
+            ));
+        }
         for (source, kind, target, deleted_tx) in deletes {
             self.select_graph_type(original, kind)?;
             let frame = OriginalPersistenceFrame::new(original)?;
-            let length = kind.len().checked_add(33).ok_or_else(|| Error::Other("working graph identity overflow".into()))?;
-            frame.reserve(length.checked_mul(2).ok_or_else(|| Error::Other("working graph identity overflow".into()))?)?;
+            let length = kind
+                .len()
+                .checked_add(33)
+                .ok_or_else(|| Error::Other("working graph identity overflow".into()))?;
+            frame.reserve(
+                length
+                    .checked_mul(2)
+                    .ok_or_else(|| Error::Other("working graph identity overflow".into()))?,
+            )?;
             let mut prefix = Vec::with_capacity(length);
-            prefix.extend_from_slice(source.as_bytes()); prefix.extend_from_slice(target.as_bytes());
-            prefix.extend_from_slice(kind.as_bytes()); prefix.push(0);
-            if prefix.capacity() != length { return Err(Error::Other("working graph identity capacity differs from admission".into())); }
+            prefix.extend_from_slice(source.as_bytes());
+            prefix.extend_from_slice(target.as_bytes());
+            prefix.extend_from_slice(kind.as_bytes());
+            prefix.push(0);
+            if prefix.capacity() != length {
+                return Err(Error::Other(
+                    "working graph identity capacity differs from admission".into(),
+                ));
+            }
             let upper = writer_source::prefix_end(&prefix);
             let mut after = None::<GraphPosition>;
             loop {
-                let lower = after.as_ref().map_or(Bound::Included(prefix.as_slice()), |position| Bound::Excluded(position.key.as_slice()));
-                let upper = upper.as_ref().map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_slice()));
-                let Some(mut window) = self.next_graph_edge(original, false, lower, upper)? else { break; };
+                let lower = after
+                    .as_ref()
+                    .map_or(Bound::Included(prefix.as_slice()), |position| {
+                        Bound::Excluded(position.key.as_slice())
+                    });
+                let upper = upper
+                    .as_ref()
+                    .map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_slice()));
+                let Some(mut window) = self.next_graph_edge(original, false, lower, upper)? else {
+                    break;
+                };
                 let next = OriginalPersistenceFrame::new(original)?;
                 let next_key = next.copy_bytes(window.position())?;
-                after = Some(GraphPosition { key: next_key, _owner: next.into_reservation() });
-                if window.edge.source == *source && window.edge.target == *target
-                    && window.edge.edge_type == *kind && window.edge.deleted_tx.is_none() {
+                after = Some(GraphPosition {
+                    key: next_key,
+                    _owner: next.into_reservation(),
+                });
+                if window.edge.source == *source
+                    && window.edge.target == *target
+                    && window.edge.edge_type == *kind
+                    && window.edge.deleted_tx.is_none()
+                {
                     window.edge.deleted_tx = Some(*deleted_tx);
                     self.put_working_graph_edge(original, &window.edge)?;
                 }
@@ -228,7 +387,10 @@ impl ReceivedWorkingWrite {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn next_graph_in_write(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     write: &redb::WriteTransaction,
@@ -236,10 +398,24 @@ pub(super) fn next_graph_in_write(
     lower: Bound<&[u8]>,
     upper: Bound<&[u8]>,
 ) -> Result<Option<WorkingEdge>> {
-    next_graph_in_table(original, write, if reverse { WORKING_GRAPH_REV } else { WORKING_GRAPH_FWD }, reverse, lower, upper)
+    next_graph_in_table(
+        original,
+        write,
+        if reverse {
+            WORKING_GRAPH_REV
+        } else {
+            WORKING_GRAPH_FWD
+        },
+        reverse,
+        lower,
+        upper,
+    )
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn next_graph_in_table(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     write: &redb::WriteTransaction,
@@ -250,24 +426,44 @@ fn next_graph_in_table(
 ) -> Result<Option<WorkingEdge>> {
     let frame = OriginalPersistenceFrame::new(original)?;
     let (edge, key, encoded) = {
-        let table = write.open_table(definition)
+        let table = write
+            .open_table(definition)
             .map_err(RedbPersistence::storage_error)?;
-        let mut range = table.range::<&[u8]>((lower, upper)).map_err(RedbPersistence::storage_error)?;
-        let Some((key, body)) = range.next().transpose().map_err(RedbPersistence::storage_error)? else { return Ok(None); };
+        let mut range = table
+            .range::<&[u8]>((lower, upper))
+            .map_err(RedbPersistence::storage_error)?;
+        let Some((key, body)) = range
+            .next()
+            .transpose()
+            .map_err(RedbPersistence::storage_error)?
+        else {
+            return Ok(None);
+        };
         let edge = frame.decode::<AdjEntry>(body.value())?;
         if !graph_key_matches(key.value(), &edge, reverse) {
-            return Err(Error::StoreCorrupted { path: "received working graph".into(), reason: "private edge key and body disagree".into() });
+            return Err(Error::StoreCorrupted {
+                path: "received working graph".into(),
+                reason: "private edge key and body disagree".into(),
+            });
         }
         let key = frame.copy_bytes(key.value())?;
         let encoded = frame.copy_bytes(body.value())?;
         (edge, key, encoded)
     };
-    Ok(Some(WorkingEdge { edge, key, encoded, _owner: frame.into_reservation() }))
+    Ok(Some(WorkingEdge {
+        edge,
+        key,
+        encoded,
+        _owner: frame.into_reservation(),
+    }))
 }
 
 /// Consumer callbacks run after both native table/range guards close. Each
 /// original window retains decoded data, exact source bytes and continuation.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn visit_graph_in_write(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     write: &redb::WriteTransaction,
@@ -276,11 +472,19 @@ pub(super) fn visit_graph_in_write(
 ) -> Result<()> {
     let mut after = None::<GraphPosition>;
     loop {
-        let lower = after.as_ref().map_or(Bound::Unbounded, |position| Bound::Excluded(position.key.as_slice()));
-        let Some(window) = next_graph_in_write(original, write, false, lower, Bound::Unbounded)? else { break; };
+        let lower = after.as_ref().map_or(Bound::Unbounded, |position| {
+            Bound::Excluded(position.key.as_slice())
+        });
+        let Some(window) = next_graph_in_write(original, write, false, lower, Bound::Unbounded)?
+        else {
+            break;
+        };
         let next = OriginalPersistenceFrame::new(original)?;
         let key = next.copy_bytes(window.position())?;
-        after = Some(GraphPosition { key, _owner: next.into_reservation() });
+        after = Some(GraphPosition {
+            key,
+            _owner: next.into_reservation(),
+        });
         if selected_types.is_none_or(|types| types.contains(&window.value().edge_type)) {
             visit(window.value(), window.position(), window.encoded())?;
         }
@@ -289,7 +493,10 @@ pub(super) fn visit_graph_in_write(
 }
 
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn visit_graph_original(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -297,26 +504,42 @@ impl ReceivedWorkingWrite {
         visit: impl FnMut(&AdjEntry, &[u8], &[u8]) -> Result<()>,
     ) -> Result<()> {
         self.require_original(original)?;
-        if !self.graph_prepared()? { return Err(Error::Other("received graph source has no completed private image".into())); }
+        if !self.graph_prepared()? {
+            return Err(Error::Other(
+                "received graph source has no completed private image".into(),
+            ));
+        }
         self.with_write(|write| visit_graph_in_write(original, write, selected, visit))
     }
 }
 
 /// A separate destination prevents a rewritten key from being visited again,
 /// and preserves source ordering when receiver coordinates reorder versions.
-const WORKING_GRAPH_REWRITE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_rewrite");
+const WORKING_GRAPH_REWRITE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_rewrite");
 
-pub(crate) enum GraphRewrite { Keep, Replace, Remove }
+pub(crate) enum GraphRewrite {
+    Keep,
+    Replace,
+    Remove,
+}
 
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn rewrite_graph(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         mut transform: impl FnMut(&mut AdjEntry) -> Result<GraphRewrite>,
     ) -> Result<()> {
         self.require_original(original)?;
-        if !self.graph_prepared()? { return Err(Error::Other("received graph rewrite has no completed private image".into())); }
+        if !self.graph_prepared()? {
+            return Err(Error::Other(
+                "received graph rewrite has no completed private image".into(),
+            ));
+        }
         self.require_graph_mutable()?;
         let rewrite_generation = self.graph_state.lock().generation;
         let name_frame = OriginalPersistenceFrame::new(original)?;
@@ -325,18 +548,30 @@ impl ReceivedWorkingWrite {
         self.keep_scratch_name(name, name_frame.into_reservation())?;
         self.with_write(|write| {
             match write.delete_table(WORKING_GRAPH_REWRITE) {
-                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {},
+                Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
                 Err(error) => return Err(RedbPersistence::storage_error(error)),
             }
-            write.open_table(WORKING_GRAPH_REWRITE).map(|_| ()).map_err(RedbPersistence::storage_error)
+            write
+                .open_table(WORKING_GRAPH_REWRITE)
+                .map(|_| ())
+                .map_err(RedbPersistence::storage_error)
         })?;
         let mut after = None::<GraphPosition>;
         loop {
-            let lower = after.as_ref().map_or(Bound::Unbounded, |position| Bound::Excluded(position.key.as_slice()));
-            let Some(mut window) = self.next_graph_edge(original, false, lower, Bound::Unbounded)? else { break; };
+            let lower = after.as_ref().map_or(Bound::Unbounded, |position| {
+                Bound::Excluded(position.key.as_slice())
+            });
+            let Some(mut window) =
+                self.next_graph_edge(original, false, lower, Bound::Unbounded)?
+            else {
+                break;
+            };
             let next = OriginalPersistenceFrame::new(original)?;
             let key = next.copy_bytes(window.position())?;
-            after = Some(GraphPosition { key, _owner: next.into_reservation() });
+            after = Some(GraphPosition {
+                key,
+                _owner: next.into_reservation(),
+            });
             let frame = OriginalPersistenceFrame::new(original)?;
             let rewritten;
             let encoded;
@@ -358,8 +593,11 @@ impl ReceivedWorkingWrite {
                 }
             };
             self.with_write(|write| {
-                write.open_table(WORKING_GRAPH_REWRITE).map_err(RedbPersistence::storage_error)?
-                    .insert(key, body).map_err(RedbPersistence::storage_error)?;
+                write
+                    .open_table(WORKING_GRAPH_REWRITE)
+                    .map_err(RedbPersistence::storage_error)?
+                    .insert(key, body)
+                    .map_err(RedbPersistence::storage_error)?;
                 Ok(())
             })?;
         }
@@ -367,27 +605,57 @@ impl ReceivedWorkingWrite {
         self.require_graph_mutable()?;
         self.graph_became_unready();
         self.with_write(|write| {
-            write.delete_table(WORKING_GRAPH_FWD).map_err(RedbPersistence::storage_error)?;
-            write.delete_table(WORKING_GRAPH_REV).map_err(RedbPersistence::storage_error)?;
-            write.open_table(WORKING_GRAPH_FWD).map_err(RedbPersistence::storage_error)?;
-            write.open_table(WORKING_GRAPH_REV).map_err(RedbPersistence::storage_error)?;
+            write
+                .delete_table(WORKING_GRAPH_FWD)
+                .map_err(RedbPersistence::storage_error)?;
+            write
+                .delete_table(WORKING_GRAPH_REV)
+                .map_err(RedbPersistence::storage_error)?;
+            write
+                .open_table(WORKING_GRAPH_FWD)
+                .map_err(RedbPersistence::storage_error)?;
+            write
+                .open_table(WORKING_GRAPH_REV)
+                .map_err(RedbPersistence::storage_error)?;
             Ok(())
         })?;
         after = None;
         loop {
-            let lower = after.as_ref().map_or(Bound::Unbounded, |position| Bound::Excluded(position.key.as_slice()));
-            let Some(window) = self.with_write(|write| next_graph_in_table(original, write,
-                WORKING_GRAPH_REWRITE, false, lower, Bound::Unbounded))? else { break; };
+            let lower = after.as_ref().map_or(Bound::Unbounded, |position| {
+                Bound::Excluded(position.key.as_slice())
+            });
+            let Some(window) = self.with_write(|write| {
+                next_graph_in_table(
+                    original,
+                    write,
+                    WORKING_GRAPH_REWRITE,
+                    false,
+                    lower,
+                    Bound::Unbounded,
+                )
+            })?
+            else {
+                break;
+            };
             let next = OriginalPersistenceFrame::new(original)?;
             let key = next.copy_bytes(window.position())?;
-            after = Some(GraphPosition { key, _owner: next.into_reservation() });
+            after = Some(GraphPosition {
+                key,
+                _owner: next.into_reservation(),
+            });
             let frame = OriginalPersistenceFrame::new(original)?;
             let reverse = original_graph_key(&frame, &window.edge, true)?;
             self.with_write(|write| {
-                write.open_table(WORKING_GRAPH_FWD).map_err(RedbPersistence::storage_error)?
-                    .insert(window.position(), window.encoded()).map_err(RedbPersistence::storage_error)?;
-                write.open_table(WORKING_GRAPH_REV).map_err(RedbPersistence::storage_error)?
-                    .insert(reverse.as_slice(), window.encoded()).map_err(RedbPersistence::storage_error)?;
+                write
+                    .open_table(WORKING_GRAPH_FWD)
+                    .map_err(RedbPersistence::storage_error)?
+                    .insert(window.position(), window.encoded())
+                    .map_err(RedbPersistence::storage_error)?;
+                write
+                    .open_table(WORKING_GRAPH_REV)
+                    .map_err(RedbPersistence::storage_error)?
+                    .insert(reverse.as_slice(), window.encoded())
+                    .map_err(RedbPersistence::storage_error)?;
                 Ok(())
             })?;
         }
@@ -397,9 +665,12 @@ impl ReceivedWorkingWrite {
 }
 
 // Internal, transaction-local bookkeeping. No table is a published graph owner.
-const WORKING_GRAPH_TYPES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_types");
-const WORKING_GRAPH_CREATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_creations");
-const WORKING_GRAPH_DELETIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_deletions");
+const WORKING_GRAPH_TYPES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_types");
+const WORKING_GRAPH_CREATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_creations");
+const WORKING_GRAPH_DELETIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_deletions");
 
 pub(super) struct WorkingGraphState {
     prepared: bool,
@@ -414,14 +685,32 @@ pub(super) struct WorkingGraphState {
 }
 impl WorkingGraphState {
     pub(super) fn new() -> Self {
-        Self { prepared: false, generation: 0, next_occurrence: 0, dirty: false, frozen: false, undo: 0, checkpoints: 0, capturing: false, declarations_owner: None }
+        Self {
+            prepared: false,
+            generation: 0,
+            next_occurrence: 0,
+            dirty: false,
+            frozen: false,
+            undo: 0,
+            checkpoints: 0,
+            capturing: false,
+            declarations_owner: None,
+        }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reset(&mut self) -> Result<()> {
         // Do not reuse an old capture even if newly empty table roots match.
-        let generation = self.generation.checked_add(1)
+        let generation = self
+            .generation
+            .checked_add(1)
             .ok_or_else(|| Error::Other("working graph generation overflow".into()))?;
-        *self = Self { generation, ..Self::new() };
+        *self = Self {
+            generation,
+            ..Self::new()
+        };
         Ok(())
     }
 }
@@ -443,8 +732,12 @@ pub(crate) struct WorkingGraphOccurrence {
     origin: WorkingGraphOrigin,
 }
 impl WorkingGraphOccurrence {
-    pub(crate) fn ordinal(&self) -> u64 { self.ordinal }
-    pub(crate) fn origin(&self) -> WorkingGraphOrigin { self.origin }
+    pub(crate) fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+    pub(crate) fn origin(&self) -> WorkingGraphOrigin {
+        self.origin
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct WorkingGraphCoordinate {
@@ -488,30 +781,66 @@ struct WorkingGraphRecord {
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn prepare_graph_state(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn prepare_graph_state(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<()> {
         self.require_original(original)?;
-        if self.graph_state.lock().prepared { return Ok(()); }
-        for definition in [WORKING_GRAPH_TYPES, WORKING_GRAPH_CREATIONS, WORKING_GRAPH_DELETIONS, WORKING_GRAPH_BODIES, WORKING_GRAPH_PENDING, WORKING_GRAPH_UNDO, WORKING_GRAPH_KEY_MAP, WORKING_GRAPH_INSTALLED, WORKING_GRAPH_EVENTS, WORKING_GRAPH_LAST] {
+        if self.graph_state.lock().prepared {
+            return Ok(());
+        }
+        for definition in [
+            WORKING_GRAPH_TYPES,
+            WORKING_GRAPH_CREATIONS,
+            WORKING_GRAPH_DELETIONS,
+            WORKING_GRAPH_BODIES,
+            WORKING_GRAPH_PENDING,
+            WORKING_GRAPH_UNDO,
+            WORKING_GRAPH_KEY_MAP,
+            WORKING_GRAPH_INSTALLED,
+            WORKING_GRAPH_EVENTS,
+            WORKING_GRAPH_LAST,
+        ] {
             let frame = OriginalPersistenceFrame::new(original)?;
             let name = frame.copy_text(definition.name())?;
             // Track before opening: even an interrupted preparation is discarded.
             self.keep_scratch_name(name, frame.into_reservation())?;
-            self.with_write(|write| write.open_table(definition).map(|_| ()).map_err(RedbPersistence::storage_error))?;
+            self.with_write(|write| {
+                write
+                    .open_table(definition)
+                    .map(|_| ())
+                    .map_err(RedbPersistence::storage_error)
+            })?;
         }
         self.graph_state.lock().prepared = true;
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn require_graph_mutable(&self) -> Result<()> {
         let state = self.graph_state.lock();
         if !state.prepared || state.frozen {
-            return Err(Error::Other("working graph bookkeeping is unavailable for mutation".into()));
+            return Err(Error::Other(
+                "working graph bookkeeping is unavailable for mutation".into(),
+            ));
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn select_graph_type(&self, original: &crate::memory_accounting::OwnedMemoryReservation, kind: &str) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn select_graph_type(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        kind: &str,
+    ) -> Result<()> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
         let frame = OriginalPersistenceFrame::new(original)?;
@@ -520,72 +849,154 @@ impl ReceivedWorkingWrite {
         self.graph_state.lock().dirty = true;
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn graph_type_contains_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation, kind: &str) -> Result<bool> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn graph_type_contains_original(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        kind: &str,
+    ) -> Result<bool> {
         self.require_original(original)?;
         self.with_write(|write| {
-            let table = write.open_table(WORKING_GRAPH_TYPES).map_err(RedbPersistence::storage_error)?;
-            let found = table.get(kind.as_bytes()).map_err(RedbPersistence::storage_error)?.is_some();
+            let table = write
+                .open_table(WORKING_GRAPH_TYPES)
+                .map_err(RedbPersistence::storage_error)?;
+            let found = table
+                .get(kind.as_bytes())
+                .map_err(RedbPersistence::storage_error)?
+                .is_some();
             Ok(found)
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn next_graph_record(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        definition: TableDefinition<&[u8], &[u8]>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<Option<WorkingGraphRecord>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn next_graph_record(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        definition: TableDefinition<&[u8], &[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<Option<WorkingGraphRecord>> {
         self.require_original(original)?;
         let frame = OriginalPersistenceFrame::new(original)?;
         let record = self.with_write(|write| {
-            let table = write.open_table(definition).map_err(RedbPersistence::storage_error)?;
-            let mut range = table.range::<&[u8]>((lower, upper)).map_err(RedbPersistence::storage_error)?;
-            let Some((key, body)) = range.next().transpose().map_err(RedbPersistence::storage_error)? else { return Ok(None); };
-            Ok(Some((frame.copy_bytes(key.value())?, frame.copy_bytes(body.value())?)))
+            let table = write
+                .open_table(definition)
+                .map_err(RedbPersistence::storage_error)?;
+            let mut range = table
+                .range::<&[u8]>((lower, upper))
+                .map_err(RedbPersistence::storage_error)?;
+            let Some((key, body)) = range
+                .next()
+                .transpose()
+                .map_err(RedbPersistence::storage_error)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some((
+                frame.copy_bytes(key.value())?,
+                frame.copy_bytes(body.value())?,
+            )))
         })?;
-        Ok(record.map(|(key, body)| WorkingGraphRecord { key, body, _owner: frame.into_reservation() }))
+        Ok(record.map(|(key, body)| WorkingGraphRecord {
+            key,
+            body,
+            _owner: frame.into_reservation(),
+        }))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn visit_graph_types_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        mut visit: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_graph_types_original(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        mut visit: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
         self.require_original(original)?;
         let mut after = None::<GraphPosition>;
         loop {
-            let lower = after.as_ref().map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-            let Some(record) = self.next_graph_record(original, WORKING_GRAPH_TYPES, lower, Bound::Unbounded)? else { break; };
+            let lower = after
+                .as_ref()
+                .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
+            let Some(record) =
+                self.next_graph_record(original, WORKING_GRAPH_TYPES, lower, Bound::Unbounded)?
+            else {
+                break;
+            };
             let kind = std::str::from_utf8(&record.key).map_err(|_| Error::StoreCorrupted {
-                path: "received working graph selection".into(), reason: "invalid exact type bytes".into() })?;
-            if !record.body.is_empty() { return Err(Error::StoreCorrupted {
-                path: "received working graph selection".into(), reason: "invalid selection marker".into() }); }
+                path: "received working graph selection".into(),
+                reason: "invalid exact type bytes".into(),
+            })?;
+            if !record.body.is_empty() {
+                return Err(Error::StoreCorrupted {
+                    path: "received working graph selection".into(),
+                    reason: "invalid selection marker".into(),
+                });
+            }
             visit(kind)?; // All native guards closed; only this name is resident.
             let next = OriginalPersistenceFrame::new(original)?;
-            after = Some(GraphPosition { key: next.copy_bytes(&record.key)?, _owner: next.into_reservation() });
+            after = Some(GraphPosition {
+                key: next.copy_bytes(&record.key)?,
+                _owner: next.into_reservation(),
+            });
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn allocate_graph_occurrence(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        origin: WorkingGraphOrigin) -> Result<WorkingGraphOccurrence> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn allocate_graph_occurrence(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        origin: WorkingGraphOrigin,
+    ) -> Result<WorkingGraphOccurrence> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
         let mut state = self.graph_state.lock();
         let ordinal = state.next_occurrence;
-        state.next_occurrence = ordinal.checked_add(1).ok_or_else(|| Error::Other("working graph occurrence overflow".into()))?;
-        Ok(WorkingGraphOccurrence { generation: state.generation,
+        state.next_occurrence = ordinal
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("working graph occurrence overflow".into()))?;
+        Ok(WorkingGraphOccurrence {
+            generation: state.generation,
             write_identity: self.control_identity,
-            loan_identity: super::received_working_source::graph_witness_loan(self, original)?, ordinal, origin })
+            loan_identity: super::received_working_source::graph_witness_loan(self, original)?,
+            ordinal,
+            origin,
+        })
     }
     /// Creation uses its exact forward physical key. Deletion uses the affected
     /// predecessor's exact key, never the newest edge with the same identity.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn record_graph_coordinate(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        predecessor_or_creation: &AdjEntry, deletion: bool, coordinate: WorkingGraphCoordinate) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn record_graph_coordinate(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        predecessor_or_creation: &AdjEntry,
+        deletion: bool,
+        coordinate: WorkingGraphCoordinate,
+    ) -> Result<()> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
         {
             let state = self.graph_state.lock();
             if coordinate.occurrence.generation != state.generation
                 || coordinate.occurrence.write_identity != self.control_identity
-                || coordinate.occurrence.loan_identity != super::received_working_source::graph_witness_loan(self, original)?
-                || coordinate.occurrence.ordinal >= state.next_occurrence {
-                return Err(Error::Other("working graph coordinate has no current occurrence".into()));
+                || coordinate.occurrence.loan_identity
+                    != super::received_working_source::graph_witness_loan(self, original)?
+                || coordinate.occurrence.ordinal >= state.next_occurrence
+            {
+                return Err(Error::Other(
+                    "working graph coordinate has no current occurrence".into(),
+                ));
             }
         }
         self.select_graph_type(original, &predecessor_or_creation.edge_type)?;
@@ -593,13 +1004,22 @@ impl ReceivedWorkingWrite {
         let key = original_graph_key(&frame, predecessor_or_creation, false)?;
         let encoded = frame.encode(&coordinate.stored())?;
         self.with_write(|write| {
-            let table = write.open_table(if deletion { WORKING_GRAPH_DELETIONS } else { WORKING_GRAPH_CREATIONS })
+            let table = write
+                .open_table(if deletion {
+                    WORKING_GRAPH_DELETIONS
+                } else {
+                    WORKING_GRAPH_CREATIONS
+                })
                 .map_err(RedbPersistence::storage_error)?;
             {
-                let existing = table.get(key.as_slice()).map_err(RedbPersistence::storage_error)?;
+                let existing = table
+                    .get(key.as_slice())
+                    .map_err(RedbPersistence::storage_error)?;
                 if let Some(existing) = existing {
                     if existing.value() != encoded.as_slice() {
-                        return Err(Error::Other("conflicting coordinates for one physical graph version".into()));
+                        return Err(Error::Other(
+                            "conflicting coordinates for one physical graph version".into(),
+                        ));
                     }
                     return Ok(());
                 }
@@ -608,66 +1028,147 @@ impl ReceivedWorkingWrite {
         })?;
         self.graph_record_put(original, if deletion { 2 } else { 1 }, &key, Some(&encoded))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn graph_coordinate_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        edge: &AdjEntry, deletion: bool) -> Result<Option<WorkingGraphCoordinate>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn graph_coordinate_original(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        edge: &AdjEntry,
+        deletion: bool,
+    ) -> Result<Option<WorkingGraphCoordinate>> {
         self.require_original(original)?;
         let frame = OriginalPersistenceFrame::new(original)?;
         let key = original_graph_key(&frame, edge, false)?;
-        let record = self.next_graph_record(original, if deletion { WORKING_GRAPH_DELETIONS } else { WORKING_GRAPH_CREATIONS },
-            Bound::Included(key.as_slice()), Bound::Included(key.as_slice()))?;
-        record.map(|record| self.decode_graph_coordinate(original, &frame, &record.body)).transpose()
+        let record = self.next_graph_record(
+            original,
+            if deletion {
+                WORKING_GRAPH_DELETIONS
+            } else {
+                WORKING_GRAPH_CREATIONS
+            },
+            Bound::Included(key.as_slice()),
+            Bound::Included(key.as_slice()),
+        )?;
+        record
+            .map(|record| self.decode_graph_coordinate(original, &frame, &record.body))
+            .transpose()
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn decode_graph_coordinate(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        frame: &OriginalPersistenceFrame<'_>, body: &[u8]) -> Result<WorkingGraphCoordinate> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn decode_graph_coordinate(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        frame: &OriginalPersistenceFrame<'_>,
+        body: &[u8],
+    ) -> Result<WorkingGraphCoordinate> {
         self.require_original(original)?;
         let stored: StoredGraphCoordinate = frame.decode(body)?;
         let state = self.graph_state.lock();
-        if !state.prepared || stored.write_identity != self.control_identity
-            || stored.generation != state.generation || stored.ordinal >= state.next_occurrence {
-            return Err(Error::StoreCorrupted { path: "received working graph coordinates".into(),
-                reason: "coordinate belongs to another occurrence scope".into() });
+        if !state.prepared
+            || stored.write_identity != self.control_identity
+            || stored.generation != state.generation
+            || stored.ordinal >= state.next_occurrence
+        {
+            return Err(Error::StoreCorrupted {
+                path: "received working graph coordinates".into(),
+                reason: "coordinate belongs to another occurrence scope".into(),
+            });
         }
         Ok(WorkingGraphCoordinate {
-            occurrence: WorkingGraphOccurrence { write_identity: self.control_identity,
+            occurrence: WorkingGraphOccurrence {
+                write_identity: self.control_identity,
                 loan_identity: super::received_working_source::graph_witness_loan(self, original)?,
-                generation: stored.generation, ordinal: stored.ordinal, origin: stored.origin },
+                generation: stored.generation,
+                ordinal: stored.ordinal,
+                origin: stored.origin,
+            },
             destination: stored.destination,
         })
     }
     /// A root witness for subsequent current-prefix validation and terminal
     /// selection. It does not activate either consumer by itself.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn capture_graph(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<WorkingGraphCapture> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn capture_graph(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<WorkingGraphCapture> {
         self.require_original(original)?;
         if !self.graph_prepared()? || !self.graph_state.lock().prepared {
-            return Err(Error::Other("working graph capture has no completed image".into()));
+            return Err(Error::Other(
+                "working graph capture has no completed image".into(),
+            ));
         }
         let roots = self.with_write(|write| {
             let mut roots = [None; 11];
-            for (slot, definition) in roots.iter_mut().zip([WORKING_GRAPH_TYPES, WORKING_GRAPH_CREATIONS,
-                WORKING_GRAPH_DELETIONS, WORKING_GRAPH_FWD, WORKING_GRAPH_REV, WORKING_GRAPH_BODIES, WORKING_GRAPH_PENDING, WORKING_GRAPH_KEY_MAP, WORKING_GRAPH_INSTALLED, WORKING_GRAPH_EVENTS, WORKING_GRAPH_LAST]) {
-                *slot = write.normal_table_root(definition.name()).map_err(RedbPersistence::storage_error)?;
-                if slot.is_none() { return Err(Error::Other("working graph capture lost a scratch table".into())); }
+            for (slot, definition) in roots.iter_mut().zip([
+                WORKING_GRAPH_TYPES,
+                WORKING_GRAPH_CREATIONS,
+                WORKING_GRAPH_DELETIONS,
+                WORKING_GRAPH_FWD,
+                WORKING_GRAPH_REV,
+                WORKING_GRAPH_BODIES,
+                WORKING_GRAPH_PENDING,
+                WORKING_GRAPH_KEY_MAP,
+                WORKING_GRAPH_INSTALLED,
+                WORKING_GRAPH_EVENTS,
+                WORKING_GRAPH_LAST,
+            ]) {
+                *slot = write
+                    .normal_table_root(definition.name())
+                    .map_err(RedbPersistence::storage_error)?;
+                if slot.is_none() {
+                    return Err(Error::Other(
+                        "working graph capture lost a scratch table".into(),
+                    ));
+                }
             }
             Ok(roots)
         })?;
         let state = self.graph_state.lock();
-        Ok(WorkingGraphCapture { original_address: original as *const _ as usize,
+        Ok(WorkingGraphCapture {
+            original_address: original as *const _ as usize,
             write_identity: self.control_identity,
-            loan_identity: super::received_working_source::graph_witness_loan(self, original)?, roots, generation: state.generation, next_occurrence: state.next_occurrence, dirty: state.dirty })
+            loan_identity: super::received_working_source::graph_witness_loan(self, original)?,
+            roots,
+            generation: state.generation,
+            next_occurrence: state.next_occurrence,
+            dirty: state.dirty,
+        })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn check_graph_capture(&self, original: &crate::memory_accounting::OwnedMemoryReservation, captured: &WorkingGraphCapture) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn check_graph_capture(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        captured: &WorkingGraphCapture,
+    ) -> Result<()> {
         if self.capture_graph(original)? != *captured {
             return Err(Error::Other("working graph changed after capture".into()));
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn freeze_graph_selection(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<WorkingGraphCapture> {
-        if self.graph_state.lock().checkpoints != 0 { return Err(Error::Other("graph freeze retained a statement checkpoint".into())); }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn freeze_graph_selection(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<WorkingGraphCapture> {
+        if self.graph_state.lock().checkpoints != 0 {
+            return Err(Error::Other(
+                "graph freeze retained a statement checkpoint".into(),
+            ));
+        }
         let capture = self.capture_graph(original)?;
         self.graph_state.lock().frozen = true;
         Ok(capture)
@@ -677,20 +1178,31 @@ impl ReceivedWorkingWrite {
 impl ReceivedWorkingWrite {
     /// Terminal controls retain the write and authentic Original, not a loan
     /// token whose synchronous callback scope has already ended.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn selected_graph_type_original(&self,
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn selected_graph_type_original(
+        &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
-        selection: &WorkingGraphCapture, kind: &str) -> Result<bool> {
+        selection: &WorkingGraphCapture,
+        kind: &str,
+    ) -> Result<bool> {
         self.check_graph_capture(original, selection)?;
         let selected = self.graph_type_contains_original(original, kind)?;
         self.check_graph_capture(original, selection)?;
         Ok(selected)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn visit_selected_graph_original(&self,
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_selected_graph_original(
+        &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
         selection: &WorkingGraphCapture,
-        mut visit: impl FnMut(&AdjEntry, &[u8], &[u8]) -> Result<()>) -> Result<()> {
+        mut visit: impl FnMut(&AdjEntry, &[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
         self.check_graph_capture(original, selection)?;
         self.visit_graph_original(original, None, |edge, key, encoded| {
             if self.selected_graph_type_original(original, selection, &edge.edge_type)? {
@@ -700,31 +1212,56 @@ impl ReceivedWorkingWrite {
         })?;
         self.check_graph_capture(original, selection)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn graph_selection_dirty(&self,
-        original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<bool> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn graph_selection_dirty(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<bool> {
         self.require_original(original)?;
         Ok(self.graph_state.lock().dirty)
     }
 }
 
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn visit_graph_coordinates_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        deletion: bool, mut visit: impl FnMut(&[u8], WorkingGraphCoordinate) -> Result<()>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_graph_coordinates_original(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        deletion: bool,
+        mut visit: impl FnMut(&[u8], WorkingGraphCoordinate) -> Result<()>,
+    ) -> Result<()> {
         self.require_original(original)?;
         let captured = self.capture_graph(original)?;
-        let definition = if deletion { WORKING_GRAPH_DELETIONS } else { WORKING_GRAPH_CREATIONS };
+        let definition = if deletion {
+            WORKING_GRAPH_DELETIONS
+        } else {
+            WORKING_GRAPH_CREATIONS
+        };
         let mut after = None::<GraphPosition>;
         loop {
-            let lower = after.as_ref().map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-            let Some(record) = self.next_graph_record(original, definition, lower, Bound::Unbounded)? else { break; };
+            let lower = after
+                .as_ref()
+                .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
+            let Some(record) =
+                self.next_graph_record(original, definition, lower, Bound::Unbounded)?
+            else {
+                break;
+            };
             let frame = OriginalPersistenceFrame::new(original)?;
             let coordinate = self.decode_graph_coordinate(original, &frame, &record.body)?;
             visit(&record.key, coordinate)?;
             self.check_graph_capture(original, &captured)?;
             let next = OriginalPersistenceFrame::new(original)?;
-            after = Some(GraphPosition { key: next.copy_bytes(&record.key)?, _owner: next.into_reservation() });
+            after = Some(GraphPosition {
+                key: next.copy_bytes(&record.key)?,
+                _owner: next.into_reservation(),
+            });
         }
         Ok(())
     }
@@ -733,9 +1270,12 @@ impl ReceivedWorkingWrite {
 // Bodies of accepted occurrences live in native scratch, before the pending
 // logical-identity overlay can replace or delete them. They are never a second
 // resident history image.
-const WORKING_GRAPH_BODIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_bodies");
-const WORKING_GRAPH_PENDING: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_pending");
-const WORKING_GRAPH_UNDO: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_undo");
+const WORKING_GRAPH_BODIES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_bodies");
+const WORKING_GRAPH_PENDING: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_pending");
+const WORKING_GRAPH_UNDO: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_undo");
 #[derive(Clone, Copy)]
 pub(crate) struct WorkingGraphCheckpoint {
     generation: u64,
@@ -744,28 +1284,50 @@ pub(crate) struct WorkingGraphCheckpoint {
     dirty: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
-struct GraphUndo { table: u8, key: Vec<u8>, body: Option<Vec<u8>> }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+struct GraphUndo {
+    table: u8,
+    key: Vec<u8>,
+    body: Option<Vec<u8>>,
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bookkeeping_table(index: u8) -> Result<TableDefinition<'static, &'static [u8], &'static [u8]>> {
     match index {
-        0 => Ok(WORKING_GRAPH_TYPES), 1 => Ok(WORKING_GRAPH_CREATIONS),
-        2 => Ok(WORKING_GRAPH_DELETIONS), 3 => Ok(WORKING_GRAPH_BODIES),
-        4 => Ok(WORKING_GRAPH_PENDING), 5 => Ok(WORKING_GRAPH_LAST),
+        0 => Ok(WORKING_GRAPH_TYPES),
+        1 => Ok(WORKING_GRAPH_CREATIONS),
+        2 => Ok(WORKING_GRAPH_DELETIONS),
+        3 => Ok(WORKING_GRAPH_BODIES),
+        4 => Ok(WORKING_GRAPH_PENDING),
+        5 => Ok(WORKING_GRAPH_LAST),
         _ => Err(Error::Other("invalid working graph undo table".into())),
     }
 }
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn graph_record_put(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        index: u8, key: &[u8], body: Option<&[u8]>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn graph_record_put(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        index: u8,
+        key: &[u8],
+        body: Option<&[u8]>,
+    ) -> Result<()> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
         let definition = bookkeeping_table(index)?;
         let undo = {
             let mut state = self.graph_state.lock();
-            if state.checkpoints == 0 { None } else {
+            if state.checkpoints == 0 {
+                None
+            } else {
                 let ordinal = state.undo;
-                state.undo = ordinal.checked_add(1).ok_or_else(|| Error::Other("working graph undo overflow".into()))?;
+                state.undo = ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Other("working graph undo overflow".into()))?;
                 Some(ordinal)
             }
         };
@@ -773,62 +1335,125 @@ impl ReceivedWorkingWrite {
         if let Some(ordinal) = undo {
             let key = frame.copy_bytes(key)?;
             let before = self.with_write(|write| {
-                let table = write.open_table(definition).map_err(RedbPersistence::storage_error)?;
-                table.get(key.as_slice()).map_err(RedbPersistence::storage_error)?
-                    .map(|v| frame.copy_bytes(v.value())).transpose()
+                let table = write
+                    .open_table(definition)
+                    .map_err(RedbPersistence::storage_error)?;
+                table
+                    .get(key.as_slice())
+                    .map_err(RedbPersistence::storage_error)?
+                    .map(|v| frame.copy_bytes(v.value()))
+                    .transpose()
             })?;
-            let before = GraphUndo { table: index, key, body: before };
+            let before = GraphUndo {
+                table: index,
+                key,
+                body: before,
+            };
             let encoded = frame.encode(&before)?;
             self.with_write(|write| {
-                write.open_table(WORKING_GRAPH_UNDO).map_err(RedbPersistence::storage_error)?
-                    .insert(ordinal.to_be_bytes().as_slice(), encoded.as_slice()).map_err(RedbPersistence::storage_error)?;
+                write
+                    .open_table(WORKING_GRAPH_UNDO)
+                    .map_err(RedbPersistence::storage_error)?
+                    .insert(ordinal.to_be_bytes().as_slice(), encoded.as_slice())
+                    .map_err(RedbPersistence::storage_error)?;
                 Ok(())
             })?;
         }
         self.with_write(|write| {
-            let mut table = write.open_table(definition).map_err(RedbPersistence::storage_error)?;
-            if let Some(body) = body { table.insert(key, body).map_err(RedbPersistence::storage_error)?; }
-            else { table.remove(key).map_err(RedbPersistence::storage_error)?; }
+            let mut table = write
+                .open_table(definition)
+                .map_err(RedbPersistence::storage_error)?;
+            if let Some(body) = body {
+                table
+                    .insert(key, body)
+                    .map_err(RedbPersistence::storage_error)?;
+            } else {
+                table.remove(key).map_err(RedbPersistence::storage_error)?;
+            }
             Ok(())
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn checkpoint_graph(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<WorkingGraphCheckpoint> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn checkpoint_graph(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<WorkingGraphCheckpoint> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
         let mut state = self.graph_state.lock();
-        state.checkpoints = state.checkpoints.checked_add(1).ok_or_else(|| Error::Other("working graph checkpoint overflow".into()))?;
-        Ok(WorkingGraphCheckpoint { generation: state.generation, undo: state.undo,
-            occurrence: state.next_occurrence, dirty: state.dirty })
+        state.checkpoints = state
+            .checkpoints
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("working graph checkpoint overflow".into()))?;
+        Ok(WorkingGraphCheckpoint {
+            generation: state.generation,
+            undo: state.undo,
+            occurrence: state.next_occurrence,
+            dirty: state.dirty,
+        })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn settle_graph_checkpoint(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        checkpoint: WorkingGraphCheckpoint, restore: bool) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn settle_graph_checkpoint(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        checkpoint: WorkingGraphCheckpoint,
+        restore: bool,
+    ) -> Result<()> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
         {
             let state = self.graph_state.lock();
-            if state.generation != checkpoint.generation || state.checkpoints == 0 || state.undo < checkpoint.undo {
+            if state.generation != checkpoint.generation
+                || state.checkpoints == 0
+                || state.undo < checkpoint.undo
+            {
                 return Err(Error::Other("working graph checkpoint is stale".into()));
             }
         }
         if restore {
             loop {
                 let ordinal = self.graph_state.lock().undo;
-                if ordinal == checkpoint.undo { break; }
+                if ordinal == checkpoint.undo {
+                    break;
+                }
                 let ordinal = ordinal - 1;
                 let frame = OriginalPersistenceFrame::new(original)?;
-                let record = self.next_graph_record(original, WORKING_GRAPH_UNDO,
-                    Bound::Included(ordinal.to_be_bytes().as_slice()), Bound::Included(ordinal.to_be_bytes().as_slice()))?
-                    .ok_or_else(|| Error::Other("working graph undo lost its original body".into()))?;
+                let record = self
+                    .next_graph_record(
+                        original,
+                        WORKING_GRAPH_UNDO,
+                        Bound::Included(ordinal.to_be_bytes().as_slice()),
+                        Bound::Included(ordinal.to_be_bytes().as_slice()),
+                    )?
+                    .ok_or_else(|| {
+                        Error::Other("working graph undo lost its original body".into())
+                    })?;
                 let undo: GraphUndo = frame.decode(&record.body)?;
                 self.with_write(|write| {
-                    let mut table = write.open_table(bookkeeping_table(undo.table)?).map_err(RedbPersistence::storage_error)?;
-                    if let Some(body) = &undo.body { table.insert(undo.key.as_slice(), body.as_slice()).map_err(RedbPersistence::storage_error)?; }
-                    else { table.remove(undo.key.as_slice()).map_err(RedbPersistence::storage_error)?; }
+                    let mut table = write
+                        .open_table(bookkeeping_table(undo.table)?)
+                        .map_err(RedbPersistence::storage_error)?;
+                    if let Some(body) = &undo.body {
+                        table
+                            .insert(undo.key.as_slice(), body.as_slice())
+                            .map_err(RedbPersistence::storage_error)?;
+                    } else {
+                        table
+                            .remove(undo.key.as_slice())
+                            .map_err(RedbPersistence::storage_error)?;
+                    }
                     drop(table);
-                    write.open_table(WORKING_GRAPH_UNDO).map_err(RedbPersistence::storage_error)?
-                        .remove(ordinal.to_be_bytes().as_slice()).map_err(RedbPersistence::storage_error)?;
+                    write
+                        .open_table(WORKING_GRAPH_UNDO)
+                        .map_err(RedbPersistence::storage_error)?
+                        .remove(ordinal.to_be_bytes().as_slice())
+                        .map_err(RedbPersistence::storage_error)?;
                     Ok(())
                 })?;
                 self.graph_state.lock().undo = ordinal;
@@ -836,44 +1461,99 @@ impl ReceivedWorkingWrite {
         }
         let mut state = self.graph_state.lock();
         state.checkpoints -= 1;
-        if restore { state.next_occurrence = checkpoint.occurrence; state.dirty = checkpoint.dirty; }
+        if restore {
+            state.next_occurrence = checkpoint.occurrence;
+            state.dirty = checkpoint.dirty;
+        }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn pending_graph_key(frame: &OriginalPersistenceFrame<'_>, source: NodeId, kind: &str, target: NodeId) -> Result<Vec<u8>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn pending_graph_key(
+        frame: &OriginalPersistenceFrame<'_>,
+        source: NodeId,
+        kind: &str,
+        target: NodeId,
+    ) -> Result<Vec<u8>> {
         frame.encode(&(source, kind, target))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn pending_graph_coordinate(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        edge: &AdjEntry) -> Result<Option<WorkingGraphCoordinate>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn pending_graph_coordinate(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        edge: &AdjEntry,
+    ) -> Result<Option<WorkingGraphCoordinate>> {
         let frame = OriginalPersistenceFrame::new(original)?;
         let key = Self::pending_graph_key(&frame, edge.source, &edge.edge_type, edge.target)?;
-        let Some(pending) = self.next_graph_record(original, WORKING_GRAPH_PENDING,
-            Bound::Included(key.as_slice()), Bound::Included(key.as_slice()))? else { return Ok(None); };
-        let Some(body) = self.next_graph_record(original, WORKING_GRAPH_BODIES,
-            Bound::Included(pending.body.as_slice()), Bound::Included(pending.body.as_slice()))? else {
-                return Err(Error::Other("pending graph occurrence lost its body".into()));
-            };
+        let Some(pending) = self.next_graph_record(
+            original,
+            WORKING_GRAPH_PENDING,
+            Bound::Included(key.as_slice()),
+            Bound::Included(key.as_slice()),
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(body) = self.next_graph_record(
+            original,
+            WORKING_GRAPH_BODIES,
+            Bound::Included(pending.body.as_slice()),
+            Bound::Included(pending.body.as_slice()),
+        )?
+        else {
+            return Err(Error::Other(
+                "pending graph occurrence lost its body".into(),
+            ));
+        };
         let body: AdjEntry = frame.decode(&body.body)?;
         self.graph_coordinate_original(original, &body, false)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn retain_graph_mutation(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        origin: WorkingGraphOrigin, source: NodeId, kind: &str, target: NodeId,
-        after: Option<&AdjEntry>, deleted_tx: TxId) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn retain_graph_mutation(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        origin: WorkingGraphOrigin,
+        source: NodeId,
+        kind: &str,
+        target: NodeId,
+        after: Option<&AdjEntry>,
+        deleted_tx: TxId,
+    ) -> Result<()> {
         self.require_original(original)?;
         let occurrence = self.allocate_graph_occurrence(original, origin)?;
-        let coordinate = WorkingGraphCoordinate { occurrence, destination: None };
+        let coordinate = WorkingGraphCoordinate {
+            occurrence,
+            destination: None,
+        };
         self.select_graph_type(original, kind)?;
         let frame = OriginalPersistenceFrame::new(original)?;
         let identity = Self::pending_graph_key(&frame, source, kind, target)?;
         let encoded_coordinate = frame.encode(&coordinate.stored())?;
         self.graph_record_put(original, 5, &identity, Some(&encoded_coordinate))?;
-        if let Some(pending) = self.next_graph_record(original, WORKING_GRAPH_PENDING,
-            Bound::Included(identity.as_slice()), Bound::Included(identity.as_slice()))? {
-            let body = self.next_graph_record(original, WORKING_GRAPH_BODIES,
-                Bound::Included(pending.body.as_slice()), Bound::Included(pending.body.as_slice()))?
-                .ok_or_else(|| Error::Other("graph predecessor occurrence body is missing".into()))?;
+        if let Some(pending) = self.next_graph_record(
+            original,
+            WORKING_GRAPH_PENDING,
+            Bound::Included(identity.as_slice()),
+            Bound::Included(identity.as_slice()),
+        )? {
+            let body = self
+                .next_graph_record(
+                    original,
+                    WORKING_GRAPH_BODIES,
+                    Bound::Included(pending.body.as_slice()),
+                    Bound::Included(pending.body.as_slice()),
+                )?
+                .ok_or_else(|| {
+                    Error::Other("graph predecessor occurrence body is missing".into())
+                })?;
             let mut edge: AdjEntry = frame.decode(&body.body)?;
             self.record_graph_coordinate(original, &edge, true, coordinate)?;
             edge.deleted_tx = Some(deleted_tx);
@@ -883,21 +1563,47 @@ impl ReceivedWorkingWrite {
         } else {
             // Select exact physical predecessors; a shared logical identity is
             // never used later to guess which retained lifetime was deleted.
-            let length = kind.len().checked_add(33).ok_or_else(|| Error::Other("graph predecessor prefix overflow".into()))?;
-            frame.reserve(length.checked_mul(2).ok_or_else(|| Error::Other("graph predecessor prefix overflow".into()))?)?;
+            let length = kind
+                .len()
+                .checked_add(33)
+                .ok_or_else(|| Error::Other("graph predecessor prefix overflow".into()))?;
+            frame.reserve(
+                length
+                    .checked_mul(2)
+                    .ok_or_else(|| Error::Other("graph predecessor prefix overflow".into()))?,
+            )?;
             let mut prefix = Vec::with_capacity(length);
-            prefix.extend_from_slice(source.as_bytes()); prefix.extend_from_slice(target.as_bytes());
-            prefix.extend_from_slice(kind.as_bytes()); prefix.push(0);
+            prefix.extend_from_slice(source.as_bytes());
+            prefix.extend_from_slice(target.as_bytes());
+            prefix.extend_from_slice(kind.as_bytes());
+            prefix.push(0);
             let upper = writer_source::prefix_end(&prefix);
             let mut position = None::<GraphPosition>;
             loop {
-                let lower = position.as_ref().map_or(Bound::Included(prefix.as_slice()), |p| Bound::Excluded(p.key.as_slice()));
-                let upper = upper.as_ref().map_or(Bound::Unbounded, |p| Bound::Excluded(p.as_slice()));
-                let Some(edge) = self.next_graph_edge(original, false, lower, upper)? else { break; };
+                let lower = position
+                    .as_ref()
+                    .map_or(Bound::Included(prefix.as_slice()), |p| {
+                        Bound::Excluded(p.key.as_slice())
+                    });
+                let upper = upper
+                    .as_ref()
+                    .map_or(Bound::Unbounded, |p| Bound::Excluded(p.as_slice()));
+                let Some(edge) = self.next_graph_edge(original, false, lower, upper)? else {
+                    break;
+                };
                 let next = OriginalPersistenceFrame::new(original)?;
-                position = Some(GraphPosition { key: next.copy_bytes(edge.position())?, _owner: next.into_reservation() });
-                if edge.edge.source == source && edge.edge.target == target && edge.edge.edge_type == kind
-                    && edge.edge.deleted_tx.is_none() && self.graph_coordinate_original(original, &edge.edge, true)?.is_none() {
+                position = Some(GraphPosition {
+                    key: next.copy_bytes(edge.position())?,
+                    _owner: next.into_reservation(),
+                });
+                if edge.edge.source == source
+                    && edge.edge.target == target
+                    && edge.edge.edge_type == kind
+                    && edge.edge.deleted_tx.is_none()
+                    && self
+                        .graph_coordinate_original(original, &edge.edge, true)?
+                        .is_none()
+                {
                     self.record_graph_coordinate(original, &edge.edge, true, coordinate)?;
                 }
             }
@@ -907,7 +1613,10 @@ impl ReceivedWorkingWrite {
             let mut edge: AdjEntry = frame.decode(&encoded)?;
             // Private-only coordinates are confined to scratch until restamp.
             edge.created_tx = TxId(u64::MAX);
-            edge.lsn = Lsn(occurrence.ordinal.checked_add(1).ok_or_else(|| Error::Other("graph occurrence overflow".into()))?);
+            edge.lsn = Lsn(occurrence
+                .ordinal
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("graph occurrence overflow".into()))?);
             edge.deleted_tx = None;
             let key = original_graph_key(&frame, &edge, false)?;
             self.record_graph_coordinate(original, &edge, false, coordinate)?;
@@ -917,9 +1626,16 @@ impl ReceivedWorkingWrite {
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn restamp_graph_occurrences(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        receiver: TxId, mut position: impl FnMut(WorkingGraphOrigin) -> Result<Lsn>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn restamp_graph_occurrences(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        receiver: TxId,
+        mut position: impl FnMut(WorkingGraphOrigin) -> Result<Lsn>,
+    ) -> Result<()> {
         self.rewrite_graph(original, |edge| {
             if let Some(mut deletion) = self.graph_coordinate_original(original, edge, true)? {
                 let frame = OriginalPersistenceFrame::new(original)?;
@@ -929,16 +1645,27 @@ impl ReceivedWorkingWrite {
                 self.graph_record_put(original, 2, &key, Some(&encoded))?;
                 edge.deleted_tx = Some(receiver);
                 Ok(GraphRewrite::Replace)
-            } else { Ok(GraphRewrite::Keep) }
+            } else {
+                Ok(GraphRewrite::Keep)
+            }
         })?;
         let mut after = None::<GraphPosition>;
         loop {
-            let lower = after.as_ref().map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-            let Some(record) = self.next_graph_record(original, WORKING_GRAPH_BODIES, lower, Bound::Unbounded)? else { break; };
+            let lower = after
+                .as_ref()
+                .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
+            let Some(record) =
+                self.next_graph_record(original, WORKING_GRAPH_BODIES, lower, Bound::Unbounded)?
+            else {
+                break;
+            };
             let frame = OriginalPersistenceFrame::new(original)?;
             let mut edge: AdjEntry = frame.decode(&record.body)?;
-            let mut creation = self.graph_coordinate_original(original, &edge, false)?
-                .ok_or_else(|| Error::Other("graph body has no exact creation occurrence".into()))?;
+            let mut creation = self
+                .graph_coordinate_original(original, &edge, false)?
+                .ok_or_else(|| {
+                    Error::Other("graph body has no exact creation occurrence".into())
+                })?;
             let mut deletion = self.graph_coordinate_original(original, &edge, true)?;
             edge.created_tx = receiver;
             edge.lsn = position(creation.occurrence.origin)?;
@@ -952,28 +1679,55 @@ impl ReceivedWorkingWrite {
             }
             edge.deleted_tx = deletion.map(|_| receiver);
             let key = original_graph_key(&frame, &edge, false)?;
-            let installed = self.next_graph_record(original, WORKING_GRAPH_INSTALLED,
-                Bound::Included(key.as_slice()), Bound::Included(key.as_slice()))?;
-            if installed.is_none() && self.next_graph_edge(original, false,
-                Bound::Included(key.as_slice()), Bound::Included(key.as_slice()))?.is_some() {
-                return Err(Error::Other("graph occurrence collides with a committed physical version".into()));
+            let installed = self.next_graph_record(
+                original,
+                WORKING_GRAPH_INSTALLED,
+                Bound::Included(key.as_slice()),
+                Bound::Included(key.as_slice()),
+            )?;
+            if installed.is_none()
+                && self
+                    .next_graph_edge(
+                        original,
+                        false,
+                        Bound::Included(key.as_slice()),
+                        Bound::Included(key.as_slice()),
+                    )?
+                    .is_some()
+            {
+                return Err(Error::Other(
+                    "graph occurrence collides with a committed physical version".into(),
+                ));
             }
             if let Some(installed) = installed {
                 let prior: u64 = frame.decode(&installed.body)?;
-                if prior >= creation.occurrence.ordinal { return Err(Error::Other("graph occurrence destination order reversed".into())); }
+                if prior >= creation.occurrence.ordinal {
+                    return Err(Error::Other(
+                        "graph occurrence destination order reversed".into(),
+                    ));
+                }
             }
             // Same source position and identity is one authored occurrence;
             // helper mutations within it coalesce in accepted operation order.
             self.put_working_graph_edge(original, &edge)?;
             self.with_write(|write| {
-                write.open_table(WORKING_GRAPH_KEY_MAP).map_err(RedbPersistence::storage_error)?
-                    .insert(record.key.as_slice(), key.as_slice()).map_err(RedbPersistence::storage_error)?;
+                write
+                    .open_table(WORKING_GRAPH_KEY_MAP)
+                    .map_err(RedbPersistence::storage_error)?
+                    .insert(record.key.as_slice(), key.as_slice())
+                    .map_err(RedbPersistence::storage_error)?;
                 let ordinal = frame.encode(&creation.occurrence.ordinal)?;
-                write.open_table(WORKING_GRAPH_INSTALLED).map_err(RedbPersistence::storage_error)?
-                    .insert(key.as_slice(), ordinal.as_slice()).map_err(RedbPersistence::storage_error)?;
+                write
+                    .open_table(WORKING_GRAPH_INSTALLED)
+                    .map_err(RedbPersistence::storage_error)?
+                    .insert(key.as_slice(), ordinal.as_slice())
+                    .map_err(RedbPersistence::storage_error)?;
                 Ok(())
             })?;
-            after = Some(GraphPosition { key: frame.copy_bytes(&record.key)?, _owner: frame.into_reservation() });
+            after = Some(GraphPosition {
+                key: frame.copy_bytes(&record.key)?,
+                _owner: frame.into_reservation(),
+            });
         }
         self.prepare_graph_events(original, receiver)?;
         Ok(())
@@ -981,151 +1735,311 @@ impl ReceivedWorkingWrite {
 }
 
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn begin_graph_capture(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn begin_graph_capture(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<()> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
         self.graph_state.lock().capturing = true;
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn graph_capturing(&self, original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<bool> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn graph_capturing(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+    ) -> Result<bool> {
         self.require_original(original)?;
         Ok(self.graph_state.lock().capturing)
     }
 }
 
-const WORKING_GRAPH_KEY_MAP: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_key_map");
-const WORKING_GRAPH_INSTALLED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_installed");
-const WORKING_GRAPH_EVENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_events");
+const WORKING_GRAPH_KEY_MAP: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_key_map");
+const WORKING_GRAPH_INSTALLED: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_installed");
+const WORKING_GRAPH_EVENTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_events");
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WorkingGraphEvent {
     entry: ChangeLogEntry,
     predecessor: Option<Vec<u8>>,
 }
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn retire_graph_occurrences(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        source: NodeId, kind: &str, target: NodeId) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn retire_graph_occurrences(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        source: NodeId,
+        kind: &str,
+        target: NodeId,
+    ) -> Result<()> {
         self.select_graph_type(original, kind)?;
         let mut after = None::<GraphPosition>;
         loop {
-            let lower = after.as_ref().map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-            let Some(record) = self.next_graph_record(original, WORKING_GRAPH_BODIES, lower, Bound::Unbounded)? else { break; };
+            let lower = after
+                .as_ref()
+                .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
+            let Some(record) =
+                self.next_graph_record(original, WORKING_GRAPH_BODIES, lower, Bound::Unbounded)?
+            else {
+                break;
+            };
             let frame = OriginalPersistenceFrame::new(original)?;
             let edge: AdjEntry = frame.decode(&record.body)?;
             if edge.source == source && edge.target == target && edge.edge_type == kind {
-                for index in [1, 2, 3] { self.graph_record_put(original, index, &record.key, None)?; }
+                for index in [1, 2, 3] {
+                    self.graph_record_put(original, index, &record.key, None)?;
+                }
             }
-            after = Some(GraphPosition { key: frame.copy_bytes(&record.key)?, _owner: frame.into_reservation() });
+            after = Some(GraphPosition {
+                key: frame.copy_bytes(&record.key)?,
+                _owner: frame.into_reservation(),
+            });
         }
         let frame = OriginalPersistenceFrame::new(original)?;
         let identity = Self::pending_graph_key(&frame, source, kind, target)?;
         self.graph_record_put(original, 4, &identity, None)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn put_graph_event(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        edge: &AdjEntry, lsn: Lsn, predecessor: Option<&[u8]>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn put_graph_event(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        edge: &AdjEntry,
+        lsn: Lsn,
+        predecessor: Option<&[u8]>,
+    ) -> Result<()> {
         let frame = OriginalPersistenceFrame::new(original)?;
         let name = frame.copy_text(&edge.edge_type)?;
         let entry = if predecessor.is_some() {
-            ChangeLogEntry::EdgeDelete { source: edge.source, target: edge.target, edge_type: name, lsn }
-        } else { ChangeLogEntry::EdgeInsert { source: edge.source, target: edge.target, edge_type: name, lsn } };
+            ChangeLogEntry::EdgeDelete {
+                source: edge.source,
+                target: edge.target,
+                edge_type: name,
+                lsn,
+            }
+        } else {
+            ChangeLogEntry::EdgeInsert {
+                source: edge.source,
+                target: edge.target,
+                edge_type: name,
+                lsn,
+            }
+        };
         let identity = Self::pending_graph_key(&frame, edge.source, &edge.edge_type, edge.target)?;
-        let size = identity.len().checked_add(9).ok_or_else(|| Error::Other("graph event key overflow".into()))?;
+        let size = identity
+            .len()
+            .checked_add(9)
+            .ok_or_else(|| Error::Other("graph event key overflow".into()))?;
         frame.reserve(size)?;
         let mut key = Vec::with_capacity(size);
-        key.extend_from_slice(&lsn.0.to_be_bytes()); key.extend_from_slice(&identity); key.push(u8::from(predecessor.is_some()));
-        let event = WorkingGraphEvent { entry, predecessor: predecessor.map(|key| frame.copy_bytes(key)).transpose()? };
+        key.extend_from_slice(&lsn.0.to_be_bytes());
+        key.extend_from_slice(&identity);
+        key.push(u8::from(predecessor.is_some()));
+        let event = WorkingGraphEvent {
+            entry,
+            predecessor: predecessor.map(|key| frame.copy_bytes(key)).transpose()?,
+        };
         let body = frame.encode(&event)?;
         self.with_write(|write| {
-            write.open_table(WORKING_GRAPH_EVENTS).map_err(RedbPersistence::storage_error)?
-                .insert(key.as_slice(), body.as_slice()).map_err(RedbPersistence::storage_error)?;
+            write
+                .open_table(WORKING_GRAPH_EVENTS)
+                .map_err(RedbPersistence::storage_error)?
+                .insert(key.as_slice(), body.as_slice())
+                .map_err(RedbPersistence::storage_error)?;
             Ok(())
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn prepare_graph_events(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        receiver: TxId) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn prepare_graph_events(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        receiver: TxId,
+    ) -> Result<()> {
         // Creation keys are already canonicalized. Stream occurrences and use
         // the exact source-to-destination map; no latest-identity body lookup.
         for deletion in [false, true] {
-            let definition = if deletion { WORKING_GRAPH_DELETIONS } else { WORKING_GRAPH_CREATIONS };
+            let definition = if deletion {
+                WORKING_GRAPH_DELETIONS
+            } else {
+                WORKING_GRAPH_CREATIONS
+            };
             let mut after = None::<GraphPosition>;
             loop {
-                let lower = after.as_ref().map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-                let Some(record) = self.next_graph_record(original, definition, lower, Bound::Unbounded)? else { break; };
+                let lower = after
+                    .as_ref()
+                    .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
+                let Some(record) =
+                    self.next_graph_record(original, definition, lower, Bound::Unbounded)?
+                else {
+                    break;
+                };
                 let frame = OriginalPersistenceFrame::new(original)?;
-                after = Some(GraphPosition { key: frame.copy_bytes(&record.key)?, _owner: frame.into_reservation() });
+                after = Some(GraphPosition {
+                    key: frame.copy_bytes(&record.key)?,
+                    _owner: frame.into_reservation(),
+                });
                 let frame = OriginalPersistenceFrame::new(original)?;
                 let coordinate = self.decode_graph_coordinate(original, &frame, &record.body)?;
                 let key = record.key.as_slice();
-                if matches!(coordinate.occurrence.origin, WorkingGraphOrigin::Callback { authored: false, .. }) { continue; }
-                let mapped = self.next_graph_record(original, WORKING_GRAPH_KEY_MAP,
-                    Bound::Included(key), Bound::Included(key))?;
+                if matches!(
+                    coordinate.occurrence.origin,
+                    WorkingGraphOrigin::Callback {
+                        authored: false,
+                        ..
+                    }
+                ) {
+                    continue;
+                }
+                let mapped = self.next_graph_record(
+                    original,
+                    WORKING_GRAPH_KEY_MAP,
+                    Bound::Included(key),
+                    Bound::Included(key),
+                )?;
                 let physical = mapped.as_ref().map_or(key, |record| record.body.as_slice());
-                let Some(edge) = self.next_graph_edge(original, false,
-                    Bound::Included(physical), Bound::Included(physical))? else { continue; };
-                if deletion && edge.edge.deleted_tx != Some(receiver) { continue; }
-                let (tx, lsn) = coordinate.destination.ok_or_else(|| Error::Other("graph event lost its exact restamped coordinate".into()))?;
-                if tx != receiver { return Err(Error::Other("graph event belongs to another receiver".into())); }
+                let Some(edge) = self.next_graph_edge(
+                    original,
+                    false,
+                    Bound::Included(physical),
+                    Bound::Included(physical),
+                )?
+                else {
+                    continue;
+                };
+                if deletion && edge.edge.deleted_tx != Some(receiver) {
+                    continue;
+                }
+                let (tx, lsn) = coordinate.destination.ok_or_else(|| {
+                    Error::Other("graph event lost its exact restamped coordinate".into())
+                })?;
+                if tx != receiver {
+                    return Err(Error::Other(
+                        "graph event belongs to another receiver".into(),
+                    ));
+                }
                 self.put_graph_event(original, &edge.edge, lsn, deletion.then_some(physical))?;
             }
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn visit_graph_events_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn visit_graph_events_original(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
         selection: &WorkingGraphCapture,
-        mut visit: impl FnMut(&ChangeLogEntry, Option<&[u8]>) -> Result<()>) -> Result<()> {
+        mut visit: impl FnMut(&ChangeLogEntry, Option<&[u8]>) -> Result<()>,
+    ) -> Result<()> {
         self.check_graph_capture(original, selection)?;
         let mut after = None::<GraphPosition>;
         loop {
-            let lower = after.as_ref().map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
-            let Some(record) = self.next_graph_record(original, WORKING_GRAPH_EVENTS, lower, Bound::Unbounded)? else { break; };
+            let lower = after
+                .as_ref()
+                .map_or(Bound::Unbounded, |p| Bound::Excluded(p.key.as_slice()));
+            let Some(record) =
+                self.next_graph_record(original, WORKING_GRAPH_EVENTS, lower, Bound::Unbounded)?
+            else {
+                break;
+            };
             let frame = OriginalPersistenceFrame::new(original)?;
             let event: WorkingGraphEvent = frame.decode(&record.body)?;
             let kind = match &event.entry {
-                ChangeLogEntry::EdgeInsert { edge_type, .. } | ChangeLogEntry::EdgeDelete { edge_type, .. } => edge_type,
-                _ => return Err(Error::Other("non-graph entry in graph occurrence spool".into())),
+                ChangeLogEntry::EdgeInsert { edge_type, .. }
+                | ChangeLogEntry::EdgeDelete { edge_type, .. } => edge_type,
+                _ => {
+                    return Err(Error::Other(
+                        "non-graph entry in graph occurrence spool".into(),
+                    ));
+                }
             };
             if !self.selected_graph_type_original(original, selection, kind)? {
-                return Err(Error::Other("graph event escaped its frozen selected type".into()));
+                return Err(Error::Other(
+                    "graph event escaped its frozen selected type".into(),
+                ));
             }
             visit(&event.entry, event.predecessor.as_deref())?;
             self.check_graph_capture(original, selection)?;
-            after = Some(GraphPosition { key: frame.copy_bytes(&record.key)?, _owner: frame.into_reservation() });
+            after = Some(GraphPosition {
+                key: frame.copy_bytes(&record.key)?,
+                _owner: frame.into_reservation(),
+            });
         }
         Ok(())
     }
 }
 
-const WORKING_GRAPH_LAST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("__received_working_graph_last");
+const WORKING_GRAPH_LAST: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("__received_working_graph_last");
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn last_graph_coordinate_original(&self, original: &crate::memory_accounting::OwnedMemoryReservation,
-        source: NodeId, kind: &str, target: NodeId) -> Result<Option<WorkingGraphCoordinate>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn last_graph_coordinate_original(
+        &self,
+        original: &crate::memory_accounting::OwnedMemoryReservation,
+        source: NodeId,
+        kind: &str,
+        target: NodeId,
+    ) -> Result<Option<WorkingGraphCoordinate>> {
         let frame = OriginalPersistenceFrame::new(original)?;
         let identity = Self::pending_graph_key(&frame, source, kind, target)?;
-        let record = self.next_graph_record(original, WORKING_GRAPH_LAST,
-            Bound::Included(identity.as_slice()), Bound::Included(identity.as_slice()))?;
-        record.map(|record| self.decode_graph_coordinate(original, &frame, &record.body)).transpose()
+        let record = self.next_graph_record(
+            original,
+            WORKING_GRAPH_LAST,
+            Bound::Included(identity.as_slice()),
+            Bound::Included(identity.as_slice()),
+        )?;
+        record
+            .map(|record| self.decode_graph_coordinate(original, &frame, &record.body))
+            .transpose()
     }
 }
 
 impl ReceivedWorkingWrite {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn replace_graph_declarations_original(&self,
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn replace_graph_declarations_original(
+        &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
-        owner: &mut Option<crate::memory_accounting::OwnedMemoryReservation>)
-        -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
+        owner: &mut Option<crate::memory_accounting::OwnedMemoryReservation>,
+    ) -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
         self.require_original(original)?;
         self.require_graph_mutable()?;
-        if owner.is_none() { return Err(Error::Other("private DAG declaration has no original invoice".into())); }
+        if owner.is_none() {
+            return Err(Error::Other(
+                "private DAG declaration has no original invoice".into(),
+            ));
+        }
         // No fallible operation follows the transfer. The caller holds the old
         // invoice until the old executor declaration body has been destroyed.
-        Ok(self.graph_state.lock().declarations_owner.replace(owner.take().expect("validated declaration original")))
+        Ok(self
+            .graph_state
+            .lock()
+            .declarations_owner
+            .replace(owner.take().expect("validated declaration original")))
     }
 }
 
-use crate::persistence::writer_source::{WriterSnapshotHandle};
+use crate::persistence::writer_source::WriterSnapshotHandle;

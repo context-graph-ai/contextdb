@@ -350,7 +350,10 @@ fn insert_passage(db: &Database, context: Uuid, row: usize, searchable: bool, em
     db.execute(
         "INSERT INTO passages VALUES ($id, $context, $searchable, $embedding)",
         &HashMap::from([
-            ("id".to_owned(), Value::Uuid(Uuid::from_u128(row as u128 + 1))),
+            (
+                "id".to_owned(),
+                Value::Uuid(Uuid::from_u128(row as u128 + 1)),
+            ),
             ("context".to_owned(), Value::Uuid(context)),
             ("searchable".to_owned(), Value::Bool(searchable)),
             ("embedding".to_owned(), Value::Vector(embedding)),
@@ -448,12 +451,24 @@ fn indexed_flat_row_check_exhaustion_before_later_matches_is_refused() {
     let auto = search_one_context(&db, "AUTO", context, &query, EXHAUSTION_LIMIT)
         .expect("AUTO returns the later match");
     assert_eq!(ids(&exact), vec![best_id.clone()]);
-    assert_eq!(ids(&auto), ids(&exact), "AUTO and EXACT name the same later match");
+    assert_eq!(
+        ids(&auto),
+        ids(&exact),
+        "AUTO and EXACT name the same later match"
+    );
     assert_one_exact_partition(&exact, "EXACT", "exact_requested");
     // The statement-wide cost decision precedes the per-partition flat arm.
     // This healthy, small resident scope is cheaper to compare exhaustively.
     assert_one_exact_partition(&auto, "AUTO", "statement_exhaustive_cheaper_than_walk");
-    assert_eq!(auto.trace().vector_search.as_ref().unwrap().partition_hnsw.len(), 1);
+    assert_eq!(
+        auto.trace()
+            .vector_search
+            .as_ref()
+            .unwrap()
+            .partition_hnsw
+            .len(),
+        1
+    );
 
     match search_one_context(&db, "INDEXED", context, &query, EXHAUSTION_LIMIT) {
         Ok(indexed) => panic!(

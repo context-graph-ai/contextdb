@@ -31,7 +31,10 @@ fn prefix(table: &str) -> String {
 }
 
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn append_ddl_summary_in_write(
         &self,
         write: &redb::WriteTransaction,
@@ -261,7 +264,10 @@ impl RedbPersistence {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn declared_direction_in_read(
         root: &WriterSnapshot,
         owner: &SourceWindowOwner,
@@ -324,11 +330,18 @@ impl RedbPersistence {
             .transpose()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn declared_meta_in_read(
-        root: &WriterSnapshotHandle, owner: SourceWindowOwner, table: &str, lsn: Lsn,
+        root: &WriterSnapshotHandle,
+        owner: SourceWindowOwner,
+        table: &str,
+        lsn: Lsn,
     ) -> Result<Option<writer_source::WriterWindow<(TableMeta, Lsn, u32)>>> {
-        let _control = root.adapter_control(&owner, table.len().saturating_mul(4).saturating_add(256))?;
+        let _control =
+            root.adapter_control(&owner, table.len().saturating_mul(4).saturating_add(256))?;
         let lower = prefix(table);
         let upper = format!("{lower}{:020}:~", lsn.0);
         let read = root.owner_read()?;
@@ -338,44 +351,79 @@ impl RedbPersistence {
             Err(error) => return Err(Self::storage_error(error)),
         };
         Self::verify_history_root(&read, DIRECTIONS.name())?;
-        let entry = summaries.range(lower.as_str()..=upper.as_str()).map_err(Self::storage_error)?
-            .next_back().transpose().map_err(Self::storage_error)?;
-        let Some((coordinate, value)) = entry else { return Ok(None); };
+        let entry = summaries
+            .range(lower.as_str()..=upper.as_str())
+            .map_err(Self::storage_error)?
+            .next_back()
+            .transpose()
+            .map_err(Self::storage_error)?;
+        let Some((coordinate, value)) = entry else {
+            return Ok(None);
+        };
         let memory = owner.image(root, "authored_declaration");
         let meta = memory.scope(|| {
             let state: DirectionState = Self::decode(value.value())?;
-            let damage = |reason: &str| crate::funded_error::corruption_display(owner.diagnostic_budget(), table, reason);
-            let (position, ordinal) = state.ddl_key.split_once(':').unwrap_or((&state.ddl_key, "0"));
-            let position = position.parse::<u64>().map_err(|_| damage("authored declaration has an invalid DDL position"))?;
-            let ordinal = ordinal.parse::<u32>().map_err(|_| damage("authored declaration has an invalid DDL ordinal"))?;
-            if coordinate.value() != format!("{lower}{position:020}:{ordinal:010}") || position > lsn.0 {
-                return Err(damage("authored declaration coordinate differs from its source occurrence"));
+            let damage = |reason: &str| {
+                crate::funded_error::corruption_display(owner.diagnostic_budget(), table, reason)
+            };
+            let (position, ordinal) = state
+                .ddl_key
+                .split_once(':')
+                .unwrap_or((&state.ddl_key, "0"));
+            let position = position
+                .parse::<u64>()
+                .map_err(|_| damage("authored declaration has an invalid DDL position"))?;
+            let ordinal = ordinal
+                .parse::<u32>()
+                .map_err(|_| damage("authored declaration has an invalid DDL ordinal"))?;
+            if coordinate.value() != format!("{lower}{position:020}:{ordinal:010}")
+                || position > lsn.0
+            {
+                return Err(damage(
+                    "authored declaration coordinate differs from its source occurrence",
+                ));
             }
-            let log = read.open_table(DDL_LOG_TABLE).map_err(Self::storage_error)?;
-            let occurrence = log.get(state.ddl_key.as_str()).map_err(Self::storage_error)?
+            let log = read
+                .open_table(DDL_LOG_TABLE)
+                .map_err(Self::storage_error)?;
+            let occurrence = log
+                .get(state.ddl_key.as_str())
+                .map_err(Self::storage_error)?
                 .ok_or_else(|| damage("authored declaration lost its source DDL occurrence"))?;
             if blake3::hash(occurrence.value()).as_bytes() != &state.ddl_digest {
-                return Err(damage("authored declaration digest differs from its source DDL occurrence"));
+                return Err(damage(
+                    "authored declaration digest differs from its source DDL occurrence",
+                ));
             }
             let change: DdlChange = Self::decode(occurrence.value())?;
             let affected = match &change {
-                DdlChange::CreateTable { name, .. } | DdlChange::AlterTable { name, .. }
+                DdlChange::CreateTable { name, .. }
+                | DdlChange::AlterTable { name, .. }
                 | DdlChange::DropTable { name } => Some(name.as_str()),
-                DdlChange::CreateIndex { table, .. } | DdlChange::DropIndex { table, .. }
-                | DdlChange::CreateTrigger { table, .. } | DdlChange::CreateEventType { table, .. } => Some(table.as_str()),
+                DdlChange::CreateIndex { table, .. }
+                | DdlChange::DropIndex { table, .. }
+                | DdlChange::CreateTrigger { table, .. }
+                | DdlChange::CreateEventType { table, .. } => Some(table.as_str()),
                 _ => None,
             };
             if affected != Some(table) {
                 return Err(damage("authored declaration is bound to a different table"));
             }
-            state.schema.as_deref().map(Self::decode_persisted_schema).transpose()
+            state
+                .schema
+                .as_deref()
+                .map(Self::decode_persisted_schema)
+                .transpose()
                 .map(|meta| meta.map(|(meta, _, _)| (meta, Lsn(position), ordinal)))
         })?;
         Ok(meta.map(|meta| writer_source::WriterWindow::from_owned(root, memory, meta)))
     }
 
     #[cfg(feature = "sync-orchestration")]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn authored_capabilities_in_read(
         root: &WriterSnapshot,
         owner: &SourceWindowOwner,
@@ -404,4 +452,4 @@ impl RedbPersistence {
     }
 }
 
-use crate::persistence::writer_source::{WriterSnapshotHandle};
+use crate::persistence::writer_source::WriterSnapshotHandle;

@@ -523,7 +523,8 @@ fn observe_with_root_comparison(path: &Path, compare_typed_root: bool) -> Observ
                     .limits
                     .limits
                     .memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -605,7 +606,8 @@ fn observe_with_root_comparison(path: &Path, compare_typed_root: bool) -> Observ
                     .limits
                     .limits
                     .memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -812,7 +814,8 @@ fn one_row_change_updates_only_bounded_logical_pages() {
                         .limits
                         .limits
                         .memory,
-                ).expect("admit the declared fixture root");
+                )
+                .expect("admit the declared fixture root");
             let operation_read_memory = declared_read_memory
                 .child()
                 .expect("admit the committed-content observation owner");
@@ -861,7 +864,8 @@ fn one_row_change_updates_only_bounded_logical_pages() {
                     .limits
                     .limits
                     .memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -1574,7 +1578,8 @@ fn the_content_identity_root_is_independently_recomputable_from_the_declaration(
                     .limits
                     .limits
                     .memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -1635,7 +1640,8 @@ fn reconstructed(path: &Path) -> CommittedContentForTest {
                     .limits
                     .limits
                     .memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -2051,7 +2057,8 @@ fn a_retired_separator_and_a_coalesced_update_remove_exactly_the_canonical_chunk
                     .limits
                     .limits
                     .memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");
@@ -2103,7 +2110,8 @@ fn a_retired_separator_and_a_coalesced_update_remove_exactly_the_canonical_chunk
                         .limits
                         .limits
                         .memory,
-                ).expect("admit the declared fixture root");
+                )
+                .expect("admit the declared fixture root");
             let operation_read_memory = declared_read_memory
                 .child()
                 .expect("admit the committed-content observation owner");
@@ -2153,7 +2161,8 @@ fn a_retired_separator_and_a_coalesced_update_remove_exactly_the_canonical_chunk
                             .limits
                             .limits
                             .memory,
-                    ).expect("admit the declared fixture root");
+                    )
+                    .expect("admit the declared fixture root");
                 let operation_read_memory = declared_read_memory
                     .child()
                     .expect("admit the committed-content observation owner");
@@ -2183,7 +2192,8 @@ fn a_retired_separator_and_a_coalesced_update_remove_exactly_the_canonical_chunk
                         .limits
                         .limits
                         .memory,
-                ).expect("admit the declared fixture root");
+                )
+                .expect("admit the declared fixture root");
             let operation_read_memory = declared_read_memory
                 .child()
                 .expect("admit the committed-content observation owner");
@@ -2276,7 +2286,8 @@ fn oversized_index_keys_match_the_independent_rebuild_through_their_whole_life()
                         .limits
                         .limits
                         .memory,
-                ).expect("admit the declared fixture root");
+                )
+                .expect("admit the declared fixture root");
             let operation_read_memory = declared_read_memory
                 .child()
                 .expect("admit the committed-content observation owner");

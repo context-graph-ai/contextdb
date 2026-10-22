@@ -333,7 +333,10 @@ pub fn row_matches_delete_predicates(
 }
 
 pub trait WriteSetApplicator: Send + Sync {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn apply(
         &self,
         ws: &WriteSet,
@@ -344,7 +347,10 @@ pub trait WriteSetApplicator: Send + Sync {
     /// fallible reservation/root creation belongs to prepare/apply; a failure
     /// after durability must poison the writer, never report rollback.
     /// Admit the successor root before a direct metadata persistence callback.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve_metadata_publication(&self) -> Result<Option<Box<dyn std::any::Any + Send>>> {
         Ok(None)
     }
@@ -362,7 +368,9 @@ pub trait WriteSetApplicator: Send + Sync {
     /// Private Native transport; a selected Native store never exports its root
     /// through the Legacy raw Arc hook.
     #[doc(hidden)]
-    fn native_publication_handle(&self) -> Option<crate::native_capture::NativeCapture> { None }
+    fn native_publication_handle(&self) -> Option<crate::native_capture::NativeCapture> {
+        None
+    }
     fn publication_handle(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
         None
     }

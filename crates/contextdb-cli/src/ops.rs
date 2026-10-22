@@ -263,19 +263,23 @@ where
             .inspect_key(&table, &key, &columns, read_memory.clone())
             .and_then(|report| {
                 serde_json::to_value(report).map_err(|err| {
-                    contextdb_core::Error::Other((format!("failed to encode key inspection: {err}")).into())
+                    contextdb_core::Error::Other(
+                        (format!("failed to encode key inspection: {err}")).into(),
+                    )
                 })
             }),
         Request::Blob { hash } => inspector.inspect_blob(hash).and_then(|report| {
             serde_json::to_value(report).map_err(|err| {
-                contextdb_core::Error::Other((format!("failed to encode blob inspection: {err}")).into())
+                contextdb_core::Error::Other(
+                    (format!("failed to encode blob inspection: {err}")).into(),
+                )
             })
         }),
         Request::SyncApplyState => inspector.inspect_sync_apply_state().and_then(|report| {
             serde_json::to_value(report).map_err(|err| {
-                contextdb_core::Error::Other((format!(
-                    "failed to encode sync-apply-state inspection: {err}"
-                )).into())
+                contextdb_core::Error::Other(
+                    (format!("failed to encode sync-apply-state inspection: {err}")).into(),
+                )
             })
         }),
     };
@@ -625,13 +629,15 @@ fn run_purge(args: &[String]) -> i32 {
     // rendering, and source close, independently of the store's writer funding.
     let read_memory =
         DeclaredReadMemory::from_reader_limit(db.owner_read_config().limits.limits.memory);
-    let result = read_memory.and_then(|root| root.child()).and_then(|request_memory| {
-        db.execute_with_read_memory(
-            &format!("PURGE FROM {table}"),
-            &std::collections::HashMap::new(),
-            request_memory,
-        )
-    });
+    let result = read_memory
+        .and_then(|root| root.child())
+        .and_then(|request_memory| {
+            db.execute_with_read_memory(
+                &format!("PURGE FROM {table}"),
+                &std::collections::HashMap::new(),
+                request_memory,
+            )
+        });
     let close_result = db.close();
     match result {
         Ok(outcome) => {

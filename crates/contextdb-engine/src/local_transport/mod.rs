@@ -33,17 +33,17 @@
 mod address;
 mod authentication;
 mod carrier;
-#[cfg(target_os = "linux")]
-pub(crate) mod native_driver;
 pub(crate) mod deadlines;
 mod engine_answer;
 mod framing;
 pub(crate) mod inbound_query;
+#[cfg(target_os = "linux")]
+pub(crate) mod native_driver;
 pub(crate) mod query_funding;
 mod runtime;
 mod stale;
 mod terminal;
-pub(crate) use terminal::{write_query_error, write_query_refusal, write_query_diagnostic};
+pub(crate) use terminal::{write_query_diagnostic, write_query_error, write_query_refusal};
 
 #[cfg(unix)]
 pub use address::ChannelKernelAddress;
@@ -105,11 +105,11 @@ pub use framing::{
     split_canonical_result, split_payload_answer, validate_handshake,
 };
 pub(crate) use framing::{
-    FundedOrdinaryResult, FundedResultReceiveOutcome, split_canonical_result_funded,
+    FundedOrdinaryResult, FundedResultReceiveOutcome, decode_read_error_under_memory_ceiling,
+    observed_cursor_page_allocation_bytes, preflight_canonical_query_result,
+    preflight_cursor_page_payload, preflight_metadata_page_payload,
+    preflight_observed_cursor_page_payload, response_is_encodable, split_canonical_result_funded,
     split_payload_answer_funded,
-    decode_read_error_under_memory_ceiling, observed_cursor_page_allocation_bytes,
-    preflight_canonical_query_result, preflight_cursor_page_payload,
-    preflight_metadata_page_payload, preflight_observed_cursor_page_payload, response_is_encodable,
 };
 pub use runtime::RuntimeDirectory;
 #[cfg(target_os = "linux")]
@@ -167,7 +167,9 @@ pub enum LocalTransportError {
     OriginalAdmission(contextdb_core::Error),
     /// Original output/control admission fields. This is private transport
     /// plumbing; the existing engine-error document carries it on the wire.
-    #[error("reader memory admission failed for {subsystem}/{operation}: requested {requested_bytes}, available {available_bytes}, limit {budget_limit_bytes}; {hint}")]
+    #[error(
+        "reader memory admission failed for {subsystem}/{operation}: requested {requested_bytes}, available {available_bytes}, limit {budget_limit_bytes}; {hint}"
+    )]
     MemoryAdmission {
         subsystem: contextdb_core::error::DiagnosticLabel,
         operation: contextdb_core::error::DiagnosticLabel,
@@ -201,12 +203,28 @@ pub enum LocalTransportError {
 }
 
 impl LocalTransportError {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_admission_error(self) -> Result<contextdb_core::Error, Self> {
         match self {
             Self::OriginalAdmission(error) => Ok(error),
-            Self::MemoryAdmission { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint } =>
-                Ok(contextdb_core::Error::MemoryBudgetExceeded { subsystem, operation, requested_bytes, available_bytes, budget_limit_bytes, hint }),
+            Self::MemoryAdmission {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            } => Ok(contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            }),
             Self::NativeAdmission(error) => Ok(contextdb_core::Error::NativeEngineOther(error)),
             other => Err(other),
         }
@@ -233,7 +251,9 @@ pub(crate) fn invalid_channel_data() -> LocalTransportError {
 /// framing and payloads still name invalid channel data.
 pub(crate) fn response_decode_refusal(error: LocalTransportError) -> LocalTransportError {
     match error {
-        LocalTransportError::MemoryAdmission { .. } | LocalTransportError::NativeAdmission(_) | LocalTransportError::OriginalAdmission(_) => error,
+        LocalTransportError::MemoryAdmission { .. }
+        | LocalTransportError::NativeAdmission(_)
+        | LocalTransportError::OriginalAdmission(_) => error,
         LocalTransportError::Payload(framing::PayloadViolation::MemoryCeilingExceeded {
             ..
         }) => error,
@@ -298,14 +318,18 @@ pub(crate) fn frame_read_refusal(error: LocalTransportError) -> LocalTransportEr
     }
 }
 
-pub(crate) use deadlines::{OperationDeadlineWait, wait_until_owned, deadline_operation_owned, deadline_operation_funded};
+pub(crate) use deadlines::{
+    OperationDeadlineWait, deadline_operation_funded, deadline_operation_owned, wait_until_owned,
+};
 
 impl PartialEq for LocalTransportError {
     fn eq(&self, other: &Self) -> bool {
         use LocalTransportError::*;
         match (self, other) {
-            (Unimplemented, Unimplemented) | (CredentialsUnavailable, CredentialsUnavailable)
-            | (PlatformUnsupported, PlatformUnsupported) | (StaleChannelUnverifiable, StaleChannelUnverifiable) => true,
+            (Unimplemented, Unimplemented)
+            | (CredentialsUnavailable, CredentialsUnavailable)
+            | (PlatformUnsupported, PlatformUnsupported)
+            | (StaleChannelUnverifiable, StaleChannelUnverifiable) => true,
             (FilesystemInspection(a), FilesystemInspection(b)) => a == b,
             (RuntimeRoot(a), RuntimeRoot(b)) => a == b,
             (ChannelPath(a), ChannelPath(b)) => a == b,
@@ -316,9 +340,24 @@ impl PartialEq for LocalTransportError {
             // Original Error is deliberately move-only and has no value Eq.
             // Preserve its unique identity without formatting/copying it.
             (OriginalAdmission(a), OriginalAdmission(b)) => std::ptr::eq(a, b),
-            (MemoryAdmission { subsystem: a, operation: b, requested_bytes: c, available_bytes: d, budget_limit_bytes: e, hint: f },
-             MemoryAdmission { subsystem: g, operation: h, requested_bytes: i, available_bytes: j, budget_limit_bytes: k, hint: l }) =>
-                **a == **g && **b == **h && c == i && d == j && e == k && **f == **l,
+            (
+                MemoryAdmission {
+                    subsystem: a,
+                    operation: b,
+                    requested_bytes: c,
+                    available_bytes: d,
+                    budget_limit_bytes: e,
+                    hint: f,
+                },
+                MemoryAdmission {
+                    subsystem: g,
+                    operation: h,
+                    requested_bytes: i,
+                    available_bytes: j,
+                    budget_limit_bytes: k,
+                    hint: l,
+                },
+            ) => **a == **g && **b == **h && c == i && d == j && e == k && **f == **l,
             _ => false,
         }
     }

@@ -1,9 +1,7 @@
 //! Immutable public answers and their private mutable execution payload.
 use super::{CascadeReport, QueryTrace};
 use crate::read_image_memory::QueryAnswerCharge;
-use contextdb_core::read_memory::{
-    NativeProduce, ReadCredit, ReadMemoryOwner, ReadShared,
-};
+use contextdb_core::read_memory::{NativeProduce, ReadCredit, ReadMemoryOwner, ReadShared};
 use contextdb_core::{Error, Result, Value};
 use std::sync::LazyLock;
 
@@ -54,7 +52,9 @@ impl QueryResult {
     pub(crate) fn encoding_owner(&self) -> Option<ReadMemoryOwner> {
         match &self.inner {
             QueryResultInner::Empty { .. } => None,
-            QueryResultInner::Shared(answer) => answer.retained_read_memory.clone()
+            QueryResultInner::Shared(answer) => answer
+                .retained_read_memory
+                .clone()
                 .or_else(|| answer.answer_charge.owner())
                 .or_else(|| answer.vector_copy_charge.owner())
                 .or_else(|| Some(answer.credit().owner())),
@@ -64,7 +64,8 @@ impl QueryResult {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn encoding_owner_for_test(&self) -> ReadMemoryOwner {
-        self.encoding_owner().expect("fixture supplies a funded answer")
+        self.encoding_owner()
+            .expect("fixture supplies a funded answer")
     }
     pub fn columns(&self) -> &[String] {
         match &self.inner {
@@ -101,24 +102,40 @@ impl QueryResult {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn from_owned_parts_for_test(
-        owner: ReadMemoryOwner, columns: Vec<String>, rows: Vec<Vec<Value>>,
-        rows_affected: u64, trace: QueryTrace, cascade: Option<CascadeReport>,
+        owner: ReadMemoryOwner,
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        rows_affected: u64,
+        trace: QueryTrace,
+        cascade: Option<CascadeReport>,
     ) -> Result<Self> {
-        Self::publish_with_owner(owner, || Ok(OwnedQueryResult::new(QueryResultData {
-            columns, rows, rows_affected, trace, cascade,
-        })))
+        Self::publish_with_owner(owner, || {
+            Ok(OwnedQueryResult::new(QueryResultData {
+                columns,
+                rows,
+                rows_affected,
+                trace,
+                cascade,
+            }))
+        })
     }
 
     /// Allocate the complete publication cell before running the producer.
     /// Durable writes can therefore never fail on carrier admission afterward.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn publish_with(
         owner: impl Into<ReadMemoryOwner>,
         make: impl FnOnce() -> Result<OwnedQueryResult>,
     ) -> Result<Self> {
         Self::publish_with_owner(owner.into(), make)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn publish_with_owner(
         owner: ReadMemoryOwner,
         make: impl FnOnce() -> Result<OwnedQueryResult>,
@@ -170,21 +187,25 @@ impl OwnedQueryResult {
 
     /// Read-only routes may allocate the carrier after execution, before
     /// publication. Mutating Database doors use publish_with before execution.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_public(self) -> Result<QueryResult> {
         let owner = self
             .retained_read_memory
             .clone()
             .or_else(|| self.answer_charge.owner())
-            .or_else(|| {
-                self.vector_copy_charge.owner()
-            })
+            .or_else(|| self.vector_copy_charge.owner())
             .ok_or_else(|| {
                 Error::Other("answer publication requires its original reader".into())
             })?;
         QueryResult::publish_with_owner(owner, || Ok(self))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_public_with_owner(self, owner: ReadMemoryOwner) -> Result<QueryResult> {
         QueryResult::publish_with_owner(owner, || Ok(self))
     }

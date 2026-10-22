@@ -83,15 +83,18 @@ fn a_bounded_scan_reports_the_rows_it_examined() {
     let bounded_scan = bounded(&database, SCAN);
     println!(
         "OBSERVED scan: executor examined {} | bounded examined {}",
-        eager_scan.trace().rows_examined, bounded_scan.trace().rows_examined
+        eager_scan.trace().rows_examined,
+        bounded_scan.trace().rows_examined
     );
 
     assert_eq!(
-        eager_scan.trace().rows_examined, SEEDED_ROWS,
+        eager_scan.trace().rows_examined,
+        SEEDED_ROWS,
         "the fixture holds exactly {SEEDED_ROWS} rows and the executor scanned all of them"
     );
     assert_eq!(
-        bounded_scan.trace().rows_examined, SEEDED_ROWS,
+        bounded_scan.trace().rows_examined,
+        SEEDED_ROWS,
         "a bounded scan of the same {SEEDED_ROWS} rows examined all of them too, and says so"
     );
 }
@@ -113,7 +116,8 @@ fn a_bounded_scan_still_reports_its_own_rows_after_unrelated_schema_work() {
     );
 
     assert_eq!(
-        schema_work.trace().rows_examined, 0,
+        schema_work.trace().rows_examined,
+        0,
         "a statement that creates a table examines no rows"
     );
     assert_eq!(

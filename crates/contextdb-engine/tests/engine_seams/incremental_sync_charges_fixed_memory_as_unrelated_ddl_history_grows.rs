@@ -29,7 +29,8 @@ fn ids(db: &Database, table: &str) -> Vec<Vec<Value>> {
         &HashMap::new(),
     )
     .unwrap()
-    .rows().to_vec()
+    .rows()
+    .to_vec()
 }
 async fn serve(
     db: Arc<Database>,

@@ -90,7 +90,11 @@ fn work_of_one_read(database: &Database) -> (u64, u64, Vec<Vec<Value>>) {
         observe(|| session.execute("SELECT body FROM unrelated WHERE id = 1", &no_params()));
     let entries = work.history.sidecar_entries.iter().sum::<u64>();
     let decodes = work.history.sidecar_decodes.iter().sum::<u64>();
-    (entries, decodes, answer.expect("the read is answered").rows().to_vec())
+    (
+        entries,
+        decodes,
+        answer.expect("the read is answered").rows().to_vec(),
+    )
 }
 
 fn measured(purged: usize, reopen: bool) -> (u64, u64) {

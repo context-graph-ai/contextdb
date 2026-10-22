@@ -1,7 +1,7 @@
 //! Vector copies use the requesting reader's existing budget capability.
 use contextdb_core::{
     Result,
-    read_memory::{NativeRefusal, NativeReadMemory, ReadCredit, ReadMemoryBudget, ReadMemoryOwner},
+    read_memory::{NativeReadMemory, NativeRefusal, ReadCredit, ReadMemoryBudget, ReadMemoryOwner},
 };
 use contextdb_vector::{MemoryBudget, VectorCopyAdmission};
 use std::sync::Arc;
@@ -9,12 +9,17 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub(crate) struct ReaderVectorBudget {
     reader: Arc<dyn ReadMemoryBudget>,
-    _read_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
-    vector_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    _read_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    vector_invoice:
+        Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
 }
 
 impl MemoryBudget for ReaderVectorBudget {
-    fn control_invoice(&self) -> Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>> {
+    fn control_invoice(
+        &self,
+    ) -> Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>
+    {
         self.vector_invoice.clone()
     }
     /// A refusal names the admission that asked for the bytes, so a reader
@@ -26,7 +31,8 @@ impl MemoryBudget for ReaderVectorBudget {
         operation: &str,
         hint: &str,
     ) -> Result<()> {
-        let result = self.reader
+        let result = self
+            .reader
             .try_reserve(
                 bytes,
                 "vector_copy",
@@ -54,8 +60,9 @@ impl MemoryBudget for ReaderVectorBudget {
             let identity = Arc::as_ptr(&self.reader) as *const () as usize;
             READER_BUDGET_LEDGER.with(|ledger| {
                 if let Some(entries) = ledger.borrow_mut().as_mut() {
-                    if let Some(event) = entries.last_mut().filter(|event|
-                        event.owner_identity == identity && event.what == "vector_copy/materialize") {
+                    if let Some(event) = entries.last_mut().filter(|event| {
+                        event.owner_identity == identity && event.what == "vector_copy/materialize"
+                    }) {
                         event.what = format!("{component}/{operation}");
                     }
                 }
@@ -70,7 +77,9 @@ impl MemoryBudget for ReaderVectorBudget {
 }
 
 /// Adapt the executing READ once, so copy admission and search share its capability.
-pub(crate) fn budget(read_memory: impl Into<ReadMemoryOwner>) -> contextdb_vector::MemoryBudgetOwner {
+pub(crate) fn budget(
+    read_memory: impl Into<ReadMemoryOwner>,
+) -> contextdb_vector::MemoryBudgetOwner {
     let budget = contextdb_vector::MemoryBudgetOwner::from(read_memory.into());
     #[cfg(any(test, feature = "test-seams"))]
     let budget = budget.with_read_copy_observer(note_copy_admission);
@@ -81,8 +90,9 @@ pub(crate) fn budget(read_memory: impl Into<ReadMemoryOwner>) -> contextdb_vecto
 fn note_copy_admission(identity: usize, component: &str, operation: &str) {
     READER_BUDGET_LEDGER.with(|ledger| {
         if let Some(entries) = ledger.borrow_mut().as_mut() {
-            if let Some(event) = entries.last_mut().filter(|event|
-                event.owner_identity == identity && event.what == "vector_copy/materialize") {
+            if let Some(event) = entries.last_mut().filter(|event| {
+                event.owner_identity == identity && event.what == "vector_copy/materialize"
+            }) {
                 event.what = format!("{component}/{operation}");
             }
         }
@@ -99,19 +109,30 @@ pub fn admission(read_memory: impl Into<ReadMemoryOwner>) -> VectorCopyAdmission
 pub(crate) fn admission_prepaid(
     read_memory: Arc<dyn ReadMemoryBudget>,
     read_invoice: contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>,
-    vector_invoice: contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>,
+    vector_invoice: contextdb_core::read_memory::ReadShared<
+        contextdb_core::read_memory::ReadCredit,
+    >,
 ) -> VectorCopyAdmission {
     VectorCopyAdmission::new(Arc::new(ReaderVectorBudget {
-        reader: read_memory, _read_invoice: Some(read_invoice), vector_invoice: Some(vector_invoice) }))
+        reader: read_memory,
+        _read_invoice: Some(read_invoice),
+        vector_invoice: Some(vector_invoice),
+    }))
 }
 
 pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn request_budget(&self) -> Result<Arc<dyn ReadMemoryBudget>>;
 
     /// Existing host providers acquire their exact legacy capability once.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn request_budget_owner(&self) -> Result<RequestReadOwner> {
         self.request_budget().map(RequestReadOwner::legacy)
     }
@@ -121,7 +142,10 @@ pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
     /// owned diagnostic; the default keeps today's acquisition, so a Legacy
     /// provider still selects Legacy and refuses on its Legacy terms.
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn request_budget_owner_native(
         &self,
     ) -> std::result::Result<RequestReadOwner, RequestOwnerFailure> {
@@ -135,7 +159,10 @@ pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
 /// the engine neither wraps it in an Arc nor acquires a second request.
 #[doc(hidden)]
 pub trait NativeReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn request_budget_owner_native(
         &self,
     ) -> std::result::Result<RequestReadOwner, RequestOwnerFailure>;
@@ -164,33 +191,47 @@ impl ReadRequestProvider {
     pub fn native(provider: Arc<dyn NativeReadRequestBudgetProvider>) -> Self {
         Self(ReadRequestProviderKind::Native(provider))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn request_budget(&self) -> Result<ReadMemoryOwner> {
         match &self.0 {
             ReadRequestProviderKind::Declared(parent) => parent.child(),
-            ReadRequestProviderKind::External(provider) =>
-                provider.request_budget().map(ReadMemoryOwner::from_legacy),
-            ReadRequestProviderKind::Native(provider) => provider.request_budget_owner_native()
+            ReadRequestProviderKind::External(provider) => {
+                provider.request_budget().map(ReadMemoryOwner::from_legacy)
+            }
+            ReadRequestProviderKind::Native(provider) => provider
+                .request_budget_owner_native()
                 .map(|request| match request.into_route() {
                     RequestReadRoute::Legacy(owner) => ReadMemoryOwner::from_legacy(owner),
                     RequestReadRoute::Native(receipt) => receipt.into_owner(),
-                }).map_err(RequestOwnerFailure::into_error),
-        }
-    }
-    #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn request_budget_owner(&self) -> Result<RequestReadOwner> {
-        match &self.0 {
-            ReadRequestProviderKind::Declared(parent) => parent.request_budget_owner(),
-            ReadRequestProviderKind::External(provider) => provider.request_budget_owner(),
-            ReadRequestProviderKind::Native(provider) => provider.request_budget_owner_native()
+                })
                 .map_err(RequestOwnerFailure::into_error),
         }
     }
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn request_budget_owner_native(&self)
-        -> std::result::Result<RequestReadOwner, RequestOwnerFailure> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn request_budget_owner(&self) -> Result<RequestReadOwner> {
+        match &self.0 {
+            ReadRequestProviderKind::Declared(parent) => parent.request_budget_owner(),
+            ReadRequestProviderKind::External(provider) => provider.request_budget_owner(),
+            ReadRequestProviderKind::Native(provider) => provider
+                .request_budget_owner_native()
+                .map_err(RequestOwnerFailure::into_error),
+        }
+    }
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn request_budget_owner_native(
+        &self,
+    ) -> std::result::Result<RequestReadOwner, RequestOwnerFailure> {
         match &self.0 {
             ReadRequestProviderKind::Declared(parent) => parent.request_budget_owner_native(),
             ReadRequestProviderKind::External(provider) => provider.request_budget_owner_native(),
@@ -199,13 +240,19 @@ impl ReadRequestProvider {
     }
 }
 impl From<DeclaredReadRoot> for ReadRequestProvider {
-    fn from(parent: DeclaredReadRoot) -> Self { Self::declared(parent) }
+    fn from(parent: DeclaredReadRoot) -> Self {
+        Self::declared(parent)
+    }
 }
 impl From<Arc<dyn ReadRequestBudgetProvider>> for ReadRequestProvider {
-    fn from(provider: Arc<dyn ReadRequestBudgetProvider>) -> Self { Self::external(provider) }
+    fn from(provider: Arc<dyn ReadRequestBudgetProvider>) -> Self {
+        Self::external(provider)
+    }
 }
 impl<T: ReadRequestBudgetProvider + 'static> From<Arc<T>> for ReadRequestProvider {
-    fn from(provider: Arc<T>) -> Self { Self::external(provider) }
+    fn from(provider: Arc<T>) -> Self {
+        Self::external(provider)
+    }
 }
 
 /// Why a native route could not acquire its request owner: a native
@@ -290,8 +337,10 @@ pub struct DeclaredReadMemory {
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
 pub fn native_control_layouts_for_test() -> (std::alloc::Layout, std::alloc::Layout) {
-    (ReadMemoryOwner::native_layout::<DeclaredReadMemory, RootTerminalInvoice>(),
-        ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>())
+    (
+        ReadMemoryOwner::native_layout::<DeclaredReadMemory, RootTerminalInvoice>(),
+        ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>(),
+    )
 }
 impl DeclaredReadMemory {
     fn effective_limit(&self) -> u64 {
@@ -313,19 +362,26 @@ impl DeclaredReadMemory {
     }
     /// Admit every original root, including a standing parent, against its
     /// declared TOTAL limit before requesting the exact native allocation.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn query_root(limit: u64) -> Result<QueryReadRoot> {
         Self::from_reader_limit(limit).map(|root| QueryReadRoot { root })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn from_reader_limit(limit: u64) -> Result<DeclaredReadRoot> {
         Self::try_from_reader_limit(limit).map_err(contextdb_core::Error::NativeEngineOther)
     }
 
     #[doc(hidden)]
-    pub fn try_from_reader_limit(limit: u64)
-        -> std::result::Result<DeclaredReadRoot, NativeRefusal> {
+    pub fn try_from_reader_limit(
+        limit: u64,
+    ) -> std::result::Result<DeclaredReadRoot, NativeRefusal> {
         let mut root = Self {
             limit,
             terminal_bytes: 0,
@@ -340,18 +396,24 @@ impl DeclaredReadMemory {
         let bytes = ReadMemoryOwner::native_layout::<Self, RootTerminalInvoice>().size();
         // The admitted AtomicU64 itself moves into the block, retaining this
         // exact debit; there is no second bank or standing-root allowance.
-        root.try_count(bytes).map_err(|held| NativeRefusal::MemoryBudgetExceeded {
-            subsystem: "reader", operation: "query_root", requested_bytes: bytes,
-            available_bytes: usize::try_from(limit.saturating_sub(held)).unwrap_or(usize::MAX),
-            budget_limit_bytes: usize::try_from(limit).unwrap_or(usize::MAX),
-            hint: "Reduce simultaneous reads or raise the declared reader memory limit.",
-        })?;
+        root.try_count(bytes)
+            .map_err(|held| NativeRefusal::MemoryBudgetExceeded {
+                subsystem: "reader",
+                operation: "query_root",
+                requested_bytes: bytes,
+                available_bytes: usize::try_from(limit.saturating_sub(held)).unwrap_or(usize::MAX),
+                budget_limit_bytes: usize::try_from(limit).unwrap_or(usize::MAX),
+                hint: "Reduce simultaneous reads or raise the declared reader memory limit.",
+            })?;
         root.terminal_bytes = bytes;
         #[cfg(any(test, feature = "test-seams"))]
         let observation = root_observations::begin(bytes);
         #[cfg(any(test, feature = "test-seams"))]
-        { root.observation = Some(observation); }
-        let invoice = RootTerminalInvoice { bytes,
+        {
+            root.observation = Some(observation);
+        }
+        let invoice = RootTerminalInvoice {
+            bytes,
             #[cfg(any(test, feature = "test-seams"))]
             observation,
         };
@@ -394,14 +456,14 @@ impl DeclaredReadMemory {
 
     /// Successful live child payload debits, excluding their native controls.
     pub(crate) fn child_payload_bytes(&self) -> u64 {
-        self.live_child_payload_bytes.load(std::sync::atomic::Ordering::SeqCst)
+        self.live_child_payload_bytes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn acl_cache_bytes(&self) -> u64 {
         self.live_acl_cache_bytes
             .load(std::sync::atomic::Ordering::SeqCst)
     }
-
 }
 impl DeclaredReadRoot {
     #[cfg(test)]
@@ -412,16 +474,33 @@ impl DeclaredReadRoot {
         assert_eq!(root_observations::sample(token), (false, 0, 0));
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn acl_cache_budget(&self) -> Result<ReadMemoryOwner> {
-        let bytes = ReadMemoryOwner::native_layout::<ReaderAclCacheBudget, ReaderAclCacheInvoice>().size();
-        self.try_reserve_native(bytes, "reader_acl_cache", "budget_owner",
-            "Increase reader memory to cache ACL grants.")
-            .map_err(contextdb_core::Error::NativeEngineOther)?;
-        self.live_acl_cache_bytes.fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst);
-        let invoice = ReaderAclCacheInvoice { parent: self.clone(), bytes };
-        ReadMemoryOwner::try_native_result(ReaderAclCacheBudget { parent: self.clone() }, invoice)
-            .map_err(contextdb_core::Error::NativeEngineOther)
+        let bytes =
+            ReadMemoryOwner::native_layout::<ReaderAclCacheBudget, ReaderAclCacheInvoice>().size();
+        self.try_reserve_native(
+            bytes,
+            "reader_acl_cache",
+            "budget_owner",
+            "Increase reader memory to cache ACL grants.",
+        )
+        .map_err(contextdb_core::Error::NativeEngineOther)?;
+        self.live_acl_cache_bytes
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        let invoice = ReaderAclCacheInvoice {
+            parent: self.clone(),
+            bytes,
+        };
+        ReadMemoryOwner::try_native_result(
+            ReaderAclCacheBudget {
+                parent: self.clone(),
+            },
+            invoice,
+        )
+        .map_err(contextdb_core::Error::NativeEngineOther)
     }
 
     /// Largest admitted live-byte figure recorded by an individual file
@@ -460,17 +539,19 @@ impl DeclaredReadRoot {
         let request_before = statement_child_proof::constructor_ordinal();
         #[cfg(any(test, feature = "test-seams"))]
         let initial_held = payload.retained.load(std::sync::atomic::Ordering::SeqCst);
-        ReadMemoryOwner::try_native_typed(payload, invoice)
-            .map(|child| {
-                let owner = child.owner();
-                #[cfg(all(test, feature = "test-seams"))]
-                crate::database::ordinary_native_owner_tests::child_allocated(
-                    self, &self.retained, owner.accounting_identity(),
-                    ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>());
-                #[cfg(any(test, feature = "test-seams"))]
-                register_native_child_observer(self, &owner, &child, request_before, initial_held);
-                NativeReadChildReceipt { owner }
-            })
+        ReadMemoryOwner::try_native_typed(payload, invoice).map(|child| {
+            let owner = child.owner();
+            #[cfg(all(test, feature = "test-seams"))]
+            crate::database::ordinary_native_owner_tests::child_allocated(
+                self,
+                &self.retained,
+                owner.accounting_identity(),
+                ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>(),
+            );
+            #[cfg(any(test, feature = "test-seams"))]
+            register_native_child_observer(self, &owner, &child, request_before, initial_held);
+            NativeReadChildReceipt { owner }
+        })
     }
 
     /// Acquire one native child together with its mandatory failure controls.
@@ -478,21 +559,34 @@ impl DeclaredReadRoot {
     /// moved into its native cell. No acquired capability escapes without the
     /// controls, and no existing connection allocation changes payer.
     pub(crate) fn native_child_with_controls(
-        &self, bytes: usize,
+        &self,
+        bytes: usize,
     ) -> std::result::Result<(NativeReadChildReceipt, ReadCredit), NativeRefusal> {
         let control_bytes =
             ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
-        self.try_reserve_native(control_bytes, "reader", "request_owner",
-            "Reduce simultaneous requests or raise the declared reader memory limit.")?;
+        self.try_reserve_native(
+            control_bytes,
+            "reader",
+            "request_owner",
+            "Reduce simultaneous requests or raise the declared reader memory limit.",
+        )?;
         self.live_child_control_bytes
             .fetch_add(control_bytes as u64, std::sync::atomic::Ordering::SeqCst);
-        let invoice = NativeChildInvoice { parent: self.clone(), bytes: control_bytes };
+        let invoice = NativeChildInvoice {
+            parent: self.clone(),
+            bytes: control_bytes,
+        };
         let payload = NativeDeclaredChild {
             parent: self.clone(),
-            operation_limit: std::sync::atomic::AtomicU64::new(self.limit), retained: std::sync::atomic::AtomicU64::new(0),
+            operation_limit: std::sync::atomic::AtomicU64::new(self.limit),
+            retained: std::sync::atomic::AtomicU64::new(0),
         };
-        payload.try_reserve_native(bytes, "reader", "query_refusal_controls",
-            "Reduce simultaneous requests or raise the declared reader memory limit.")?;
+        payload.try_reserve_native(
+            bytes,
+            "reader",
+            "query_refusal_controls",
+            "Reduce simultaneous requests or raise the declared reader memory limit.",
+        )?;
         // Before the cell exists this rollback guard owns the child's parent
         // debit. Its success handoff keeps that same debit and the payload's
         // retained counter intact; it does not refund or reserve again.
@@ -511,7 +605,10 @@ impl DeclaredReadRoot {
     }
 
     /// Existing public provider result remains unqualified at its Error terminal.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn native_child_unqualified(&self) -> Result<NativeReadChildReceipt> {
         let control_bytes =
             ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
@@ -544,11 +641,14 @@ impl DeclaredReadRoot {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn child(&self) -> Result<ReadMemoryOwner> {
-        self.native_child_unqualified().map(NativeReadChildReceipt::into_owner)
+        self.native_child_unqualified()
+            .map(NativeReadChildReceipt::into_owner)
     }
-
 }
 /// Strong aliases retain the same original native block. No Arc wrapper,
 /// Weak header, external bank or self-credit cycle is created by this handle.
@@ -556,16 +656,24 @@ impl DeclaredReadRoot {
 pub struct DeclaredReadRoot(NativeReadMemory<DeclaredReadMemory>);
 impl std::ops::Deref for DeclaredReadRoot {
     type Target = DeclaredReadMemory;
-    fn deref(&self) -> &DeclaredReadMemory { &self.0 }
+    fn deref(&self) -> &DeclaredReadMemory {
+        &self.0
+    }
 }
 impl AsRef<DeclaredReadMemory> for DeclaredReadRoot {
-    fn as_ref(&self) -> &DeclaredReadMemory { self }
+    fn as_ref(&self) -> &DeclaredReadMemory {
+        self
+    }
 }
 impl DeclaredReadRoot {
-    pub(crate) fn original_owner(&self) -> ReadMemoryOwner { self.0.owner() }
+    pub(crate) fn original_owner(&self) -> ReadMemoryOwner {
+        self.0.owner()
+    }
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
-    pub fn original_owner_for_test(&self) -> ReadMemoryOwner { self.original_owner() }
+    pub fn original_owner_for_test(&self) -> ReadMemoryOwner {
+        self.original_owner()
+    }
 }
 #[derive(Debug)]
 pub(crate) struct QueryReadRoot {
@@ -592,12 +700,28 @@ impl Drop for RootTerminalInvoice {
 impl Drop for DeclaredReadMemory {
     fn drop(&mut self) {
         #[cfg(any(test, feature = "test-seams"))]
-        if let Some(token) = self.observation { root_observations::payload_dropped(token, self); }
-        debug_assert_eq!(self.live_child_control_bytes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        debug_assert_eq!(self.live_child_payload_bytes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        debug_assert_eq!(self.live_acl_cache_bytes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        debug_assert_eq!(self.retained.load(std::sync::atomic::Ordering::SeqCst),
-            self.terminal_bytes as u64);
+        if let Some(token) = self.observation {
+            root_observations::payload_dropped(token, self);
+        }
+        debug_assert_eq!(
+            self.live_child_control_bytes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        debug_assert_eq!(
+            self.live_child_payload_bytes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        debug_assert_eq!(
+            self.live_acl_cache_bytes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        debug_assert_eq!(
+            self.retained.load(std::sync::atomic::Ordering::SeqCst),
+            self.terminal_bytes as u64
+        );
     }
 }
 
@@ -624,15 +748,22 @@ struct NativeDeclaredChild {
 impl NativeDeclaredChild {
     #[cfg(any(test, feature = "test-seams"))]
     fn note_reader_budget_event(&self, subsystem: &str, operation: &str, bytes: usize, held: u64) {
-        let identity = native_child_identity(&self.parent, &self.retained, self as *const Self as usize);
+        let identity =
+            native_child_identity(&self.parent, &self.retained, self as *const Self as usize);
         READER_BUDGET_LEDGER.with(|ledger| {
             if let Some(events) = ledger.borrow_mut().as_mut() {
                 events.push(crate::memory_accounting::BudgetLedgerEntry {
-                    what: if subsystem.is_empty() { operation.to_owned() } else { format!("{subsystem}/{operation}") },
-                    bytes, used_after: usize::try_from(held).unwrap_or(usize::MAX),
+                    what: if subsystem.is_empty() {
+                        operation.to_owned()
+                    } else {
+                        format!("{subsystem}/{operation}")
+                    },
+                    bytes,
+                    used_after: usize::try_from(held).unwrap_or(usize::MAX),
                     owner_identity: identity,
                     parent_identity: self.parent.as_ref() as *const DeclaredReadMemory as usize,
-                    row_identity: None, allocation: None,
+                    row_identity: None,
+                    allocation: None,
                 });
             }
         });
@@ -641,10 +772,13 @@ impl NativeDeclaredChild {
         use std::sync::atomic::Ordering;
         let limit = self.operation_limit.load(Ordering::SeqCst);
         let control = ReadMemoryOwner::native_layout::<Self, NativeChildInvoice>().size() as u64;
-        self.retained.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-            held.checked_add(bytes as u64).filter(|next|
-                next.checked_add(control).is_some_and(|total| total <= limit))
-        })
+        self.retained
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.checked_add(bytes as u64).filter(|next| {
+                    next.checked_add(control)
+                        .is_some_and(|total| total <= limit)
+                })
+            })
     }
 }
 #[cfg(any(test, feature = "test-seams"))]
@@ -662,11 +796,13 @@ impl ReadMemoryBudget for NativeDeclaredChild {
     fn native_allocation_for_test(&self, _layout: std::alloc::Layout) {
         // The child's cell is paid by the original parent, not its own payload.
         crate::read_work_probe::allocator_events::funding_next(
-            &self.parent.retained as *const _ as usize);
+            &self.parent.retained as *const _ as usize,
+        );
     }
 
     fn constrain_operation_memory(&self, limit: usize) {
-        self.operation_limit.fetch_min(limit as u64, std::sync::atomic::Ordering::SeqCst);
+        self.operation_limit
+            .fetch_min(limit as u64, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn native_reserve_supported(&self) -> bool {
@@ -681,8 +817,12 @@ impl ReadMemoryBudget for NativeDeclaredChild {
     ) -> std::result::Result<(), NativeRefusal> {
         #[cfg(all(test, feature = "test-seams"))]
         crate::database::ordinary_native_owner_tests::child_counter(
-            &self.parent, self as *const Self as usize, &self.retained,
-            self.operation_limit.load(std::sync::atomic::Ordering::SeqCst));
+            &self.parent,
+            self as *const Self as usize,
+            &self.retained,
+            self.operation_limit
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
         #[cfg(any(test, feature = "test-seams"))]
         let _capture = statement_child_proof::ChildCall::new(
             &self.parent,
@@ -698,28 +838,57 @@ impl ReadMemoryBudget for NativeDeclaredChild {
         let previous = self.try_count(bytes).map_err(|held| {
             #[cfg(any(test, feature = "test-seams"))]
             _capture.refused();
-            let control = ReadMemoryOwner::native_layout::<Self, NativeChildInvoice>().size() as u64;
-            let limit = self.operation_limit.load(std::sync::atomic::Ordering::SeqCst);
-            NativeRefusal::MemoryBudgetExceeded { subsystem, operation, requested_bytes: bytes,
+            let control =
+                ReadMemoryOwner::native_layout::<Self, NativeChildInvoice>().size() as u64;
+            let limit = self
+                .operation_limit
+                .load(std::sync::atomic::Ordering::SeqCst);
+            NativeRefusal::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes: bytes,
                 available_bytes: limit.saturating_sub(held.saturating_add(control)) as usize,
-                budget_limit_bytes: limit as usize, hint }
+                budget_limit_bytes: limit as usize,
+                hint,
+            }
         })?;
         #[cfg(any(test, feature = "test-seams"))]
         let _forward = _capture.forwarding();
-        if let Err(error) = self.parent.try_reserve_native(bytes, subsystem, operation, hint) {
-            self.retained.fetch_sub(bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        if let Err(error) = self
+            .parent
+            .try_reserve_native(bytes, subsystem, operation, hint)
+        {
+            self.retained
+                .fetch_sub(bytes as u64, std::sync::atomic::Ordering::SeqCst);
             #[cfg(all(test, feature = "test-seams"))]
-            crate::database::retained_trace_ownership_tests::ordered_cut("child-reserve-refusal",
-                [native_child_identity(&self.parent, &self.retained, self as *const Self as usize), bytes,
-                 self.parent.retained.load(std::sync::atomic::Ordering::SeqCst) as usize, 0, 0, 0, 0, 0]);
+            crate::database::retained_trace_ownership_tests::ordered_cut(
+                "child-reserve-refusal",
+                [
+                    native_child_identity(
+                        &self.parent,
+                        &self.retained,
+                        self as *const Self as usize,
+                    ),
+                    bytes,
+                    self.parent
+                        .retained
+                        .load(std::sync::atomic::Ordering::SeqCst) as usize,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            );
             #[cfg(any(test, feature = "test-seams"))]
             _capture.refused();
             return Err(error);
         }
         // Both real owner admissions succeeded. Observe that exact debit;
         // a refusal rolls back above and never enters this component.
-        self.parent.live_child_payload_bytes.fetch_add(
-            bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        self.parent
+            .live_child_payload_bytes
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst);
         let held = previous + bytes as u64;
         self.parent
             .file_child_high_water
@@ -737,8 +906,12 @@ impl ReadMemoryBudget for NativeDeclaredChild {
     ) -> Result<()> {
         #[cfg(all(test, feature = "test-seams"))]
         crate::database::ordinary_native_owner_tests::child_counter(
-            &self.parent, self as *const Self as usize, &self.retained,
-            self.operation_limit.load(std::sync::atomic::Ordering::SeqCst));
+            &self.parent,
+            self as *const Self as usize,
+            &self.retained,
+            self.operation_limit
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
         #[cfg(any(test, feature = "test-seams"))]
         let _capture = statement_child_proof::ChildCall::new(
             &self.parent,
@@ -754,26 +927,54 @@ impl ReadMemoryBudget for NativeDeclaredChild {
         let previous = self.try_count(bytes).map_err(|held| {
             #[cfg(any(test, feature = "test-seams"))]
             _capture.refused();
-            let limit = self.operation_limit.load(std::sync::atomic::Ordering::SeqCst);
-            let control = ReadMemoryOwner::native_layout::<Self, NativeChildInvoice>().size() as u64;
-            reader_memory_refusal(limit, held.saturating_add(control), bytes, subsystem, operation, hint)
+            let limit = self
+                .operation_limit
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let control =
+                ReadMemoryOwner::native_layout::<Self, NativeChildInvoice>().size() as u64;
+            reader_memory_refusal(
+                limit,
+                held.saturating_add(control),
+                bytes,
+                subsystem,
+                operation,
+                hint,
+            )
         })?;
         #[cfg(any(test, feature = "test-seams"))]
         let _forward = _capture.forwarding();
         if let Err(error) = self.parent.try_reserve(bytes, subsystem, operation, hint) {
-            self.retained.fetch_sub(bytes as u64, std::sync::atomic::Ordering::SeqCst);
+            self.retained
+                .fetch_sub(bytes as u64, std::sync::atomic::Ordering::SeqCst);
             #[cfg(all(test, feature = "test-seams"))]
-            crate::database::retained_trace_ownership_tests::ordered_cut("child-reserve-refusal",
-                [native_child_identity(&self.parent, &self.retained, self as *const Self as usize), bytes,
-                 self.parent.retained.load(std::sync::atomic::Ordering::SeqCst) as usize, 0, 0, 0, 0, 0]);
+            crate::database::retained_trace_ownership_tests::ordered_cut(
+                "child-reserve-refusal",
+                [
+                    native_child_identity(
+                        &self.parent,
+                        &self.retained,
+                        self as *const Self as usize,
+                    ),
+                    bytes,
+                    self.parent
+                        .retained
+                        .load(std::sync::atomic::Ordering::SeqCst) as usize,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            );
             #[cfg(any(test, feature = "test-seams"))]
             _capture.refused();
             return Err(error);
         }
         // Both real owner admissions succeeded. Observe that exact debit;
         // a refusal rolls back above and never enters this component.
-        self.parent.live_child_payload_bytes.fetch_add(
-            bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        self.parent
+            .live_child_payload_bytes
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst);
         let held = previous + bytes as u64;
         self.parent
             .file_child_high_water
@@ -797,12 +998,21 @@ impl ReadMemoryBudget for NativeDeclaredChild {
         );
         #[cfg(all(test, feature = "test-seams"))]
         crate::database::retained_trace_ownership_tests::ordered_child_release(
-            false, native_child_identity(&self.parent, &self.retained, self as *const Self as usize), bytes);
-        let _before = self.retained
+            false,
+            native_child_identity(&self.parent, &self.retained, self as *const Self as usize),
+            bytes,
+        );
+        let _before = self
+            .retained
             .fetch_sub(bytes as u64, std::sync::atomic::Ordering::SeqCst);
-        let payload_before = self.parent.live_child_payload_bytes.fetch_sub(
-            bytes as u64, std::sync::atomic::Ordering::SeqCst);
-        assert!(payload_before >= bytes as u64, "reader payload observation underflow");
+        let payload_before = self
+            .parent
+            .live_child_payload_bytes
+            .fetch_sub(bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            payload_before >= bytes as u64,
+            "reader payload observation underflow"
+        );
         #[cfg(any(test, feature = "test-seams"))]
         self.note_reader_budget_event("", "release", bytes, _before - bytes as u64);
         #[cfg(any(test, feature = "test-seams"))]
@@ -810,7 +1020,10 @@ impl ReadMemoryBudget for NativeDeclaredChild {
         self.parent.release(bytes);
         #[cfg(all(test, feature = "test-seams"))]
         crate::database::retained_trace_ownership_tests::ordered_child_release(
-            true, native_child_identity(&self.parent, &self.retained, self as *const Self as usize), bytes);
+            true,
+            native_child_identity(&self.parent, &self.retained, self as *const Self as usize),
+            bytes,
+        );
     }
 }
 fn reader_memory_refusal(
@@ -882,12 +1095,19 @@ pub fn take_reader_budget_ledger_for_test() -> Vec<crate::memory_accounting::Bud
 // Refine the real admitted event at the storage producer, rather than
 // infer body identity from an incidental numerical request size.
 #[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn note_reader_body_admission_for_test(bytes: usize, row: contextdb_core::RowId,
-    created: contextdb_core::TxId, lsn: contextdb_core::Lsn) {
+pub(crate) fn note_reader_body_admission_for_test(
+    bytes: usize,
+    row: contextdb_core::RowId,
+    created: contextdb_core::TxId,
+    lsn: contextdb_core::Lsn,
+) {
     READER_BUDGET_LEDGER.with(|ledger| {
         if let Some(events) = ledger.borrow_mut().as_mut() {
-            if let Some(event) = events.last_mut().filter(|event|
-                event.owner_identity != event.parent_identity && event.bytes == bytes && event.what != "release") {
+            if let Some(event) = events.last_mut().filter(|event| {
+                event.owner_identity != event.parent_identity
+                    && event.bytes == bytes
+                    && event.what != "release"
+            }) {
                 event.what = "vector_store/load_raw_vector_candidate".into();
                 event.row_identity = Some((row.0, created.0, lsn.0));
             }
@@ -895,12 +1115,17 @@ pub(crate) fn note_reader_body_admission_for_test(bytes: usize, row: contextdb_c
     });
 }
 #[cfg(any(test, feature = "test-seams"))]
-pub(crate) fn note_reader_container_allocation_for_test(bytes: usize, pointer: usize,
-    capacity: usize, element_bytes: usize) {
+pub(crate) fn note_reader_container_allocation_for_test(
+    bytes: usize,
+    pointer: usize,
+    capacity: usize,
+    element_bytes: usize,
+) {
     READER_BUDGET_LEDGER.with(|ledger| {
         if let Some(events) = ledger.borrow_mut().as_mut() {
-            if let Some(event) = events.last_mut().filter(|event|
-                event.owner_identity != event.parent_identity && event.bytes == bytes) {
+            if let Some(event) = events.last_mut().filter(|event| {
+                event.owner_identity != event.parent_identity && event.bytes == bytes
+            }) {
                 event.allocation = Some((pointer, capacity, element_bytes));
             }
         }
@@ -962,7 +1187,9 @@ impl ReadMemoryBudget for DeclaredReadMemory {
             root_observations::before_allocation(token, self, layout);
         }
     }
-    fn native_reserve_supported(&self) -> bool { true }
+    fn native_reserve_supported(&self) -> bool {
+        true
+    }
     fn try_reserve_native(
         &self,
         bytes: usize,
@@ -990,7 +1217,9 @@ impl ReadMemoryBudget for DeclaredReadMemory {
                 hint,
             });
         #[cfg(any(test, feature = "test-seams"))]
-        if result.is_err() { _capture.refused(); }
+        if result.is_err() {
+            _capture.refused();
+        }
         #[cfg(any(test, feature = "test-seams"))]
         if let Some(witnesses) = NATIVE_ADMISSIONS
             .lock()
@@ -1038,7 +1267,14 @@ impl ReadMemoryBudget for DeclaredReadMemory {
         self.try_count(bytes).map_err(|held| {
             #[cfg(any(test, feature = "test-seams"))]
             _capture.refused();
-            reader_memory_refusal(self.effective_limit(), held, bytes, subsystem, operation, hint)
+            reader_memory_refusal(
+                self.effective_limit(),
+                held,
+                bytes,
+                subsystem,
+                operation,
+                hint,
+            )
         })?;
         #[cfg(any(test, feature = "test-seams"))]
         READER_BUDGET_LEDGER.with(|ledger| {
@@ -1046,8 +1282,10 @@ impl ReadMemoryBudget for DeclaredReadMemory {
                 entries.push(crate::memory_accounting::BudgetLedgerEntry {
                     what: format!("{subsystem}/{operation}"),
                     bytes,
-                    used_after: usize::try_from(self.retained.load(std::sync::atomic::Ordering::SeqCst))
-                        .unwrap_or(usize::MAX),
+                    used_after: usize::try_from(
+                        self.retained.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                    .unwrap_or(usize::MAX),
                     owner_identity: self as *const Self as usize,
                     parent_identity: self as *const Self as usize,
                     row_identity: None,
@@ -1089,12 +1327,18 @@ impl ReadMemoryBudget for DeclaredReadMemory {
     }
 }
 impl DeclaredReadRoot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn request_budget_owner(&self) -> Result<RequestReadOwner> {
         self.native_child_unqualified()
             .map(RequestReadOwner::native)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn request_budget_owner_native(
         &self,
     ) -> std::result::Result<RequestReadOwner, RequestOwnerFailure> {
@@ -1117,14 +1361,21 @@ struct ReaderAclCacheBudget {
     parent: DeclaredReadRoot,
 }
 impl ReadMemoryBudget for ReaderAclCacheBudget {
-    fn native_reserve_supported(&self) -> bool { true }
+    fn native_reserve_supported(&self) -> bool {
+        true
+    }
     fn try_reserve_native(
-        &self, bytes: usize, subsystem: &'static str,
-        operation: &'static str, hint: &'static str,
+        &self,
+        bytes: usize,
+        subsystem: &'static str,
+        operation: &'static str,
+        hint: &'static str,
     ) -> std::result::Result<(), NativeRefusal> {
-        self.parent.try_reserve_native(bytes, subsystem, operation, hint)?;
-        self.parent.live_acl_cache_bytes.fetch_add(
-            bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        self.parent
+            .try_reserve_native(bytes, subsystem, operation, hint)?;
+        self.parent
+            .live_acl_cache_bytes
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -1157,8 +1408,9 @@ struct ReaderAclCacheInvoice {
 }
 impl Drop for ReaderAclCacheInvoice {
     fn drop(&mut self) {
-        self.parent.live_acl_cache_bytes.fetch_sub(
-            self.bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        self.parent
+            .live_acl_cache_bytes
+            .fetch_sub(self.bytes as u64, std::sync::atomic::Ordering::SeqCst);
         self.parent.release(self.bytes);
     }
 }
@@ -1178,9 +1430,14 @@ impl DeclaredReadChildObserver {
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn retain_original_for_physical_test(&self) -> Option<ReadMemoryOwner> {
         let source = {
-            let registry = native_child_observers().lock().unwrap_or_else(|e| e.into_inner());
-            registry.get_generation(self.owner_identity, self.native_generation)?
-                .forwarder.as_ref()?.upgrade()?
+            let registry = native_child_observers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            registry
+                .get_generation(self.owner_identity, self.native_generation)?
+                .forwarder
+                .as_ref()?
+                .upgrade()?
         };
         Some(source.original_native_owner())
     }
@@ -1192,29 +1449,41 @@ impl DeclaredReadChildObserver {
     // retired child. The pointer itself carries no lifetime or ownership.
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn physical_funding_counter_for_test(&self) -> usize {
-        let registry = native_child_observers().lock().unwrap_or_else(|e| e.into_inner());
-        let record = registry.get_generation(self.owner_identity, self.native_generation)
+        let registry = native_child_observers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let record = registry
+            .get_generation(self.owner_identity, self.native_generation)
             .expect("physical observation generation invalidated");
-        assert!(record.alive && record.counter != 0,
-            "physical observation requires a pinned live original child");
+        assert!(
+            record.alive && record.counter != 0,
+            "physical observation requires a pinned live original child"
+        );
         record.counter
     }
     pub(crate) fn sample(&self) -> crate::read_work_probe::DeclaredReadChildFunding {
         use std::sync::atomic::Ordering;
-        let mut registry = native_child_observers().lock().unwrap_or_else(|e| e.into_inner());
-        let record = registry.get_generation_mut(self.owner_identity, self.native_generation)
+        let mut registry = native_child_observers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let record = registry
+            .get_generation_mut(self.owner_identity, self.native_generation)
             .expect("child observation generation retired; proof invalidated");
         if record.alive {
             assert_ne!(record.counter, 0, "real child counter not bound");
             // SAFETY: child Drop invalidates under this same mutex before free.
-            record.last_charged = unsafe { &*(record.counter as *const std::sync::atomic::AtomicU64) }
-                .load(Ordering::SeqCst);
+            record.last_charged =
+                unsafe { &*(record.counter as *const std::sync::atomic::AtomicU64) }
+                    .load(Ordering::SeqCst);
         }
         let (parent_alive, _, parent_charged_bytes) = root_observations::sample(self.parent);
         crate::read_work_probe::DeclaredReadChildFunding {
-            owner_identity: self.owner_identity, alive: record.alive,
+            owner_identity: self.owner_identity,
+            alive: record.alive,
             charged_bytes: record.last_charged,
-            parent_identity: self.parent_identity, parent_alive, parent_charged_bytes,
+            parent_identity: self.parent_identity,
+            parent_alive,
+            parent_charged_bytes,
         }
     }
 }
@@ -1225,7 +1494,9 @@ pub(crate) fn declared_child_observer(
     native_observer(observed_reader_identity(read_memory))
 }
 #[cfg(all(test, feature = "test-seams"))]
-pub(crate) fn original_child_observer_for_test(identity: usize) -> Option<DeclaredReadChildObserver> {
+pub(crate) fn original_child_observer_for_test(
+    identity: usize,
+) -> Option<DeclaredReadChildObserver> {
     native_observer(identity)
 }
 
@@ -1248,18 +1519,28 @@ impl NativePhysicalPin {
     pub fn counter(&self) -> crate::read_work_probe::allocator_events::FundingCounter<'_> {
         // SAFETY: clone the genuine in-block owner that contains this counter.
         // A forgotten watch must retain the owner even after this borrow ends.
-        unsafe { crate::read_work_probe::allocator_events::FundingCounter::from_native_pinned(
-            self.observer.physical_funding_counter_for_test(), self._owner.clone()) }
+        unsafe {
+            crate::read_work_probe::allocator_events::FundingCounter::from_native_pinned(
+                self.observer.physical_funding_counter_for_test(),
+                self._owner.clone(),
+            )
+        }
     }
 }
 #[cfg(any(test, feature = "test-seams"))]
 impl ParentPhysicalPin {
     pub fn counter(&self) -> crate::read_work_probe::allocator_events::FundingCounter<'_> {
         // SAFETY: the cloned original parent contains this retained counter.
-        unsafe { crate::read_work_probe::allocator_events::FundingCounter::from_parent_pinned(
-            &self.0.retained as *const _ as usize, self.0.clone()) }
+        unsafe {
+            crate::read_work_probe::allocator_events::FundingCounter::from_parent_pinned(
+                &self.0.retained as *const _ as usize,
+                self.0.clone(),
+            )
+        }
     }
-    pub fn charged_bytes(&self) -> u64 { self.0.retained_bytes_for_test() }
+    pub fn charged_bytes(&self) -> u64 {
+        self.0.retained_bytes_for_test()
+    }
 }
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
@@ -1270,15 +1551,25 @@ pub fn pin_original_native_for_test(
     owner: &ReadMemoryOwner,
 ) -> Option<(NativePhysicalPin, ParentPhysicalPin)> {
     use crate::read_work_probe::allocator_events as events;
-    let Some(actual) = native.block.actual_request else { events::fail(events::MISSING); return None; };
+    let Some(actual) = native.block.actual_request else {
+        events::fail(events::MISSING);
+        return None;
+    };
     let request = window.live_request(native.payload).ok()?;
     if (request.pointer, request.bytes, request.align) != actual
-        || request.ordinal != native.block.ordinal || request.pointer != native.owner {
-        events::fail(events::STALE); return None;
+        || request.ordinal != native.block.ordinal
+        || request.pointer != native.owner
+    {
+        events::fail(events::STALE);
+        return None;
     }
-    let Some(observer) = native_observer(native.owner) else { events::fail(events::MISSING); return None; };
+    let Some(observer) = native_observer(native.owner) else {
+        events::fail(events::MISSING);
+        return None;
+    };
     if !owner.is_native() || owner.accounting_identity() != native.owner {
-        events::fail(events::STALE); return None;
+        events::fail(events::STALE);
+        return None;
     }
     // A scalar registry token cannot promote a retired native root. The
     // fixture supplies its genuine original strong capability; validate it
@@ -1286,10 +1577,18 @@ pub fn pin_original_native_for_test(
     if observer.physical_funding_counter_for_test() != native.counter
         || parent.as_ref() as *const _ as usize != native.parent
         || observer.parent_identity != native.parent
-        || &parent.retained as *const _ as usize != native.parent_counter {
-        events::fail(events::STALE); return None;
+        || &parent.retained as *const _ as usize != native.parent_counter
+    {
+        events::fail(events::STALE);
+        return None;
     }
-    Some((NativePhysicalPin { _owner: owner.clone(), observer }, ParentPhysicalPin(parent.clone())))
+    Some((
+        NativePhysicalPin {
+            _owner: owner.clone(),
+            observer,
+        },
+        ParentPhysicalPin(parent.clone()),
+    ))
 }
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -1321,99 +1620,195 @@ struct NativeChildObservers {
 #[cfg(any(test, feature = "test-seams"))]
 impl NativeChildObservers {
     fn get(&self, identity: &usize) -> Option<&NativeChildObservation> {
-        self.slots.iter().flatten().find(|r| r.alive && r.identity == *identity)
+        self.slots
+            .iter()
+            .flatten()
+            .find(|r| r.alive && r.identity == *identity)
     }
     fn get_mut(&mut self, identity: &usize) -> Option<&mut NativeChildObservation> {
-        self.slots.iter_mut().flatten().find(|r| r.alive && r.identity == *identity)
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find(|r| r.alive && r.identity == *identity)
     }
     fn iter(&self) -> impl Iterator<Item = (&usize, &NativeChildObservation)> {
-        self.slots.iter().flatten().filter(|r| r.alive).map(|r| (&r.identity, r))
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|r| r.alive)
+            .map(|r| (&r.identity, r))
     }
     fn get_generation(&self, identity: usize, generation: u64) -> Option<&NativeChildObservation> {
-        self.slots.iter().flatten().find(|r| r.identity == identity && r.generation == generation)
+        self.slots
+            .iter()
+            .flatten()
+            .find(|r| r.identity == identity && r.generation == generation)
     }
-    fn get_generation_mut(&mut self, identity: usize, generation: u64) -> Option<&mut NativeChildObservation> {
-        self.slots.iter_mut().flatten().find(|r| r.identity == identity && r.generation == generation)
+    fn get_generation_mut(
+        &mut self,
+        identity: usize,
+        generation: u64,
+    ) -> Option<&mut NativeChildObservation> {
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find(|r| r.identity == identity && r.generation == generation)
     }
     fn retire(&mut self, identity: usize, held: u64) {
-        let record = self.get_mut(&identity).expect("child retirement lost its original record");
-        assert!(record.forwarder.is_none() && record.forwarder_identity == 0,
-            "child payload cannot retire before its forwarding weak tail");
+        let record = self
+            .get_mut(&identity)
+            .expect("child retirement lost its original record");
+        assert!(
+            record.forwarder.is_none() && record.forwarder_identity == 0,
+            "child payload cannot retire before its forwarding weak tail"
+        );
         record.last_charged = held;
         record.counter = 0;
         record.alive = false;
     }
     fn insert(&mut self, mut record: NativeChildObservation) {
-        assert!(self.get(&record.identity).is_none(), "duplicate native observer invalidates proof");
-        let index = self.slots.iter().position(Option::is_none).or_else(||
-            self.slots.iter().enumerate().filter_map(|(i, r)|
-                r.as_ref().filter(|r| !r.alive).map(|r| (i, r.generation)))
-                .min_by_key(|(_, generation)| *generation).map(|(i, _)| i))
+        assert!(
+            self.get(&record.identity).is_none(),
+            "duplicate native observer invalidates proof"
+        );
+        let index = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .or_else(|| {
+                self.slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| r.as_ref().filter(|r| !r.alive).map(|r| (i, r.generation)))
+                    .min_by_key(|(_, generation)| *generation)
+                    .map(|(i, _)| i)
+            })
             .expect("native observer static capacity exhausted; proof invalid");
-        self.generation = self.generation.checked_add(1).expect("native observer generation exhausted");
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("native observer generation exhausted");
         record.generation = self.generation;
         self.slots[index] = Some(record);
     }
 }
 #[cfg(any(test, feature = "test-seams"))]
 fn native_child_observers() -> &'static std::sync::Mutex<NativeChildObservers> {
-    static REGISTRY: std::sync::Mutex<NativeChildObservers> = std::sync::Mutex::new(
-        NativeChildObservers { slots: [const { None }; 64], generation: 0 });
+    static REGISTRY: std::sync::Mutex<NativeChildObservers> =
+        std::sync::Mutex::new(NativeChildObservers {
+            slots: [const { None }; 64],
+            generation: 0,
+        });
     &REGISTRY
 }
 #[cfg(any(test, feature = "test-seams"))]
-fn register_native_child_observer(parent: &DeclaredReadRoot, owner: &ReadMemoryOwner,
-    child: &NativeDeclaredChild, request_before: usize, initial_held: u64) {
+fn register_native_child_observer(
+    parent: &DeclaredReadRoot,
+    owner: &ReadMemoryOwner,
+    child: &NativeDeclaredChild,
+    request_before: usize,
+    initial_held: u64,
+) {
     // Active and inactive observation both allocate nothing. No strong owner
     // or invoice enters this registry, including during first registration.
     if statement_child_proof::limit(parent).is_none()
-        && !READER_BUDGET_LEDGER.with(|ledger| ledger.borrow().is_some()) { return; }
+        && !READER_BUDGET_LEDGER.with(|ledger| ledger.borrow().is_some())
+    {
+        return;
+    }
     // Charge-only ledgers remain useful without an observing allocator, but
     // their roots carry no physical evidence for a child consumer to sample.
-    if parent.observation.is_none_or(|token| !root_observations::has_evidence(token)) { return; }
+    if parent
+        .observation
+        .is_none_or(|token| !root_observations::has_evidence(token))
+    {
+        return;
+    }
     let identity = owner.accounting_identity();
     let bytes = ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
-    native_child_observers().lock().unwrap_or_else(|e| e.into_inner()).insert(
-        NativeChildObservation { identity, generation: 0, parent: parent.observation.expect("original root observation"),
-            parent_identity: parent.as_ref() as *const _ as usize, bytes,
+    native_child_observers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(NativeChildObservation {
+            identity,
+            generation: 0,
+            parent: parent.observation.expect("original root observation"),
+            parent_identity: parent.as_ref() as *const _ as usize,
+            bytes,
             counter: &child.retained as *const _ as usize,
             payload_identity: child as *const _ as usize,
-            forwarder_identity: 0, forwarder: None,
-            alive: true, last_charged: initial_held, native: true });
-    statement_child_proof::native_created(parent, identity, bytes, request_before, initial_held, child);
+            forwarder_identity: 0,
+            forwarder: None,
+            alive: true,
+            last_charged: initial_held,
+            native: true,
+        });
+    statement_child_proof::native_created(
+        parent,
+        identity,
+        bytes,
+        request_before,
+        initial_held,
+        child,
+    );
 }
 #[cfg(any(test, feature = "test-seams"))]
-fn native_child_identity(parent: &DeclaredReadMemory, counter: &std::sync::atomic::AtomicU64, fallback: usize) -> usize {
+fn native_child_identity(
+    parent: &DeclaredReadMemory,
+    counter: &std::sync::atomic::AtomicU64,
+    fallback: usize,
+) -> usize {
     let address = counter as *const _ as usize;
-    let mut registry = native_child_observers().lock().unwrap_or_else(|e| e.into_inner());
-    for record in registry.slots.iter_mut().flatten().filter(|r| r.alive && r.native) {
+    let mut registry = native_child_observers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for record in registry
+        .slots
+        .iter_mut()
+        .flatten()
+        .filter(|r| r.alive && r.native)
+    {
         let identity = record.identity;
         // Bind the actual counter supplied by NativeDeclaredChild, using the
         // genuine allocator block bounds, never an assumed payload offset.
-        if address >= identity && address.checked_add(std::mem::size_of_val(counter))
-            .is_some_and(|end| end <= identity + record.bytes)
+        if address >= identity
+            && address
+                .checked_add(std::mem::size_of_val(counter))
+                .is_some_and(|end| end <= identity + record.bytes)
         {
-            assert_eq!(record.parent_identity, parent as *const _ as usize,
-                "foreign parent in native observer invalidates proof");
+            assert_eq!(
+                record.parent_identity, parent as *const _ as usize,
+                "foreign parent in native observer invalidates proof"
+            );
             assert!(record.counter == 0 || record.counter == address);
             assert!(fallback >= identity && fallback < identity + record.bytes);
             record.counter = address;
             record.payload_identity = fallback;
-            statement_child_proof::native_forwarder(parent, identity, fallback, address,
-                record.forwarder_identity);
+            statement_child_proof::native_forwarder(
+                parent,
+                identity,
+                fallback,
+                address,
+                record.forwarder_identity,
+            );
             return identity;
         }
     }
-    assert!(!statement_child_proof::expects_native_address(parent, address),
-        "selected native counter missing original registry entry");
+    assert!(
+        !statement_child_proof::expects_native_address(parent, address),
+        "selected native counter missing original registry entry"
+    );
     fallback
 }
 #[cfg(any(test, feature = "test-seams"))]
 fn unregister_native_child_observer(counter: &std::sync::atomic::AtomicU64) -> Option<usize> {
     let address = counter as *const _ as usize;
-    let mut registry = native_child_observers().lock().unwrap_or_else(|e| e.into_inner());
-    let identity = registry.iter().find_map(|(&identity, record)|
-        (address >= identity && address < identity + record.bytes).then_some(identity));
+    let mut registry = native_child_observers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let identity = registry.iter().find_map(|(&identity, record)| {
+        (address >= identity && address < identity + record.bytes).then_some(identity)
+    });
     if let Some(identity) = identity {
         registry.retire(identity, counter.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -1421,28 +1816,51 @@ fn unregister_native_child_observer(counter: &std::sync::atomic::AtomicU64) -> O
 }
 #[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn register_native_forwarder<T: NativeOriginalPinSource + 'static>(
-    identity: usize, forwarder: &Arc<T>)
-{
-    let mut registry = native_child_observers().lock().unwrap_or_else(|e| e.into_inner());
+    identity: usize,
+    forwarder: &Arc<T>,
+) {
+    let mut registry = native_child_observers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if statement_child_proof::selected_native(identity) {
-        assert!(registry.get(&identity).is_some(), "selected native forwarder missing original record");
+        assert!(
+            registry.get(&identity).is_some(),
+            "selected native forwarder missing original record"
+        );
     }
     if let Some(record) = registry.get_mut(&identity) {
-        assert_eq!(record.forwarder_identity, 0, "duplicate native forwarder invalidates proof");
-        assert_ne!(record.counter, 0, "real adapter admissions must bind the native counter");
+        assert_eq!(
+            record.forwarder_identity, 0,
+            "duplicate native forwarder invalidates proof"
+        );
+        assert_ne!(
+            record.counter, 0,
+            "real adapter admissions must bind the native counter"
+        );
         record.forwarder_identity = Arc::as_ptr(forwarder) as usize;
         let erased: Arc<dyn NativeOriginalPinSource> = forwarder.clone();
         record.forwarder = Some(Arc::downgrade(&erased));
-        root_observations::with_live(record.parent, |parent|
-            statement_child_proof::native_forwarder(parent, identity,
-                record.payload_identity, record.counter, record.forwarder_identity));
+        root_observations::with_live(record.parent, |parent| {
+            statement_child_proof::native_forwarder(
+                parent,
+                identity,
+                record.payload_identity,
+                record.counter,
+                record.forwarder_identity,
+            )
+        });
     }
 }
 #[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn unregister_native_forwarder(identity: usize) {
-    let mut registry = native_child_observers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut registry = native_child_observers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if statement_child_proof::selected_native(identity) {
-        assert!(registry.get(&identity).is_some(), "selected native retirement missing original record");
+        assert!(
+            registry.get(&identity).is_some(),
+            "selected native retirement missing original record"
+        );
     }
     if let Some(record) = registry.get_mut(&identity) {
         record.forwarder = None;
@@ -1454,19 +1872,28 @@ pub(crate) fn unregister_native_forwarder(identity: usize) {
 }
 #[cfg(any(test, feature = "test-seams"))]
 fn native_observer(identity: usize) -> Option<DeclaredReadChildObserver> {
-    let registry = native_child_observers().lock().unwrap_or_else(|e| e.into_inner());
+    let registry = native_child_observers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let record = registry.get(&identity)?;
     Some(DeclaredReadChildObserver {
         native_generation: record.generation,
-        parent: record.parent, owner_identity: identity,
+        parent: record.parent,
+        owner_identity: identity,
         parent_identity: record.parent_identity,
     })
 }
 #[cfg(any(test, feature = "test-seams"))]
 pub(crate) fn observed_identity(identity: usize) -> usize {
-    let registry = native_child_observers().lock().unwrap_or_else(|e| e.into_inner());
-    registry.iter().find_map(|(&native, record)|
-        (record.forwarder_identity != 0 && record.forwarder_identity == identity).then_some(native))
+    let registry = native_child_observers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry
+        .iter()
+        .find_map(|(&native, record)| {
+            (record.forwarder_identity != 0 && record.forwarder_identity == identity)
+                .then_some(native)
+        })
         .unwrap_or(identity)
 }
 #[cfg(any(test, feature = "test-seams"))]
@@ -1518,7 +1945,11 @@ pub(crate) mod native_ownership_proof {
     }
     fn sample(parent: &root_observations::Token) -> Sample {
         let (alive, controls, retained) = root_observations::sample(*parent);
-        Sample { alive, controls, retained }
+        Sample {
+            alive,
+            controls,
+            retained,
+        }
     }
     fn layout() -> Layout {
         ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>()
@@ -1571,8 +2002,15 @@ pub(crate) mod native_ownership_proof {
                 if selected == (request.size(), request.align()) {
                     if REFUSE_LAYOUT_SKIP.with(|skip| {
                         let remaining = skip.get();
-                        if remaining == 0 { false } else { skip.set(remaining - 1); true }
-                    }) { return false; }
+                        if remaining == 0 {
+                            false
+                        } else {
+                            skip.set(remaining - 1);
+                            true
+                        }
+                    }) {
+                        return false;
+                    }
                     armed.set((0, 0));
                     true
                 } else {
@@ -1692,8 +2130,9 @@ pub(crate) mod native_ownership_proof {
         let layout = native_control_layouts_for_test().0;
         let bytes = layout.size() as u64;
         for limit in [0, bytes - 1] {
-            let (refused, _, count) = oracle::native_requests_for_test(||
-                DeclaredReadMemory::try_from_reader_limit(limit));
+            let (refused, _, count) = oracle::native_requests_for_test(|| {
+                DeclaredReadMemory::try_from_reader_limit(limit)
+            });
             assert_eq!(count, 0, "root refusal must precede all allocator requests");
             assert!(matches!(refused, Err(NativeRefusal::MemoryBudgetExceeded {
                 subsystem: "reader", operation: "query_root", requested_bytes,
@@ -1702,17 +2141,26 @@ pub(crate) mod native_ownership_proof {
                 && budget_limit_bytes == limit as usize));
         }
         arm_refuse_one_live_layout(layout);
-        let (refused, _, count) = oracle::native_requests_for_test(||
-            DeclaredReadMemory::try_from_reader_limit(bytes));
-        assert!(!refusal_armed_for_test(), "root null control must reach its actual allocator");
+        let (refused, _, count) =
+            oracle::native_requests_for_test(|| DeclaredReadMemory::try_from_reader_limit(bytes));
+        assert!(
+            !refusal_armed_for_test(),
+            "root null control must reach its actual allocator"
+        );
         assert_eq!(count, 0, "null attempt creates no physical allocation");
-        assert!(matches!(refused, Err(NativeRefusal::AllocatorFailed { layout: actual, .. })
-            if actual == layout));
+        assert!(
+            matches!(refused, Err(NativeRefusal::AllocatorFailed { layout: actual, .. })
+            if actual == layout)
+        );
         root_observations::assert_null_terminal_retired();
         for unwind in [false, true] {
-            let (root, requests, count) = oracle::native_requests_for_test(||
-                DeclaredReadMemory::try_from_reader_limit(bytes).unwrap());
-            assert_eq!(count, 1, "root plus terminal invoice is exactly one actual request");
+            let (root, requests, count) = oracle::native_requests_for_test(|| {
+                DeclaredReadMemory::try_from_reader_limit(bytes).unwrap()
+            });
+            assert_eq!(
+                count, 1,
+                "root plus terminal invoice is exactly one actual request"
+            );
             let token = root.observation.unwrap();
             let request = requests[0];
             assert_eq!(request.0, root.original_owner().accounting_identity());
@@ -1720,14 +2168,19 @@ pub(crate) mod native_ownership_proof {
             assert_eq!(root.standing_control_bytes(), (0, bytes));
             let alias = root.clone();
             drop(root);
-            assert!(root_observations::sample(token).0, "same original alias keeps root alive");
+            assert!(
+                root_observations::sample(token).0,
+                "same original alias keeps root alive"
+            );
             if unwind {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _last = alias;
                     panic!("root alias unwind");
                 }));
                 assert!(result.is_err());
-            } else { drop(alias); }
+            } else {
+                drop(alias);
+            }
             root_observations::assert_terminal_free(token);
         }
     }
@@ -1749,7 +2202,10 @@ pub(crate) mod native_ownership_proof {
             assert!(owner.same_owner(&clone));
             let mut credit =
                 ReadCredit::try_new_owned(clone, 17, "proof", "activation", "proof").unwrap();
-            assert_eq!(parent.standing_control_bytes(), (bytes, root_bytes + bytes + 17));
+            assert_eq!(
+                parent.standing_control_bytes(),
+                (bytes, root_bytes + bytes + 17)
+            );
             assert!(credit.try_grow_for(1, "proof", "refusal", "proof").is_err());
             assert_eq!(credit.bytes(), 17);
             assert!(credit.try_split_off(18).is_err());
@@ -1758,7 +2214,8 @@ pub(crate) mod native_ownership_proof {
             assert_eq!(credit.bytes(), 10);
             credit.try_merge_prepaid(split).unwrap();
             assert_eq!(credit.bytes(), 17);
-            let other_parent = DeclaredReadMemory::from_reader_limit(root_bytes + bytes + 3).unwrap();
+            let other_parent =
+                DeclaredReadMemory::from_reader_limit(root_bytes + bytes + 3).unwrap();
             let other = acquire(&other_parent);
             assert!(!owner.same_owner(&other));
             let other_credit =
@@ -1767,7 +2224,10 @@ pub(crate) mod native_ownership_proof {
             assert_eq!(credit.bytes(), 17);
             assert_eq!(other_parent.standing_control_bytes(), (0, root_bytes));
             drop(owner);
-            assert_eq!(parent.standing_control_bytes(), (bytes, root_bytes + bytes + 17));
+            assert_eq!(
+                parent.standing_control_bytes(),
+                (bytes, root_bytes + bytes + 17)
+            );
             if external_drop {
                 drop(parent);
                 assert!(root_observations::sample(lifetime).0);
@@ -1793,7 +2253,10 @@ pub(crate) mod native_ownership_proof {
             ReadCredit::try_new_owned(other, 2, "proof", "same-parent-other", "proof").unwrap();
         assert!(credit.try_merge_prepaid(other_credit).is_err());
         assert_eq!(credit.bytes(), 3);
-        assert_eq!(parent.standing_control_bytes(), (bytes, root_bytes + bytes + 3));
+        assert_eq!(
+            parent.standing_control_bytes(),
+            (bytes, root_bytes + bytes + 3)
+        );
         drop(credit);
         assert_freed(&finish());
         assert_eq!(parent.standing_control_bytes(), (0, root_bytes));
@@ -1809,11 +2272,19 @@ pub(crate) mod native_ownership_proof {
         #[derive(Debug, Default)]
         struct HostBudget(AtomicUsize);
         impl ReadMemoryBudget for HostBudget {
-            fn try_reserve(&self, bytes: usize, _: &'static str, _: &'static str,
-                _: &'static str) -> Result<()> {
-                self.0.fetch_add(bytes, Ordering::SeqCst); Ok(())
+            fn try_reserve(
+                &self,
+                bytes: usize,
+                _: &'static str,
+                _: &'static str,
+                _: &'static str,
+            ) -> Result<()> {
+                self.0.fetch_add(bytes, Ordering::SeqCst);
+                Ok(())
             }
-            fn release(&self, bytes: usize) { self.0.fetch_sub(bytes, Ordering::SeqCst); }
+            fn release(&self, bytes: usize) {
+                self.0.fetch_sub(bytes, Ordering::SeqCst);
+            }
         }
         let parent = DeclaredReadMemory::from_reader_limit(u64::MAX).unwrap();
         let child: Arc<dyn ReadMemoryBudget> = Arc::new(HostBudget::default());
@@ -1821,19 +2292,26 @@ pub(crate) mod native_ownership_proof {
         let request = provider.request_budget_owner().unwrap();
         match request.into_route() {
             RequestReadRoute::Legacy(actual) => assert!(Arc::ptr_eq(&actual, &child)),
-            RequestReadRoute::Native(_) => panic!("host provider's legacy capability must stay legacy"),
+            RequestReadRoute::Native(_) => {
+                panic!("host provider's legacy capability must stay legacy")
+            }
         }
         let owner = ReadMemoryOwner::from_legacy(child.clone());
         assert!(owner.same_owner(&ReadMemoryOwner::from_legacy(child.clone())));
         let native = acquire(&parent);
         assert!(!native.same_owner(&owner));
-        drop(native); drop(owner); drop(provider); drop(child);
+        drop(native);
+        drop(owner);
+        drop(provider);
+        drop(child);
         assert_eq!(parent.standing_control_bytes(), (0, root_bytes));
 
         // Original parent remains funded even when all external parent handles close.
         // Barriers make every contender own its credit before any contender releases it.
         for contenders in [2, 8] {
-            let parent = DeclaredReadMemory::from_reader_limit(root_bytes + bytes + contenders as u64).unwrap();
+            let parent =
+                DeclaredReadMemory::from_reader_limit(root_bytes + bytes + contenders as u64)
+                    .unwrap();
             let lifetime = parent.observation.expect("original root generation");
             begin(&parent, false);
             let owner = acquire(&parent);
@@ -2072,24 +2550,36 @@ pub mod statement_child_proof {
     #[cfg(feature = "test-seams")]
     pub(crate) fn funding_next(owner: &ReadMemoryOwner) {
         if let Some(original) = owner.original_native_owner_for_test()
-            && let Some(observer) = native_observer(original.accounting_identity()) {
+            && let Some(observer) = native_observer(original.accounting_identity())
+        {
             // Caller borrows the actual retained producer/invoice through the
             // immediately following allocator request. No observational alias.
             crate::read_work_probe::allocator_events::funding_next(
-                observer.physical_funding_counter_for_test());
+                observer.physical_funding_counter_for_test(),
+            );
         }
     }
     pub(crate) fn constructor_ordinal() -> usize {
         #[cfg(all(test, feature = "test-seams"))]
-        { crate::persistence::content_identity::proof_allocation_oracle_tests::last_request_for_test(false).2 }
+        {
+            crate::persistence::content_identity::proof_allocation_oracle_tests::last_request_for_test(false).2
+        }
         #[cfg(not(all(test, feature = "test-seams")))]
-        { crate::read_work_probe::allocator_events::constructor_ordinal() }
+        {
+            crate::read_work_probe::allocator_events::constructor_ordinal()
+        }
     }
-    pub(crate) fn control_allocation(payload: usize, layout: std::alloc::Layout,
-        _before: usize) -> ControlAllocation {
+    pub(crate) fn control_allocation(
+        payload: usize,
+        layout: std::alloc::Layout,
+        _before: usize,
+    ) -> ControlAllocation {
         #[allow(unused_mut)]
-        let mut capture = ControlAllocation { payload, layout: (layout.size(), layout.align()),
-            ..ControlAllocation::default() };
+        let mut capture = ControlAllocation {
+            payload,
+            layout: (layout.size(), layout.align()),
+            ..ControlAllocation::default()
+        };
         #[cfg(all(test, feature = "test-seams"))]
         {
             use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
@@ -2097,19 +2587,30 @@ pub mod statement_child_proof {
             let pointer = oracle::last_request_pointer_for_test();
             // No active allocator watch means UNKNOWN, not a fabricated request.
             if ordinal != _before {
-                assert_eq!(ordinal, _before.checked_add(1).expect("allocator ordinal overflow"),
-                    "constructor must add exactly one actual allocator request");
-                assert!(pointer != 0 && pointer <= payload
-                    && pointer.checked_add(bytes).is_some_and(|end| payload < end),
-                    "constructor payload must belong to the actual last request");
-                assert_eq!((bytes, align), capture.layout, "constructor request Layout mismatch");
+                assert_eq!(
+                    ordinal,
+                    _before.checked_add(1).expect("allocator ordinal overflow"),
+                    "constructor must add exactly one actual allocator request"
+                );
+                assert!(
+                    pointer != 0
+                        && pointer <= payload
+                        && pointer.checked_add(bytes).is_some_and(|end| payload < end),
+                    "constructor payload must belong to the actual last request"
+                );
+                assert_eq!(
+                    (bytes, align),
+                    capture.layout,
+                    "constructor request Layout mismatch"
+                );
                 capture.actual_request = Some((pointer, bytes, align));
                 capture.ordinal = ordinal;
             }
         }
         #[cfg(not(all(test, feature = "test-seams")))]
-        if let Some(request) = crate::read_work_probe::allocator_events::constructor_request(
-            _before, payload, layout) {
+        if let Some(request) =
+            crate::read_work_probe::allocator_events::constructor_request(_before, payload, layout)
+        {
             capture.actual_request = Some((request.pointer, request.bytes, request.align));
             capture.ordinal = request.ordinal;
         }
@@ -2133,15 +2634,21 @@ pub mod statement_child_proof {
     }
     fn reconcile_parent(sample: &mut Observation, actual: u64) {
         let identity = &sample.identity;
-        let expected = sample.parent_before as i128
-            + identity.target_last_held as i128 - identity.target_initial_held as i128
-            + identity.sibling_parent_net + identity.direct_parent_net + identity.target_control_parent_net;
+        let expected = sample.parent_before as i128 + identity.target_last_held as i128
+            - identity.target_initial_held as i128
+            + identity.sibling_parent_net
+            + identity.direct_parent_net
+            + identity.target_control_parent_net;
         sample.parent_equation = ParentEquation {
-            baseline: sample.parent_before, target_initial: identity.target_initial_held,
-            target_current: identity.target_last_held, target_forwarded_net: identity.target_parent_net,
+            baseline: sample.parent_before,
+            target_initial: identity.target_initial_held,
+            target_current: identity.target_last_held,
+            target_forwarded_net: identity.target_parent_net,
             target_control_net: identity.target_control_parent_net,
-            sibling_net: identity.sibling_parent_net, direct_net: identity.direct_parent_net,
-            expected, actual,
+            sibling_net: identity.sibling_parent_net,
+            direct_net: identity.direct_parent_net,
+            expected,
+            actual,
         };
         sample.complete_parent_expected = expected;
         sample.complete_parent_actual = actual;
@@ -2367,7 +2874,8 @@ pub mod statement_child_proof {
                     sample.refusals += usize::from(self.refused.get());
                     sample.single_child_parent_mismatches += usize::from(
                         self.parent.retained.load(Ordering::SeqCst)
-                            != sample.parent_before + self.context.control_bytes as u64 + held);
+                            != sample.parent_before + self.context.control_bytes as u64 + held,
+                    );
                     sample.identity.last_final_writer = Some(record);
                 }
                 let identity = &mut sample.identity;
@@ -2399,20 +2907,25 @@ pub mod statement_child_proof {
                         child_bytes: self.context.held,
                         parent_counter: &self.parent.retained as *const _ as usize,
                         parent_bytes: self.context.parent_held,
-                        live_child_controls: self.context.controls, acl_bytes: self.context.acl,
+                        live_child_controls: self.context.controls,
+                        acl_bytes: self.context.acl,
                     };
                     let after = ControlFunding {
-                        child_bytes: held, parent_bytes: record.parent_after,
-                        live_child_controls: record.live_controls_after, acl_bytes: record.acl_after,
+                        child_bytes: held,
+                        parent_bytes: record.parent_after,
+                        live_child_controls: record.live_controls_after,
+                        acl_bytes: record.acl_after,
                         ..before
                     };
                     match self.context.operation {
                         "native_adapter_keeper" => {
-                            controls.keeper_before = Some(before); controls.keeper_after = Some(after);
+                            controls.keeper_before = Some(before);
+                            controls.keeper_after = Some(after);
                             controls.keeper_refused = self.refused.get();
                         }
                         "native_adapter" => {
-                            controls.adapter_before = Some(before); controls.adapter_after = Some(after);
+                            controls.adapter_before = Some(before);
+                            controls.adapter_after = Some(after);
                             controls.adapter_refused = self.refused.get();
                         }
                         _ => {}
@@ -2502,7 +3015,10 @@ pub mod statement_child_proof {
                     sample.identity.forwarded_parent_samples += 1;
                     if child == sample.identity.target_identity {
                         sample.identity.target_parent_net += delta;
-                        if self.forward.is_some_and(|f| f.call.operation == "control_refund") {
+                        if self
+                            .forward
+                            .is_some_and(|f| f.call.operation == "control_refund")
+                        {
                             // Legacy control bytes live on the parent, outside
                             // its child's retained counter, just like a native
                             // block invoice. Preserve that separate obligation.
@@ -2612,38 +3128,60 @@ pub mod statement_child_proof {
         });
     }
     pub(super) fn expects_native_address(parent: &DeclaredReadMemory, address: usize) -> bool {
-        ACTIVE.with(|slot| slot.get().is_some_and(|s|
-            s.parent_identity == parent as *const _ as usize && s.native_controls.is_some_and(|n|
-                address >= n.block.payload
-                    && n.block.payload.checked_add(n.block.layout.0).is_some_and(|end| address < end))))
+        ACTIVE.with(|slot| {
+            slot.get().is_some_and(|s| {
+                s.parent_identity == parent as *const _ as usize
+                    && s.native_controls.is_some_and(|n| {
+                        address >= n.block.payload
+                            && n.block
+                                .payload
+                                .checked_add(n.block.layout.0)
+                                .is_some_and(|end| address < end)
+                    })
+            })
+        })
     }
     pub(super) fn selected_native(identity: usize) -> bool {
-        ACTIVE.with(|slot| slot.get().is_some_and(|s|
-            s.owner_identity == identity && s.native_controls.is_some()))
+        ACTIVE.with(|slot| {
+            slot.get()
+                .is_some_and(|s| s.owner_identity == identity && s.native_controls.is_some())
+        })
     }
     pub(super) fn limit(parent: &DeclaredReadMemory) -> Option<u64> {
-        ACTIVE.with(|slot| slot.get().filter(|sample|
-            sample.parent_identity == parent as *const DeclaredReadMemory as usize
-        ).map(|sample| sample.limit))
+        ACTIVE.with(|slot| {
+            slot.get()
+                .filter(|sample| {
+                    sample.parent_identity == parent as *const DeclaredReadMemory as usize
+                })
+                .map(|sample| sample.limit)
+        })
     }
     /// Temporarily lower the ORIGINAL parent's admission ceiling. Existing
     /// child/control/bookkeeping invoices remain counted and are not refunded.
     /// The callback still calls Database::execute_at_snapshot itself.
-    pub fn observe<T>(parent: &DeclaredReadMemory, limit: u64, operation: impl FnOnce() -> T)
-        -> (T, Observation)
-    {
+    pub fn observe<T>(
+        parent: &DeclaredReadMemory,
+        limit: u64,
+        operation: impl FnOnce() -> T,
+    ) -> (T, Observation) {
         struct Restore(Option<Observation>);
         impl Drop for Restore {
-            fn drop(&mut self) { ACTIVE.with(|slot| slot.set(self.0)); }
+            fn drop(&mut self) {
+                ACTIVE.with(|slot| slot.set(self.0));
+            }
         }
         CALL.with(|_| ());
         FORWARD.with(|_| ());
         let before = parent.retained.load(Ordering::SeqCst);
         assert!(limit <= parent.effective_limit());
-        let restore = Restore(ACTIVE.with(|slot| slot.replace(Some(Observation {
-            parent_identity: parent as *const DeclaredReadMemory as usize,
-            parent_before: before, limit, ..Observation::default()
-        }))));
+        let restore = Restore(ACTIVE.with(|slot| {
+            slot.replace(Some(Observation {
+                parent_identity: parent as *const DeclaredReadMemory as usize,
+                parent_before: before,
+                limit,
+                ..Observation::default()
+            }))
+        }));
         let result = operation();
         let mut sample = ACTIVE.with(|slot| slot.get().unwrap());
         sample.parent_after = parent.retained.load(Ordering::SeqCst);
@@ -2654,9 +3192,19 @@ pub mod statement_child_proof {
         drop(restore);
         (result, sample)
     }
-    pub(super) fn native_created(parent: &DeclaredReadMemory, identity: usize, control: usize, request_before: usize, initial_held: u64, child: &NativeDeclaredChild) {
-        let block = control_allocation(identity,
-            ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>(), request_before);
+    pub(super) fn native_created(
+        parent: &DeclaredReadMemory,
+        identity: usize,
+        control: usize,
+        request_before: usize,
+        initial_held: u64,
+        child: &NativeDeclaredChild,
+    ) {
+        let block = control_allocation(
+            identity,
+            ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>(),
+            request_before,
+        );
         update(parent, |sample| {
             sample.children += 1;
             // The constructor borrows the real in-block payload; no forwarder
@@ -2666,12 +3214,17 @@ pub mod statement_child_proof {
             sample.native_forwarder_identity = 0;
             sample.native_forwarder_history_not_live = None;
             sample.native_controls = Some(NativeOwnerControls {
-                owner: identity, parent: parent as *const _ as usize,
+                owner: identity,
+                parent: parent as *const _ as usize,
                 parent_counter: &parent.retained as *const _ as usize,
-                parent_before_block: sample.identity.last_parent.filter(|e|
-                    e.operation == "request_owner" && e.kind == "ParentReserved").map(|e| e.parent_before),
+                parent_before_block: sample
+                    .identity
+                    .last_parent
+                    .filter(|e| e.operation == "request_owner" && e.kind == "ParentReserved")
+                    .map(|e| e.parent_before),
                 parent_after_block: parent.retained.load(Ordering::SeqCst),
-                initial_child_bytes: initial_held, block,
+                initial_child_bytes: initial_held,
+                block,
                 payload: child as *const _ as usize,
                 counter: &child.retained as *const _ as usize,
                 ..NativeOwnerControls::default()
@@ -2683,14 +3236,26 @@ pub mod statement_child_proof {
             sample.identity.target_initial_held = initial_held;
             sample.identity.target_last_held = initial_held;
             sample.identity.target_control_bytes = control;
-            let mut record = event(parent, sample, Some(identity), 0, "ChildCreated", "completed");
+            let mut record = event(
+                parent,
+                sample,
+                Some(identity),
+                0,
+                "ChildCreated",
+                "completed",
+            );
             record.site = "DeclaredReadMemory::native_child";
             record.child_control_bytes = control;
             sample.identity.target_created = Some(record);
         });
     }
-    pub(super) fn native_forwarder(parent: &DeclaredReadMemory, identity: usize,
-        payload: usize, counter: usize, forwarder: usize) {
+    pub(super) fn native_forwarder(
+        parent: &DeclaredReadMemory,
+        identity: usize,
+        payload: usize,
+        counter: usize,
+        forwarder: usize,
+    ) {
         update(parent, |sample| {
             if sample.owner_identity == identity {
                 sample.native_payload_identity = payload;
@@ -2705,44 +3270,72 @@ pub mod statement_child_proof {
     }
     pub(super) fn native_forwarder_retired(identity: usize) {
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get() && sample.owner_identity == identity {
+            if let Some(mut sample) = slot.get()
+                && sample.owner_identity == identity
+            {
                 sample.native_forwarder_identity = 0;
                 slot.set(Some(sample));
             }
         });
     }
-    pub(crate) fn native_control_credits(identity: usize, keeper_bytes: usize,
-        adapter_bytes: usize, keeper_payer: Option<usize>, adapter_payer: Option<usize>,
-        adapter_payload_layout: std::alloc::Layout) {
+    pub(crate) fn native_control_credits(
+        identity: usize,
+        keeper_bytes: usize,
+        adapter_bytes: usize,
+        keeper_payer: Option<usize>,
+        adapter_payer: Option<usize>,
+        adapter_payload_layout: std::alloc::Layout,
+    ) {
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get() && sample.owner_identity == identity {
-                let controls = sample.native_controls.as_mut()
+            if let Some(mut sample) = slot.get()
+                && sample.owner_identity == identity
+            {
+                let controls = sample
+                    .native_controls
+                    .as_mut()
                     .expect("selected native credits missing original child receipt");
                 controls.keeper_credit_bytes = keeper_bytes;
                 controls.adapter_invoice_bytes = adapter_bytes;
                 controls.keeper_payer = keeper_payer;
                 controls.adapter_payer = adapter_payer;
-                controls.adapter_payload_layout = (adapter_payload_layout.size(), adapter_payload_layout.align());
+                controls.adapter_payload_layout = (
+                    adapter_payload_layout.size(),
+                    adapter_payload_layout.align(),
+                );
                 slot.set(Some(sample));
             }
         });
     }
-    pub(crate) fn native_control_allocated(identity: usize, keeper: bool,
-        allocation: ControlAllocation, payer: usize, invoice_bytes: usize,
-        outer_keeper: usize, inner_keeper: usize) {
+    pub(crate) fn native_control_allocated(
+        identity: usize,
+        keeper: bool,
+        allocation: ControlAllocation,
+        payer: usize,
+        invoice_bytes: usize,
+        outer_keeper: usize,
+        inner_keeper: usize,
+    ) {
         ACTIVE.with(|slot| {
             if let Some(mut sample) = slot.get()
                 && sample.owner_identity == identity
             {
-                let controls = sample.native_controls.as_mut()
+                let controls = sample
+                    .native_controls
+                    .as_mut()
                     .expect("selected native constructor has no original child receipt");
-                assert_eq!(payer, identity, "native controls must use the original child");
+                assert_eq!(
+                    payer, identity,
+                    "native controls must use the original child"
+                );
                 if keeper {
                     assert!(controls.keeper.is_none(), "duplicate native keeper receipt");
                     controls.keeper = Some(allocation);
                     controls.adapter_invoice_bytes = invoice_bytes;
                 } else {
-                    assert!(controls.adapter.is_none(), "duplicate native adapter receipt");
+                    assert!(
+                        controls.adapter.is_none(),
+                        "duplicate native adapter receipt"
+                    );
                     controls.adapter = Some(allocation);
                     controls.outer_keeper = outer_keeper;
                     controls.inner_keeper = inner_keeper;
@@ -2758,10 +3351,17 @@ pub mod statement_child_proof {
         update(&child.parent, |sample| {
             sample.drops += 1;
             let held = child.retained.load(Ordering::SeqCst);
-            let mut record = event(&child.parent, sample, Some(identity), held,
-                "ChildDropBeforeControlRefund", "payload-drop");
+            let mut record = event(
+                &child.parent,
+                sample,
+                Some(identity),
+                held,
+                "ChildDropBeforeControlRefund",
+                "payload-drop",
+            );
             record.site = "NativeDeclaredChild::drop";
-            record.child_control_bytes = ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
+            record.child_control_bytes =
+                ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
             if identity == sample.identity.target_identity {
                 sample.final_bytes = held;
                 sample.identity.target_drop_seen = true;
@@ -2776,12 +3376,17 @@ pub mod statement_child_proof {
     /// open. This neither ends/resets observation nor retains a forwarding Arc.
     /// parent_after is the operation-exit sample and is final only on return.
     #[doc(hidden)]
-    pub fn current() -> Option<Observation> { ACTIVE.with(Cell::get) }
+    pub fn current() -> Option<Observation> {
+        ACTIVE.with(Cell::get)
+    }
 
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn native_controls(identity: usize) -> Option<NativeOwnerControls> {
-        ACTIVE.with(|slot| slot.get().filter(|s| s.owner_identity == identity)
-            .and_then(|s| s.native_controls))
+        ACTIVE.with(|slot| {
+            slot.get()
+                .filter(|s| s.owner_identity == identity)
+                .and_then(|s| s.native_controls)
+        })
     }
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn trace_owner_controls(controls: TraceOwnerControls) {
@@ -2793,8 +3398,12 @@ pub mod statement_child_proof {
         });
     }
     #[cfg(feature = "test-seams")]
-    pub(crate) fn trace_produced(mut receipt: contextdb_vector::mem::TraceInvoiceForTest,
-        payer: usize, owner: usize, prepaid: std::alloc::Layout) {
+    pub(crate) fn trace_produced(
+        mut receipt: contextdb_vector::mem::TraceInvoiceForTest,
+        payer: usize,
+        owner: usize,
+        prepaid: std::alloc::Layout,
+    ) {
         receipt.original_payer = payer;
         receipt.owner_payload_pointer = owner;
         receipt.prepaid_control = (0, prepaid.size(), prepaid.align());
@@ -2809,14 +3418,18 @@ pub mod statement_child_proof {
     pub(crate) fn trace_cleared(old: Option<&contextdb_vector::OwnedVectorSearchTrace>) {
         ACTIVE.with(|slot| {
             if let Some(mut sample) = slot.get() {
-                if let Some(old) = old { sample.trace_cleared = Some(old.complete_invoice_for_test(|_| {})); }
+                if let Some(old) = old {
+                    sample.trace_cleared = Some(old.complete_invoice_for_test(|_| {}));
+                }
                 slot.set(Some(sample));
             }
         });
     }
     #[cfg(feature = "test-seams")]
-    pub(crate) fn trace_published(new: &contextdb_vector::OwnedVectorSearchTrace,
-        old: Option<&contextdb_vector::OwnedVectorSearchTrace>) {
+    pub(crate) fn trace_published(
+        new: &contextdb_vector::OwnedVectorSearchTrace,
+        old: Option<&contextdb_vector::OwnedVectorSearchTrace>,
+    ) {
         ACTIVE.with(|slot| {
             if let Some(mut sample) = slot.get() {
                 sample.trace_new = Some(new.complete_invoice_for_test(|_| {}));
@@ -2830,14 +3443,18 @@ pub mod statement_child_proof {
     pub(crate) fn live_workspace(memory: impl Into<ReadMemoryOwner>, bytes: usize) {
         let memory: ReadMemoryOwner = memory.into();
         ACTIVE.with(|slot| {
-            let Some(mut sample) = slot.get() else { return; };
+            let Some(mut sample) = slot.get() else {
+                return;
+            };
             let identity = observed_reader_identity(&memory);
             sample.workspace_samples += 1;
             sample.foreign_workspace_owners += usize::from(identity != sample.owner_identity);
             let funding = declared_child_observer(&memory).map(|observer| observer.sample());
-            sample.underfunded_workspace_samples += usize::from(funding.is_none_or(|funding|
-                !funding.alive || funding.charged_bytes < bytes as u64
-                    || funding.parent_identity != sample.parent_identity));
+            sample.underfunded_workspace_samples += usize::from(funding.is_none_or(|funding| {
+                !funding.alive
+                    || funding.charged_bytes < bytes as u64
+                    || funding.parent_identity != sample.parent_identity
+            }));
             slot.set(Some(sample));
         });
     }
@@ -2867,9 +3484,15 @@ pub(crate) mod root_observations {
     }
     // Set only by hooks called by the actual observing GlobalAlloc wrapper.
     static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    pub(crate) fn install_physical_observer() { INSTALLED.store(true, Ordering::SeqCst); }
-    fn installed() -> bool { INSTALLED.load(Ordering::SeqCst) }
-    pub(super) fn has_evidence(token: Token) -> bool { token.0 != 0 }
+    pub(crate) fn install_physical_observer() {
+        INSTALLED.store(true, Ordering::SeqCst);
+    }
+    fn installed() -> bool {
+        INSTALLED.load(Ordering::SeqCst)
+    }
+    pub(super) fn has_evidence(token: Token) -> bool {
+        token.0 != 0
+    }
     static INVALID_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     #[derive(Debug, Clone, Copy)]
     pub(crate) struct Token(u64);
@@ -2898,37 +3521,79 @@ pub(crate) mod root_observations {
         free_after: u64,
         retired_at: u64,
     }
-    struct Registry { slots: [Option<Record>; 64], generation: u64, event: u64 }
+    struct Registry {
+        slots: [Option<Record>; 64],
+        generation: u64,
+        event: u64,
+    }
     static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
-        slots: [None; 64], generation: 0, event: 0,
+        slots: [None; 64],
+        generation: 0,
+        event: 0,
     });
     impl Registry {
         fn record(&mut self, token: Token) -> &mut Record {
-            self.slots.iter_mut().flatten().find(|r| r.token.0 == token.0)
+            self.slots
+                .iter_mut()
+                .flatten()
+                .find(|r| r.token.0 == token.0)
                 .expect("root observation generation retired; proof invalidated")
         }
     }
     pub(super) fn begin(bytes: usize) -> Token {
-        if !installed() { return Token(0); }
+        if !installed() {
+            return Token(0);
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = registry.slots.iter().position(Option::is_none).or_else(||
-            registry.slots.iter().enumerate().filter_map(|(i, r)|
-                r.filter(|r| r.terminal_retired).map(|r| (i, r.token.0)))
-                .min_by_key(|(_, generation)| *generation).map(|(i, _)| i))
+        let slot = registry
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .or_else(|| {
+                registry
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| r.filter(|r| r.terminal_retired).map(|r| (i, r.token.0)))
+                    .min_by_key(|(_, generation)| *generation)
+                    .map(|(i, _)| i)
+            })
             .expect("root observation static capacity exhausted; proof invalid");
-        registry.generation = registry.generation.checked_add(1)
+        registry.generation = registry
+            .generation
+            .checked_add(1)
             .expect("root observation generation exhausted");
         let token = Token(registry.generation);
-        registry.slots[slot] = Some(Record { token, block: 0, payload: 0, bytes,
-            alignment: ReadMemoryOwner::native_layout::<DeclaredReadMemory, RootTerminalInvoice>().align(),
-            alive: false, payload_dropped: false, terminal_retired: false,
-            physical_free_returned: false, last_charged: bytes as u64,
-            last_controls: 0, producer: 0, counter: 0, payload_bytes: 0, allocation_attempts: 0, before_allocation: 0, payer: None, free_before: 0, free_after: 0, retired_at: 0 });
+        registry.slots[slot] = Some(Record {
+            token,
+            block: 0,
+            payload: 0,
+            bytes,
+            alignment: ReadMemoryOwner::native_layout::<DeclaredReadMemory, RootTerminalInvoice>()
+                .align(),
+            alive: false,
+            payload_dropped: false,
+            terminal_retired: false,
+            physical_free_returned: false,
+            last_charged: bytes as u64,
+            last_controls: 0,
+            producer: 0,
+            counter: 0,
+            payload_bytes: 0,
+            allocation_attempts: 0,
+            before_allocation: 0,
+            payer: None,
+            free_before: 0,
+            free_after: 0,
+            retired_at: 0,
+        });
         LAST_ROOT_ATTEMPT.with(|slot| slot.set(Some(token)));
         token
     }
     pub(super) fn bind(token: Token, root: &DeclaredReadRoot) {
-        if token.0 == 0 { return; }
+        if token.0 == 0 {
+            return;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let record = registry.record(token);
         assert!(!record.payload_dropped && record.payload == 0);
@@ -2938,15 +3603,25 @@ pub(crate) mod root_observations {
         assert_eq!(record.block % record.alignment, 0);
         record.alive = true;
     }
-    pub(super) fn with_live<T>(token: Token, f: impl FnOnce(&DeclaredReadMemory) -> T) -> Option<T> {
-        if token.0 == 0 { return None; }
+    pub(super) fn with_live<T>(
+        token: Token,
+        f: impl FnOnce(&DeclaredReadMemory) -> T,
+    ) -> Option<T> {
+        if token.0 == 0 {
+            return None;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let record = registry.record(token);
-        assert!(record.alive && record.payload != 0, "original root is retired");
+        assert!(
+            record.alive && record.payload != 0,
+            "original root is retired"
+        );
         // SAFETY: bind records only the real projected payload. Root Drop
         // invalidates under this same mutex before its native block can free.
         // f cannot return a reference tied to this temporary root borrow.
-        Some(f(unsafe { &*(record.payload as *const DeclaredReadMemory) }))
+        Some(f(unsafe {
+            &*(record.payload as *const DeclaredReadMemory)
+        }))
     }
     pub(super) fn sample(token: Token) -> (bool, u64, u64) {
         assert_ne!(token.0, 0, "physical observer not installed; no evidence");
@@ -2960,11 +3635,20 @@ pub(crate) mod root_observations {
         }
         // Zero follows the recorded terminal retirement, never a missing
         // registry entry. Keep last_charged separately as pre-free evidence.
-        (record.alive, record.last_controls,
-            if record.terminal_retired { 0 } else { record.last_charged })
+        (
+            record.alive,
+            record.last_controls,
+            if record.terminal_retired {
+                0
+            } else {
+                record.last_charged
+            },
+        )
     }
     pub(super) fn payload_dropped(token: Token, root: &DeclaredReadMemory) {
-        if token.0 == 0 { return; }
+        if token.0 == 0 {
+            return;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let record = registry.record(token);
         record.last_charged = root.retained.load(Ordering::SeqCst);
@@ -2974,9 +3658,14 @@ pub(crate) mod root_observations {
         // Keep the scalar identity, but every dereference is now disabled.
     }
     pub(super) fn retire(token: Token, bytes: usize) {
-        if token.0 == 0 { return; }
+        if token.0 == 0 {
+            return;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        registry.event = registry.event.checked_add(1).expect("terminal event ordinal overflow");
+        registry.event = registry
+            .event
+            .checked_add(1)
+            .expect("terminal event ordinal overflow");
         let event = registry.event;
         let record = registry.record(token);
         assert!(record.payload_dropped && !record.terminal_retired);
@@ -2989,20 +3678,27 @@ pub(crate) mod root_observations {
         record.retired_at = event;
     }
     #[cfg(feature = "test-seams")]
-    pub(super) fn before_allocation(token: Token, root: &DeclaredReadMemory, layout: std::alloc::Layout) {
-        if token.0 == 0 { return; }
+    pub(super) fn before_allocation(
+        token: Token,
+        root: &DeclaredReadMemory,
+        layout: std::alloc::Layout,
+    ) {
+        if token.0 == 0 {
+            return;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let r = registry.record(token);
         assert_eq!(r.producer, 0);
         assert_eq!((r.bytes, r.alignment), (layout.size(), layout.align()));
         r.before_allocation = root.retained.load(Ordering::SeqCst);
         r.allocation_attempts += 1;
-        crate::read_work_probe::allocator_events::funding_next(
-            &root.retained as *const _ as usize);
+        crate::read_work_probe::allocator_events::funding_next(&root.retained as *const _ as usize);
     }
     #[cfg(test)]
     pub(super) fn assert_null_terminal_retired() {
-        let token = LAST_ROOT_ATTEMPT.with(|slot| slot.get()).expect("actual root attempt token");
+        let token = LAST_ROOT_ATTEMPT
+            .with(|slot| slot.get())
+            .expect("actual root attempt token");
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let r = registry.record(token);
         assert!(r.payload_dropped && r.terminal_retired && !r.physical_free_returned);
@@ -3018,33 +3714,55 @@ pub(crate) mod root_observations {
     #[cfg(test)]
     pub(super) fn assert_terminal_free(token: Token) {
         assert_ne!(token.0, 0, "physical observer not installed; no evidence");
-        assert!(!INVALID_FREE.load(Ordering::SeqCst), "unqualified physical-free observation");
+        assert!(
+            !INVALID_FREE.load(Ordering::SeqCst),
+            "unqualified physical-free observation"
+        );
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let r = registry.record(token);
         assert_eq!(r.producer, 0);
         #[cfg(feature = "test-seams")]
         {
             assert_eq!(r.allocation_attempts, 1);
-            assert_eq!(r.before_allocation, r.bytes as u64,
-                "real original root debit was present at the actual cell allocation boundary");
+            assert_eq!(
+                r.before_allocation, r.bytes as u64,
+                "real original root debit was present at the actual cell allocation boundary"
+            );
         }
-        assert!(r.payload_dropped && r.terminal_retired && r.physical_free_returned,
-            "original root requires payload retirement, actual allocator free, then terminal retirement");
-        assert!(0 < r.free_before && r.free_before < r.free_after && r.free_after < r.retired_at,
-            "actual allocator free must precede the original terminal invoice retirement");
+        assert!(
+            r.payload_dropped && r.terminal_retired && r.physical_free_returned,
+            "original root requires payload retirement, actual allocator free, then terminal retirement"
+        );
+        assert!(
+            0 < r.free_before && r.free_before < r.free_after && r.free_after < r.retired_at,
+            "actual allocator free must precede the original terminal invoice retirement"
+        );
         assert_eq!(r.last_controls, 0);
-        assert_eq!(r.last_charged, r.bytes as u64,
-            "every child and payload invoice must retire before the root's own physical free");
+        assert_eq!(
+            r.last_charged, r.bytes as u64,
+            "every child and payload invoice must retire before the root's own physical free"
+        );
     }
     /// Extend the same fixed provenance slots. Registration borrows a real
     /// producer and copies its current counters; no pointer is read by sample.
     pub(crate) fn producer(
-        payload: usize, kind: u8, counter: usize, held: usize, payload_bytes: usize, payer: Option<usize>,
+        payload: usize,
+        kind: u8,
+        counter: usize,
+        held: usize,
+        payload_bytes: usize,
+        payer: Option<usize>,
     ) -> Token {
-        if !installed() { return Token(0); }
+        if !installed() {
+            return Token(0);
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(record) = registry.slots.iter_mut().flatten().find(|r|
-            r.producer == kind && r.payload == payload && r.alive) {
+        if let Some(record) = registry
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|r| r.producer == kind && r.payload == payload && r.alive)
+        {
             if record.payer != payer {
                 // Panic cleanup can deallocate through the observer. Never hold
                 // its registry while reporting rejected provenance.
@@ -3055,108 +3773,193 @@ pub(crate) mod root_observations {
             record.payload_bytes = payload_bytes;
             return record.token;
         }
-        if registry.slots.iter().flatten().any(|r| r.producer == kind && r.payload == payload
-            && !r.alive && !r.physical_free_returned) {
+        if registry.slots.iter().flatten().any(|r| {
+            r.producer == kind && r.payload == payload && !r.alive && !r.physical_free_returned
+        }) {
             drop(registry);
-            panic!("address reused without original physical-free evidence; observation unqualified");
+            panic!(
+                "address reused without original physical-free evidence; observation unqualified"
+            );
         }
-        let slot = registry.slots.iter().position(Option::is_none).or_else(||
-            registry.slots.iter().enumerate().filter_map(|(i, r)|
-                r.filter(|r| r.terminal_retired).map(|r| (i, r.token.0)))
-                .min_by_key(|(_, generation)| *generation).map(|(i, _)| i))
-            ;
+        let slot = registry.slots.iter().position(Option::is_none).or_else(|| {
+            registry
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, r)| r.filter(|r| r.terminal_retired).map(|r| (i, r.token.0)))
+                .min_by_key(|(_, generation)| *generation)
+                .map(|(i, _)| i)
+        });
         let Some(slot) = slot else {
             drop(registry);
             panic!("producer observation static capacity exhausted; proof invalid");
         };
-        registry.generation = registry.generation.checked_add(1).expect("producer generation overflow");
+        registry.generation = registry
+            .generation
+            .checked_add(1)
+            .expect("producer generation overflow");
         let token = Token(registry.generation);
-        registry.slots[slot] = Some(Record { token, block: 0, payload, bytes: 0,
-            alignment: 0, alive: true, payload_dropped: false, terminal_retired: false,
-            physical_free_returned: false, last_charged: held as u64, last_controls: 0,
-            producer: kind, counter, payload_bytes, allocation_attempts: 0, before_allocation: 0,
-            payer, free_before: 0, free_after: 0, retired_at: 0 });
+        registry.slots[slot] = Some(Record {
+            token,
+            block: 0,
+            payload,
+            bytes: 0,
+            alignment: 0,
+            alive: true,
+            payload_dropped: false,
+            terminal_retired: false,
+            physical_free_returned: false,
+            last_charged: held as u64,
+            last_controls: 0,
+            producer: kind,
+            counter,
+            payload_bytes,
+            allocation_attempts: 0,
+            before_allocation: 0,
+            payer,
+            free_before: 0,
+            free_after: 0,
+            retired_at: 0,
+        });
         token
     }
     pub(crate) fn producer_update(payload: usize, kind: u8, held: usize, payload_bytes: usize) {
-        if !installed() { return; }
+        if !installed() {
+            return;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        for r in registry.slots.iter_mut().flatten().filter(|r|
-            r.producer == kind && r.payload == payload && r.alive) {
-            r.last_charged = held as u64; r.payload_bytes = payload_bytes;
+        for r in registry
+            .slots
+            .iter_mut()
+            .flatten()
+            .filter(|r| r.producer == kind && r.payload == payload && r.alive)
+        {
+            r.last_charged = held as u64;
+            r.payload_bytes = payload_bytes;
         }
     }
     pub(crate) fn producer_used(counter: usize, used: usize) {
-        if !installed() { return; }
+        if !installed() {
+            return;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        for r in registry.slots.iter_mut().flatten().filter(|r|
-            (r.producer == 2 || r.producer == 3) && r.counter == counter && r.alive) {
+        for r in registry
+            .slots
+            .iter_mut()
+            .flatten()
+            .filter(|r| (r.producer == 2 || r.producer == 3) && r.counter == counter && r.alive)
+        {
             r.last_charged = used as u64;
         }
     }
     pub(crate) fn producer_dropped(payload: usize, kind: u8, held: usize, payload_bytes: usize) {
-        if !installed() { return; }
+        if !installed() {
+            return;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        for r in registry.slots.iter_mut().flatten().filter(|r|
-            r.producer == kind && r.payload == payload && !r.physical_free_returned) {
-            r.last_charged = held as u64; r.payload_bytes = payload_bytes;
-            r.alive = false; r.payload_dropped = true;
+        for r in registry
+            .slots
+            .iter_mut()
+            .flatten()
+            .filter(|r| r.producer == kind && r.payload == payload && !r.physical_free_returned)
+        {
+            r.last_charged = held as u64;
+            r.payload_bytes = payload_bytes;
+            r.alive = false;
+            r.payload_dropped = true;
         }
     }
     /// Actual allocator boundaries, including std Arc backing. Containment
     /// matches only registered genuine typed payload identities. No dead load.
     /// The returned generation is stable across System.dealloc/address reuse.
     pub(crate) fn before_physical_free(pointer: usize, layout: std::alloc::Layout) -> u64 {
-        if !installed() { return 0; }
+        if !installed() {
+            return 0;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let Some(next) = registry.event.checked_add(1) else {
-            INVALID_FREE.store(true, Ordering::SeqCst); return 0;
+            INVALID_FREE.store(true, Ordering::SeqCst);
+            return 0;
         };
         registry.event = next;
         let event = registry.event;
         let mut generation = 0;
-        for r in registry.slots.iter_mut().flatten().filter(|r|
-            !r.physical_free_returned && (r.payload_dropped || r.producer == 3) && pointer <= r.payload
-                && pointer.checked_add(layout.size()).is_some_and(|end| r.payload < end)) {
+        for r in registry.slots.iter_mut().flatten().filter(|r| {
+            !r.physical_free_returned
+                && (r.payload_dropped || r.producer == 3)
+                && pointer <= r.payload
+                && pointer
+                    .checked_add(layout.size())
+                    .is_some_and(|end| r.payload < end)
+        }) {
             if generation != 0 {
-                INVALID_FREE.store(true, Ordering::SeqCst); return 0;
+                INVALID_FREE.store(true, Ordering::SeqCst);
+                return 0;
             }
             if (r.block != 0 && r.block != pointer)
-                || (r.producer == 0 && (r.bytes, r.alignment) != (layout.size(), layout.align())) {
-                INVALID_FREE.store(true, Ordering::SeqCst); return 0;
+                || (r.producer == 0 && (r.bytes, r.alignment) != (layout.size(), layout.align()))
+            {
+                INVALID_FREE.store(true, Ordering::SeqCst);
+                return 0;
             }
-            r.block = pointer; r.bytes = layout.size(); r.alignment = layout.align();
+            r.block = pointer;
+            r.bytes = layout.size();
+            r.alignment = layout.align();
             r.free_before = event;
             generation = r.token.0;
         }
         generation
     }
     pub(crate) fn after_physical_free(generation: u64) {
-        if generation == 0 { return; }
+        if generation == 0 {
+            return;
+        }
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let Some(next) = registry.event.checked_add(1) else {
-            INVALID_FREE.store(true, Ordering::SeqCst); return;
+            INVALID_FREE.store(true, Ordering::SeqCst);
+            return;
         };
         registry.event = next;
         let event = registry.event;
-        let Some(r) = registry.slots.iter_mut().flatten().find(|r| r.token.0 == generation) else {
-            INVALID_FREE.store(true, Ordering::SeqCst); return;
+        let Some(r) = registry
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|r| r.token.0 == generation)
+        else {
+            INVALID_FREE.store(true, Ordering::SeqCst);
+            return;
         };
-        if !(r.payload_dropped || r.producer == 3) || r.physical_free_returned
-            || r.free_before == 0 || r.free_before >= event {
-            INVALID_FREE.store(true, Ordering::SeqCst); return;
+        if !(r.payload_dropped || r.producer == 3)
+            || r.physical_free_returned
+            || r.free_before == 0
+            || r.free_before >= event
+        {
+            INVALID_FREE.store(true, Ordering::SeqCst);
+            return;
         }
         r.free_after = event;
         r.physical_free_returned = true;
-        if r.producer != 0 { r.alive = false; r.terminal_retired = true; }
+        if r.producer != 0 {
+            r.alive = false;
+            r.terminal_retired = true;
+        }
     }
     pub(crate) fn producer_sample(token: Token) -> (bool, usize, usize, bool) {
         assert_ne!(token.0, 0, "physical observer not installed; no evidence");
-        assert!(!INVALID_FREE.load(Ordering::SeqCst), "unqualified physical-free observation");
+        assert!(
+            !INVALID_FREE.load(Ordering::SeqCst),
+            "unqualified physical-free observation"
+        );
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let r = registry.record(token);
         assert_ne!(r.producer, 0);
-        (r.alive, r.last_charged as usize, r.payload_bytes, r.physical_free_returned)
+        (
+            r.alive,
+            r.last_charged as usize,
+            r.payload_bytes,
+            r.physical_free_returned,
+        )
     }
 
     #[cfg(test)]
@@ -3169,66 +3972,122 @@ pub(crate) mod root_observations {
                     "vector_read_memory::root_observations::installed_provenance_rejects_reuse_and_payer_changes",
                     "--nocapture"])
                 .env(CHILD, "1").output().expect("run isolated provenance negatives");
-            assert!(output.status.success(), "isolated provenance negatives failed: {}",
-                String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stdout).contains(
-                "PROVENANCE_NEGATIVES payer reuse duplicate_free capacity PASS"),
-                "the child must execute every destructive negative branch");
+            assert!(
+                output.status.success(),
+                "isolated provenance negatives failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("PROVENANCE_NEGATIVES payer reuse duplicate_free capacity PASS"),
+                "the child must execute every destructive negative branch"
+            );
             return;
         }
         fn rejects(operation: impl FnOnce() + std::panic::UnwindSafe, expected: &str) {
             let error = std::panic::catch_unwind(operation).expect_err(expected);
-            let message = error.downcast_ref::<&str>().copied()
+            let message = error
+                .downcast_ref::<&str>()
+                .copied()
                 .or_else(|| error.downcast_ref::<String>().map(String::as_str));
             assert_eq!(message, Some(expected));
         }
         use crate::read_image_memory::{ImageMemory, ImageMemoryObservation};
-        assert!(installed(), "unit GlobalAlloc must establish the installation fact");
+        assert!(
+            installed(),
+            "unit GlobalAlloc must establish the installation fact"
+        );
         let image = ImageMemory::new(None).unwrap();
         let _observation = ImageMemoryObservation::new(&image);
         let address = image.as_ref() as *const ImageMemory as usize;
         let actual = {
             let registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-            *registry.slots.iter().flatten().find(|record|
-                record.payload == address && record.producer == 1 && record.alive).unwrap()
+            *registry
+                .slots
+                .iter()
+                .flatten()
+                .find(|record| record.payload == address && record.producer == 1 && record.alive)
+                .unwrap()
         };
         let token = actual.token;
         assert!(producer_sample(token).0);
-        let wrong_payer = if actual.payer.is_some() { None }
-            else { Some(image.accountant.as_ptr() as usize) };
-        rejects(std::panic::AssertUnwindSafe(|| {
-            producer(address, 1, actual.counter, actual.last_charged as usize,
-                actual.payload_bytes, wrong_payer);
-        }), "producer cannot change its original payer");
+        let wrong_payer = if actual.payer.is_some() {
+            None
+        } else {
+            Some(image.accountant.as_ptr() as usize)
+        };
+        rejects(
+            std::panic::AssertUnwindSafe(|| {
+                producer(
+                    address,
+                    1,
+                    actual.counter,
+                    actual.last_charged as usize,
+                    actual.payload_bytes,
+                    wrong_payer,
+                );
+            }),
+            "producer cannot change its original payer",
+        );
         // Withhold only the observer's deallocation boundary. The real image
         // remains pinned; a second registration cannot qualify address reuse.
-        producer_dropped(address, 1, actual.last_charged as usize, actual.payload_bytes);
-        rejects(|| {
-            producer(address, 1, actual.counter,
-                actual.last_charged as usize, actual.payload_bytes, actual.payer);
-        }, "address reused without original physical-free evidence; observation unqualified");
-        assert!(!producer_sample(token).3, "a rejected reuse cannot invent a free");
+        producer_dropped(
+            address,
+            1,
+            actual.last_charged as usize,
+            actual.payload_bytes,
+        );
+        rejects(
+            || {
+                producer(
+                    address,
+                    1,
+                    actual.counter,
+                    actual.last_charged as usize,
+                    actual.payload_bytes,
+                    actual.payer,
+                );
+            },
+            "address reused without original physical-free evidence; observation unqualified",
+        );
+        assert!(
+            !producer_sample(token).3,
+            "a rejected reuse cannot invent a free"
+        );
         drop(image);
-        assert!(producer_sample(token).3, "only the GlobalAlloc return qualifies free");
+        assert!(
+            producer_sample(token).3,
+            "only the GlobalAlloc return qualifies free"
+        );
         // Invalidate this actual free before capacity reuse can retire its slot.
         after_physical_free(token.0);
-        rejects(|| { producer_sample(token); }, "unqualified physical-free observation");
+        rejects(
+            || {
+                producer_sample(token);
+            },
+            "unqualified physical-free observation",
+        );
         let images: Vec<_> = (0..65).map(|_| ImageMemory::new(None).unwrap()).collect();
         let mut rejected = 0;
         for image in &images {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-                ImageMemoryObservation::new(image))) {
-                Ok(_) => {},
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ImageMemoryObservation::new(image)
+            })) {
+                Ok(_) => {}
                 Err(error) => {
-                    assert_eq!(error.downcast_ref::<&str>().copied(),
-                        Some("producer observation static capacity exhausted; proof invalid"));
+                    assert_eq!(
+                        error.downcast_ref::<&str>().copied(),
+                        Some("producer observation static capacity exhausted; proof invalid")
+                    );
                     rejected += 1;
                 }
             }
         }
-        assert!(rejected > 0, "installed provenance capacity remains fail-closed");
+        assert!(
+            rejected > 0,
+            "installed provenance capacity remains fail-closed"
+        );
         drop(images);
         println!("PROVENANCE_NEGATIVES payer reuse duplicate_free capacity PASS");
     }
-
 }

@@ -8,7 +8,6 @@
 //! set rather than insertion order, compaction, or Redb page layout. Point
 //! mutations rewrite one page and its bounded proof path.
 
-use contextdb_core::read_memory::ReadMemoryBudget as _;
 use super::{
     CONTENT_IDENTITY_METADATA_TABLE, CONTENT_IDENTITY_NODES_TABLE, CONTENT_IDENTITY_ROOTS_TABLE,
     RedbPersistence,
@@ -16,6 +15,7 @@ use super::{
 use crate::direct_file_reader::DirectTypedImageDigest;
 #[cfg(test)]
 use crate::memory_accounting::MemoryAccountant;
+use contextdb_core::read_memory::ReadMemoryBudget as _;
 use contextdb_core::{
     AdjEntry, Error, Lsn, Result, RowId, TableMeta, TxId, Value, VectorEntry, VectorIndexRef,
     VectorQuantization, VersionedRow,
@@ -584,7 +584,9 @@ const MAX_NODE_BYTES: usize = 64 * 1024;
 // not a shape a real tree reaches.
 const MAX_CHUNK_LEVEL: u32 = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub(crate) enum LogicalFamily {
     Relational = 0,
@@ -633,12 +635,17 @@ impl LogicalFamily {
         Self::Status,
     ];
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn from_tag(tag: u8) -> Result<Self> {
         Self::ALL
             .into_iter()
             .find(|family| *family as u8 == tag)
-            .ok_or_else(|| Error::Other((format!("unknown logical content family tag {tag}")).into()))
+            .ok_or_else(|| {
+                Error::Other((format!("unknown logical content family tag {tag}")).into())
+            })
     }
 
     fn carries_vector_directory_projection(self) -> bool {
@@ -697,7 +704,10 @@ pub(crate) struct ContentIdentityMutation {
 }
 
 impl ContentIdentityMutation {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn encoded_value(&self) -> Result<Option<&[u8]>> {
         match &self.logical_value {
             None => Ok(None),
@@ -708,7 +718,10 @@ impl ContentIdentityMutation {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn value_digest(&self) -> Result<Option<[u8; 32]>> {
         match &self.logical_value {
             None => Ok(None),
@@ -795,7 +808,10 @@ fn key_parts(parts: &[&[u8]]) -> Vec<u8> {
     encoded
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     let encoding_failure = |error: serde_json::Error| {
         Error::Other((format!("cannot encode logical identity leaf: {error}")).into())
@@ -817,7 +833,10 @@ fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
 // Streaming that closed shape preserves canonical bytes without cloning all
 // text into a temporary serde_json::Value graph. Vector values are excluded
 // by the row projection below, including their f32-to-JSON widening.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn canonical_row_json_admitted(
     values: &BTreeMap<&String, &Value>,
     owner: &crate::read_image_memory::ImageMemoryHandle,
@@ -833,7 +852,10 @@ fn canonical_row_json_admitted(
     Ok(encoded)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn canonical_json_admitted<T: Serialize + ?Sized>(
     value: &T,
     owner: &crate::read_image_memory::ImageMemoryHandle,
@@ -889,7 +911,10 @@ fn canonicalize_json_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn row_mutation(
     table: &str,
     row: &VersionedRow,
@@ -897,7 +922,10 @@ pub(crate) fn row_mutation(
 ) -> Result<ContentIdentityMutation> {
     row_mutation_with_owner(table, row, meta, None)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn admitted_row_mutation(
     table: &str,
     row: &VersionedRow,
@@ -906,7 +934,10 @@ pub(crate) fn admitted_row_mutation(
     let owner = crate::read_image_memory::active_owner()?;
     row_mutation_with_owner(table, row, meta, Some(&owner))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn row_mutation_with_owner(
     table: &str,
     row: &VersionedRow,
@@ -963,16 +994,25 @@ pub(crate) fn remove_row_mutation(table: &str, row_id: RowId) -> ContentIdentity
     mutation
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn edge_mutation(edge: &AdjEntry) -> Result<ContentIdentityMutation> {
     edge_mutation_with_owner(edge, None)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn admitted_edge_mutation(edge: &AdjEntry) -> Result<ContentIdentityMutation> {
     let owner = crate::read_image_memory::active_owner()?;
     edge_mutation_with_owner(edge, Some(&owner))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn edge_mutation_with_owner(
     edge: &AdjEntry,
     owner: Option<&crate::read_image_memory::ImageMemoryHandle>,
@@ -995,10 +1035,7 @@ fn edge_mutation_with_owner(
                 .saturating_mul(edge.properties.len()),
         )?;
     }
-    let properties = edge
-        .properties
-        .iter()
-        .collect::<BTreeMap<_, _>>();
+    let properties = edge.properties.iter().collect::<BTreeMap<_, _>>();
     Ok(ContentIdentityMutation::put(
         LogicalFamily::Graph,
         key,
@@ -1076,7 +1113,10 @@ pub(crate) fn vector_mutation_pair(
     ]
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn vector_pair_key_bytes(entry: &VectorEntry) -> Result<usize> {
     entry
         .index
@@ -1086,7 +1126,10 @@ fn vector_pair_key_bytes(entry: &VectorEntry) -> Result<usize> {
         .and_then(|bytes| bytes.checked_add(24 + std::mem::size_of::<u64>() + 32))
         .ok_or_else(|| Error::Other("vector identity key layout overflow".into()))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn vector_projection_scratch_bytes(
     entry: &VectorEntry,
     quantization: VectorQuantization,
@@ -1103,7 +1146,10 @@ fn vector_projection_scratch_bytes(
         .and_then(|bytes| bytes.checked_add(entry.vector.len()))
         .ok_or_else(|| Error::Other("vector projection layout overflow".into()))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn admitted_vector_mutation_pair(
     entry: &VectorEntry,
     quantization: VectorQuantization,
@@ -1320,7 +1366,10 @@ pub(crate) fn remove_vector_mutation(
     ContentIdentityMutation::remove(vector_family(quantization), vector_key(index, row_id))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn schema_mutations(
     name: &str,
     meta: &TableMeta,
@@ -1357,7 +1406,10 @@ pub(crate) fn config_mutations(key: &str, value: Option<&[u8]>) -> Vec<ContentId
 
 /// Read the old occurrence from the still-unmodified compact mirror. The
 /// canonical configuration may already contain the replacement in this write.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn pending_delete_positions(
     write: &redb::WriteTransaction,
     key: &str,
@@ -1383,7 +1435,10 @@ fn pending_delete_positions(
 
 /// The caller funds the exact key capacity and the optional canonical-record
 /// reference before this constructor allocates either of them.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn pending_delete_mutation(key: &str, lsn: Lsn, present: bool) -> Result<ContentIdentityMutation> {
     use std::fmt::Write;
     let suffix = key
@@ -1413,7 +1468,10 @@ fn pending_delete_mutation(key: &str, lsn: Lsn, present: bool) -> Result<Content
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn write_pending_delete_mutation(
     write: &redb::WriteTransaction,
     mutation: &ContentIdentityMutation,
@@ -1473,7 +1531,10 @@ pub(crate) trait HistoryRecord: Serialize {
 
     /// Public history keeps its canonical JSON commitment. Private wrappers
     /// override this with their exact durable manual encoding.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn commitment_bytes(&self) -> Result<Vec<u8>> {
         canonical_json(self)
     }
@@ -1525,7 +1586,10 @@ pub(super) fn history_tree_key(kind: HistoryKind, coordinate: &[u8]) -> Vec<u8> 
 
 /// A stored change or schema key is a zero-padded LSN, optionally followed by
 /// `:` and a zero-padded ordinal. Anything else is not a key a writer stores.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_history_key(physical_key: &str) -> Result<()> {
     let (lsn, ordinal) = match physical_key.split_once(':') {
         Some((lsn, ordinal)) => (lsn, Some(ordinal)),
@@ -1537,9 +1601,10 @@ fn validate_history_key(physical_key: &str) -> Result<()> {
     if lsn.len() == 20 && digits(lsn, 20) && ordinal.is_none_or(|ordinal| digits(ordinal, 6)) {
         Ok(())
     } else {
-        Err(Error::Other((format!(
-            "stored history key {physical_key:?} is not an LSN and ordinal coordinate"
-        )).into()))
+        Err(Error::Other(
+            (format!("stored history key {physical_key:?} is not an LSN and ordinal coordinate"))
+                .into(),
+        ))
     }
 }
 
@@ -1554,7 +1619,10 @@ pub(super) fn ddl_mutation_coordinate(mutation: &ContentIdentityMutation) -> Opt
     std::str::from_utf8(&raw[1..]).ok()
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn ddl_selector_roots_in_read(read: &redb::ReadTransaction) -> Result<[[u8; 32]; 2]> {
     let roots = read
         .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
@@ -1578,7 +1646,10 @@ pub(super) fn ddl_selector_roots_in_read(read: &redb::ReadTransaction) -> Result
         })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn ddl_selector_roots_in_write(write: &redb::WriteTransaction) -> Result<[[u8; 32]; 2]> {
     let roots = write
         .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
@@ -1603,7 +1674,10 @@ pub(super) fn ddl_selector_roots_in_write(write: &redb::WriteTransaction) -> Res
 }
 
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn rebind_ddl_selector_roots_in_write(write: &redb::WriteTransaction) -> Result<()> {
         let fingerprints = Self::ddl_selector_fingerprints_in_write(write)?;
         let mut roots = write
@@ -1647,7 +1721,10 @@ impl RedbPersistence {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encoded_history_mutation<T: HistoryRecord>(
     physical_key: &str,
     value: &T,
@@ -1662,7 +1739,10 @@ pub(crate) fn encoded_history_mutation<T: HistoryRecord>(
 
 /// Caller validates the private codec before passing the complete stored
 /// bytes. Never reconstruct these bytes from public equality or JSON.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn private_history_mutation(
     physical_key: &str,
     bytes: &[u8],
@@ -1689,7 +1769,10 @@ pub(super) fn private_history_value_hash(bytes: &[u8]) -> [u8; 32] {
     value_hash(LogicalFamily::ChangeAndDdl, bytes)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn remove_encoded_history_mutation<T: HistoryRecord>(
     physical_key: &str,
     _value: &T,
@@ -1703,7 +1786,10 @@ pub(crate) fn remove_encoded_history_mutation<T: HistoryRecord>(
 
 /// The committed value hash of one stored change or schema record, as the
 /// ordered history walk compares it.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn history_record_value_hash<T: HistoryRecord>(value: &T) -> Result<[u8; 32]> {
     Ok(value_hash(
         LogicalFamily::ChangeAndDdl,
@@ -1739,7 +1825,10 @@ pub(crate) fn status_mutation(
     ContentIdentityMutation::put(LogicalFamily::Status, key_parts(&[namespace, key]), value)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encoded_status_mutation<T: Serialize>(
     namespace: &[u8],
     key: &[u8],
@@ -1763,7 +1852,10 @@ fn hash_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 }
 
 // Private readers preserve the existing framing while checkpointing actual input.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn hash_parts_checkpoint(
     domain: &[u8],
     parts: &[&[u8]],
@@ -1781,7 +1873,10 @@ fn hash_parts_checkpoint(
     }
     Ok(*hash.finalize().as_bytes())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn key_hash_checkpoint(key: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<[u8; 32]> {
     if key.first() == Some(&KEY_REFERENCE_TAG) && key.len() == KEY_REFERENCE_BYTES {
         checkpoint()?;
@@ -1790,7 +1885,10 @@ fn key_hash_checkpoint(key: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -
         hash_parts_checkpoint(b"contextdb-prolly-key", &[key], checkpoint)
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bytes_cmp_checkpoint(
     left: &[u8],
     right: &[u8],
@@ -1805,7 +1903,10 @@ fn bytes_cmp_checkpoint(
     }
     Ok(left.len().cmp(&right.len()))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn identity_key_cmp_checkpoint(
     left: &[u8],
     right: &[u8],
@@ -1822,7 +1923,10 @@ fn identity_key_cmp_checkpoint(
         }
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn checkpoint_operation<E: From<Error>, T>(
     checkpoint: &mut dyn FnMut() -> std::result::Result<(), E>,
     operation: impl FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<T>,
@@ -1841,7 +1945,10 @@ pub(super) fn checkpoint_operation<E: From<Error>, T>(
     }
     result.map_err(E::from)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn chunk_id_checkpoint(
     level: u32,
     last: &[u8],
@@ -1859,7 +1966,10 @@ fn chunk_id_checkpoint(
     );
     Ok(id)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolve_key_checkpoint<'a>(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -1894,7 +2004,8 @@ fn resolve_key_checkpoint<'a>(
         || key_hash_checkpoint(&bytes[1..], checkpoint)? != id
     {
         return Err(Error::Other(
-            "authenticated separator key is damaged".into()));
+            "authenticated separator key is damaged".into(),
+        ));
     }
     #[cfg(any(test, feature = "test-seams"))]
     observe_resolved_key_event("copy", len);
@@ -1905,7 +2016,10 @@ fn resolve_key_checkpoint<'a>(
     }
     Ok(resolved.into())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolve_key_charged_checkpoint<'a>(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -1982,7 +2096,10 @@ struct FamilyRoot {
 
 type EntryEdits = Vec<(Vec<u8>, Option<[u8; 32]>)>;
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn take_u32(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<usize> {
     let end = cursor.saturating_add(4);
     let raw = bytes
@@ -1992,16 +2109,19 @@ fn take_u32(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<usize> {
     Ok(u32::from_be_bytes(raw.try_into().expect("checked u32")) as usize)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn take_bytes<'a>(
     bytes: &'a [u8],
     cursor: &mut usize,
     len: usize,
     label: &str,
 ) -> Result<&'a [u8]> {
-    let end = cursor
-        .checked_add(len)
-        .ok_or_else(|| Error::Other((format!("logical identity {label} length overflow")).into()))?;
+    let end = cursor.checked_add(len).ok_or_else(|| {
+        Error::Other((format!("logical identity {label} length overflow")).into())
+    })?;
     let value = bytes
         .get(*cursor..end)
         .ok_or_else(|| Error::Other((format!("logical identity {label} is truncated")).into()))?;
@@ -2023,27 +2143,32 @@ fn posting_tree_key(table: &str, index: &str, bound: u8, order_key: &[u8]) -> Ve
 
 type PostingTreeKeyParts<'a> = (&'a [u8], &'a [u8], u8, &'a [u8]);
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn parse_posting_tree_key(key: &[u8]) -> Result<PostingTreeKeyParts<'_>> {
     if key.first().copied() != Some(ORDERED_POSTING_KEY_TAG) {
-        return Err(Error::Other((
-            "logical identity ordered key has an invalid tag".to_owned()).into()));
+        return Err(Error::Other(
+            ("logical identity ordered key has an invalid tag".to_owned()).into(),
+        ));
     }
     let mut cursor = 1;
     let table_len = take_u32(key, &mut cursor, "posting table length")?;
     let table = take_bytes(key, &mut cursor, table_len, "posting table")?;
     let index_len = take_u32(key, &mut cursor, "posting index length")?;
     let index = take_bytes(key, &mut cursor, index_len, "posting index")?;
-    let bound = *key
-        .get(cursor)
-        .ok_or_else(|| Error::Other(("logical identity posting bound is absent".to_owned()).into()))?;
+    let bound = *key.get(cursor).ok_or_else(|| {
+        Error::Other(("logical identity posting bound is absent".to_owned()).into())
+    })?;
     cursor += 1;
     if !matches!(
         bound,
         POSTING_LOWER_BOUND_TAG | POSTING_ACTUAL_TAG | POSTING_UPPER_BOUND_TAG
     ) {
-        return Err(Error::Other((
-            "logical identity posting bound is invalid".to_owned()).into()));
+        return Err(Error::Other(
+            ("logical identity posting bound is invalid".to_owned()).into(),
+        ));
     }
     Ok((table, index, bound, &key[cursor..]))
 }
@@ -2057,13 +2182,17 @@ fn parse_posting_tree_key(key: &[u8]) -> Result<PostingTreeKeyParts<'_>> {
 /// diagnosis and a tie silently breaks the strict-order invariant the tree
 /// rests on, so stored bytes are refused with the identity corruption error
 /// instead.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validated_directed_order(left: (bool, Value), right: (bool, Value)) -> Result<Ordering> {
     let (left_descending, left_value) = left;
     let (right_descending, right_value) = right;
     if left_descending != right_descending {
         return Err(Error::Other(
-            "logical identity posting keys disagree about their sort direction".into()));
+            "logical identity posting keys disagree about their sort direction".into(),
+        ));
     }
     for value in [&left_value, &right_value] {
         if !matches!(
@@ -2078,7 +2207,8 @@ fn validated_directed_order(left: (bool, Value), right: (bool, Value)) -> Result
                 | Value::TxId(_)
         ) {
             return Err(Error::Other(
-                "logical identity posting key holds a value no index may order".into()));
+                "logical identity posting key holds a value no index may order".into(),
+            ));
         }
     }
     if !left_value.is_null()
@@ -2086,7 +2216,8 @@ fn validated_directed_order(left: (bool, Value), right: (bool, Value)) -> Result
         && std::mem::discriminant(&left_value) != std::mem::discriminant(&right_value)
     {
         return Err(Error::Other(
-            "logical identity posting keys compare unlike value types".into()));
+            "logical identity posting keys compare unlike value types".into(),
+        ));
     }
     Ok(if left_descending {
         contextdb_core::TotalOrdDesc(left_value).cmp(&contextdb_core::TotalOrdDesc(right_value))
@@ -2095,13 +2226,19 @@ fn validated_directed_order(left: (bool, Value), right: (bool, Value)) -> Result
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_posting_position(bytes: &[u8]) -> Result<super::EncodedRelationalIndexPosition> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     RedbPersistence::decode_exact::<super::EncodedRelationalIndexPosition>(bytes).map_err(|error| {
-        Error::Other((format!(
-            "logical identity ordered posting key is not a decodable index position: {error}"
-        )).into())
+        Error::Other(
+            (format!(
+                "logical identity ordered posting key is not a decodable index position: {error}"
+            ))
+            .into(),
+        )
     })
 }
 
@@ -2144,9 +2281,12 @@ impl<'de> serde::Deserialize<'de> for DiscardPostingVector {
 }
 
 fn posting_decode_error(error: impl std::fmt::Display) -> Error {
-    Error::Other((format!(
-        "logical identity ordered posting key is not a decodable index position: {error}"
-    )).into())
+    Error::Other(
+        (format!(
+            "logical identity ordered posting key is not a decodable index position: {error}"
+        ))
+        .into(),
+    )
 }
 
 struct BorrowedPostingCursor<'a> {
@@ -2155,7 +2295,10 @@ struct BorrowedPostingCursor<'a> {
     count: usize,
 }
 impl<'a> BorrowedPostingCursor<'a> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn open(bytes: &'a [u8]) -> Result<Self> {
         let (count, cursor) =
             bincode::serde::decode_from_slice::<usize, _>(bytes, bincode::config::standard())
@@ -2171,7 +2314,10 @@ impl<'a> BorrowedPostingCursor<'a> {
             count,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next(&mut self) -> Result<(bool, BorrowedPostingValue<'a>)> {
         let (value, read) = bincode::serde::borrow_decode_from_slice::<
             (bool, BorrowedPostingValue<'a>),
@@ -2181,7 +2327,10 @@ impl<'a> BorrowedPostingCursor<'a> {
         self.cursor += read;
         Ok(value)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn tail(&mut self) -> Result<(RowId, TxId)> {
         let (tail, read) = bincode::serde::decode_from_slice::<(RowId, TxId), _>(
             &self.bytes[self.cursor..],
@@ -2194,7 +2343,10 @@ impl<'a> BorrowedPostingCursor<'a> {
         }
         Ok(tail)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate(&mut self) -> Result<(RowId, TxId)> {
         for _ in 0..self.count {
             let (_, value) = self.next()?;
@@ -2209,7 +2361,10 @@ impl<'a> BorrowedPostingCursor<'a> {
 /// Validate an unsupported stored JSON component without constructing its
 /// values. Full validation still precedes comparison, including components
 /// after the first unequal one. The recursion ceiling is serde_json's default.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_posting_json(json: &str) -> Result<()> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     struct Parser<'a> {
@@ -2217,7 +2372,10 @@ fn validate_posting_json(json: &str) -> Result<()> {
         cursor: usize,
     }
     impl Parser<'_> {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn fail<T>(&self) -> Result<T> {
             Err(posting_decode_error("invalid JSON value"))
         }
@@ -2238,7 +2396,10 @@ fn validate_posting_json(json: &str) -> Result<()> {
                 false
             }
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn hex(&mut self) -> Result<u16> {
             let mut value = 0;
             for _ in 0..4 {
@@ -2256,7 +2417,10 @@ fn validate_posting_json(json: &str) -> Result<()> {
             }
             Ok(value)
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn string(&mut self) -> Result<()> {
             if !self.eat(b'"') {
                 return self.fail();
@@ -2296,7 +2460,10 @@ fn validate_posting_json(json: &str) -> Result<()> {
                 }
             }
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn number(&mut self) -> Result<()> {
             let start = self.cursor;
             self.eat(b'-');
@@ -2358,7 +2525,10 @@ fn validate_posting_json(json: &str) -> Result<()> {
             drop(credit);
             Ok(())
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn value(&mut self, remaining: usize) -> Result<()> {
             self.space();
             match self.bytes.get(self.cursor).copied() {
@@ -2421,7 +2591,10 @@ fn validate_posting_json(json: &str) -> Result<()> {
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn borrowed_directed_order(
     left: (bool, BorrowedPostingValue<'_>),
     right: (bool, BorrowedPostingValue<'_>),
@@ -2431,11 +2604,13 @@ fn borrowed_directed_order(
     let (right_descending, right) = right;
     if left_descending != right_descending {
         return Err(Error::Other(
-            "logical identity posting keys disagree about their sort direction".into()));
+            "logical identity posting keys disagree about their sort direction".into(),
+        ));
     }
     if matches!(left, V::Json(_) | V::Vector(_)) || matches!(right, V::Json(_) | V::Vector(_)) {
         return Err(Error::Other(
-            "logical identity posting key holds a value no index may order".into()));
+            "logical identity posting key holds a value no index may order".into(),
+        ));
     }
     let ascending = match (left, right) {
         (V::Null, V::Null) => Ordering::Equal,
@@ -2451,7 +2626,8 @@ fn borrowed_directed_order(
         (V::TxId(left), V::TxId(right)) => left.0.cmp(&right.0),
         _ => {
             return Err(Error::Other(
-                "logical identity posting keys compare unlike value types".into()));
+                "logical identity posting keys compare unlike value types".into(),
+            ));
         }
     };
     Ok(if left_descending {
@@ -2461,7 +2637,10 @@ fn borrowed_directed_order(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn validated_posting_order(left: &[u8], right: &[u8]) -> Result<Ordering> {
     // Validate each complete payload before ordering, just as the owned
     // decoder did, without retaining component vectors or string copies.
@@ -2484,13 +2663,19 @@ pub(super) fn validated_posting_order(left: &[u8], right: &[u8]) -> Result<Order
 
 /// Preflight callers already validated both complete keys against their declaration.
 /// Borrow their scalar payloads; wide text comparison checks each 64 KiB window.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn validated_preflight_posting_order(
     left_bytes: &[u8],
     right_bytes: &[u8],
     checkpoint: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Ordering> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn tail(bytes: &[u8], checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<(RowId, TxId)> {
         let mut cursor = BorrowedPostingCursor::open(bytes)?;
         for _ in 0..cursor.count {
@@ -2639,7 +2824,10 @@ pub(super) fn total_posting_order(left: &[u8], right: &[u8]) -> Ordering {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn identity_key_cmp(left: &[u8], right: &[u8]) -> Result<Ordering> {
     match (left.first().copied(), right.first().copied()) {
         (Some(HASHED_KEY_TAG), Some(HASHED_KEY_TAG)) => Ok(left.cmp(right)),
@@ -2667,12 +2855,16 @@ fn identity_key_cmp(left: &[u8], right: &[u8]) -> Result<Ordering> {
         {
             Ok(left.cmp(&right))
         }
-        _ => Err(Error::Other((
-            "logical identity key has an invalid key-space tag".to_owned()).into())),
+        _ => Err(Error::Other(
+            ("logical identity key has an invalid key-space tag".to_owned()).into(),
+        )),
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn mutation_tree_key(mutation: &ContentIdentityMutation) -> Result<Vec<u8>> {
     if mutation.family == LogicalFamily::SchemaAndIndexes
         && mutation.logical_key.starts_with(ORDERED_POSTING_MAGIC)
@@ -2683,8 +2875,9 @@ fn mutation_tree_key(mutation: &ContentIdentityMutation) -> Result<Vec<u8>> {
         key.extend_from_slice(raw);
         let (_, _, bound, order_key) = parse_posting_tree_key(&key)?;
         if bound != POSTING_ACTUAL_TAG || order_key.is_empty() {
-            return Err(Error::Other((
-                "logical identity posting key is not an actual ordered posting".to_owned()).into()));
+            return Err(Error::Other(
+                ("logical identity posting key is not an actual ordered posting".to_owned()).into(),
+            ));
         }
         Ok(key)
     } else if mutation.family == LogicalFamily::ChangeAndDdl
@@ -2703,8 +2896,9 @@ fn mutation_tree_key(mutation: &ContentIdentityMutation) -> Result<Vec<u8>> {
                 key.extend_from_slice(raw);
                 Ok(key)
             }
-            _ => Err(Error::Other((
-                "logical identity history key has no kind and coordinate".to_owned()).into())),
+            _ => Err(Error::Other(
+                ("logical identity history key has no kind and coordinate".to_owned()).into(),
+            )),
         }
     } else {
         let mut key = Vec::with_capacity(33);
@@ -2844,11 +3038,15 @@ impl SetCommitment {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn decode(set: CompactIndexSet, bytes: &[u8]) -> Result<Self> {
         if bytes.len() != SET_COMMITMENT_STATE_BYTES {
-            return Err(Error::Other((
-                "compact index set commitment has invalid size".to_owned()).into()));
+            return Err(Error::Other(
+                ("compact index set commitment has invalid size".to_owned()).into(),
+            ));
         }
         let mut commitment = Self::empty(set);
         commitment.count = u64::from_be_bytes(bytes[..8].try_into().expect("checked count"));
@@ -2886,7 +3084,10 @@ impl SetCommitment {
         lanes
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn insert(&mut self, key: &[u8], witness: &[u8; 32]) -> Result<()> {
         let element = self.element(key, witness);
         for (lane, add) in self.lanes.iter_mut().zip(element) {
@@ -2899,7 +3100,10 @@ impl SetCommitment {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn remove(&mut self, key: &[u8], witness: &[u8; 32]) -> Result<()> {
         let element = self.element(key, witness);
         for (lane, sub) in self.lanes.iter_mut().zip(element) {
@@ -2935,7 +3139,10 @@ impl SetCommitment {
     /// The writer's running commitment for `set`. An absent record is the
     /// empty set: a store that never wrote the copy, or a rebuild that has just
     /// cleared it.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn load_in_write(
         write_txn: &redb::WriteTransaction,
         set: CompactIndexSet,
@@ -2954,7 +3161,10 @@ impl SetCommitment {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn store_in_write(&self, write_txn: &redb::WriteTransaction) -> Result<()> {
         write_txn
             .open_table(super::COMPACT_INDEX_SET_TABLE)
@@ -2965,7 +3175,10 @@ impl SetCommitment {
     }
 
     /// Forget the running commitment before a rebuild re-adds every record.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn clear_in_write(
         write_txn: &redb::WriteTransaction,
         set: CompactIndexSet,
@@ -3101,7 +3314,10 @@ fn encoded_key(level: u32, key: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     encoded_key_in(level, key, &mut reference).to_vec().into()
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolve_key<'a>(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -3132,7 +3348,8 @@ fn resolve_key<'a>(
     observe_node_read(bytes.len());
     if bytes.len() != len + 1 || bytes[0] != 0 || key_hash(&bytes[1..]) != id {
         return Err(Error::Other(
-            "authenticated separator key is damaged".into()));
+            "authenticated separator key is damaged".into(),
+        ));
     }
     #[cfg(any(test, feature = "test-seams"))]
     observe_resolved_key_event("copy", len);
@@ -3142,7 +3359,10 @@ fn resolve_key<'a>(
 /// The referenced key, with the copy it makes charged before it is made. The
 /// reference states the length, so the charge is exact and is taken before
 /// the store is even asked for the blob.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolve_key_charged<'a>(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -3171,7 +3391,10 @@ fn resolve_key_charged<'a>(
 /// Bytes a referenced key will occupy once copied. Inline keys are borrowed
 /// from the already-charged chunk and cost nothing extra. The length is read
 /// from the reference so the charge can precede the copy.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn referenced_key_live_bytes(key: &[u8]) -> Result<usize> {
     if key.first() != Some(&KEY_REFERENCE_TAG) {
         return Ok(0);
@@ -3305,7 +3528,10 @@ struct EncodedEntry<'a> {
 }
 
 impl<'a> EncodedNode<'a> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn entry_at(&self, cursor: &mut usize) -> Result<EncodedEntry<'a>> {
         let len = take_u32(self.bytes, cursor, "key length")?;
         let key = take_bytes(self.bytes, cursor, len, "key")?;
@@ -3318,18 +3544,23 @@ impl<'a> EncodedNode<'a> {
         Ok(EncodedEntry { key, value_hash })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn authenticate(family: LogicalFamily, bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() > MAX_NODE_BYTES || bytes.first().copied() != Some(NODE_VERSION) {
             return Err(Error::Other(
-                "logical identity chunk size or representation is invalid".into()));
+                "logical identity chunk size or representation is invalid".into(),
+            ));
         }
         let mut cursor = 1;
         let level = take_u32(bytes, &mut cursor, "level")? as u32;
         let count = take_u32(bytes, &mut cursor, "entry count")?;
         if level > MAX_CHUNK_LEVEL || count == 0 || count > bytes.len() / 36 {
             return Err(Error::Other(
-                "logical identity chunk level or count is invalid".into()));
+                "logical identity chunk level or count is invalid".into(),
+            ));
         }
         let mut node = Self {
             bytes,
@@ -3356,7 +3587,8 @@ impl<'a> EncodedNode<'a> {
         crate::read_work_probe::note_proof_node_hashed();
         if cursor != bytes.len() || *hash.finalize().as_bytes() != node.subtree_hash {
             return Err(Error::Other(
-                "logical identity chunk does not authenticate its contents".into()));
+                "logical identity chunk does not authenticate its contents".into(),
+            ));
         }
         // Authenticate before a typed comparator interprets stored keys.
         let mut cursor = 9;
@@ -3370,12 +3602,14 @@ impl<'a> EncodedNode<'a> {
                 && identity_key_cmp(prior, entry.key)? != Ordering::Less
             {
                 return Err(Error::Other(
-                    "logical identity chunk keys are not strictly ordered".into()));
+                    "logical identity chunk keys are not strictly ordered".into(),
+                ));
             }
             let end = size + 36 + encoded_key_len(level, entry.key);
             if position + 1 < count && chunk_cut(level, entry.key, size, end, position + 1) {
                 return Err(Error::Other(
-                    "logical identity chunk crosses a canonical boundary".into()));
+                    "logical identity chunk crosses a canonical boundary".into(),
+                ));
             }
             prior = Some(entry.key);
             size = end;
@@ -3384,7 +3618,10 @@ impl<'a> EncodedNode<'a> {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_node(family: LogicalFamily, bytes: &[u8]) -> Result<Node> {
     let encoded = EncodedNode::authenticate(family, bytes)?;
     let mut entries = Vec::with_capacity(encoded.count);
@@ -3403,7 +3640,10 @@ fn decode_node(family: LogicalFamily, bytes: &[u8]) -> Result<Node> {
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_node(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -3419,7 +3659,10 @@ fn read_node(
 /// that were admitted for it. The charge is NOT released here: it follows the
 /// decoded chunk, and whoever ends up owning that chunk gives it back when the
 /// chunk is dropped.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_node_charged(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -3453,7 +3696,8 @@ fn read_node_charged(
     if chunk_id(node.level, &node.entries.last().expect("chunk").key) != id {
         admission.release(decoded_bytes);
         return Err(Error::Other(
-            "logical identity chunk id disagrees with its separator".into()));
+            "logical identity chunk id disagrees with its separator".into(),
+        ));
     }
     // The charge above was read from the stored header before anything was
     // allocated, and it rounds up so the allocation can never outrun it. The
@@ -3495,7 +3739,10 @@ fn precharged_node_bytes(encoded: &[u8]) -> usize {
 /// The decode charge for a stored chunk, read from the borrowed page before
 /// anything is allocated. Missing or unreadable chunks fail here the same
 /// way `read_node_charged` would a moment later.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn stored_node_precharge_bytes(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -3586,11 +3833,18 @@ impl std::ops::DerefMut for OwnedProofAdmission {
 }
 
 impl ProofAdmission {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn diagnostic_budget(&self) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
-        if let Some(reader) = &self.reader_budget { return Ok(reader.clone()); }
-        self.accountant.as_ref().ok_or_else(|| Error::Other(
-            "diagnostic requires its original proof payer".into()))?.read_budget()
+        if let Some(reader) = &self.reader_budget {
+            return Ok(reader.clone());
+        }
+        self.accountant
+            .as_ref()
+            .ok_or_else(|| Error::Other("diagnostic requires its original proof payer".into()))?
+            .read_budget()
     }
 
     pub(super) fn take_reader_refusal(&self) -> Option<Error> {
@@ -3631,7 +3885,10 @@ impl ProofAdmission {
         self
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn open_scratch(&mut self) -> Result<(Box<dyn redb::ScratchBackend>, AdmittedBytes)> {
         // The concrete factory exposes its exact Box payload layout without
         // allocating. Admission therefore precedes both file and Box creation.
@@ -3708,7 +3965,10 @@ impl ProofAdmission {
 
     /// Admit `bytes` before they are allocated. A refusal is the existing typed
     /// budget error and leaves this transaction to abort with nothing written.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn admit(&mut self, bytes: usize) -> Result<()> {
         self.admit_for(
             bytes,
@@ -3719,7 +3979,10 @@ impl ProofAdmission {
 
     /// [`Self::admit`] for writer work this admission funds under its own
     /// operation name, so a refusal names what asked for the bytes.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn admit_for(
         &mut self,
         bytes: usize,
@@ -3727,7 +3990,8 @@ impl ProofAdmission {
         hint: &'static str,
     ) -> Result<()> {
         #[cfg(test)]
-        let _capture_phase = crate::memory_accounting::compaction_admission_capture::Phase::proof_default();
+        let _capture_phase =
+            crate::memory_accounting::compaction_admission_capture::Phase::proof_default();
         if let Some(reader) = &self.reader_budget {
             if let Err(error) = reader.try_reserve(
                 bytes,
@@ -3799,7 +4063,10 @@ impl ProofAdmission {
     /// a terminal's signatures inside this transaction: this admission's
     /// reader budget or accountant, or an unlimited measuring owner when the
     /// admission itself is unaccounted.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verification_owner(
         &self,
     ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
@@ -4010,7 +4277,10 @@ impl MutationKeyNode {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn insert(
         link: &mut Option<Box<Self>>,
         ordinal: usize,
@@ -4024,8 +4294,13 @@ impl MutationKeyNode {
                 .checked_add(bytes)
                 .ok_or_else(|| proof_allocation_overflow(admission))?;
             #[cfg(test)]
-            let _capture_node = crate::memory_accounting::compaction_admission_capture::Phase::enter(
-                "proof-node", "MutationKeyNode::insert", "", Some(mutations[ordinal].family as usize));
+            let _capture_node =
+                crate::memory_accounting::compaction_admission_capture::Phase::enter(
+                    "proof-node",
+                    "MutationKeyNode::insert",
+                    "",
+                    Some(mutations[ordinal].family as usize),
+                );
             admission.admit(bytes)?;
             *link = Some(Box::new(Self {
                 first: ordinal,
@@ -4072,7 +4347,10 @@ impl MutationKeyNode {
                 .map_or(0, |node| node.allocation_bytes())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visit(&self, visitor: &mut impl FnMut(&Self) -> Result<()>) -> Result<()> {
         if let Some(left) = &self.left {
             left.visit(visitor)?;
@@ -4133,7 +4411,10 @@ impl std::ops::Index<usize> for MutationInputs<'_> {
 }
 
 /// The exact payload capacity mutation_tree_key requests for this encoding.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn mutation_key_capacity(
     mutation: &ContentIdentityMutation,
     admission: &ProofAdmission,
@@ -4169,7 +4450,10 @@ const fn proof_path_bytes(height: u32) -> usize {
 /// Compare two keys that may each be stored inline or by reference, resolving
 /// at most one key at a time and never both when their hashes already decide
 /// the answer.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolving_key_cmp(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -4208,7 +4492,10 @@ fn resolving_key_cmp(
 /// Binary search over stored entries, resolving only the key being compared.
 /// A leaf that holds a key too large to inline is searched without ever
 /// materializing more than one key at a time.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn resolving_entry_search(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -4229,7 +4516,10 @@ fn resolving_entry_search(
     Ok(Err(left))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn entry_search(entries: &[PageEntry], key: &[u8]) -> Result<std::result::Result<usize, usize>> {
     let mut left = 0;
     let mut right = entries.len();
@@ -4246,7 +4536,10 @@ fn entry_search(entries: &[PageEntry], key: &[u8]) -> Result<std::result::Result
 
 /// Sort by canonical key order without a panic on a key that cannot be
 /// ordered: the first refusal is kept and returned.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sort_canonical(edits: &mut EntryEdits) -> Result<()> {
     let mut failure = None;
     edits.sort_by(|left, right| match identity_key_cmp(&left.0, &right.0) {
@@ -4265,7 +4558,10 @@ fn sort_canonical(edits: &mut EntryEdits) -> Result<()> {
 /// Coalescing yields distinct encoded keys in raw-byte order. The raw-byte
 /// tiebreak therefore reproduces stable canonical sorting when distinct
 /// accepted encodings compare semantically equal, with no auxiliary allocation.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn sort_canonical_from_coalesced(edits: &mut EntryEdits) -> Result<()> {
     let mut failure = None;
     edits.sort_unstable_by(|left, right| match identity_key_cmp(&left.0, &right.0) {
@@ -4334,7 +4630,10 @@ fn assign_open_projections(
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn persist_changed_family_roots(
     write_txn: &redb::WriteTransaction,
     roots: &[FamilyRoot; 11],
@@ -4371,7 +4670,10 @@ fn persist_changed_family_roots(
 /// Compare the producer's fixed-size placement commitment with the family
 /// roots in this captured read. Hash the borrowed encoding directly: no decoded
 /// lane box or encoded copy is needed to authenticate a fresh historical read.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn vector_directory_projection_matches_in_read(
     read: &redb::ReadTransaction,
     bodies: u64,
@@ -4383,14 +4685,22 @@ pub(super) fn vector_directory_projection_matches_in_read(
         Err(redb::TableError::TableDoesNotExist(_)) => None,
         Err(error) => return Err(RedbPersistence::storage_error(error)),
     };
-    let stored = table.as_ref()
-        .map(|table| table.get(set.state_key()).map_err(RedbPersistence::storage_error))
-        .transpose()?.flatten();
+    let stored = table
+        .as_ref()
+        .map(|table| {
+            table
+                .get(set.state_key())
+                .map_err(RedbPersistence::storage_error)
+        })
+        .transpose()?
+        .flatten();
     let mut set_hash = blake3::Hasher::new();
     set_hash.update(set.root_domain());
     if let Some(stored) = stored {
         if stored.value().len() != SET_COMMITMENT_STATE_BYTES {
-            return Err(Error::Other("compact index set commitment has invalid size".into()));
+            return Err(Error::Other(
+                "compact index set commitment has invalid size".into(),
+            ));
         }
         if stored.value()[..8] != members.to_be_bytes() {
             return Ok(false);
@@ -4413,7 +4723,10 @@ pub(super) fn vector_directory_projection_matches_in_read(
     Ok(*coverage.finalize().as_bytes() == vector_directory_projection_in_read(read)?)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn vector_directory_projection_in_read(
     read_txn: &redb::ReadTransaction,
 ) -> Result<[u8; 32]> {
@@ -4429,22 +4742,29 @@ pub(super) fn vector_directory_projection_in_read(
         let encoded = roots_table
             .get(family as u8)
             .map_err(RedbPersistence::storage_error)?
-            .ok_or_else(|| Error::Other(("logical content family root is absent".to_owned()).into()))?;
+            .ok_or_else(|| {
+                Error::Other(("logical content family root is absent".to_owned()).into())
+            })?;
         let root = decode_published_root(family, encoded.value())?;
         let digest = root.vector_directory_root.ok_or_else(|| {
-            Error::Other(("vector directory projection is absent from the committed root".to_owned()).into())
+            Error::Other(
+                ("vector directory projection is absent from the committed root".to_owned()).into(),
+            )
         })?;
         match expected {
             None => expected = Some(digest),
             Some(previous) if previous != digest => {
-                return Err(Error::Other((
-                    "vector directory projection disagrees across committed vector roots"
-                        .to_owned()).into()));
+                return Err(Error::Other(
+                    ("vector directory projection disagrees across committed vector roots"
+                        .to_owned())
+                    .into(),
+                ));
             }
             Some(_) => {}
         }
     }
-    expected.ok_or_else(|| Error::Other(("vector directory projection is absent".to_owned()).into()))
+    expected
+        .ok_or_else(|| Error::Other(("vector directory projection is absent".to_owned()).into()))
 }
 
 fn encode_root(root: &FamilyRoot) -> Vec<u8> {
@@ -4504,23 +4824,33 @@ fn encode_published_root(root: &PublishedRoot) -> Vec<u8> {
     encoded
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn take_root_hash(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<[u8; 32]> {
     Ok(take_bytes(bytes, cursor, 32, label)?
         .try_into()
         .expect("checked 32-byte root field"))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_root(family: LogicalFamily, bytes: &[u8]) -> Result<FamilyRoot> {
     Ok(decode_published_root(family, bytes)?.identity)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_published_root(family: LogicalFamily, bytes: &[u8]) -> Result<PublishedRoot> {
     if bytes.first().copied() != Some(ROOT_VERSION) {
-        return Err(Error::Other((
-            "logical identity root has an unsupported representation".to_owned()).into()));
+        return Err(Error::Other(
+            ("logical identity root has an unsupported representation".to_owned()).into(),
+        ));
     }
     let mut cursor = 1;
     let root = match bytes.get(cursor).copied() {
@@ -4544,8 +4874,9 @@ fn decode_published_root(family: LogicalFamily, bytes: &[u8]) -> Result<Publishe
             )
         }
         _ => {
-            return Err(Error::Other((
-                "logical identity root tag is invalid".to_owned()).into()));
+            return Err(Error::Other(
+                ("logical identity root tag is invalid".to_owned()).into(),
+            ));
         }
     };
     let hash = take_bytes(bytes, &mut cursor, 32, "root hash")?
@@ -4610,8 +4941,9 @@ fn decode_published_root(family: LogicalFamily, bytes: &[u8]) -> Result<Publishe
         None
     };
     if cursor != bytes.len() || (root.is_none() && hash != empty_hash(family)) {
-        return Err(Error::Other((
-            "logical identity root is malformed".to_owned()).into()));
+        return Err(Error::Other(
+            ("logical identity root is malformed".to_owned()).into(),
+        ));
     }
     Ok(PublishedRoot {
         history_open,
@@ -5320,7 +5652,10 @@ impl ProofMemory {
 
     /// Charge `bytes`, returning `Ok(None)` when the pool's own ceiling stops
     /// the walk and `Err` when the accountant refused the allocation.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn charge_or_exhaust(&self, bytes: usize) -> Result<Option<ProofCharge<'_>>> {
         match self.charge_live(bytes) {
             Some(charge) => Ok(Some(charge)),
@@ -5617,7 +5952,10 @@ impl ReadAuthenticationNodes {
 }
 
 impl ReadAuthenticationBatch<'_> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn verify(&mut self, mutation: &ContentIdentityMutation) -> Result<()> {
         self.verifier
             .verify_with_batch(
@@ -5633,7 +5971,10 @@ impl ReadAuthenticationBatch<'_> {
 }
 
 impl ContentIdentityReadVerifier {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verify_open_config_projection(&self, copied: &[(String, Vec<u8>)]) -> Result<()> {
         let digest = open_config_digest(
             copied
@@ -5648,7 +5989,10 @@ impl ContentIdentityReadVerifier {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn verify_custody_config_projection(&self, digest: [u8; 32]) -> Result<()> {
         if self.custody_config_root != digest {
             return Err(self.corrupt(
@@ -5658,7 +6002,10 @@ impl ContentIdentityReadVerifier {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn verify_lineage_config_projection(&self, digest: [u8; 32]) -> Result<()> {
         if self.lineage_config_root != digest {
             return Err(self.corrupt(
@@ -5670,11 +6017,18 @@ impl ContentIdentityReadVerifier {
 
     /// Report a proof failure as the existing typed corruption error. An error
     /// that already carries that type passes through unchanged.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn corrupt(&self, reason: impl std::fmt::Display) -> Error {
-        crate::funded_error::corruption_display(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &self.source, format_args!(
+        crate::funded_error::corruption_display(
+            crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),
+            &self.source,
+            format_args!(
                 "loaded content does not authenticate against the committed image root: {reason}"
-            ))
+            ),
+        )
     }
 
     fn typed(&self, error: Error) -> Error {
@@ -5689,7 +6043,10 @@ impl ContentIdentityReadVerifier {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn open(
         read_txn: &redb::ReadTransaction,
         source: &std::path::Path,
@@ -5706,7 +6063,9 @@ impl ContentIdentityReadVerifier {
             let encoded = roots_table
                 .get(family as u8)
                 .map_err(RedbPersistence::storage_error)?
-                .ok_or_else(|| Error::Other(("logical content family root is absent".to_owned()).into()))?;
+                .ok_or_else(|| {
+                    Error::Other(("logical content family root is absent".to_owned()).into())
+                })?;
             let published = decode_published_root(family, encoded.value())?;
             if family == LogicalFamily::Configuration {
                 custody_config_root = published.custody_config_root;
@@ -5715,12 +6074,16 @@ impl ContentIdentityReadVerifier {
             roots[family as usize] = published.identity;
         }
         let custody_config_root = custody_config_root.ok_or_else(|| {
-            Error::Other((
-                "custody configuration projection is absent from the committed root".to_owned()).into())
+            Error::Other(
+                ("custody configuration projection is absent from the committed root".to_owned())
+                    .into(),
+            )
         })?;
         let lineage_config_root = lineage_config_root.ok_or_else(|| {
-            Error::Other((
-                "lineage configuration projection is absent from the committed root".to_owned()).into())
+            Error::Other(
+                ("lineage configuration projection is absent from the committed root".to_owned())
+                    .into(),
+            )
         })?;
         drop(roots_table);
         let nodes = read_txn
@@ -5853,7 +6216,10 @@ impl ContentIdentityReadVerifier {
 
     /// Point proof scratch belongs to this operation; any cache already held
     /// by the source keeps its separately admitted owner.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verify_with_read_memory(
         &self,
         mutation: &ContentIdentityMutation,
@@ -5892,7 +6258,10 @@ impl ContentIdentityReadVerifier {
 
     /// Authenticate a hashed reader projection with operation-owned scratch
     /// and the caller's checkpoint at every input window and proof descent.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verify_with_read_memory_before(
         &self,
         mutation: &ContentIdentityMutation,
@@ -5927,7 +6296,10 @@ impl ContentIdentityReadVerifier {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verify(&self, mutation: &ContentIdentityMutation) -> Result<()> {
         if let Some(memory) = crate::read_image_memory::current_reader_budget() {
             return self.verify_with_read_memory(mutation, memory);
@@ -5947,7 +6319,10 @@ impl ContentIdentityReadVerifier {
     /// memory is this record's own proof and nothing kept for later, is the
     /// typed answer; the set is left empty either way, so a refused statement
     /// holds nothing afterwards.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn verify_with_nodes(
         &self,
         nodes: &mut ReadAuthenticationNodes,
@@ -5988,7 +6363,10 @@ impl ContentIdentityReadVerifier {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verify_with_nodes_once(
         &self,
         nodes: &mut ReadAuthenticationNodes,
@@ -6086,7 +6464,10 @@ impl ContentIdentityReadVerifier {
     /// and did not already hold, and answer the proved leaf it ended on. Every
     /// page a charged walk puts into `batch` already carries its own charge
     /// (see `verified_node`), so the caller has nothing left to bill for it.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verify_with_batch(
         &self,
         mutation: &ContentIdentityMutation,
@@ -6115,7 +6496,10 @@ impl ContentIdentityReadVerifier {
         clippy::too_many_arguments,
         reason = "One proof walk retains its existing batch and supplied admission"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verify_with_batch_admission(
         &self,
         mutation: &ContentIdentityMutation,
@@ -6138,7 +6522,10 @@ impl ContentIdentityReadVerifier {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verify_with_batch_admission_and_checkpoint(
         &self,
         mutation: &ContentIdentityMutation,
@@ -6259,7 +6646,10 @@ impl ContentIdentityReadVerifier {
         Ok(verified_leaf)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verify_reader_projection(
         &self,
         mutation: &ContentIdentityMutation,
@@ -6311,7 +6701,8 @@ impl ContentIdentityReadVerifier {
             let result = (|| {
                 if node.subtree_hash != expected_hash {
                     return Err(Error::Other(
-                        "logical content page disagrees with its committed proof path".into()));
+                        "logical content page disagrees with its committed proof path".into(),
+                    ));
                 }
                 let mut low = 0;
                 let mut high = node.entries.len();
@@ -6364,7 +6755,10 @@ impl ContentIdentityReadVerifier {
         verify_record_witness(mutation.family, wanted_value, actual)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn verified_node(
         &self,
         family: LogicalFamily,
@@ -6417,10 +6811,13 @@ impl ContentIdentityReadVerifier {
         // under the hash its parent — and through it the committed root —
         // demands of it on THIS walk, exactly as a chunk just read is.
         if verified.node.subtree_hash != expected_hash {
-            return Err(Error::Other((format!(
-                "logical content family {} page disagrees with its committed proof path",
-                family as u8
-            )).into()));
+            return Err(Error::Other(
+                (format!(
+                    "logical content family {} page disagrees with its committed proof path",
+                    family as u8
+                ))
+                .into(),
+            ));
         }
         // A charged walk's batch is statement reuse: it pins whatever it holds
         // until the statement ends, so it grows only while the session keeps
@@ -6754,7 +7151,10 @@ impl ContentIdentityReadVerifier {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visit_ordered_node<E>(
         &self,
         family: LogicalFamily,
@@ -6966,7 +7366,10 @@ struct OrderedVisitBounds<'a> {
 }
 
 impl OrderedVisitBounds<'_> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn includes_checkpoint(
         &self,
         key: &[u8],
@@ -6994,7 +7397,10 @@ impl OrderedVisitBounds<'_> {
             (false, _) => compare.is_gt(),
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn page_before_start_checkpoint(
         &self,
         key: &[u8],
@@ -7017,7 +7423,10 @@ impl OrderedVisitBounds<'_> {
             std::ops::Bound::Unbounded => false,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn page_after_start_checkpoint(
         &self,
         key: &[u8],
@@ -7040,7 +7449,10 @@ impl OrderedVisitBounds<'_> {
             std::ops::Bound::Unbounded => false,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn compare_start(&self, key: &[u8], start: &[u8]) -> Result<Ordering> {
         if !self.prefix_successor {
             return identity_key_cmp(key, start);
@@ -7075,7 +7487,10 @@ impl OrderedVisitBounds<'_> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn includes(&self, key: &[u8]) -> Result<bool> {
         if identity_key_cmp(key, self.low)? != Ordering::Greater
             || identity_key_cmp(key, self.high)? != Ordering::Less
@@ -7102,7 +7517,10 @@ impl OrderedVisitBounds<'_> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn page_before_start(&self, last: &[u8]) -> Result<bool> {
         if self.reverse {
             return Ok(identity_key_cmp(last, self.low)? != Ordering::Greater);
@@ -7114,7 +7532,10 @@ impl OrderedVisitBounds<'_> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn page_after_start(&self, first: &[u8]) -> Result<bool> {
         if !self.reverse {
             return Ok(identity_key_cmp(first, self.high)? != Ordering::Less);
@@ -7127,7 +7548,10 @@ impl OrderedVisitBounds<'_> {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn verify_record_witness(
     family: LogicalFamily,
     wanted: Option<[u8; 32]>,
@@ -7135,19 +7559,28 @@ fn verify_record_witness(
 ) -> Result<()> {
     match (wanted, actual) {
         (Some(wanted), Some(actual)) if wanted == actual => Ok(()),
-        (Some(_), Some(_)) => Err(Error::Other((format!(
-            "logical content family {} record value does not match its authenticated page",
-            family as u8
-        )).into())),
-        (None, Some(_)) => Err(Error::Other((format!(
-            "logical content family {} contains a record expected to be absent",
-            family as u8
-        )).into())),
+        (Some(_), Some(_)) => Err(Error::Other(
+            (format!(
+                "logical content family {} record value does not match its authenticated page",
+                family as u8
+            ))
+            .into(),
+        )),
+        (None, Some(_)) => Err(Error::Other(
+            (format!(
+                "logical content family {} contains a record expected to be absent",
+                family as u8
+            ))
+            .into(),
+        )),
         (None, None) => Ok(()),
-        (Some(_), None) => Err(Error::Other((format!(
-            "logical content family {} is missing the requested committed record",
-            family as u8
-        )).into())),
+        (Some(_), None) => Err(Error::Other(
+            (format!(
+                "logical content family {} is missing the requested committed record",
+                family as u8
+            ))
+            .into(),
+        )),
     }
 }
 
@@ -7206,7 +7639,10 @@ fn digest_from_roots(roots: [[u8; 32]; 11]) -> DirectTypedImageDigest {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn content_size_root_in_native_read(read: &redb::NativeReadView) -> Result<[u8; 32]> {
     let value = read
         .get_native_u8_value(
@@ -7249,14 +7685,20 @@ pub(super) fn content_size_root_in_native_read(read: &redb::NativeReadView) -> R
     }
     content_size_root.ok_or_else(|| Error::Other("committed content-size root is missing".into()))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn content_size_root_record(value: &[u8]) -> Result<[u8; 32]> {
     decode_published_root(LogicalFamily::Configuration, value)?
         .content_size_root
         .ok_or_else(|| Error::Other("committed content-size root is missing".into()))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn content_size_root_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
     let roots = read
         .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
@@ -7268,7 +7710,10 @@ pub(super) fn content_size_root_in_read(read: &redb::ReadTransaction) -> Result<
     content_size_root_record(value.value())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn content_size_root_in_write(write: &redb::WriteTransaction) -> Result<[u8; 32]> {
     let roots = write
         .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
@@ -7292,7 +7737,10 @@ fn vector_schema_pages_hash(pages: [u8; 32], schema: [u8; 32]) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn vector_schema_pages_root_in_write(
     write: &redb::WriteTransaction,
 ) -> Result<[u8; 32]> {
@@ -7307,7 +7755,10 @@ pub(super) fn vector_schema_pages_root_in_write(
     Ok(vector_schema_pages_hash(pages, schema))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn vector_schema_pages_root_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
     let pages = read
         .table_root_fingerprint(super::vector_paged::PAGES)
@@ -7321,7 +7772,10 @@ pub(super) fn vector_schema_pages_root_in_read(read: &redb::ReadTransaction) -> 
 }
 
 /// Whether a paged bind ever recorded the schema half of its binding.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn vector_schema_meta_root_bound_in_read(read: &redb::ReadTransaction) -> Result<bool> {
     let recovery = match read.open_table(super::writer_recovery::RECOVERY_TABLE) {
         Ok(table) => table,
@@ -7335,7 +7789,10 @@ pub(super) fn vector_schema_meta_root_bound_in_read(read: &redb::ReadTransaction
 }
 
 /// Whether the committed schema half of the paged binding still matches.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn vector_schema_meta_root_matches_in_read(
     read: &redb::ReadTransaction,
 ) -> Result<bool> {
@@ -7352,7 +7809,10 @@ pub(super) fn vector_schema_meta_root_matches_in_read(
         .is_some_and(|bound| bound.value() == schema))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn vector_pages_root_in_read(read: &redb::ReadTransaction) -> Result<[u8; 32]> {
     let roots = read
         .open_table(CONTENT_IDENTITY_ROOTS_TABLE)
@@ -7369,7 +7829,10 @@ pub(super) fn vector_pages_root_in_read(read: &redb::ReadTransaction) -> Result<
 /// table can be told apart from damaged schema metadata.
 pub(super) const VECTOR_SCHEMA_META_ROOT_KEY: &str = "vector_schema_meta_root_v1";
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn bind_vector_pages_root_in_write(write: &redb::WriteTransaction) -> Result<()> {
     let fingerprint = vector_schema_pages_root_in_write(write)?;
     bind_vector_schema_meta_root_in_write(write)?;
@@ -7397,7 +7860,10 @@ pub(super) fn bind_vector_pages_root_in_write(write: &redb::WriteTransaction) ->
 
 /// Carry an existing schema-half binding forward to this commit's metadata.
 /// A store that never bound a paged generation is left without one.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn rebind_vector_schema_meta_root_if_bound_in_write(
     write: &redb::WriteTransaction,
 ) -> Result<()> {
@@ -7417,7 +7883,10 @@ pub(super) fn rebind_vector_schema_meta_root_if_bound_in_write(
 }
 
 /// Record the schema half of the paged binding beside every combined bind.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn bind_vector_schema_meta_root_in_write(write: &redb::WriteTransaction) -> Result<()> {
     let schema = write
         .table_root_fingerprint(super::META_TABLE)
@@ -7484,7 +7953,10 @@ impl RedbPersistence {
             .and_then(|slot| slot.original_handle_for(accountant))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_proof_owner(&self) -> Result<()> {
         if let Some(slot) = self.proof_accountant.get() {
             slot.prepare()?;
@@ -7509,7 +7981,10 @@ impl RedbPersistence {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn require_current_content_identity(&self) -> Result<()> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -7519,17 +7994,24 @@ impl RedbPersistence {
             let version = metadata
                 .get(IDENTITY_VERSION_KEY)
                 .map_err(Self::storage_error)?
-                .ok_or_else(|| Error::Other(("logical content identity is absent".to_owned()).into()))?;
+                .ok_or_else(|| {
+                    Error::Other(("logical content identity is absent".to_owned()).into())
+                })?;
             if version.value() != IDENTITY_VERSION {
-                return Err(Error::Other((
-                    "logical content identity has an unsupported internal representation"
-                        .to_owned()).into()));
+                return Err(Error::Other(
+                    ("logical content identity has an unsupported internal representation"
+                        .to_owned())
+                    .into(),
+                ));
             }
             Ok(())
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn initialize_content_identity_in_write(
         write_txn: &redb::WriteTransaction,
     ) -> Result<()> {
@@ -7543,7 +8025,10 @@ impl RedbPersistence {
     /// the owning accountant. An export destination is created with one of
     /// these before its first artifact byte, so the destination's own proof is
     /// inside `MEMORY_LIMIT` from the format marker onwards.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn initialize_content_identity_in_write_admitted(
         write_txn: &redb::WriteTransaction,
         admission: &mut ProofAdmission,
@@ -7585,7 +8070,10 @@ impl RedbPersistence {
     /// restore or maintenance holds a batch rather than a copy of every proof
     /// chunk of the selected families. A refused batch aborts the whole
     /// transaction with the existing typed budget error and nothing reset.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reset_content_identity_families_in_write(
         write_txn: &redb::WriteTransaction,
         families: &[LogicalFamily],
@@ -7623,7 +8111,10 @@ impl RedbPersistence {
     /// admitted before it is copied out of storage and released as soon as the
     /// batch that held it is removed, so the peak is one batch however many
     /// nodes the store holds.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn delete_proof_nodes_in_admitted_batches(
         nodes: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
         family: Option<LogicalFamily>,
@@ -7683,7 +8174,10 @@ impl RedbPersistence {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn maintain_pending_delete_index_in_write(
         write: &redb::WriteTransaction,
         key: &str,
@@ -7746,7 +8240,10 @@ impl RedbPersistence {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn apply_content_identity_mutations_in_write(
         write_txn: &redb::WriteTransaction,
         mutations: &[ContentIdentityMutation],
@@ -7755,7 +8252,10 @@ impl RedbPersistence {
         Self::apply_content_identity_with_manifests_in_write(write_txn, mutations, &[], admission)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn apply_content_identity_with_manifests_in_write(
         write_txn: &redb::WriteTransaction,
         mutations: &[ContentIdentityMutation],
@@ -7766,7 +8266,10 @@ impl RedbPersistence {
             write_txn, mutations, manifests, admission, None,
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn apply_content_identity_with_manifests_and_groups_in_write(
         write_txn: &redb::WriteTransaction,
         mutations: &[ContentIdentityMutation],
@@ -7810,8 +8313,9 @@ impl RedbPersistence {
                 Error::Other(("logical content identity is not initialized".to_owned()).into())
             })?;
         if version.value() != IDENTITY_VERSION {
-            return Err(Error::Other((
-                "logical content identity has an unsupported version".to_owned()).into()));
+            return Err(Error::Other(
+                ("logical content identity has an unsupported version".to_owned()).into(),
+            ));
         }
         drop(version);
         drop(metadata);
@@ -7902,7 +8406,9 @@ impl RedbPersistence {
             let encoded = roots_table
                 .get(family as u8)
                 .map_err(Self::storage_error)?
-                .ok_or_else(|| Error::Other(("logical content family root is absent".to_owned()).into()))?;
+                .ok_or_else(|| {
+                    Error::Other(("logical content family root is absent".to_owned()).into())
+                })?;
             let published = decode_published_root(family, encoded.value())?;
             roots[family as usize] = published.identity;
             tails[family as usize] = RootTail {
@@ -7979,268 +8485,295 @@ impl RedbPersistence {
         #[cfg(not(feature = "test-seams"))]
         let observing = false;
         let selections: [Option<LogicalFamily>; LogicalFamily::ALL.len()] =
-            std::array::from_fn(|i| if observing { None } else { Some(LogicalFamily::ALL[i]) });
+            std::array::from_fn(|i| {
+                if observing {
+                    None
+                } else {
+                    Some(LogicalFamily::ALL[i])
+                }
+            });
         let mut observed_directory = None;
-        for selected_family in selections.into_iter().take(if observing { 1 } else { LogicalFamily::ALL.len() }) {
-        #[cfg(test)]
-        let _capture_family = crate::memory_accounting::compaction_admission_capture::Phase::enter(
-            "proof-non-group", "apply_content_identity_mutations_in_write", "",
-            selected_family.map(|family| family as usize));
-        let coalescing_admission_start = admission.held();
-        let coalescing_result = (|| -> Result<Option<Box<MutationKeyNode>>> {
-            // Retain only unique-key boxes. Every input still receives the
-            // original parser validation, including entries later overwritten.
-            let mut unique = None;
-            let mut node_bytes = 0usize;
-            for (ordinal, mutation) in mutations.iter().enumerate() {
-                if selected_family.is_some_and(|family| mutation.family != family) {
-                    continue;
+        for selected_family in selections.into_iter().take(if observing {
+            1
+        } else {
+            LogicalFamily::ALL.len()
+        }) {
+            #[cfg(test)]
+            let _capture_family =
+                crate::memory_accounting::compaction_admission_capture::Phase::enter(
+                    "proof-non-group",
+                    "apply_content_identity_mutations_in_write",
+                    "",
+                    selected_family.map(|family| family as usize),
+                );
+            let coalescing_admission_start = admission.held();
+            let coalescing_result = (|| -> Result<Option<Box<MutationKeyNode>>> {
+                // Retain only unique-key boxes. Every input still receives the
+                // original parser validation, including entries later overwritten.
+                let mut unique = None;
+                let mut node_bytes = 0usize;
+                for (ordinal, mutation) in mutations.iter().enumerate() {
+                    if selected_family.is_some_and(|family| mutation.family != family) {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    let _capture_validation =
+                        crate::memory_accounting::compaction_admission_capture::Phase::enter(
+                            "proof-validation",
+                            "mutation_tree_key",
+                            "",
+                            Some(mutation.family as usize),
+                        );
+                    let key_bytes = mutation_key_capacity(mutation, admission)?;
+                    admission.admit(key_bytes)?;
+                    let key = mutation_tree_key(mutation)?;
+                    debug_assert_eq!(key.capacity(), key_bytes);
+                    drop(key);
+                    admission.release(key_bytes);
+                    let replaced = MutationKeyNode::insert(
+                        &mut unique,
+                        ordinal,
+                        mutations,
+                        admission,
+                        &mut node_bytes,
+                    )?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    if mutation.family == LogicalFamily::Status {
+                        observe_status_namespace(&mutation.logical_key);
+                        if replaced {
+                            forget_status_namespace(&mutation.logical_key);
+                        }
+                    }
+                    #[cfg(not(any(test, feature = "test-seams")))]
+                    let _ = replaced;
+                }
+                let mut coalesced_bytes = 0usize;
+                let Some(unique) = unique else {
+                    return Ok(None);
+                };
+
+                // The coalesced directory borrows source records; grouping allocates
+                // only exact tuple slices and the selected keys' actual payloads.
+                #[cfg(any(test, feature = "test-seams"))]
+                let group_started = std::time::Instant::now();
+                type GroupEntry = (Vec<u8>, Option<[u8; 32]>);
+                let mut family_counts = [0usize; LogicalFamily::ALL.len()];
+                unique.visit(&mut |node| {
+                    let family = mutations[node.first].family as usize;
+                    family_counts[family] = family_counts[family]
+                        .checked_add(1)
+                        .ok_or_else(|| proof_allocation_overflow(admission))?;
+                    Ok(())
+                })?;
+                // The fixed family directory lives on the stack. Each nonempty list
+                // gets one exact slice allocation, including the tuple's alignment;
+                // neither map nodes nor geometric Vec growth are needed for grouping.
+                let mut grouped_bytes = 0usize;
+                for count in family_counts {
+                    let layout = std::alloc::Layout::array::<GroupEntry>(count)
+                        .map_err(|_| proof_allocation_overflow(admission))?;
+                    grouped_bytes = grouped_bytes
+                        .checked_add(layout.size())
+                        .ok_or_else(|| proof_allocation_overflow(admission))?;
                 }
                 #[cfg(test)]
-                let _capture_validation = crate::memory_accounting::compaction_admission_capture::Phase::enter(
-                    "proof-validation", "mutation_tree_key", "", Some(mutation.family as usize));
-                let key_bytes = mutation_key_capacity(mutation, admission)?;
-                admission.admit(key_bytes)?;
-                let key = mutation_tree_key(mutation)?;
-                debug_assert_eq!(key.capacity(), key_bytes);
-                drop(key);
-                admission.release(key_bytes);
-                let replaced = MutationKeyNode::insert(
-                    &mut unique,
-                    ordinal,
-                    mutations,
-                    admission,
-                    &mut node_bytes,
-                )?;
-                #[cfg(any(test, feature = "test-seams"))]
-                if mutation.family == LogicalFamily::Status {
-                    observe_status_namespace(&mutation.logical_key);
-                    if replaced {
-                        forget_status_namespace(&mutation.logical_key);
-                    }
-                }
-                #[cfg(not(any(test, feature = "test-seams")))]
-                let _ = replaced;
-            }
-            let mut coalesced_bytes = 0usize;
-            let Some(unique) = unique else {
-                return Ok(None);
-            };
-
-            // The coalesced directory borrows source records; grouping allocates
-            // only exact tuple slices and the selected keys' actual payloads.
-            #[cfg(any(test, feature = "test-seams"))]
-            let group_started = std::time::Instant::now();
-            type GroupEntry = (Vec<u8>, Option<[u8; 32]>);
-            let mut family_counts = [0usize; LogicalFamily::ALL.len()];
-            unique.visit(&mut |node| {
-                let family = mutations[node.first].family as usize;
-                family_counts[family] = family_counts[family]
-                    .checked_add(1)
-                    .ok_or_else(|| proof_allocation_overflow(admission))?;
-                Ok(())
-            })?;
-            // The fixed family directory lives on the stack. Each nonempty list
-            // gets one exact slice allocation, including the tuple's alignment;
-            // neither map nodes nor geometric Vec growth are needed for grouping.
-            let mut grouped_bytes = 0usize;
-            for count in family_counts {
-                let layout = std::alloc::Layout::array::<GroupEntry>(count)
-                    .map_err(|_| proof_allocation_overflow(admission))?;
-                grouped_bytes = grouped_bytes
-                    .checked_add(layout.size())
-                    .ok_or_else(|| proof_allocation_overflow(admission))?;
-            }
-            #[cfg(test)]
             let _capture_grouping = crate::memory_accounting::compaction_admission_capture::Phase::grouping(
                 crate::memory_accounting::compaction_admission_capture::GroupingApply::Borrowed,
                 family_counts, grouped_bytes);
-            admission.admit(grouped_bytes)?;
-            let mut grouped: [EntryEdits; LogicalFamily::ALL.len()] =
-                std::array::from_fn(|family| {
-                    let count = family_counts[family];
-                    let mut entries = Box::<[GroupEntry]>::new_uninit_slice(count);
-                    for entry in &mut entries {
-                        entry.write((Vec::new(), None));
-                    }
-                    // SAFETY: every slot was initialized above, with no fallible
-                    // work between initialization and conversion. A boxed slice
-                    // converts without reallocating and gives Vec capacity equal
-                    // to its length, exactly the layout admitted before allocation.
-                    let entries = unsafe { entries.assume_init() }.into_vec();
-                    debug_assert_eq!(entries.capacity(), count);
-                    entries
-                });
-            #[cfg(test)]
-            drop(_capture_grouping);
-            let mut family_positions = [0usize; LogicalFamily::ALL.len()];
-            unique.visit(&mut |node| {
-                // First-key ownership and final-value replacement match the map.
-                let mutation = &mutations[node.first];
-                let final_mutation = &mutations[node.last];
-                let key_bytes = mutation_key_capacity(mutation, admission)?;
+                admission.admit(grouped_bytes)?;
+                let mut grouped: [EntryEdits; LogicalFamily::ALL.len()] =
+                    std::array::from_fn(|family| {
+                        let count = family_counts[family];
+                        let mut entries = Box::<[GroupEntry]>::new_uninit_slice(count);
+                        for entry in &mut entries {
+                            entry.write((Vec::new(), None));
+                        }
+                        // SAFETY: every slot was initialized above, with no fallible
+                        // work between initialization and conversion. A boxed slice
+                        // converts without reallocating and gives Vec capacity equal
+                        // to its length, exactly the layout admitted before allocation.
+                        let entries = unsafe { entries.assume_init() }.into_vec();
+                        debug_assert_eq!(entries.capacity(), count);
+                        entries
+                    });
                 #[cfg(test)]
-                let _capture_payload = crate::memory_accounting::compaction_admission_capture::Phase::enter(
-                    "proof-group-key", "grouped key payload", "", Some(mutation.family as usize));
-                let next_bytes = coalesced_bytes
-                    .checked_add(key_bytes)
-                    .ok_or_else(|| proof_allocation_overflow(admission))?;
-                admission.admit(key_bytes)?;
-                let key = mutation_tree_key(mutation)?;
-                debug_assert_eq!(key.capacity(), key_bytes);
-                coalesced_bytes = next_bytes;
-                let value = final_mutation.value_digest()?;
-                let family = mutation.family as usize;
-                grouped[family][family_positions[family]] = (key, value);
-                family_positions[family] += 1;
-                Ok(())
-            })?;
-            #[cfg(feature = "test-seams")]
-            let observe_mutations = crate::append_work::coalesced_mutation_observer_is_active();
-            #[cfg(not(feature = "test-seams"))]
-            let observe_mutations = false;
-            // Unobserved applies keep the directory's original lifetime and
-            // credit exactly: no observation extends production residency.
-            let observed_directory = if observe_mutations {
-                Some(unique)
-            } else {
-                drop(unique);
-                admission.release(node_bytes);
-                None
-            };
+                drop(_capture_grouping);
+                let mut family_positions = [0usize; LogicalFamily::ALL.len()];
+                unique.visit(&mut |node| {
+                    // First-key ownership and final-value replacement match the map.
+                    let mutation = &mutations[node.first];
+                    let final_mutation = &mutations[node.last];
+                    let key_bytes = mutation_key_capacity(mutation, admission)?;
+                    #[cfg(test)]
+                    let _capture_payload =
+                        crate::memory_accounting::compaction_admission_capture::Phase::enter(
+                            "proof-group-key",
+                            "grouped key payload",
+                            "",
+                            Some(mutation.family as usize),
+                        );
+                    let next_bytes = coalesced_bytes
+                        .checked_add(key_bytes)
+                        .ok_or_else(|| proof_allocation_overflow(admission))?;
+                    admission.admit(key_bytes)?;
+                    let key = mutation_tree_key(mutation)?;
+                    debug_assert_eq!(key.capacity(), key_bytes);
+                    coalesced_bytes = next_bytes;
+                    let value = final_mutation.value_digest()?;
+                    let family = mutation.family as usize;
+                    grouped[family][family_positions[family]] = (key, value);
+                    family_positions[family] += 1;
+                    Ok(())
+                })?;
+                #[cfg(feature = "test-seams")]
+                let observe_mutations = crate::append_work::coalesced_mutation_observer_is_active();
+                #[cfg(not(feature = "test-seams"))]
+                let observe_mutations = false;
+                // Unobserved applies keep the directory's original lifetime and
+                // credit exactly: no observation extends production residency.
+                let observed_directory = if observe_mutations {
+                    Some(unique)
+                } else {
+                    drop(unique);
+                    admission.release(node_bytes);
+                    None
+                };
 
-            #[cfg(any(test, feature = "test-seams"))]
-            observe_identity_span(IdentitySpan::CoalesceAndGroup, group_started);
-            let mut nodes = write_txn
-                .open_table(CONTENT_IDENTITY_NODES_TABLE)
-                .map_err(Self::storage_error)?;
-            for family in LogicalFamily::ALL {
-                let mut mutations = std::mem::take(&mut grouped[family as usize]);
-                if mutations.is_empty() {
-                    continue;
-                }
-                // One family's frames stop being held the moment its update has
-                // consumed them, so the next family starts from the lower peak.
-                // The walk itself returns them, because it is what consumes the
-                // list: holding them until it came back reserved the list twice
-                // over for the whole of the deepest walk.
-                let frames = mutations.capacity() * std::mem::size_of::<GroupEntry>();
-                grouped_bytes = grouped_bytes.saturating_sub(frames);
                 #[cfg(any(test, feature = "test-seams"))]
-                let sort_started = std::time::Instant::now();
-                sort_canonical_from_coalesced(&mut mutations)?;
-                #[cfg(any(test, feature = "test-seams"))]
-                {
-                    observe_identity_span(IdentitySpan::CoalesceAndGroup, sort_started);
-                    enter_family(family, mutations.len());
-                }
-                let mut history = tails[family as usize].history_open;
-                let mut refresh = [false; 3];
-                if let Some(publication) = history.as_mut() {
-                    for (key, value) in &mutations {
-                        if key
-                            .starts_with(&[ORDERED_HISTORY_KEY_TAG, HistoryKind::CommitIndex as u8])
-                        {
-                            let raw: [u8; 8] = key[2..].try_into().map_err(|_| {
-                                history_control_damage("invalid changed commit coordinate")
-                            })?;
-                            let lsn = Lsn(u64::from_be_bytes(raw));
-                            let old = writer_window::history_member(
-                                &nodes,
-                                admission,
-                                &roots[family as usize],
-                                key,
-                            )?;
-                            publication.control.commit_count =
-                                match (old.is_some(), value.is_some()) {
-                                    (false, true) => {
-                                        publication.control.commit_count.checked_add(1)
-                                    }
-                                    (true, false) => {
-                                        publication.control.commit_count.checked_sub(1)
-                                    }
-                                    _ => Some(publication.control.commit_count),
-                                }
-                                .ok_or_else(|| {
-                                    history_control_damage("history member count overflow")
+                observe_identity_span(IdentitySpan::CoalesceAndGroup, group_started);
+                let mut nodes = write_txn
+                    .open_table(CONTENT_IDENTITY_NODES_TABLE)
+                    .map_err(Self::storage_error)?;
+                for family in LogicalFamily::ALL {
+                    let mut mutations = std::mem::take(&mut grouped[family as usize]);
+                    if mutations.is_empty() {
+                        continue;
+                    }
+                    // One family's frames stop being held the moment its update has
+                    // consumed them, so the next family starts from the lower peak.
+                    // The walk itself returns them, because it is what consumes the
+                    // list: holding them until it came back reserved the list twice
+                    // over for the whole of the deepest walk.
+                    let frames = mutations.capacity() * std::mem::size_of::<GroupEntry>();
+                    grouped_bytes = grouped_bytes.saturating_sub(frames);
+                    #[cfg(any(test, feature = "test-seams"))]
+                    let sort_started = std::time::Instant::now();
+                    sort_canonical_from_coalesced(&mut mutations)?;
+                    #[cfg(any(test, feature = "test-seams"))]
+                    {
+                        observe_identity_span(IdentitySpan::CoalesceAndGroup, sort_started);
+                        enter_family(family, mutations.len());
+                    }
+                    let mut history = tails[family as usize].history_open;
+                    let mut refresh = [false; 3];
+                    if let Some(publication) = history.as_mut() {
+                        for (key, value) in &mutations {
+                            if key.starts_with(&[
+                                ORDERED_HISTORY_KEY_TAG,
+                                HistoryKind::CommitIndex as u8,
+                            ]) {
+                                let raw: [u8; 8] = key[2..].try_into().map_err(|_| {
+                                    history_control_damage("invalid changed commit coordinate")
                                 })?;
-                            if let Some(hash) = value {
-                                if publication.control.first.is_none_or(|pair| lsn <= pair.0) {
-                                    publication.control.first = Some((lsn, *hash));
+                                let lsn = Lsn(u64::from_be_bytes(raw));
+                                let old = writer_window::history_member(
+                                    &nodes,
+                                    admission,
+                                    &roots[family as usize],
+                                    key,
+                                )?;
+                                publication.control.commit_count =
+                                    match (old.is_some(), value.is_some()) {
+                                        (false, true) => {
+                                            publication.control.commit_count.checked_add(1)
+                                        }
+                                        (true, false) => {
+                                            publication.control.commit_count.checked_sub(1)
+                                        }
+                                        _ => Some(publication.control.commit_count),
+                                    }
+                                    .ok_or_else(|| {
+                                        history_control_damage("history member count overflow")
+                                    })?;
+                                if let Some(hash) = value {
+                                    if publication.control.first.is_none_or(|pair| lsn <= pair.0) {
+                                        publication.control.first = Some((lsn, *hash));
+                                    }
+                                    if publication.control.last.is_none_or(|pair| lsn >= pair.0) {
+                                        publication.control.last = Some((lsn, *hash));
+                                    }
+                                } else {
+                                    refresh[0] |=
+                                        publication.control.first.is_some_and(|pair| pair.0 == lsn);
+                                    refresh[1] |=
+                                        publication.control.last.is_some_and(|pair| pair.0 == lsn);
                                 }
-                                if publication.control.last.is_none_or(|pair| lsn >= pair.0) {
-                                    publication.control.last = Some((lsn, *hash));
-                                }
-                            } else {
-                                refresh[0] |=
-                                    publication.control.first.is_some_and(|pair| pair.0 == lsn);
-                                refresh[1] |=
-                                    publication.control.last.is_some_and(|pair| pair.0 == lsn);
+                            } else if key
+                                .starts_with(&[ORDERED_HISTORY_KEY_TAG, HistoryKind::DdlLog as u8])
+                            {
+                                // DDL's variable coordinate stays in the proof window; retain only fixed facts.
+                                writer_window::history_member(
+                                    &nodes,
+                                    admission,
+                                    &roots[family as usize],
+                                    key,
+                                )?;
+                                refresh[2] = true;
                             }
-                        } else if key
-                            .starts_with(&[ORDERED_HISTORY_KEY_TAG, HistoryKind::DdlLog as u8])
-                        {
-                            // DDL's variable coordinate stays in the proof window; retain only fixed facts.
-                            writer_window::history_member(
-                                &nodes,
-                                admission,
-                                &roots[family as usize],
-                                key,
-                            )?;
-                            refresh[2] = true;
                         }
                     }
+                    let updated = writer_window::update_family_consuming_keys(
+                        &mut nodes,
+                        admission,
+                        family,
+                        &roots[family as usize],
+                        mutations,
+                        frames,
+                        &mut coalesced_bytes,
+                    );
+                    #[cfg(any(test, feature = "test-seams"))]
+                    leave_family();
+                    roots[family as usize] = updated?;
+                    if let Some(publication) = history.as_mut() {
+                        let root = &roots[family as usize];
+                        publication.control.tree = root.root;
+                        publication.control.tree_hash = root.hash;
+                        if refresh[0] {
+                            publication.control.first = writer_window::history_commit_extreme(
+                                &nodes, admission, root, false,
+                            )?;
+                        }
+                        if refresh[1] {
+                            publication.control.last = writer_window::history_commit_extreme(
+                                &nodes, admission, root, true,
+                            )?;
+                        }
+                        if refresh[2] {
+                            publication.control.ddl =
+                                writer_window::history_ddl_extreme(&nodes, admission, root)?;
+                        }
+                        if publication.control.commit_count == 0 {
+                            publication.control.first = None;
+                            publication.control.last = None;
+                        }
+                        publication.control.validate()?;
+                        publication.control_hash = publication.control.digest();
+                        tails[family as usize].history_open = history;
+                    }
                 }
-                let updated = writer_window::update_family_consuming_keys(
-                    &mut nodes,
-                    admission,
-                    family,
-                    &roots[family as usize],
-                    mutations,
-                    frames,
-                    &mut coalesced_bytes,
-                );
-                #[cfg(any(test, feature = "test-seams"))]
-                leave_family();
-                roots[family as usize] = updated?;
-                if let Some(publication) = history.as_mut() {
-                    let root = &roots[family as usize];
-                    publication.control.tree = root.root;
-                    publication.control.tree_hash = root.hash;
-                    if refresh[0] {
-                        publication.control.first =
-                            writer_window::history_commit_extreme(&nodes, admission, root, false)?;
-                    }
-                    if refresh[1] {
-                        publication.control.last =
-                            writer_window::history_commit_extreme(&nodes, admission, root, true)?;
-                    }
-                    if refresh[2] {
-                        publication.control.ddl =
-                            writer_window::history_ddl_extreme(&nodes, admission, root)?;
-                    }
-                    if publication.control.commit_count == 0 {
-                        publication.control.first = None;
-                        publication.control.last = None;
-                    }
-                    publication.control.validate()?;
-                    publication.control_hash = publication.control.digest();
-                    tails[family as usize].history_open = history;
-                }
-            }
-            drop(nodes);
-            admission.release(grouped_bytes);
-            admission.release(coalesced_bytes);
+                drop(nodes);
+                admission.release(grouped_bytes);
+                admission.release(coalesced_bytes);
 
-            Ok(observed_directory)
-        })();
-        // Every local allocation has dropped before a refusal escapes this
-        // scope. Settle only this scope's remaining admission; caller-owned
-        // charges present on entry stay with their original lifetime.
-        if coalescing_result.is_err() {
-            admission.release(admission.held() - coalescing_admission_start);
-        }
-        observed_directory = coalescing_result?;
+                Ok(observed_directory)
+            })();
+            // Every local allocation has dropped before a refusal escapes this
+            // scope. Settle only this scope's remaining admission; caller-owned
+            // charges present on entry stay with their original lifetime.
+            if coalescing_result.is_err() {
+                admission.release(admission.held() - coalescing_admission_start);
+            }
+            observed_directory = coalescing_result?;
         }
         let coalesced = CoalescedDirectory::new(observed_directory, admission);
 
@@ -8280,7 +8813,10 @@ impl RedbPersistence {
         })))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn load_content_identity_from_read(
         read_txn: &redb::ReadTransaction,
     ) -> Result<DirectTypedImageDigest> {
@@ -8290,10 +8826,13 @@ impl RedbPersistence {
         let version = metadata
             .get(IDENTITY_VERSION_KEY)
             .map_err(Self::storage_error)?
-            .ok_or_else(|| Error::Other(("logical content identity is absent".to_owned()).into()))?;
+            .ok_or_else(|| {
+                Error::Other(("logical content identity is absent".to_owned()).into())
+            })?;
         if version.value() != IDENTITY_VERSION {
-            return Err(Error::Other((
-                "logical content identity has an unsupported version".to_owned()).into()));
+            return Err(Error::Other(
+                ("logical content identity has an unsupported version".to_owned()).into(),
+            ));
         }
         drop(version);
         drop(metadata);
@@ -8305,14 +8844,19 @@ impl RedbPersistence {
             let encoded = roots_table
                 .get(family as u8)
                 .map_err(Self::storage_error)?
-                .ok_or_else(|| Error::Other(("logical content family root is absent".to_owned()).into()))?;
+                .ok_or_else(|| {
+                    Error::Other(("logical content family root is absent".to_owned()).into())
+                })?;
             root_hashes[family as usize] = decode_root(family, encoded.value())?.hash;
         }
         Ok(digest_from_roots(root_hashes))
     }
 
     #[allow(dead_code)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate_family_tag(tag: u8) -> Result<LogicalFamily> {
         LogicalFamily::from_tag(tag)
     }
@@ -9316,7 +9860,10 @@ pub(crate) mod original_writer {
             private_interfaces,
             reason = "the type is crate-private on purpose; the crate-visible item is only reachable inside the crate"
         )]
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn new(
             original: &OwnedMemoryReservation,
             scratch_owner: Option<std::sync::Weak<super::super::writer_file::LockedWriterFile>>,
@@ -9336,7 +9883,10 @@ pub(crate) mod original_writer {
                 peak: std::cell::Cell::new(0),
             })
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(super) fn absorb_output(
             &mut self,
             credit: &mut OwnedMemoryReservation,
@@ -9351,11 +9901,17 @@ pub(crate) mod original_writer {
             self.peak.set(self.peak.get().max(next));
             Ok(())
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn fork(&self) -> Result<Self> {
             Self::new(&self.original, self.scratch_owner.clone())
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn admit(&mut self, bytes: usize) -> Result<()> {
             self.admit_for(
                 bytes,
@@ -9364,7 +9920,10 @@ pub(crate) mod original_writer {
             )
         }
         /// [`Self::admit`] under its own operation name.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn admit_for(
             &mut self,
             bytes: usize,
@@ -9403,7 +9962,10 @@ pub(crate) mod original_writer {
         }
         /// The owner that funds custody pending verification's signature
         /// inputs: this admission's original writer frame.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn verification_owner(
             &self,
         ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
@@ -9418,7 +9980,10 @@ pub(crate) mod original_writer {
         fn is_accounted(&self) -> bool {
             true
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn open_scratch(&mut self) -> Result<(Box<dyn redb::ScratchBackend>, AdmittedBytes)> {
             let bytes = redb::scratch_backend_allocation_size();
             self.admit(bytes)?;
@@ -9456,7 +10021,10 @@ pub(crate) mod original_writer {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn resolve_key_charged_checkpoint<'a>(
         table: &impl ReadableTable<&'static [u8], &'static [u8]>,
         family: LogicalFamily,
@@ -9482,7 +10050,10 @@ pub(crate) mod original_writer {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn resolve_key_charged<'a>(
         table: &impl ReadableTable<&'static [u8], &'static [u8]>,
         family: LogicalFamily,
@@ -9506,7 +10077,10 @@ pub(crate) mod original_writer {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_node_charged(
         table: &impl ReadableTable<&'static [u8], &'static [u8]>,
         family: LogicalFamily,
@@ -9542,7 +10116,8 @@ pub(crate) mod original_writer {
         if chunk_id(node.level, &node.entries.last().expect("chunk").key) != id {
             admission.release(decoded_bytes);
             return Err(Error::Other(
-                "logical identity chunk id disagrees with its separator".into()));
+                "logical identity chunk id disagrees with its separator".into(),
+            ));
         }
         // The charge above was read from the stored header before anything was
         // allocated, and it rounds up so the allocation can never outrun it. The
@@ -9563,7 +10138,10 @@ pub(crate) mod original_writer {
         Ok((node, live_bytes))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn mutation_key_capacity(
         mutation: &ContentIdentityMutation,
         admission: &ProofAdmission,
@@ -9585,7 +10163,10 @@ pub(crate) mod original_writer {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn resolving_key_cmp(
         table: &impl ReadableTable<&'static [u8], &'static [u8]>,
         family: LogicalFamily,
@@ -9621,7 +10202,10 @@ pub(crate) mod original_writer {
         ordering
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn resolving_entry_search(
         table: &impl ReadableTable<&'static [u8], &'static [u8]>,
         family: LogicalFamily,
@@ -9697,7 +10281,10 @@ pub(crate) mod original_writer {
             }
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn insert(
             link: &mut Option<Box<Self>>,
             ordinal: usize,
@@ -9756,7 +10343,10 @@ pub(crate) mod original_writer {
                     .map_or(0, |node| node.allocation_bytes())
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn visit(&self, visitor: &mut impl FnMut(&Self) -> Result<()>) -> Result<()> {
             if let Some(left) = &self.left {
                 left.visit(visitor)?;
@@ -9817,7 +10407,10 @@ pub(crate) mod original_writer {
     }
 
     impl RedbPersistence {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn maintain_owned_pending_delete_index_in_write(
             write: &redb::WriteTransaction,
             key: &str,
@@ -9866,7 +10459,10 @@ pub(crate) mod original_writer {
             Ok(())
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn apply_owned_content_identity_with_manifests_in_write(
             write_txn: &redb::WriteTransaction,
             mutations: &[ContentIdentityMutation],
@@ -9881,7 +10477,10 @@ pub(crate) mod original_writer {
             private_interfaces,
             reason = "the type is crate-private on purpose; the crate-visible item is only reachable inside the crate"
         )]
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn apply_owned_content_identity_with_manifests_and_groups_in_write(
             write_txn: &redb::WriteTransaction,
             mutations: &[ContentIdentityMutation],
@@ -9890,7 +10489,8 @@ pub(crate) mod original_writer {
             groups: Option<&super::super::custody_groups::GroupPlan>,
         ) -> Result<DirectTypedImageDigest> {
             #[cfg(test)]
-            let _capture_apply = crate::memory_accounting::compaction_admission_capture::Phase::apply();
+            let _capture_apply =
+                crate::memory_accounting::compaction_admission_capture::Phase::apply();
             Self::reconcile_owned_ddl_selectors_in_write(write_txn, mutations, admission)?;
             super::super::content_size::reconcile_row_heads(write_txn, mutations, admission)?;
             Self::apply_writer_row_heads_in_write(write_txn, mutations, admission)?;
@@ -9925,8 +10525,9 @@ pub(crate) mod original_writer {
                     Error::Other(("logical content identity is not initialized".to_owned()).into())
                 })?;
             if version.value() != IDENTITY_VERSION {
-                return Err(Error::Other((
-                    "logical content identity has an unsupported version".to_owned()).into()));
+                return Err(Error::Other(
+                    ("logical content identity has an unsupported version".to_owned()).into(),
+                ));
             }
             drop(version);
             drop(metadata);
@@ -10411,7 +11012,10 @@ pub(crate) mod original_writer {
 
         impl Window<'_, '_, '_> {
             /// A bounded authenticated writer descent, retaining only its proof path.
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn history_search<T>(
                 &self,
                 address: ([u8; 32], [u8; 32]),
@@ -10484,7 +11088,10 @@ pub(crate) mod original_writer {
             }
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn with_history_window<T>(
             table: &redb::Table<'_, &'static [u8], &'static [u8]>,
             admission: &mut ProofAdmission,
@@ -10520,7 +11127,10 @@ pub(crate) mod original_writer {
             .history_search((id, root.hash), None, bounds, reverse, &mut take)
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(super) fn history_member(
             table: &redb::Table<'_, &'static [u8], &'static [u8]>,
             admission: &mut ProofAdmission,
@@ -10536,7 +11146,10 @@ pub(crate) mod original_writer {
                 |_, hash| Ok(hash),
             )
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(super) fn history_commit_extreme(
             table: &redb::Table<'_, &'static [u8], &'static [u8]>,
             admission: &mut ProofAdmission,
@@ -10561,7 +11174,10 @@ pub(crate) mod original_writer {
                 },
             )
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(super) fn history_ddl_extreme(
             table: &redb::Table<'_, &'static [u8], &'static [u8]>,
             admission: &mut ProofAdmission,
@@ -10606,7 +11222,10 @@ pub(crate) mod original_writer {
                 io_kind: error.kind(),
             }
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn position(value: u64) -> Result<usize> {
             usize::try_from(value).map_err(|_| overflow())
         }
@@ -10619,7 +11238,10 @@ pub(crate) mod original_writer {
             _charge: AdmittedBytes,
         }
         impl Scratch {
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn open(admission: &mut ProofAdmission) -> Result<Self> {
                 let (backend, charge) = admission.open_scratch()?;
                 Ok(Self {
@@ -10628,7 +11250,10 @@ pub(crate) mod original_writer {
                     _charge: charge,
                 })
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn reserve(&self, bytes: usize) -> Result<u64> {
                 let start = self.end.get();
                 let end = start
@@ -10640,7 +11265,10 @@ pub(crate) mod original_writer {
                 self.end.set(end);
                 Ok(start)
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn read(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
                 if offset
                     .checked_add(bytes.len() as u64)
@@ -10655,7 +11283,10 @@ pub(crate) mod original_writer {
                     .read(offset, bytes)
                     .map_err(|e| scratch_error("read_content_identity_scratch", e))
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn write(&self, offset: u64, bytes: &[u8]) -> Result<()> {
                 if offset
                     .checked_add(bytes.len() as u64)
@@ -10667,13 +11298,19 @@ pub(crate) mod original_writer {
                     .write(offset, bytes)
                     .map_err(|e| scratch_error("write_content_identity_scratch", e))
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn append(&self, bytes: &[u8]) -> Result<u64> {
                 let offset = self.reserve(bytes.len())?;
                 self.write(offset, bytes)?;
                 Ok(offset)
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn get<T: DiskRecord>(&self, offset: u64) -> Result<T> {
                 let mut bytes = [0; RECORD_BUFFER_BYTES];
                 self.read(offset, &mut bytes[..T::BYTES + 32])?;
@@ -10685,7 +11322,10 @@ pub(crate) mod original_writer {
                 }
                 T::decode(&bytes[..T::BYTES])
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn put<T: DiskRecord>(&self, offset: u64, record: T) -> Result<()> {
                 let mut bytes = [0; RECORD_BUFFER_BYTES];
                 record.encode(&mut bytes[..T::BYTES]);
@@ -10693,7 +11333,10 @@ pub(crate) mod original_writer {
                 bytes[T::BYTES..T::BYTES + 32].copy_from_slice(&hash);
                 self.write(offset, &bytes[..T::BYTES + 32])
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn push<T: DiskRecord>(&self, record: T) -> Result<u64> {
                 let offset = self.reserve(T::BYTES + 32)?;
                 self.put(offset, record)?;
@@ -10704,7 +11347,10 @@ pub(crate) mod original_writer {
         trait DiskRecord: Copy {
             const BYTES: usize;
             fn encode(self, bytes: &mut [u8]);
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn decode(bytes: &[u8]) -> Result<Self>;
         }
         struct Encoder<'a> {
@@ -10751,7 +11397,10 @@ pub(crate) mod original_writer {
             fn u64(&mut self) -> u64 {
                 u64::from_be_bytes(self.array())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn hash(&mut self) -> Result<Option<[u8; 32]>> {
                 let flag = self.array::<1>()[0];
                 let hash = self.array();
@@ -10761,7 +11410,10 @@ pub(crate) mod original_writer {
                     _ => Err(Error::Other("invalid scratch optional hash".into())),
                 }
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn locator(&mut self) -> Result<Locator> {
                 let loc = Locator {
                     kind: self.u64(),
@@ -10775,7 +11427,10 @@ pub(crate) mod original_writer {
                 }
                 Ok(loc)
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn key(&mut self) -> Result<Key> {
                 Ok(Key {
                     encoded: self.locator()?,
@@ -10919,7 +11574,10 @@ pub(crate) mod original_writer {
                     operation: 2,
                 }
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn fold(&mut self, later: Self) -> Result<()> {
                 if self.key != later.key {
                     return Err(Error::Other("proof write fold key mismatch".into()));
@@ -10927,7 +11585,8 @@ pub(crate) mod original_writer {
                 if let Some(hash) = later.original {
                     if self.original.is_some_and(|original| original != hash) {
                         return Err(Error::Other(
-                            "logical identity original hash changed".into()));
+                            "logical identity original hash changed".into(),
+                        ));
                     }
                     self.original = Some(hash);
                 }
@@ -11005,7 +11664,10 @@ pub(crate) mod original_writer {
                     count: 0,
                 }
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn record_offset<T: DiskRecord>(block: u64, index: usize) -> Result<u64> {
                 let offset = index.checked_mul(T::BYTES).ok_or_else(overflow)?;
                 block
@@ -11013,7 +11675,10 @@ pub(crate) mod original_writer {
                     .and_then(|start| start.checked_add(offset as u64))
                     .ok_or_else(overflow)
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn push<T: DiskRecord>(&mut self, scratch: &Scratch, record: T) -> Result<()> {
                 let slots = (STREAM_BLOCK_BYTES - STREAM_HEADER_BYTES) / T::BYTES;
                 if slots == 0 {
@@ -11062,7 +11727,10 @@ pub(crate) mod original_writer {
             remaining: u64,
         }
         impl StreamReader {
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn read<T: DiskRecord>(&mut self, scratch: &Scratch) -> Result<Option<T>> {
                 if self.remaining == 0 {
                     return Ok(None);
@@ -11110,7 +11778,10 @@ pub(crate) mod original_writer {
             caller_peak: &'a Cell<usize>,
         }
         impl Ledger<'_> {
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn add(&self, bytes: usize) -> Result<()> {
                 let live = self.live.get().checked_add(bytes).ok_or_else(overflow)?;
                 let total = self.base.checked_add(live).ok_or_else(overflow)?;
@@ -11136,7 +11807,10 @@ pub(crate) mod original_writer {
             ledger: &'a Ledger<'a>,
         }
         impl<'a> Workspace<'a> {
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn charge(&self, bytes: usize) -> Result<Lease<'a>> {
                 let mut admission = self.admission.borrow_mut();
                 admission.admit(bytes)?;
@@ -11149,7 +11823,10 @@ pub(crate) mod original_writer {
                     ledger: self.ledger,
                 })
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn array<T>(
                 &self,
                 count: usize,
@@ -11249,7 +11926,10 @@ pub(crate) mod original_writer {
                     last: NONE,
                 }
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn push(&mut self, s: &Scratch, mut action: Action) -> Result<()> {
                 action.next = NONE;
                 let at = s.push(action)?;
@@ -11269,11 +11949,15 @@ pub(crate) mod original_writer {
             count: &'a Cell<usize>,
         }
         impl<'a> OperandBorrow<'a> {
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn enter(count: &'a Cell<usize>) -> Result<Self> {
                 if count.get() >= 2 {
                     return Err(Error::Other(
-                        "proof comparison exhausted its operand guards".into()));
+                        "proof comparison exhausted its operand guards".into(),
+                    ));
                 }
                 count.set(count.get() + 1);
                 Ok(Self { count })
@@ -11344,7 +12028,10 @@ pub(crate) mod original_writer {
                     build_hash: blake3::Hasher::new(),
                 }
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn with_referenced<R>(
                 &self,
                 key: &[u8],
@@ -11382,17 +12069,24 @@ pub(crate) mod original_writer {
                     || key_hash(&wide.guard.value()[1..]) != id
                 {
                     return Err(Error::Other(
-                        "authenticated separator key is damaged".into()));
+                        "authenticated separator key is damaged".into(),
+                    ));
                 }
                 f(&wide.guard.value()[1..])
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn compare_encoded(&self, left: &[u8], right: &[u8]) -> Result<Ordering> {
                 self.with_referenced(left, |left| {
                     self.with_referenced(right, |right| identity_key_cmp(left, right))
                 })
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn original(
                 &self,
                 id: [u8; 32],
@@ -11425,7 +12119,8 @@ pub(crate) mod original_writer {
                 let node = EncodedNode::authenticate(self.family, page.guard.value())?;
                 if node.subtree_hash != expected {
                     return Err(Error::Other(
-                        "logical identity chunk disagrees with committed parent".into()));
+                        "logical identity chunk disagrees with committed parent".into(),
+                    ));
                 }
                 let mut entries = self.workspace.array(node.count, |_| DecodedEntry {
                     start: 0,
@@ -11446,7 +12141,8 @@ pub(crate) mod original_writer {
                 }
                 if chunk_id(node.level, last) != id {
                     return Err(Error::Other(
-                        "logical identity chunk id disagrees with its separator".into()));
+                        "logical identity chunk id disagrees with its separator".into(),
+                    ));
                 }
                 let level = node.level;
                 Ok(VerifiedOriginal {
@@ -11460,7 +12156,10 @@ pub(crate) mod original_writer {
                     _page_charge: page.charge,
                 })
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn validate_order(&self, original: &VerifiedOriginal<'_, '_>) -> Result<()> {
                 if original.order_verified.get() {
                     return Ok(());
@@ -11481,7 +12180,10 @@ pub(crate) mod original_writer {
                 original.order_verified.set(true);
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn initialize(&mut self, root: &FamilyRoot) -> Result<u32> {
                 let original = root
                     .root
@@ -11496,7 +12198,8 @@ pub(crate) mod original_writer {
                 let height = original.as_ref().map_or(0, |node| node.level);
                 if height > MAX_CHUNK_LEVEL {
                     return Err(Error::Other(
-                        "logical identity internal chunks exceed permitted depth".into()));
+                        "logical identity internal chunks exceed permitted depth".into(),
+                    ));
                 }
                 self.slots = Some(
                     self.workspace
@@ -11528,7 +12231,10 @@ pub(crate) mod original_writer {
                             .any(|frame| frame.slot == index)
                     })
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn cached(&self, id: [u8; 32], expected: [u8; 32]) -> Result<usize> {
                 let slots = &self.slots.as_ref().expect("initialized slots").entries;
                 for (index, slot) in slots.iter().enumerate() {
@@ -11566,9 +12272,13 @@ pub(crate) mod original_writer {
                     return Ok(index);
                 }
                 Err(Error::Other(
-                    "proof comparison exhausted its operand guards".into()))
+                    "proof comparison exhausted its operand guards".into(),
+                ))
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn load(&mut self, id: [u8; 32], expected: [u8; 32]) -> Result<()> {
                 let prior = self.current.replace(None);
                 let result = self.cached(id, expected);
@@ -11592,7 +12302,10 @@ pub(crate) mod original_writer {
                 }
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn with_locator<R>(
                 &self,
                 loc: Locator,
@@ -11630,7 +12343,10 @@ pub(crate) mod original_writer {
                     _ => Err(Error::Other("invalid proof key locator".into())),
                 }
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn with_key<R>(
                 &self,
                 key: Key,
@@ -11647,15 +12363,24 @@ pub(crate) mod original_writer {
                     self.with_locator(loc, f)
                 }
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn with_encoded<R>(&self, key: Key, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
                 self.with_key(key, false, f)
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn with_semantic<R>(&self, key: Key, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
                 self.with_key(key, true, |bytes| self.with_referenced(bytes, f))
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn compare_keys(&self, left: Key, right: Key) -> Result<Ordering> {
                 self.with_semantic(left, |left| {
                     self.with_semantic(right, |right| identity_key_cmp(left, right))
@@ -11673,7 +12398,10 @@ pub(crate) mod original_writer {
                     node.hash,
                 )
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn entry(&self, index: usize) -> Result<(Key, [u8; 32])> {
                 let slot = self.current.get().expect("current original");
                 let original = self.slots.as_ref().expect("slots").entries[slot].borrow();
@@ -11699,7 +12427,10 @@ pub(crate) mod original_writer {
                     entry.hash,
                 ))
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn push_frame(&mut self, slot: usize, index: usize) -> Result<()> {
                 let path = self.path.as_mut().expect("path");
                 let frame = path.entries.get_mut(self.path_len).ok_or_else(|| {
@@ -11709,7 +12440,10 @@ pub(crate) mod original_writer {
                 self.path_len += 1;
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn seek(&mut self, root: &FamilyRoot, target: u32, edit: Edit) -> Result<bool> {
                 self.path_len = 0;
                 let Some(id) = root.root else {
@@ -11755,7 +12489,10 @@ pub(crate) mod original_writer {
                             < node.as_ref().expect("pinned parent").entries.entries.len()
                     })
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn advance(&mut self, target: u32) -> Result<bool> {
                 while self.path_len != 0 {
                     self.path_len -= 1;
@@ -11781,7 +12518,8 @@ pub(crate) mod original_writer {
                         self.load(id, hash)?;
                         if self.current_meta().1 + 1 != level {
                             return Err(Error::Other(
-                                "logical identity child level mismatch".into()));
+                                "logical identity child level mismatch".into(),
+                            ));
                         }
                     }
                     return Ok(true);
@@ -11789,7 +12527,10 @@ pub(crate) mod original_writer {
                 self.current.set(None);
                 Ok(false)
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn separator(&self, key: Key) -> Result<Key> {
                 self.with_encoded(key, |bytes| {
                     let mut reference = [0; KEY_REFERENCE_BYTES];
@@ -11813,18 +12554,27 @@ pub(crate) mod original_writer {
                     })
                 })
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn parent(&mut self, edit: Edit) -> Result<()> {
                 let sequence = self.parents.count;
                 self.parents.push(&self.scratch, Parent { edit, sequence })
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn parent_order(&self, left: &Parent, right: &Parent) -> Result<Ordering> {
                 Ok(self
                     .compare_keys(left.edit.key, right.edit.key)?
                     .then(left.sequence.cmp(&right.sequence)))
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn fold_parent(
                 &self,
                 output: &mut Stream,
@@ -11835,12 +12585,14 @@ pub(crate) mod original_writer {
                     match self.compare_keys(prior.edit.key, parent.edit.key)? {
                         Ordering::Greater => {
                             return Err(Error::Other(
-                                "generated parent stream is not ordered".into()));
+                                "generated parent stream is not ordered".into(),
+                            ));
                         }
                         Ordering::Equal => {
                             if prior.sequence >= parent.sequence {
                                 return Err(Error::Other(
-                                    "generated parent ordinal is not ordered".into()));
+                                    "generated parent ordinal is not ordered".into(),
+                                ));
                             }
                         }
                         Ordering::Less => output.push(&self.scratch, prior.edit)?,
@@ -11851,7 +12603,10 @@ pub(crate) mod original_writer {
                 *pending = Some(parent);
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn end_parents(&mut self) -> Result<Stream> {
                 let count = self.parents.count;
                 if count == 0 {
@@ -11972,7 +12727,10 @@ pub(crate) mod original_writer {
                 self.build_hash.update(&[self.family as u8]);
                 self.build_hash.update(&level.to_be_bytes());
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn grow_builder(&mut self, needed: usize) -> Result<()> {
                 let capacity = self
                     .builder
@@ -12000,12 +12758,16 @@ pub(crate) mod original_writer {
                 self.observe_residency();
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn push(&mut self, level: u32, key: Key, value: [u8; 32]) -> Result<()> {
                 let bytes = self.with_encoded(key, |key| Ok(36 + encoded_key_len(level, key)))?;
                 if NODE_HEADER_BYTES + bytes > MAX_NODE_BYTES {
                     return Err(Error::Other(
-                        "logical identity key exceeds authenticated chunk capacity".into()));
+                        "logical identity key exceeds authenticated chunk capacity".into(),
+                    ));
                 }
                 if self.build_len + 32 + bytes > MAX_NODE_BYTES {
                     self.finish(level)?;
@@ -12041,7 +12803,10 @@ pub(crate) mod original_writer {
                 }
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn finish(&mut self, level: u32) -> Result<()> {
                 if self.build_count == 0 {
                     return Ok(());
@@ -12074,7 +12839,10 @@ pub(crate) mod original_writer {
                 observe_identity_span(IdentitySpan::BuildAndHash, started);
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn read_edit(&mut self) -> Result<Option<Edit>> {
                 match &mut self.edits {
                     Edits::Inputs { next } => {
@@ -12095,12 +12863,18 @@ pub(crate) mod original_writer {
                     Edits::Stream(reader) => reader.read(&self.scratch),
                 }
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn step_edit(&mut self) -> Result<()> {
                 self.next_edit = self.read_edit()?;
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn edit_level(&mut self, root: &FamilyRoot, level: u32) -> Result<()> {
                 self.parents = Stream::new();
                 self.step_edit()?;
@@ -12200,7 +12974,10 @@ pub(crate) mod original_writer {
         impl StreamReader {
             /// Skip to a run boundary by whole blocks and offsets, never by allocating
             /// a directory or reading each record being skipped.
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn skip<T: DiskRecord>(&mut self, mut count: u64, scratch: &Scratch) -> Result<()> {
                 if count > self.remaining {
                     return Err(overflow());
@@ -12241,12 +13018,18 @@ pub(crate) mod original_writer {
 
         /// Sort inside the exact admitted record array. No recursion, stable-sort
         /// workspace, auxiliary heap, or platform-dependent equal-key ordering.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn heapsort<T>(
             records: &mut [T],
             mut compare: impl FnMut(&T, &T) -> Result<Ordering>,
         ) -> Result<()> {
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn sift<T>(
                 records: &mut [T],
                 mut root: usize,
@@ -12283,7 +13066,10 @@ pub(crate) mod original_writer {
         }
 
         impl Window<'_, '_, '_> {
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn planned_write(&self, key: [u8; 33]) -> Result<Option<Write>> {
                 let mut reader = self.writes.reader();
                 let mut result: Option<Write> = None;
@@ -12299,7 +13085,10 @@ pub(crate) mod original_writer {
                 }
                 Ok(result)
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn emit_write(&mut self, write: Write) -> Result<()> {
                 if write.body != NONE {
                     if write.original != write.hash {
@@ -12330,7 +13119,10 @@ pub(crate) mod original_writer {
                 }
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn fold_sorted(&mut self, records: impl IntoIterator<Item = Write>) -> Result<()> {
                 let mut pending: Option<Write> = None;
                 for write in records {
@@ -12351,7 +13143,10 @@ pub(crate) mod original_writer {
                 }
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn finalize_directory(&mut self) -> Result<()> {
                 let count = self.writes.count;
                 if count == 0 {
@@ -12467,7 +13262,10 @@ pub(crate) mod original_writer {
                 }
                 Ok(())
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn plan(&mut self, root: &FamilyRoot) -> Result<FamilyRoot> {
                 // The full admitted input keys remain borrowed; wide bodies are
                 // sequentially spooled before any durable table mutation is allowed.
@@ -12531,7 +13329,8 @@ pub(crate) mod original_writer {
                     level += 1;
                     if level > MAX_CHUNK_LEVEL {
                         return Err(Error::Other(
-                            "logical identity internal chunks exceed permitted depth".into()));
+                            "logical identity internal chunks exceed permitted depth".into(),
+                        ));
                     }
                     self.parents = Stream::new();
                     self.begin(level);
@@ -12546,7 +13345,8 @@ pub(crate) mod original_writer {
                     if final_stream.count >= count {
                         return Err(Error::Other(
                             "logical identity internal chunks cannot reduce oversized separators"
-                                .into()));
+                                .into(),
+                        ));
                     }
                     count = final_stream.count;
                     first = final_stream.reader().read::<Edit>(&self.scratch)?;
@@ -12581,7 +13381,8 @@ pub(crate) mod original_writer {
                         const SINGLETON_BYTES: usize = 9 + 4 + INLINE_SEPARATOR_BYTES + 32 + 32;
                         if len > SINGLETON_BYTES {
                             return Err(Error::Other(
-                                "scratch singleton root exceeds separator bound".into()));
+                                "scratch singleton root exceeds separator bound".into(),
+                            ));
                         }
                         let mut bytes = [0; SINGLETON_BYTES];
                         self.scratch.read(write.body, &mut bytes[..len])?;
@@ -12625,7 +13426,10 @@ pub(crate) mod original_writer {
                 }
                 Ok(result)
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn plan_for_replay(mut self, root: &FamilyRoot) -> Result<(FamilyRoot, Scratch, u64)> {
                 let result = self.plan(root)?;
                 let Self {
@@ -12639,7 +13443,10 @@ pub(crate) mod original_writer {
                 Ok((result, scratch, journal.first))
             }
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn replay(
             scratch: &Scratch,
             first: u64,
@@ -12671,7 +13478,8 @@ pub(crate) mod original_writer {
                     if action.kind == 1 {
                         if bytes.first() != Some(&0) || key_hash(&bytes[1..]) != action.key[1..] {
                             return Err(Error::Other(
-                                "scratch separator blob does not authenticate".into()));
+                                "scratch separator blob does not authenticate".into(),
+                            ));
                         }
                     } else {
                         let node = EncodedNode::authenticate(family, bytes)?;
@@ -12685,7 +13493,8 @@ pub(crate) mod original_writer {
                         }
                         if node_storage_key(family, &chunk_id(node.level, last)) != action.key {
                             return Err(Error::Other(
-                                "scratch chunk id disagrees with its separator".into()));
+                                "scratch chunk id disagrees with its separator".into(),
+                            ));
                         }
                     }
                     drop(destination);
@@ -12706,7 +13515,10 @@ pub(crate) mod original_writer {
             Ok(())
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(super) fn update_family_consuming_keys(
             table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
             admission: &mut ProofAdmission,
@@ -12769,7 +13581,10 @@ mod original_ddl_occurrences {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn coordinate(key: &str) -> Result<(Lsn, u32)> {
         let (lsn, ordinal) = key.split_once(':').unwrap_or((key, "000000"));
         let lsn = Lsn(lsn.parse().map_err(|_| damage("invalid occurrence LSN"))?);
@@ -12788,7 +13603,10 @@ mod original_ddl_occurrences {
         Ok((lsn, ordinal))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate_ordinal(ordinal: u32) -> Result<()> {
         if ordinal > 999_999 {
             return Err(damage(
@@ -12829,14 +13647,21 @@ mod original_ddl_occurrences {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prefix_buffer_bytes(change: &DdlChange) -> Result<usize> {
         let (_, name) = prefix_parts(change);
-        name.len().checked_add(42 + 12)
+        name.len()
+            .checked_add(42 + 12)
             .ok_or_else(|| damage("declaration selector capacity overflow"))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prefix(change: &DdlChange) -> Result<Vec<u8>> {
         let (kind, name) = prefix_parts(change);
         // Both callers prepay through their existing original owner. Include
@@ -12877,7 +13702,10 @@ mod original_ddl_occurrences {
         unmarked: bool,
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn config_occurrence(key: &str) -> Result<Option<(Lsn, u32)>> {
         for prefix in [GENERATION, ARRIVAL, SUPERSEDED] {
             if let Some(rest) = key.strip_prefix(prefix) {
@@ -12891,18 +13719,27 @@ mod original_ddl_occurrences {
     }
 
     impl RedbPersistence {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn owned_validate_ddl_occurrence_ordinal(ordinal: u32) -> Result<()> {
             validate_ordinal(ordinal)
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn owned_ddl_config_occurrence_coordinate(key: &str) -> Result<(Lsn, u32)> {
             config_occurrence(key)?
                 .ok_or_else(|| damage("invalid occurrence configuration namespace"))
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(super) fn owned_initialize_ddl_selectors_in_write(
             write: &redb::WriteTransaction,
         ) -> Result<()> {
@@ -12913,7 +13750,10 @@ mod original_ddl_occurrences {
             Ok(())
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(super) fn owned_ddl_selector_fingerprints_in_write(
             write: &redb::WriteTransaction,
         ) -> Result<[[u8; 32]; 2]> {
@@ -12934,7 +13774,10 @@ mod original_ddl_occurrences {
             ])
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(super) fn reconcile_owned_ddl_selectors_in_write(
             write: &redb::WriteTransaction,
             mutations: &[content_identity::ContentIdentityMutation],
@@ -13162,7 +14005,10 @@ mod original_ddl_occurrences {
             Ok(())
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn owned_validate_ddl_selectors_in_write(write: &redb::WriteTransaction) -> Result<()> {
             let actual = Self::owned_ddl_selector_fingerprints_in_write(write)?;
             let expected = content_identity::ddl_selector_roots_in_write(write)?;
@@ -13172,7 +14018,10 @@ mod original_ddl_occurrences {
             Ok(())
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(super) fn owned_validate_ddl_selectors_in_read(
             read: &redb::ReadTransaction,
         ) -> Result<()> {
@@ -13204,7 +14053,10 @@ mod original_ddl_occurrences {
             Ok(())
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn owned_first_eligible_ddl_occurrence(
             root: &WriterSnapshotHandle,
             owner: writer_source::SourceWindowOwner,
@@ -13305,7 +14157,10 @@ mod original_ddl_occurrences {
             Ok(Some(at))
         }
 
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn owned_unmarked_ddl_occurrences(
             root: &WriterSnapshot,
             owner: writer_source::SourceWindowOwner,
@@ -13584,7 +14439,10 @@ pub(crate) struct OriginalCanonicalBytes {
     allocation: crate::memory_accounting::OwnedMemoryReservation,
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn canonical_json_from_original<T: Serialize + ?Sized>(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     value: &T,
@@ -13618,7 +14476,8 @@ pub(crate) fn canonical_json_from_original<T: Serialize + ?Sized>(
     serde_json::to_writer(&mut bytes, &value).map_err(encoding_failure)?;
     if bytes.capacity() != measured.0 || bytes.len() != measured.0 {
         return Err(Error::Other(
-            "logical identity encoder capacity mismatch".into()));
+            "logical identity encoder capacity mismatch".into(),
+        ));
     }
     drop(value);
     drop(work);
@@ -13631,7 +14490,10 @@ pub(crate) struct OriginalIdentityMutations {
     admission: original_writer::ProofAdmission,
 }
 impl OriginalIdentityMutations {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn new(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         capacity: usize,
@@ -13644,14 +14506,18 @@ impl OriginalIdentityMutations {
         let mutations = Vec::with_capacity(capacity);
         if mutations.capacity() != capacity {
             return Err(Error::Other(
-                "logical identity mutation capacity mismatch".into()));
+                "logical identity mutation capacity mismatch".into(),
+            ));
         }
         Ok(Self {
             mutations,
             admission,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn push_status<T: Serialize>(
         &mut self,
         namespace: &[u8],
@@ -13681,7 +14547,8 @@ impl OriginalIdentityMutations {
         };
         if self.mutations.len() == self.mutations.capacity() {
             return Err(Error::Other(
-                "logical identity mutation count exceeded preparation".into()));
+                "logical identity mutation count exceeded preparation".into(),
+            ));
         }
         self.mutations.push(ContentIdentityMutation {
             family: LogicalFamily::Status,
@@ -13691,7 +14558,10 @@ impl OriginalIdentityMutations {
         });
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn push_config(&mut self, key: &str, value: Option<&[u8]>) -> Result<()> {
         self.admission.admit(
             key.len()
@@ -13700,7 +14570,8 @@ impl OriginalIdentityMutations {
         )?;
         if self.mutations.len() == self.mutations.capacity() {
             return Err(Error::Other(
-                "logical identity mutation count exceeded preparation".into()));
+                "logical identity mutation count exceeded preparation".into(),
+            ));
         }
         self.mutations.push(ContentIdentityMutation {
             family: LogicalFamily::Configuration,
@@ -13717,7 +14588,10 @@ pub(crate) struct OriginalIdentityMutation {
     allocation: crate::memory_accounting::OwnedMemoryReservation,
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn fund_identity_mutation_from_original(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     bytes: usize,
@@ -13743,7 +14617,8 @@ pub(crate) fn fund_identity_mutation_from_original(
         .ok_or_else(|| Error::Other("logical identity mutation capacity overflow".into()))?;
     if retained > bytes {
         return Err(Error::Other(
-            "logical identity mutation exceeded its original allocation plan".into()));
+            "logical identity mutation exceeded its original allocation plan".into(),
+        ));
     }
     Ok(OriginalIdentityMutation {
         mutation,
@@ -13752,7 +14627,10 @@ pub(crate) fn fund_identity_mutation_from_original(
 }
 
 /// Exact-capacity escaping posting removal; no geometric encoder invoice.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn remove_posting_from_original(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     table: &str,
@@ -13773,7 +14651,10 @@ pub(crate) fn remove_posting_from_original(
         Ok(remove_relational_index_posting_mutation(table, index, key))
     })
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn count_from_original(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     namespace: &[u8],
@@ -13791,7 +14672,10 @@ pub(crate) fn count_from_original(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn original_key_parts_bytes(parts: &[&[u8]]) -> Result<usize> {
     parts.iter().try_fold(0usize, |n, p| {
         n.checked_add(8)
@@ -13800,7 +14684,10 @@ fn original_key_parts_bytes(parts: &[&[u8]]) -> Result<usize> {
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn canonical_identity_mutation_from_original<T: Serialize + ?Sized>(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     family: LogicalFamily,
@@ -13828,7 +14715,10 @@ fn canonical_identity_mutation_from_original<T: Serialize + ?Sized>(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn row_mutation_from_original(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     table: &str,
@@ -13891,7 +14781,10 @@ pub(crate) fn row_mutation_from_original(
     Ok(m)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn edge_mutation_from_original(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     edge: &AdjEntry,
@@ -13933,7 +14826,10 @@ pub(crate) fn edge_mutation_from_original(
     canonical_identity_mutation_from_original(original, LogicalFamily::Graph, &parts, &properties)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn schema_mutation_from_original(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     name: &str,
@@ -13956,7 +14852,10 @@ pub(crate) fn schema_mutation_from_original(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn status_mutation_from_original<T: Serialize>(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     namespace: &[u8],
@@ -13972,7 +14871,10 @@ pub(crate) fn status_mutation_from_original<T: Serialize>(
 }
 
 impl OriginalIdentityMutations {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn push_original(&mut self, mut value: OriginalIdentityMutation) -> Result<()> {
         if self.mutations.len() == self.mutations.capacity() {
             let old = self.mutations.capacity();
@@ -14004,14 +14906,20 @@ impl OriginalIdentityMutations {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn retain_original_identity_mutation(
     frame: &crate::persistence::OriginalPersistenceFrame<'_>,
     owned: &mut OriginalIdentityMutation,
 ) -> Result<()> {
     frame.retain(&mut owned.allocation)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn retain_original_canonical<T: Serialize + ?Sized>(
     frame: &crate::persistence::OriginalPersistenceFrame<'_>,
     value: &T,
@@ -14020,7 +14928,10 @@ pub(crate) fn retain_original_canonical<T: Serialize + ?Sized>(
     frame.retain(&mut encoded.allocation)?;
     Ok(encoded.bytes)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn original_record_work_bytes<T: Serialize + ?Sized>(value: &T) -> Result<usize> {
     value
         .serialize(original_canonical_measure::Measure)
@@ -14030,14 +14941,20 @@ pub(crate) fn original_record_work_bytes<T: Serialize + ?Sized>(value: &T) -> Re
 pub(crate) mod original_producers {
     use super::*;
     use crate::persistence::OriginalPersistenceFrame;
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn size(parts: &[usize]) -> Result<usize> {
         parts.iter().try_fold(0usize, |n, v| {
             n.checked_add(*v)
                 .ok_or_else(|| Error::Other("logical identity allocation overflow".into()))
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn key(frame: &OriginalPersistenceFrame<'_>, parts: &[&[u8]]) -> Result<Vec<u8>> {
         let bytes = original_key_parts_bytes(parts)?;
         frame.reserve(bytes)?;
@@ -14048,7 +14965,10 @@ pub(crate) mod original_producers {
         }
         Ok(v)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn put(
         frame: &OriginalPersistenceFrame<'_>,
         family: LogicalFamily,
@@ -14058,7 +14978,10 @@ pub(crate) mod original_producers {
         frame.reserve(size(&[k.as_ref().len(), v.as_ref().len()])?)?;
         Ok(ContentIdentityMutation::put(family, k.as_ref(), v.as_ref()))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove(
         frame: &OriginalPersistenceFrame<'_>,
         family: LogicalFamily,
@@ -14067,7 +14990,10 @@ pub(crate) mod original_producers {
         frame.reserve(k.as_ref().len())?;
         Ok(ContentIdentityMutation::remove(family, k.as_ref()))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn row_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         table: &str,
@@ -14081,14 +15007,20 @@ pub(crate) mod original_producers {
             meta,
         )?)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn edge_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         edge: &AdjEntry,
     ) -> Result<ContentIdentityMutation> {
         frame.take_mutation(edge_mutation_from_original(frame.original, edge)?)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn schema_mutations(
         frame: &OriginalPersistenceFrame<'_>,
         name: &str,
@@ -14101,7 +15033,10 @@ pub(crate) mod original_producers {
             meta,
         )?)?])
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_schema_mutations(
         frame: &OriginalPersistenceFrame<'_>,
         name: &str,
@@ -14109,7 +15044,10 @@ pub(crate) mod original_producers {
         frame.array::<ContentIdentityMutation>(1)?;
         Ok(vec![remove(frame, SCHEMA_RECORD_FAMILY, name.as_bytes())?])
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn config_mutations(
         frame: &OriginalPersistenceFrame<'_>,
         name: &str,
@@ -14121,7 +15059,10 @@ pub(crate) mod original_producers {
             None => remove(frame, LogicalFamily::Configuration, name.as_bytes())?,
         }])
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn encoded_status_mutation<T: Serialize>(
         frame: &OriginalPersistenceFrame<'_>,
         namespace: &[u8],
@@ -14135,7 +15076,10 @@ pub(crate) mod original_producers {
             value,
         )?)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn status_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         namespace: &[u8],
@@ -14150,7 +15094,10 @@ pub(crate) mod original_producers {
             value,
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_status_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         namespace: &[u8],
@@ -14161,7 +15108,10 @@ pub(crate) mod original_producers {
             key(frame, &[namespace, k])?,
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn encoded_history_mutation<T: HistoryRecord>(
         frame: &OriginalPersistenceFrame<'_>,
         coordinate: &str,
@@ -14177,7 +15127,10 @@ pub(crate) mod original_producers {
             v,
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_encoded_history_mutation<T: HistoryRecord>(
         frame: &OriginalPersistenceFrame<'_>,
         coordinate: &str,
@@ -14186,7 +15139,10 @@ pub(crate) mod original_producers {
         frame.reserve(size(&[ORDERED_HISTORY_MAGIC.len(), 1, coordinate.len()])?)?;
         super::remove_encoded_history_mutation(coordinate, value)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn private_history_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         coordinate: &str,
@@ -14205,7 +15161,10 @@ pub(crate) mod original_producers {
             value,
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_row_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         table: &str,
@@ -14217,7 +15176,10 @@ pub(crate) mod original_producers {
         ])?)?;
         Ok(super::remove_row_mutation(table, row_id))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_edge_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         source: uuid::Uuid,
@@ -14233,7 +15195,10 @@ pub(crate) mod original_producers {
         )?;
         Ok(super::remove_edge_mutation(source, edge_type, target))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit_index_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         lsn: Lsn,
@@ -14242,7 +15207,10 @@ pub(crate) mod original_producers {
         frame.reserve(ORDERED_HISTORY_MAGIC.len() + 1 + 8 + 8)?;
         Ok(super::commit_index_mutation(lsn, tx))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_commit_index_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         lsn: Lsn,
@@ -14250,7 +15218,10 @@ pub(crate) mod original_producers {
         frame.reserve(ORDERED_HISTORY_MAGIC.len() + 1 + 8)?;
         Ok(super::remove_commit_index_mutation(lsn))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn sync_source_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         table: &str,
@@ -14261,7 +15232,10 @@ pub(crate) mod original_producers {
         frame.reserve(size(&[table.len(), 8, 9])? * 4)?;
         Ok(super::sync_source_mutation(table, row_id, source_lsn, kind))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_sync_source_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         table: &str,
@@ -14270,7 +15244,10 @@ pub(crate) mod original_producers {
         frame.reserve(size(&[table.len(), 8])? * 4)?;
         Ok(super::remove_sync_source_mutation(table, row_id))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn relational_index_posting_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         table: &str,
@@ -14292,7 +15269,10 @@ pub(crate) mod original_producers {
             table, index, order_key,
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_relational_index_posting_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         table: &str,
@@ -14314,7 +15294,10 @@ pub(crate) mod original_producers {
             table, index, order_key,
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_vector_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         index: &VectorIndexRef,
@@ -14324,7 +15307,10 @@ pub(crate) mod original_producers {
         frame.reserve(size(&[index.table.len(), index.column.len(), 32])?)?;
         Ok(super::remove_vector_mutation(index, row_id, quantization))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn remove_vector_version_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         index: &VectorIndexRef,
@@ -14342,7 +15328,10 @@ pub(crate) mod original_producers {
             quantization,
         ))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn vector_mutation_pair(
         frame: &OriginalPersistenceFrame<'_>,
         entry: &VectorEntry,
@@ -14353,7 +15342,10 @@ pub(crate) mod original_producers {
         scratch.reserve(super::vector_projection_scratch_bytes(entry, quantization)?)?;
         Ok(super::vector_mutation_pair(entry, quantization))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn vector_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         entry: &VectorEntry,
@@ -14364,7 +15356,10 @@ pub(crate) mod original_producers {
         scratch.reserve(super::vector_projection_scratch_bytes(entry, quantization)?)?;
         Ok(super::vector_mutation(entry, quantization))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn vector_version_mutation(
         frame: &OriginalPersistenceFrame<'_>,
         entry: &VectorEntry,
@@ -14398,7 +15393,10 @@ pub(crate) mod original_version_manifest {
         Error::Other((format!("relational version manifest: {reason}")).into())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn manifest_prefix(table: &str) -> Result<Vec<u8>> {
         let len = u32::try_from(table.len()).map_err(|_| bad("table length overflow"))?;
         let capacity = (FIXED_KEY_BYTES - 2)
@@ -14411,7 +15409,10 @@ pub(crate) mod original_version_manifest {
         Ok(key)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn parse_manifest(coordinate: &[u8]) -> Result<VersionManifest<'_>> {
         if coordinate.len() < FIXED_KEY_BYTES - 2 || coordinate[0] != FORMAT {
             return Err(bad("invalid format or truncated key"));
@@ -14439,7 +15440,10 @@ pub(crate) mod original_version_manifest {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn parse_manifest_with_checkpoint<'a>(
         coordinate: &'a [u8],
         checkpoint: &mut dyn FnMut() -> Result<()>,
@@ -14486,7 +15490,10 @@ pub(crate) mod original_version_manifest {
             digest: coordinate[p + 33..].try_into().expect("digest"),
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prefix_with_checkpoint(
         table: &str,
         checkpoint: &mut dyn FnMut() -> Result<()>,
@@ -14504,7 +15511,10 @@ pub(crate) mod original_version_manifest {
         }
         Ok(key)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn copy_with_checkpoint(
         bytes: &[u8],
         checkpoint: &mut dyn FnMut() -> Result<()>,
@@ -14516,7 +15526,10 @@ pub(crate) mod original_version_manifest {
         }
         Ok(copy)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn starts_with_checkpoint(
         bytes: &[u8],
         prefix: &[u8],
@@ -14527,7 +15540,10 @@ pub(crate) mod original_version_manifest {
         }
         Ok(bytes_cmp_checkpoint(&bytes[..prefix.len()], prefix, checkpoint)? == Ordering::Equal)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn equal_with_checkpoint(
         left: &[u8],
         right: &[u8],
@@ -14550,7 +15566,10 @@ pub(crate) mod original_version_manifest {
         checkpoint: &'c mut dyn FnMut() -> Result<()>,
     }
     impl<'a> Encoded<'a, '_> {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn take(&mut self, len: usize) -> Result<&'a [u8]> {
             let end = self
                 .position
@@ -14566,11 +15585,17 @@ pub(crate) mod original_version_manifest {
             self.position = end;
             Ok(raw)
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn byte(&mut self) -> Result<u8> {
             Ok(self.take(1)?[0])
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn integer(&mut self) -> Result<u64> {
             let tag = self.byte()?;
             let (value, minimum) = match tag {
@@ -14594,11 +15619,17 @@ pub(crate) mod original_version_manifest {
             }
             Ok(value)
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn length(&mut self) -> Result<usize> {
             usize::try_from(self.integer()?).map_err(|_| bad("length overflow"))
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn text(&mut self) -> Result<(usize, usize)> {
             let len = self.length()?;
             let start = self.position;
@@ -14622,7 +15653,10 @@ pub(crate) mod original_version_manifest {
             }
             Ok((start, self.position))
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn option_integer(&mut self) -> Result<Option<u64>> {
             match self.byte()? {
                 0 => Ok(None),
@@ -14630,7 +15664,10 @@ pub(crate) mod original_version_manifest {
                 _ => Err(bad("invalid option marker")),
             }
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn floats(&mut self) -> Result<()> {
             let bytes = self
                 .length()?
@@ -14639,7 +15676,10 @@ pub(crate) mod original_version_manifest {
             self.take(bytes)?;
             Ok(())
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn scalar_value(&mut self) -> Result<()> {
             match self.integer()? {
                 0 => (),
@@ -14669,7 +15709,10 @@ pub(crate) mod original_version_manifest {
             }
             Ok(())
         }
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn value(&mut self) -> Result<()> {
             match self.integer()? {
                 0 => self.scalar_value()?,
@@ -14710,7 +15753,10 @@ pub(crate) mod original_version_manifest {
         pub(crate) created: TxId,
         pub(crate) deleted: Option<TxId>,
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn has_indexed_vector(body: &[u8], declarations: &[IndexDecl]) -> Result<bool> {
         let mut checkpoint = || Ok(());
         let mut input = Encoded {
@@ -14738,7 +15784,10 @@ pub(crate) mod original_version_manifest {
         }
         Ok(found)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn scalar_posting_for_body(
         body: &[u8],
         declaration: &IndexDecl,
@@ -14818,7 +15867,10 @@ pub(crate) mod original_version_manifest {
         }))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn scalar_posting_identity(key: &[u8]) -> Result<(usize, RowId, TxId)> {
         let mut checkpoint = || Ok(());
         let mut input = Encoded {
@@ -14845,7 +15897,10 @@ pub(crate) mod original_version_manifest {
     /// Parse and hash the exact persisted representation before schema projection.
     /// Scratch is admitted before the descriptor vector is allocated and refunded
     /// after the hash, including every parse/admission failure.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn manifest_for_body(
         table: &str,
         physical: &[u8],
@@ -14855,7 +15910,10 @@ pub(crate) mod original_version_manifest {
         manifest_for_body_with_checkpoint(table, physical, body, admission, &mut || Ok(()))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn manifest_for_body_with_checkpoint(
         table: &str,
         physical: &[u8],
@@ -14918,7 +15976,10 @@ pub(crate) mod original_version_manifest {
             }
             let checkpoint = input.checkpoint;
             // Unstable sorting is in-place and allocates no population-sized work.
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn compare_names(
                 body: &[u8],
                 a: Span,
@@ -14936,7 +15997,10 @@ pub(crate) mod original_version_manifest {
                 }
                 Ok(a.len().cmp(&b.len()))
             }
-            #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+            #[expect(
+                clippy::result_large_err,
+                reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+            )]
             fn sift(
                 spans: &mut [Span],
                 body: &[u8],
@@ -15036,7 +16100,10 @@ pub(crate) mod original_version_manifest {
         result
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn manifest_mutation(
         coordinate: &[u8],
         present: bool,
@@ -15052,7 +16119,10 @@ pub(crate) mod original_version_manifest {
 
     /// An authenticated successor under the current writer transaction's root.
     /// Only a path and one resolved separator exist at a time.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_manifest_next(
         write: &redb::WriteTransaction,
         start: &[u8],
@@ -15079,7 +16149,10 @@ pub(crate) mod original_version_manifest {
             .ok_or_else(|| bad("seek layout overflow"))?;
         admission.admit(target_bytes)?;
         let target = history_tree_key(HistoryKind::RelationalVersion, start);
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn descend(
             nodes: &impl ReadableTable<&'static [u8], &'static [u8]>,
             id: Option<[u8; 32]>,
@@ -15153,7 +16226,10 @@ pub(crate) mod original_version_manifest {
         admission.release(target_bytes);
         result
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_manifest_next_pending(
         write: &redb::WriteTransaction,
         start: &[u8],
@@ -15208,7 +16284,10 @@ pub(crate) mod original_version_manifest {
             Ok(stored)
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn manifest_mutation_bytes(coordinate: &[u8], present: bool) -> Result<usize> {
         coordinate
             .len()
@@ -15219,4 +16298,4 @@ pub(crate) mod original_version_manifest {
 }
 
 #[cfg(test)]
-use crate::persistence::writer_source::{WriterSnapshotHandle};
+use crate::persistence::writer_source::WriterSnapshotHandle;

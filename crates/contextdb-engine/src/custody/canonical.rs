@@ -58,7 +58,10 @@ impl Encoder {
     pub fn string(&mut self, v: &str) {
         self.bytes(v.as_bytes());
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn node(&mut self, v: &str) -> Result<()> {
         self.raw(&node_bytes(v)?);
         Ok(())
@@ -185,7 +188,10 @@ impl Encoder {
             self.string(value);
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn policy(&mut self, p: &ApplicationTablePolicy) -> Result<()> {
         self.u8(match p.sync_direction {
             SyncDirection::None => 0,
@@ -223,7 +229,10 @@ impl Encoder {
 /// Emit primitive canonical fields into an exact, originally admitted buffer.
 /// The finite callers supply a checked nonallocating plan; no JSON/key/row
 /// allocating walk is permitted without its own separately retained scratch.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn prepare_encoder_owned(
     db: &crate::Database,
     capacity: usize,
@@ -244,7 +253,10 @@ pub(crate) fn prepare_encoder_owned(
 
 /// Count and emit the same fmt arguments without constructing an intermediate
 /// key. Output capacity is admitted before String construction.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn prepare_string_owned(
     db: &crate::Database,
     args: std::fmt::Arguments<'_>,
@@ -269,7 +281,10 @@ pub(crate) fn prepare_string_owned(
     })
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn node_bytes(node: &str) -> Result<[u8; 32]> {
     node_bytes_with_error(node, invalid)
 }
@@ -312,7 +327,10 @@ pub(crate) fn content_row_digest(values: &HashMap<String, Value>, exclude: &[Str
     e.row(values, exclude);
     e.digest()
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn policy_digest(table: &str, policy: &ApplicationTablePolicy) -> Result<[u8; 32]> {
     let mut e = Encoder::domain("tenant-table-policy.v1");
     e.string(table);
@@ -395,7 +413,10 @@ impl FiniteEncoder<'_> {
     pub fn string(&mut self, v: &str) {
         self.bytes(v.as_bytes());
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn node(&mut self, v: &str) -> Result<()> {
         self.raw(&node_bytes(v)?);
         Ok(())
@@ -515,7 +536,10 @@ impl FiniteEncoder<'_> {
             self.string(value);
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn policy(&mut self, p: &ApplicationTablePolicy) -> Result<()> {
         self.u8(match p.sync_direction {
             SyncDirection::None => 0,
@@ -546,12 +570,18 @@ impl FiniteEncoder<'_> {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn finish(&self) -> Result<()> {
         if self.failed { Err(invalid()) } else { Ok(()) }
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn finite_bytes_owned(
     db: &crate::Database,
     walk: impl Fn(&mut FiniteEncoder<'_>) -> Result<()>,
@@ -584,7 +614,10 @@ pub(crate) fn finite_bytes_owned(
         Ok(value)
     })
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn finite_hash(
     walk: impl FnOnce(&mut FiniteEncoder<'_>) -> Result<()>,
 ) -> Result<[u8; 32]> {
@@ -610,7 +643,10 @@ pub(crate) fn finite_hash_with_error<E>(
     Ok(*hash.finalize().as_bytes())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn finite_len(walk: impl FnOnce(&mut FiniteEncoder<'_>) -> Result<()>) -> Result<usize> {
     finite_len_with_error(walk, invalid)
 }

@@ -366,18 +366,23 @@ fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_clean
                 "SELECT id FROM held_filter WHERE label = 'wanted' ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 8"
             );
             let params = HashMap::from([("query".into(), Value::Vector(vec![1.0, 0.0]))]);
-            let mut opened = crate::owned_cursor_page::with_public_page(|| open_cursor(
-                db.clone() as Arc<dyn ReadExecutionTarget>,
-                &sql,
-                &params,
-                owner.clone(),
-                limits(),
-                Arc::new(Clock),
-                OwnerReadCancellation::new(),
-                None,
-            ))
+            let mut opened = crate::owned_cursor_page::with_public_page(|| {
+                open_cursor(
+                    db.clone() as Arc<dyn ReadExecutionTarget>,
+                    &sql,
+                    &params,
+                    owner.clone(),
+                    limits(),
+                    Arc::new(Clock),
+                    OwnerReadCancellation::new(),
+                    None,
+                )
+            })
             .unwrap();
-            let first = opened.first_page.into_public().expect("publish the admitted fixture answer");
+            let first = opened
+                .first_page
+                .into_public()
+                .expect("publish the admitted fixture answer");
             assert_eq!(ids(&first.rows()), vec![0]);
             assert!(first.has_more());
             let (pointer, invoice, live) = retained_filter(&opened.cursor);
@@ -416,14 +421,19 @@ fn a_real_vector_cursor_keeps_its_filter_invoice_across_pages_and_terminal_clean
                 }
             }
             oracle::watch_registry_free_for_test(pointer, &*live as *const _ as usize);
-            let fetched = crate::owned_cursor_page::with_public_page(|| fetch_cursor(
-                &mut opened.cursor,
-                NonZeroUsize::new(1),
-                OwnerReadCancellation::new(),
-                None,
-            ))
+            let fetched = crate::owned_cursor_page::with_public_page(|| {
+                fetch_cursor(
+                    &mut opened.cursor,
+                    NonZeroUsize::new(1),
+                    OwnerReadCancellation::new(),
+                    None,
+                )
+            })
             .unwrap();
-            let second = fetched.page.into_public().expect("publish the admitted fixture answer");
+            let second = fetched
+                .page
+                .into_public()
+                .expect("publish the admitted fixture answer");
             assert_eq!(ids(&second.rows()), vec![1]);
             assert!(second.has_more());
             let (later_pointer, later_invoice, later_live) = retained_filter(&opened.cursor);
@@ -564,18 +574,23 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
         let sql = format!(
             "SELECT id FROM authorized_rows WHERE bucket = 1 AND label = 'wanted' ORDER BY embedding <=> $query USE VECTOR {mode} LIMIT 3"
         );
-        let opened = crate::owned_cursor_page::with_public_page(|| open_cursor(
-            reader.clone() as Arc<dyn ReadExecutionTarget>,
-            &sql,
-            &params,
-            owner.clone(),
-            limits(),
-            Arc::new(Clock),
-            OwnerReadCancellation::new(),
-            None,
-        ))
+        let opened = crate::owned_cursor_page::with_public_page(|| {
+            open_cursor(
+                reader.clone() as Arc<dyn ReadExecutionTarget>,
+                &sql,
+                &params,
+                owner.clone(),
+                limits(),
+                Arc::new(Clock),
+                OwnerReadCancellation::new(),
+                None,
+            )
+        })
         .unwrap();
-        let first = opened.first_page.into_public().expect("publish the admitted fixture answer");
+        let first = opened
+            .first_page
+            .into_public()
+            .expect("publish the admitted fixture answer");
         assert_eq!(
             ids(&first.rows()),
             vec![0],
@@ -617,14 +632,19 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
         let mut rows = ids(&first.rows());
         let mut more = first.has_more();
         while more {
-            let fetched = crate::owned_cursor_page::with_public_page(|| fetch_cursor(
-                &mut cursor,
-                NonZeroUsize::new(1),
-                OwnerReadCancellation::new(),
-                None,
-            ))
+            let fetched = crate::owned_cursor_page::with_public_page(|| {
+                fetch_cursor(
+                    &mut cursor,
+                    NonZeroUsize::new(1),
+                    OwnerReadCancellation::new(),
+                    None,
+                )
+            })
             .unwrap();
-            let page = fetched.page.into_public().expect("publish the admitted fixture answer");
+            let page = fetched
+                .page
+                .into_public()
+                .expect("publish the admitted fixture answer");
             rows.extend(ids(&page.rows()));
             more = page.has_more();
         }
@@ -656,7 +676,10 @@ fn authorized_vector_modes_keep_their_captured_rows_and_grants_after_later_write
         None,
     )
     .unwrap();
-    let public = fresh.result.into_public().expect("publish the admitted fixture answer");
+    let public = fresh
+        .result
+        .into_public()
+        .expect("publish the admitted fixture answer");
     assert_eq!(ids(&public.rows()), vec![92, 93]);
     reader.__reset_last_query_vector_trace_for_test();
     admin.__reset_last_query_vector_trace_for_test();

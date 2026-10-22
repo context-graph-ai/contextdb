@@ -27,7 +27,8 @@ fn observed_read(
     let rows = db
         .execute_at_snapshot(sql, &empty(), snapshot)
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     (rows, work.counters(), work.historical_counters())
 }
 

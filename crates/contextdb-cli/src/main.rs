@@ -417,9 +417,10 @@ fn main() {
             operation.spelling(),
             operation.arguments(),
             || {
-                let read_parent = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
-                    args.read_configuration().limits.memory,
-                )?;
+                let read_parent =
+                    contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                        args.read_configuration().limits.memory,
+                    )?;
                 let operation = read_parent.child()?;
                 Ok((operation, read_parent))
             },
@@ -481,15 +482,16 @@ fn main() {
             refuse_invocation(args.json, &format!("invalid --disk-limit: {err}"));
         });
 
-    let read_memory = match contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
-        read.limits.memory,
-    ) {
-        Ok(root) => root,
-        Err(error) => {
-            output.report_error(ErrorClass::of(&error), &error.to_string());
-            std::process::exit(EXIT_ERROR);
-        }
-    };
+    let read_memory =
+        match contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+            read.limits.memory,
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                output.report_error(ErrorClass::of(&error), &error.to_string());
+                std::process::exit(EXIT_ERROR);
+            }
+        };
 
     if !writes_permitted {
         // A reading session opens no database at all. There is no handle here

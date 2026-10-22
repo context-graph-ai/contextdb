@@ -326,8 +326,10 @@ fn assert_native_cache_index_charge_on_writer_settle_and_read_only_open() {
         let ledger = take_budget_ledger_for_test();
         let source = reader.file_cache_index_charge_for_test().unwrap();
         let reader_index = source.index_bytes;
-        let source_charge = source.remaining_base + source.retained_control.1
-            + source.source_control.1 + source.preparation_invoice;
+        let source_charge = source.remaining_base
+            + source.retained_control.1
+            + source.source_control.1
+            + source.preparation_invoice;
         assert!(reader_index > 0);
         // Read the unchanged source reserve independently of the actual native index.
         let (read_page_cap, fixed_source_bytes) =
@@ -335,27 +337,51 @@ fn assert_native_cache_index_charge_on_writer_settle_and_read_only_open() {
                 64 * 1024 * 1024,
             ));
         let base_source_charge = read_page_cap + fixed_source_bytes;
-        assert_eq!(source.remaining_base + source.retained_control.1, base_source_charge,
-            "detaching the retained control transfers R without refund or readmission");
-        assert_eq!(source.preparation_invoice, source.preparation.1 + reader_index,
-            "the actual preparation owns P and every separate native index invoice I");
+        assert_eq!(
+            source.remaining_base + source.retained_control.1,
+            base_source_charge,
+            "detaching the retained control transfers R without refund or readmission"
+        );
+        assert_eq!(
+            source.preparation_invoice,
+            source.preparation.1 + reader_index,
+            "the actual preparation owns P and every separate native index invoice I"
+        );
         let allocations = &source.allocations[..source.allocation_count];
-        assert_eq!(allocations.iter().map(|a| a.1).sum::<usize>(), reader_index,
-            "actual producer Layouts reconcile the native index, including both counters");
-        let admissions = ledger.iter().filter(|entry| {
-            entry.what == "direct_read/hydrate_owned_image"
-                && entry.owner_identity == source.payer_identity
-        }).collect::<Vec<_>>();
-        let mut expected = vec![source.source_control.1, base_source_charge, source.preparation.1];
+        assert_eq!(
+            allocations.iter().map(|a| a.1).sum::<usize>(),
+            reader_index,
+            "actual producer Layouts reconcile the native index, including both counters"
+        );
+        let admissions = ledger
+            .iter()
+            .filter(|entry| {
+                entry.what == "direct_read/hydrate_owned_image"
+                    && entry.owner_identity == source.payer_identity
+            })
+            .collect::<Vec<_>>();
+        let mut expected = vec![
+            source.source_control.1,
+            base_source_charge,
+            source.preparation.1,
+        ];
         expected.extend(allocations.iter().map(|a| a.1));
         assert!(admissions.len() >= expected.len());
-        let mut actual = admissions[..expected.len()].iter().map(|entry| entry.bytes).collect::<Vec<_>>();
+        let mut actual = admissions[..expected.len()]
+            .iter()
+            .map(|entry| entry.bytes)
+            .collect::<Vec<_>>();
         expected.sort_unstable();
         actual.sort_unstable();
-        assert_eq!(actual, expected,
-            "M, unchanged B, P and each actual I are separate once-only admissions by the original payer");
-        assert_eq!(source_charge, expected.iter().sum::<usize>(),
-            "B + M + P + I has zero gap; R was transferred inside B");
+        assert_eq!(
+            actual, expected,
+            "M, unchanged B, P and each actual I are separate once-only admissions by the original payer"
+        );
+        assert_eq!(
+            source_charge,
+            expected.iter().sum::<usize>(),
+            "B + M + P + I has zero gap; R was transferred inside B"
+        );
         assert_eq!(
             reader.file_retained_charge_bytes_for_test(),
             Some(0),
@@ -371,10 +397,7 @@ fn assert_native_cache_index_charge_on_writer_settle_and_read_only_open() {
                 .rows(),
             vec![vec![Value::Int64(1), Value::Text("held exactly".into())]]
         );
-        assert_eq!(
-            reader.file_cache_index_charge_for_test(),
-            Some(source)
-        );
+        assert_eq!(reader.file_cache_index_charge_for_test(), Some(source));
         drop(reader);
     }
 }

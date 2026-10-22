@@ -504,11 +504,18 @@ fn consecutive_hnsw_builds_within_one_open_database_are_stable() {
             // Committed changes are searchable before maintenance. Publish
             // their real native graph before inspecting saved topology; a
             // journal identity is never a substitute for an HNSW point.
-            let pending = db.query_vector(index_ref("det_one"), &axis3(1), TOP_K, None, db.snapshot()).unwrap();
-            assert_eq!(pending.first().map(|(row, _)| *row), Some(sentinel_row_id),
-                "the committed sentinel is searchable before graph publication");
-            assert!(db.persist_import_vector_tails().unwrap(),
-                "caller-driven maintenance publishes the actual saved sentinel graph");
+            let pending = db
+                .query_vector(index_ref("det_one"), &axis3(1), TOP_K, None, db.snapshot())
+                .unwrap();
+            assert_eq!(
+                pending.first().map(|(row, _)| *row),
+                Some(sentinel_row_id),
+                "the committed sentinel is searchable before graph publication"
+            );
+            assert!(
+                db.persist_import_vector_tails().unwrap(),
+                "caller-driven maintenance publishes the actual saved sentinel graph"
+            );
             assert_eq!(
                 db.__debug_vector_hnsw_len(index_ref("det_one")),
                 Some(REOPEN_ROWS + 1),

@@ -434,7 +434,9 @@ fn measure_reader(reader: &contextdb_engine::ReadSession, partitions: usize) -> 
         rows_examined: answer.trace().rows_examined,
         plan: format!(
             "{} index={:?} pushed={:?}",
-            answer.trace().physical_plan, answer.trace().index_used, answer.trace().predicates_pushed,
+            answer.trace().physical_plan,
+            answer.trace().index_used,
+            answer.trace().predicates_pushed,
         ),
     }
 }

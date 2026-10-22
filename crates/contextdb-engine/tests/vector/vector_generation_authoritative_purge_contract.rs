@@ -183,7 +183,8 @@ fn authoritative_purge_retires_only_the_selected_partitions_saved_generation_aft
             )
             .expect("the public authoritative PURGE removes alpha's complete lineage");
         assert_eq!(
-            purged.rows_affected(), ROWS_PER_PARTITION as u64,
+            purged.rows_affected(),
+            ROWS_PER_PARTITION as u64,
             "the public purge selected every vector lineage in alpha and no bravo lineage"
         );
         assert_eq!(

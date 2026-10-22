@@ -61,7 +61,10 @@ impl JsonReadAdmissionGuard {
     /// Select only a concrete engine root whose outer adapter owns these
     /// callbacks. This is refusal/diagnostic transport, not calibration proof.
     #[doc(hidden)]
-    pub fn enter_closed(owner: impl Into<crate::read_memory::ReadMemoryOwner>, hooks: ClosedJsonReadHooks) -> Self {
+    pub fn enter_closed(
+        owner: impl Into<crate::read_memory::ReadMemoryOwner>,
+        hooks: ClosedJsonReadHooks,
+    ) -> Self {
         let owner: crate::read_memory::ReadMemoryOwner = owner.into();
 
         let guard = Self::enter(owner);
@@ -117,13 +120,16 @@ impl Drop for JsonReadAdmissionGuard {
         CLOSED_HOOKS.with(|slot| {
             slot.replace(self.previous_hooks.take());
         });
-        NATIVE_OWNER.with(|slot| { slot.replace(self.previous_native.take()); });
+        NATIVE_OWNER.with(|slot| {
+            slot.replace(self.previous_native.take());
+        });
     }
 }
 
 fn current_owner() -> Option<ReadMemoryOwner> {
-    NATIVE_OWNER.with(|slot| slot.borrow().clone()).or_else(||
-        OWNER.with(|slot| slot.borrow().clone()))
+    NATIVE_OWNER
+        .with(|slot| slot.borrow().clone())
+        .or_else(|| OWNER.with(|slot| slot.borrow().clone()))
 }
 
 // The outer engine serde adapter has already admitted this exact String.
@@ -131,7 +137,9 @@ fn current_owner() -> Option<ReadMemoryOwner> {
 pub(crate) fn release_serialized_input(input: String) {
     let capacity = input.capacity();
     drop(input);
-    if let Some(owner) = current_owner() { owner.release(capacity); }
+    if let Some(owner) = current_owner() {
+        owner.release(capacity);
+    }
 }
 
 pub(crate) fn in_scope() -> bool {
@@ -142,8 +150,7 @@ pub(crate) fn in_scope() -> bool {
 /// failures from the installed budget's existing failure sideband.
 #[doc(hidden)]
 pub fn deserialize_json_in_read_scope(input: &str) -> serde_json::Result<Value> {
-    let owner = current_owner()
-        .ok_or_else(|| serde_json::Error::custom(MISSING_OWNER))?;
+    let owner = current_owner().ok_or_else(|| serde_json::Error::custom(MISSING_OWNER))?;
     let mut state = BuildState::new(input, owner);
     let mut parser = serde_json::Deserializer::from_str(input);
     let result = ValueSeed { state: &mut state }.deserialize(&mut parser);
@@ -199,7 +206,12 @@ struct ClosedState {
 struct ClosedScope(Option<ClosedState>);
 impl ClosedScope {
     fn enter() -> Self {
-        Self(CLOSED_FAILURE.with(|slot| slot.replace(Some(ClosedState { refusal: None, finite: None }))))
+        Self(CLOSED_FAILURE.with(|slot| {
+            slot.replace(Some(ClosedState {
+                refusal: None,
+                finite: None,
+            }))
+        }))
     }
     fn failure(&self) -> Option<NativeRefusal> {
         CLOSED_FAILURE.with(|slot| slot.borrow().as_ref().and_then(|state| state.refusal))
@@ -230,7 +242,11 @@ fn closed() -> bool {
     CLOSED_FAILURE.with(|slot| slot.borrow().is_some())
 }
 fn refused() -> bool {
-    CLOSED_FAILURE.with(|slot| slot.borrow().as_ref().is_some_and(|state| state.refusal.is_some()))
+    CLOSED_FAILURE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|state| state.refusal.is_some())
+    })
 }
 
 fn capacity_error<E: serde::de::Error>() -> E {
@@ -243,9 +259,12 @@ fn capacity_error<E: serde::de::Error>() -> E {
 }
 
 pub(crate) fn deserialize_json_closed(input: &str) -> Result<Value, ClosedJsonFailure> {
-    let owner = current_owner()
-        .ok_or_else(|| ClosedJsonFailure::Native(
-            serde_json::Error::custom(MISSING_OWNER), Some(MISSING_OWNER)))?;
+    let owner = current_owner().ok_or_else(|| {
+        ClosedJsonFailure::Native(
+            serde_json::Error::custom(MISSING_OWNER),
+            Some(MISSING_OWNER),
+        )
+    })?;
     let scope = ClosedScope::enter();
     let mut state = BuildState::new(input, owner);
     let mut parser = serde_json::Deserializer::from_str(input);
@@ -264,7 +283,9 @@ pub(crate) fn deserialize_json_closed(input: &str) -> Result<Value, ClosedJsonFa
                     Err(ClosedJsonFailure::Native(error, scope.finite()))
                 }
             },
-            Err(ClosedError::Native(error)) => Err(ClosedJsonFailure::Native(error, scope.finite())),
+            Err(ClosedError::Native(error)) => {
+                Err(ClosedJsonFailure::Native(error, scope.finite()))
+            }
             Err(ClosedError::Captured) => unreachable!("captured JSON refusal has a scalar cause"),
         }
     };
@@ -285,7 +306,9 @@ pub(crate) fn deserialize_json_closed(input: &str) -> Result<Value, ClosedJsonFa
                 // Preserve the genuine Data category and zero coordinates.
                 // Its sole Message backing was prepaid by the selected caller.
                 return Err(ClosedJsonFailure::Native(
-                    capacity_error(), Some(CAPACITY_ERROR)));
+                    capacity_error(),
+                    Some(CAPACITY_ERROR),
+                ));
             }
             if let Err(error) = state
                 .payload
@@ -642,10 +665,7 @@ impl<'a> BuildState<'a> {
         }
     }
     fn prepare<E: serde::de::Error>(&mut self) -> Result<(), E> {
-        let prediction = self
-            .shadow
-            .token()
-            .ok_or_else(|| capacity_error::<E>())?;
+        let prediction = self.shadow.token().ok_or_else(|| capacity_error::<E>())?;
         // Fund only token-local native requests, including realloc overlap.
         let additional = prediction
             .peak
@@ -747,8 +767,7 @@ impl<'de> Visitor<'de> for ValueVisitor<'_, '_> {
                 let new = if old == 0 {
                     4
                 } else {
-                    old.checked_mul(2)
-                        .ok_or_else(capacity_error::<A::Error>)?
+                    old.checked_mul(2).ok_or_else(capacity_error::<A::Error>)?
                 };
                 let bytes = new
                     .checked_mul(std::mem::size_of::<Value>())
@@ -1135,39 +1154,67 @@ mod finite_recipe_provenance_rows {
     fn finite_native_data_recipes_preserve_their_real_constructor_provenance() {
         let scope = ClosedScope::enter();
         let produced: ClosedError<serde_json::Error> = capacity_error();
-        let ClosedError::Native(produced) = produced else { panic!("finite capacity is native Data") };
+        let ClosedError::Native(produced) = produced else {
+            panic!("finite capacity is native Data")
+        };
         let control = serde_json::Error::custom(CAPACITY_ERROR);
         assert_eq!(scope.finite(), Some(CAPACITY_ERROR));
         assert_eq!(produced.classify(), control.classify());
-        assert_eq!((produced.line(),produced.column()),(control.line(),control.column()));
-        assert_eq!(produced.to_string(),control.to_string());
-        assert_eq!((produced.line(),produced.column()),(0,0));
-        assert!(produced.is_data()); drop(produced); drop(control); drop(scope);
+        assert_eq!(
+            (produced.line(), produced.column()),
+            (control.line(), control.column())
+        );
+        assert_eq!(produced.to_string(), control.to_string());
+        assert_eq!((produced.line(), produced.column()), (0, 0));
+        assert!(produced.is_data());
+        drop(produced);
+        drop(control);
+        drop(scope);
 
         struct Restore(Option<ReadMemoryOwner>);
-        impl Drop for Restore { fn drop(&mut self) { OWNER.with(|slot|{slot.replace(self.0.take());}); } }
-        let _restore=Restore(OWNER.with(|slot|slot.replace(None)));
-        let failure=deserialize_json_closed("null").err().expect("no owner must refuse");
-        let ClosedJsonFailure::Native(produced,finite)=failure else {panic!("missing owner retains native Data recipe")};
-        let control=serde_json::Error::custom(MISSING_OWNER);
-        assert_eq!(finite,Some(MISSING_OWNER));assert!(produced.is_data());
-        assert_eq!(produced.to_string(),control.to_string());
-        assert_eq!((produced.line(),produced.column()),(0,0));
-        assert_eq!(produced.classify(),control.classify());
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OWNER.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let _restore = Restore(OWNER.with(|slot| slot.replace(None)));
+        let failure = deserialize_json_closed("null")
+            .err()
+            .expect("no owner must refuse");
+        let ClosedJsonFailure::Native(produced, finite) = failure else {
+            panic!("missing owner retains native Data recipe")
+        };
+        let control = serde_json::Error::custom(MISSING_OWNER);
+        assert_eq!(finite, Some(MISSING_OWNER));
+        assert!(produced.is_data());
+        assert_eq!(produced.to_string(), control.to_string());
+        assert_eq!((produced.line(), produced.column()), (0, 0));
+        assert_eq!(produced.classify(), control.classify());
     }
 
     #[test]
     fn captured_scalar_refusal_never_formats_a_custom_message() {
         struct Forbidden;
         impl fmt::Display for Forbidden {
-            fn fmt(&self,_:&mut fmt::Formatter<'_>)->fmt::Result {panic!("custom Display entered after actual scalar latch")}
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                panic!("custom Display entered after actual scalar latch")
+            }
         }
-        let scope=ClosedScope::enter();
-        let cause=NativeRefusal::MemoryBudgetExceeded {subsystem:"json_decode",operation:"construct_value",
-            requested_bytes:9,available_bytes:8,budget_limit_bytes:8,hint:"test scalar latch"};
+        let scope = ClosedScope::enter();
+        let cause = NativeRefusal::MemoryBudgetExceeded {
+            subsystem: "json_decode",
+            operation: "construct_value",
+            requested_bytes: 9,
+            available_bytes: 8,
+            budget_limit_bytes: 8,
+            hint: "test scalar latch",
+        };
         latch_refusal(cause);
-        let error:ClosedError<serde_json::Error>=ClosedError::custom(Forbidden);
-        assert!(matches!(error,ClosedError::Captured));assert_eq!(scope.failure(),Some(cause));
-        assert_eq!(scope.finite(),None);
+        let error: ClosedError<serde_json::Error> = ClosedError::custom(Forbidden);
+        assert!(matches!(error, ClosedError::Captured));
+        assert_eq!(scope.failure(), Some(cause));
+        assert_eq!(scope.finite(), None);
     }
 }

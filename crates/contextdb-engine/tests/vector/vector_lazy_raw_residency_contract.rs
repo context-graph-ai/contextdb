@@ -6,7 +6,8 @@ use contextdb_core::read_contract::{DeadlineClock, DeadlineWait, ReadLimits};
 use contextdb_core::{ContextId, Error, RowId, Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::executor::bounded_read_test_support as bounded;
 use contextdb_engine::vector_read_memory::{
-    take_reader_budget_ledger_for_test as take_budget_ledger_for_test, watch_reader_budget_ledger_for_test as watch_budget_ledger_for_test,
+    take_reader_budget_ledger_for_test as take_budget_ledger_for_test,
+    watch_reader_budget_ledger_for_test as watch_budget_ledger_for_test,
 };
 use contextdb_engine::{Database, MaintenancePolicy, QueryResult};
 use serial_test::serial;
@@ -309,8 +310,13 @@ fn reopen_and_selected_queries_keep_raw_vector_residency_partition_local() {
 #[test]
 #[serial]
 fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
-    use contextdb_vector::mem::{NativeVectorScoreEvent, NativeVectorScoreObserver, with_native_vector_score_observer_for_test};
-    use contextdb_vector::hnsw::{PagedVectorObserver, PagedVectorStorageWork, with_paged_vector_observer};
+    use contextdb_vector::hnsw::{
+        PagedVectorObserver, PagedVectorStorageWork, with_paged_vector_observer,
+    };
+    use contextdb_vector::mem::{
+        NativeVectorScoreEvent, NativeVectorScoreObserver,
+        with_native_vector_score_observer_for_test,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[derive(Default)]
     struct Scores {
@@ -407,9 +413,19 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
     // Point-read the actual stored old/current identity, never a resident
     // partition or a synthetic identity inferred from the fixture generator.
     let selected_identity = |snapshot| {
-        let mut owner = contextdb_engine::vector_read_memory::admission(db.declared_reader_memory().unwrap());
-        let entry = db.vector_store_for_test().try_live_entry_for_row_in_partition(
-            &index(), &partition(many_scope(0)), replaced_row_id, snapshot, &mut owner).unwrap().unwrap();
+        let mut owner =
+            contextdb_engine::vector_read_memory::admission(db.declared_reader_memory().unwrap());
+        let entry = db
+            .vector_store_for_test()
+            .try_live_entry_for_row_in_partition(
+                &index(),
+                &partition(many_scope(0)),
+                replaced_row_id,
+                snapshot,
+                &mut owner,
+            )
+            .unwrap()
+            .unwrap();
         let identity = (entry.row_id, entry.created_tx, entry.lsn);
         drop(entry);
         drop(owner);
@@ -418,29 +434,51 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
     let old_identity = selected_identity(old_snapshot);
     let new_identity = selected_identity(new_snapshot);
     assert_ne!(old_identity, new_identity);
-    let assert_native_scores = |scores: &Scores, final_rows: &[RowId], snapshot: contextdb_core::SnapshotId| {
-        let events = scores.events.lock().unwrap();
-        assert!(events.len() >= final_rows.len() && events.len() <= 20,
-            "actual visible scoring preserves the original twenty-candidate work ceiling: {:?}", *events);
-        for row in final_rows {
-            assert!(events.iter().any(|event| event.identity().0 == *row), "every final row has an actual native stored score");
-        }
-        for event in events.iter() {
-            assert_eq!(event.snapshot(), snapshot);
-            assert!(event.identity().1.0 <= snapshot.0);
-            assert!(event.score().is_finite());
-            if event.identity().0 == replaced_row_id {
-                assert_eq!(event.identity(), if snapshot == old_snapshot { old_identity } else { new_identity },
-                    "the scorer uses the exact old/current selected stored version");
+    let assert_native_scores =
+        |scores: &Scores, final_rows: &[RowId], snapshot: contextdb_core::SnapshotId| {
+            let events = scores.events.lock().unwrap();
+            assert!(
+                events.len() >= final_rows.len() && events.len() <= 20,
+                "actual visible scoring preserves the original twenty-candidate work ceiling: {:?}",
+                *events
+            );
+            for row in final_rows {
+                assert!(
+                    events.iter().any(|event| event.identity().0 == *row),
+                    "every final row has an actual native stored score"
+                );
             }
-        }
-        assert!(scores.source_reads.load(Ordering::SeqCst) >= MANY_PARTITIONS,
-            "all selected saved graph sources perform real page work");
-        assert!(scores.source_bytes.load(Ordering::SeqCst) >= 2 * MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>());
-    };
+            for event in events.iter() {
+                assert_eq!(event.snapshot(), snapshot);
+                assert!(event.identity().1.0 <= snapshot.0);
+                assert!(event.score().is_finite());
+                if event.identity().0 == replaced_row_id {
+                    assert_eq!(
+                        event.identity(),
+                        if snapshot == old_snapshot {
+                            old_identity
+                        } else {
+                            new_identity
+                        },
+                        "the scorer uses the exact old/current selected stored version"
+                    );
+                }
+            }
+            assert!(
+                scores.source_reads.load(Ordering::SeqCst) >= MANY_PARTITIONS,
+                "all selected saved graph sources perform real page work"
+            );
+            assert!(
+                scores.source_bytes.load(Ordering::SeqCst)
+                    >= 2 * MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>()
+            );
+        };
 
     let evicted = db.vector_store_for_test().evict_reloadable_raw_partitions();
-    assert_eq!(evicted, 0, "exact body streaming leaves no resident partition to evict");
+    assert_eq!(
+        evicted, 0,
+        "exact body streaming leaves no resident partition to evict"
+    );
     assert_eq!(
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
@@ -478,9 +516,15 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
     let mut observed_unique_candidates = 0_u64;
 
     watch_budget_ledger_for_test();
-    let streamed = db.__with_snapshot_override_for_test(new_snapshot, ||
-        db.read_session(ReadLimits { memory: QUERY_WORKSPACE_BYTES as u64, ..ReadLimits::default() }).unwrap()
-            .execute(exact_sql, &query))
+    let streamed = db
+        .__with_snapshot_override_for_test(new_snapshot, || {
+            db.read_session(ReadLimits {
+                memory: QUERY_WORKSPACE_BYTES as u64,
+                ..ReadLimits::default()
+            })
+            .unwrap()
+            .execute(exact_sql, &query)
+        })
         .expect("EXACT streams stored bodies under the same candidate ceiling");
     let streamed_ledger = take_budget_ledger_for_test();
     assert_eq!(streamed.rows(), new_exact.rows());
@@ -499,10 +543,19 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
             watch_budget_ledger_for_test();
             db.__reset_last_query_vector_trace_for_test();
             let ordinary_scores = Arc::new(Scores::default());
-            let ordinary = with_native_vector_score_observer_for_test(ordinary_scores.clone(), ||
-                with_paged_vector_observer(ordinary_scores.clone(), || db.__with_snapshot_override_for_test(snapshot, ||
-                    db.read_session(ReadLimits { memory: QUERY_WORKSPACE_BYTES as u64, ..ReadLimits::default() }).unwrap()
-                        .execute(&sql, &query))))
+            let ordinary =
+                with_native_vector_score_observer_for_test(ordinary_scores.clone(), || {
+                    with_paged_vector_observer(ordinary_scores.clone(), || {
+                        db.__with_snapshot_override_for_test(snapshot, || {
+                            db.read_session(ReadLimits {
+                                memory: QUERY_WORKSPACE_BYTES as u64,
+                                ..ReadLimits::default()
+                            })
+                            .unwrap()
+                            .execute(&sql, &query)
+                        })
+                    })
+                })
                 .unwrap_or_else(|error| panic!("ordinary {mode} candidate search failed: {error}"));
             let ledger = take_budget_ledger_for_test();
             let ordinary_trace = {
@@ -517,10 +570,16 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
             assert_score_workspace(&ledger, true);
             let arm_after = db.__vector_passive_activity_counters_for_test();
             let loads = arm_after.raw_candidate_point_loads - arm_before.raw_candidate_point_loads;
-            assert!(loads <= 20, "raw rereads retain the original candidate ceiling");
+            assert!(
+                loads <= 20,
+                "raw rereads retain the original candidate ceiling"
+            );
             assert_streamed_body_charges(&ledger, loads as usize);
-            assert_eq!(arm_after.raw_candidate_point_body_bytes - arm_before.raw_candidate_point_body_bytes,
-                loads * bytes_per_f32_body as u64);
+            assert_eq!(
+                arm_after.raw_candidate_point_body_bytes
+                    - arm_before.raw_candidate_point_body_bytes,
+                loads * bytes_per_f32_body as u64
+            );
             assert_native_scores(&ordinary_scores, &ordinary_trace.final_row_ids, snapshot);
             assert!(
                 ordinary_trace.used_hnsw,
@@ -546,13 +605,16 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
             watch_budget_ledger_for_test();
             db.__reset_last_query_vector_trace_for_test();
             let bounded_scores = Arc::new(Scores::default());
-            let bounded = with_native_vector_score_observer_for_test(bounded_scores.clone(), ||
-                with_paged_vector_observer(bounded_scores.clone(), || db
-                    .__with_snapshot_override_for_test(snapshot, || {
-                        let mut request = bounded_request(&sql, query.clone());
-                        request.limits.memory = QUERY_WORKSPACE_BYTES as u64;
-                        bounded::execute(&db, &request)
-                    })))
+            let bounded =
+                with_native_vector_score_observer_for_test(bounded_scores.clone(), || {
+                    with_paged_vector_observer(bounded_scores.clone(), || {
+                        db.__with_snapshot_override_for_test(snapshot, || {
+                            let mut request = bounded_request(&sql, query.clone());
+                            request.limits.memory = QUERY_WORKSPACE_BYTES as u64;
+                            bounded::execute(&db, &request)
+                        })
+                    })
+                })
                 .unwrap_or_else(|error| {
                     panic!("bounded {mode} candidate search failed: {error:?}")
                 });
@@ -569,10 +631,16 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
             assert_score_workspace(&ledger, false);
             let arm_after = db.__vector_passive_activity_counters_for_test();
             let loads = arm_after.raw_candidate_point_loads - arm_before.raw_candidate_point_loads;
-            assert!(loads <= 20, "bounded raw rereads retain the original candidate ceiling");
+            assert!(
+                loads <= 20,
+                "bounded raw rereads retain the original candidate ceiling"
+            );
             assert_streamed_body_charges(&ledger, loads as usize);
-            assert_eq!(arm_after.raw_candidate_point_body_bytes - arm_before.raw_candidate_point_body_bytes,
-                loads * bytes_per_f32_body as u64);
+            assert_eq!(
+                arm_after.raw_candidate_point_body_bytes
+                    - arm_before.raw_candidate_point_body_bytes,
+                loads * bytes_per_f32_body as u64
+            );
             assert_native_scores(&bounded_scores, &bounded_trace.final_row_ids, snapshot);
             assert_eq!(bounded.result.rows(), ordinary.rows());
             assert!(
@@ -604,7 +672,10 @@ fn indexed_many_partition_reads_point_load_only_visible_versioned_candidates() {
     );
     assert_eq!(observed_graph_candidates, 160);
     assert_eq!(observed_unique_candidates, 160);
-    assert!(point_loads <= 160, "native page scores cannot add raw rereads beyond the original ceiling");
+    assert!(
+        point_loads <= 160,
+        "native page scores cannot add raw rereads beyond the original ceiling"
+    );
     assert!(point_loads <= observed_unique_candidates);
 
     assert_eq!(point_body_bytes, point_loads * bytes_per_f32_body as u64);
@@ -700,7 +771,12 @@ fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
 
     let activity_before = db.__vector_passive_activity_counters_for_test();
     watch_budget_ledger_for_test();
-    let streamed_exact = db.read_session(ReadLimits { memory: QUERY_WORKSPACE_BYTES as u64, ..ReadLimits::default() }).unwrap()
+    let streamed_exact = db
+        .read_session(ReadLimits {
+            memory: QUERY_WORKSPACE_BYTES as u64,
+            ..ReadLimits::default()
+        })
+        .unwrap()
         .execute(exact_sql, &query)
         .expect("EXACT streams inside the body and score workspace");
     let exact_ledger = take_budget_ledger_for_test();
@@ -709,13 +785,19 @@ fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
     assert_eq!(streamed_exact.rows(), exact.rows());
     watch_budget_ledger_for_test();
 
-    let auto = db.read_session(ReadLimits { memory: QUERY_WORKSPACE_BYTES as u64, ..ReadLimits::default() }).unwrap()
-        .execute(auto_sql, &query).unwrap_or_else(|error| {
-        panic!(
-            "the automatic exhaustive find must answer inside the declared memory by reading \
+    let auto = db
+        .read_session(ReadLimits {
+            memory: QUERY_WORKSPACE_BYTES as u64,
+            ..ReadLimits::default()
+        })
+        .unwrap()
+        .execute(auto_sql, &query)
+        .unwrap_or_else(|error| {
+            panic!(
+                "the automatic exhaustive find must answer inside the declared memory by reading \
              one stored vector at a time, not load a whole partition: {error:?}"
-        )
-    });
+            )
+        });
     let auto_ledger = take_budget_ledger_for_test();
     assert_streamed_body_charges(&auto_ledger, 1200);
     assert_score_workspace(&auto_ledger, true);
@@ -736,7 +818,11 @@ fn auto_exhaustive_find_answers_inside_memory_that_cannot_hold_a_partition() {
     let ownership = db.vector_memory_ownership_receipt_for_test();
     assert_eq!(ownership.raw_vector_bodies, 0);
     assert_eq!(ownership.temporary_workspace, 0);
-    assert_eq!(auto.rows(), exact.rows(), "the automatic route answers exactly");
+    assert_eq!(
+        auto.rows(),
+        exact.rows(),
+        "the automatic route answers exactly"
+    );
     assert_eq!(
         db.vector_store_for_test()
             .resident_raw_partition_count_for_test(),
@@ -1540,7 +1626,8 @@ fn nullable_single_column_lower_ranges_match_exact_in_both_index_directions() {
                     .expect("the directed indexed route answers");
                 let materialized = db.__candidate_derivation_counters_for_test() - before;
                 assert_eq!(
-                    indexed.result.rows(), exact.rows(),
+                    indexed.result.rows(),
+                    exact.rows(),
                     "{direction} {operator} must agree with the explicit exact oracle for {table}"
                 );
                 assert!(
@@ -1814,15 +1901,20 @@ fn auto_refuses_typed_when_the_exact_score_array_cannot_fit() {
     let query = params([("query", Value::Vector(lang_query(0)))]);
     let auto_sql = "SELECT id FROM raw_residency_items WHERE lang = 'en' \
                     ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 3";
-    let exact = db.execute(&auto_sql.replace("VECTOR AUTO", "VECTOR EXACT"), &query).unwrap();
+    let exact = db
+        .execute(&auto_sql.replace("VECTOR AUTO", "VECTOR EXACT"), &query)
+        .unwrap();
     assert_eq!(exact.rows().len(), 3);
-    let ceiling = (LANG_PARTITIONS * LANG_ROWS_PER_PARTITION)
-        * std::mem::size_of::<(RowId, f32)>() - 1;
+    let ceiling =
+        (LANG_PARTITIONS * LANG_ROWS_PER_PARTITION) * std::mem::size_of::<(RowId, f32)>() - 1;
     let writer = db.accountant().usage().used;
     db.set_memory_limit(Some(writer)).unwrap();
     let mut request = bounded_request(auto_sql, query.clone());
     request.limits.memory = ceiling as u64;
-    let ordinary = db.read_session(request.limits).unwrap().execute(auto_sql, &query)
+    let ordinary = db
+        .read_session(request.limits)
+        .unwrap()
+        .execute(auto_sql, &query)
         .expect("the actual reader can stream top three below the obsolete full-array floor");
     assert_eq!(ordinary.rows(), exact.rows());
     let bounded = bounded::execute(&db, &request)
@@ -1830,21 +1922,38 @@ fn auto_refuses_typed_when_the_exact_score_array_cannot_fit() {
     assert_eq!(bounded.result.rows(), exact.rows());
     request.limits.memory = 1;
     let refused = bounded::execute(&db, &request).unwrap_err();
-    assert!(matches!(&refused, bounded::TestError::Refused(failure)
+    assert!(
+        matches!(&refused, bounded::TestError::Refused(failure)
         if failure.kind() == ReadFailureKind::OwnerLimitExceeded
         && matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail)
-            if detail.limit == ReadFailureLimit::Memory)), "actual reader workspace refusal: {refused:?}");
+            if detail.limit == ReadFailureLimit::Memory)),
+        "actual reader workspace refusal: {refused:?}"
+    );
     request.limits.memory = ceiling as u64;
-    assert_eq!(bounded::execute(&db, &request).unwrap().result.rows(), exact.rows(),
-        "releasing the refused operation restores the same complete answer");
+    assert_eq!(
+        bounded::execute(&db, &request).unwrap().result.rows(),
+        exact.rows(),
+        "releasing the refused operation restores the same complete answer"
+    );
     let indexed_sql = auto_sql.replace("VECTOR AUTO", "VECTOR INDEXED");
     let indexed_error = db.execute(&indexed_sql, &query).unwrap_err();
-    assert!(matches!(indexed_error, Error::VectorFilteredRouteUnavailable { .. }));
-    assert_eq!(db.accountant().usage().used, writer, "reader never funds itself from the writer");
+    assert!(matches!(
+        indexed_error,
+        Error::VectorFilteredRouteUnavailable { .. }
+    ));
+    assert_eq!(
+        db.accountant().usage().used,
+        writer,
+        "reader never funds itself from the writer"
+    );
     for ordinal in 0..LANG_PARTITIONS {
         assert!(!payload_resident(&db, lang_scope(ordinal)));
     }
-    assert_eq!(db.vector_store_for_test().resident_raw_partition_count_for_test(), 0);
+    assert_eq!(
+        db.vector_store_for_test()
+            .resident_raw_partition_count_for_test(),
+        0
+    );
 }
 
 /// Each selected stored body owns 2,048 bytes from admission through decode
@@ -1857,20 +1966,43 @@ fn assert_streamed_body_charges(
     let mut count = 0;
     let mut invoice = None;
     let mut executing = None;
-    for event in ledger.iter().filter(|event| event.owner_identity != event.parent_identity) {
+    for event in ledger
+        .iter()
+        .filter(|event| event.owner_identity != event.parent_identity)
+    {
         if event.what == "vector_store/load_raw_vector_candidate" {
-            assert!(held.is_none(), "the previous admitted body must be released before the next");
-            assert!(event.row_identity.is_some(), "the storage producer records the actual selected row/version");
-            assert!(event.bytes >= MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>(), "the actual invoice covers its stored F32 body");
-            assert_eq!(*invoice.get_or_insert(event.bytes), event.bytes, "one declaration has one fixed body/decode window");
-            assert_eq!(*executing.get_or_insert(event.owner_identity), event.owner_identity, "all bodies use the actual operation child");
+            assert!(
+                held.is_none(),
+                "the previous admitted body must be released before the next"
+            );
+            assert!(
+                event.row_identity.is_some(),
+                "the storage producer records the actual selected row/version"
+            );
+            assert!(
+                event.bytes >= MANY_VECTOR_DIMENSION * std::mem::size_of::<f32>(),
+                "the actual invoice covers its stored F32 body"
+            );
+            assert_eq!(
+                *invoice.get_or_insert(event.bytes),
+                event.bytes,
+                "one declaration has one fixed body/decode window"
+            );
+            assert_eq!(
+                *executing.get_or_insert(event.owner_identity),
+                event.owner_identity,
+                "all bodies use the actual operation child"
+            );
             held = Some((event.owner_identity, event.bytes));
             count += 1;
         } else if event.what == "release" && held == Some((event.owner_identity, event.bytes)) {
             held = None;
         }
     }
-    assert!(held.is_none(), "the last body returns its complete actual invoice");
+    assert!(
+        held.is_none(),
+        "the last body returns its complete actual invoice"
+    );
     assert_eq!(count, expected_bodies, "actual producer body count");
 }
 
@@ -1878,15 +2010,33 @@ fn assert_score_workspace(
     ledger: &[contextdb_engine::memory_accounting::BudgetLedgerEntry],
     _ordinary: bool,
 ) {
-    let ranking = ledger.iter().filter(|event| event.owner_identity != event.parent_identity
-        && event.what == "bounded_read/read/rank_candidates").collect::<Vec<_>>();
-    assert_eq!(ranking.len(), 1, "the fixed top-two rank buffer allocates once");
+    let ranking = ledger
+        .iter()
+        .filter(|event| {
+            event.owner_identity != event.parent_identity
+                && event.what == "bounded_read/read/rank_candidates"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ranking.len(),
+        1,
+        "the fixed top-two rank buffer allocates once"
+    );
     let event = ranking[0];
-    let (pointer, capacity, element_bytes) = event.allocation.expect("actual native rank Vec allocation observed at its producer");
+    let (pointer, capacity, element_bytes) = event
+        .allocation
+        .expect("actual native rank Vec allocation observed at its producer");
     assert_ne!(pointer, 0);
     assert!(capacity >= 2);
-    assert_eq!(event.bytes, capacity * element_bytes, "the actual native rank capacity is fully admitted");
-    assert!(ledger.iter().any(|release| release.what == "release"
-        && release.owner_identity == event.owner_identity && release.bytes == event.bytes),
-        "the same executing child receives the complete actual rank-container refund");
+    assert_eq!(
+        event.bytes,
+        capacity * element_bytes,
+        "the actual native rank capacity is fully admitted"
+    );
+    assert!(
+        ledger.iter().any(|release| release.what == "release"
+            && release.owner_identity == event.owner_identity
+            && release.bytes == event.bytes),
+        "the same executing child receives the complete actual rank-container refund"
+    );
 }

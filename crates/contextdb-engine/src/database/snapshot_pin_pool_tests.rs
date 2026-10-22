@@ -44,7 +44,8 @@ fn distinct_snapshot_pins_refuse_one_past_capacity_without_disturbing_live_pins(
     // Exhaust the reader budget as well as the prepaid slots. The pool is
     // a fast path; only a memory shortage may refuse an overflow pin.
     db.declared_read_memory =
-        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(pool.slot_bytes as u64).expect("admit the declared fixture root");
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(pool.slot_bytes as u64)
+            .expect("admit the declared fixture root");
     let _held_reader = contextdb_core::read_memory::ReadCredit::try_new(
         db.declared_read_memory.original_owner(),
         pool.slot_bytes,
@@ -100,7 +101,8 @@ fn overflow_pins_spend_reader_memory_and_refuse_without_changing_committed_state
     // Exactly two overflow registrations fit; there is no count ceiling.
     db.declared_read_memory = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
         (2 * pool.slot_bytes) as u64,
-    ).expect("admit the declared fixture root");
+    )
+    .expect("admit the declared fixture root");
     let pins = (0..pool.slots)
         .map(|_| db.pin_snapshot(snapshot).unwrap())
         .collect::<Vec<_>>();

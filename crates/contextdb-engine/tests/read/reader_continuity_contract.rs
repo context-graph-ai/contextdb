@@ -578,7 +578,11 @@ fn a_file_reader_keeps_its_snapshot_after_a_writer_takes_the_store() {
     });
     let witness = reader.file_memory_for_test().unwrap().3;
     drop(reader);
-    assert!(!witness.is_alive() && witness.is_physically_freed() && witness.accountant_is_physically_freed());
+    assert!(
+        !witness.is_alive()
+            && witness.is_physically_freed()
+            && witness.accountant_is_physically_freed()
+    );
     let latest = fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()));
     assert_ne!(latest.file_snapshot_for_test(), Some(snapshot));
     assert_eq!(
@@ -623,8 +627,8 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
     };
     let before_indexed = {
         let fixture_answer_26 = baseline
-        .execute(&SQL.replace("AUTO", "INDEXED"), &q())
-        .unwrap();
+            .execute(&SQL.replace("AUTO", "INDEXED"), &q())
+            .unwrap();
         fixture_answer_26.rows().to_vec()
     };
     drop(baseline);
@@ -676,7 +680,8 @@ fn lazy_generation_load_beside_a_writer_keeps_serving() {
             &before_indexed
         };
         assert_eq!(
-            &answer.rows(), expected,
+            &answer.rows(),
+            expected,
             "the identical query on the original snapshot retains its answer"
         );
         assert_eq!(
@@ -739,7 +744,11 @@ fn read_journey(reader: &ReadSession) -> (Vec<Vec<Value>>, Vec<Vec<Value>>, Vec<
         .execute("SHOW VECTOR_INDEXES", &HashMap::new())
         .unwrap();
     assert!(!find.rows().is_empty() && !show.rows().is_empty() && !status.rows().is_empty());
-    (find.rows().to_vec(), show.rows().to_vec(), status.rows().to_vec())
+    (
+        find.rows().to_vec(),
+        show.rows().to_vec(),
+        status.rows().to_vec(),
+    )
 }
 #[test]
 fn schema_replay_does_not_interrupt_active_readers() {
@@ -916,8 +925,8 @@ fn an_owner_query_keeps_its_registered_snapshot_while_the_writer_commits() {
     let baseline = fixture::open_file(&path, roomy(), Arc::new(fixture::Routes::default()));
     let expected = {
         let fixture_answer_28 = baseline
-        .execute(&SQL.replace("AUTO", "EXACT"), &q())
-        .unwrap();
+            .execute(&SQL.replace("AUTO", "EXACT"), &q())
+            .unwrap();
         fixture_answer_28.rows().to_vec()
     };
     drop(baseline);

@@ -278,7 +278,9 @@ fn fresh_snapshot_pin_does_not_borrow_an_older_readers_root() {
     db.execute("INSERT INTO items VALUES (1, 'original')", &HashMap::new())
         .unwrap();
     let snapshot = db.snapshot();
-    let older_pin = db.pin_snapshot(snapshot).expect("first reader captures root");
+    let older_pin = db
+        .pin_snapshot(snapshot)
+        .expect("first reader captures root");
     let older_root = older_pin._root.as_ref().expect("durable first reader");
     let older_identity = older_root.storage_identity();
 
@@ -334,7 +336,6 @@ fn fresh_snapshot_pin_does_not_borrow_an_older_readers_root() {
     assert!(db.snapshot_registry.state.lock().active.is_empty());
 }
 
-
 // Historical vector authenticity is a different criterion from relational pin
 // registration: an internally consistent physical fingerprint cannot substitute
 // for authenticating selected placement companions and their global controls.
@@ -386,7 +387,11 @@ fn historical_vector_queries_refuse_damaged_companions_in_the_selected_root() {
         cases.push(("__content_identity_metadata", None, damage, false));
     }
 
-    assert_eq!(cases.len(), 34, "every original companion-damage row remains covered");
+    assert_eq!(
+        cases.len(),
+        34,
+        "every original companion-damage row remains covered"
+    );
     for (table_name, fingerprint_key, damage, rebind) in cases {
         let case = format!("{table_name}/{damage}/rebind={rebind}");
         let dir = tempfile::tempdir().unwrap();
@@ -429,11 +434,20 @@ fn historical_vector_queries_refuse_damaged_companions_in_the_selected_root() {
                 Some(successor.clone()),
                 db.declared_reader_memory().unwrap(),
             );
-            let answer = db.execute_at_snapshot(sql, &HashMap::new(), historical).unwrap();
+            let answer = db
+                .execute_at_snapshot(sql, &HashMap::new(), historical)
+                .unwrap();
             assert_eq!(answer.rows(), expected, "healthy successor: {case}");
-            let route = answer.trace().vector_search.as_ref()
+            let route = answer
+                .trace()
+                .vector_search
+                .as_ref()
                 .expect("the healthy control must execute the vector consumer");
-            assert_eq!(route.route_evidence, VectorSearchRouteEvidence::Executed, "{case}");
+            assert_eq!(
+                route.route_evidence,
+                VectorSearchRouteEvidence::Executed,
+                "{case}"
+            );
             assert_eq!(route.route, Some(VectorSearchRoute::Exact), "{case}");
         }
         let persistence = db.persistence.as_ref().unwrap();

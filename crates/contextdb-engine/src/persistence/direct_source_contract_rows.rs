@@ -599,17 +599,30 @@ fn direct_session_source_constructor_refusals_and_native_nulls_leave_no_original
         let observation = Observation::begin();
         PANIC_INVOICE.set(Some(target));
         let failed = open(&path, LIMIT);
-        assert!(failed.is_err(), "the production native-open boundary catches constructor unwind");
+        assert!(
+            failed.is_err(),
+            "the production native-open boundary catches constructor unwind"
+        );
         drop(failed);
         assert_eq!(INVOICE_COUNT.get(), target + 1);
-        assert!(CUTS.get()[1].count >= target + 1,
-            "P and the earlier actual cache counters allocated before constructor unwind");
-        assert_eq!(observation.owner().usage().used, 0,
-            "caught native constructor unwind returns the original source invoices");
+        assert!(
+            CUTS.get()[1].count >= target + 1,
+            "P and the earlier actual cache counters allocated before constructor unwind"
+        );
+        assert_eq!(
+            observation.owner().usage().used,
+            0,
+            "caught native constructor unwind returns the original source invoices"
+        );
         drop(observation);
         let retry = open(&path, LIMIT).unwrap();
-        assert_eq!(retry.execute("SELECT COUNT(*) FROM source_rows", &HashMap::new()).unwrap().rows(),
-            vec![vec![Value::Int64(2)]]);
+        assert_eq!(
+            retry
+                .execute("SELECT COUNT(*) FROM source_rows", &HashMap::new())
+                .unwrap()
+                .rows(),
+            vec![vec![Value::Int64(2)]]
+        );
         drop(retry);
     }
     for request in std::iter::once(source.source_control)

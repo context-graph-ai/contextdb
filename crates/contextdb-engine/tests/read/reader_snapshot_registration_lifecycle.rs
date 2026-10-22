@@ -617,7 +617,8 @@ fn read_rows(session: &ReadSession) -> Vec<Vec<contextdb_core::Value>> {
     session
         .execute("SELECT value FROM items ORDER BY id", &HashMap::new())
         .expect("the reader answers")
-        .rows().to_vec()
+        .rows()
+        .to_vec()
 }
 
 #[test]
@@ -696,7 +697,9 @@ fn last_reader_close_race_child() {
     let mut departure = leave_park.as_ref().map(|park| {
         let leaving = departing.take();
         let thread = std::thread::spawn(move || drop(leaving));
-        park.parked.recv().expect("real leave owns the stable root serializer");
+        park.parked
+            .recv()
+            .expect("real leave owns the stable root serializer");
         thread
     });
     let (join_waiting, join_wait_seen) = mpsc::channel();
@@ -723,10 +726,20 @@ fn last_reader_close_race_child() {
     });
 
     if let Some(park) = &leave_park {
-        join_wait_seen.recv().expect("join reaches its blocking root flock after pinning its data root");
-        assert_eq!(pause.attempts_for_test(), 0, "join cannot open a registry under the leaving serializer");
+        join_wait_seen
+            .recv()
+            .expect("join reaches its blocking root flock after pinning its data root");
+        assert_eq!(
+            pause.attempts_for_test(),
+            0,
+            "join cannot open a registry under the leaving serializer"
+        );
         park.resume.send(()).expect("release the real last leave");
-        departure.take().unwrap().join().expect("leave completes before join publication");
+        departure
+            .take()
+            .unwrap()
+            .join()
+            .expect("leave completes before join publication");
     }
     assert!(pause.wait_for_attempt_for_test(1, std::time::Duration::from_secs(30)));
     // Joining owns the stable runtime root before opening its registry
@@ -751,7 +764,9 @@ fn last_reader_close_race_child() {
         .recv()
         .expect("the arriving reader reports")
         .expect("teardown must not reject a reader opening a healthy store");
-    arrival_thread.join().expect("the arriving reader thread joins");
+    arrival_thread
+        .join()
+        .expect("the arriving reader thread joins");
     if let Some(departure) = departure {
         departure.join().expect("the old reader finishes leaving");
     }
@@ -779,7 +794,10 @@ fn last_reader_close_race_child() {
             assert_eq!(read_rows(&passing), original_rows());
             drop(passing);
             assert!(registry_directory.is_dir());
-            let expected_handle = arriving.file_storage_registration_for_test().unwrap().handle_identity;
+            let expected_handle = arriving
+                .file_storage_registration_for_test()
+                .unwrap()
+                .handle_identity;
             let (writer, observed) = captured_writer_registry(&path);
             assert!(matches!(observed,
                 WriterReaderSnapshotRegistryObservation::Complete(ref records)

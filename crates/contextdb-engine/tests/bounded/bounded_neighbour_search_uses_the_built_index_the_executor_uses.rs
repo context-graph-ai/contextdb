@@ -190,7 +190,9 @@ fn insert_documents(database: &Database) {
 fn described(result: &QueryResult) -> String {
     format!(
         "plan={:?} index_used={:?} rows={:?}",
-        result.trace().physical_plan, result.trace().index_used, result.rows()
+        result.trace().physical_plan,
+        result.trace().index_used,
+        result.rows()
     )
 }
 

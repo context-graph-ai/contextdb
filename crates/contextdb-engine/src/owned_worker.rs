@@ -77,7 +77,10 @@ mod native {
             crate::memory_accounting::refund_open_residue(bytes);
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn ensure_finisher() -> Result<()> {
         let mut finisher = FINISHER.lock().unwrap_or_else(|p| p.into_inner());
         if finisher.is_some() {
@@ -176,7 +179,10 @@ mod native {
         }
     }
     impl OwnedWorker {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         pub(crate) fn spawn<F: FnOnce() + Send + 'static>(
             owner: ReadMemoryOwner,
             run: F,
@@ -185,7 +191,10 @@ mod native {
         }
         // Only ensure_finisher uses the nonrecursive bootstrap path while
         // holding FINISHER. All other workers require its live lease.
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn spawn_inner<F: FnOnce() + Send + 'static>(
             owner: ReadMemoryOwner,
             run: F,
@@ -240,10 +249,7 @@ mod native {
                         .unwrap_or(libc::EIO),
                 ));
             }
-            let stack = Stack {
-                address,
-                bytes,
-            };
+            let stack = Stack { address, bytes };
             if unsafe { libc::mprotect(address, page, libc::PROT_NONE) } != 0 {
                 return Err(os_error(
                     std::io::Error::last_os_error()
@@ -365,32 +371,56 @@ mod native {
         use super::*;
         use crate::memory_accounting::MemoryAccountant;
         use crate::persistence::content_identity::proof_allocation_oracle_tests as physical;
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
 
         static PHASE: AtomicUsize = AtomicUsize::new(0);
         static STACK_PAGE: AtomicUsize = AtomicUsize::new(0);
         static ENTERED: AtomicUsize = AtomicUsize::new(0);
-        fn page_bytes() -> usize { unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize } }
+        fn page_bytes() -> usize {
+            unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+        }
         fn worker_body() {
             let marker = 0_u8;
             let page = page_bytes();
-            STACK_PAGE.store((&marker as *const u8 as usize) / page * page, Ordering::Release);
+            STACK_PAGE.store(
+                (&marker as *const u8 as usize) / page * page,
+                Ordering::Release,
+            );
             ENTERED.fetch_add(1, Ordering::SeqCst);
             PHASE.store(1, Ordering::Release);
-            while PHASE.load(Ordering::Acquire) == 1 { std::hint::spin_loop(); }
-            if PHASE.load(Ordering::Acquire) == 3 { panic!("application test callback unwinds"); }
+            while PHASE.load(Ordering::Acquire) == 1 {
+                std::hint::spin_loop();
+            }
+            if PHASE.load(Ordering::Acquire) == 3 {
+                panic!("application test callback unwinds");
+            }
             std::hint::black_box(marker);
         }
-        fn threads() -> usize { std::fs::read_dir("/proc/self/task").unwrap().count() }
+        fn threads() -> usize {
+            std::fs::read_dir("/proc/self/task").unwrap().count()
+        }
         fn unmapped(address: usize) -> bool {
             let mut residency = 0_u8;
-            let rc = unsafe { libc::mincore(address as *mut libc::c_void, page_bytes(), &mut residency) };
+            let rc = unsafe {
+                libc::mincore(address as *mut libc::c_void, page_bytes(), &mut residency)
+            };
             rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM)
         }
         struct ReleaseBody;
-        impl Drop for ReleaseBody { fn drop(&mut self) { PHASE.store(2, Ordering::Release); } }
+        impl Drop for ReleaseBody {
+            fn drop(&mut self) {
+                PHASE.store(2, Ordering::Release);
+            }
+        }
         struct FreeWatch;
-        impl Drop for FreeWatch { fn drop(&mut self) { physical::disarm_source_free_watch(); } }
+        impl Drop for FreeWatch {
+            fn drop(&mut self) {
+                physical::disarm_source_free_watch();
+            }
+        }
 
         // Promise: engine closure/handoff data stays paid through physical
         // free; intrinsic stacks belong to the whole-process limit. A data
@@ -408,13 +438,21 @@ mod native {
                 let error = match OwnedWorker::spawn(actual.clone().into(), worker_body as fn()) {
                     Err(error) => error,
                     Ok(worker) => {
-                        while PHASE.load(Ordering::Acquire) != 1 { std::thread::yield_now(); }
+                        while PHASE.load(Ordering::Acquire) != 1 {
+                            std::thread::yield_now();
+                        }
                         PHASE.store(2, Ordering::Release);
                         drop(worker);
                         panic!("the original under-limit owner must refuse worker startup");
                     }
                 };
-                let Error::MemoryBudgetExceeded { operation, requested_bytes, budget_limit_bytes, .. } = error else {
+                let Error::MemoryBudgetExceeded {
+                    operation,
+                    requested_bytes,
+                    budget_limit_bytes,
+                    ..
+                } = error
+                else {
                     panic!("startup denial must preserve the original memory refusal: {error:?}");
                 };
                 assert_eq!(operation.to_string(), "worker_control");
@@ -439,26 +477,48 @@ mod native {
                 // Exactly the engine body budget admits startup: no intrinsic
                 // mapped stack, thread control block or TLS charge is allowed.
                 let payer = Arc::new(MemoryAccountant::with_budget(control.size()));
-                let counter = crate::memory_accounting::AccountantHandle::from_host(payer.clone()).used_counter_for_observation();
-                let (worker, requests, count) = physical::source_requests_for_test(counter, || OwnedWorker::spawn(payer.clone().into(), worker_body as fn()));
+                let counter = crate::memory_accounting::AccountantHandle::from_host(payer.clone())
+                    .used_counter_for_observation();
+                let (worker, requests, count) = physical::source_requests_for_test(counter, || {
+                    OwnedWorker::spawn(payer.clone().into(), worker_body as fn())
+                });
                 let worker = worker.unwrap();
-                while PHASE.load(Ordering::Acquire) != 1 { std::thread::yield_now(); }
+                while PHASE.load(Ordering::Acquire) != 1 {
+                    std::thread::yield_now();
+                }
                 let _release = ReleaseBody;
                 assert_eq!(threads(), warm + 1);
                 assert_eq!(payer.usage().used, control.size());
                 assert!(!unmapped(STACK_PAGE.load(Ordering::Acquire)));
-                let request = requests[..count].iter().copied().find(|(pointer, bytes, align)|
-                    *bytes == control.size() && *align == control.align()
-                        && *pointer <= worker.body as usize && (worker.body as usize) < *pointer + *bytes)
+                let request = requests[..count]
+                    .iter()
+                    .copied()
+                    .find(|(pointer, bytes, align)| {
+                        *bytes == control.size()
+                            && *align == control.align()
+                            && *pointer <= worker.body as usize
+                            && (worker.body as usize) < *pointer + *bytes
+                    })
                     .expect("actual original control allocation containing the worker body");
                 physical::watch_source_free_for_test(&[request], counter);
                 let watch = FreeWatch;
                 PHASE.store(if ending == "unwind" { 3 } else { 2 }, Ordering::Release);
-                if ending == "drop" { drop(worker); } else { assert_eq!(worker.join().is_err(), ending == "unwind"); }
+                if ending == "drop" {
+                    drop(worker);
+                } else {
+                    assert_eq!(worker.join().is_err(), ending == "unwind");
+                }
                 let free = physical::source_free_for_test(1)[0];
                 assert_eq!(free.2, 1, "original body allocation physically freed once");
-                assert_eq!(free.0, control.size(), "engine body invoice at free entry; intrinsic stack is process-accounted");
-                assert_eq!(free.1, free.0, "body invoice remains paid through actual System.dealloc");
+                assert_eq!(
+                    free.0,
+                    control.size(),
+                    "engine body invoice at free entry; intrinsic stack is process-accounted"
+                );
+                assert_eq!(
+                    free.1, free.0,
+                    "body invoice remains paid through actual System.dealloc"
+                );
                 assert!(unmapped(STACK_PAGE.load(Ordering::Acquire)));
                 assert_eq!(payer.usage().used, 0);
                 assert_eq!(threads(), warm);

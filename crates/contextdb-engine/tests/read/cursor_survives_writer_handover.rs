@@ -1229,7 +1229,9 @@ pub(crate) mod append_heap_oracle {
                 let counters = unsafe { Arc::from_raw(header.counters) };
                 counters.live.fetch_sub(layout.size(), Ordering::SeqCst);
             }
-            let physical = contextdb_engine::read_work_probe::allocator_events::before_dealloc(pointer, layout);
+            let physical = contextdb_engine::read_work_probe::allocator_events::before_dealloc(
+                pointer, layout,
+            );
             unsafe { System.dealloc(pointer.sub(offset), allocation) };
             contextdb_engine::read_work_probe::allocator_events::after_dealloc(physical);
         }

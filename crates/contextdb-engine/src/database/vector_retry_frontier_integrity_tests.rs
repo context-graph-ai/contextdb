@@ -381,7 +381,9 @@ fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_pr
     assert_eq!(retry.vector.built_partitions, 1, "{retry:?}");
     assert!(retry.vector.first_failure.is_none(), "{retry:?}");
     assert_eq!(
-        db.execute(&query("INDEXED"), &HashMap::new()).unwrap().rows(),
+        db.execute(&query("INDEXED"), &HashMap::new())
+            .unwrap()
+            .rows(),
         exact.rows()
     );
     assert_eq!(

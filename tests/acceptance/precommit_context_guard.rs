@@ -152,7 +152,8 @@ fn t4_03_update_other_context_rejected() {
         .execute("UPDATE memos SET body = $body WHERE id = $id", &p)
         .unwrap();
     assert_eq!(
-        result.rows_affected(), 0,
+        result.rows_affected(),
+        0,
         "UPDATE predicate targeting a hidden ctx-b row must behave as no visible match"
     );
     drop(scoped);
@@ -188,7 +189,8 @@ fn t4_04_delete_other_context_rejected() {
         )
         .unwrap();
     assert_eq!(
-        result.rows_affected(), 0,
+        result.rows_affected(),
+        0,
         "DELETE predicate targeting a hidden ctx-b row must behave as no visible match"
     );
     drop(scoped);

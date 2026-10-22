@@ -818,7 +818,11 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
             indexes.columns()
         );
     }
-    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let dim_idx = indexes
         .columns()
         .iter()
@@ -1072,7 +1076,11 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
     let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let quant_idx = indexes
         .columns()
         .iter()
@@ -1295,7 +1303,11 @@ fn f113b_sq8_cross_batch_recall_stability() {
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
     let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let quant_idx = indexes
         .columns()
         .iter()
@@ -1467,7 +1479,11 @@ fn f113c_sq4_cross_batch_recall_stability() {
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
     let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let quant_idx = indexes
         .columns()
         .iter()

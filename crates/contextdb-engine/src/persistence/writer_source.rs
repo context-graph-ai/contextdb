@@ -5,7 +5,10 @@ use crate::memory_accounting::{ContainedMemoryReservation, OwnedMemoryReservatio
 use crate::read_image_memory::ImageMemory;
 use std::ops::Bound;
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_window_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     let owner = crate::read_image_memory::active_owner()?;
@@ -15,7 +18,8 @@ fn decode_window_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T
         drop(value);
         owner.release(owner.held() - before);
         return Err(Error::Other(
-            "writer cursor record has trailing bytes".into()));
+            "writer cursor record has trailing bytes".into(),
+        ));
     }
     Ok(value)
 }
@@ -33,47 +37,80 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-
 #[derive(Clone, Debug)]
 pub(crate) struct WriterSnapshotHandle(contextdb_tx::native_capture::CaptureHandle);
 #[derive(Clone, Default)]
 pub(crate) struct WriterSnapshotWeak(contextdb_tx::native_capture::CaptureWeak);
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn from_capture(handle: contextdb_tx::native_capture::CaptureHandle) -> Result<Self> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn from_capture(
+        handle: contextdb_tx::native_capture::CaptureHandle,
+    ) -> Result<Self> {
         if handle.downcast_ref::<WriterSnapshot>().is_none() {
-            return Err(Error::Other("writer publication has an invalid durable root".into()));
+            return Err(Error::Other(
+                "writer publication has an invalid durable root".into(),
+            ));
         }
         Ok(Self(handle))
     }
-    pub(crate) fn into_capture(self) -> contextdb_tx::native_capture::CaptureHandle { self.0 }
+    pub(crate) fn into_capture(self) -> contextdb_tx::native_capture::CaptureHandle {
+        self.0
+    }
     pub(crate) fn into_native(self) -> contextdb_tx::native_capture::NativeCapture {
-        match self.0 { contextdb_tx::native_capture::CaptureHandle::Native(root) => root,
-            _ => panic!("Native publication requires its paired producer") }
+        match self.0 {
+            contextdb_tx::native_capture::CaptureHandle::Native(root) => root,
+            _ => panic!("Native publication requires its paired producer"),
+        }
     }
     pub(crate) fn into_legacy(self) -> Arc<WriterSnapshot> {
-        match self.0 { contextdb_tx::native_capture::CaptureHandle::Legacy(root) =>
-            root.downcast().unwrap_or_else(|_| unreachable!("typed Legacy root")),
-            _ => panic!("Native root cannot cross the Legacy publication door") }
+        match self.0 {
+            contextdb_tx::native_capture::CaptureHandle::Legacy(root) => root
+                .downcast()
+                .unwrap_or_else(|_| unreachable!("typed Legacy root")),
+            _ => panic!("Native root cannot cross the Legacy publication door"),
+        }
     }
     fn native(body: WriterSnapshot, credit: OwnedMemoryReservation) -> Self {
         let bytes = credit.bytes();
         Self(contextdb_tx::native_capture::CaptureHandle::Native(
-            contextdb_tx::native_capture::NativeCapture::from_prepaid(body, credit, bytes)))
+            contextdb_tx::native_capture::NativeCapture::from_prepaid(body, credit, bytes),
+        ))
     }
-    pub(crate) fn downgrade(&self) -> WriterSnapshotWeak { WriterSnapshotWeak(self.0.downgrade()) }
-    pub(crate) fn ptr_eq(&self, other: &Self) -> bool { self.0.ptr_eq(&other.0) }
+    pub(crate) fn downgrade(&self) -> WriterSnapshotWeak {
+        WriterSnapshotWeak(self.0.downgrade())
+    }
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn control_bytes(&self) -> usize {
-        self.descriptor_control_bytes().saturating_add(self.schema._memory.bytes())
-            .saturating_add(self.schema.tables.values().map(|owned| owned._memory.bytes()).sum::<usize>())
-            .saturating_add(self.erasure.read()._memory.as_ref().map_or(0, ContainedMemoryReservation::bytes))
+        self.descriptor_control_bytes()
+            .saturating_add(self.schema._memory.bytes())
+            .saturating_add(
+                self.schema
+                    .tables
+                    .values()
+                    .map(|owned| owned._memory.bytes())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.erasure
+                    .read()
+                    ._memory
+                    .as_ref()
+                    .map_or(0, ContainedMemoryReservation::bytes),
+            )
     }
 
     #[cfg(any(test, feature = "test-seams"))]
     pub(crate) fn descriptor_control_bytes(&self) -> usize {
-        match &self.0 { contextdb_tx::native_capture::CaptureHandle::Native(root) => root.retained_bytes(),
-            contextdb_tx::native_capture::CaptureHandle::Legacy(_) => self._control.bytes() }
+        match &self.0 {
+            contextdb_tx::native_capture::CaptureHandle::Native(root) => root.retained_bytes(),
+            contextdb_tx::native_capture::CaptureHandle::Legacy(_) => self._control.bytes(),
+        }
     }
 }
 impl From<Arc<WriterSnapshot>> for WriterSnapshotHandle {
@@ -83,21 +120,35 @@ impl From<Arc<WriterSnapshot>> for WriterSnapshotHandle {
 }
 impl std::ops::Deref for WriterSnapshotHandle {
     type Target = WriterSnapshot;
-    fn deref(&self) -> &WriterSnapshot { self.0.downcast_ref().expect("typed snapshot handle") }
+    fn deref(&self) -> &WriterSnapshot {
+        self.0.downcast_ref().expect("typed snapshot handle")
+    }
 }
 impl WriterSnapshotWeak {
-    pub(crate) fn is_registered(&self) -> bool { !self.as_ptr().is_null() }
+    pub(crate) fn is_registered(&self) -> bool {
+        !self.as_ptr().is_null()
+    }
     pub(crate) fn upgrade(&self) -> Option<WriterSnapshotHandle> {
         self.0.upgrade().map(WriterSnapshotHandle)
     }
-    pub(crate) fn strong_count(&self) -> usize { self.0.strong_count() }
-    fn as_ptr(&self) -> *const WriterSnapshot { self.0.data_ptr().cast() }
+    pub(crate) fn strong_count(&self) -> usize {
+        self.0.strong_count()
+    }
+    fn as_ptr(&self) -> *const WriterSnapshot {
+        self.0.data_ptr().cast()
+    }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn native_snapshot_control_bytes() -> Result<usize> {
-    contextdb_tx::native_capture::NativeCapture::allocation_bytes::<WriterSnapshot, OwnedMemoryReservation>()
-        .ok_or_else(|| Error::Other("writer publication control size overflow".into()))
+    contextdb_tx::native_capture::NativeCapture::allocation_bytes::<
+        WriterSnapshot,
+        OwnedMemoryReservation,
+    >()
+    .ok_or_else(|| Error::Other("writer publication control size overflow".into()))
 }
 
 /// An admitted durable descriptor prepared before the transaction manager's
@@ -120,12 +171,18 @@ pub(crate) struct WriterSnapshot {
 // descriptors leave this empty; their external invoice precedes allocation.
 struct WriterSnapshotControl(std::sync::OnceLock<ContainedMemoryReservation>);
 impl WriterSnapshotControl {
-    fn empty() -> Self { Self(std::sync::OnceLock::new()) }
+    fn empty() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
     fn from_owned(control: OwnedMemoryReservation) -> Self {
-        Self(std::sync::OnceLock::from(ContainedMemoryReservation::from_owned(control)))
+        Self(std::sync::OnceLock::from(
+            ContainedMemoryReservation::from_owned(control),
+        ))
     }
     #[cfg(any(test, feature = "test-seams"))]
-    fn bytes(&self) -> usize { self.0.get().map_or(0, ContainedMemoryReservation::bytes) }
+    fn bytes(&self) -> usize {
+        self.0.get().map_or(0, ContainedMemoryReservation::bytes)
+    }
 }
 
 pub(crate) struct PreparedWriterSnapshot {
@@ -137,7 +194,9 @@ impl PreparedWriterSnapshot {
         // durable. The external invoice is already owned by the paired handle.
         // These moves have no allocation, provider or storage call.
         *self.root.read.write() = Some(read);
-        self.root.active.store(true, std::sync::atomic::Ordering::Release);
+        self.root
+            .active
+            .store(true, std::sync::atomic::Ordering::Release);
         self.root
     }
 }
@@ -156,24 +215,44 @@ struct WriterTableMeta {
 }
 
 impl WriterSnapshot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn require_working_store(&self, store: &RedbPersistence) -> Result<()> {
         if !Arc::ptr_eq(&self.registry, &store.writer_snapshots) {
-            return Err(Error::Other("working source root belongs to another persistence owner".into()));
+            return Err(Error::Other(
+                "working source root belongs to another persistence owner".into(),
+            ));
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn check_working_graph_key(&self, key: &[u8], reverse: bool) -> Result<()> {
         drop(self.owner_read()?);
-        self.erasure.read().check_key(if reverse { GRAPH_REV_TABLE.name() } else { GRAPH_FWD_TABLE.name() }, key)
+        self.erasure.read().check_key(
+            if reverse {
+                GRAPH_REV_TABLE.name()
+            } else {
+                GRAPH_FWD_TABLE.name()
+            },
+            key,
+        )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn check_working_scope(&self,table:&str)->Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn check_working_scope(&self, table: &str) -> Result<()> {
         // Reuse the captured resource/cancellation and erasure fence without
         // asking its old declaration to describe newly created private data.
         drop(self.owner_read()?);
-        self.erasure.read().check_scope(Some(table),"received working table")
+        self.erasure
+            .read()
+            .check_scope(Some(table), "received working table")
     }
     /// Whether this captured root carried a complete custody group index.
     pub(crate) fn custody_groups_complete(&self) -> bool {
@@ -182,7 +261,9 @@ impl WriterSnapshot {
     /// Whether an authoritative erasure invalidated part of this captured view.
     pub(crate) fn erased(&self) -> bool {
         let erasure = self.erasure.read();
-        !erasure.tables.is_empty() || !erasure.graph_keys.is_empty() || erasure.graph_spool.is_some()
+        !erasure.tables.is_empty()
+            || !erasure.graph_keys.is_empty()
+            || erasure.graph_spool.is_some()
     }
     pub(super) fn internal_source_owner(&self) -> SourceWindowOwner {
         SourceWindowOwner::Write(
@@ -191,7 +272,10 @@ impl WriterSnapshot {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn row_body_bytes(
         &self,
         owner: &SourceWindowOwner,
@@ -212,7 +296,13 @@ impl WriterSnapshot {
             .get(key.as_slice())
             .map_err(RedbPersistence::storage_error)?
             .map(|value| value.value().len())
-            .ok_or_else(|| crate::funded_error::corruption_text(owner.diagnostic_budget(), table, "selected saved row is missing".into()))
+            .ok_or_else(|| {
+                crate::funded_error::corruption_text(
+                    owner.diagnostic_budget(),
+                    table,
+                    "selected saved row is missing".into(),
+                )
+            })
     }
 
     pub(crate) fn captured_table_meta(&self, table: &str) -> Option<TableMeta> {
@@ -229,7 +319,9 @@ impl WriterSnapshot {
         names
     }
 
-    pub(crate) fn captured_table_metadata(&self) -> impl ExactSizeIterator<Item = (&str, &TableMeta)> {
+    pub(crate) fn captured_table_metadata(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&str, &TableMeta)> {
         self.schema
             .tables
             .iter()
@@ -258,9 +350,14 @@ struct WriterErasure {
     _memory: Option<ContainedMemoryReservation>,
 }
 
-pub(crate) struct PreparedWriterErasure(Vec<(WriterSnapshotHandle, WriterErasure)>, Option<OwnedMemoryReservation>);
+pub(crate) struct PreparedWriterErasure(
+    Vec<(WriterSnapshotHandle, WriterErasure)>,
+    Option<OwnedMemoryReservation>,
+);
 impl PreparedWriterErasure {
-    fn retain_original_control(&mut self, memory: OwnedMemoryReservation) { self.1 = Some(memory); }
+    fn retain_original_control(&mut self, memory: OwnedMemoryReservation) {
+        self.1 = Some(memory);
+    }
     pub(crate) fn publish(self) {
         for (root, erasure) in self.0 {
             *root.erasure.write() = erasure;
@@ -275,7 +372,10 @@ impl RedbPersistence {
     /// operator once declared a limit below this floor, with no way back in
     /// to raise it. The limit sees the bytes, and the ordinary typed refusal
     /// fires on the next admission (the same rule as the writer page cache).
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepared_writer_schema(&self) -> Result<Arc<WriterSchema>> {
         if let Some(schema) = self.writer_schema.lock().as_ref().cloned() {
             return Ok(schema);
@@ -339,7 +439,10 @@ impl RedbPersistence {
 
     /// The caller supplies exactly the metadata its write transaction installs.
     /// This preparation can refuse; it occurs before opening that transaction.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_writer_schema_change<'a>(
         &self,
         removed: impl Iterator<Item = &'a str>,
@@ -407,7 +510,10 @@ impl RedbPersistence {
     /// The local policy publisher lends its Original explicitly. Unchanged
     /// table bodies share their old paid Arcs; the successor map and changed
     /// body each keep independent credit through their last captured reader.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_writer_policy_schema_change(
         &self,
         original: &OwnedMemoryReservation,
@@ -475,7 +581,10 @@ impl RedbPersistence {
     }
     /// Prepare capability restrictions before durability. Old descriptors retain
     /// their native image, but cannot decode erased families after publication.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_writer_erasure(
         &self,
         writer: crate::memory_accounting::AccountantHandle,
@@ -541,12 +650,17 @@ impl RedbPersistence {
         Ok(PreparedWriterErasure(replacements, None))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn prepare_original_discard_writer_erasure(&self,
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn prepare_original_discard_writer_erasure(
+        &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
-        tables: &BTreeSet<String>, history: &super::discard_history::OriginalDiscardHistory,
+        tables: &BTreeSet<String>,
+        history: &super::discard_history::OriginalDiscardHistory,
     ) -> Result<PreparedWriterErasure> {
-        use super::discard_history::{self, FrozenGraphErasure, FENCE_KEYS};
+        use super::discard_history::{self, FENCE_KEYS, FrozenGraphErasure};
         let frame = OriginalPersistenceFrame::new(original)?;
         // Admission can reclaim memory: never run it under the registry
         // mutex. A larger concurrent live-reader set retries with a fresh
@@ -556,11 +670,16 @@ impl RedbPersistence {
             let control = OriginalPersistenceFrame::new(original)?;
             control.array::<WriterSnapshotHandle>(capacity)?;
             let registry = self.writer_snapshots.lock();
-            if registry.len() > capacity { drop(registry); continue; }
+            if registry.len() > capacity {
+                drop(registry);
+                continue;
+            }
             let mut roots = Vec::with_capacity(capacity);
-            for root in registry.iter().filter_map(WriterSnapshotWeak::upgrade) { roots.push(root); }
+            for root in registry.iter().filter_map(WriterSnapshotWeak::upgrade) {
+                roots.push(root);
+            }
             drop(registry);
-            break (roots,control);
+            break (roots, control);
         };
         frame.array::<(WriterSnapshotHandle, WriterErasure)>(root_capture.0.len())?;
         let mut replacements = Vec::with_capacity(root_capture.0.len());
@@ -568,30 +687,66 @@ impl RedbPersistence {
             let current = root.erasure.read();
             let window = OriginalPersistenceFrame::new(original)?;
             window.tree::<String, ()>(current.tables.len().saturating_add(tables.len()))?;
-            for table in current.tables.iter().chain(tables) { window.reserve(table.len())?; }
+            for table in current.tables.iter().chain(tables) {
+                window.reserve(table.len())?;
+            }
             let mut next_tables = current.tables.clone();
             next_tables.extend(tables.iter().cloned());
-            if !history.write().open_table(FENCE_KEYS).map_err(Self::storage_error)?.is_empty().map_err(Self::storage_error)? {
-                return Err(Error::Other("discard graph fence scratch survived its consumer".into()));
+            if !history
+                .write()
+                .open_table(FENCE_KEYS)
+                .map_err(Self::storage_error)?
+                .is_empty()
+                .map_err(Self::storage_error)?
+            {
+                return Err(Error::Other(
+                    "discard graph fence scratch survived its consumer".into(),
+                ));
             }
-            if let Some(prior) = &current.graph_spool { prior.copy_keys(original,history.write())?; }
+            if let Some(prior) = &current.graph_spool {
+                prior.copy_keys(original, history.write())?;
+            }
             for key in &current.graph_keys {
-                history.write().open_table(FENCE_KEYS).map_err(Self::storage_error)?.insert(key.as_slice(),0).map_err(Self::storage_error)?;
+                history
+                    .write()
+                    .open_table(FENCE_KEYS)
+                    .map_err(Self::storage_error)?
+                    .insert(key.as_slice(), 0)
+                    .map_err(Self::storage_error)?;
             }
-            discard_history::visit::<AdjEntry>(history.write(), original, discard_history::EDGES, |entry| {
-                let window = OriginalPersistenceFrame::new(original)?;
-                window.reserve(entry.edge_type.len().saturating_mul(2).saturating_add(128))?;
-                let forward = RedbPersistence::graph_fwd_key(entry);
-                let reverse = RedbPersistence::graph_rev_key(entry);
-                let mut keys = history.write().open_table(FENCE_KEYS).map_err(Self::storage_error)?;
-                keys.insert(forward.as_slice(),0).map_err(Self::storage_error)?;
-                keys.insert(reverse.as_slice(),0).map_err(Self::storage_error)?;
-                Ok(())
-            })?;
-            let spool = FrozenGraphErasure::build(self,original,history.write())?;
-            history.write().delete_table(FENCE_KEYS).map_err(Self::storage_error)?;
-            let next = WriterErasure {tables:next_tables, graph_keys:BTreeSet::new(), graph_spool:Some(Arc::new(spool)),
-                _memory:Some(ContainedMemoryReservation::from_owned(window.into_reservation()))};
+            discard_history::visit::<AdjEntry>(
+                history.write(),
+                original,
+                discard_history::EDGES,
+                |entry| {
+                    let window = OriginalPersistenceFrame::new(original)?;
+                    window.reserve(entry.edge_type.len().saturating_mul(2).saturating_add(128))?;
+                    let forward = RedbPersistence::graph_fwd_key(entry);
+                    let reverse = RedbPersistence::graph_rev_key(entry);
+                    let mut keys = history
+                        .write()
+                        .open_table(FENCE_KEYS)
+                        .map_err(Self::storage_error)?;
+                    keys.insert(forward.as_slice(), 0)
+                        .map_err(Self::storage_error)?;
+                    keys.insert(reverse.as_slice(), 0)
+                        .map_err(Self::storage_error)?;
+                    Ok(())
+                },
+            )?;
+            let spool = FrozenGraphErasure::build(self, original, history.write())?;
+            history
+                .write()
+                .delete_table(FENCE_KEYS)
+                .map_err(Self::storage_error)?;
+            let next = WriterErasure {
+                tables: next_tables,
+                graph_keys: BTreeSet::new(),
+                graph_spool: Some(Arc::new(spool)),
+                _memory: Some(ContainedMemoryReservation::from_owned(
+                    window.into_reservation(),
+                )),
+            };
             drop(current);
             replacements.push((root, next));
         }
@@ -611,12 +766,25 @@ impl RedbPersistence {
             .iter()
             .filter_map(WriterSnapshotWeak::upgrade)
             .collect::<Vec<_>>();
-        let root_bytes = roots.iter().map(|root| {
-            let erasure = root.erasure.read();
-            root.descriptor_control_bytes()
-                .saturating_add(erasure._memory.as_ref().map_or(0, ContainedMemoryReservation::bytes))
-                .saturating_add(erasure.graph_spool.as_ref().map_or(0, |spool| spool.retained_memory_bytes()))
-        }).sum();
+        let root_bytes = roots
+            .iter()
+            .map(|root| {
+                let erasure = root.erasure.read();
+                root.descriptor_control_bytes()
+                    .saturating_add(
+                        erasure
+                            ._memory
+                            .as_ref()
+                            .map_or(0, ContainedMemoryReservation::bytes),
+                    )
+                    .saturating_add(
+                        erasure
+                            .graph_spool
+                            .as_ref()
+                            .map_or(0, |spool| spool.retained_memory_bytes()),
+                    )
+            })
+            .sum();
         let current = self.writer_schema.lock().clone();
         let mut schemas = std::collections::HashSet::new();
         let mut metadata = std::collections::HashSet::new();
@@ -643,20 +811,35 @@ impl RedbPersistence {
         control: &mut Option<OwnedMemoryReservation>,
     ) -> crate::funded_error::OriginalResult<PreparedWriterSnapshot> {
         let diagnostic = crate::funded_error::OriginalError::prepare_route(original)?;
-        crate::memory_accounting::persistence_original_projection(original).map_err(|error| diagnostic.error(error))?;
+        crate::memory_accounting::persistence_original_projection(original)
+            .map_err(|error| diagnostic.error(error))?;
         let accountant = original.accountant().clone();
-        let schema = self.writer_schema.lock().as_ref().cloned()
-            .ok_or_else(|| diagnostic.error(Error::Other("publication schema was not prepared".into())))?;
-        let custody_groups_complete = view.bytes_equal(super::custody_groups::GROUP_TABLE,
-            super::custody_groups::COMPLETE, super::custody_groups::COMPLETE_VALUE)
+        let schema = self.writer_schema.lock().as_ref().cloned().ok_or_else(|| {
+            diagnostic.error(Error::Other("publication schema was not prepared".into()))
+        })?;
+        let custody_groups_complete = view
+            .bytes_equal(
+                super::custody_groups::GROUP_TABLE,
+                super::custody_groups::COMPLETE,
+                super::custody_groups::COMPLETE_VALUE,
+            )
             .map_err(|error| diagnostic.storage(original, error))?;
-        let root = WriterSnapshotHandle::native(WriterSnapshot {
-            read: parking_lot::RwLock::new(None), identity: view.identity(),
-            active: std::sync::atomic::AtomicBool::new(false), custody_groups_complete,
-            snapshot, lsn, accountant, _control: WriterSnapshotControl::empty(),
-            erasure: parking_lot::RwLock::new(WriterErasure::default()), schema,
-            registry: Arc::clone(&self.writer_snapshots),
-        }, control.take().expect("original prepaid descriptor"));
+        let root = WriterSnapshotHandle::native(
+            WriterSnapshot {
+                read: parking_lot::RwLock::new(None),
+                identity: view.identity(),
+                active: std::sync::atomic::AtomicBool::new(false),
+                custody_groups_complete,
+                snapshot,
+                lsn,
+                accountant,
+                _control: WriterSnapshotControl::empty(),
+                erasure: parking_lot::RwLock::new(WriterErasure::default()),
+                schema,
+                registry: Arc::clone(&self.writer_snapshots),
+            },
+            control.take().expect("original prepaid descriptor"),
+        );
         let mut roots = self.writer_snapshots.lock();
         roots.retain(|root| root.strong_count() != 0);
         roots.reserve_exact(1);
@@ -675,13 +858,22 @@ impl RedbPersistence {
         control: &mut Option<OwnedMemoryReservation>,
     ) -> PreparedWriterSnapshot {
         let accountant = original.accountant().clone();
-        let root = WriterSnapshotHandle::native(WriterSnapshot {
-            read: parking_lot::RwLock::new(None), identity,
-            active: std::sync::atomic::AtomicBool::new(false), custody_groups_complete,
-            snapshot, lsn, accountant, _control: WriterSnapshotControl::empty(),
-            erasure: parking_lot::RwLock::new(WriterErasure::default()), schema,
-            registry: Arc::clone(&self.writer_snapshots),
-        }, control.take().expect("original prepaid descriptor"));
+        let root = WriterSnapshotHandle::native(
+            WriterSnapshot {
+                read: parking_lot::RwLock::new(None),
+                identity,
+                active: std::sync::atomic::AtomicBool::new(false),
+                custody_groups_complete,
+                snapshot,
+                lsn,
+                accountant,
+                _control: WriterSnapshotControl::empty(),
+                erasure: parking_lot::RwLock::new(WriterErasure::default()),
+                schema,
+                registry: Arc::clone(&self.writer_snapshots),
+            },
+            control.take().expect("original prepaid descriptor"),
+        );
         let mut roots = self.writer_snapshots.lock();
         roots.retain(|root| root.strong_count() != 0);
         roots.reserve_exact(1);
@@ -694,16 +886,23 @@ impl RedbPersistence {
     /// private failure through its result loan, using the funded-error route.
     /// The active queue consumer retains the producing scope across preparation,
     /// commit and retirement. Opaque Storage errors remain unqualified.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_exact_queue_root_read(
         &self,
         write: redb::PreparedReadInput,
         original: &OwnedMemoryReservation,
         snapshot: SnapshotId,
         lsn: Lsn,
-    ) -> std::result::Result<(redb::PreparedWrite<PreparedWriterSnapshot>,
-        super::native_storage_admission::StorageAdmissionScope),
-        super::native_storage_admission::PreparedReadFailure> {
+    ) -> std::result::Result<
+        (
+            redb::PreparedWrite<PreparedWriterSnapshot>,
+            super::native_storage_admission::StorageAdmissionScope,
+        ),
+        super::native_storage_admission::PreparedReadFailure,
+    > {
         use super::native_storage_admission::{PreparedReadCause, StorageAdmissionScope};
         // All controls retain the existing exact Original reservation. New
         // page/control receipts are independent and survive scope destruction.
@@ -711,35 +910,66 @@ impl RedbPersistence {
         let prepared = scope.prepare_read(|scope, admission| {
             // Schema capture was prepared before opening this write. Never
             // perform a new latest read or price that pre-existing owner again.
-            let schema = self.writer_schema.lock().as_ref().cloned()
-                .ok_or(PreparedReadCause::EngineStatic("publication schema was not prepared"))?;
-            let slots = self.writer_snapshots.lock().len().checked_add(1)
-                .ok_or(PreparedReadCause::EngineStatic("writer registry size overflow"))?;
-            let bytes = contextdb_tx::native_capture::NativeCapture::allocation_bytes::<WriterSnapshot, OwnedMemoryReservation>()
-                .ok_or(PreparedReadCause::EngineStatic("writer publication control size overflow"))?
-                .checked_add(redb::PreparedWrite::<PreparedWriterSnapshot>::control_bytes())
-                .and_then(|n| n.checked_add(std::mem::size_of::<crate::persistent_store::PreparedQueueSourceLink<'_>>()))
-                .and_then(|n| n.checked_add(slots.checked_mul(std::mem::size_of::<WriterSnapshotWeak>())?))
-                .ok_or(PreparedReadCause::EngineStatic("writer publication control size overflow"))?;
-            let credit = scope.reserve_prepared_control(bytes).map_err(PreparedReadCause::Refused)?;
+            let schema = self.writer_schema.lock().as_ref().cloned().ok_or(
+                PreparedReadCause::EngineStatic("publication schema was not prepared"),
+            )?;
+            let slots = self.writer_snapshots.lock().len().checked_add(1).ok_or(
+                PreparedReadCause::EngineStatic("writer registry size overflow"),
+            )?;
+            let bytes = contextdb_tx::native_capture::NativeCapture::allocation_bytes::<
+                WriterSnapshot,
+                OwnedMemoryReservation,
+            >()
+            .ok_or(PreparedReadCause::EngineStatic(
+                "writer publication control size overflow",
+            ))?
+            .checked_add(redb::PreparedWrite::<PreparedWriterSnapshot>::control_bytes())
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<
+                    crate::persistent_store::PreparedQueueSourceLink<'_>,
+                >())
+            })
+            .and_then(|n| {
+                n.checked_add(slots.checked_mul(std::mem::size_of::<WriterSnapshotWeak>())?)
+            })
+            .ok_or(PreparedReadCause::EngineStatic(
+                "writer publication control size overflow",
+            ))?;
+            let credit = scope
+                .reserve_prepared_control(bytes)
+                .map_err(PreparedReadCause::Refused)?;
             let mut control = Some(credit);
             write.prepare_commit_with_read(
                 admission,
                 |error| PreparedReadCause::Lower(error.into()),
                 PreparedReadCause::Lower,
                 |view| {
-                    let complete = view.bytes_equal_prepared(super::custody_groups::GROUP_TABLE,
-                        super::custody_groups::COMPLETE, super::custody_groups::COMPLETE_VALUE)
+                    let complete = view
+                        .bytes_equal_prepared(
+                            super::custody_groups::GROUP_TABLE,
+                            super::custody_groups::COMPLETE,
+                            super::custody_groups::COMPLETE_VALUE,
+                        )
                         .map_err(PreparedReadCause::Lower)?;
-                    Ok(self.prepare_exact_writer_descriptor(original, schema, view.identity(), snapshot, lsn,
-                        complete, &mut control))
+                    Ok(self.prepare_exact_writer_descriptor(
+                        original,
+                        schema,
+                        view.identity(),
+                        snapshot,
+                        lsn,
+                        complete,
+                        &mut control,
+                    ))
                 },
             )
         })?;
         Ok((prepared, scope))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit_exact_queue_root(
         &self,
         write: redb::WriteTransaction,
@@ -749,27 +979,40 @@ impl RedbPersistence {
     ) -> crate::funded_error::OriginalResult<()> {
         // Abort custody precedes even diagnostic/control bootstrap refusal.
         let write = write.into_prepared_read();
-        let diagnostic = crate::funded_error::OriginalError::prepare(original,
-            "relational", "statement_overlay", "Reduce prepared event bodies or raise MEMORY_LIMIT.")
-            .map_err(crate::funded_error::OriginalError::native)?;
+        let diagnostic = crate::funded_error::OriginalError::prepare(
+            original,
+            "relational",
+            "statement_overlay",
+            "Reduce prepared event bodies or raise MEMORY_LIMIT.",
+        )
+        .map_err(crate::funded_error::OriginalError::native)?;
         let diagnostic = std::cell::RefCell::new(Some(diagnostic));
-        let take_diagnostic = || diagnostic.borrow_mut().take().expect("one escaping publication failure");
+        let take_diagnostic = || {
+            diagnostic
+                .borrow_mut()
+                .take()
+                .expect("one escaping publication failure")
+        };
         crate::persistent_store::with_exact_queue_source_link(self, |source| {
-            let (mut prepared, scope) = self.prepare_exact_queue_root_read(
-                write, original, completion.snapshot, completion.lsn,
-            ).map_err(|error| error.into_original(take_diagnostic(), original))?;
+            let (mut prepared, scope) = self
+                .prepare_exact_queue_root_read(write, original, completion.snapshot, completion.lsn)
+                .map_err(|error| error.into_original(take_diagnostic(), original))?;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                scope.prepare_read(|_, admission| redb::with_native_storage_admission(admission, || {
-                    prepared.commit().map_err(|error| {
-                        // CommitError still carries the actual Storage producer.
-                        // Normalize native tags without classifying an I/O kind.
-                        use super::native_storage_admission::PreparedReadCause;
-                        match error {
-                            redb::CommitError::Storage(error) => PreparedReadCause::Lower(error.into()),
-                            error => PreparedReadCause::Commit(error),
-                        }
+                scope.prepare_read(|_, admission| {
+                    redb::with_native_storage_admission(admission, || {
+                        prepared.commit().map_err(|error| {
+                            // CommitError still carries the actual Storage producer.
+                            // Normalize native tags without classifying an I/O kind.
+                            use super::native_storage_admission::PreparedReadCause;
+                            match error {
+                                redb::CommitError::Storage(error) => {
+                                    PreparedReadCause::Lower(error.into())
+                                }
+                                error => PreparedReadCause::Commit(error),
+                            }
+                        })
                     })
-                }))
+                })
             }));
             if let Some((read, root)) = prepared.take_durable() {
                 let root = root.activate(read);
@@ -779,7 +1022,9 @@ impl RedbPersistence {
             // Build the original result BEFORE retirement. Secondary cleanup
             // unwinds move to the caller's fixed phase, outside held guards.
             let result = match outcome {
-                Ok(result) => Ok(result.map_err(|error| error.into_original(take_diagnostic(), original))),
+                Ok(result) => {
+                    Ok(result.map_err(|error| error.into_original(take_diagnostic(), original)))
+                }
                 Err(panic) => Err(panic),
             };
             let retirement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -797,29 +1042,54 @@ impl RedbPersistence {
                     std::panic::resume_unwind(panic)
                 }
             }
-        }).map_err(|error| take_diagnostic().unqualified(error))?
+        })
+        .map_err(|error| take_diagnostic().unqualified(error))?
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn reserve_exact_writer_snapshot(&self, original: &OwnedMemoryReservation) -> Result<OwnedMemoryReservation> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn reserve_exact_writer_snapshot(
+        &self,
+        original: &OwnedMemoryReservation,
+    ) -> Result<OwnedMemoryReservation> {
         self.prepare_proof_owner()?;
         let _schema = self.prepared_writer_schema()?;
         // Pay the complete replacement registry array before reserve_exact,
         // plus both native Arc controls, the pin Box and the sealed owner.
-        let slots = self.writer_snapshots.lock().len().checked_add(1)
+        let slots = self
+            .writer_snapshots
+            .lock()
+            .len()
+            .checked_add(1)
             .ok_or_else(|| Error::Other("writer registry size overflow".into()))?;
         let bytes = native_snapshot_control_bytes()?
             .checked_add(redb::PreparedWrite::<PreparedWriterSnapshot>::control_bytes())
-            .and_then(|n| n.checked_add(std::mem::size_of::<crate::persistent_store::PreparedQueueSourceLink<'_>>()))
-            .and_then(|n| n.checked_add(slots.checked_mul(std::mem::size_of::<WriterSnapshotWeak>())?))
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<
+                    crate::persistent_store::PreparedQueueSourceLink<'_>,
+                >())
+            })
+            .and_then(|n| {
+                n.checked_add(slots.checked_mul(std::mem::size_of::<WriterSnapshotWeak>())?)
+            })
             .ok_or_else(|| Error::Other("writer publication control size overflow".into()))?;
-        crate::memory_accounting::reserve_preparation_from_original(original, bytes,
-            "writer_source", "prepared_exact_root", HINT)
+        crate::memory_accounting::reserve_preparation_from_original(
+            original,
+            bytes,
+            "writer_source",
+            "prepared_exact_root",
+            HINT,
+        )
     }
 
     /// Prepare the initial admitted root before constructing the manager.
     /// Pass it to new_with_directory; persistence keeps no publication slot.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn initialize_writer_snapshot(
         &self,
         snapshot: SnapshotId,
@@ -840,7 +1110,10 @@ impl RedbPersistence {
 
     /// Reserve this before durable commit. Failed reservation leaves the
     /// existing root untouched and must abort commit preparation.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve_writer_snapshot(&self) -> Result<OwnedMemoryReservation> {
         self.prepare_proof_owner()?;
         let _schema = self.prepared_writer_schema()?;
@@ -859,7 +1132,10 @@ impl RedbPersistence {
     /// Called after durability, while serialized with commits. The caller
     /// must poison the writer if this fails; the durable commit cannot roll
     /// back. This deliberately does not publish the new root.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_writer_snapshot(
         &self,
         control: OwnedMemoryReservation,
@@ -915,7 +1191,10 @@ impl RedbPersistence {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_native_writer_snapshot(
         &self,
         control: OwnedMemoryReservation,
@@ -944,19 +1223,22 @@ impl RedbPersistence {
                 Err(redb::TableError::TableDoesNotExist(_)) => false,
                 Err(error) => return Err(Self::storage_error(error)),
             };
-            let root = WriterSnapshotHandle::native(WriterSnapshot {
-                read: parking_lot::RwLock::new(Some(read)),
-                identity,
-                active: std::sync::atomic::AtomicBool::new(true),
-                custody_groups_complete,
-                snapshot,
-                lsn,
-                accountant,
-                _control: WriterSnapshotControl::empty(),
-                erasure: parking_lot::RwLock::new(WriterErasure::default()),
-                schema,
-                registry: Arc::clone(&self.writer_snapshots),
-            }, control);
+            let root = WriterSnapshotHandle::native(
+                WriterSnapshot {
+                    read: parking_lot::RwLock::new(Some(read)),
+                    identity,
+                    active: std::sync::atomic::AtomicBool::new(true),
+                    custody_groups_complete,
+                    snapshot,
+                    lsn,
+                    accountant,
+                    _control: WriterSnapshotControl::empty(),
+                    erasure: parking_lot::RwLock::new(WriterErasure::default()),
+                    schema,
+                    registry: Arc::clone(&self.writer_snapshots),
+                },
+                control,
+            );
             let mut roots = self.writer_snapshots.lock();
             roots.retain(|root| root.strong_count() != 0);
             roots.reserve_exact(1);
@@ -1029,11 +1311,16 @@ pub(crate) enum SourceWindowCredit {
 }
 
 impl SourceWindowOwner {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn diagnostic_budget(&self) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
         match self {
             Self::Read(owner) => Ok(owner.clone()),
-            Self::Write(accountant, original) => accountant.read_budget_for_original(original.clone()),
+            Self::Write(accountant, original) => {
+                accountant.read_budget_for_original(original.clone())
+            }
         }
     }
 
@@ -1041,7 +1328,10 @@ impl SourceWindowOwner {
         let token = crate::memory_accounting::WriterUse::retain_if_writer(&writer);
         Self::Write(writer, token)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reserve_box_credit(
         &self,
         bytes: usize,
@@ -1059,16 +1349,19 @@ impl SourceWindowOwner {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve(
         &self,
         bytes: usize,
         operation: &'static str,
     ) -> Result<SourceWindowCredit> {
         let mut credit = match self {
-            Self::Read(read) => SourceWindowCredit::Read(
-                contextdb_core::read_memory::ReadCredit::new(read.clone()),
-            ),
+            Self::Read(read) => {
+                SourceWindowCredit::Read(contextdb_core::read_memory::ReadCredit::new(read.clone()))
+            }
             Self::Write(writer, _) => {
                 SourceWindowCredit::Write(OwnedMemoryReservation::new(writer.clone()))
             }
@@ -1084,7 +1377,10 @@ impl SourceWindowOwner {
         Ok(credit)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn endpoint(
         &self,
         parts: &[&[u8]],
@@ -1113,7 +1409,10 @@ impl SourceWindowOwner {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prefix_end(
         &self,
         prefix: &[u8],
@@ -1127,7 +1426,11 @@ impl SourceWindowOwner {
         Ok(Some(endpoint))
     }
 
-    pub(super) fn image(&self, root: &WriterSnapshot, operation: &'static str) -> crate::read_image_memory::ImageMemoryHandle {
+    pub(super) fn image(
+        &self,
+        root: &WriterSnapshot,
+        operation: &'static str,
+    ) -> crate::read_image_memory::ImageMemoryHandle {
         match self {
             Self::Read(read) => ImageMemory::charging_reader_for(
                 root.accountant.clone(),
@@ -1197,11 +1500,19 @@ pub(crate) struct WriterWindow<T> {
     _memory: crate::read_image_memory::ImageMemoryHandle,
 }
 impl<T> WriterWindow<T> {
-    pub(super) fn from_owned(root: &WriterSnapshotHandle, memory: crate::read_image_memory::ImageMemoryHandle, value: T) -> Self {
-        Self { value, position: Box::default(), _root: root.clone(), _memory: memory }
+    pub(super) fn from_owned(
+        root: &WriterSnapshotHandle,
+        memory: crate::read_image_memory::ImageMemoryHandle,
+        value: T,
+    ) -> Self {
+        Self {
+            value,
+            position: Box::default(),
+            _root: root.clone(),
+            _memory: memory,
+        }
     }
 }
-
 
 impl<T> WriterWindow<T> {
     /// Move the value while retaining its original source credit and root.
@@ -1229,7 +1540,10 @@ impl<T> WriterWindow<T> {
             _memory: self._memory,
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn boxed<U: ?Sized>(
         self,
         coerce: impl FnOnce(Box<Self>) -> Box<U>,
@@ -1249,7 +1563,10 @@ impl<T> WriterWindow<T> {
     }
 }
 impl WriterSnapshot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn adapter_control(
         &self,
         owner: &SourceWindowOwner,
@@ -1277,7 +1594,10 @@ impl WriterSnapshot {
                     .map_or(0, ContainedMemoryReservation::bytes),
             )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn content_size_totals(
         &self,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1295,7 +1615,10 @@ impl WriterSnapshot {
     /// at this root and nothing was visited. Each record is decoded under its
     /// own admission, released after `visit` returns, and checked against the
     /// table, list and prefix it was asked for.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn maintained_count_groups<E: From<Error>>(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1368,7 +1691,13 @@ impl WriterSnapshot {
         let counts =
             read.open_table(RELATIONAL_INDEX_COUNT_TABLE)
                 .map_err(|error| match error {
-                    redb::TableError::TableDoesNotExist(_) => crate::funded_error::corruption_display(Ok(read_memory.clone()), "writer source", format_args!("maintained counts of ready table '{table}' are absent")),
+                    redb::TableError::TableDoesNotExist(_) => {
+                        crate::funded_error::corruption_display(
+                            Ok(read_memory.clone()),
+                            "writer source",
+                            format_args!("maintained counts of ready table '{table}' are absent"),
+                        )
+                    }
                     other => RedbPersistence::storage_error(other),
                 })?;
         let lower = RedbPersistence::relational_index_count_range_prefix(table, columns, prefix)?;
@@ -1378,7 +1707,13 @@ impl WriterSnapshot {
             None => counts.range::<&[u8]>(lower.as_slice()..),
         }
         .map_err(RedbPersistence::storage_error)?;
-        let corrupt = |reason: &str| crate::funded_error::corruption_display(Ok(read_memory.clone()), "writer source", format_args!("maintained count of '{table}': {reason}"));
+        let corrupt = |reason: &str| {
+            crate::funded_error::corruption_display(
+                Ok(read_memory.clone()),
+                "writer source",
+                format_args!("maintained count of '{table}': {reason}"),
+            )
+        };
         for entry in range {
             before_touch()?;
             self.erasure
@@ -1424,7 +1759,10 @@ impl WriterSnapshot {
         Ok(true)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn owner_read(&self) -> Result<Arc<redb::ReadTransaction>> {
         if !self.active.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::Other("prepared writer root is not durable".into()));
@@ -1447,7 +1785,10 @@ impl WriterSnapshot {
         Ok(read)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn check_table_scope(&self, table: &str) -> Result<()> {
         self.erasure
             .read()
@@ -1468,7 +1809,10 @@ impl WriterSnapshot {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1481,7 +1825,10 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).cursor(owner, table, family, lower, upper, reverse)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn row_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1491,23 +1838,38 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).row_cursor(owner, table, row_id)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn authored_row_cursor(
-        self: &Arc<Self>, owner: SourceWindowOwner, table: &str, row: RowId,
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
+        table: &str,
+        row: RowId,
     ) -> Result<Option<WriterReadCursor>> {
         WriterSnapshotHandle::from(self.clone()).authored_row_cursor(owner, table, row)
     }
 
     /// Read a retired authored occurrence under the same revocable scope as
     /// its canonical row. No raw retired-root handle escapes this method.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn authored_row_at(
-        self: &Arc<Self>, owner: SourceWindowOwner, table: &str, key: &[u8;24],
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
+        table: &str,
+        key: &[u8; 24],
     ) -> Result<Option<WriterWindow<VersionedRow>>> {
         WriterSnapshotHandle::from(self.clone()).authored_row_at(owner, table, key)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn exact_row(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1517,7 +1879,10 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).exact_row(owner, table, key)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn graph_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1529,7 +1894,10 @@ impl WriterSnapshot {
 
     /// Read the canonical body named by a placement in this exact root.
     /// Placement lifetimes stay on the membership; the body keeps its own stamps.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn export_vector_body(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1540,15 +1908,22 @@ impl WriterSnapshot {
 
     /// Canonical encoded body from this exact authenticated membership root.
     /// No float hydration or quantization round trip is needed for the spool.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn export_vector_raw_for_working(
-        self: &Arc<Self>, owner: SourceWindowOwner,
+        self: &Arc<Self>,
+        owner: SourceWindowOwner,
         membership: &VectorPartitionMembershipRecord,
     ) -> Result<WriterWindow<Vec<u8>>> {
         WriterSnapshotHandle::from(self.clone()).export_vector_raw_for_working(owner, membership)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn membership_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1560,7 +1935,10 @@ impl WriterSnapshot {
 
     /// Ordered index endpoints use the canonical index codec/comparator,
     /// including complete row/version suffixes supplied by the query planner.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn index_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1571,12 +1949,16 @@ impl WriterSnapshot {
         upper: Bound<&[u8]>,
         reverse: bool,
     ) -> Result<WriterReadCursor> {
-        WriterSnapshotHandle::from(self.clone()).index_cursor(owner, table, index, current, lower, upper, reverse)
+        WriterSnapshotHandle::from(self.clone())
+            .index_cursor(owner, table, index, current, lower, upper, reverse)
     }
 }
 
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1622,7 +2004,10 @@ impl WriterSnapshotHandle {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn row_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1644,26 +2029,58 @@ impl WriterSnapshotHandle {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn authored_row_cursor(
-        &self, owner: SourceWindowOwner, table: &str, row: RowId,
+        &self,
+        owner: SourceWindowOwner,
+        table: &str,
+        row: RowId,
     ) -> Result<Option<WriterReadCursor>> {
-        let _control = self.adapter_control(&owner, table.len().saturating_mul(4).saturating_add(256))?;
+        let _control =
+            self.adapter_control(&owner, table.len().saturating_mul(4).saturating_add(256))?;
         let lower = super::authored_history::body_key(table, &row.0.to_be_bytes());
         let upper = format!("{lower}~");
         let read = self.owner_read()?;
-        let witnessed = RedbPersistence::witnessed_row_count_in_read(&read, super::authored_history::BODIES.name())?;
-        if read.normal_table_root(super::authored_history::BODIES.name()).map_err(RedbPersistence::storage_error)?.is_none() && witnessed.is_none() { return Ok(None); }
+        let witnessed = RedbPersistence::witnessed_row_count_in_read(
+            &read,
+            super::authored_history::BODIES.name(),
+        )?;
+        if read
+            .normal_table_root(super::authored_history::BODIES.name())
+            .map_err(RedbPersistence::storage_error)?
+            .is_none()
+            && witnessed.is_none()
+        {
+            return Ok(None);
+        }
         RedbPersistence::verify_history_root(&read, super::authored_history::BODIES.name())?;
-        self.cursor(owner, super::authored_history::BODIES.name(), WriterCursorFamily::Text,
-            Bound::Included(lower.as_bytes()), Bound::Excluded(upper.as_bytes()), false)?.with_table_scope(table).map(Some)
+        self.cursor(
+            owner,
+            super::authored_history::BODIES.name(),
+            WriterCursorFamily::Text,
+            Bound::Included(lower.as_bytes()),
+            Bound::Excluded(upper.as_bytes()),
+            false,
+        )?
+        .with_table_scope(table)
+        .map(Some)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn authored_row_at(
-        &self, owner: SourceWindowOwner, table: &str, key: &[u8;24],
+        &self,
+        owner: SourceWindowOwner,
+        table: &str,
+        key: &[u8; 24],
     ) -> Result<Option<WriterWindow<VersionedRow>>> {
-        let _control = self.adapter_control(&owner, table.len().saturating_mul(3).saturating_add(256))?;
+        let _control =
+            self.adapter_control(&owner, table.len().saturating_mul(3).saturating_add(256))?;
         let physical = RedbPersistence::rel_table_name(table);
         let addressed = super::authored_history::body_key(table, key);
         let read = self.owner_read()?;
@@ -1673,15 +2090,29 @@ impl WriterSnapshotHandle {
         let bodies = match read.open_table(super::authored_history::BODIES) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => {
-                if RedbPersistence::witnessed_row_count_in_read(&read, super::authored_history::BODIES.name())?.is_some() {
-                    return Err(crate::funded_error::corruption_text(owner.diagnostic_budget(), table, "authored body relation is missing".into()));
+                if RedbPersistence::witnessed_row_count_in_read(
+                    &read,
+                    super::authored_history::BODIES.name(),
+                )?
+                .is_some()
+                {
+                    return Err(crate::funded_error::corruption_text(
+                        owner.diagnostic_budget(),
+                        table,
+                        "authored body relation is missing".into(),
+                    ));
                 }
                 return Ok(None);
             }
             Err(error) => return Err(RedbPersistence::storage_error(error)),
         };
         RedbPersistence::verify_history_root(&read, super::authored_history::BODIES.name())?;
-        let Some(value) = bodies.get(addressed.as_str()).map_err(RedbPersistence::storage_error)? else { return Ok(None); };
+        let Some(value) = bodies
+            .get(addressed.as_str())
+            .map_err(RedbPersistence::storage_error)?
+        else {
+            return Ok(None);
+        };
         let memory = owner.image(self, "authored_occurrence");
         #[cfg(any(test, feature = "test-seams"))]
         {
@@ -1691,20 +2122,34 @@ impl WriterSnapshotHandle {
         }
         let row = memory.scope(|| RedbPersistence::decode_versioned_row(value.value(), None))?;
         if RedbPersistence::rel_row_key(&row) != *key {
-            return Err(crate::funded_error::corruption_text(owner.diagnostic_budget(), table, "authored body has a different occurrence key".into()));
+            return Err(crate::funded_error::corruption_text(
+                owner.diagnostic_budget(),
+                table,
+                "authored body has a different occurrence key".into(),
+            ));
         }
         #[cfg(any(test, feature = "test-seams"))]
         let row = {
             let mut row = row;
-            if EXACT_ROW_FAULT_SCOPE.with(|scope| scope.get()) && EXACT_ROW_LSN_FAULT.with(|fault| fault.replace(false)) {
+            if EXACT_ROW_FAULT_SCOPE.with(|scope| scope.get())
+                && EXACT_ROW_LSN_FAULT.with(|fault| fault.replace(false))
+            {
                 row.lsn = Lsn(row.lsn.0 ^ 1);
             }
             row
         };
-        Ok(Some(WriterWindow { value: row, position: Box::default(), _root: self.clone(), _memory: memory }))
+        Ok(Some(WriterWindow {
+            value: row,
+            position: Box::default(),
+            _root: self.clone(),
+            _memory: memory,
+        }))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn exact_row(
         &self,
         owner: SourceWindowOwner,
@@ -1723,7 +2168,10 @@ impl WriterSnapshotHandle {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn graph_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1747,7 +2195,10 @@ impl WriterSnapshotHandle {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn export_vector_body(
         &self,
         owner: SourceWindowOwner,
@@ -1812,34 +2263,64 @@ impl WriterSnapshotHandle {
             })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn export_vector_raw_for_working(
-        &self, owner: SourceWindowOwner,
+        &self,
+        owner: SourceWindowOwner,
         membership: &VectorPartitionMembershipRecord,
     ) -> Result<WriterWindow<Vec<u8>>> {
-        let bytes = membership.index.table.len().checked_add(membership.index.column.len())
-            .and_then(|n| n.checked_add(34)).ok_or_else(|| Error::Other("vector working key overflow".into()))?;
+        let bytes = membership
+            .index
+            .table
+            .len()
+            .checked_add(membership.index.column.len())
+            .and_then(|n| n.checked_add(34))
+            .ok_or_else(|| Error::Other("vector working key overflow".into()))?;
         let _key_credit = owner.reserve(bytes, "working_vector_identity")?;
-        let key = RedbPersistence::vector_identity_key(&membership.index, membership.row_id,
-            membership.vector_created_tx, membership.vector_lsn);
-        self.cursor(owner, VECTORS_TABLE.name(), WriterCursorFamily::Bytes,
-            Bound::Included(&key), Bound::Included(&key), false)?
-            .with_table_scope(&membership.index.table)?
-            .next(|physical, bytes| {
-                let body: PersistedVectorEntry = decode_window_exact(bytes)?;
-                if physical != key.as_slice() || body.index != membership.index
-                    || body.row_id != membership.row_id || body.created_tx != membership.vector_created_tx
-                    || body.lsn != membership.vector_lsn {
-                    return Err(Error::StoreCorrupted { path: "vectors".into(),
-                        reason: "working body identity differs from source membership".into() });
-                }
-                crate::read_image_memory::reserve(bytes.len())?;
-                Ok(bytes.to_vec())
-            })?.ok_or_else(|| Error::StoreCorrupted { path: "vectors".into(),
-                reason: "working membership lost its canonical body".into() })
+        let key = RedbPersistence::vector_identity_key(
+            &membership.index,
+            membership.row_id,
+            membership.vector_created_tx,
+            membership.vector_lsn,
+        );
+        self.cursor(
+            owner,
+            VECTORS_TABLE.name(),
+            WriterCursorFamily::Bytes,
+            Bound::Included(&key),
+            Bound::Included(&key),
+            false,
+        )?
+        .with_table_scope(&membership.index.table)?
+        .next(|physical, bytes| {
+            let body: PersistedVectorEntry = decode_window_exact(bytes)?;
+            if physical != key.as_slice()
+                || body.index != membership.index
+                || body.row_id != membership.row_id
+                || body.created_tx != membership.vector_created_tx
+                || body.lsn != membership.vector_lsn
+            {
+                return Err(Error::StoreCorrupted {
+                    path: "vectors".into(),
+                    reason: "working body identity differs from source membership".into(),
+                });
+            }
+            crate::read_image_memory::reserve(bytes.len())?;
+            Ok(bytes.to_vec())
+        })?
+        .ok_or_else(|| Error::StoreCorrupted {
+            path: "vectors".into(),
+            reason: "working membership lost its canonical body".into(),
+        })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn membership_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1875,7 +2356,10 @@ impl WriterSnapshotHandle {
         .with_table_scope(&index.table)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn index_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -1940,7 +2424,10 @@ impl WriterErasure {
             .expect("authoritative erasure carries reason detail"),
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn check_scope(&self, logical: Option<&str>, physical: &str) -> Result<()> {
         let affected = match logical {
             Some(table) => self.tables.contains(table),
@@ -1956,15 +2443,31 @@ impl WriterErasure {
             Ok(())
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn check_key(&self, physical: &str, key: &[u8]) -> Result<()> {
         self.check_key_with_checkpoint(physical, key, None)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    fn check_key_with_checkpoint(&self, physical: &str, key: &[u8], checkpoint: Option<&mut dyn FnMut() -> Result<()>>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn check_key_with_checkpoint(
+        &self,
+        physical: &str,
+        key: &[u8],
+        checkpoint: Option<&mut dyn FnMut() -> Result<()>>,
+    ) -> Result<()> {
         if (physical == GRAPH_FWD_TABLE.name() || physical == GRAPH_REV_TABLE.name())
             && (self.graph_keys.contains(key)
-                || self.graph_spool.as_ref().map(|spool| spool.contains(key, checkpoint)).transpose()?.unwrap_or(false))
+                || self
+                    .graph_spool
+                    .as_ref()
+                    .map(|spool| spool.contains(key, checkpoint))
+                    .transpose()?
+                    .unwrap_or(false))
         {
             Err(Self::refusal())
         } else {
@@ -1974,7 +2477,10 @@ impl WriterErasure {
 }
 
 impl WriterReadCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn with_table_scope(mut self, table: &str) -> Result<Self> {
         let credit = self.owner.reserve(table.len(), "cursor_keys")?;
         let logical = Box::<str>::from(table);
@@ -2005,7 +2511,10 @@ impl WriterReadCursor {
 
     /// The closure decodes one record under allocation-aware serde admission.
     /// Its returned object retains that admission until the caller drops it.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next<T>(
         &mut self,
         decode: impl FnOnce(&[u8], &[u8]) -> Result<T>,
@@ -2013,7 +2522,10 @@ impl WriterReadCursor {
         self.next_before(&mut || Ok(()), decode)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_before<T>(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -2022,7 +2534,10 @@ impl WriterReadCursor {
         self.next_before_handoff(before, decode, Ok)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next_before_handoff<T, H>(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -2066,7 +2581,10 @@ impl WriterReadCursor {
         Ok(Some(delivered))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn read_one<T>(
         &self,
         memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -2111,7 +2629,13 @@ impl WriterReadCursor {
                     }
                     let corrupted = graph && matches!(&error, redb::StorageError::Corrupted(_));
                     match RedbPersistence::storage_error(error) {
-                        Error::Other(reason) if corrupted => crate::funded_error::corruption_display(memory.diagnostic_budget(), "graph adjacency", reason),
+                        Error::Other(reason) if corrupted => {
+                            crate::funded_error::corruption_display(
+                                memory.diagnostic_budget(),
+                                "graph adjacency",
+                                reason,
+                            )
+                        }
                         other => other,
                     }
                 };
@@ -2120,14 +2644,24 @@ impl WriterReadCursor {
                     Ok(table) => table,
                     Err(redb::TableError::TableDoesNotExist(_)) => {
                         if graph {
-                            return Err(crate::funded_error::corruption_text(memory.diagnostic_budget(), "graph adjacency", "graph projection table missing".into()));
+                            return Err(crate::funded_error::corruption_text(
+                                memory.diagnostic_budget(),
+                                "graph adjacency",
+                                "graph projection table missing".into(),
+                            ));
                         }
                         return Ok(None);
                     }
                     Err(redb::TableError::Storage(error)) => return Err(storage_error(error)),
                     Err(error) => {
                         return Err(match RedbPersistence::storage_error(error) {
-                            Error::Other(reason) if graph => crate::funded_error::corruption_display(memory.diagnostic_budget(), "graph adjacency", reason),
+                            Error::Other(reason) if graph => {
+                                crate::funded_error::corruption_display(
+                                    memory.diagnostic_budget(),
+                                    "graph adjacency",
+                                    reason,
+                                )
+                            }
                             other => other,
                         });
                     }
@@ -2212,7 +2746,11 @@ impl WriterReadCursor {
                     )) {
                     Ok(table) => table,
                     Err(redb::TableError::TableDoesNotExist(_)) => {
-                        return Err(crate::funded_error::corruption_text(memory.diagnostic_budget(), self.table.as_ref(), "missing durable posting family".into()));
+                        return Err(crate::funded_error::corruption_text(
+                            memory.diagnostic_budget(),
+                            self.table.as_ref(),
+                            "missing durable posting family".into(),
+                        ));
                     }
                     Err(e) => return Err(RedbPersistence::storage_error(e)),
                 };
@@ -2239,7 +2777,8 @@ impl WriterReadCursor {
             }
             WriterCursorFamily::Text => {
                 let utf8 = |b| {
-                    std::str::from_utf8(b).map_err(|e| Error::Other((format!("cursor key: {e}")).into()))
+                    std::str::from_utf8(b)
+                        .map_err(|e| Error::Other((format!("cursor key: {e}")).into()))
                 };
                 let lower = match lower {
                     Bound::Included(v) => Bound::Included(utf8(v)?),
@@ -2293,44 +2832,69 @@ impl WriterReadCursor {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn next_authored_row(&mut self, table: &str) -> Result<Option<WriterWindow<VersionedRow>>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn next_authored_row(
+        &mut self,
+        table: &str,
+    ) -> Result<Option<WriterWindow<VersionedRow>>> {
         let diagnostic_owner = self.owner.clone();
         let root = self.root.clone();
-        self.next_before_handoff(&mut || Ok(()), |key, value| {
-            crate::read_image_memory::reserve(table.len().saturating_mul(3).saturating_add(256))?;
-            #[cfg(any(test, feature = "test-seams"))]
-            {
-                root.note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
-                crate::read_work_probe::note_decoded_row();
-                crate::read_work_probe::note_stored_row_bytes(value.len());
-            }
-            let row = RedbPersistence::decode_versioned_row(value, None)?;
-            let canonical = RedbPersistence::rel_row_key(&row);
-            if super::authored_history::body_key(table, &canonical).as_bytes() != key {
-                return Err(crate::funded_error::corruption_text(diagnostic_owner.diagnostic_budget(), table, "retained body has a mismatched occurrence key".into()));
-            }
-            let erasure = root.erasure.read();
-            let physical = RedbPersistence::rel_table_name(table);
-            erasure.check_scope(Some(table), &physical)?;
-            erasure.check_key(&physical, &canonical)?;
-            Ok(row)
-        }, Ok)
+        self.next_before_handoff(
+            &mut || Ok(()),
+            |key, value| {
+                crate::read_image_memory::reserve(
+                    table.len().saturating_mul(3).saturating_add(256),
+                )?;
+                #[cfg(any(test, feature = "test-seams"))]
+                {
+                    root.note_read_source(crate::writer_query_test_seams::PhysicalFamily::Row);
+                    crate::read_work_probe::note_decoded_row();
+                    crate::read_work_probe::note_stored_row_bytes(value.len());
+                }
+                let row = RedbPersistence::decode_versioned_row(value, None)?;
+                let canonical = RedbPersistence::rel_row_key(&row);
+                if super::authored_history::body_key(table, &canonical).as_bytes() != key {
+                    return Err(crate::funded_error::corruption_text(
+                        diagnostic_owner.diagnostic_budget(),
+                        table,
+                        "retained body has a mismatched occurrence key".into(),
+                    ));
+                }
+                let erasure = root.erasure.read();
+                let physical = RedbPersistence::rel_table_name(table);
+                erasure.check_scope(Some(table), &physical)?;
+                erasure.check_key(&physical, &canonical)?;
+                Ok(row)
+            },
+            Ok,
+        )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_row(&mut self) -> Result<Option<WriterWindow<VersionedRow>>> {
         self.next_row_before(&mut || Ok(()))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_row_before(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<WriterWindow<VersionedRow>>> {
         self.next_row_before_handoff(before, Ok)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_row_before_handoff<H>(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -2398,7 +2962,10 @@ pub(crate) struct WriterCommitCursor {
 }
 
 impl WriterSnapshot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn change_log_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2408,7 +2975,10 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).change_log_cursor(owner, first, last)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn config_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2419,7 +2989,10 @@ impl WriterSnapshot {
 
     /// The configuration rows under `prefix` from `start` (inclusive) on,
     /// in key order: a lower-bound seek, never a walk of the earlier rows.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn config_cursor_from(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2432,7 +3005,10 @@ impl WriterSnapshot {
     /// The complete lineage projection has a producer root witness. Seeking
     /// its pending coordinates authenticates absence and excluded prefixes
     /// without enumerating the rest of the configuration journal.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lineage_cursor_from(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2442,7 +3018,10 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).lineage_cursor_from(owner, prefix, start)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2455,7 +3034,10 @@ impl WriterSnapshot {
 
     /// Resolve one change coordinate against this root's authenticated
     /// commit directory, never against a newer transaction-manager view.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn transaction_at_lsn(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2464,7 +3046,10 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).transaction_at_lsn(owner, lsn)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit_bounds(&self) -> Result<(Option<(Lsn, TxId)>, Option<(Lsn, TxId)>, u64)> {
         let read = self.owner_read()?;
         let table = read
@@ -2485,7 +3070,10 @@ impl WriterSnapshot {
         ))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn sync_source(
         &self,
         owner: SourceWindowOwner,
@@ -2519,7 +3107,10 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn change_log_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -2540,7 +3131,10 @@ impl WriterSnapshotHandle {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn config_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -2558,7 +3152,10 @@ impl WriterSnapshotHandle {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn config_cursor_from(
         &self,
         owner: SourceWindowOwner,
@@ -2577,7 +3174,10 @@ impl WriterSnapshotHandle {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lineage_cursor_from(
         &self,
         owner: SourceWindowOwner,
@@ -2596,7 +3196,10 @@ impl WriterSnapshotHandle {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -2616,7 +3219,10 @@ impl WriterSnapshotHandle {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn transaction_at_lsn(
         &self,
         owner: SourceWindowOwner,
@@ -2629,16 +3235,22 @@ impl WriterSnapshotHandle {
                 reason: "change coordinate exceeds the captured committed frontier".into(),
             });
         }
-        let membership = self.config_point::<(u64,u64)>(owner.clone(),
-            &crate::database::connected_replay::membership_key(lsn))?;
+        let membership = self.config_point::<(u64, u64)>(
+            owner.clone(),
+            &crate::database::connected_replay::membership_key(lsn),
+        )?;
         let lsn = if let Some(membership) = membership.as_ref() {
-            let (start,end) = membership.value;
+            let (start, end) = membership.value;
             if start > lsn.0 || end < lsn.0 || end > self.lsn.0 {
-                return Err(Error::StoreCorrupted { path: "connected_position".into(),
-                    reason: "historical position has an invalid acceptance interval".into() });
+                return Err(Error::StoreCorrupted {
+                    path: "connected_position".into(),
+                    reason: "historical position has an invalid acceptance interval".into(),
+                });
             }
             Lsn(end)
-        } else { lsn };
+        } else {
+            lsn
+        };
         let read = self.owner_read()?;
         RedbPersistence::authenticate_commit_recovery_in_read(&read)?;
         let table = read
@@ -2661,14 +3273,20 @@ impl WriterSnapshotHandle {
 }
 
 impl WriterReadCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_index(
         &mut self,
         current: bool,
     ) -> Result<Option<WriterWindow<WriterIndexPosting>>> {
         self.next_index_before(current, &mut || Ok(()))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_index_before(
         &mut self,
         current: bool,
@@ -2676,7 +3294,10 @@ impl WriterReadCursor {
     ) -> Result<Option<WriterWindow<WriterIndexPosting>>> {
         self.next_index_before_handoff(current, before, Ok)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_index_before_handoff<H>(
         &mut self,
         current: bool,
@@ -2732,16 +3353,32 @@ impl WriterReadCursor {
 
     /// Retain the exact authenticated physical bytes for the private working
     /// write. Re-encoding a decoded edge must not normalize its source bytes.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(crate) fn next_edge_for_working(&mut self) -> Result<Option<WriterWindow<(AdjEntry, Vec<u8>)>>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn next_edge_for_working(
+        &mut self,
+    ) -> Result<Option<WriterWindow<(AdjEntry, Vec<u8>)>>> {
         let root = self.root.clone();
-        let definition = if self.table.as_ref() == GRAPH_REV_TABLE.name() { GRAPH_REV_TABLE } else { GRAPH_FWD_TABLE };
+        let definition = if self.table.as_ref() == GRAPH_REV_TABLE.name() {
+            GRAPH_REV_TABLE
+        } else {
+            GRAPH_FWD_TABLE
+        };
         self.next_edge_handoff(|window| {
             let encoded = {
                 let read = root.owner_read()?;
-                let source = read.open_table(definition).map_err(RedbPersistence::storage_error)?;
-                let raw = source.get(window.position()).map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::StoreCorrupted { path: "graph adjacency".into(), reason: "authenticated graph source disappeared".into() })?;
+                let source = read
+                    .open_table(definition)
+                    .map_err(RedbPersistence::storage_error)?;
+                let raw = source
+                    .get(window.position())
+                    .map_err(RedbPersistence::storage_error)?
+                    .ok_or_else(|| Error::StoreCorrupted {
+                        path: "graph adjacency".into(),
+                        reason: "authenticated graph source disappeared".into(),
+                    })?;
                 window._memory.reserve(raw.value().len())?;
                 raw.value().to_vec()
             };
@@ -2749,18 +3386,28 @@ impl WriterReadCursor {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_edge(&mut self) -> Result<Option<WriterWindow<AdjEntry>>> {
         self.next_edge_handoff(Ok)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_edge_with(
-        &mut self, checkpoint: &dyn Fn() -> Result<()>,
+        &mut self,
+        checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<Option<WriterWindow<AdjEntry>>> {
         self.next_edge_handoff_with(&mut || checkpoint(), Ok)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_row_edge_handoff<H>(
         &mut self,
         reverse: bool,
@@ -2768,9 +3415,14 @@ impl WriterReadCursor {
     ) -> Result<Option<H>> {
         self.next_row_edge_handoff_with(reverse, &mut || Ok(()), handoff)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_row_edge_handoff_with<H>(
-        &mut self, reverse: bool, checkpoint: &mut dyn FnMut() -> Result<()>,
+        &mut self,
+        reverse: bool,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
         handoff: impl FnOnce(WriterWindow<contextdb_tx::OwnedAdjEntry>) -> Result<H>,
     ) -> Result<Option<H>> {
         let root = self.root.clone();
@@ -2824,14 +3476,20 @@ impl WriterReadCursor {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_edge_handoff<H>(
         &mut self,
         handoff: impl FnOnce(WriterWindow<AdjEntry>) -> Result<H>,
     ) -> Result<Option<H>> {
         self.next_edge_handoff_with(&mut || Ok(()), handoff)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next_edge_handoff_with<H>(
         &mut self,
         checkpoint: &mut dyn FnMut() -> Result<()>,
@@ -2888,26 +3546,40 @@ impl WriterReadCursor {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_membership_for_working(
         &mut self,
     ) -> Result<Option<WriterWindow<(VectorPartitionMembershipRecord, Vec<u8>)>>> {
         let root = self.root.clone();
-        self.next_membership()?.map(|window| {
-            let encoded = {
-                let read = root.owner_read()?;
-                let table = read.open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE).map_err(RedbPersistence::storage_error)?;
-                let value = table.get(window.position()).map_err(RedbPersistence::storage_error)?
-                    .ok_or_else(|| Error::StoreCorrupted { path: "vector_partition_membership".into(),
-                        reason: "working source membership disappeared".into() })?;
-                window._memory.reserve(value.value().len())?;
-                value.value().to_vec()
-            };
-            Ok(window.map(|membership| (membership, encoded)))
-        }).transpose()
+        self.next_membership()?
+            .map(|window| {
+                let encoded = {
+                    let read = root.owner_read()?;
+                    let table = read
+                        .open_table(VECTOR_PARTITION_MEMBERSHIP_TABLE)
+                        .map_err(RedbPersistence::storage_error)?;
+                    let value = table
+                        .get(window.position())
+                        .map_err(RedbPersistence::storage_error)?
+                        .ok_or_else(|| Error::StoreCorrupted {
+                            path: "vector_partition_membership".into(),
+                            reason: "working source membership disappeared".into(),
+                        })?;
+                    window._memory.reserve(value.value().len())?;
+                    value.value().to_vec()
+                };
+                Ok(window.map(|membership| (membership, encoded)))
+            })
+            .transpose()
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_membership(
         &mut self,
     ) -> Result<Option<WriterWindow<VectorPartitionMembershipRecord>>> {
@@ -2921,22 +3593,31 @@ impl WriterReadCursor {
             )?;
             if RedbPersistence::vector_partition_membership_key(&record) != key {
                 return Err(Error::Other(
-                    "membership cursor encountered a mismatched identity".into()));
+                    "membership cursor encountered a mismatched identity".into(),
+                ));
             }
             Ok(record)
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_change(&mut self) -> Result<Option<WriterWindow<ChangeLogEntry>>> {
         self.next_stored_change(|_, record| Ok(record.entry))
     }
 
     // Private provenance never crosses into the public change-log projection.
     // The returned window retains this cursor's authenticated root and invoice.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn next_stored_change<T>(&mut self,
-        decode: impl FnOnce(&[u8], graph_history_record::StoredChangeLogEntry) -> Result<T>) -> Result<Option<WriterWindow<T>>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn next_stored_change<T>(
+        &mut self,
+        decode: impl FnOnce(&[u8], graph_history_record::StoredChangeLogEntry) -> Result<T>,
+    ) -> Result<Option<WriterWindow<T>>> {
         let root = self.root.clone();
         let owner = self.owner.clone();
         self.next(|position, value| {
@@ -2964,7 +3645,10 @@ impl WriterReadCursor {
 }
 
 impl WriterCommitCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next(&mut self) -> Result<Option<(Lsn, TxId)>> {
         let read = self.root.owner_read()?;
         let table = read
@@ -3016,7 +3700,10 @@ impl WriterCommitCursor {
 }
 
 impl WriterSnapshot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn table_change_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3027,7 +3714,10 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).table_change_cursor(owner, table, first, last)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn change_log_occurrences(&self, lsn: Lsn) -> Result<u64> {
         let read = self.owner_read()?;
         let counts = match read.open_table(writer_history::CHANGE_LOG_LSN_COUNT) {
@@ -3043,7 +3733,10 @@ impl WriterSnapshot {
 
     /// Terminal lifecycle preparation uses the existing config compatibility
     /// contract and retains its exact original decode owner beyond all guards.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn config_point_original<T: serde::de::DeserializeOwned>(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,
@@ -3063,7 +3756,10 @@ impl WriterSnapshot {
         RedbPersistence::decode_owned_config_value(original, value.value()).map(Some)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn config_point<T: serde::de::DeserializeOwned>(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3072,7 +3768,10 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).config_point(owner, key)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lineage_point<T: serde::de::DeserializeOwned>(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3081,7 +3780,10 @@ impl WriterSnapshot {
         WriterSnapshotHandle::from(self.clone()).lineage_point(owner, key)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn config_point_in<T: serde::de::DeserializeOwned>(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3093,7 +3795,10 @@ impl WriterSnapshot {
 }
 
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn table_change_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -3130,7 +3835,10 @@ impl WriterSnapshotHandle {
         .with_table_scope(table)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn config_point<T: serde::de::DeserializeOwned>(
         &self,
         owner: SourceWindowOwner,
@@ -3139,7 +3847,10 @@ impl WriterSnapshotHandle {
         self.config_point_in(owner, key, CONFIG_TABLE.name())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lineage_point<T: serde::de::DeserializeOwned>(
         &self,
         owner: SourceWindowOwner,
@@ -3152,7 +3863,10 @@ impl WriterSnapshotHandle {
         self.config_point_in(owner, key, READ_LINEAGE_CONFIG_TABLE.name())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn config_point_in<T: serde::de::DeserializeOwned>(
         &self,
         owner: SourceWindowOwner,
@@ -3184,14 +3898,18 @@ impl WriterSnapshotHandle {
 }
 
 impl WriterReadCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn next_table_change(&mut self) -> Result<Option<WriterWindow<ChangeLogEntry>>> {
         let root = self.root.clone();
         let owner = self.owner.clone();
         self.next(|_, position| {
             if position.len() != 16 {
                 return Err(Error::Other(
-                    "table log selector has an invalid position width".into()));
+                    "table log selector has an invalid position width".into(),
+                ));
             }
             let read = root.owner_read()?;
             let log = read
@@ -3216,7 +3934,10 @@ impl WriterReadCursor {
 }
 
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn reserve_redb_allocator_state(
         &self,
     ) -> Result<crate::memory_accounting::RedbAllocatorStateCharge> {
@@ -3231,7 +3952,10 @@ impl RedbPersistence {
 }
 
 impl WriterSnapshot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn exact_index_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3240,12 +3964,16 @@ impl WriterSnapshot {
         current: bool,
         tuple: &IndexKey,
     ) -> Result<WriterReadCursor> {
-        WriterSnapshotHandle::from(self.clone()).exact_index_cursor(owner, table, index, current, tuple)
+        WriterSnapshotHandle::from(self.clone())
+            .exact_index_cursor(owner, table, index, current, tuple)
     }
 }
 
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn exact_index_cursor(
         &self,
         owner: SourceWindowOwner,
@@ -3275,7 +4003,10 @@ impl WriterSnapshotHandle {
 impl WriterSnapshot {
     /// Build an admitted physical endpoint using the persistence codec. Query
     /// adapters need not duplicate its encoding or its row/version suffixes.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn index_position_key(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3283,10 +4014,14 @@ impl WriterSnapshot {
         row_id: RowId,
         created_tx: TxId,
     ) -> Result<WriterWindow<Vec<u8>>> {
-        WriterSnapshotHandle::from(self.clone()).index_position_key(owner, tuple, row_id, created_tx)
+        WriterSnapshotHandle::from(self.clone())
+            .index_position_key(owner, tuple, row_id, created_tx)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn row_index_position_key_with_checkpoint(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3295,10 +4030,19 @@ impl WriterSnapshot {
         created_tx: TxId,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WriterWindow<Vec<u8>>> {
-        WriterSnapshotHandle::from(self.clone()).row_index_position_key_with_checkpoint(owner, declaration, row, created_tx, checkpoint)
+        WriterSnapshotHandle::from(self.clone()).row_index_position_key_with_checkpoint(
+            owner,
+            declaration,
+            row,
+            created_tx,
+            checkpoint,
+        )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn index_position_key_with_checkpoint(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3307,12 +4051,16 @@ impl WriterSnapshot {
         created_tx: TxId,
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<WriterWindow<Vec<u8>>> {
-        WriterSnapshotHandle::from(self.clone()).index_position_key_with_checkpoint(owner, tuple, row_id, created_tx, checkpoint)
+        WriterSnapshotHandle::from(self.clone())
+            .index_position_key_with_checkpoint(owner, tuple, row_id, created_tx, checkpoint)
     }
 }
 
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn index_position_key(
         &self,
         owner: SourceWindowOwner,
@@ -3323,7 +4071,10 @@ impl WriterSnapshotHandle {
         self.index_position_key_with_checkpoint(owner, tuple, row_id, created_tx, &mut || Ok(()))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn row_index_position_key_with_checkpoint(
         &self,
         owner: SourceWindowOwner,
@@ -3348,7 +4099,10 @@ impl WriterSnapshotHandle {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn index_position_key_with_checkpoint(
         &self,
         owner: SourceWindowOwner,
@@ -3384,7 +4138,11 @@ impl RedbPersistence {
             };
             Ok(roots
                 .into_iter()
-                .filter_map(|root| root.upgrade().filter(|root| root.active.load(std::sync::atomic::Ordering::Acquire)).map(|root| root.storage_identity()))
+                .filter_map(|root| {
+                    root.upgrade()
+                        .filter(|root| root.active.load(std::sync::atomic::Ordering::Acquire))
+                        .map(|root| root.storage_identity())
+                })
                 .collect())
         })
     }
@@ -3392,7 +4150,10 @@ impl RedbPersistence {
         let roots = self.writer_snapshots.lock().clone();
         roots
             .into_iter()
-            .filter_map(|root| root.upgrade().filter(|root| root.active.load(std::sync::atomic::Ordering::Acquire)))
+            .filter_map(|root| {
+                root.upgrade()
+                    .filter(|root| root.active.load(std::sync::atomic::Ordering::Acquire))
+            })
             .collect()
     }
 }
@@ -3504,11 +4265,15 @@ mod tests {
                         assert_eq!(observed_identity.user_root, old_identity.user_root);
                     }
                     assert!(
-                        old.row_cursor(SourceWindowOwner::Read(reader.clone().into()), "items", RowId(7))
-                            .unwrap()
-                            .next_row()
-                            .unwrap()
-                            .is_none()
+                        old.row_cursor(
+                            SourceWindowOwner::Read(reader.clone().into()),
+                            "items",
+                            RowId(7)
+                        )
+                        .unwrap()
+                        .next_row()
+                        .unwrap()
+                        .is_none()
                     );
                     // A live redb write cannot delay capture at the published root.
                     store
@@ -3545,7 +4310,11 @@ mod tests {
         assert_eq!((current.snapshot, current.lsn), (SnapshotId(1), Lsn(1)));
         let baseline = reader.usage().used;
         let mut cursor = current
-            .row_cursor(SourceWindowOwner::Read(reader.clone().into()), "items", RowId(7))
+            .row_cursor(
+                SourceWindowOwner::Read(reader.clone().into()),
+                "items",
+                RowId(7),
+            )
             .unwrap();
         let cursor_only = reader.usage().used;
         let window = cursor.next_row().unwrap().unwrap();
@@ -3557,11 +4326,15 @@ mod tests {
         drop(cursor);
         assert_eq!(reader.usage().used, baseline);
         assert!(
-            old.row_cursor(SourceWindowOwner::Read(reader.clone().into()), "items", RowId(7))
-                .unwrap()
-                .next_row()
-                .unwrap()
-                .is_none()
+            old.row_cursor(
+                SourceWindowOwner::Read(reader.clone().into()),
+                "items",
+                RowId(7)
+            )
+            .unwrap()
+            .next_row()
+            .unwrap()
+            .is_none()
         );
         // The manager uses the durable directory, not a mirrored tree.
         use contextdb_tx::CommitDirectory;
@@ -3751,7 +4524,11 @@ mod tests {
             .unwrap();
         for (root, stamp) in [(&before, None), (&after, Some(TxId(3)))] {
             let mut fwd = root
-                .graph_cursor(SourceWindowOwner::Read(reader.clone().into()), node(1), false)
+                .graph_cursor(
+                    SourceWindowOwner::Read(reader.clone().into()),
+                    node(1),
+                    false,
+                )
                 .unwrap();
             let mut selected = 0;
             while let Some(window) = fwd.next_edge().unwrap() {
@@ -3764,7 +4541,11 @@ mod tests {
             }
             assert_eq!(selected, 2);
             let mut rev = root
-                .graph_cursor(SourceWindowOwner::Read(reader.clone().into()), node(200), true)
+                .graph_cursor(
+                    SourceWindowOwner::Read(reader.clone().into()),
+                    node(200),
+                    true,
+                )
                 .unwrap();
             let mut count = 0;
             while let Some(window) = rev.next_edge().unwrap() {
@@ -3806,14 +4587,23 @@ mod tests {
             .unwrap();
         assert_eq!(old.change_log_occurrences(Lsn(9)).unwrap(), 2);
         let mut selected = old
-            .table_change_cursor(SourceWindowOwner::Read(reader.clone().into()), "a", Lsn(9), Lsn(9))
+            .table_change_cursor(
+                SourceWindowOwner::Read(reader.clone().into()),
+                "a",
+                Lsn(9),
+                Lsn(9),
+            )
             .unwrap();
         for entry in &entries {
             assert_eq!(&selected.next_table_change().unwrap().unwrap().value, entry);
         }
         assert!(selected.next_table_change().unwrap().is_none());
         let mut cursor = old
-            .change_log_cursor(SourceWindowOwner::Read(reader.clone().into()), Lsn(9), Lsn(9))
+            .change_log_cursor(
+                SourceWindowOwner::Read(reader.clone().into()),
+                Lsn(9),
+                Lsn(9),
+            )
             .unwrap();
         for entry in &entries {
             assert_eq!(&cursor.next_change().unwrap().unwrap().value, entry);
@@ -3830,16 +4620,24 @@ mod tests {
         assert_eq!(new.change_log_occurrences(Lsn(9)).unwrap(), 1);
         assert_eq!(old.change_log_occurrences(Lsn(9)).unwrap(), 2);
         let mut cursor = new
-            .change_log_cursor(SourceWindowOwner::Read(reader.clone().into()), Lsn(9), Lsn(9))
+            .change_log_cursor(
+                SourceWindowOwner::Read(reader.clone().into()),
+                Lsn(9),
+                Lsn(9),
+            )
             .unwrap();
         assert_eq!(cursor.next_change().unwrap().unwrap().value, entries[0]);
         assert!(cursor.next_change().unwrap().is_none());
         assert!(
-            old.change_log_cursor(SourceWindowOwner::Read(reader.clone().into()), Lsn(9), Lsn(9))
-                .unwrap()
-                .next_change()
-                .unwrap()
-                .is_some()
+            old.change_log_cursor(
+                SourceWindowOwner::Read(reader.clone().into()),
+                Lsn(9),
+                Lsn(9)
+            )
+            .unwrap()
+            .next_change()
+            .unwrap()
+            .is_some()
         );
     }
 }
@@ -3847,7 +4645,10 @@ mod tests {
 impl WriterSnapshot {
     /// Reconcile an independently rooted retained-version range before any
     /// selected value or successful absence escapes its immutable capture.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn visit_historical_rows(
         self: &Arc<Self>,
         table: &str,
@@ -3859,12 +4660,22 @@ impl WriterSnapshot {
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        WriterSnapshotHandle::from(self.clone()).visit_historical_rows(table, row_id, snapshot, read_memory, before, visit)
+        WriterSnapshotHandle::from(self.clone()).visit_historical_rows(
+            table,
+            row_id,
+            snapshot,
+            read_memory,
+            before,
+            visit,
+        )
     }
 }
 
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn visit_historical_rows(
         &self,
         table: &str,
@@ -4091,7 +4902,10 @@ impl WriterReadCursor {
     /// The manifest chooses the next physical identity independently of the
     /// surviving relation; the selected member's bounds, body and closure are
     /// proved before its value or an empty range is returned.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_historical_row_before_handoff<H>(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -4100,7 +4914,8 @@ impl WriterReadCursor {
         use super::content_identity::version_manifest as manifest;
         let SourceWindowOwner::Read(memory) = &self.owner else {
             return Err(Error::Other(
-                "historical row cursor requires its reader child".into()));
+                "historical row cursor requires its reader child".into(),
+            ));
         };
         let memory = memory.clone();
         let table = self
@@ -4419,7 +5234,10 @@ pub(crate) struct NativeConfigBytes {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeConfigBytes {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn join(
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
         parts: &[&[u8]],
@@ -4493,7 +5311,10 @@ impl NativeConfigWindow {
         // Borrowed bincode String decoder validated UTF-8 before the copy.
         std::str::from_utf8(self.text.as_slice()).expect("decoded config UTF-8")
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn incarnation(
         &self,
     ) -> std::result::Result<contextdb_core::Incarnation, NativeConfigFailure> {
@@ -4525,7 +5346,10 @@ struct NativeConfigCursor<'root> {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeConfigCursor<'_> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn next_text(
         &mut self,
     ) -> std::result::Result<Option<NativeConfigWindow>, NativeConfigFailure> {
@@ -4574,7 +5398,10 @@ impl NativeConfigCursor<'_> {
 }
 #[cfg(feature = "sync-orchestration")]
 impl WriterSnapshot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn native_config_text(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4660,7 +5487,10 @@ impl NativeRawConfigView<'_> {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeRawConfigWindow {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn view(&self) -> std::result::Result<NativeRawConfigView<'_>, NativeConfigFailure> {
         use super::native_storage_admission::NativeStorageFailure;
         self.context
@@ -4711,7 +5541,10 @@ pub(crate) struct NativeRawConfigCursor {
 }
 #[cfg(feature = "sync-orchestration")]
 impl NativeRawConfigCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visit_next_group<T>(
         &mut self,
         visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
@@ -4788,7 +5621,10 @@ impl NativeRawConfigCursor {
 
     /// Exact persisted-byte comparison loan on this cursor's original owner,
     /// metadata and captured transaction. It never changes prefix resume state.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn visit_exact<T>(
         &self,
         key: &str,
@@ -4835,7 +5671,10 @@ impl NativeRawConfigCursor {
 
     /// Consume one admitted raw window privately. A retained window can be the
     /// callback result; every later field borrow still checks its weak context.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn visit_next<T>(
         &mut self,
         visit: impl FnOnce(NativeRawConfigWindow) -> std::result::Result<T, NativeConfigFailure>,
@@ -4898,7 +5737,10 @@ impl NativeRawConfigCursor {
 }
 #[cfg(feature = "sync-orchestration")]
 impl WriterSnapshot {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn native_raw_config_prefix(
         self: &Arc<Self>,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4908,9 +5750,13 @@ impl WriterSnapshot {
         contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>,
         NativeConfigFailure,
     > {
-        WriterSnapshotHandle::from(self.clone()).native_raw_config_prefix(operation, context, prefix)
+        WriterSnapshotHandle::from(self.clone())
+            .native_raw_config_prefix(operation, context, prefix)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn native_raw_config_prefix_after(
         self: &Arc<Self>,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4921,9 +5767,13 @@ impl WriterSnapshot {
         contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>,
         NativeConfigFailure,
     > {
-        WriterSnapshotHandle::from(self.clone()).native_raw_config_prefix_after(operation, context, prefix, after)
+        WriterSnapshotHandle::from(self.clone())
+            .native_raw_config_prefix_after(operation, context, prefix, after)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn native_raw_custody_group(
         self: &Arc<Self>,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4935,7 +5785,10 @@ impl WriterSnapshot {
     > {
         WriterSnapshotHandle::from(self.clone()).native_raw_custody_group(operation, context, group)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn require_native_custody_groups(
         &self,
     ) -> std::result::Result<(), NativeConfigFailure> {
@@ -4951,7 +5804,10 @@ impl WriterSnapshot {
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn native_raw_cursor(
         self: &Arc<Self>,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4963,13 +5819,17 @@ impl WriterSnapshot {
         contextdb_core::read_memory::ReadShared<std::sync::Mutex<NativeRawConfigCursor>>,
         NativeConfigFailure,
     > {
-        WriterSnapshotHandle::from(self.clone()).native_raw_cursor(operation, context, prefix, after, group)
+        WriterSnapshotHandle::from(self.clone())
+            .native_raw_cursor(operation, context, prefix, after, group)
     }
 }
 
 #[cfg(feature = "sync-orchestration")]
 impl WriterSnapshotHandle {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn native_raw_config_prefix(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4982,7 +5842,10 @@ impl WriterSnapshotHandle {
         self.native_raw_config_prefix_after(operation, context, prefix, None)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn native_raw_config_prefix_after(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -4999,7 +5862,10 @@ impl WriterSnapshotHandle {
         self.native_raw_cursor(operation, context, &[prefix.as_bytes()], after, false)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn native_raw_custody_group(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -5018,7 +5884,10 @@ impl WriterSnapshotHandle {
         self.native_raw_cursor(operation, context, &[&len, group.as_bytes()], None, true)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn native_raw_cursor(
         &self,
         operation: &crate::owner_read::NativeReadRequest,
@@ -5098,10 +5967,13 @@ impl WriterSnapshotHandle {
 #[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]
 impl RedbPersistence {
     pub(crate) fn visit_registered_vector_roots(
-        &self, operation: &crate::owner_read::NativeReadRequest,
+        &self,
+        operation: &crate::owner_read::NativeReadRequest,
         context: &crate::executor::bounded::NativeReadOpenContext,
-        mut visit: impl FnMut(&WriterSnapshotHandle, bool)
-            -> std::result::Result<(), NativeConfigFailure>,
+        mut visit: impl FnMut(
+            &WriterSnapshotHandle,
+            bool,
+        ) -> std::result::Result<(), NativeConfigFailure>,
     ) -> std::result::Result<u64, NativeConfigFailure> {
         use crate::persistence::native_storage_admission::NativeStorageFailure;
         let unqualified = |e| NativeConfigFailure::Storage(NativeStorageFailure::Unqualified(e));
@@ -5112,10 +5984,15 @@ impl RedbPersistence {
         // This observation's only new root/weak/cursor control is prepaid by
         // the real query. Existing source Arcs keep their original payer.
         let _control = contextdb_core::read_memory::ReadCredit::try_new_owned_native(
-            owner, std::mem::size_of::<WriterSnapshotWeak>()
-                + std::mem::size_of::<WriterSnapshotHandle>() + 2 * std::mem::size_of::<usize>(),
-            "vector_observation", "registered_root_window", HINT,
-        ).map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Refused(e)))?;
+            owner,
+            std::mem::size_of::<WriterSnapshotWeak>()
+                + std::mem::size_of::<WriterSnapshotHandle>()
+                + 2 * std::mem::size_of::<usize>(),
+            "vector_observation",
+            "registered_root_window",
+            HINT,
+        )
+        .map_err(|e| NativeConfigFailure::Storage(NativeStorageFailure::Refused(e)))?;
         let mut position = 0usize;
         let mut visited = 0u64;
         loop {
@@ -5123,15 +6000,23 @@ impl RedbPersistence {
             // Do not drop an upgraded Arc under the registry mutex: its Drop
             // unregisters here. No source/registry list is cloned or retained.
             let next = self.writer_snapshots.lock().get(position).cloned();
-            let Some(next) = next else { break; };
-            position = position.checked_add(1).ok_or(NativeConfigFailure::InvalidCanonicalIndex)?;
-            let Some(root) = next.upgrade() else { continue; };
+            let Some(next) = next else {
+                break;
+            };
+            position = position
+                .checked_add(1)
+                .ok_or(NativeConfigFailure::InvalidCanonicalIndex)?;
+            let Some(root) = next.upgrade() else {
+                continue;
+            };
             root.require_working_store(self).map_err(unqualified)?;
             context.touch_row().map_err(unqualified)?;
             // A true flag is authentic fence state, NOT physical absence and
             // NOT a proof that ordinary or diagnostic consumers lost access.
             visit(&root, root.erased())?;
-            visited = visited.checked_add(1).ok_or(NativeConfigFailure::InvalidCanonicalIndex)?;
+            visited = visited
+                .checked_add(1)
+                .ok_or(NativeConfigFailure::InvalidCanonicalIndex)?;
         }
         context.checkpoint().map_err(unqualified)?;
         // Concurrent removal may shift positions. This number is deliberately
@@ -5141,5 +6026,7 @@ impl RedbPersistence {
 }
 
 impl AsRef<WriterSnapshot> for WriterSnapshotHandle {
-    fn as_ref(&self) -> &WriterSnapshot { self }
+    fn as_ref(&self) -> &WriterSnapshot {
+        self
+    }
 }

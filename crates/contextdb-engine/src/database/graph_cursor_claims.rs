@@ -1,6 +1,6 @@
 //! Immutable transaction decisions retained by a captured graph read.
 use super::*;
-use contextdb_core::read_memory::{ReadCredit};
+use contextdb_core::read_memory::ReadCredit;
 
 #[derive(Clone)]
 pub(crate) struct GraphCursorReadGuard(Arc<GraphDecisionContext>);
@@ -36,7 +36,10 @@ impl GraphDecisionContext {
     pub(super) fn rows(&self, table: &str) -> Option<Arc<contextdb_tx::StatementRows>> {
         self.legacy_rows.get(table).cloned()
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn sealed_rows(
         &self,
         table: &str,
@@ -49,7 +52,10 @@ impl GraphDecisionContext {
             .map(|directory| directory.table_rows(table, memory))
             .transpose()
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn capture_rows(
         ws: &WriteSet,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -74,20 +80,27 @@ impl GraphDecisionContext {
         let mut rows = HashMap::new();
         for (table, _) in &ws.relational_inserts {
             if !rows.contains_key(table)
-                && let Some(image) = ws.ordered_staged_rows.statement_rows(table) {
-                    rows.insert(table.clone(), image);
-                }
+                && let Some(image) = ws.ordered_staged_rows.statement_rows(table)
+            {
+                rows.insert(table.clone(), image);
+            }
         }
         Ok((rows, credit))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn check_table(&self, table: &str) -> Result<()> {
         if let Some(root) = &self.root {
             root.check_table_scope(table)?;
         }
         Ok(())
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn check(&self) -> Result<()> {
         for edge in &self.decisions.row_adj_inserts {
             self.check_table(&edge.owner.table)?;
@@ -104,7 +117,10 @@ impl Database {
                 .map(|(_, guard)| guard.0.clone())
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn capture_graph_decision_metadata(
         &self,
         read: contextdb_tx::manager::EngineRead<'_>,
@@ -252,7 +268,10 @@ impl Database {
             _rows_memory: rows_memory,
         })))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn graph_cursor_prepared_read_guard(
         &self,
         ws: &WriteSet,
@@ -273,7 +292,10 @@ impl Database {
             memory,
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn graph_cursor_held_read_guard(
         &self,
         held: &contextdb_tx::manager::EngineGuard<'_>,
@@ -296,7 +318,10 @@ impl Database {
             memory,
         )
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn graph_cursor_read_guard(
         &self,
         tx: Option<TxId>,
@@ -390,7 +415,10 @@ fn staged_binding<'a>(
     }
 }
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn wrap_graph_bfs_cursor(
         &self,
         _tx: Option<TxId>,
@@ -483,7 +511,8 @@ impl Database {
         (|| {
             let Some((edge, owner)) = staged_binding(&read, position) else {
                 return Err(E::from(Error::SyncError(
-                    "a graph cursor's staged binding was removed while open".into())));
+                    "a graph cursor's staged binding was removed while open".into(),
+                )));
             };
             let bytes = Self::staged_edge_type_bytes(edge.edge_type.len())
                 .saturating_add(owner.map_or(0, |owner| owner.table.len()));

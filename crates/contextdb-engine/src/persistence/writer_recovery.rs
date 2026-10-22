@@ -62,7 +62,10 @@ pub(crate) struct WriterOpenBounds {
 impl RedbPersistence {
     /// The private recovery record is versioned and exactly consumed. It is
     /// deliberately independent of the public serde codec.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn decode_writer_recovery_bounds(bytes: &[u8]) -> Result<WriterRecoveryBounds> {
         if bytes.len() != 49 || bytes[0] != 1 {
             return Err(Error::StoreCorrupted {
@@ -106,7 +109,10 @@ impl RedbPersistence {
         bytes
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_writer_recovery_bounds_in_read(
         read: &redb::ReadTransaction,
     ) -> Result<WriterRecoveryBounds> {
@@ -123,7 +129,10 @@ impl RedbPersistence {
         Self::decode_writer_recovery_bounds(value.value())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_graph_recovery_bounds_in_write(
         write: &redb::WriteTransaction,
     ) -> Result<WriterRecoveryBounds> {
@@ -142,7 +151,10 @@ impl RedbPersistence {
 
     /// Graph callers may raise their two scalars, never overwrite the other
     /// recovery facts or publish a premature root fingerprint.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn write_graph_recovery_bounds_in_write(
         write: &redb::WriteTransaction,
         requested: WriterRecoveryBounds,
@@ -165,7 +177,10 @@ impl RedbPersistence {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn graph_roots_digest(
         mut root_for: impl FnMut(u8) -> Result<Option<[u8; 32]>>,
     ) -> Result<[u8; 32]> {
@@ -180,7 +195,10 @@ impl RedbPersistence {
         Ok(*hasher.finalize().as_bytes())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn config_prefix_exists_at_root(
         root: &WriterSnapshot,
         prefix: &str,
@@ -201,7 +219,10 @@ impl RedbPersistence {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn pruned_change_counts_at_root(
         root: &WriterSnapshotHandle,
         owner: SourceWindowOwner,
@@ -236,7 +257,10 @@ impl RedbPersistence {
         Ok((total, counts))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit_candidates_at_root<F>(
         root: &WriterSnapshot,
         floor_probe: F,
@@ -250,8 +274,7 @@ impl RedbPersistence {
         let SourceWindowOwner::Write(accountant, _) = &owner else {
             unreachable!("internal writer retention owner")
         };
-        let memory: contextdb_core::read_memory::ReadMemoryOwner =
-            accountant.read_budget()?;
+        let memory: contextdb_core::read_memory::ReadMemoryOwner = accountant.read_budget()?;
         graph_read::with_pages(memory, || {
             let _controls = owner.reserve(
                 2 * std::mem::size_of::<redb::ReadOnlyTable<&[u8], &[u8]>>()
@@ -371,7 +394,10 @@ impl RedbPersistence {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit_retention_probe_key(
         root: &WriterSnapshot,
         owner: &SourceWindowOwner,
@@ -382,7 +408,10 @@ impl RedbPersistence {
 
     /// A monotone upper bound can prove that no retained row is future-dated.
     /// Deletes need not lower it: a high stale bound only keeps the exact scan.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn retention_clock_upper_in_read(
         root: &WriterSnapshot,
         table: &str,
@@ -399,7 +428,10 @@ impl RedbPersistence {
             .map(|value| Wallclock(value.value())))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn invalidate_retention_clock_in_write(
         write: &redb::WriteTransaction,
         table: &str,
@@ -412,7 +444,10 @@ impl RedbPersistence {
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_recovery_floors_in_read(
         snapshot: &WriterSnapshot,
     ) -> Result<WriterRecoveryBounds> {
@@ -423,7 +458,10 @@ impl RedbPersistence {
     /// A checkpoint carries non-derivable identity floors even if no retained
     /// row or commit key witnesses them. Destination counts and physical roots
     /// remain those of its own completed copy.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn flush_writer_recovery_floors(&self, source: WriterRecoveryBounds) -> Result<()> {
         let _scratch = self
             .proof_accountant()
@@ -505,7 +543,10 @@ impl RedbPersistence {
             .saturating_mul(std::mem::size_of::<(&str, u64)>())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn write_writer_recovery_bounds_in_write(
         write: &redb::WriteTransaction,
         ws: Option<&WriteSet>,
@@ -517,7 +558,10 @@ impl RedbPersistence {
     /// identity, source and external-row floors to `floors` in the same write
     /// of the bounds record, so a commit that applies many received rows
     /// rewrites that record once.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn write_writer_recovery_bounds_with_floors_in_write(
         write: &redb::WriteTransaction,
         ws: Option<&WriteSet>,
@@ -716,7 +760,10 @@ impl RedbPersistence {
         Self::write_read_bounds_roots_in_write(write)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn raise_table_read_lsn_in_write(
         write: &redb::WriteTransaction,
         table: &str,
@@ -737,7 +784,10 @@ impl RedbPersistence {
 
     /// A point lookup in the already authenticated root. Absence permits
     /// only zero-LSN bootstrap records, never an unbounded durable version.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn table_read_lsn_in_read(
         read: &redb::ReadTransaction,
         table: &str,
@@ -750,7 +800,10 @@ impl RedbPersistence {
     /// Refreshed in the mutation's own transaction, after every recovery
     /// record and schema maximum has been installed. Physical relocation
     /// rebinds these exact same facts; it does not reconstruct their contents.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn write_read_bounds_roots_in_write(write: &redb::WriteTransaction) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         graph_observation_checkpoint(9)?;
@@ -856,7 +909,10 @@ impl RedbPersistence {
     /// Both read routes authenticate the same constant-size committed roots.
     /// Missing bindings are corrupt in a greenfield store; there is no scan
     /// fallback and no upgrade or earlier-format compatibility path.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn authenticate_read_bounds(
         read: &redb::ReadTransaction,
     ) -> Result<AuthenticatedReadBounds<'_>> {
@@ -864,7 +920,10 @@ impl RedbPersistence {
         Ok(AuthenticatedReadBounds { read, bounds })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_authenticated_bounds_in_read(
         read: &redb::ReadTransaction,
     ) -> Result<WriterRecoveryBounds> {
@@ -993,7 +1052,10 @@ impl RedbPersistence {
 
     /// Constant-size root binding, also refreshed after physical relocation.
     /// It authenticates the committed directory without walking history.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn write_commit_directory_root_in_write(
         write: &redb::WriteTransaction,
     ) -> Result<()> {
@@ -1027,16 +1089,31 @@ impl RedbPersistence {
     // the one the relation's producer witness captured with its root when it
     // last closed, so maintaining it costs a commit nothing beyond the
     // relations it actually touched. No identities or row payloads are read.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn verify_writer_relational_count_in_read(
         read: &redb::ReadTransaction,
         table: &str,
         actual: u64,
     ) -> Result<()> {
         let expected = Self::witnessed_row_count_in_read(read, &Self::rel_table_name(table))?
-            .ok_or_else(|| crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), table, "missing saved row cardinality".into()))?;
+            .ok_or_else(|| {
+                crate::funded_error::corruption_text(
+                    crate::read_image_memory::active_owner()
+                        .and_then(|owner| owner.diagnostic_budget()),
+                    table,
+                    "missing saved row cardinality".into(),
+                )
+            })?;
         if expected != actual {
-            return Err(crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), table, "row family cardinality differs from its committed record".into()));
+            return Err(crate::funded_error::corruption_text(
+                crate::read_image_memory::active_owner()
+                    .and_then(|owner| owner.diagnostic_budget()),
+                table,
+                "row family cardinality differs from its committed record".into(),
+            ));
         }
         Ok(())
     }
@@ -1044,7 +1121,10 @@ impl RedbPersistence {
     /// Schema-sized open work: one end-key probe per relation and two commit
     /// end probes. Callers must not reconstruct a directory by walking rows,
     /// graphs, vectors or change history after obtaining these bounds.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn writer_open_bounds<'a>(
         &self,
         tables: impl IntoIterator<Item = &'a str>,
@@ -1059,7 +1139,10 @@ impl RedbPersistence {
     /// Authenticate the recovery half of the existing committed-read binding
     /// before a commit point lookup. Unrelated graph catalogs are not part of
     /// that lookup's source work.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn authenticate_commit_recovery_in_read(
         read: &redb::ReadTransaction,
     ) -> Result<WriterRecoveryBounds> {
@@ -1090,7 +1173,10 @@ impl RedbPersistence {
         Ok(stored)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn read_commit_directory_bounds_in_read(
         read: &redb::ReadTransaction,
         stored: WriterRecoveryBounds,
@@ -1140,7 +1226,10 @@ impl RedbPersistence {
         Ok((count, commit_first, commit_last))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_open_bounds_in_read<'a>(
         read: &redb::ReadTransaction,
         tables: impl IntoIterator<Item = &'a str>,
@@ -1212,7 +1301,12 @@ impl RedbPersistence {
             if let Some((key, _)) = relation.last().map_err(Self::storage_error)? {
                 let key = key.value();
                 if key.len() != 24 {
-                    return Err(crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &name, "relation end key is not a 24-byte version key".into()));
+                    return Err(crate::funded_error::corruption_text(
+                        crate::read_image_memory::active_owner()
+                            .and_then(|owner| owner.diagnostic_budget()),
+                        &name,
+                        "relation end key is not a 24-byte version key".into(),
+                    ));
                 }
                 let row_id = u64::from_be_bytes(key[..8].try_into().expect("validated key width"));
                 bounds.max_row_id = bounds.max_row_id.max(RowId(row_id));
@@ -1223,7 +1317,10 @@ impl RedbPersistence {
 }
 
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn raise_config_identity_floors_in_write(
         write: &redb::WriteTransaction,
         key: &str,
@@ -1238,7 +1335,10 @@ impl RedbPersistence {
 
     /// Snapshot/import batching can install identities without a canonical
     /// commit entry in that batch. Preserve their floors before committing.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn raise_noncanonical_writer_floors_in_write(
         write: &redb::WriteTransaction,
         tx: TxId,
@@ -1265,4 +1365,4 @@ impl RedbPersistence {
     }
 }
 
-use crate::persistence::writer_source::{WriterSnapshotHandle};
+use crate::persistence::writer_source::WriterSnapshotHandle;

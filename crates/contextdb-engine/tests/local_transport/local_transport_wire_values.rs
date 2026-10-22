@@ -1,5 +1,8 @@
 use super::wire_fixture_test_support::FixtureFrame;
-use super::wire_fixture_test_support::{encode_cursor_page, encode_message, encode_query_result, encode_metadata_page};
+use super::wire_fixture_test_support::QueryFixture as QueryResult;
+use super::wire_fixture_test_support::{
+    encode_cursor_page, encode_message, encode_metadata_page, encode_query_result,
+};
 use contextdb_core::read_contract::{
     CursorExpiryKind, CursorPage, HeldByReadersDetail, HeldByWriterDetail, MetadataItem,
     MetadataPage, MetadataPageVocabulary, OwnerLimitExceededDetail, OwnerRouteUnsupportedDetail,
@@ -11,13 +14,13 @@ use contextdb_engine::local_transport::{
     CursorOpenedResponse, CursorPageResponse, FrameBufferAllocator, FrameReader, FrameViolation,
     LocalInboundKind, LocalInboundMessage, LocalOutboundMessage, LocalProtocolBoundary,
     LocalResponse, LocalResponseExpectation, LocalTransportError, MetadataResponse,
-    PayloadViolation, decode_message_exact, };
+    PayloadViolation, decode_message_exact,
+};
 use contextdb_engine::read_contract::{
     CanonicalCascadeReport, CanonicalIndexCandidate, CanonicalQueryResult, CanonicalQueryTrace,
     ReadEncodingError, decode_cursor_page, decode_metadata_page, decode_query_result,
-    };
+};
 use contextdb_engine::{CascadeReport, IndexCandidate, QueryTrace};
-use super::wire_fixture_test_support::QueryFixture as QueryResult;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;

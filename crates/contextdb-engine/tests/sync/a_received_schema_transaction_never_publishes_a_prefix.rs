@@ -322,7 +322,9 @@ impl DatabasePlugin for RejectReceivedSchemaCommit {
     ) -> contextdb_core::Result<()> {
         if source == CommitSource::SyncPull {
             return Err(Error::Other(
-                "injected received-schema pre-commit refusal".to_string().into(),
+                "injected received-schema pre-commit refusal"
+                    .to_string()
+                    .into(),
             ));
         }
         Ok(())

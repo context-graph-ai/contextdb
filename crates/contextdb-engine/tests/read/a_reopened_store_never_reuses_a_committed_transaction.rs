@@ -69,7 +69,8 @@ fn read_committed_history(path: &std::path::Path) {
             kind: DirectImageMetadataKind::ChangeLog,
         })
         .expect("the store's own committed history must read back, not as damage")
-        .body.clone()
+        .body
+        .clone()
     {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(_),
@@ -86,7 +87,8 @@ fn kept_rows(path: &std::path::Path) -> usize {
                     .limits
                     .limits
                     .memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
         let operation_read_memory = declared_read_memory
             .child()
             .expect("admit the committed-content observation owner");

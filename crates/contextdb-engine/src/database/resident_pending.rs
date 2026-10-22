@@ -1,6 +1,6 @@
 //! Immutable pending-delete roots, changed only by lineage publication.
 use super::*;
-use contextdb_core::read_memory::{ReadCredit};
+use contextdb_core::read_memory::ReadCredit;
 use contextdb_relational::membership::MembershipImage;
 use contextdb_relational::store::IndexEntry;
 use parking_lot::{ArcMutexGuard, RawMutex};
@@ -30,7 +30,10 @@ impl PreparedPendingRoot {
         std::mem::swap(&mut self.original.image, &mut self.image);
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn update(
         &mut self,
         key: &str,
@@ -118,7 +121,9 @@ impl PreparedPendingDelta {
 }
 
 pub(super) fn install(state: &mut InMemoryLineageState, delta: InMemoryLineageDelta) {
-    if let Some(image) = delta.connected_membership { state.connected_membership = image; }
+    if let Some(image) = delta.connected_membership {
+        state.connected_membership = image;
+    }
     state.unbound_creations.extend(delta.unbound_creations);
     state.row_sidecars.extend(delta.row_sidecars);
     state.records.extend(delta.records);
@@ -127,7 +132,10 @@ pub(super) fn install(state: &mut InMemoryLineageState, delta: InMemoryLineageDe
 }
 
 impl Database {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn resident_pending_source(&self) -> Result<Arc<Mutex<ResidentPendingSource>>> {
         let mut slot = self.snapshot_registry.pending_delete_source.lock();
         if let Some(source) = slot.as_ref() {
@@ -152,7 +160,10 @@ impl Database {
         Ok(source)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_resident_pending_record(
         &self,
         state: &InMemoryLineageState,
@@ -162,7 +173,10 @@ impl Database {
         self.prepare_resident_pending_changes(state, std::iter::once((key, record)))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_resident_pending_changes<'a>(
         &self,
         state: &InMemoryLineageState,
@@ -181,7 +195,10 @@ impl Database {
         Ok(prepared)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_resident_pending_delta(
         &self,
         records: &HashMap<String, DurableLineageRecord>,
@@ -220,13 +237,16 @@ impl Database {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn coordinate(
     lsn: u64,
     key: &str,
     budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> Result<(ReadCredit, IndexKey)> {
-        let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
+    let budget: contextdb_core::read_memory::ReadMemoryOwner = budget.into();
 
     let credit = ReadCredit::try_new(
         budget,
@@ -261,7 +281,10 @@ pub(super) struct ResidentPendingCursor {
 }
 
 impl ResidentPendingCursor {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn new(
         image: MembershipImage,
         since: Lsn,
@@ -297,7 +320,10 @@ impl ResidentPendingCursor {
         }))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn peek_lsn(&mut self) -> Result<Option<Lsn>> {
         if self.peeked.is_some() {
             return Ok(self.peeked);
@@ -357,7 +383,10 @@ impl ResidentPendingCursor {
         Ok(self.peeked)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn next_record(
         &mut self,
     ) -> Result<

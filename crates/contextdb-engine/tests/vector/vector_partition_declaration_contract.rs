@@ -189,7 +189,8 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
         )
         .unwrap();
     assert_eq!(
-        threshold_partitions.rows()[0][column(&threshold_partitions, "declared_consolidation_mode")],
+        threshold_partitions.rows()[0]
+            [column(&threshold_partitions, "declared_consolidation_mode")],
         Value::Text("thresholds".to_owned())
     );
     assert_eq!(
@@ -314,11 +315,13 @@ fn consolidation_and_maintenance_poll_declarations_round_trip_and_reset() {
         .unwrap();
     assert_eq!(defaulted_partitions.rows().len(), 1);
     assert_eq!(
-        defaulted_partitions.rows()[0][column(&defaulted_partitions, "declared_consolidation_mode")],
+        defaulted_partitions.rows()[0]
+            [column(&defaulted_partitions, "declared_consolidation_mode")],
         Value::Null
     );
     assert_eq!(
-        defaulted_partitions.rows()[0][column(&defaulted_partitions, "effective_consolidation_mode")],
+        defaulted_partitions.rows()[0]
+            [column(&defaulted_partitions, "effective_consolidation_mode")],
         Value::Text("thresholds".to_owned())
     );
 }

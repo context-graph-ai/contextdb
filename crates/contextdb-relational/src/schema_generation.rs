@@ -28,8 +28,14 @@ struct Node {
     _credit: ReadCredit,
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-fn credit(owner: &contextdb_core::read_memory::ReadMemoryOwner, bytes: usize) -> Result<ReadCredit> {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn credit(
+    owner: &contextdb_core::read_memory::ReadMemoryOwner,
+    bytes: usize,
+) -> Result<ReadCredit> {
     ReadCredit::try_new(
         owner.clone(),
         bytes,
@@ -41,7 +47,10 @@ fn credit(owner: &contextdb_core::read_memory::ReadMemoryOwner, bytes: usize) ->
 fn height(root: &Root) -> u16 {
     root.as_ref().map_or(0, |node| node.height)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn node(
     owner: &contextdb_core::read_memory::ReadMemoryOwner,
     key: Key,
@@ -62,7 +71,10 @@ fn node(
         _credit: paid,
     }))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn balanced(
     owner: &contextdb_core::read_memory::ReadMemoryOwner,
     key: Key,
@@ -106,7 +118,10 @@ fn balanced(
     }
     node(owner, key, body, left, right)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn insert(
     root: &Root,
     key: Key,
@@ -149,8 +164,15 @@ fn get(root: &Root, key: Key) -> Option<&Arc<Body>> {
     }
     None
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-fn remove(root: &Root, key: Key, owner: &contextdb_core::read_memory::ReadMemoryOwner) -> Result<Root> {
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn remove(
+    root: &Root,
+    key: Key,
+    owner: &contextdb_core::read_memory::ReadMemoryOwner,
+) -> Result<Root> {
     let Some(n) = root else {
         return Ok(None);
     };
@@ -215,7 +237,10 @@ impl PreparedSchemaHistoryErasure {
 }
 
 impl History {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare<'a>(
         &self,
         tables: impl IntoIterator<Item = (&'a str, &'a TableMeta, &'a [VersionedRow])>,
@@ -270,7 +295,10 @@ impl History {
             _credit: control,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_erasure(
         &self,
         keys: impl IntoIterator<Item = (RowId, Lsn)>,
@@ -311,12 +339,18 @@ impl History {
         }
         self.root = prepared.root;
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn visit_all(
         &self,
         mut consume: impl FnMut(&str, &TableMeta, &VersionedRow) -> Result<()>,
     ) -> Result<()> {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn walk(
             root: &Root,
             consume: &mut dyn FnMut(&str, &TableMeta, &VersionedRow) -> Result<()>,
@@ -337,14 +371,20 @@ impl History {
         walk(&self.root, &mut consume)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn visit_row(
         &self,
         table: &str,
         row: RowId,
         mut consume: impl FnMut(&VersionedRow) -> Result<()>,
     ) -> Result<()> {
-        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+        #[expect(
+            clippy::result_large_err,
+            reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+        )]
         fn walk(
             root: &Root,
             table: &str,
@@ -357,7 +397,8 @@ impl History {
             if node.key.0 >= row {
                 walk(&node.left, table, row, consume)?;
             }
-            if node.key.0 == row && node.body.declaration.table == table
+            if node.key.0 == row
+                && node.body.declaration.table == table
                 && let Some(body) = node.body.row.lock().as_ref()
             {
                 consume(body)?;
@@ -370,7 +411,10 @@ impl History {
         walk(&self.root, table, row, &mut consume)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn with_row<T>(
         &self,
         table: &str,
@@ -391,18 +435,42 @@ impl History {
 
 impl PreparedSchemaGeneration {
     #[doc(hidden)]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub fn retain_owned(&mut self, table: &str, meta: &TableMeta, row: &VersionedRow,
-        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn retain_owned(
+        &mut self,
+        table: &str,
+        meta: &TableMeta,
+        row: &VersionedRow,
+        owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<()> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
-        let key = (row.row_id,row.lsn);
-        if get(&self.root,key).is_some() { return Ok(()); }
-        let declaration_credit = credit(&owner,meta.estimated_bytes()+table.len()+std::mem::size_of::<Declaration>()+16)?;
-        let body_credit = credit(&owner,row.estimated_bytes()+std::mem::size_of::<Body>()+16)?;
-        let declaration = Arc::new(Declaration { table: table.into(), meta: meta.clone(), _credit: declaration_credit });
-        let body = Arc::new(Body { row: Mutex::new(Some(row.clone())), declaration, _credit: body_credit });
-        self.root = insert(&self.root,key,body,&owner)?;
+        let key = (row.row_id, row.lsn);
+        if get(&self.root, key).is_some() {
+            return Ok(());
+        }
+        let declaration_credit = credit(
+            &owner,
+            meta.estimated_bytes() + table.len() + std::mem::size_of::<Declaration>() + 16,
+        )?;
+        let body_credit = credit(
+            &owner,
+            row.estimated_bytes() + std::mem::size_of::<Body>() + 16,
+        )?;
+        let declaration = Arc::new(Declaration {
+            table: table.into(),
+            meta: meta.clone(),
+            _credit: declaration_credit,
+        });
+        let body = Arc::new(Body {
+            row: Mutex::new(Some(row.clone())),
+            declaration,
+            _credit: body_credit,
+        });
+        self.root = insert(&self.root, key, body, &owner)?;
         Ok(())
     }
 }

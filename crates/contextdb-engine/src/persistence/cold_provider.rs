@@ -24,7 +24,10 @@ pub(crate) struct ColdCommittedProvider<'root> {
 }
 
 impl<'root> ColdCommittedProvider<'root> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn capture(root: &'root WriterSnapshot) -> Result<Self> {
         Ok(Self {
             root,
@@ -36,7 +39,10 @@ impl<'root> ColdCommittedProvider<'root> {
         ColdRootIdentity(self.read.storage_snapshot_identity())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn validate_original(
         &self,
         original: &OwnedMemoryReservation,
@@ -57,7 +63,10 @@ impl<'root> ColdCommittedProvider<'root> {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit_floor_unqualified(
         &self,
         upper: Bound<Lsn>,
@@ -66,7 +75,10 @@ impl<'root> ColdCommittedProvider<'root> {
     }
 
     /// Count and end-key bounds only; no directory or body scan at startup.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn commit_bounds_unqualified(
         &self,
     ) -> Result<super::super::writer_commit_directory::ColdCommitBounds> {
@@ -75,7 +87,10 @@ impl<'root> ColdCommittedProvider<'root> {
 
     /// End-key startup probes in the captured root, with no payload decode.
     /// Recovery authentication and lower storage admission remain unqualified.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn open_bounds_unqualified(
         &self,
         original: &OwnedMemoryReservation,
@@ -124,7 +139,10 @@ impl<'root> ColdCommittedProvider<'root> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn row_cursor_unqualified<'source, 'original>(
         &'source self,
         original: &'original OwnedMemoryReservation,
@@ -151,7 +169,10 @@ impl<'root> ColdCommittedProvider<'root> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn exact_row_unqualified<'source, 'original>(
         &'source self,
         original: &'original OwnedMemoryReservation,
@@ -173,7 +194,10 @@ impl<'root> ColdCommittedProvider<'root> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn graph_cursor_unqualified<'source, 'original>(
         &'source self,
         original: &'original OwnedMemoryReservation,
@@ -209,7 +233,10 @@ struct OriginalBuffer {
     _allocation: OwnedMemoryReservation,
 }
 impl OriginalBuffer {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn copy(original: &OwnedMemoryReservation, bytes: &[u8]) -> Result<Self> {
         let (bytes, allocation) = copy_owned_native_slice(original, bytes)?;
         Ok(Self {
@@ -217,7 +244,10 @@ impl OriginalBuffer {
             _allocation: allocation,
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn join(original: &OwnedMemoryReservation, parts: &[&[u8]]) -> Result<Self> {
         let len = parts
             .iter()
@@ -234,7 +264,10 @@ impl OriginalBuffer {
         }
         Ok(result)
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prefix_end(original: &OwnedMemoryReservation, prefix: &[u8]) -> Result<Option<Self>> {
         let Some(last) = prefix.iter().rposition(|byte| *byte != u8::MAX) else {
             return Ok(None);
@@ -262,7 +295,10 @@ impl ColdByteCursor<'_, '_, '_> {
     /// Lent guards cannot escape this synchronous callback. Caller-owned typed
     /// decode/proof is still required for rows and graph lifecycle records.
     /// Failed cancellation, admission or callback leaves the resume key intact.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lend_next_unqualified<T>(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -337,7 +373,10 @@ pub(crate) struct PreparedColdSuccessor<'p, 'o> {
     _control: OwnedMemoryReservation,
 }
 impl RedbPersistence {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn prepare_cold_successor<'p, 'o>(
         &'p self,
         original: &'o OwnedMemoryReservation,
@@ -375,7 +414,10 @@ impl RedbPersistence {
 impl PreparedColdSuccessor<'_, '_> {
     /// Preflight MUST refuse before durability. Calling the old root constructor
     /// here would silently admit neither redb allocations nor registry growth.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn publication_preflight(&self) -> Result<()> {
         let accountant = self
             .persistence
@@ -397,7 +439,10 @@ impl ColdCommittedProvider<'_> {
         private_interfaces,
         reason = "the type is crate-private on purpose; the crate-visible item is only reachable inside the crate"
     )]
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn scalar_metadata_unqualified(
         &self,
     ) -> Result<super::super::native_storage_admission::ColdMetadataOwner> {
@@ -417,7 +462,10 @@ impl ColdCommittedProvider<'_> {
     /// cache refusal, callback and erasure errors remain unqualified.
     /// The inner result retains lower inline faults without error formatting;
     /// admission returns the original scalar through the outer result first.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lend_exact_row_body_original_unqualified<T>(
         &self,
         original: &OwnedMemoryReservation,
@@ -444,7 +492,10 @@ impl ColdCommittedProvider<'_> {
 
     /// Same storage primitive and captured transaction, with one actual native
     /// operation child. Never uses child(), the legacy budget, or writer memory.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lend_exact_row_body_reader_unqualified<T>(
         &self,
         declared: &crate::vector_read_memory::DeclaredReadRoot,
@@ -470,7 +521,10 @@ impl ColdCommittedProvider<'_> {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn lend_exact_body_in_scope<T>(
         &self,
         logical: &str,
@@ -496,7 +550,10 @@ impl ColdCommittedProvider<'_> {
 impl ColdCommittedProvider<'_> {
     /// Descriptor of THIS retained transaction, paid by the original request.
     /// Existing store-funded descriptors and bootstrap are unchanged.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn native_read_metadata(
         &self,
         owner: &contextdb_core::read_memory::ReadMemoryOwner,
@@ -530,7 +587,10 @@ impl ColdCommittedProvider<'_> {
     /// Exact config lookup in the same cold transaction as the original cursor.
     /// The scalar storage refusal is extracted BEFORE any callback/body error.
     /// Text-table/cache/backend/erasure errors retain typed Unqualified egress.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lend_native_read<T, E>(
         &self,
         scope: &super::super::native_storage_admission::StorageAdmissionScope,
@@ -580,7 +640,10 @@ pub(crate) struct NativeConfigRangeSource {
 }
 #[cfg(feature = "sync-orchestration")]
 impl ColdCommittedProvider<'_> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn into_native_config_range(
         self,
         root: WriterSnapshotHandle,
@@ -602,7 +665,10 @@ impl NativeConfigRangeSource {
 
     /// Actual CONFIG_TABLE range producer. The callback receives only actual
     /// immutable page guards; refusal extraction precedes callback/cold errors.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lend_next_native_config<T, E>(
         &self,
         scope: &super::super::native_storage_admission::StorageAdmissionScope,
@@ -668,7 +734,10 @@ impl NativeConfigRangeSource {
             // Erasure fence spans callback and raw page construction.
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn lend_next_native_group<T, E>(
         &self,
         scope: &super::super::native_storage_admission::StorageAdmissionScope,
@@ -741,4 +810,4 @@ impl NativeConfigRangeSource {
 #[path = "vector_physical_observation.rs"]
 pub(crate) mod physical_vector;
 
-use crate::persistence::writer_source::{WriterSnapshotHandle};
+use crate::persistence::writer_source::WriterSnapshotHandle;

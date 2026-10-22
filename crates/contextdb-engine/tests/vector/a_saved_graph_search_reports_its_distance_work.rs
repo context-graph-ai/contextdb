@@ -300,7 +300,11 @@ fn a_saved_graph_search_reports_its_distance_work() {
         LIMIT,
         "INDEXED answers a full page"
     );
-    assert_eq!(exact.answer.rows().len(), LIMIT, "EXACT answers a full page");
+    assert_eq!(
+        exact.answer.rows().len(),
+        LIMIT,
+        "EXACT answers a full page"
+    );
     assert!(
         matches!(
             indexed.route(),

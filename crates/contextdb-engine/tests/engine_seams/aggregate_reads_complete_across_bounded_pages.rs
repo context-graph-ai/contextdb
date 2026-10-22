@@ -269,7 +269,10 @@ fn sum_of_a_byte_column_agrees_on_every_route() {
     let expected = Value::Int64(seeded.expected_sum);
     println!(
         "OBSERVED byte total over {} chunks: executor {:?} | in-process {:?} | direct file {:?}",
-        seeded.expected_rows, eager.rows(), embedded.rows(), direct.rows()
+        seeded.expected_rows,
+        eager.rows(),
+        embedded.rows(),
+        direct.rows()
     );
 
     for (what, answer) in [
@@ -310,11 +313,13 @@ fn sum_of_a_byte_column_agrees_on_every_route() {
     );
 
     assert_eq!(
-        embedded.columns(), eager.columns(),
+        embedded.columns(),
+        eager.columns(),
         "the doors must not disagree about what the total is called"
     );
     assert_eq!(
-        direct.columns(), eager.columns(),
+        direct.columns(),
+        eager.columns(),
         "the doors must not disagree about what the total is called"
     );
 
@@ -324,16 +329,20 @@ fn sum_of_a_byte_column_agrees_on_every_route() {
          the figure an operator reads to size a query is unusable"
     );
     assert_eq!(
-        embedded.trace().rows_examined, eager.trace().rows_examined,
+        embedded.trace().rows_examined,
+        eager.trace().rows_examined,
         "an in-process bounded read examined {} rows where the executor examined {} for the same \
          statement over the same committed rows",
-        embedded.trace().rows_examined, eager.trace().rows_examined
+        embedded.trace().rows_examined,
+        eager.trace().rows_examined
     );
     assert_eq!(
-        direct.trace().rows_examined, eager.trace().rows_examined,
+        direct.trace().rows_examined,
+        eager.trace().rows_examined,
         "a direct read of the closed file examined {} rows where the executor examined {} for the \
          same statement over the same committed rows",
-        direct.trace().rows_examined, eager.trace().rows_examined
+        direct.trace().rows_examined,
+        eager.trace().rows_examined
     );
 }
 

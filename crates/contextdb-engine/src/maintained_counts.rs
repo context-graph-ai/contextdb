@@ -124,7 +124,10 @@ pub(crate) fn every_maintained_prefix(meta: &TableMeta) -> Vec<Vec<(String, Sort
 /// Every refusal names the offending list and the indexes that were
 /// considered, because the author's next move is either to fix the list or to
 /// add the index that would carry it.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn validate_maintained_counts_for_meta(table: &str, meta: &TableMeta) -> Result<()> {
     let Some(MaintainedCounts::Lists(lists)) = meta.maintained_counts.as_ref() else {
         return Ok(());

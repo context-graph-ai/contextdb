@@ -45,7 +45,8 @@ impl FailedMaintenancePartitions {
                     && entry.catalog.partition_key == route.partition_key
             })
         }) || self.sources.as_ref().is_some_and(|sources| {
-            sources.try_partition_state(&route.index, &route.partition_key)
+            sources
+                .try_partition_state(&route.index, &route.partition_key)
                 .and_then(|state| state.source_maintenance_metadata().failure)
                 .is_some_and(|failure| failure.operation == CLEANUP)
         })
@@ -135,7 +136,10 @@ struct MaintenanceIndexes {
 }
 
 impl MaintenanceContext {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn maintenance_indexes(&self) -> Result<MaintenanceIndexes> {
         let mut memory = OwnedMemoryReservation::new(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
@@ -169,7 +173,10 @@ impl MaintenanceContext {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn maintenance_workspace(
         &self,
         bytes: usize,
@@ -183,7 +190,10 @@ impl MaintenanceContext {
         )
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn admit_inventory_slot<T>(
         &self,
         _slot: &'static str,
@@ -209,12 +219,18 @@ impl MaintenanceContext {
 
     /// Caller holds the existing commit boundary. Strong state handles are
     /// consumed before it releases, so DDL cannot detach their directory owner.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn maintenance_inventory_phase_locked(&self) -> Result<InventoryPhase> {
         self.maintenance_inventory_phase_with_catalog_retention_locked(true)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn maintenance_inventory_phase_with_catalog_retention_locked(
         &self,
         retain_catalogs: bool,
@@ -653,40 +669,62 @@ impl MaintenanceContext {
     /// Capture the fixed catalog root after validating all source attribution.
     /// Decoded catalogs are released as validation proceeds; only the borrowed
     /// source outcomes remain beside the cursor through this finite pass.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn maintenance_catalog_stream_locked(&self) -> Result<MaintenanceCatalogStream> {
         let phase = self.maintenance_inventory_phase_with_catalog_retention_locked(false)?;
         // A durable cleanup failure stays visible until its retry completes.
         // Preserve that marker while releasing every sampled strong source
         // before callbacks can retire a registry's original directory owner.
         for source in &phase.sources {
-            let pending = source.metadata.failure.filter(|failure|
-                failure.operation == CLEANUP && failure.message.contains("durable"));
+            let pending = source.metadata.failure.filter(|failure| {
+                failure.operation == CLEANUP && failure.message.contains("durable")
+            });
             self.vector.apply_partition_source_maintenance_metadata(
-                &phase.indexes.indexes[source.index], &source.state,
-                source.failure.or(pending), source.quarantine,
+                &phase.indexes.indexes[source.index],
+                &source.state,
+                source.failure.or(pending),
+                source.quarantine,
             );
         }
         let cursor = if phase.complete {
             match self.persistence.as_ref() {
-                Some(persistence) => vector_source_page_admission::with_preparation_source_page_admission(
-                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                    || persistence.maintenance_vector_catalog_cursor(),
-                )?,
+                Some(persistence) => {
+                    vector_source_page_admission::with_preparation_source_page_admission(
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &self.finalization.accountant,
+                        ),
+                        || persistence.maintenance_vector_catalog_cursor(),
+                    )?
+                }
                 None => None,
             }
-        } else { None };
-        Ok(MaintenanceCatalogStream { inventory: Self::release_inventory_sources(phase), cursor })
+        } else {
+            None
+        };
+        Ok(MaintenanceCatalogStream {
+            inventory: Self::release_inventory_sources(phase),
+            cursor,
+        })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn maintenance_catalog_stream(&self) -> Result<MaintenanceCatalogStream> {
-        self.tx_mgr.with_commit_lock(|| self.maintenance_catalog_stream_locked())
+        self.tx_mgr
+            .with_commit_lock(|| self.maintenance_catalog_stream_locked())
     }
 
     /// Consume the captured root one catalog at a time. A callback retains only
     /// failed work; successful entries physically drop before the next decode.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn visit_maintenance_catalog_stream(
         &self,
         mut stream: MaintenanceCatalogStream,
@@ -696,66 +734,112 @@ impl MaintenanceContext {
         let mut memory = OwnedMemoryReservation::new(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
         );
-        let mut failures = MaintenanceMetadataFailures { first: stream.inventory.failures.first };
-        if let (Some(persistence), Some(cursor)) = (self.persistence.as_ref(), stream.cursor.as_mut()) {
+        let mut failures = MaintenanceMetadataFailures {
+            first: stream.inventory.failures.first,
+        };
+        if let (Some(persistence), Some(cursor)) =
+            (self.persistence.as_ref(), stream.cursor.as_mut())
+        {
             loop {
                 self.build_checkpoint()?;
                 let next = vector_source_page_admission::with_preparation_source_page_admission(
-                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                    || cursor.next().transpose().map_err(RedbPersistence::storage_error),
+                    crate::memory_accounting::AccountantHandle::clone(
+                        &self.finalization.accountant,
+                    ),
+                    || {
+                        cursor
+                            .next()
+                            .transpose()
+                            .map_err(RedbPersistence::storage_error)
+                    },
                 );
                 let handle = match next {
                     Ok(Some(handle)) => handle,
                     Ok(None) => break,
                     Err(error @ Error::MemoryBudgetExceeded { .. }) => {
-                        failures.first.get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
+                        failures.first.get_or_insert_with(|| {
+                            VectorMaintenanceFailureDetails::from_error(&error)
+                        });
                         break;
                     }
                     Err(error) => return Err(error),
                 };
-                let inspected = vector_source_page_admission::with_preparation_source_page_admission(
-                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                    || -> Result<Option<AdmittedMaintenanceCatalog>> {
-                        let (_key, encoded) = handle.materialize().map_err(RedbPersistence::storage_error)?;
-                        let mut workspace = self.maintenance_workspace(
-                            RedbPersistence::maintenance_vector_catalog_decode_bound(encoded.value().len()),
-                            PREPARE,
-                        )?;
-                        let catalog = match persistence.decode_maintenance_vector_catalog(encoded.value()) {
-                            Ok(catalog) => catalog,
-                            Err(Error::StoreCorrupted { .. }) => return Ok(None),
-                            Err(error) => return Err(error),
-                        };
-                        let mut frames = OwnedMemoryReservation::new(
-                            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                        );
-                        frames.try_grow_for(
-                            RedbPersistence::maintenance_catalog_key_frame_bytes(&catalog.partition_key),
-                            "vector_maintenance", PREPARE, HINT,
-                        )?;
-                        if !RedbPersistence::maintenance_catalog_key_matches(&handle, &catalog.index, &catalog.partition_key)? {
-                            return Ok(None);
-                        }
-                        drop(frames);
-                        let metadata = self.vector.try_partition_state(&catalog.index, &catalog.partition_key)
-                            .map(|state| state.source_maintenance_metadata());
-                        if metadata.is_some_and(|metadata| metadata.quarantine.is_some()) {
-                            return Ok(None);
-                        }
-                        let pending_cleanup = metadata.and_then(|metadata| metadata.failure)
-                            .is_some_and(|failure| failure.operation == CLEANUP && failure.message.contains("durable"));
-                        workspace.resize_static(
-                            RedbPersistence::maintenance_vector_catalog_heap_bytes(&catalog),
-                            if pending_cleanup { CLEANUP } else { PREPARE }, HINT,
-                        )?;
-                        Ok(Some(AdmittedMaintenanceCatalog { catalog, workspace, pending_cleanup, source: None }))
-                    },
-                );
+                let inspected =
+                    vector_source_page_admission::with_preparation_source_page_admission(
+                        crate::memory_accounting::AccountantHandle::clone(
+                            &self.finalization.accountant,
+                        ),
+                        || -> Result<Option<AdmittedMaintenanceCatalog>> {
+                            let (_key, encoded) = handle
+                                .materialize()
+                                .map_err(RedbPersistence::storage_error)?;
+                            let mut workspace = self.maintenance_workspace(
+                                RedbPersistence::maintenance_vector_catalog_decode_bound(
+                                    encoded.value().len(),
+                                ),
+                                PREPARE,
+                            )?;
+                            let catalog = match persistence
+                                .decode_maintenance_vector_catalog(encoded.value())
+                            {
+                                Ok(catalog) => catalog,
+                                Err(Error::StoreCorrupted { .. }) => return Ok(None),
+                                Err(error) => return Err(error),
+                            };
+                            let mut frames = OwnedMemoryReservation::new(
+                                crate::memory_accounting::AccountantHandle::clone(
+                                    &self.finalization.accountant,
+                                ),
+                            );
+                            frames.try_grow_for(
+                                RedbPersistence::maintenance_catalog_key_frame_bytes(
+                                    &catalog.partition_key,
+                                ),
+                                "vector_maintenance",
+                                PREPARE,
+                                HINT,
+                            )?;
+                            if !RedbPersistence::maintenance_catalog_key_matches(
+                                &handle,
+                                &catalog.index,
+                                &catalog.partition_key,
+                            )? {
+                                return Ok(None);
+                            }
+                            drop(frames);
+                            let metadata = self
+                                .vector
+                                .try_partition_state(&catalog.index, &catalog.partition_key)
+                                .map(|state| state.source_maintenance_metadata());
+                            if metadata.is_some_and(|metadata| metadata.quarantine.is_some()) {
+                                return Ok(None);
+                            }
+                            let pending_cleanup = metadata
+                                .and_then(|metadata| metadata.failure)
+                                .is_some_and(|failure| {
+                                    failure.operation == CLEANUP
+                                        && failure.message.contains("durable")
+                                });
+                            workspace.resize_static(
+                                RedbPersistence::maintenance_vector_catalog_heap_bytes(&catalog),
+                                if pending_cleanup { CLEANUP } else { PREPARE },
+                                HINT,
+                            )?;
+                            Ok(Some(AdmittedMaintenanceCatalog {
+                                catalog,
+                                workspace,
+                                pending_cleanup,
+                                source: None,
+                            }))
+                        },
+                    );
                 let mut entry = match inspected {
                     Ok(Some(entry)) => entry,
                     Ok(None) => continue,
                     Err(error @ Error::MemoryBudgetExceeded { .. }) => {
-                        failures.first.get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
+                        failures.first.get_or_insert_with(|| {
+                            VectorMaintenanceFailureDetails::from_error(&error)
+                        });
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -764,7 +848,9 @@ impl MaintenanceContext {
                     match self.admit_inventory_slot("catalogs", &mut memory, &mut retained) {
                         Ok(()) => {}
                         Err(error @ Error::MemoryBudgetExceeded { .. }) => {
-                            failures.first.get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
+                            failures.first.get_or_insert_with(|| {
+                                VectorMaintenanceFailureDetails::from_error(&error)
+                            });
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -782,7 +868,10 @@ impl MaintenanceContext {
         })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn maintenance_catalog_inventory_locked(
         &self,
     ) -> Result<MaintenanceCatalogInventory> {
@@ -790,7 +879,10 @@ impl MaintenanceContext {
         Ok(self.finish_inventory_phase_locked(phase))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn maintenance_catalog_inventory(&self) -> Result<MaintenanceCatalogInventory> {
         self.tx_mgr
             .with_commit_lock(|| self.maintenance_catalog_inventory_locked())
@@ -826,7 +918,10 @@ impl MaintenanceContext {
     /// Reclaim selected source graphs one route at a time. Strong source
     /// handles are released before the caller retires registry states, and
     /// no list of unrelated owned routes occupies reclamation headroom.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reclaim_closing_source_graphs_locked(
         &self,
         registered_snapshots: &[SnapshotId],
@@ -839,26 +934,34 @@ impl MaintenanceContext {
         for (index_position, index) in phase.indexes.indexes.iter().enumerate() {
             for position in 0..phase.sources.len() {
                 let source = &phase.sources[position];
-                if source.index != index_position || source.failed || source.metadata.historical_only {
+                if source.index != index_position
+                    || source.failed
+                    || source.metadata.historical_only
+                {
                     continue;
                 }
                 let mut route = None;
-                let captured = self.vector.with_partition_sources(index, |view| -> Result<()> {
-                    view.visit(|key, state| -> Result<()> {
-                        if !Arc::ptr_eq(state, &source.state) { return Ok(()); }
-                        let heap = key.estimated_bytes()
-                            .saturating_sub(std::mem::size_of::<VectorPartitionKey>())
-                            .saturating_add(index.table.len())
-                            .saturating_add(index.column.len());
-                        let workspace = self.maintenance_workspace(heap, PREPARE)?;
-                        route = Some(MaintenanceBuildCandidate {
-                            partition: VectorPartitionRef::new(index.clone(), key.clone()),
-                            cold: false,
-                            _workspace: workspace,
-                        });
-                        Ok(())
-                    })
-                });
+                let captured = self
+                    .vector
+                    .with_partition_sources(index, |view| -> Result<()> {
+                        view.visit(|key, state| -> Result<()> {
+                            if !Arc::ptr_eq(state, &source.state) {
+                                return Ok(());
+                            }
+                            let heap = key
+                                .estimated_bytes()
+                                .saturating_sub(std::mem::size_of::<VectorPartitionKey>())
+                                .saturating_add(index.table.len())
+                                .saturating_add(index.column.len());
+                            let workspace = self.maintenance_workspace(heap, PREPARE)?;
+                            route = Some(MaintenanceBuildCandidate {
+                                partition: VectorPartitionRef::new(index.clone(), key.clone()),
+                                cold: false,
+                                _workspace: workspace,
+                            });
+                            Ok(())
+                        })
+                    });
                 match captured {
                     Ok(()) => {}
                     Err(error @ Error::MemoryBudgetExceeded { .. }) => {
@@ -872,9 +975,11 @@ impl MaintenanceContext {
                 }
                 if let Some(route) = route {
                     reclaimed = reclaimed.saturating_add(
-                        self.vector.reclaim_snapshot_free_partition_graph_generations(
-                            &route.partition, registered_snapshots,
-                        ),
+                        self.vector
+                            .reclaim_snapshot_free_partition_graph_generations(
+                                &route.partition,
+                                registered_snapshots,
+                            ),
                     );
                 }
             }
@@ -882,7 +987,10 @@ impl MaintenanceContext {
         Ok((self.finish_inventory_phase_locked(phase), reclaimed))
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reclaim_catalogs_locked(
         &self,
         inventory: &mut MaintenanceCatalogInventory,
@@ -987,7 +1095,10 @@ impl MaintenanceContext {
         Ok(reclaimed)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn maintenance_build_candidates(&self) -> Result<MaintenanceBuildCandidates> {
         let mut maintenance_vector_copy_owner = contextdb_vector::VectorCopyAdmission::new(
             contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),

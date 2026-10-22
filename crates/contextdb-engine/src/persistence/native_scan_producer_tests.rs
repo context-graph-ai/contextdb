@@ -36,10 +36,12 @@ struct Reader {
 }
 impl Reader {
     fn new(limit: u64) -> Self {
-        let parent = DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
-        let (child, _) = crate::vector_read_memory::statement_child_proof::observe(
-            &parent, limit, || parent.child().unwrap(),
-        );
+        let parent =
+            DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
+        let (child, _) =
+            crate::vector_read_memory::statement_child_proof::observe(&parent, limit, || {
+                parent.child().unwrap()
+            });
         let counter = declared_child_observer(&child)
             .unwrap()
             .physical_funding_counter_for_test();
@@ -64,7 +66,12 @@ impl Reader {
         } = self;
         drop(scope);
         drop(child);
-        assert_eq!(parent.retained_bytes_for_test(), crate::vector_read_memory::native_control_layouts_for_test().0.size() as u64);
+        assert_eq!(
+            parent.retained_bytes_for_test(),
+            crate::vector_read_memory::native_control_layouts_for_test()
+                .0
+                .size() as u64
+        );
         parent.assert_final_root_free_for_test();
     }
     fn allowance(&self) -> ScanAllowance {
@@ -421,15 +428,24 @@ fn native_scan_nested_helpers_and_every_drop_order_share_monotone_allowances() {
             drop(middle);
             drop(helper);
         });
-        assert_eq!(count, 6, "only three actual node/receipt pairs in the entire interval");
+        assert_eq!(
+            count, 6,
+            "only three actual node/receipt pairs in the entire interval"
+        );
         {
             let measured = MEASUREMENT.lock().unwrap();
-            assert_eq!(measured.payload_live, 0, "no scan control or TLS backing survives the final guard");
-            assert_eq!(measured.live, 0, "including every oracle-wrapped allocation");
+            assert_eq!(
+                measured.payload_live, 0,
+                "no scan control or TLS backing survives the final guard"
+            );
+            assert_eq!(
+                measured.live, 0,
+                "including every oracle-wrapped allocation"
+            );
         }
         assert_eq!(reader.used(), before);
         assert_eq!(ScanAllowance::current_node_for_test(), 0);
-        drop((a,b));
+        drop((a, b));
         reader.finish();
     })
     .join()
@@ -511,7 +527,12 @@ fn native_scan_error_and_unwind_restore_scope_and_physically_free_entries() {
         assert_eq!(parent.retained_bytes_for_test() as usize, child_control);
         disarm_source_free_watch();
         drop(child);
-        assert_eq!(parent.retained_bytes_for_test(), crate::vector_read_memory::native_control_layouts_for_test().0.size() as u64);
+        assert_eq!(
+            parent.retained_bytes_for_test(),
+            crate::vector_read_memory::native_control_layouts_for_test()
+                .0
+                .size() as u64
+        );
         parent.assert_final_root_free_for_test();
     }
 }

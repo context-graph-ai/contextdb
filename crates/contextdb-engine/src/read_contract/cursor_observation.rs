@@ -202,7 +202,10 @@ pub(crate) struct CanonicalObservedCursorPage {
     memory: Option<crate::read_image_memory::ImageMemoryHandle>,
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_observed_cursor_page(
     page: &CursorPage,
     observation: &CursorObservation,
@@ -211,27 +214,42 @@ pub(crate) fn encode_observed_cursor_page(
         .map_err(|_| ReadEncodingError::InvalidPayload)?;
     encode(&BorrowedObservedPage::new(page, observation))
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_observed_cursor_page_funded(
     page: &CursorPage,
     observation: &CursorObservation,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
-    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
-    encode_transport_funded(&BorrowedObservedPage::new(page, observation), Some(owner), memory_ceiling)
+    page.validate()
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    encode_transport_funded(
+        &BorrowedObservedPage::new(page, observation),
+        Some(owner),
+        memory_ceiling,
+    )
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn observed_cursor_page_encoded_size(
     page: &CursorPage,
     observation: &CursorObservation,
 ) -> Result<usize, ReadEncodingError> {
-    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    page.validate()
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
     encoded_size(&BorrowedObservedPage::new(page, observation))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_observed_cursor_page(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -243,7 +261,10 @@ pub(crate) fn decode_observed_cursor_page(
     Ok(observed)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_observed_cursor_page_with_memory(
     bytes: &[u8],
     memory: &crate::read_image_memory::ImageMemoryHandle,

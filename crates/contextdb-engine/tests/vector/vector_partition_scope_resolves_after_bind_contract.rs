@@ -92,7 +92,8 @@ fn show_partitions(db: &Database) -> QueryResult {
 fn drive_to_ready(db: &Database) {
     for _ in 0..MAX_FINITE_CYCLES {
         let partitions = show_partitions(db);
-        if (0..partitions.rows().len()).all(|row| text(&partitions, row, "query_state") == "ready") {
+        if (0..partitions.rows().len()).all(|row| text(&partitions, row, "query_state") == "ready")
+        {
             return;
         }
         db.run_maintenance_cycle()

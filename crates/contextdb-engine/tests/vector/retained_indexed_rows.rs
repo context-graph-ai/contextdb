@@ -189,7 +189,8 @@ fn an_indexed_update_keeps_the_complete_disk_row_after_reopen() {
         "the bounded read agrees with the eager index scan"
     );
     assert_eq!(
-        bounded.result.trace().physical_plan, "IndexScan",
+        bounded.result.trace().physical_plan,
+        "IndexScan",
         "the bounded read keeps using the declared index"
     );
     assert!(

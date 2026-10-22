@@ -108,11 +108,11 @@ fn exercise(route: ReadRoute, operation: Operation) {
     let snapshot = reader.file_snapshot_for_test();
     let baseline = {
         let fixture_answer_29 = reader
-        .execute(
-            "SELECT id, payload FROM expiry_rows ORDER BY id",
-            &HashMap::new(),
-        )
-        .unwrap();
+            .execute(
+                "SELECT id, payload FROM expiry_rows ORDER BY id",
+                &HashMap::new(),
+            )
+            .unwrap();
         fixture_answer_29.rows().to_vec()
     };
     match operation {

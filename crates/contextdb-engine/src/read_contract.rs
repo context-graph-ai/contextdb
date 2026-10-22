@@ -5,8 +5,8 @@
 
 pub(crate) mod cursor_observation;
 mod encoded_bytes;
-pub use encoded_bytes::EncodedReadBytes;
 pub(crate) use cursor_observation::{decode_observed_cursor_page, encode_observed_cursor_page};
+pub use encoded_bytes::EncodedReadBytes;
 
 use crate::local_transport::{
     preflight_canonical_query_result, preflight_cursor_page_payload,
@@ -493,16 +493,22 @@ pub struct CanonicalQueryResultView<'result> {
 impl<'result> From<&'result QueryResult> for CanonicalQueryResultView<'result> {
     fn from(result: &'result QueryResult) -> Self {
         Self {
-            columns: result.columns(), rows: result.rows(), rows_affected: result.rows_affected(),
+            columns: result.columns(),
+            rows: result.rows(),
+            rows_affected: result.rows_affected(),
             trace: result.trace(),
             cascade: result.cascade(),
         }
     }
 }
-impl<'result> From<&'result crate::database::QueryResultData> for CanonicalQueryResultView<'result> {
+impl<'result> From<&'result crate::database::QueryResultData>
+    for CanonicalQueryResultView<'result>
+{
     fn from(result: &'result crate::database::QueryResultData) -> Self {
         Self {
-            columns: &result.columns, rows: &result.rows, rows_affected: result.rows_affected,
+            columns: &result.columns,
+            rows: &result.rows,
+            rows_affected: result.rows_affected,
             trace: &result.trace,
             cascade: result.cascade.as_ref(),
         }
@@ -525,20 +531,26 @@ impl From<&QueryResult> for CanonicalQueryResult {
     }
 }
 fn serialize_query_result_rows<S: serde::Serializer>(
-    rows: &[Vec<Value>], serializer: S,
+    rows: &[Vec<Value>],
+    serializer: S,
 ) -> Result<S::Ok, S::Error> {
     QueryRows(rows).serialize(serializer)
 }
 
 fn serialize_query_result_trace<S: serde::Serializer>(
-    trace: &QueryTrace, serializer: S,
+    trace: &QueryTrace,
+    serializer: S,
 ) -> Result<S::Ok, S::Error> {
     QueryTraceView::from(trace).serialize(serializer)
 }
 fn serialize_query_result_cascade<S: serde::Serializer>(
-    cascade: &Option<&crate::database::CascadeReport>, serializer: S,
+    cascade: &Option<&crate::database::CascadeReport>,
+    serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    cascade.map(|cascade| QueryCascadeView { dropped_indexes: &cascade.dropped_indexes })
+    cascade
+        .map(|cascade| QueryCascadeView {
+            dropped_indexes: &cascade.dropped_indexes,
+        })
         .serialize(serializer)
 }
 
@@ -573,7 +585,10 @@ fn encoding_error_from_transport(
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn encode_query_result(
     result: &QueryResult,
     caller_owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -584,10 +599,15 @@ pub fn encode_query_result(
     let bytes = encode_transport_funded(&view, Some(owner), u64::MAX)?;
     EncodedReadBytes::from_funded(bytes, u64::MAX)
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_query_view(view: &CanonicalQueryResultView<'_>) -> Result<(), ReadEncodingError> {
     for row in view.rows {
-        if row.len() != view.columns.len() { return Err(ReadEncodingError::InvalidPayload); }
+        if row.len() != view.columns.len() {
+            return Err(ReadEncodingError::InvalidPayload);
+        }
     }
     Ok(())
 }
@@ -654,15 +674,23 @@ struct QueryTraceView<'a> {
 }
 #[derive(Serialize)]
 struct QueryCountView<'a> {
-    used: bool, declared: bool, table: &'a str,
-    columns: QueryCountColumns<'a>, already_declared: QueryCountLists<'a>,
+    used: bool,
+    declared: bool,
+    table: &'a str,
+    columns: QueryCountColumns<'a>,
+    already_declared: QueryCountLists<'a>,
 }
 #[derive(Serialize)]
-struct QueryCascadeView<'a> { dropped_indexes: &'a [String] }
+struct QueryCascadeView<'a> {
+    dropped_indexes: &'a [String],
+}
 #[derive(Serialize)]
 struct QueryResultView<'a> {
-    columns: &'a [String], rows: QueryRows<'a>, rows_affected: u64,
-    trace: QueryTraceView<'a>, cascade: Option<QueryCascadeView<'a>>,
+    columns: &'a [String],
+    rows: QueryRows<'a>,
+    rows_affected: u64,
+    trace: QueryTraceView<'a>,
+    cascade: Option<QueryCascadeView<'a>>,
 }
 // The core JSON serializer builds a temporary String. This private binary
 // view writes that SAME length-prefixed UTF-8 directly, without a second
@@ -674,7 +702,9 @@ impl Serialize for QueryRows<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for row in self.0 { sequence.serialize_element(&QueryRow(row))?; }
+        for row in self.0 {
+            sequence.serialize_element(&QueryRow(row))?;
+        }
         sequence.end()
     }
 }
@@ -682,14 +712,18 @@ impl Serialize for QueryRow<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for value in self.0 { sequence.serialize_element(&QueryValue(value))?; }
+        for value in self.0 {
+            sequence.serialize_element(&QueryValue(value))?;
+        }
         sequence.end()
     }
 }
 impl Serialize for QueryValue<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.0 {
-            Value::Json(value) => serializer.serialize_newtype_variant("Value", 7, "Json", &QueryJson(value)),
+            Value::Json(value) => {
+                serializer.serialize_newtype_variant("Value", 7, "Json", &QueryJson(value))
+            }
             value => value.serialize(serializer),
         }
     }
@@ -698,11 +732,15 @@ struct QueryJson<'a>(&'a serde_json::Value);
 struct QueryJsonSize(usize);
 impl std::io::Write for QueryJsonSize {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.checked_add(bytes.len())
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
             .ok_or(std::io::ErrorKind::InvalidData)?;
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 struct QueryJsonSequence<S: serde::ser::SerializeSeq> {
     sequence: S,
@@ -718,7 +756,9 @@ impl<S: serde::ser::SerializeSeq> std::io::Write for QueryJsonSequence<S> {
         }
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 impl Serialize for QueryJson<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -726,10 +766,13 @@ impl Serialize for QueryJson<'_> {
         let mut size = QueryJsonSize(0);
         serde_json::to_writer(&mut size, self.0).map_err(S::Error::custom)?;
         let mut output = QueryJsonSequence {
-            sequence: serializer.serialize_seq(Some(size.0))?, failure: None,
+            sequence: serializer.serialize_seq(Some(size.0))?,
+            failure: None,
         };
         let encoded = serde_json::to_writer(&mut output, self.0);
-        if let Some(error) = output.failure { return Err(error); }
+        if let Some(error) = output.failure {
+            return Err(error);
+        }
         encoded.map_err(S::Error::custom)?;
         output.sequence.end()
     }
@@ -739,11 +782,16 @@ impl Serialize for QueryCandidateSequence<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         #[derive(Serialize)]
-        struct Candidate<'a> { name: &'a str, rejected_reason: &'a str }
+        struct Candidate<'a> {
+            name: &'a str,
+            rejected_reason: &'a str,
+        }
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
         for candidate in self.0 {
-            sequence.serialize_element(&Candidate { name: &candidate.name,
-                rejected_reason: candidate.rejected_reason.as_ref() })?;
+            sequence.serialize_element(&Candidate {
+                name: &candidate.name,
+                rejected_reason: candidate.rejected_reason.as_ref(),
+            })?;
         }
         sequence.end()
     }
@@ -757,10 +805,12 @@ impl Serialize for QueryPartitionSequence<'_> {
             sequence.serialize_element(&QueryPartitionView {
                 partition: &partition.partition,
                 route: partition.route.map(|route| route.as_str()),
-                reason: partition.reason.as_deref(), hnsw_m: partition.hnsw_m as u64,
+                reason: partition.reason.as_deref(),
+                hnsw_m: partition.hnsw_m as u64,
                 hnsw_ef_construction: partition.hnsw_ef_construction as u64,
                 hnsw_ef_search: partition.hnsw_ef_search as u64,
-                ef_search_source: &partition.ef_search_source, policy_revision: partition.policy_revision,
+                ef_search_source: &partition.ef_search_source,
+                policy_revision: partition.policy_revision,
             })?;
         }
         sequence.end()
@@ -772,7 +822,10 @@ impl Serialize for QueryCountColumns<'_> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
         for (name, direction) in self.0 {
-            sequence.serialize_element(&(name, matches!(direction, contextdb_core::SortDirection::Desc)))?;
+            sequence.serialize_element(&(
+                name,
+                matches!(direction, contextdb_core::SortDirection::Desc),
+            ))?;
         }
         sequence.end()
     }
@@ -782,7 +835,9 @@ impl Serialize for QueryCountLists<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for columns in self.0 { sequence.serialize_element(&QueryCountColumns(columns))?; }
+        for columns in self.0 {
+            sequence.serialize_element(&QueryCountColumns(columns))?;
+        }
         sequence.end()
     }
 }
@@ -790,23 +845,40 @@ impl<'a> From<&'a crate::maintained_counts::MaintainedCountDisclosure> for Query
     fn from(value: &'a crate::maintained_counts::MaintainedCountDisclosure) -> Self {
         use crate::maintained_counts::MaintainedCountDisclosure;
         let (used, declared, table, columns, lists) = match value {
-            MaintainedCountDisclosure::Used { table, columns } => (true, true, table, columns, &[][..]),
-            MaintainedCountDisclosure::DeclaredNotServed { table, columns } => (false, true, table, columns, &[][..]),
-            MaintainedCountDisclosure::NotDeclared { table, columns, already_declared } =>
-                (false, false, table, columns, already_declared.as_slice()),
+            MaintainedCountDisclosure::Used { table, columns } => {
+                (true, true, table, columns, &[][..])
+            }
+            MaintainedCountDisclosure::DeclaredNotServed { table, columns } => {
+                (false, true, table, columns, &[][..])
+            }
+            MaintainedCountDisclosure::NotDeclared {
+                table,
+                columns,
+                already_declared,
+            } => (false, false, table, columns, already_declared.as_slice()),
         };
-        Self { used, declared, table, columns: QueryCountColumns(columns), already_declared: QueryCountLists(lists) }
+        Self {
+            used,
+            declared,
+            table,
+            columns: QueryCountColumns(columns),
+            already_declared: QueryCountLists(lists),
+        }
     }
 }
 impl<'a> From<&'a QueryTrace> for QueryTraceView<'a> {
     fn from(trace: &'a QueryTrace) -> Self {
         Self {
-            physical_plan: trace.physical_plan, index_used: trace.index_used.as_deref(),
+            physical_plan: trace.physical_plan,
+            index_used: trace.index_used.as_deref(),
             predicates_pushed: &trace.predicates_pushed,
             indexes_considered: QueryCandidateSequence(&trace.indexes_considered),
-            sort_elided: trace.sort_elided, query_vector_source: trace.query_vector_source.as_ref(),
-            vector_search: trace.vector_search.as_deref().map(Into::into), rows_examined: trace.rows_examined,
-            maintained_count: trace.maintained_count.as_deref().map(Into::into), groups: &trace.groups,
+            sort_elided: trace.sort_elided,
+            query_vector_source: trace.query_vector_source.as_ref(),
+            vector_search: trace.vector_search.as_deref().map(Into::into),
+            rows_examined: trace.rows_examined,
+            maintained_count: trace.maintained_count.as_deref().map(Into::into),
+            groups: &trace.groups,
         }
     }
 }
@@ -850,22 +922,30 @@ impl<'a> From<&'a VectorSearchDisclosure> for QueryVectorView<'a> {
     }
 }
 
-
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_query_result_funded(
     result: &crate::database::QueryResultData,
     owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
-        let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
+    let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
 
     for row in &result.rows {
-        if row.len() != result.columns.len() { return Err(ReadEncodingError::InvalidPayload); }
+        if row.len() != result.columns.len() {
+            return Err(ReadEncodingError::InvalidPayload);
+        }
     }
     let view = QueryResultView {
-        columns: &result.columns, rows: QueryRows(&result.rows), rows_affected: result.rows_affected,
+        columns: &result.columns,
+        rows: QueryRows(&result.rows),
+        rows_affected: result.rows_affected,
         trace: QueryTraceView::from(&result.trace),
-        cascade: result.cascade.as_ref().map(|cascade| QueryCascadeView { dropped_indexes: &cascade.dropped_indexes }),
+        cascade: result.cascade.as_ref().map(|cascade| QueryCascadeView {
+            dropped_indexes: &cascade.dropped_indexes,
+        }),
     };
     encode_transport_funded(&view, Some(owner), memory_ceiling)
 }
@@ -873,58 +953,93 @@ pub(crate) fn encode_query_result_funded(
 /// The Query variant has the same tag, field order and map ordering as the
 /// owned public DTO. Only JSON values use the existing streaming wire view.
 #[derive(Serialize)]
-struct QueryRequestEnvelopeView<'a> { limits: ReadLimits, request: QueryRequestView<'a> }
+struct QueryRequestEnvelopeView<'a> {
+    limits: ReadLimits,
+    request: QueryRequestView<'a>,
+}
 #[derive(Serialize)]
-enum QueryRequestView<'a> { Query { statement: &'a str, params: QueryParamsView<'a> } }
+enum QueryRequestView<'a> {
+    Query {
+        statement: &'a str,
+        params: QueryParamsView<'a>,
+    },
+}
 struct QueryParamsView<'a>(&'a std::collections::BTreeMap<String, Value>);
 impl Serialize for QueryParamsView<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (key, value) in self.0 { map.serialize_entry(key, &QueryValue(value))?; }
+        for (key, value) in self.0 {
+            map.serialize_entry(key, &QueryValue(value))?;
+        }
         map.end()
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_request_funded(
     request: &crate::local_transport::LocalRequestEnvelope,
     owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
     if let crate::local_transport::LocalRequest::Query { statement, params } = &request.request {
-        encode_transport_funded(&QueryRequestEnvelopeView { limits: request.limits,
-            request: QueryRequestView::Query { statement, params: QueryParamsView(params) } },
-            owner, memory_ceiling)
-    } else { encode_transport_funded(request, owner, memory_ceiling) }
+        encode_transport_funded(
+            &QueryRequestEnvelopeView {
+                limits: request.limits,
+                request: QueryRequestView::Query {
+                    statement,
+                    params: QueryParamsView(params),
+                },
+            },
+            owner,
+            memory_ceiling,
+        )
+    } else {
+        encode_transport_funded(request, owner, memory_ceiling)
+    }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_transport_funded<T: Serialize>(
     value: &T,
     owner: Option<contextdb_core::read_memory::ReadMemoryOwner>,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
     let len = encoded_size(value)?;
-    let mut output = crate::local_transport::query_funding::Funded::allocate_owned(owner,
-        len, || vec![0; len])
-        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let mut output =
+        crate::local_transport::query_funding::Funded::allocate_owned(owner, len, || vec![0; len])
+            .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     // A fixed slice cannot silently grow beyond the admitted allocation if a
     // serializer writes a different size on its second visit.
-    let written = contextdb_core::types::with_borrowed_json_wire(||
-        bincode::serde::encode_into_slice(value, &mut output.value, standard()))
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
-    if written != len { return Err(ReadEncodingError::InvalidPayload); }
+    let written = contextdb_core::types::with_borrowed_json_wire(|| {
+        bincode::serde::encode_into_slice(value, &mut output.value, standard())
+    })
+    .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    if written != len {
+        return Err(ReadEncodingError::InvalidPayload);
+    }
     Ok(output)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_query_result_funded(
     bytes: &[u8],
     memory: &crate::read_image_memory::ImageMemoryHandle,
     memory_ceiling: u64,
-) -> Result<crate::local_transport::query_funding::Funded<CanonicalQueryResult>, ReadEncodingError> {
+) -> Result<crate::local_transport::query_funding::Funded<CanonicalQueryResult>, ReadEncodingError>
+{
     #[cfg(feature = "test-seams")]
-    crate::local_transport::OrdinaryResultReceiver::observe_actual_canonical_decode_entry_for_test(bytes);
+    crate::local_transport::OrdinaryResultReceiver::observe_actual_canonical_decode_entry_for_test(
+        bytes,
+    );
     preflight_canonical_query_result(bytes, memory_ceiling)?;
     let result = crate::local_transport::query_funding::decode(bytes, memory)
         .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
@@ -934,7 +1049,10 @@ pub(crate) fn decode_query_result_funded(
 
 /// Decode with no caller ceiling in hand. The shipped default stands in as
 /// the backstop, which is what a caller that never declared one gets.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_query_result(bytes: &[u8]) -> Result<CanonicalQueryResult, ReadEncodingError> {
     decode_query_result_under_memory_ceiling(bytes, ReadLimits::SHIPPED_MEMORY)
 }
@@ -943,7 +1061,10 @@ pub fn decode_query_result(bytes: &[u8]) -> Result<CanonicalQueryResult, ReadEnc
 /// A caller that declared a tighter or wider envelope is held to its own
 /// number rather than to the shipped backstop, so a decode refused here names
 /// the ceiling that caller set and can raise.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_query_result_under_memory_ceiling(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -960,7 +1081,10 @@ pub fn decode_query_result_under_memory_ceiling(
     Ok(result)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn query_result_encoded_size(result: &QueryResult) -> Result<usize, ReadEncodingError> {
     let view = CanonicalQueryResultView::from(result);
     validate_query_view(&view)?;
@@ -975,12 +1099,18 @@ pub fn query_result_encoded_size(result: &QueryResult) -> Result<usize, ReadEnco
 /// closed over a small set of dependencies on purpose -- so the shape is
 /// written out here, field by field, length-prefixed so no two shapes can
 /// render alike.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn encode_metadata_body(
     body: &crate::direct_file_reader::DirectMetadataBody,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> Result<EncodedReadBytes, ReadEncodingError> {
-    EncodedReadBytes::from_funded(encode_metadata_body_funded(body, owner, u64::MAX)?, u64::MAX)
+    EncodedReadBytes::from_funded(
+        encode_metadata_body_funded(body, owner, u64::MAX)?,
+        u64::MAX,
+    )
 }
 
 /// How many bytes [`encode_metadata_body`] produces for `body`, measured
@@ -996,22 +1126,32 @@ pub(crate) fn encoded_metadata_body_len(
 
 /// Encode on the actual request owner; the returned allocation keeps its
 /// original credit through payload destruction, including on failed callers.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_metadata_body_funded(
     body: &crate::direct_file_reader::DirectMetadataBody,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
     let len = encoded_metadata_body_len(body);
-    let mut output = crate::local_transport::query_funding::Funded::allocate_owned(
-        Some(owner), len, || Vec::with_capacity(len),
-    ).map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let mut output =
+        crate::local_transport::query_funding::Funded::allocate_owned(Some(owner), len, || {
+            Vec::with_capacity(len)
+        })
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     let mut writer = CanonicalWriter {
-        bytes: std::mem::take(&mut output.value), len: 0, counting: false,
-        credit: None, overflowed: false,
+        bytes: std::mem::take(&mut output.value),
+        len: 0,
+        counting: false,
+        credit: None,
+        overflowed: false,
     };
     crate::read_image::write_metadata_body(&mut writer, body);
-    if writer.len() != len { return Err(ReadEncodingError::InvalidPayload); }
+    if writer.len() != len {
+        return Err(ReadEncodingError::InvalidPayload);
+    }
     output.value = writer.finish_raw()?;
     #[cfg(any(test, feature = "test-seams"))]
     crate::read_image::answer_encoded_for_test();
@@ -1031,15 +1171,27 @@ pub struct CanonicalWriter {
 impl CanonicalWriter {
     /// Admit the exact output capacity on the original caller owner. Writing
     /// beyond this capacity refuses at finish instead of growing uncharged.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn try_new(
-        owner: contextdb_core::read_memory::ReadMemoryOwner, capacity: usize,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+        capacity: usize,
     ) -> Result<Self, ReadEncodingError> {
         let bytes = crate::local_transport::query_funding::Funded::allocate_owned(
-            Some(owner), capacity, || Vec::with_capacity(capacity),
-        ).map_err(ReadEncodingError::Admission)?;
-        Ok(Self { bytes: bytes.value, len: 0, counting: false,
-            credit: bytes.credit, overflowed: false })
+            Some(owner),
+            capacity,
+            || Vec::with_capacity(capacity),
+        )
+        .map_err(ReadEncodingError::Admission)?;
+        Ok(Self {
+            bytes: bytes.value,
+            len: 0,
+            counting: false,
+            credit: bytes.credit,
+            overflowed: false,
+        })
     }
 
     /// A writer that measures a document's encoded length without keeping
@@ -1049,7 +1201,8 @@ impl CanonicalWriter {
             bytes: Vec::new(),
             len: 0,
             counting: true,
-            credit: None, overflowed: false,
+            credit: None,
+            overflowed: false,
         }
     }
 
@@ -1069,8 +1222,11 @@ impl CanonicalWriter {
         };
         self.len = len;
         if !self.counting && !self.overflowed {
-            if len > self.bytes.capacity() { self.overflowed = true; }
-            else { self.bytes.extend_from_slice(bytes); }
+            if len > self.bytes.capacity() {
+                self.overflowed = true;
+            } else {
+                self.bytes.extend_from_slice(bytes);
+            }
         }
     }
 
@@ -1109,7 +1265,9 @@ impl CanonicalWriter {
                     self.0.put(bytes);
                     Ok(bytes.len())
                 }
-                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
             }
             serde_json::to_writer(JsonSink(&mut *self), value)
                 .expect("canonical metadata JSON serializes");
@@ -1133,18 +1291,32 @@ impl CanonicalWriter {
         self
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn finish_raw(self) -> Result<Vec<u8>, ReadEncodingError> {
-        if self.overflowed { return Err(ReadEncodingError::InvalidPayload); }
+        if self.overflowed {
+            return Err(ReadEncodingError::InvalidPayload);
+        }
         Ok(self.bytes)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn finish(self) -> Result<EncodedReadBytes, ReadEncodingError> {
-        if self.counting || self.overflowed { return Err(ReadEncodingError::InvalidPayload); }
-        EncodedReadBytes::from_funded(crate::local_transport::query_funding::Funded {
-            value: self.bytes, credit: self.credit,
-        }, u64::MAX)
+        if self.counting || self.overflowed {
+            return Err(ReadEncodingError::InvalidPayload);
+        }
+        EncodedReadBytes::from_funded(
+            crate::local_transport::query_funding::Funded {
+                value: self.bytes,
+                credit: self.credit,
+            },
+            u64::MAX,
+        )
     }
 }
 
@@ -1156,7 +1328,10 @@ impl CanonicalWriter {
 /// that is not UTF-8, trailing bytes after a complete body -- are not a
 /// metadata answer and are refused as an invalid payload rather than guessed
 /// at.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_metadata_body(
     bytes: &[u8],
 ) -> Result<crate::direct_file_reader::DirectMetadataBody, ReadEncodingError> {
@@ -1165,7 +1340,10 @@ pub fn decode_metadata_body(
     decode_metadata_body_with_memory(bytes, &memory, ReadLimits::SHIPPED_MEMORY)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_metadata_body_with_memory(
     bytes: &[u8],
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -1195,30 +1373,57 @@ pub(crate) fn decode_metadata_body_with_memory(
 /// prefix taken from the payload can never be trusted into an allocation or a
 /// slice: a claim the bytes do not back is refused here, not acted on.
 pub struct CanonicalReader<'a> {
-    bytes: &'a [u8], at: usize,
+    bytes: &'a [u8],
+    at: usize,
     memory: Option<crate::read_image_memory::ImageMemoryHandle>,
 }
 
 impl<'a> CanonicalReader<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0, memory: None }
+        Self {
+            bytes,
+            at: 0,
+            memory: None,
+        }
     }
-    pub(crate) fn with_memory(bytes: &'a [u8], memory: crate::read_image_memory::ImageMemoryHandle) -> Self {
-        Self { bytes, at: 0, memory: Some(memory) }
+    pub(crate) fn with_memory(
+        bytes: &'a [u8],
+        memory: crate::read_image_memory::ImageMemoryHandle,
+    ) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            memory: Some(memory),
+        }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn vector<T>(&self, count: usize) -> Result<Vec<T>, ReadEncodingError> {
-        let bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or(ReadEncodingError::InvalidPayload)?;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(ReadEncodingError::InvalidPayload)?;
         self.admit(bytes)?;
         Ok(Vec::with_capacity(count))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn admit(&self, bytes: usize) -> Result<(), ReadEncodingError> {
-        if let Some(memory) = &self.memory { memory.reserve(bytes).map_err(ReadEncodingError::Admission)?; }
+        if let Some(memory) = &self.memory {
+            memory
+                .reserve(bytes)
+                .map_err(ReadEncodingError::Admission)?;
+        }
         Ok(())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn take(&mut self, length: usize) -> Result<&'a [u8], ReadEncodingError> {
         let end = self
             .at
@@ -1232,12 +1437,18 @@ impl<'a> CanonicalReader<'a> {
         Ok(taken)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn tag(&mut self) -> Result<u8, ReadEncodingError> {
         Ok(self.take(1)?[0])
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn count(&mut self) -> Result<u64, ReadEncodingError> {
         let bytes: [u8; 8] = self
             .take(8)?
@@ -1249,7 +1460,10 @@ impl<'a> CanonicalReader<'a> {
     /// A count that is about to become a number of elements to read. The
     /// bytes claim it; the payload has to be long enough to mean it, and the
     /// smallest element any of these documents holds is one byte.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn element_count(&mut self) -> Result<usize, ReadEncodingError> {
         let claimed =
             usize::try_from(self.count()?).map_err(|_| ReadEncodingError::InvalidPayload)?;
@@ -1259,7 +1473,10 @@ impl<'a> CanonicalReader<'a> {
         Ok(claimed)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn flag(&mut self) -> Result<bool, ReadEncodingError> {
         match self.tag()? {
             0 => Ok(false),
@@ -1268,7 +1485,10 @@ impl<'a> CanonicalReader<'a> {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn text(&mut self) -> Result<String, ReadEncodingError> {
         let length =
             usize::try_from(self.count()?).map_err(|_| ReadEncodingError::InvalidPayload)?;
@@ -1278,7 +1498,10 @@ impl<'a> CanonicalReader<'a> {
         Ok(text.to_owned())
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn optional_text(&mut self) -> Result<Option<String>, ReadEncodingError> {
         match self.tag()? {
             0 => Ok(None),
@@ -1287,7 +1510,10 @@ impl<'a> CanonicalReader<'a> {
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn raw(&mut self) -> Result<&'a [u8], ReadEncodingError> {
         let length =
             usize::try_from(self.count()?).map_err(|_| ReadEncodingError::InvalidPayload)?;
@@ -1296,7 +1522,10 @@ impl<'a> CanonicalReader<'a> {
 
     /// A complete document ends where the bytes end: anything after it was
     /// never part of the answer.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn finish(self) -> Result<(), ReadEncodingError> {
         if self.at == self.bytes.len() {
             Ok(())
@@ -1310,30 +1539,44 @@ impl<'a> CanonicalReader<'a> {
 pub(crate) fn encode_owned_cursor_page_for_test(
     page: &crate::owned_cursor_page::OwnedCursorPage,
 ) -> Result<Vec<u8>, ReadEncodingError> {
-    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    page.validate()
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
     encode(page)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn encode_cursor_page(
     page: &CursorPage,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> Result<EncodedReadBytes, ReadEncodingError> {
     let owner = page.encoding_owner().unwrap_or(owner);
-    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
-    EncodedReadBytes::from_funded(encode_transport_funded(page, Some(owner), u64::MAX)?, u64::MAX)
+    page.validate()
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    EncodedReadBytes::from_funded(
+        encode_transport_funded(page, Some(owner), u64::MAX)?,
+        u64::MAX,
+    )
 }
 
 /// See [`decode_query_result`]: the shipped default is the backstop for a
 /// caller with no declared ceiling.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_cursor_page(bytes: &[u8]) -> Result<CursorPage, ReadEncodingError> {
     decode_cursor_page_under_memory_ceiling(bytes, ReadLimits::SHIPPED_MEMORY)
 }
 
 /// Decode a cursor page against the memory ceiling in force for THIS
 /// exchange.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_cursor_page_under_memory_ceiling(
     bytes: &[u8],
     memory_ceiling: u64,
@@ -1347,18 +1590,30 @@ pub fn decode_cursor_page_under_memory_ceiling(
     let before = memory.held();
     let page: crate::owned_cursor_page::OwnedCursorPage =
         decode_exact_with_memory(bytes, &memory, memory_ceiling)?;
-    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
-    let credit = memory.take_retained_credit(memory.held() - before)
+    page.validate()
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    let credit = memory
+        .take_retained_credit(memory.held() - before)
         .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     let credit = crate::local_transport::query_funding::retain_cursor_credit(credit, owner.clone());
-    let mut page = crate::local_transport::query_funding::Funded { value: page, credit: Some(credit) };
+    let mut page = crate::local_transport::query_funding::Funded {
+        value: page,
+        credit: Some(credit),
+    };
     if page.value.rows.capacity() != 0 {
-        page.credit.as_mut().expect("decoded page owns credit").try_grow_for(
-            crate::owned_cursor_page::SharedRows::allocation_header_bytes(),
-            "reader", "publish_cursor_root", "Reduce retained pages or raise the reader memory limit.",
-        ).map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+        page.credit
+            .as_mut()
+            .expect("decoded page owns credit")
+            .try_grow_for(
+                crate::owned_cursor_page::SharedRows::allocation_header_bytes(),
+                "reader",
+                "publish_cursor_root",
+                "Reduce retained pages or raise the reader memory limit.",
+            )
+            .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     }
-    page.value.with_credit(page.credit.take().expect("decoded page owns credit"))
+    page.value
+        .with_credit(page.credit.take().expect("decoded page owns credit"))
         .and_then(|mut page| {
             page.attach_publication(prepared);
             page.into_public()
@@ -1366,9 +1621,13 @@ pub fn decode_cursor_page_under_memory_ceiling(
         .map_err(|error| encoding_error_from_core(error, memory_ceiling))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn cursor_page_encoded_size(page: &CursorPage) -> Result<usize, ReadEncodingError> {
-    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    page.validate()
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
     encoded_size(page)
 }
 
@@ -1387,7 +1646,10 @@ impl Serialize for MetadataItemsView<'_> {
         use contextdb_core::read_contract::MetadataItem;
         use serde::ser::SerializeSeq;
         #[derive(Serialize)]
-        enum Item<'a> { Table(&'a str), EventStatus(QueryParamsView<'a>) }
+        enum Item<'a> {
+            Table(&'a str),
+            EventStatus(QueryParamsView<'a>),
+        }
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
         for item in self.0 {
             let view = match item {
@@ -1401,63 +1663,98 @@ impl Serialize for MetadataItemsView<'_> {
 }
 impl<'a> From<&'a MetadataPage> for MetadataPageView<'a> {
     fn from(page: &'a MetadataPage) -> Self {
-        Self { vocabulary: page.vocabulary, items: MetadataItemsView(&page.items),
-            has_more: page.has_more, continuation: page.continuation.as_deref() }
+        Self {
+            vocabulary: page.vocabulary,
+            items: MetadataItemsView(&page.items),
+            has_more: page.has_more,
+            continuation: page.continuation.as_deref(),
+        }
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encode_metadata_page_funded(
     page: &MetadataPage,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
     memory_ceiling: u64,
 ) -> Result<crate::local_transport::query_funding::Funded<Vec<u8>>, ReadEncodingError> {
-    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    page.validate()
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
     encode_transport_funded(&MetadataPageView::from(page), Some(owner), memory_ceiling)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn encode_metadata_page(
     page: &MetadataPage,
     owner: contextdb_core::read_memory::ReadMemoryOwner,
 ) -> Result<EncodedReadBytes, ReadEncodingError> {
-    EncodedReadBytes::from_funded(encode_metadata_page_funded(page, owner, u64::MAX)?, u64::MAX)
+    EncodedReadBytes::from_funded(
+        encode_metadata_page_funded(page, owner, u64::MAX)?,
+        u64::MAX,
+    )
 }
 
 /// See [`decode_query_result`]: the shipped default is the backstop for a
 /// caller with no declared ceiling.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_metadata_page(bytes: &[u8]) -> Result<MetadataPage, ReadEncodingError> {
     decode_metadata_page_under_memory_ceiling(bytes, ReadLimits::SHIPPED_MEMORY)
 }
 
 /// Decode a metadata page against the memory ceiling in force for THIS
 /// exchange.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn decode_metadata_page_under_memory_ceiling(
     bytes: &[u8],
     memory_ceiling: u64,
 ) -> Result<MetadataPage, ReadEncodingError> {
-    let memory = decoder_memory(memory_ceiling).map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
+    let memory = decoder_memory(memory_ceiling)
+        .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     decode_metadata_page_with_memory(bytes, &memory, memory_ceiling)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_metadata_page_with_memory(
-    bytes: &[u8], memory: &crate::read_image_memory::ImageMemoryHandle, memory_ceiling: u64,
+    bytes: &[u8],
+    memory: &crate::read_image_memory::ImageMemoryHandle,
+    memory_ceiling: u64,
 ) -> Result<MetadataPage, ReadEncodingError> {
-    preflight_metadata_page_payload(bytes, memory_ceiling).map_err(encoding_error_from_transport)?;
+    preflight_metadata_page_payload(bytes, memory_ceiling)
+        .map_err(encoding_error_from_transport)?;
     let page: MetadataPage = decode_exact_with_memory(bytes, memory, memory_ceiling)?;
-    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    page.validate()
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(page)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn metadata_page_encoded_size(page: &MetadataPage) -> Result<usize, ReadEncodingError> {
-    page.validate().map_err(|_| ReadEncodingError::InvalidPayload)?;
+    page.validate()
+        .map_err(|_| ReadEncodingError::InvalidPayload)?;
     encoded_size(&MetadataPageView::from(page))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn validate_query_result(result: &CanonicalQueryResult) -> Result<(), ReadEncodingError> {
     for row in &result.rows {
         if row.len() != result.columns.len() {
@@ -1467,34 +1764,46 @@ fn validate_query_result(result: &CanonicalQueryResult) -> Result<(), ReadEncodi
     Ok(())
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn encoded_size<T: Serialize>(value: &T) -> Result<usize, ReadEncodingError> {
     let mut measured = bincode::enc::write::SizeWriter::default();
-    contextdb_core::types::with_borrowed_json_wire(||
-        bincode::serde::encode_into_writer(value, &mut measured, standard()))
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    contextdb_core::types::with_borrowed_json_wire(|| {
+        bincode::serde::encode_into_writer(value, &mut measured, standard())
+    })
+    .map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(measured.bytes_written)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ReadEncodingError> {
     // Measured first and written once into a buffer of exactly that length.
     // Growing the output by doubling would reserve up to twice a large answer
     // and briefly hold the old and new buffers together while it copies.
     let mut measured = bincode::enc::write::SizeWriter::default();
-    contextdb_core::types::with_borrowed_json_wire(||
-        bincode::serde::encode_into_writer(value, &mut measured, standard()))
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    contextdb_core::types::with_borrowed_json_wire(|| {
+        bincode::serde::encode_into_writer(value, &mut measured, standard())
+    })
+    .map_err(|_| ReadEncodingError::InvalidPayload)?;
     let mut encoded = Vec::with_capacity(measured.bytes_written);
-    contextdb_core::types::with_borrowed_json_wire(||
-        bincode::serde::encode_into_std_write(value, &mut encoded, standard()))
-        .map_err(|_| ReadEncodingError::InvalidPayload)?;
+    contextdb_core::types::with_borrowed_json_wire(|| {
+        bincode::serde::encode_into_std_write(value, &mut encoded, standard())
+    })
+    .map_err(|_| ReadEncodingError::InvalidPayload)?;
     Ok(encoded)
 }
 
 /// The standalone codec retains its original factory in its typed image
 /// capability, including through escaping page and decoded-payload aliases.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decoder_memory(
     memory_ceiling: u64,
 ) -> contextdb_core::Result<crate::read_image_memory::ImageMemoryHandle> {
@@ -1509,8 +1818,11 @@ pub(crate) fn encoding_error_from_core(
         error if crate::read_image_memory::is_memory_refusal(&error) => {
             ReadEncodingError::MemoryCeilingExceeded {
                 ceiling: if memory_ceiling == u64::MAX {
-                    crate::local_transport::query_funding::memory_refusal_ceiling(&error).unwrap_or(memory_ceiling)
-                } else { memory_ceiling },
+                    crate::local_transport::query_funding::memory_refusal_ceiling(&error)
+                        .unwrap_or(memory_ceiling)
+                } else {
+                    memory_ceiling
+                },
             }
         }
         _ => ReadEncodingError::InvalidPayload,
@@ -1519,7 +1831,10 @@ pub(crate) fn encoding_error_from_core(
 
 /// Borrowed wire input coexists with all decoded buffers. This credit is
 /// temporary; payload credit stays on the same owner until its DTO boundary.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_exact_with_memory<T: DeserializeOwned>(
     bytes: &[u8],
     memory: &crate::read_image_memory::ImageMemoryHandle,
@@ -1546,7 +1861,10 @@ pub(crate) fn decode_exact_with_memory<T: DeserializeOwned>(
     Ok(value)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn decode_query_result_with_memory(
     bytes: &[u8],
     memory: &crate::read_image_memory::ImageMemoryHandle,

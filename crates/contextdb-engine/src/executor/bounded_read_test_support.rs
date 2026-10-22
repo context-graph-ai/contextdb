@@ -313,10 +313,15 @@ pub fn execute(db: &Database, request: &BoundedReadRequest) -> Result<TestResult
         request.cancellation.clone(),
         adapted_probe(request),
     )
-    .and_then(|outcome| Ok(TestResult {
-        result: outcome.result.into_public().map_err(BoundedExecutionError::from)?,
-        telemetry: outcome.telemetry.into(),
-    }))
+    .and_then(|outcome| {
+        Ok(TestResult {
+            result: outcome
+                .result
+                .into_public()
+                .map_err(BoundedExecutionError::from)?,
+            telemetry: outcome.telemetry.into(),
+        })
+    })
     .map_err(test_error)
 }
 

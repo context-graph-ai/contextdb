@@ -129,7 +129,8 @@ pub(crate) fn observe_reverse_for_test(_reverse: &Arc<DurableReverseMembershipSo
 fn reader_credit() -> contextdb_vector::VectorCopyAdmission {
     let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
         contextdb_core::read_contract::ReadLimits::default().memory,
-    ).expect("admit the declared fixture root");
+    )
+    .expect("admit the declared fixture root");
     crate::vector_read_memory::admission(declared.child().unwrap())
 }
 fn open(path: &std::path::Path, owner: &Arc<MemoryAccountant>) -> (Database, OpenCapture) {
@@ -512,7 +513,8 @@ pub(crate) fn mapped_rows_for_test() {
             drop(callback);
             let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
                 contextdb_core::read_contract::ReadLimits::default().memory,
-            ).expect("admit the declared fixture root");
+            )
+            .expect("admit the declared fixture root");
             let image = crate::read_image_memory::ImageMemory::charging_reader(
                 owner.clone().into(),
                 declared.child().unwrap(),

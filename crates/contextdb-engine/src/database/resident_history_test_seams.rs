@@ -319,8 +319,14 @@ impl Database {
     }
     /// Explicit displacement setup only; ordinary hold calls preserve pinned residents.
     #[doc(hidden)]
-    pub fn __detach_cached_row_page_for_test(&self, page: &redb::AccessGuard<'_, &'static [u8]>) -> Result<(u64, usize, usize, bool)> {
-        self.persistence.as_ref().expect("file-backed fixture").detach_cached_row_page_for_test(page)
+    pub fn __detach_cached_row_page_for_test(
+        &self,
+        page: &redb::AccessGuard<'_, &'static [u8]>,
+    ) -> Result<(u64, usize, usize, bool)> {
+        self.persistence
+            .as_ref()
+            .expect("file-backed fixture")
+            .detach_cached_row_page_for_test(page)
     }
     /// Deliberate checksummed-envelope corruption, only on a task fixture.
     #[doc(hidden)]
@@ -491,7 +497,10 @@ impl Database {
         Ok(Box::new(ObservedReadCommitCursor {
             cursor,
             manager: self.tx_mgr.clone(),
-            image: self.read_image_memory.as_ref().map(|image| crate::read_image_memory::ImageMemoryObservation::new(image)),
+            image: self
+                .read_image_memory
+                .as_ref()
+                .map(|image| crate::read_image_memory::ImageMemoryObservation::new(image)),
         }))
     }
 
@@ -642,7 +651,8 @@ impl SavedVectorRootForTest {
     ) -> Result<T> {
         if self.manager != database.tx_mgr.identity() {
             return Err(Error::Other(
-                "saved vector proof root belongs to another database".into()));
+                "saved vector proof root belongs to another database".into(),
+            ));
         }
         if let Some(retained) = &self.retained {
             let original = database.retained_relational_source.as_ref().or_else(|| {
@@ -651,9 +661,12 @@ impl SavedVectorRootForTest {
                     .as_ref()
                     .map(|startup| &startup.config_source)
             });
-            if !original.is_some_and(|source| crate::persistence::RetainedReadSource::ptr_eq(source, retained)) {
+            if !original.is_some_and(|source| {
+                crate::persistence::RetainedReadSource::ptr_eq(source, retained)
+            }) {
                 return Err(Error::Other(
-                    "saved vector proof retained source changed".into()));
+                    "saved vector proof retained source changed".into(),
+                ));
             }
         }
         let _root = database.enter_writer_read(self.writer.clone(), read_memory);
@@ -716,7 +729,8 @@ fn saved_generation_receipt(
         .ok_or_else(|| Error::Other("proof fixture did not publish saved topology".into()))?;
     if version != 1 {
         return Err(Error::Other(
-            "proof fixture did not publish graph format 1".into()));
+            "proof fixture did not publish graph format 1".into(),
+        ));
     }
     Ok(SavedVectorGenerationForTest {
         graph_format_version: version,
@@ -769,7 +783,8 @@ impl Database {
             (self.snapshot(), source.storage_identity())
         } else {
             return Err(Error::Other(
-                "saved vector proof requires a durable root".into()));
+                "saved vector proof requires a durable root".into(),
+            ));
         };
         Ok(SavedVectorRootForTest {
             manager: self.tx_mgr.identity(),

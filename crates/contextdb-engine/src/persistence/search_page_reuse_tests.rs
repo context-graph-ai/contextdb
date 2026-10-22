@@ -299,7 +299,8 @@ fn walk_rows(load: &ReadPersistenceLoad) -> Result<usize> {
             .limit
             .map(|bytes| bytes as u64)
             .unwrap_or(u64::MAX),
-    ).expect("admit the declared fixture root");
+    )
+    .expect("admit the declared fixture root");
     let read_memory = declared_reader.child()?;
     load.source.bounded_visit_relational_rows::<Error>(
         TABLE,

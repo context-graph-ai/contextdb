@@ -448,9 +448,15 @@ fn same_id_membership_and_vector_replacements_compose_with_rollback_and_reopen()
         db.execute_in_tx(tx, sql, &bound).unwrap().rows()[0][0],
         Value::Int64(2)
     );
-    assert_eq!(db.execute(sql, &bound).unwrap().rows()[0][0], Value::Int64(1));
+    assert_eq!(
+        db.execute(sql, &bound).unwrap().rows()[0][0],
+        Value::Int64(1)
+    );
     db.rollback(tx).unwrap();
-    assert_eq!(db.execute(sql, &bound).unwrap().rows()[0][0], Value::Int64(1));
+    assert_eq!(
+        db.execute(sql, &bound).unwrap().rows()[0][0],
+        Value::Int64(1)
+    );
     for revision in 1..=32 {
         db.execute(
             "UPDATE vector_members SET revision = $revision, embedding = $vector WHERE id = 1",
@@ -478,7 +484,10 @@ fn same_id_membership_and_vector_replacements_compose_with_rollback_and_reopen()
         assert_eq!(bounded.result.rows()[0][0], Value::Int64(2));
         assert_eq!(index_entries_touched(&bounded), 2);
         assert_eq!(
-            current.execute_at_snapshot(sql, &bound, old).unwrap().rows(),
+            current
+                .execute_at_snapshot(sql, &bound, old)
+                .unwrap()
+                .rows(),
             vec![vec![Value::Int64(1), Value::Int64(0)]]
         );
         let historical = current
@@ -839,7 +848,8 @@ fn retired_partitions_keep_old_exact_membership_after_moves_delete_and_reopen() 
                 })
                 .unwrap();
             assert_eq!(
-                result.result.rows(), expected,
+                result.result.rows(),
+                expected,
                 "bounded reopened={reopened} snapshot={snapshot:?}"
             );
         }

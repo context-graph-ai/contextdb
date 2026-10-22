@@ -2,12 +2,11 @@
 //! Original bootstrap refusals borrow their static diagnostics.
 //! Joined Original callbacks move private diagnostic custody; legacy callbacks
 //! and lower producers retain their explicit unqualified coverage.
-use contextdb_core::read_memory::ReadMemoryBudget as _;
 use crate::memory_accounting::{
     AccountantHandle, ControlCredit, OwnedMemoryReservation, StoreAccountantHandle, WriterUse,
-    clone_persistence_original_writer, persistence_original_projection,
-    validate_owned_original,
+    clone_persistence_original_writer, persistence_original_projection, validate_owned_original,
 };
+use contextdb_core::read_memory::ReadMemoryBudget as _;
 use contextdb_core::read_memory::{NativeRefusal, ReadCredit, ReadMemoryOwner};
 use contextdb_core::{Error, Lsn, Result, SnapshotId};
 use contextdb_tx::SourceFunder;
@@ -35,7 +34,12 @@ impl std::fmt::Display for NativeStorageFailure {
         match self {
             Self::Refused(refusal) => std::fmt::Display::fmt(refusal, f),
             Self::AllocatorFailed { site, layout } => std::fmt::Display::fmt(
-                &redb::NativeColdReadError::AllocatorFailed { site, layout: *layout }, f),
+                &redb::NativeColdReadError::AllocatorFailed {
+                    site,
+                    layout: *layout,
+                },
+                f,
+            ),
             Self::Unqualified(error) => std::fmt::Display::fmt(error, f),
         }
     }
@@ -51,7 +55,12 @@ unsafe fn inspect_scope_failure(
 ) {
     let scope = &unsafe { raw.cast::<StorageScopeBlock>().as_ref() }.payload;
     let failure = scope.failure.lock().unwrap_or_else(|e| e.into_inner());
-    inspect(failure.original.as_ref().map(|cause| cause as &(dyn std::error::Error + Send + Sync + 'static)));
+    inspect(
+        failure
+            .original
+            .as_ref()
+            .map(|cause| cause as &(dyn std::error::Error + Send + Sync + 'static)),
+    );
 }
 
 pub(crate) enum StorageAllocation {
@@ -80,12 +89,14 @@ impl StorageFunding {
     // Bootstrap uses the same held Original and its existing scalar policy.
     // Static diagnostic labels borrow their backing; no diagnostic invoice is
     // needed. Legacy reader adapters retain their existing Error kernel.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve_unqualified(&self, layout: Layout) -> Result<StorageAllocation> {
         match self {
             Self::Original(original) => {
-                reserve_original_bootstrap(original, layout.size())
-                    .map(StorageAllocation::Writer)
+                reserve_original_bootstrap(original, layout.size()).map(StorageAllocation::Writer)
             }
             Self::Writer {
                 original_use,
@@ -114,7 +125,10 @@ impl StorageFunding {
             }
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve_scope(
         &self,
         layout: Layout,
@@ -152,7 +166,11 @@ impl StorageFunding {
                 original_use,
                 original_handle,
                 ..
-            } | Self::PreparedWriter { original_use, original_handle } => crate::memory_accounting::reserve_native_storage_from_writer_use(
+            }
+            | Self::PreparedWriter {
+                original_use,
+                original_handle,
+            } => crate::memory_accounting::reserve_native_storage_from_writer_use(
                 original_use,
                 original_handle,
                 layout.size(),
@@ -172,7 +190,10 @@ impl StorageFunding {
 // Validate and retain the exact held writer before entering scalar admission.
 // Both the zero-byte capability clone and the actual scope-cell debit keep the
 // bootstrap's original pending_directory labels and hint, including on refusal.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn reserve_original_bootstrap(
     original: &OwnedMemoryReservation,
     bytes: usize,
@@ -222,7 +243,10 @@ unsafe fn finish_receipt(raw: NonNull<()>) {
     drop(allocation);
     drop(control);
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn paid_receipt(
     scope: &StorageScope,
     layout: Layout,
@@ -235,7 +259,8 @@ fn paid_receipt(
     let raw = unsafe { alloc(layout) }.cast::<StorageReceipt>();
     let Some(pointer) = NonNull::new(raw) else {
         return Err(NativeStorageFailure::AllocatorFailed {
-            site: "native storage receipt", layout,
+            site: "native storage receipt",
+            layout,
         });
     };
     unsafe {
@@ -351,7 +376,10 @@ pub(crate) struct StorageAdmissionScope {
 unsafe impl Send for StorageAdmissionScope {}
 unsafe impl Sync for StorageAdmissionScope {}
 impl StorageAdmissionScope {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_original(original: &OwnedMemoryReservation) -> Result<Self> {
         let original = reserve_original_bootstrap(original, 0)?;
         Self::new_unqualified(StorageFunding::Original(original))
@@ -365,15 +393,26 @@ impl StorageAdmissionScope {
         let (held, projection) = crate::memory_accounting::native_preparation_original(original)
             .map_err(NativeRefusal::Other)?;
         let original = crate::memory_accounting::reserve_native_storage_from_writer_use_for(
-            &held, &projection, 0, "pending_directory", HINT,
+            &held,
+            &projection,
+            0,
+            "pending_directory",
+            HINT,
         )?;
         let layout = Layout::new::<StorageScopeBlock>();
         let invoice = crate::memory_accounting::reserve_native_storage_from_writer_use_for(
-            &held, &projection, layout.size(), "pending_directory", HINT,
+            &held,
+            &projection,
+            layout.size(),
+            "pending_directory",
+            HINT,
         )?;
         let raw = unsafe { alloc(layout) }.cast::<StorageScopeBlock>();
         let Some(pointer) = NonNull::new(raw) else {
-            return Err(NativeRefusal::AllocatorFailed { site: "native storage scope", layout });
+            return Err(NativeRefusal::AllocatorFailed {
+                site: "native storage scope",
+                layout,
+            });
         };
         unsafe {
             pointer.as_ptr().write(StorageScopeBlock {
@@ -388,8 +427,14 @@ impl StorageAdmissionScope {
         }
         Ok(Self { pointer })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
-    pub(super) fn run_original_unqualified<R>(&self, operation: impl FnOnce() -> Result<R>) -> Result<R> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn run_original_unqualified<R>(
+        &self,
+        operation: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         self.run_native(operation).map_err(original_storage_error)
     }
 
@@ -407,11 +452,19 @@ impl StorageAdmissionScope {
             .map_err(OriginalError::native)?;
         let (result, original) = self.run_scoped(true, operation);
         let (cause, allocator) = match original {
-            Some(NativeStorageFailure::Refused(refusal)) => (Some(OriginalScopeCause::Refused(refusal)), None),
-            Some(NativeStorageFailure::Unqualified(error)) => (Some(OriginalScopeCause::Unqualified(error)), None),
+            Some(NativeStorageFailure::Refused(refusal)) => {
+                (Some(OriginalScopeCause::Refused(refusal)), None)
+            }
+            Some(NativeStorageFailure::Unqualified(error)) => {
+                (Some(OriginalScopeCause::Unqualified(error)), None)
+            }
             Some(NativeStorageFailure::AllocatorFailed { site, layout }) => {
-                unsafe { self.pointer.as_ref() }.payload.error
-                    .lock().unwrap_or_else(|e| e.into_inner()).native_allocator = Some((site, layout));
+                unsafe { self.pointer.as_ref() }
+                    .payload
+                    .error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .native_allocator = Some((site, layout));
                 (None, Some((site, layout)))
             }
             None => (None, None),
@@ -430,22 +483,34 @@ impl StorageAdmissionScope {
                     OriginalScopeCause::Refused(refusal) => OriginalError::native(refusal),
                     OriginalScopeCause::Unqualified(error) => diagnostic.unqualified(error),
                 };
-                let discard_unwind = std::panic::catch_unwind(
-                    std::panic::AssertUnwindSafe(|| redb::with_native_storage_admission(
-                        self.retain_admission(), || drop(value)))).err();
+                let discard_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    redb::with_native_storage_admission(self.retain_admission(), || drop(value))
+                }))
+                .err();
                 Err(self.attach_error(phase, error, None, discard_unwind))
             }
             (Ok(value), None) => {
-                let Some((site, layout)) = allocator else { return Ok(value); };
+                let Some((site, layout)) = allocator else {
+                    return Ok(value);
+                };
                 // All actual Original phases use this retained Original. The
                 // cell was prepaid before the callback and the null producer.
-                let StorageFunding::Original(original) = &unsafe { self.pointer.as_ref() }.payload.funding
-                    else { unreachable!("Original phases retain their Original funding") };
-                let error = diagnostic.storage(redb::Error::Native(
-                    redb::NativeColdReadError::AllocatorFailed { site, layout }), original);
-                let discard_unwind = std::panic::catch_unwind(
-                    std::panic::AssertUnwindSafe(|| redb::with_native_storage_admission(
-                        self.retain_admission(), || drop(value)))).err();
+                let StorageFunding::Original(original) =
+                    &unsafe { self.pointer.as_ref() }.payload.funding
+                else {
+                    unreachable!("Original phases retain their Original funding")
+                };
+                let error = diagnostic.storage(
+                    redb::Error::Native(redb::NativeColdReadError::AllocatorFailed {
+                        site,
+                        layout,
+                    }),
+                    original,
+                );
+                let discard_unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    redb::with_native_storage_admission(self.retain_admission(), || drop(value))
+                }))
+                .err();
                 Err(self.attach_error(phase, error, None, discard_unwind))
             }
         }
@@ -459,12 +524,17 @@ impl StorageAdmissionScope {
         discard_unwind: Option<Box<dyn std::any::Any + Send>>,
     ) -> crate::funded_error::OriginalError {
         if let Some(previous) = &error.storage {
-            assert!(!previous.scope.contains_error_phase(phase),
-                "one entry of each funded storage phase");
+            assert!(
+                !previous.scope.contains_error_phase(phase),
+                "one entry of each funded storage phase"
+            );
         }
         {
-            let mut custody = unsafe { self.pointer.as_ref() }.payload.error
-                .lock().unwrap_or_else(|e| e.into_inner());
+            let mut custody = unsafe { self.pointer.as_ref() }
+                .payload
+                .error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert!(custody.phase.is_none(), "one failure per producing scope");
             custody.phase = Some(phase);
             custody.secondary = secondary;
@@ -476,35 +546,62 @@ impl StorageAdmissionScope {
     }
 
     fn contains_error_phase(&self, phase: crate::funded_error::OriginalStoragePhase) -> bool {
-        let custody = unsafe { self.pointer.as_ref() }.payload.error
-            .lock().unwrap_or_else(|e| e.into_inner());
-        custody.phase == Some(phase) || custody.previous.as_ref()
-            .is_some_and(|previous| previous.scope.contains_error_phase(phase))
+        let custody = unsafe { self.pointer.as_ref() }
+            .payload
+            .error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        custody.phase == Some(phase)
+            || custody
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.scope.contains_error_phase(phase))
     }
 
     pub(crate) fn error_source_is_qualified(&self) -> bool {
-        if matches!(&unsafe { self.pointer.as_ref() }.payload.failure
-            .lock().unwrap_or_else(|e| e.into_inner()).original,
-            Some(NativeStorageFailure::Unqualified(_))) {
+        if matches!(
+            &unsafe { self.pointer.as_ref() }
+                .payload
+                .failure
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .original,
+            Some(NativeStorageFailure::Unqualified(_))
+        ) {
             return false;
         }
-        let custody = unsafe { self.pointer.as_ref() }.payload.error
-            .lock().unwrap_or_else(|e| e.into_inner());
+        let custody = unsafe { self.pointer.as_ref() }
+            .payload
+            .error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         custody.discard_unwind.is_none()
-            && !matches!(&custody.secondary,
-                Some(crate::funded_error::OriginalScopeCause::Unqualified(_)))
-            && custody.previous.as_ref()
+            && !matches!(
+                &custody.secondary,
+                Some(crate::funded_error::OriginalScopeCause::Unqualified(_))
+            )
+            && custody
+                .previous
+                .as_ref()
                 .is_none_or(|previous| previous.scope.error_source_is_qualified())
     }
 
-    pub(crate) fn reserve_diagnostic(&self, layout: Layout)
-        -> std::result::Result<StorageAllocation, NativeRefusal> {
+    pub(crate) fn reserve_diagnostic(
+        &self,
+        layout: Layout,
+    ) -> std::result::Result<StorageAllocation, NativeRefusal> {
         // Fund the independent carrier from the scope's payer, without making
         // that carrier a child owned by the scope itself.
-        unsafe { self.pointer.as_ref() }.payload.funding.reserve_native(layout)
+        unsafe { self.pointer.as_ref() }
+            .payload
+            .funding
+            .reserve_native(layout)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn new_unqualified(funding: StorageFunding) -> Result<Self> {
         let layout = Layout::new::<StorageScopeBlock>();
         // Original bootstrap uses scalar admission and borrowed diagnostics.
@@ -528,7 +625,10 @@ impl StorageAdmissionScope {
         }
         Ok(Self { pointer })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn writer_unqualified(
         original: &OwnedMemoryReservation,
         expected: &AccountantHandle,
@@ -541,13 +641,19 @@ impl StorageAdmissionScope {
             genuine_funder: funder.clone(),
         })
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reader_unqualified(
         receipt: crate::vector_read_memory::NativeReadChildReceipt,
     ) -> Result<Self> {
         Self::new_unqualified(StorageFunding::Read(receipt.into_owner()))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reader_operation(
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> std::result::Result<Self, NativeStorageFailure> {
@@ -556,16 +662,17 @@ impl StorageAdmissionScope {
         if memory.native_reserve_supported() {
             Self::reader_native_owner(memory)
         } else {
-            Self::new_unqualified(StorageFunding::ReadUnqualified(
-                memory,
-            ))
-            .map_err(NativeStorageFailure::Unqualified)
+            Self::new_unqualified(StorageFunding::ReadUnqualified(memory))
+                .map_err(NativeStorageFailure::Unqualified)
         }
     }
 
     /// Use the executing begin_request child, never acquire another child or
     /// recover a Legacy budget. The scope's exact physical cell is prepaid.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reader_native_owner(
         owner: ReadMemoryOwner,
     ) -> std::result::Result<Self, NativeStorageFailure> {
@@ -576,7 +683,8 @@ impl StorageAdmissionScope {
             .map_err(NativeStorageFailure::Refused)?;
         let raw = unsafe { alloc(layout) }.cast::<StorageScopeBlock>();
         let pointer = NonNull::new(raw).ok_or(NativeStorageFailure::AllocatorFailed {
-            site: "native reader scope", layout,
+            site: "native reader scope",
+            layout,
         })?;
         // No fallible step after allocation: final scope release destroys its
         // payload, frees this cell, and only then refunds the original child.
@@ -594,13 +702,18 @@ impl StorageAdmissionScope {
         Ok(Self { pointer })
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn run_native<R>(
         &self,
         operation: impl FnOnce() -> Result<R>,
     ) -> std::result::Result<R, NativeStorageFailure> {
         let (result, original) = self.run_scoped(false, operation);
-        if let Some(original) = original { return Err(original); }
+        if let Some(original) = original {
+            return Err(original);
+        }
         result.map_err(NativeStorageFailure::Unqualified)
     }
     fn run_scoped<R, E>(
@@ -611,8 +724,12 @@ impl StorageAdmissionScope {
         unsafe { retain_scope(self.pointer.cast()) };
         let admission = unsafe {
             NativeStorageAdmission::from_owned_receipt(
-                self.pointer.cast(), retain_scope, finish_scope, admit_scope,
-            ).with_failure_inspector(inspect_scope_failure)
+                self.pointer.cast(),
+                retain_scope,
+                finish_scope,
+                admit_scope,
+            )
+            .with_failure_inspector(inspect_scope_failure)
         };
         let result = redb::with_native_storage_admission(admission, operation);
         let scope = &unsafe { self.pointer.as_ref() }.payload;
@@ -650,7 +767,10 @@ pub(super) struct ColdMetadataOwner {
 unsafe impl Send for ColdMetadataOwner {}
 unsafe impl Sync for ColdMetadataOwner {}
 impl ColdMetadataOwner {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn new_unqualified(
         accountant: &AccountantHandle,
         metadata: ColdSnapshotMetadata,
@@ -723,7 +843,10 @@ impl Drop for StorageName {
     }
 }
 impl StorageAdmissionScope {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn with_rel_name<R>(
         &self,
         logical: &str,
@@ -756,12 +879,17 @@ impl StorageAdmissionScope {
         // also prevents a later physical-name allocation in this scope.
         let invoice = match unsafe { admit_scope(self.pointer.cast(), layout) } {
             Ok(invoice) => invoice,
-            Err(_) => return Ok(Err(redb::NativeColdReadError::AdmissionRefusedAt(self.retain_admission()))),
+            Err(_) => {
+                return Ok(Err(redb::NativeColdReadError::AdmissionRefusedAt(
+                    self.retain_admission(),
+                )));
+            }
         };
         let raw = unsafe { alloc(layout) };
         let Some(pointer) = NonNull::new(raw) else {
             return Ok(Err(redb::NativeColdReadError::AllocatorFailed {
-                site: "physical relation name", layout,
+                site: "physical relation name",
+                layout,
             }));
         };
         // No fallible callback between alloc and initialized owner construction.
@@ -784,8 +912,9 @@ impl StorageAdmissionScope {
 pub(crate) fn original_storage_error(failure: NativeStorageFailure) -> Error {
     match failure {
         NativeStorageFailure::Unqualified(error) => error,
-        NativeStorageFailure::AllocatorFailed { site, layout } =>
-            Error::NativeEngineOther(NativeRefusal::AllocatorFailed { site, layout }),
+        NativeStorageFailure::AllocatorFailed { site, layout } => {
+            Error::NativeEngineOther(NativeRefusal::AllocatorFailed { site, layout })
+        }
         NativeStorageFailure::Refused(NativeRefusal::MemoryBudgetExceeded {
             subsystem,
             operation,
@@ -835,8 +964,12 @@ pub(crate) struct PreparedReadFailure {
 }
 impl PreparedReadFailure {
     pub(super) fn static_engine(reason: &'static str) -> Self {
-        Self { cause: PreparedReadCause::EngineStatic(reason), admission: None,
-            _scope: None, _original: None }
+        Self {
+            cause: PreparedReadCause::EngineStatic(reason),
+            admission: None,
+            _scope: None,
+            _original: None,
+        }
     }
 
     /// Consume a cell prepared BEFORE read/commit entry. No formatting, source
@@ -846,19 +979,33 @@ impl PreparedReadFailure {
         diagnostic: crate::funded_error::PreparedDiagnostic,
         original: &OwnedMemoryReservation,
     ) -> crate::funded_error::OriginalError {
-        let Self { cause, admission, _scope, _original } = self;
+        let Self {
+            cause,
+            admission,
+            _scope,
+            _original,
+        } = self;
         let error = match cause {
-            PreparedReadCause::EngineStatic(reason) => diagnostic.unqualified(Error::Other(reason.into())),
-            PreparedReadCause::Refused(refusal) => crate::funded_error::OriginalError::native(refusal),
+            PreparedReadCause::EngineStatic(reason) => {
+                diagnostic.unqualified(Error::Other(reason.into()))
+            }
+            PreparedReadCause::Refused(refusal) => {
+                crate::funded_error::OriginalError::native(refusal)
+            }
             PreparedReadCause::Unqualified(error) => diagnostic.unqualified(error),
-            PreparedReadCause::Lower(error) => diagnostic.storage(redb::Error::PreparedRead(error), original),
+            PreparedReadCause::Lower(error) => {
+                diagnostic.storage(redb::Error::PreparedRead(error), original)
+            }
             PreparedReadCause::Commit(error) => diagnostic.storage(error.into(), original),
         };
         // The primary error is never put into the scope it can retain through
         // its native descriptor/page. The compact carrier owns both separately.
         match _scope {
             Some(scope) => scope.attach_prepared_error(error, admission),
-            None => { debug_assert!(admission.is_none()); error }
+            None => {
+                debug_assert!(admission.is_none());
+                error
+            }
         }
     }
 }
@@ -866,32 +1013,51 @@ impl PreparedReadFailure {
 impl StorageAdmissionScope {
     /// Authenticate the supplied Original before constructing the scope. Scope
     /// and per-allocation receipt controls use its scalar admission kernel.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepared_original(
         original: &OwnedMemoryReservation,
     ) -> std::result::Result<Self, PreparedReadFailure> {
-        let (original_use, original_handle) = crate::memory_accounting::native_preparation_original(original)
-            .map_err(PreparedReadFailure::static_engine)?;
-        let funding = StorageFunding::PreparedWriter { original_use, original_handle };
+        let (original_use, original_handle) =
+            crate::memory_accounting::native_preparation_original(original)
+                .map_err(PreparedReadFailure::static_engine)?;
+        let funding = StorageFunding::PreparedWriter {
+            original_use,
+            original_handle,
+        };
         let layout = Layout::new::<StorageScopeBlock>();
         let invoice = match funding.reserve_native(layout) {
             Ok(invoice) => invoice,
             Err(refusal) => {
-                let StorageFunding::PreparedWriter { original_use, .. } = funding else { unreachable!() };
-                return Err(PreparedReadFailure { cause: PreparedReadCause::Refused(refusal),
-                    admission: None, _scope: None, _original: Some(original_use) });
+                let StorageFunding::PreparedWriter { original_use, .. } = funding else {
+                    unreachable!()
+                };
+                return Err(PreparedReadFailure {
+                    cause: PreparedReadCause::Refused(refusal),
+                    admission: None,
+                    _scope: None,
+                    _original: Some(original_use),
+                });
             }
         };
         let raw = unsafe { alloc(layout) }.cast::<StorageScopeBlock>();
         let Some(pointer) = NonNull::new(raw) else {
             // This is allocator failure, not a fabricated budget refusal.
-            let StorageFunding::PreparedWriter { original_use, .. } = funding else { unreachable!() };
+            let StorageFunding::PreparedWriter { original_use, .. } = funding else {
+                unreachable!()
+            };
             return Err(PreparedReadFailure {
                 cause: PreparedReadCause::Lower(redb::PreparedReadError::Native(
                     redb::NativeColdReadError::AllocatorFailed {
-                        site: "prepared storage scope", layout,
-                    })),
-                admission: None, _scope: None, _original: Some(original_use),
+                        site: "prepared storage scope",
+                        layout,
+                    },
+                )),
+                admission: None,
+                _scope: None,
+                _original: Some(original_use),
             });
         };
         unsafe {
@@ -899,7 +1065,8 @@ impl StorageAdmissionScope {
                 owners: AtomicUsize::new(1),
                 payload: ManuallyDrop::new(StorageScope {
                     error: Mutex::new(ScopeErrorCustody::default()),
-                    funding, failure: Mutex::new(StorageFailureState::default()),
+                    funding,
+                    failure: Mutex::new(StorageFailureState::default()),
                 }),
                 invoice: ManuallyDrop::new(invoice),
             });
@@ -912,22 +1079,40 @@ impl StorageAdmissionScope {
         bytes: usize,
     ) -> std::result::Result<OwnedMemoryReservation, NativeRefusal> {
         let scope = &unsafe { self.pointer.as_ref() }.payload;
-        let StorageFunding::PreparedWriter { original_use, original_handle } = &scope.funding
-            else { unreachable!("prepared controls keep their exact Original") };
-        crate::memory_accounting::reserve_native_storage_from_writer_use(original_use, original_handle, bytes)
+        let StorageFunding::PreparedWriter {
+            original_use,
+            original_handle,
+        } = &scope.funding
+        else {
+            unreachable!("prepared controls keep their exact Original")
+        };
+        crate::memory_accounting::reserve_native_storage_from_writer_use(
+            original_use,
+            original_handle,
+            bytes,
+        )
     }
 
     /// A fixed external queue phase retains this already admitted owner on
     /// unwind too; it never rediscovers the current scope or an Original.
     pub(crate) fn retain_admission(&self) -> NativeStorageAdmission {
         unsafe { retain_scope(self.pointer.cast()) };
-        unsafe { NativeStorageAdmission::from_owned_receipt(self.pointer.cast(),
-            retain_scope, finish_scope, admit_scope).with_failure_inspector(inspect_scope_failure) }
+        unsafe {
+            NativeStorageAdmission::from_owned_receipt(
+                self.pointer.cast(),
+                retain_scope,
+                finish_scope,
+                admit_scope,
+            )
+            .with_failure_inspector(inspect_scope_failure)
+        }
     }
 
     fn retain_scope_owner(&self) -> Self {
         unsafe { retain_scope(self.pointer.cast()) };
-        Self { pointer: self.pointer }
+        Self {
+            pointer: self.pointer,
+        }
     }
 
     /// Retain preparation custody without certifying a synthetic phase. The
@@ -940,88 +1125,152 @@ impl StorageAdmissionScope {
         let scope = &unsafe { self.pointer.as_ref() }.payload;
         if let Some(admission) = admission {
             let mut failure = scope.failure.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(failure.original.is_none(), "one retained native secondary cause");
+            assert!(
+                failure.original.is_none(),
+                "one retained native secondary cause"
+            );
             failure.original = Some(admission);
         }
         {
             let mut custody = scope.error.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(custody.phase.is_none() && custody.previous.is_none(), "one prepared failure");
+            assert!(
+                custody.phase.is_none() && custody.previous.is_none(),
+                "one prepared failure"
+            );
             custody.previous = error.storage.take();
         }
         error.storage = Some(crate::funded_error::OriginalScopeCustody { scope: self });
         error
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn prepare_read<T>(
         &self,
-        operation: impl FnOnce(&Self, NativeStorageAdmission) -> std::result::Result<T, PreparedReadCause>,
+        operation: impl FnOnce(
+            &Self,
+            NativeStorageAdmission,
+        ) -> std::result::Result<T, PreparedReadCause>,
     ) -> std::result::Result<T, PreparedReadFailure> {
         unsafe { retain_scope(self.pointer.cast()) };
         let admission = unsafe {
             NativeStorageAdmission::from_owned_receipt(
-                self.pointer.cast(), retain_scope, finish_scope, admit_scope,
-            ).with_failure_inspector(inspect_scope_failure)
+                self.pointer.cast(),
+                retain_scope,
+                finish_scope,
+                admit_scope,
+            )
+            .with_failure_inspector(inspect_scope_failure)
         };
         // The lower API installs this owned scope before verified-root reads.
         // No formatting, boxing or losing conversion occurs on either exit.
         let result = operation(self, admission).map_err(|cause| match cause {
             PreparedReadCause::Lower(redb::PreparedReadError::Native(
-                redb::NativeColdReadError::AdmissionRefusedAt(producer))) => {
+                redb::NativeColdReadError::AdmissionRefusedAt(producer),
+            )) => {
                 if producer.same_source(&self.retain_admission()) {
                     // The normal match below moves this scope's actual typed cause.
                     PreparedReadCause::Lower(redb::PreparedReadError::Native(
-                        redb::NativeColdReadError::AdmissionRefused))
+                        redb::NativeColdReadError::AdmissionRefused,
+                    ))
                 } else {
-                    let actual = producer.inspect_failure(|cause| cause
-                        .and_then(|cause| cause.downcast_ref::<NativeStorageFailure>())
-                        .and_then(|cause| match cause {
-                            NativeStorageFailure::Refused(refusal) => Some(PreparedReadCause::Refused(*refusal)),
-                            NativeStorageFailure::AllocatorFailed { site, layout } => Some(PreparedReadCause::Lower(
-                                redb::PreparedReadError::Native(redb::NativeColdReadError::AllocatorFailed {
-                                    site, layout: *layout,
-                                }))),
-                            NativeStorageFailure::Unqualified(_) => None,
-                        }));
+                    let actual = producer.inspect_failure(|cause| {
+                        cause
+                            .and_then(|cause| cause.downcast_ref::<NativeStorageFailure>())
+                            .and_then(|cause| match cause {
+                                NativeStorageFailure::Refused(refusal) => {
+                                    Some(PreparedReadCause::Refused(*refusal))
+                                }
+                                NativeStorageFailure::AllocatorFailed { site, layout } => {
+                                    Some(PreparedReadCause::Lower(redb::PreparedReadError::Native(
+                                        redb::NativeColdReadError::AllocatorFailed {
+                                            site,
+                                            layout: *layout,
+                                        },
+                                    )))
+                                }
+                                NativeStorageFailure::Unqualified(_) => None,
+                            })
+                    });
                     actual.unwrap_or(PreparedReadCause::Lower(redb::PreparedReadError::Native(
-                        redb::NativeColdReadError::AdmissionRefusedAt(producer))))
+                        redb::NativeColdReadError::AdmissionRefusedAt(producer),
+                    )))
                 }
             }
             cause => cause,
         });
-        let refused = unsafe { self.pointer.as_ref() }.payload.failure
-            .lock().unwrap_or_else(|e| e.into_inner()).original.take();
+        let refused = unsafe { self.pointer.as_ref() }
+            .payload
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .original
+            .take();
         match (result, refused) {
             (Ok(value), None) => Ok(value),
-            (Err(PreparedReadCause::Lower(redb::PreparedReadError::Native(
-                redb::NativeColdReadError::AdmissionRefused))), Some(refusal)) => {
-                let cause = match refusal { NativeStorageFailure::Refused(r) => PreparedReadCause::Refused(r),
-                    NativeStorageFailure::AllocatorFailed { site, layout } => PreparedReadCause::Lower(
-                        redb::PreparedReadError::Native(redb::NativeColdReadError::AllocatorFailed { site, layout })),
-                    NativeStorageFailure::Unqualified(e) => PreparedReadCause::Unqualified(e) };
-                Err(PreparedReadFailure { cause,
-                    admission: None, _scope: Some(self.retain_scope_owner()), _original: None })
+            (
+                Err(PreparedReadCause::Lower(redb::PreparedReadError::Native(
+                    redb::NativeColdReadError::AdmissionRefused,
+                ))),
+                Some(refusal),
+            ) => {
+                let cause = match refusal {
+                    NativeStorageFailure::Refused(r) => PreparedReadCause::Refused(r),
+                    NativeStorageFailure::AllocatorFailed { site, layout } => {
+                        PreparedReadCause::Lower(redb::PreparedReadError::Native(
+                            redb::NativeColdReadError::AllocatorFailed { site, layout },
+                        ))
+                    }
+                    NativeStorageFailure::Unqualified(e) => PreparedReadCause::Unqualified(e),
+                };
+                Err(PreparedReadFailure {
+                    cause,
+                    admission: None,
+                    _scope: Some(self.retain_scope_owner()),
+                    _original: None,
+                })
             }
             (Err(cause), admission) => Err(PreparedReadFailure {
-                cause, admission, _scope: Some(self.retain_scope_owner()), _original: None,
+                cause,
+                admission,
+                _scope: Some(self.retain_scope_owner()),
+                _original: None,
             }),
             (Ok(value), Some(refusal)) => {
                 // A caller that ignored a marker cannot publish its result.
                 // Keep the genuine refusal alive while retiring that value.
-                let cause = match refusal { NativeStorageFailure::Refused(r) => PreparedReadCause::Refused(r),
-                    NativeStorageFailure::AllocatorFailed { site, layout } => PreparedReadCause::Lower(
-                        redb::PreparedReadError::Native(redb::NativeColdReadError::AllocatorFailed { site, layout })),
-                    NativeStorageFailure::Unqualified(e) => PreparedReadCause::Unqualified(e) };
-                if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| redb::with_native_storage_admission(
-                        self.retain_admission(), || drop(value)))) {
+                let cause = match refusal {
+                    NativeStorageFailure::Refused(r) => PreparedReadCause::Refused(r),
+                    NativeStorageFailure::AllocatorFailed { site, layout } => {
+                        PreparedReadCause::Lower(redb::PreparedReadError::Native(
+                            redb::NativeColdReadError::AllocatorFailed { site, layout },
+                        ))
+                    }
+                    NativeStorageFailure::Unqualified(e) => PreparedReadCause::Unqualified(e),
+                };
+                if let Err(secondary) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        redb::with_native_storage_admission(self.retain_admission(), || drop(value))
+                    }))
+                {
                     // The scope is still owned here. Retain the actual panic
                     // payload in its prepaid custody cell instead of leaking it
                     // or allocating another carrier after the native refusal.
-                    unsafe { self.pointer.as_ref() }.payload.error
-                        .lock().unwrap_or_else(|e| e.into_inner()).discard_unwind = Some(secondary);
+                    unsafe { self.pointer.as_ref() }
+                        .payload
+                        .error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .discard_unwind = Some(secondary);
                 }
-                Err(PreparedReadFailure { cause,
-                    admission: None, _scope: Some(self.retain_scope_owner()), _original: None })
+                Err(PreparedReadFailure {
+                    cause,
+                    admission: None,
+                    _scope: Some(self.retain_scope_owner()),
+                    _original: None,
+                })
             }
         }
     }
@@ -1029,8 +1278,13 @@ impl StorageAdmissionScope {
 
 #[cfg(test)]
 impl StorageAdmissionScope {
-    pub(crate) fn receipt_layout_for_scan_test() -> Layout { Layout::new::<StorageReceipt>() }
+    pub(crate) fn receipt_layout_for_scan_test() -> Layout {
+        Layout::new::<StorageReceipt>()
+    }
     pub(crate) fn allocation_observation_for_scan_test(&self) -> (usize, Layout) {
-        (self.pointer.as_ptr() as usize, Layout::new::<StorageScopeBlock>())
+        (
+            self.pointer.as_ptr() as usize,
+            Layout::new::<StorageScopeBlock>(),
+        )
     }
 }

@@ -156,7 +156,11 @@ fn indexed_pinned_snapshot_keeps_eligible_tail_across_newer_commits() {
         .execute_at_snapshot(&format!("{sql} INDEXED LIMIT 10"), &query, snapshot)
         .expect("a newer commit does not disable the snapshot-compatible fresh tail");
     let tail_ids = ids(&tail_result);
-    assert_eq!(tail_result.rows().len(), 10, "the sealed base fills LIMIT 10");
+    assert_eq!(
+        tail_result.rows().len(),
+        10,
+        "the sealed base fills LIMIT 10"
+    );
     assert!(
         tail_ids.contains(&inserted_after_base),
         "the bit-identical eligible tail row wins a slot even though the base can fill LIMIT"

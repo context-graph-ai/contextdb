@@ -3,7 +3,7 @@
 //! exit, resumes exactly after the last group it consumed, and loses or
 //! repeats no occurrence at or below that point, whether the hub is resident
 //! or durable and whatever maintenance removes between pages.
-use super::resident_history_test_seams::{observe, Work};
+use super::resident_history_test_seams::{Work, observe};
 use super::*;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
@@ -365,7 +365,8 @@ fn a_refused_resident_page_releases_everything_it_admitted() {
     let db = caller_driven(Database::open_memory());
     synced_notes(&db);
     commit_uuid_rows(&db, 0, 200);
-    let tiny = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1024).expect("admit the declared fixture root")
+    let tiny = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1024)
+        .expect("admit the declared fixture root")
         .child()
         .expect("a tiny reader");
     let (outcome, counting) = page_from(&db, Lsn(0), PAGE_BYTES, tiny);
@@ -494,7 +495,8 @@ fn a_resident_tail_larger_than_the_reader_budget_pulls_in_pages() {
     let db = caller_driven(Database::open_memory());
     synced_notes(&db);
     commit_uuid_rows(&db, 0, 3_000);
-    let reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(2 * 1024 * 1024).expect("admit the declared fixture root");
+    let reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(2 * 1024 * 1024)
+        .expect("admit the declared fixture root");
     let mut since = Lsn(0);
     let mut delivered = Vec::new();
     loop {
@@ -1543,7 +1545,8 @@ fn wide_group_hub(members: usize, member_bytes: usize) -> (tempfile::TempDir, Da
 fn an_oversized_group_after_a_log_gap_is_refused_before_any_copy() {
     let (_dir, db) = wide_group_hub(10, 512 * 1024);
     let limit = 2 * 1024 * 1024;
-    let reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limit).expect("admit the declared fixture root");
+    let reader = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limit)
+        .expect("admit the declared fixture root");
     for attempt in 0..2 {
         let (outcome, counting) = page_from(
             &db,
@@ -1561,7 +1564,8 @@ fn an_oversized_group_after_a_log_gap_is_refused_before_any_copy() {
             "attempt {attempt}: admission never exceeded the limit, so no copy outran it"
         );
     }
-    let roomy = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(64 << 20).expect("admit the declared fixture root");
+    let roomy = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(64 << 20)
+        .expect("admit the declared fixture root");
     let (outcome, counting) = page_from(
         &db,
         Lsn(0),
@@ -1585,7 +1589,8 @@ fn an_oversized_group_after_a_log_gap_is_refused_before_any_copy() {
 fn an_exhausted_budget_refuses_the_cut_selector_and_leaves_no_trace() {
     let (_dir, db) = gap_hub(150, 2);
     db.__force_change_log_gap_for_test();
-    let starved = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(2 * 1024).expect("admit the declared fixture root");
+    let starved = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(2 * 1024)
+        .expect("admit the declared fixture root");
     let (outcome, counting) = page_from(
         &db,
         Lsn(0),
@@ -1659,7 +1664,8 @@ fn live_body(db: &Database, id: i64) -> Vec<Vec<Value>> {
         &HashMap::from([("id".to_string(), Value::Int64(id))]),
     )
     .expect("read the live incarnation")
-    .rows().to_vec()
+    .rows()
+    .to_vec()
 }
 
 // Policy 16: a snapshot exported after DROP/recreate still replays the authored
@@ -1669,7 +1675,7 @@ fn live_body(db: &Database, id: i64) -> Vec<Vec<Value>> {
 // `export_snapshot` artifact, and none place the fresh life in that stream.
 #[test]
 fn an_exported_snapshot_after_recreation_replays_authored_body_schema_and_a_distinct_fresh_occurrence()
-{
+ {
     let dir = tempfile::tempdir().expect("historical export directory");
     let path = dir.path().join("schema.db");
     let db = caller_driven(Database::open(&path).expect("open historical schema store"));
@@ -1694,8 +1700,7 @@ fn an_exported_snapshot_after_recreation_replays_authored_body_schema_and_a_dist
     let original_body = serde_json::to_value(Value::Text("original authored value".to_owned()))
         .expect("serialize the existing authored Value form");
     assert_eq!(
-        authored_occurrence.0["rows"][0]["values"]["body"],
-        original_body,
+        authored_occurrence.0["rows"][0]["values"]["body"], original_body,
         "the occurrence carries the authored Value::Text body"
     );
     assert!(

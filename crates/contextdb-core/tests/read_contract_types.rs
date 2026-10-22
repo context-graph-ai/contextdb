@@ -1058,7 +1058,9 @@ impl OwnerRequestHandler for EchoHandler {
         _cancel: &OwnerReadCancellation,
     ) -> contextdb_core::Result<Vec<u8>> {
         if request == b"fail" {
-            Err(Error::Other("custom owner handler failed".to_owned().into()))
+            Err(Error::Other(
+                "custom owner handler failed".to_owned().into(),
+            ))
         } else {
             Ok(request.to_vec())
         }
@@ -1547,9 +1549,15 @@ fn cursor_page_validation_requires_only_column_row_coherence() {
         _payload: ReadCredit,
     }
     impl CursorPageStorage for Page {
-        fn columns(&self) -> &[String] { &self.columns }
-        fn rows(&self) -> &[Vec<contextdb_core::Value>] { &self.rows }
-        fn has_more(&self) -> bool { self.has_more }
+        fn columns(&self) -> &[String] {
+            &self.columns
+        }
+        fn rows(&self) -> &[Vec<contextdb_core::Value>] {
+            &self.rows
+        }
+        fn has_more(&self) -> bool {
+            self.has_more
+        }
     }
     // Use the production publication route available with default features.
     // Every carrier and retained payload keeps this store's original reader.
@@ -1562,23 +1570,40 @@ fn cursor_page_validation_requires_only_column_row_coherence() {
         let payload_bytes = columns.capacity() * std::mem::size_of::<String>()
             + columns.iter().map(String::capacity).sum::<usize>()
             + rows.capacity() * std::mem::size_of::<Vec<contextdb_core::Value>>()
-            + rows.iter().map(|row| {
-                row.capacity() * std::mem::size_of::<contextdb_core::Value>()
-                    + row.iter().map(|value| match value {
-                        contextdb_core::Value::Text(text) => text.capacity(),
-                        _ => 0,
-                    }).sum::<usize>()
-            }).sum::<usize>();
+            + rows
+                .iter()
+                .map(|row| {
+                    row.capacity() * std::mem::size_of::<contextdb_core::Value>()
+                        + row
+                            .iter()
+                            .map(|value| match value {
+                                contextdb_core::Value::Text(text) => text.capacity(),
+                                _ => 0,
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
         let payload = ReadCredit::try_new_owned(
-            owner.clone(), payload_bytes, "reader", "cursor_page_fixture",
+            owner.clone(),
+            payload_bytes,
+            "reader",
+            "cursor_page_fixture",
             "Release the retained test page.",
-        ).expect("admit the actual retained fixture buffers");
+        )
+        .expect("admit the actual retained fixture buffers");
         CursorPage::try_prepare::<Page>(owner)
             .expect("admit the exact immutable carrier layout")
-            .publish(Page { columns, rows, has_more, _payload: payload })
+            .publish(Page {
+                columns,
+                rows,
+                has_more,
+                _payload: payload,
+            })
     }
     let db = contextdb_engine::Database::open_memory();
-    let owner = db.declared_reader_memory().expect("use the store's declared reader");
+    let owner = db
+        .declared_reader_memory()
+        .expect("use the store's declared reader");
     let empty = page(owner.clone(), vec!["id".to_owned()], vec![], false);
     assert_eq!(empty.validate(), Ok(()));
 

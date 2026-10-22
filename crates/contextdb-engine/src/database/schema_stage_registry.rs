@@ -82,7 +82,10 @@ impl RegistryFamily for Pre2ReceivedSchemaStage {
 fn capacity_error() -> Error {
     Error::Other(("schema stage registry allocation capacity overflow".to_string()).into())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bucket_count<T>(capacity: usize) -> Result<usize> {
     if capacity < 15 {
         let minimum = match (GROUP_WIDTH, std::mem::size_of::<T>()) {
@@ -113,7 +116,10 @@ fn bucket_capacity(buckets: usize) -> usize {
         (buckets / 8) * 7
     }
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn bucket_layout<T>(buckets: usize) -> Result<Layout> {
     if buckets == 0 {
         return Ok(Layout::new::<()>());
@@ -161,7 +167,10 @@ impl<K: Eq + Hash + Copy, V, P> Backing<K, V, P> {
             attribution,
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn reserve_key(&mut self, key: &K) -> Result<()> {
         if self.map.contains_key(key) {
             return Ok(());
@@ -273,7 +282,10 @@ impl<K: Eq + Hash + Copy, V, P> Drop for Backing<K, V, P> {
 
 pub(crate) struct LocalRegistry(Backing<Lsn, LocalSchemaStage, Pre2LocalSchemaStage>);
 impl LocalRegistry {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn new_arc(
         accountant: &crate::memory_accounting::AccountantHandle,
     ) -> Result<Arc<Mutex<Self>>> {
@@ -304,7 +316,10 @@ impl LocalRegistry {
             attribution,
         )))))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(crate) fn insert(
         &mut self,
         key: Lsn,
@@ -347,7 +362,10 @@ pub(crate) struct Cell<V> {
 }
 pub(crate) struct OccupiedRegistry<K: Eq + Hash + Copy, V, P>(Backing<K, Cell<V>, P>);
 impl<K: Eq + Hash + Copy, V, P> OccupiedRegistry<K, V, P> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn new_arc(
         accountant: &crate::memory_accounting::AccountantHandle,
     ) -> Result<Arc<Mutex<Self>>>
@@ -427,7 +445,10 @@ impl<K: Eq + Hash + Copy, V, P> OccupiedRegistry<K, V, P> {
         self.0.map.retain(|_, cell| cell.tokens != 0);
         self.0.release_if_empty();
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn acquire(&mut self, key: K, detach: bool) -> Result<Option<V>> {
         if let Some(cell) = self.0.map.get_mut(&key) {
             let count = cell.tokens.checked_add(1).ok_or_else(capacity_error)?;
@@ -475,7 +496,10 @@ pub(crate) struct Token<K: Eq + Hash + Copy, V, P> {
     armed: bool,
 }
 impl<K: Eq + Hash + Copy, V, P> Token<K, V, P> {
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn detach_existing(
         registry: &Arc<Mutex<OccupiedRegistry<K, V, P>>>,
         key: K,
@@ -496,7 +520,10 @@ impl<K: Eq + Hash + Copy, V, P> Token<K, V, P> {
             stage,
         )))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub(super) fn reserve(
         registry: &Arc<Mutex<OccupiedRegistry<K, V, P>>>,
         key: K,

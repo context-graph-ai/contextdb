@@ -1276,7 +1276,9 @@ fn t21_12_missing_commit_directory_refuses_without_repair() {
     assert!(!is_directory_refusal(
         &contextdb_core::Error::StoreCorrupted {
             path: "rel_items".to_owned().into(),
-            reason: "commit directory differs from its committed root".to_owned().into(),
+            reason: "commit directory differs from its committed root"
+                .to_owned()
+                .into(),
         }
     ));
     for _ in 0..2 {
@@ -1597,7 +1599,10 @@ fn assert_current_commit_index_integrity_refusal(disorder_ids: bool) {
             healthy.snapshot_at(before_lsn),
         )
         .unwrap();
-    assert_eq!(before_lookup.rows(), vec![vec![Value::Text("before".into())]]);
+    assert_eq!(
+        before_lookup.rows(),
+        vec![vec![Value::Text("before".into())]]
+    );
     let after_lookup = healthy
         .execute_at_snapshot(
             "SELECT label FROM items WHERE id = $id",
