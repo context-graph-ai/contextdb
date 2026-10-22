@@ -26,3 +26,9 @@ impl<T: ?Sized + AsRef<[Vec<Value>]>> PartialEq<T> for RetainedRows {
         self.0.rows() == other.as_ref()
     }
 }
+
+impl serde::Serialize for RetainedRows {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(self.0.rows(), serializer)
+    }
+}

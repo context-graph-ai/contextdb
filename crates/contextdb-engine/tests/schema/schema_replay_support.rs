@@ -1,5 +1,7 @@
 // Canonical test-only replay helpers; this file declares no tests.
 
+#[path = "../fixtures/retained_query_rows.rs"]
+mod retained_query_rows;
 #[path = "../fixtures/schema_wall/mod.rs"]
 mod support;
 use contextdb_core::Value;
@@ -8,6 +10,7 @@ use contextdb_engine::database::{
 };
 use contextdb_engine::{Database, MaintenancePolicy};
 use redb::TableWriteOperationForTest;
+use retained_query_rows::RetainedRows;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -150,14 +153,14 @@ fn receiver_with_unrelated_rows(path: &std::path::Path, row_count: i64) -> Arc<D
     db
 }
 
-fn resident_rows(db: &Database) -> Vec<Vec<Value>> {
-    let rows = db
+fn resident_rows(db: &Database) -> RetainedRows {
+    let rows: RetainedRows = db
         .execute(
             "SELECT id, embedding FROM resident_vectors ORDER BY id",
             &empty(),
         )
         .expect("resident data remains readable")
-        .rows;
+        .into();
     assert_eq!(
         rows.len(),
         usize::try_from(crate::UNRELATED_RESIDENT_ROWS).unwrap(),
@@ -185,17 +188,17 @@ fn cost_receipt(label: &str, observation: &ReceivedSchemaApplyObservationForTest
 include!("schema_replay_exchange_helpers.rs");
 
 // The full targets retain the frozen row-count assertion through their root constant.
-fn replay_resident_rows(db: &Database, row_count: i64) -> Vec<Vec<Value>> {
+fn replay_resident_rows(db: &Database, row_count: i64) -> RetainedRows {
     if row_count == 10_000 {
         return resident_rows(db);
     }
-    let rows = db
+    let rows: RetainedRows = db
         .execute(
             "SELECT id, embedding FROM resident_vectors ORDER BY id",
             &empty(),
         )
         .expect("bounded resident data remains readable")
-        .rows;
+        .into();
     assert_eq!(rows.len(), usize::try_from(row_count).unwrap());
     if row_count == 1 {
         assert_eq!(
@@ -257,16 +260,18 @@ async fn affected_schema_closure_contract(row_count: i64) {
     source
         .execute("ALTER TABLE closure_parent ADD COLUMN note TEXT", &empty())
         .expect("author affected parent alteration");
+    let affected = BTreeSet::from(["closure_parent".to_string(), "closure_child".to_string()]);
+    let mut indexes = physical_index_tables(&receiver, &affected);
     let observer = ReceivedSchemaApplyObserverForTest::new();
     let scope = receiver.observe_received_schema_applies_for_test(&observer);
     push_phase(&client, "closure-replay-push").await;
     drop(scope);
+    indexes.extend(physical_index_tables(&receiver, &affected));
     let observed = observer
         .observation()
         .expect("real dependency-closure apply");
-    let affected = BTreeSet::from(["closure_parent".to_string(), "closure_child".to_string()]);
     cost_receipt("dependency-closure", &observed);
-    assert_dependency_complete(&observed, &affected, 1);
+    assert_dependency_complete(&observed, &affected, &indexes, 1);
     assert!(
         receiver
             .list_triggers()
@@ -291,7 +296,7 @@ async fn affected_schema_closure_contract(row_count: i64) {
         receiver
             .execute("SELECT status FROM closure_child", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("invalidated".into())]]
     );
     source.execute("INSERT INTO closure_parent (id, status) VALUES ('00000000-0000-0000-0000-000000000010', 'active')", &empty()).unwrap();
