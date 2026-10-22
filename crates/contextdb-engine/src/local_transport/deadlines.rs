@@ -1510,6 +1510,9 @@ mod independent_owned_driver_tests {
     #[test]
     #[serial_test::serial]
     fn one_clock_worker_keeps_pending_waits_after_caller_departure_rows() {
+        // The process finisher may be cold here; exclude its permanent
+        // worker from the clock driver's own creation/release delta.
+        crate::owned_worker::ensure_finisher().unwrap();
         let before = threads();
         let actual = Arc::new(MemoryAccountant::with_budget(contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY as usize));
         let owner: contextdb_core::read_memory::ReadMemoryOwner = actual.clone().into();

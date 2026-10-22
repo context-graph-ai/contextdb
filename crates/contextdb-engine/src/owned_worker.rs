@@ -447,6 +447,14 @@ mod native {
                 assert_eq!(ENTERED.load(Ordering::SeqCst), 0);
                 assert_eq!(threads(), before);
             }
+            // A cold process starts its one permanent finisher only after
+            // successful admission. Repeating bootstrap must add no worker.
+            let finisher_was_started = FINISHER.lock().unwrap().is_some();
+            ensure_finisher().expect("start the process finisher after refusal controls");
+            let warm = before + usize::from(!finisher_was_started);
+            assert_eq!(threads(), warm);
+            ensure_finisher().expect("reuse the same process finisher");
+            assert_eq!(threads(), warm);
             for ending in ["join", "drop", "unwind"] {
                 STACK_PAGE.store(0, Ordering::SeqCst);
                 ENTERED.store(0, Ordering::SeqCst);
@@ -457,7 +465,7 @@ mod native {
                 let worker = worker.unwrap();
                 while PHASE.load(Ordering::Acquire) != 1 { std::thread::yield_now(); }
                 let _release = ReleaseBody;
-                assert_eq!(threads(), before + 1);
+                assert_eq!(threads(), warm + 1);
                 assert_eq!(payer.actual.usage().used, control.size() + stack);
                 assert!(!unmapped(STACK_PAGE.load(Ordering::Acquire)));
                 let request = requests[..count].iter().copied().find(|(pointer, bytes, align)|
@@ -476,7 +484,7 @@ mod native {
                 assert!(!payer.early.load(Ordering::SeqCst), "stack invoice refunded while its actual page was still mapped");
                 assert!(unmapped(STACK_PAGE.load(Ordering::Acquire)));
                 assert_eq!(payer.actual.usage().used, 0);
-                assert_eq!(threads(), before);
+                assert_eq!(threads(), warm);
                 drop(watch);
             }
         }

@@ -1560,6 +1560,9 @@ fn prove_request_and_response_deadline_jump(jump_to_ms: u64) {
     );
     let baseline = harness.service.resources();
     let client = harness.client(93);
+    let live_client = harness.service.resources();
+    assert!(live_client.reader_used_bytes > baseline.reader_used_bytes);
+    assert!(live_client.reader_control_bytes > baseline.reader_control_bytes);
     let worker_client = Arc::clone(&client);
     let worker = std::thread::spawn(move || {
         block_on(
@@ -1573,6 +1576,7 @@ fn prove_request_and_response_deadline_jump(jump_to_ms: u64) {
         )
     });
     handler.wait_for_entered(1);
+    let live_request = harness.service.resources();
 
     harness.clock.advance_to(jump_to_ms);
     // At the exact request deadline (110) only the owner's deadline has
@@ -1610,8 +1614,25 @@ fn prove_request_and_response_deadline_jump(jump_to_ms: u64) {
 
     handler.release();
     observer.wait_for_finished_requests(1);
-    assert_resources(&harness.service, baseline);
+    // Request completion releases admission and cancellation. The carrier
+    // still owns data, charged until its storage is physically released.
+    let completed = harness.service.resources();
+    assert_eq!(completed.active_slots, baseline.active_slots);
+    assert_eq!(completed.cursor_count, baseline.cursor_count);
+    assert_eq!(completed.cursor_retained_bytes, baseline.cursor_retained_bytes);
+    assert_eq!(completed.buffered_bytes, baseline.buffered_bytes);
+    assert_eq!(completed.active_cancellations, baseline.active_cancellations);
+    assert_eq!(completed.accountant_used_bytes, baseline.accountant_used_bytes);
+    assert!(completed.reader_used_bytes <= live_request.reader_used_bytes);
+    assert!(completed.reader_control_bytes <= live_request.reader_control_bytes);
     assert_eq!(harness.service.cancellation_signal_count(), 1);
+    drop(client);
+    harness.clients.lock().expect("owner client registry").clear();
+    harness
+        .service
+        .shutdown_and_drain()
+        .expect("join connection workers after the client closes");
+    assert_resources(&harness.service, baseline);
 }
 
 #[test]
