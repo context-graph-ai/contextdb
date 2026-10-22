@@ -503,8 +503,19 @@ fn consolidation_failure_before_and_after_durability_keeps_one_authoritative_dec
             matches!(error.engine_diagnostic(), Error::Other(message) if message == "injected policy metadata publication failure"),
             "the actual durability cut must refuse: {error:?}"
         );
-        assert_eq!(column(&db).consolidation_disabled, cut == 11);
         let fresh = db.writer_read_root().unwrap().unwrap();
+        let fresh_meta = fresh.borrow_captured_table_meta("breadth_rows").unwrap();
+        assert_eq!(
+            fresh_meta
+                .columns
+                .iter()
+                .find(|column| column.name == "embedding")
+                .unwrap()
+                .consolidation_disabled,
+            cut == 11,
+            "a newly captured root must publish the committed declaration even when its caller received an error"
+        );
+        assert_eq!(column(&db).consolidation_disabled, cut == 11);
         assert_eq!(
             canonical(fresh.borrow_captured_table_meta("breadth_rows").unwrap()),
             canonical(&db.table_meta("breadth_rows").unwrap()),
