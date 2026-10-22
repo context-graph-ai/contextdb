@@ -27515,10 +27515,14 @@ impl MaintenanceContext {
             .is_ok_and(|committed| committed.1.commit_lsn.is_some());
         let watch_completed = publication_watch.borrow_mut().take();
         match result {
-            Ok(_) => {
+            Ok(committed) => {
                 if let Some(watch) = watch_completed {
                     watch.completed();
                 }
+                // Callback selections are gone; free the returned write-set
+                // payload before its original selection workspace settles.
+                drop(committed);
+                drop(workspace);
                 #[cfg(any(test, feature = "test-seams"))]
                 if writer_checkpoint && let Some(observer) = &self.writer_receipt_observer {
                     observer.emit_writer_memory_ownership_receipt_for_test("commit");
@@ -27731,6 +27735,9 @@ impl MaintenanceContext {
                 if let Some(watch) = watch_completed {
                     watch.completed();
                 }
+                // The callback selections, staged bodies and terminal have
+                // physically dropped before their selection workspace ends.
+                drop(workspace);
                 #[cfg(any(test, feature = "test-seams"))]
                 if writer_checkpoint && let Some(observer) = &self.writer_receipt_observer {
                     observer.emit_writer_memory_ownership_receipt_for_test("commit");
