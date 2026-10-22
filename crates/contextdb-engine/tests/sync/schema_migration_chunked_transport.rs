@@ -641,7 +641,7 @@ async fn oversized_authenticated_schema_stays_invisible_until_one_commit_and_ret
         "opening the current schema under default limits never walks history"
     );
     assert_eq!(file.route(), contextdb_core::read_contract::ReadRoute::File);
-    support::assert_cg_artifact_queries(|sql, p| file.execute(sql, p).unwrap().rows, 0x90000);
+    support::assert_cg_artifact_queries(|sql, p| file.execute(sql, p).unwrap(), 0x90000);
 }
 
 impl Drop for RealHub {

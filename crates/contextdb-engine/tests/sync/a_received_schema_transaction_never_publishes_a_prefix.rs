@@ -932,7 +932,7 @@ async fn retry_after_crash(fixture: &CrashFixture, boundary: CrashBoundary) {
     let file = contextdb_engine::ReadSession::open(&fixture.hub_path).unwrap();
     assert_eq!(file.route(), contextdb_core::read_contract::ReadRoute::File);
     support::assert_cg_artifact_queries(
-        |sql, p| file.execute(sql, p).unwrap().rows,
+        |sql, p| file.execute(sql, p).unwrap(),
         0x1A000 + boundary as u128 * 0x100,
     );
 }

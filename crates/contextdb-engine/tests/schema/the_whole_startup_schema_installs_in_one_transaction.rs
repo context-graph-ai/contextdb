@@ -351,7 +351,7 @@ fn the_whole_startup_schema_installs_in_one_transaction() {
         reader.route(),
         contextdb_core::read_contract::ReadRoute::File
     );
-    support::assert_cg_artifact_queries(|sql, p| reader.execute(sql, p).unwrap().rows, 0x7000);
+    support::assert_cg_artifact_queries(|sql, p| reader.execute(sql, p).unwrap(), 0x7000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -605,7 +605,7 @@ mod source_crash {
             reader.route(),
             contextdb_core::read_contract::ReadRoute::File
         );
-        support::assert_cg_artifact_queries(|sql, p| reader.execute(sql, p).unwrap().rows, 0x8000);
+        support::assert_cg_artifact_queries(|sql, p| reader.execute(sql, p).unwrap(), 0x8000);
         drop(reader);
         let recovered = identity(&path);
         assert_eq!(

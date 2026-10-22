@@ -425,7 +425,7 @@ pub fn cg_artifact_params(seed: u128) -> HashMap<String, Value> {
 }
 
 pub fn assert_cg_artifact_queries(
-    mut execute: impl FnMut(&str, &HashMap<String, Value>) -> Vec<Vec<Value>>,
+    mut execute: impl FnMut(&str, &HashMap<String, Value>) -> contextdb_engine::QueryResult,
     seed: u128,
 ) {
     let p = cg_artifact_params(seed);
@@ -433,21 +433,21 @@ pub fn assert_cg_artifact_queries(
         execute(
             "SELECT id FROM digests WHERE context_id = $context ORDER BY vector_text <=> $query LIMIT 1",
             &p
-        ),
+        ).rows(),
         vec![vec![p["digest"].clone()]]
     );
     assert_eq!(
         execute(
             "SELECT target FROM GRAPH_TABLE(edges MATCH (a)-[:CITES]->(b) WHERE a.id = $context COLUMNS (b.id AS target))",
             &p
-        ),
+        ).rows(),
         vec![vec![p["target"].clone()]]
     );
     assert_eq!(
         execute(
             "SELECT source FROM GRAPH_TABLE(edges MATCH (a)<-[:CITES]-(b) WHERE a.id = $target COLUMNS (b.id AS source))",
             &p
-        ),
+        ).rows(),
         vec![vec![p["context"].clone()]]
     );
 }
@@ -457,7 +457,7 @@ pub fn assert_cg_artifacts(db: &Database, seed: u128) {
         db.column_has_covering_index("edges", "source_id"),
         "the actual cg composite source index is installed"
     );
-    assert_cg_artifact_queries(|sql, p| db.execute(sql, p).unwrap().rows().to_vec(), seed);
+    assert_cg_artifact_queries(|sql, p| db.execute(sql, p).unwrap(), seed);
     let mut p = cg_artifact_params(seed);
     p.insert(
         "back_edge".into(),
