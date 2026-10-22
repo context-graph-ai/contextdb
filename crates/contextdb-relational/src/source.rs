@@ -14,8 +14,10 @@ pub trait RelationalWindow<T>: Send {
 }
 
 pub trait RelationalCursor<T>: Send {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_window(&mut self) -> Result<Option<OwnedReadBox<dyn RelationalWindow<T>>>>;
     /// Admit work after a record exists and before decoding its payload.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_window_before(
         &mut self,
         before: &mut dyn FnMut() -> Result<()>,
@@ -52,10 +54,12 @@ pub trait RelationalReadSource: Send + Sync {
     fn ordered_prefix_snapshot_is_current(&self, snapshot: SnapshotId) -> bool {
         snapshot == self.snapshot()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_table(&self, _table: &str) -> Result<()> {
         Ok(())
     }
     fn lsn(&self) -> Lsn;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_cursor(
         &self,
         table: &str,
@@ -64,23 +68,27 @@ pub trait RelationalReadSource: Send + Sync {
         reverse: bool,
     ) -> Result<RelationalCursorOwner<VersionedRow>>;
     /// Reverse version order within one row identity.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_id_cursor(
         &self,
         table: &str,
         row: RowId,
         snapshot: SnapshotId,
     ) -> Result<RelationalCursorOwner<VersionedRow>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn exact_row(
         &self,
         table: &str,
         position: &[u8; 24],
     ) -> Result<Option<OwnedReadBox<dyn RelationalWindow<VersionedRow>>>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn index_cursor(
         &self,
         table: &str,
         index: &str,
         range: RelationalIndexRange<'_>,
     ) -> Result<RelationalCursorOwner<RelationalPosting>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn exact_index_cursor(
         &self,
         table: &str,
@@ -89,6 +97,7 @@ pub trait RelationalReadSource: Send + Sync {
         key: &IndexKey,
     ) -> Result<RelationalCursorOwner<RelationalPosting>>;
     /// Construct full physical endpoints under source scratch admission.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn index_position_key(
         &self,
         current: bool,
@@ -96,10 +105,12 @@ pub trait RelationalReadSource: Send + Sync {
         row: RowId,
         created: TxId,
     ) -> Result<OwnedReadBox<dyn RelationalPositionKey>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_source(&self, table: &str, row: RowId) -> Result<Option<(Lsn, SyncSourceKind)>>;
 }
 
 /// Retains only the currently inspected version while reverse seeking.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn visible_row(
     source: &dyn RelationalReadSource,
     table: &str,
@@ -116,6 +127,7 @@ pub fn visible_row(
     Ok(None)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn ensure_snapshot(source: &dyn RelationalReadSource, snapshot: SnapshotId) -> Result<()> {
     if snapshot.0 > source.snapshot().0 {
         return Err(contextdb_core::Error::Other(
@@ -155,6 +167,7 @@ impl RelationalProbeHit<'_> {
 /// identity lookup supplied by the engine, including staged deletes and
 /// replaced committed identities. It must not rebuild or scan the write set.
 /// Null/coercion/constraint policy stays with the engine's existing validators.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn exact_probe<'a>(
     source: &dyn RelationalReadSource,
     table: &str,
@@ -208,6 +221,7 @@ pub fn exact_probe<'a>(
     Ok(None)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn staged_row<'a>(
     inserts: &'a [(String, VersionedRow)],
     table: &str,
@@ -276,6 +290,7 @@ pub struct OrderedRelationalMerge<'a> {
 }
 
 impl<'a> OrderedRelationalMerge<'a> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn new(
         source: std::sync::Arc<dyn RelationalReadSource>,
         staged: Box<dyn Iterator<Item = Result<StagedRelationalPosting<'a>>> + 'a>,
@@ -325,6 +340,7 @@ impl<'a> OrderedRelationalMerge<'a> {
         self.staged_done = true;
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn next(
         &mut self,
         hidden_committed: impl FnMut(RowId) -> bool,
@@ -333,6 +349,7 @@ impl<'a> OrderedRelationalMerge<'a> {
     }
 
     /// Observe each committed posting before visibility and suppression.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn next_observed(
         &mut self,
         hidden_committed: impl FnMut(RowId) -> bool,
@@ -345,6 +362,7 @@ impl<'a> OrderedRelationalMerge<'a> {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_inner(
         &mut self,
         mut hidden_committed: impl FnMut(RowId) -> bool,
