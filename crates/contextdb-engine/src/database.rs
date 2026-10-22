@@ -26845,24 +26845,15 @@ impl MaintenanceContext {
             let registered = active_removal_pass.registered_snapshots();
             // This is a fresh authenticated sample inside the removal boundary,
             // before any catalog-driven removal or resident retirement.
-            let mut inventory = self.maintenance_closing_inventory_locked()?;
+            let (mut inventory, mut retired) = self.reclaim_closing_source_graphs_locked(registered)?;
             if !inventory.complete {
                 return Ok(inventory.failures);
             }
-            let mut retired = self.vector.retire_snapshot_free_partition_states(
+            retired = retired.saturating_add(self.vector.retire_snapshot_free_partition_states(
                 registered,
                 self.finalization.accountant.as_ref(),
                 &mut maintenance_vector_copy_owner,
-            )?;
-            for route in &inventory.routes {
-                retired = retired.saturating_add(
-                    self.vector
-                        .reclaim_snapshot_free_partition_graph_generations(
-                            &route.partition,
-                            registered,
-                        ),
-                );
-            }
+            )?);
             if registered.is_empty() || retired != 0 {
                 self.reclaim_catalogs_locked(
                     &mut inventory,
@@ -26882,19 +26873,11 @@ impl MaintenanceContext {
             let active_removal_pass = self
                 .snapshot_registry
                 .begin_vector_removal_pass(self.tx_mgr.current_tx_max());
-            let mut inventory = self.maintenance_closing_inventory_locked()?;
+            let (mut inventory, reclaimed) = self.reclaim_closing_source_graphs_locked(
+                active_removal_pass.registered_snapshots(),
+            )?;
             if !inventory.complete {
                 return Ok(inventory.failures);
-            }
-            let mut reclaimed = 0usize;
-            for route in &inventory.routes {
-                reclaimed = reclaimed.saturating_add(
-                    self.vector
-                        .reclaim_snapshot_free_partition_graph_generations(
-                            &route.partition,
-                            active_removal_pass.registered_snapshots(),
-                        ),
-                );
             }
             if reclaimed != 0 {
                 self.reclaim_catalogs_locked(

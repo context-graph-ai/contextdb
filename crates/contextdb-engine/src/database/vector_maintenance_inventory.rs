@@ -809,78 +809,62 @@ impl MaintenanceContext {
         }
     }
 
-    pub(super) fn maintenance_closing_inventory_locked(
+    /// Reclaim selected source graphs one route at a time. Strong source
+    /// handles are released before the caller retires registry states, and
+    /// no list of unrelated owned routes occupies reclamation headroom.
+    pub(super) fn reclaim_closing_source_graphs_locked(
         &self,
-    ) -> Result<MaintenanceCatalogInventory> {
+        registered_snapshots: &[SnapshotId],
+    ) -> Result<(MaintenanceCatalogInventory, usize)> {
         let mut phase = self.maintenance_inventory_phase_with_catalog_retention_locked(false)?;
         if !phase.complete {
-            return Ok(self.finish_inventory_phase_locked(phase));
+            return Ok((self.finish_inventory_phase_locked(phase), 0));
         }
-        let mut routes = Vec::new();
-        let sampled = (|| -> Result<()> {
-            for (index_position, index) in phase.indexes.indexes.iter().enumerate() {
-                self.vector
-                    .with_partition_sources(index, |view| -> Result<()> {
-                        view.visit(|key, state| -> Result<()> {
-                            let position = phase
-                                .sources
-                                .iter()
-                                .position(|source| {
-                                    source.index == index_position
-                                        && Arc::ptr_eq(&source.state, state)
-                                })
-                                .expect("sampled source");
-                            if phase.sources[position].failed
-                                || phase.sources[position].metadata.historical_only
-                            {
-                                return Ok(());
-                            }
-                            let heap = key
-                                .estimated_bytes()
-                                .saturating_sub(std::mem::size_of::<VectorPartitionKey>())
-                                .saturating_add(index.table.len())
-                                .saturating_add(index.column.len());
-                            let workspace = match self.maintenance_workspace(heap, PREPARE) {
-                                Ok(workspace) => workspace,
-                                Err(error @ Error::MemoryBudgetExceeded { .. }) => {
-                                    let details =
-                                        VectorMaintenanceFailureDetails::from_error(&error);
-                                    phase.failures.first.get_or_insert(details);
-                                    phase.sources[position].failure = Some(details);
-                                    phase.sources[position].failed = true;
-                                    return Ok(());
-                                }
-                                Err(error) => return Err(error),
-                            };
-                            self.admit_inventory_slot(
-                                "closing_routes",
-                                &mut phase.memory,
-                                &mut routes,
-                            )?;
-                            routes.push(MaintenanceBuildCandidate {
-                                partition: VectorPartitionRef::new(index.clone(), key.clone()),
-                                cold: false,
-                                _workspace: workspace,
-                            });
-                            Ok(())
-                        })
-                    })?;
+        let mut reclaimed = 0usize;
+        for (index_position, index) in phase.indexes.indexes.iter().enumerate() {
+            for position in 0..phase.sources.len() {
+                let source = &phase.sources[position];
+                if source.index != index_position || source.failed || source.metadata.historical_only {
+                    continue;
+                }
+                let mut route = None;
+                let captured = self.vector.with_partition_sources(index, |view| -> Result<()> {
+                    view.visit(|key, state| -> Result<()> {
+                        if !Arc::ptr_eq(state, &source.state) { return Ok(()); }
+                        let heap = key.estimated_bytes()
+                            .saturating_sub(std::mem::size_of::<VectorPartitionKey>())
+                            .saturating_add(index.table.len())
+                            .saturating_add(index.column.len());
+                        let workspace = self.maintenance_workspace(heap, PREPARE)?;
+                        route = Some(MaintenanceBuildCandidate {
+                            partition: VectorPartitionRef::new(index.clone(), key.clone()),
+                            cold: false,
+                            _workspace: workspace,
+                        });
+                        Ok(())
+                    })
+                });
+                match captured {
+                    Ok(()) => {}
+                    Err(error @ Error::MemoryBudgetExceeded { .. }) => {
+                        let details = VectorMaintenanceFailureDetails::from_error(&error);
+                        phase.failures.first.get_or_insert(details);
+                        phase.sources[position].failure = Some(details);
+                        phase.sources[position].failed = true;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+                if let Some(route) = route {
+                    reclaimed = reclaimed.saturating_add(
+                        self.vector.reclaim_snapshot_free_partition_graph_generations(
+                            &route.partition, registered_snapshots,
+                        ),
+                    );
+                }
             }
-            Ok(())
-        })();
-        match sampled {
-            Ok(()) => {}
-            Err(error @ Error::MemoryBudgetExceeded { .. }) => {
-                drop(routes);
-                return Ok(self.finish_inventory_phase_locked(
-                    self.incomplete_inventory_phase(phase, &error),
-                ));
-            }
-            Err(error) => return Err(error),
         }
-        let mut inventory = self.finish_inventory_phase_locked(phase);
-        inventory.routes = routes;
-        Ok(inventory)
+        Ok((self.finish_inventory_phase_locked(phase), reclaimed))
     }
 
     pub(super) fn reclaim_catalogs_locked(
