@@ -8,6 +8,7 @@ use pest_derive::Parser;
 #[grammar = "grammar.pest"]
 struct ContextDbParser;
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn parse(input: &str) -> Result<Statement> {
     let sql = input.trim();
 
@@ -32,6 +33,7 @@ pub fn parse(input: &str) -> Result<Statement> {
     parse_statement(sql)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn parse_statement(sql: &str) -> Result<Statement> {
     if contains_where_match_operator(sql) {
         return Err(Error::FullTextSearchNotSupported);
@@ -110,6 +112,7 @@ fn parse_statement(sql: &str) -> Result<Statement> {
     Ok(stmt)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_show_vector_partitions(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut table = None;
     let mut column = None;
@@ -173,6 +176,7 @@ fn build_show_vector_partitions(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStatement> {
     let mut ctes = Vec::new();
     let mut body = None;
@@ -199,6 +203,7 @@ fn build_select(pair: Pair<'_, Rule>) -> Result<SelectStatement> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_cte(pair: Pair<'_, Rule>) -> Result<Cte> {
     let mut name = None;
     let mut query = None;
@@ -217,6 +222,7 @@ fn build_cte(pair: Pair<'_, Rule>) -> Result<Cte> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     let mut distinct = false;
     let mut columns = Vec::new();
@@ -294,6 +300,7 @@ fn build_select_core(pair: Pair<'_, Rule>) -> Result<SelectBody> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_select_list(pair: Pair<'_, Rule>) -> Result<Vec<SelectColumn>> {
     let mut cols = Vec::new();
 
@@ -314,6 +321,7 @@ fn build_select_list(pair: Pair<'_, Rule>) -> Result<Vec<SelectColumn>> {
     Ok(cols)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_select_item(pair: Pair<'_, Rule>) -> Result<SelectColumn> {
     let mut expr = None;
     let mut alias = None;
@@ -333,6 +341,7 @@ fn build_select_item(pair: Pair<'_, Rule>) -> Result<SelectColumn> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_from_clause(pair: Pair<'_, Rule>) -> Result<Vec<FromItem>> {
     let mut items = Vec::new();
     for p in pair.into_inner() {
@@ -343,6 +352,7 @@ fn build_from_clause(pair: Pair<'_, Rule>) -> Result<Vec<FromItem>> {
     Ok(items)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_from_item(pair: Pair<'_, Rule>) -> Result<FromItem> {
     let inner = pair
         .into_inner()
@@ -356,6 +366,7 @@ fn build_from_item(pair: Pair<'_, Rule>) -> Result<FromItem> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_join_clause(pair: Pair<'_, Rule>) -> Result<JoinClause> {
     let mut join_type = None;
     let mut table = None;
@@ -391,6 +402,7 @@ fn build_join_clause(pair: Pair<'_, Rule>) -> Result<JoinClause> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_table_ref(pair: Pair<'_, Rule>) -> Result<FromItem> {
     let mut name = None;
     let mut alias = None;
@@ -410,6 +422,7 @@ fn build_table_ref(pair: Pair<'_, Rule>) -> Result<FromItem> {
     Ok(FromItem::Table { name, alias })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_graph_table(pair: Pair<'_, Rule>) -> Result<FromItem> {
     let mut graph_name = None;
     let mut pattern = None;
@@ -463,6 +476,7 @@ fn build_graph_table(pair: Pair<'_, Rule>) -> Result<FromItem> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_match_pattern(pair: Pair<'_, Rule>) -> Result<GraphPattern> {
     let inner = pair
         .into_inner()
@@ -491,6 +505,7 @@ fn build_match_pattern(pair: Pair<'_, Rule>) -> Result<GraphPattern> {
     Ok(GraphPattern { start, edges })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_node_pattern(pair: Pair<'_, Rule>) -> Result<NodePattern> {
     let mut alias = None;
     let mut label = None;
@@ -512,6 +527,7 @@ fn build_node_pattern(pair: Pair<'_, Rule>) -> Result<NodePattern> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_edge_step(pair: Pair<'_, Rule>) -> Result<EdgeStep> {
     let edge = pair
         .into_inner()
@@ -558,6 +574,7 @@ fn build_edge_step(pair: Pair<'_, Rule>) -> Result<EdgeStep> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_edge_bracket(pair: Pair<'_, Rule>) -> Result<(Option<String>, Option<String>)> {
     let mut alias = None;
     let mut edge_type = None;
@@ -587,6 +604,7 @@ fn build_edge_bracket(pair: Pair<'_, Rule>) -> Result<(Option<String>, Option<St
     Ok((alias, edge_type))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_quantifier(pair: Pair<'_, Rule>) -> Result<(u32, u32)> {
     let inner = pair
         .into_inner()
@@ -614,6 +632,7 @@ fn build_quantifier(pair: Pair<'_, Rule>) -> Result<(u32, u32)> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_columns_clause(pair: Pair<'_, Rule>) -> Result<Vec<GraphTableColumn>> {
     let mut cols = Vec::new();
 
@@ -645,6 +664,7 @@ fn build_columns_clause(pair: Pair<'_, Rule>) -> Result<Vec<GraphTableColumn>> {
     Ok(cols)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_where_clause(pair: Pair<'_, Rule>) -> Result<Expr> {
     let expr_pair = pair
         .into_inner()
@@ -653,6 +673,7 @@ fn build_where_clause(pair: Pair<'_, Rule>) -> Result<Expr> {
     build_expr(expr_pair)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_order_by_clause(pair: Pair<'_, Rule>) -> Result<Vec<OrderByItem>> {
     let mut items = Vec::new();
     for p in pair.into_inner() {
@@ -663,6 +684,7 @@ fn build_order_by_clause(pair: Pair<'_, Rule>) -> Result<Vec<OrderByItem>> {
     Ok(items)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
     let mut direction = SortDirection::Asc;
     let mut expr = None;
@@ -704,6 +726,7 @@ fn build_order_item(pair: Pair<'_, Rule>) -> Result<OrderByItem> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_cosine_rhs(pair: Pair<'_, Rule>) -> Result<Expr> {
     let inner = pair
         .into_inner()
@@ -716,6 +739,7 @@ fn build_cosine_rhs(pair: Pair<'_, Rule>) -> Result<Expr> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_row_vector_source(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut values = pair.into_inner();
     let table = match values.next() {
@@ -750,6 +774,7 @@ fn build_row_vector_source(pair: Pair<'_, Rule>) -> Result<Expr> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_row_vector_key(pair: Pair<'_, Rule>) -> Result<Expr> {
     let inner = pair
         .into_inner()
@@ -777,6 +802,7 @@ fn build_row_vector_key(pair: Pair<'_, Rule>) -> Result<Expr> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_limit_clause(pair: Pair<'_, Rule>) -> Result<u64> {
     let num = pair
         .into_inner()
@@ -785,6 +811,7 @@ fn build_limit_clause(pair: Pair<'_, Rule>) -> Result<u64> {
     parse_u64(num.as_str(), "invalid LIMIT value")
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_use_vector_clause(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
     let mode = pair
         .into_inner()
@@ -793,6 +820,7 @@ fn build_use_vector_clause(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
     build_vector_search_mode(mode)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_use_rank_clause(pair: Pair<'_, Rule>) -> Result<String> {
     pair.into_inner()
         .find(|p| p.as_rule() == Rule::identifier)
@@ -800,6 +828,7 @@ fn build_use_rank_clause(pair: Pair<'_, Rule>) -> Result<String> {
         .ok_or_else(|| Error::ParseError("USE RANK missing sort key".to_string()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_vector_search_mode(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
     match pair.as_str().to_ascii_uppercase().as_str() {
         "AUTO" => Ok(VectorSearchMode::Auto),
@@ -811,6 +840,7 @@ fn build_vector_search_mode(pair: Pair<'_, Rule>) -> Result<VectorSearchMode> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let inner = pair
         .into_inner()
@@ -819,6 +849,7 @@ fn build_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     build_or_expr(inner)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_or_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let first = inner
@@ -843,6 +874,7 @@ fn build_or_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_and_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let first = inner
@@ -867,6 +899,7 @@ fn build_and_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_unary_bool_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut not_count = 0usize;
     let mut cmp = None;
@@ -890,6 +923,7 @@ fn build_unary_bool_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_comparison_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let left_pair = inner
@@ -915,6 +949,7 @@ fn build_comparison_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_row_value(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut elements = Vec::new();
     for element in pair.into_inner() {
@@ -930,6 +965,7 @@ fn build_row_value(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(Expr::Row(elements))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
     let suffix = pair
         .into_inner()
@@ -1119,6 +1155,7 @@ fn build_comparison_suffix(left: Expr, pair: Pair<'_, Rule>) -> Result<Expr> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_additive_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let first = inner
@@ -1141,6 +1178,7 @@ fn build_additive_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_multiplicative_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let first = inner
@@ -1163,6 +1201,7 @@ fn build_multiplicative_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_unary_math_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut neg_count = 0usize;
     let mut primary = None;
@@ -1187,6 +1226,7 @@ fn build_unary_math_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(expr)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_primary_expr(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut inner = pair.into_inner();
     let first = inner
@@ -1239,6 +1279,7 @@ fn window_refusal(form: &str) -> Error {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_window_call(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut parts = pair.into_inner();
     let call = parts
@@ -1311,6 +1352,7 @@ fn build_window_call(pair: Pair<'_, Rule>) -> Result<Expr> {
     }))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
     let mut name = None;
     let mut args = Vec::new();
@@ -1337,6 +1379,7 @@ fn build_function_call(pair: Pair<'_, Rule>) -> Result<Expr> {
     Ok(Expr::FunctionCall { name, args })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_column_ref(pair: Pair<'_, Rule>) -> Result<Expr> {
     let ids: Vec<String> = pair
         .into_inner()
@@ -1357,6 +1400,7 @@ fn build_column_ref(pair: Pair<'_, Rule>) -> Result<Expr> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
     let mut name = None;
     let mut if_not_exists = false;
@@ -1668,6 +1712,7 @@ fn build_create_table(pair: Pair<'_, Rule>) -> Result<CreateTable> {
 /// Read one `MAINTAIN COUNT ...` clause. Each parenthesised list reuses
 /// `indexed_column`, so the optional per-column `ASC`/`DESC` is spelled
 /// exactly as `CREATE INDEX` spells it and defaults to `ASC`.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_maintain_count_option(pair: Pair<'_, Rule>) -> Result<MaintainedCountsDecl> {
     let mut lists: Vec<Vec<(String, SortDirection)>> = Vec::new();
     for part in pair.into_inner() {
@@ -1735,6 +1780,7 @@ fn build_maintain_count_option(pair: Pair<'_, Rule>) -> Result<MaintainedCountsD
     Ok(MaintainedCountsDecl::Lists(lists))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_identifier_list(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     let mut values = Vec::new();
     for part in pair.into_inner() {
@@ -1751,6 +1797,7 @@ fn build_identifier_list(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     Ok(values)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_edge_discard_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::EdgeDiscardMode> {
     let spelling = pair
         .into_inner()
@@ -1764,6 +1811,7 @@ fn build_edge_discard_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::Edg
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_declare_tenant_table_policy(pair: Pair<'_, Rule>) -> Result<DeclareTenantTablePolicy> {
     let mut table = None;
     let mut immutable = false;
@@ -1852,6 +1900,7 @@ fn build_declare_tenant_table_policy(pair: Pair<'_, Rule>) -> Result<DeclareTena
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_show_delivery_outcomes(pair: Pair<'_, Rule>) -> Result<ShowDeliveryOutcomes> {
     let mut table = None;
     let mut where_clause = None;
@@ -1880,6 +1929,7 @@ fn build_show_delivery_outcomes(pair: Pair<'_, Rule>) -> Result<ShowDeliveryOutc
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_history_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::HistoryPolicy> {
     let inner = pair
         .into_inner()
@@ -1892,6 +1942,7 @@ fn build_history_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::HistoryP
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_alter_table(pair: Pair<'_, Rule>) -> Result<AlterTable> {
     let mut table = None;
     let mut action = None;
@@ -1911,6 +1962,7 @@ fn build_alter_table(pair: Pair<'_, Rule>) -> Result<AlterTable> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     let action = pair
         .into_inner()
@@ -2017,6 +2069,7 @@ fn build_alter_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     let mut column = None;
     let mut max_partitions = None;
@@ -2199,6 +2252,7 @@ fn build_alter_column_action(pair: Pair<'_, Rule>) -> Result<AlterAction> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMachineDef>)> {
     let mut name = None;
     let mut data_type = None;
@@ -2415,6 +2469,7 @@ fn build_column_def(pair: Pair<'_, Rule>) -> Result<(ColumnDef, Option<StateMach
     ))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_rank_policy_clause(pair: Pair<'_, Rule>) -> Result<RankPolicyAst> {
     let mut joined_table = None;
     let mut joined_column = None;
@@ -2462,6 +2517,7 @@ fn build_rank_policy_clause(pair: Pair<'_, Rule>) -> Result<RankPolicyAst> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     let columns: Vec<String> = pair
         .into_inner()
@@ -2488,6 +2544,7 @@ fn build_unique_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     Ok(columns)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_primary_key_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     let columns: Vec<String> = pair
         .into_inner()
@@ -2516,6 +2573,7 @@ fn build_primary_key_table_constraint(pair: Pair<'_, Rule>) -> Result<Vec<String
     Ok(columns)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_composite_foreign_key(pair: Pair<'_, Rule>) -> Result<CompositeForeignKey> {
     let mut identifiers = pair
         .into_inner()
@@ -2565,6 +2623,7 @@ fn refuse_nested_direction(nested: Pair<'_, Rule>) -> Error {
     ))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_sync_direction_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::SyncDirection> {
     use contextdb_core::SyncDirection;
     let spelling = pair
@@ -2580,6 +2639,7 @@ fn build_sync_direction_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::S
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_sync_conflict_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::ConflictPolicy> {
     use contextdb_core::ConflictPolicy;
     let policy = pair
@@ -2593,6 +2653,7 @@ fn build_sync_conflict_option(pair: Pair<'_, Rule>) -> Result<contextdb_core::Co
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
     let mut amount = None;
     let mut unit = None;
@@ -2644,6 +2705,7 @@ fn build_retain_option(pair: Pair<'_, Rule>) -> Result<RetainOption> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_scope_label_simple(pair: Pair<'_, Rule>) -> Result<ScopeLabelConstraint> {
     let labels = pair
         .into_inner()
@@ -2658,6 +2720,7 @@ fn build_scope_label_simple(pair: Pair<'_, Rule>) -> Result<ScopeLabelConstraint
     Ok(ScopeLabelConstraint::Simple { labels })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_scope_label_split(pair: Pair<'_, Rule>) -> Result<ScopeLabelConstraint> {
     let raw = pair.as_str();
     let write_pos = find_keyword_outside_strings(raw, "WRITE")
@@ -2740,6 +2803,7 @@ fn find_keyword_outside_strings(raw: &str, keyword: &str) -> Option<usize> {
     None
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_acl_constraint(pair: Pair<'_, Rule>) -> Result<AclConstraint> {
     let mut identifiers = pair
         .into_inner()
@@ -2757,6 +2821,7 @@ fn build_acl_constraint(pair: Pair<'_, Rule>) -> Result<AclConstraint> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {
     let ids: Vec<String> = pair
         .into_inner()
@@ -2777,6 +2842,7 @@ fn build_references_clause(pair: Pair<'_, Rule>) -> Result<ForeignKey> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_fk_propagation_clause(pair: Pair<'_, Rule>) -> Result<AstPropagationRule> {
     let mut trigger_state = None;
     let mut target_state = None;
@@ -2807,6 +2873,7 @@ fn build_fk_propagation_clause(pair: Pair<'_, Rule>) -> Result<AstPropagationRul
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_edge_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagationRule> {
     let mut edge_type = None;
     let mut direction = None;
@@ -2849,6 +2916,7 @@ fn build_edge_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagationR
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_vector_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagationRule> {
     let trigger_state = pair
         .into_inner()
@@ -2859,6 +2927,7 @@ fn build_vector_propagation_option(pair: Pair<'_, Rule>) -> Result<AstPropagatio
     Ok(AstPropagationRule::VectorExclusion { trigger_state })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn parse_max_depth_clause(pair: Pair<'_, Rule>) -> Result<u32> {
     let depth = pair
         .into_inner()
@@ -2867,6 +2936,7 @@ fn parse_max_depth_clause(pair: Pair<'_, Rule>) -> Result<u32> {
     parse_u32(depth.as_str(), "invalid MAX DEPTH value")
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_data_type(pair: Pair<'_, Rule>) -> Result<DataType> {
     let txt = pair.as_str().to_string();
     let mut inner = pair.into_inner();
@@ -2912,6 +2982,7 @@ struct ParsedVectorColumnOptions {
     consolidation: VectorConsolidationOptions,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn vector_column_options_for_data_type(pair: &Pair<'_, Rule>) -> Result<ParsedVectorColumnOptions> {
     let Some(vector_type) = pair
         .clone()
@@ -3026,6 +3097,7 @@ fn build_vector_policy_value(pair: Pair<'_, Rule>) -> VectorPolicyValue {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_vector_hnsw_options(pair: Pair<'_, Rule>) -> Result<VectorHnswOptions> {
     let mut options = VectorHnswOptions::default();
     for option in pair.into_inner() {
@@ -3074,6 +3146,7 @@ fn build_vector_hnsw_options(pair: Pair<'_, Rule>) -> Result<VectorHnswOptions> 
     Ok(options)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_vector_consolidation_options(pair: Pair<'_, Rule>) -> Result<VectorConsolidationOptions> {
     let mut options = VectorConsolidationOptions::default();
     for option in pair.into_inner() {
@@ -3115,6 +3188,7 @@ fn build_vector_consolidation_options(pair: Pair<'_, Rule>) -> Result<VectorCons
     Ok(options)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn vector_quantization_for_data_type(pair: &Pair<'_, Rule>) -> Result<VectorQuantization> {
     let Some(vector_type) = pair
         .clone()
@@ -3147,6 +3221,7 @@ fn vector_quantization_for_data_type(pair: &Pair<'_, Rule>) -> Result<VectorQuan
     Ok(VectorQuantization::F32)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_state_machine_option(pair: Pair<'_, Rule>) -> Result<StateMachineDef> {
     let entries = pair
         .into_inner()
@@ -3199,6 +3274,7 @@ fn build_state_machine_option(pair: Pair<'_, Rule>) -> Result<StateMachineDef> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_dag_option(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     let edge_types = pair
         .into_inner()
@@ -3215,6 +3291,7 @@ fn build_dag_option(pair: Pair<'_, Rule>) -> Result<Vec<String>> {
     Ok(edge_types)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_drop_table(pair: Pair<'_, Rule>) -> Result<DropTable> {
     let mut if_exists = false;
     let mut name = None;
@@ -3233,6 +3310,7 @@ fn build_drop_table(pair: Pair<'_, Rule>) -> Result<DropTable> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_create_index(pair: Pair<'_, Rule>) -> Result<CreateIndex> {
     let mut name: Option<String> = None;
     let mut table: Option<String> = None;
@@ -3280,6 +3358,7 @@ fn build_create_index(pair: Pair<'_, Rule>) -> Result<CreateIndex> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_drop_index(pair: Pair<'_, Rule>) -> Result<DropIndex> {
     let mut if_exists = false;
     let mut idents: Vec<String> = Vec::new();
@@ -3302,6 +3381,7 @@ fn build_drop_index(pair: Pair<'_, Rule>) -> Result<DropIndex> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_create_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut name = None;
     let mut every = None;
@@ -3345,6 +3425,7 @@ fn build_create_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_drop_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
     let name = pair
         .into_inner()
@@ -3354,6 +3435,7 @@ fn build_drop_schedule(pair: Pair<'_, Rule>) -> Result<Statement> {
     Ok(Statement::DropSchedule { name })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_create_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut name = None;
     let mut table = None;
@@ -3386,6 +3468,7 @@ fn build_create_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_drop_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
     let name = pair
         .into_inner()
@@ -3395,6 +3478,7 @@ fn build_drop_trigger(pair: Pair<'_, Rule>) -> Result<Statement> {
     Ok(Statement::DropTrigger { name })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_create_event_type(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut name = None;
     let mut when = None;
@@ -3425,6 +3509,7 @@ fn build_create_event_type(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_create_sink(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut name = None;
     let mut sink_type = None;
@@ -3456,6 +3541,7 @@ fn build_create_sink(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_create_route(pair: Pair<'_, Rule>) -> Result<Statement> {
     let mut idents = Vec::new();
     let mut where_in = None;
@@ -3497,6 +3583,7 @@ fn build_create_route(pair: Pair<'_, Rule>) -> Result<Statement> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_drop_route(pair: Pair<'_, Rule>) -> Result<Statement> {
     let name = pair
         .into_inner()
@@ -3506,6 +3593,7 @@ fn build_drop_route(pair: Pair<'_, Rule>) -> Result<Statement> {
     Ok(Statement::DropRoute { name })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_insert(pair: Pair<'_, Rule>) -> Result<Insert> {
     let mut table = None;
     let mut columns = Vec::new();
@@ -3534,6 +3622,7 @@ fn build_insert(pair: Pair<'_, Rule>) -> Result<Insert> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_values_row(pair: Pair<'_, Rule>) -> Result<Vec<Expr>> {
     pair.into_inner()
         .filter(|p| p.as_rule() == Rule::expr)
@@ -3541,6 +3630,7 @@ fn build_values_row(pair: Pair<'_, Rule>) -> Result<Vec<Expr>> {
         .collect()
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_on_conflict(pair: Pair<'_, Rule>) -> Result<OnConflict> {
     let mut columns = Vec::new();
     let mut update_columns = Vec::new();
@@ -3559,6 +3649,7 @@ fn build_on_conflict(pair: Pair<'_, Rule>) -> Result<OnConflict> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_assignment(pair: Pair<'_, Rule>) -> Result<(String, Expr)> {
     let mut name = None;
     let mut value = None;
@@ -3577,6 +3668,7 @@ fn build_assignment(pair: Pair<'_, Rule>) -> Result<(String, Expr)> {
     ))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_delete(pair: Pair<'_, Rule>) -> Result<Delete> {
     let mut table = None;
     let mut where_clause = None;
@@ -3595,18 +3687,21 @@ fn build_delete(pair: Pair<'_, Rule>) -> Result<Delete> {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_purge(pair: Pair<'_, Rule>) -> Result<Purge> {
     Ok(Purge {
         selections: build_erasure_selections(pair)?,
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_discard(pair: Pair<'_, Rule>) -> Result<Discard> {
     Ok(Discard {
         selections: build_erasure_selections(pair)?,
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_erasure_selections(pair: Pair<'_, Rule>) -> Result<Vec<ErasureSelection>> {
     let mut selections = Vec::new();
     for selection in pair.into_inner() {
@@ -3633,6 +3728,7 @@ fn build_erasure_selections(pair: Pair<'_, Rule>) -> Result<Vec<ErasureSelection
     Ok(selections)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_update(pair: Pair<'_, Rule>) -> Result<Update> {
     let mut table = None;
     let mut assignments = Vec::new();
@@ -3741,6 +3837,7 @@ fn grouped_count_pins(expr: &Expr, in_scope: &dyn Fn(&ColumnRef) -> bool) -> boo
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_statement(stmt: &Statement) -> Result<()> {
     if let Statement::Select(sel) = stmt {
         validate_select(sel)?;
@@ -3748,6 +3845,7 @@ fn validate_statement(stmt: &Statement) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_select(sel: &SelectStatement) -> Result<()> {
     for cte in &sel.ctes {
         if let Cte::SqlCte { query, .. } = cte {
@@ -3772,6 +3870,7 @@ fn validate_select(sel: &SelectStatement) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_select_body(body: &SelectBody) -> Result<()> {
     if body
         .order_by
@@ -3799,6 +3898,7 @@ fn validate_select_body(body: &SelectBody) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_match_clause(mc: &MatchClause) -> Result<()> {
     if mc.graph_name.as_ref().is_none_or(|g| g.trim().is_empty()) {
         return Err(Error::ParseError(
@@ -3840,6 +3940,7 @@ fn validate_match_clause(mc: &MatchClause) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_expr(expr: &Expr) -> Result<()> {
     match expr {
         Expr::InSubquery { subquery, .. } => {
@@ -3887,6 +3988,7 @@ fn validate_expr(expr: &Expr) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
     match expr {
         Expr::InSubquery { subquery, .. } => {
@@ -3947,6 +4049,7 @@ fn validate_subquery_expr(expr: &Expr, cte_names: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_row_vector_key_expr(expr: &Expr) -> Result<()> {
     match expr {
         Expr::Literal(Literal::Bool(_))
@@ -4005,21 +4108,25 @@ fn parse_string_literals_in(raw: &str) -> Vec<String> {
     out
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn parse_u32(s: &str, err: &str) -> Result<u32> {
     s.parse::<u32>()
         .map_err(|_| Error::ParseError(err.to_string()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn parse_u64(s: &str, err: &str) -> Result<u64> {
     s.parse::<u64>()
         .map_err(|_| Error::ParseError(err.to_string()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn parse_i64(s: &str, err: &str) -> Result<i64> {
     s.parse::<i64>()
         .map_err(|_| Error::ParseError(err.to_string()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn parse_f64(s: &str, err: &str) -> Result<f64> {
     s.parse::<f64>()
         .map_err(|_| Error::ParseError(err.to_string()))
@@ -4115,6 +4222,7 @@ fn contains_where_match_operator(input: &str) -> bool {
     false
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
     let inner = pair
         .into_inner()
@@ -4139,6 +4247,7 @@ fn build_set_memory_limit(pair: Pair<'_, Rule>) -> Result<SetMemoryLimitValue> {
 }
 
 /// `None` means the column returns to the engine's default share.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_vector_serving_cache(pair: Pair<'_, Rule>) -> Result<Option<u64>> {
     let inner = pair
         .into_inner()
@@ -4163,6 +4272,7 @@ fn build_vector_serving_cache(pair: Pair<'_, Rule>) -> Result<Option<u64>> {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_set_disk_limit(pair: Pair<'_, Rule>) -> Result<SetDiskLimitValue> {
     let inner = pair
         .into_inner()
@@ -4190,9 +4300,11 @@ fn build_set_disk_limit(pair: Pair<'_, Rule>) -> Result<SetDiskLimitValue> {
 /// the statement and the Rust setter refuse identically. Only what a parser
 /// alone can see is refused here: a number too large to hold, and a clause
 /// named twice.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSetting> {
     use contextdb_core::StorageCompactionDeclarationIssue as Issue;
     let refuse = |issue| Error::InvalidStorageCompactionDeclaration { issue };
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ratio(pair: Pair<'_, Rule>, name: &str) -> Result<f64> {
         let text = pair
             .into_inner()
@@ -4204,6 +4316,7 @@ fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSet
             .parse::<f64>()
             .map_err(|_| Error::ParseError(format!("STORAGE_COMPACTION {name} is not a number")))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn integer(pair: Pair<'_, Rule>, name: &str) -> Result<Option<u64>> {
         let text = pair
             .into_inner()
@@ -4213,6 +4326,7 @@ fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSet
             })?;
         Ok(text.as_str().parse::<u64>().ok())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn once<T>(slot: &mut Option<T>, value: T) -> Result<()> {
         if slot.replace(value).is_some() {
             return Err(Error::InvalidStorageCompactionDeclaration {
@@ -4261,6 +4375,7 @@ fn build_storage_compaction(pair: Pair<'_, Rule>) -> Result<StorageCompactionSet
     Ok(StorageCompactionSetting::Declare(clauses))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_maintenance_poll_interval(pair: Pair<'_, Rule>) -> Result<u64> {
     let mut value = None;
     let mut multiplier = None;
@@ -4304,6 +4419,7 @@ fn build_maintenance_poll_interval(pair: Pair<'_, Rule>) -> Result<u64> {
     Ok(milliseconds)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn parse_size_with_unit(text: &str) -> Result<u64> {
     let (digits, suffix) = text.split_at(text.len() - 1);
     let base: u64 = digits
@@ -4318,6 +4434,7 @@ fn parse_size_with_unit(text: &str) -> Result<u64> {
     Ok(base * multiplier)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_window_spec<'a>(
     expr: &'a Expr,
     window: &mut Option<&'a RowNumberWindow>,
