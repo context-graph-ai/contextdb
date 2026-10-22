@@ -1118,6 +1118,32 @@ enum Row {
     Refusal,
     Unwind,
 }
+// This checks copies of actual allocator/invoice receipts. Negative controls
+// below mutate those copies; they do not claim to mutate production refunds.
+#[derive(Clone, Copy)]
+struct RetainedFreeCut {
+    request: Allocation,
+    original_counter: usize,
+    watched_counter: usize,
+    original_payer: usize,
+    observed_payer: usize,
+    freed: (usize, usize, usize),
+    live: usize,
+    residual: usize,
+}
+fn retained_free_cut_matches(cut: RetainedFreeCut) -> bool {
+    cut.request.0 != 0
+        && cut.request.1 != 0
+        && cut.request.2.is_power_of_two()
+        && cut.original_counter != 0
+        && cut.original_counter == cut.watched_counter
+        && cut.original_payer != 0
+        && cut.original_payer == cut.observed_payer
+        && cut.freed.2 == 1
+        && cut.freed.0 == cut.freed.1
+        && cut.live >= cut.request.1
+        && cut.live.checked_add(cut.residual) == Some(cut.freed.0)
+}
 fn retained_trace_row(row: Row) {
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let (_directory, db) = fixture();
@@ -1227,35 +1253,108 @@ fn retained_trace_row(row: Row) {
     );
     assert_eq!(next.trace_new, Some(next_invoice));
     let freed = oracle::source_free_for_test(count);
+    let live = oracle::source_live_at_free_for_test(count);
     for index in 0..count {
         assert_eq!(
             freed[index].2, 1,
             "each ORIGINAL allocation physically freed exactly once: {requests:?} {freed:?}"
         );
-        // Field destruction is trace buffers, score credit, token Box,
-        // admission's extra/Box refund, provider Arc, keeper payload, keeper free.
-        let exact = if index < payload_count {
-            controls.debit(first_invoice)
-        } else if index == payload_count {
-            first_invoice.prepaid_control_bytes
-                + first_invoice.additional_bytes
-                + controls.bytes()
-                + controls.native_bytes()
-        } else if index == payload_count + 1 {
-            controls.bytes() + controls.native_bytes()
-        } else if index == payload_count + 2 {
-            controls.keeper.1 + controls.native_bytes()
-        } else if index == payload_count + 3 {
-            controls.native_bytes()
+        if index < payload_count {
+            // Payload buffers share one prepaid invoice. Their physical
+            // frees precede that invoice's refund; keep the original exact
+            // complete invoice assertion at every one of these cuts.
+            assert_eq!(
+                (freed[index].0, freed[index].1),
+                (controls.debit(first_invoice), controls.debit(first_invoice))
+            );
+            continue;
+        }
+        // The score credit retires after the payload group, before B. Its
+        // original assertion at B includes additional but not score bytes.
+        let residual = if index == payload_count {
+            first_invoice.additional_bytes
         } else {
-            controls.native_keeper.1
+            0
         };
-        assert_eq!(
-            (freed[index].0, freed[index].1),
-            (exact, exact),
-            "each allocation stays funded THROUGH native free in actual field-drop order: index={index}, requests={requests:?}, freed={freed:?}"
+        let cut = RetainedFreeCut {
+            request: requests[index],
+            original_counter: controls.native.counter,
+            watched_counter: counter,
+            original_payer: first_invoice.original_payer,
+            observed_payer: first_owner.payer,
+            freed: freed[index],
+            live: live[index],
+            residual,
+        };
+        assert!(
+            retained_free_cut_matches(cut),
+            "actual original payer must equal independently recorded live allocation requests plus its retained invoice: index={index} live={live:?} requests={requests:?} freed={freed:?}"
+        );
+        let mut bad = cut;
+        bad.freed.2 = 0;
+        assert!(
+            !retained_free_cut_matches(bad),
+            "missing physical free is rejected"
+        );
+        let mut bad = cut;
+        bad.freed.2 = 2;
+        assert!(
+            !retained_free_cut_matches(bad),
+            "duplicate physical free is rejected"
+        );
+        let mut bad = cut;
+        bad.freed.0 -= cut.request.1;
+        bad.freed.1 = bad.freed.0;
+        assert!(!retained_free_cut_matches(bad), "early refund is rejected");
+        let mut bad = cut;
+        bad.observed_payer ^= 1;
+        assert!(
+            !retained_free_cut_matches(bad),
+            "wrong original payer is rejected"
+        );
+        let mut bad = cut;
+        bad.watched_counter ^= 1;
+        assert!(
+            !retained_free_cut_matches(bad),
+            "wrong watched counter is rejected"
+        );
+        let mut bad = cut;
+        bad.freed.0 += cut.request.1;
+        bad.freed.1 = bad.freed.0;
+        assert!(
+            !retained_free_cut_matches(bad),
+            "extra residual allocation is rejected"
         );
     }
+    let token = payload_count;
+    let provider = token + 1;
+    let keeper = token + 2;
+    let adapter = token + 3;
+    let native_keeper = token + 4;
+    // This is the same actual order as the protected physical-free contract:
+    // payload group -> B -> An -> Kn -> At -> Kt. Each control's own Layout
+    // is refunded only after its physical free; no control is pinned to force
+    // the superseded hand-written At/Kt-before-An/Kn assumption.
+    assert_eq!(
+        freed[token].0,
+        first_invoice.prepaid_control_bytes
+            + first_invoice.additional_bytes
+            + controls.bytes()
+            + controls.native_bytes()
+    );
+    assert_eq!(
+        freed[token].0 - freed[adapter].0,
+        requests[token].1 + first_invoice.additional_bytes
+    );
+    for (earlier, later) in [
+        (adapter, native_keeper),
+        (native_keeper, provider),
+        (provider, keeper),
+    ] {
+        assert!(live[earlier] > live[later]);
+        assert_eq!(freed[earlier].0 - freed[later].0, requests[earlier].1);
+    }
+    assert_eq!(freed[keeper].0, requests[keeper].1);
     assert_eq!(
         counter_value(counter),
         0,
