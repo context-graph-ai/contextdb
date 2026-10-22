@@ -80,7 +80,7 @@ pub fn hold(db: &Database) -> (ReadSession, ReadCursor) {
         .open_cursor("SELECT id FROM bulk ORDER BY id", &p())
         .unwrap();
     assert!(
-        cursor.first_page().has_more,
+        cursor.first_page().has_more(),
         "the cursor must keep a live snapshot"
     );
     (session, cursor)
@@ -92,12 +92,12 @@ pub fn backlog(db: &Database) -> (usize, usize) {
 }
 
 fn rows_in(mut cursor: ReadCursor) -> usize {
-    let mut rows = cursor.first_page().rows.len();
-    let mut more = cursor.first_page().has_more;
+    let mut rows = cursor.first_page().rows().len();
+    let mut more = cursor.first_page().has_more();
     while more {
         let page = cursor.fetch(None).unwrap();
-        rows += page.rows.len();
-        more = page.has_more;
+        rows += page.rows().len();
+        more = page.has_more();
     }
     rows
 }
@@ -106,7 +106,7 @@ fn count_rows(db: &Database, table: &str) -> i64 {
     let result = db
         .execute(&format!("SELECT COUNT(*) FROM {table}"), &p())
         .unwrap();
-    match &result.rows[0][0] {
+    match &result.rows()[0][0] {
         Value::Int64(n) => *n,
         other => panic!("unexpected count value {other:?}"),
     }
