@@ -994,15 +994,52 @@ mod tests {
             "control",
         )
         .unwrap();
+        assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial + bytes);
+        let prepaid_control_bytes = std::mem::size_of::<VectorWorkspaceReservation>();
         let mut prepaid =
             VectorCopyAdmission::from_prepaid(routing_budget.clone(), charge).unwrap();
         assert!(!prepaid.historical_durable_reads());
-        assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial + bytes);
+        assert!(std::ptr::addr_eq(
+            prepaid.accountant().as_ref(),
+            routing_budget.as_ref()
+        ));
+        assert_eq!(prepaid.retained_bytes(), bytes);
+        assert_eq!(prepaid_live.load(Ordering::SeqCst), bytes);
+        assert_eq!(
+            routing_budget.0.load(Ordering::SeqCst),
+            initial + bytes + prepaid_control_bytes
+        );
+        #[cfg(feature = "test-seams")]
+        let prepaid_invoice = {
+            let mut invoice = crate::mem::TraceInvoiceForTest::default();
+            prepaid.complete_invoice_for_test(&mut invoice);
+            assert_eq!(invoice.prepaid_bytes, bytes);
+            assert_eq!(invoice.additional_bytes, 0);
+            assert_eq!(invoice.prepaid_control_bytes, prepaid_control_bytes);
+            assert_ne!(invoice.prepaid_control.0, 0);
+            assert_eq!(invoice.prepaid_control.1, prepaid_control_bytes);
+            assert_eq!(
+                invoice.prepaid_control.2,
+                std::mem::align_of::<VectorWorkspaceReservation>()
+            );
+            invoice
+        };
         prepaid.with_historical_durable_reads(|marked| {
             assert!(marked.local_scratch().is_none());
             marked.reserve(bytes).unwrap();
             assert!(marked.historical_durable_reads());
-            assert_eq!(routing_budget.0.load(Ordering::SeqCst), initial + bytes);
+            assert_eq!(
+                routing_budget.0.load(Ordering::SeqCst),
+                initial + bytes + prepaid_control_bytes
+            );
+            assert_eq!(marked.retained_bytes(), bytes);
+            assert_eq!(prepaid_live.load(Ordering::SeqCst), bytes);
+            #[cfg(feature = "test-seams")]
+            {
+                let mut invoice = crate::mem::TraceInvoiceForTest::default();
+                marked.complete_invoice_for_test(&mut invoice);
+                assert_eq!(invoice, prepaid_invoice);
+            }
         });
         assert!(!prepaid.historical_durable_reads());
         drop(prepaid);
