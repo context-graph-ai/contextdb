@@ -397,7 +397,13 @@ impl NavigationSession {
     #[cfg(test)]
     pub(crate) fn fill_base_body_for_test(&self, point: &paged_builder::PagedVectorPoint) {
         self.lock().remember_point(0, PointId(0, 0), point);
-        assert!(self.lock().point(0, PointId(0, 0)).unwrap().values.is_some());
+        assert!(
+            self.lock()
+                .point(0, PointId(0, 0))
+                .unwrap()
+                .values
+                .is_some()
+        );
     }
     #[cfg(test)]
     pub(crate) fn has_base_body_for_test(&self) -> bool {
@@ -6487,20 +6493,76 @@ mod admitted_navigation_body_tests {
                 crate::memory_budget::ScopedVectorCopy::from_admitted(point(id, 9.0), token),
             ))
         }
-        fn load_point(&mut self, _: PointId) -> Result<paged_builder::PagedVectorPoint> { panic!("must use copy admission") }
-        fn identity(&mut self, _: usize) -> Result<paged_builder::PagedVectorIdentity> { unreachable!() }
-        fn point_for_row(&mut self, _: contextdb_core::RowId, _: contextdb_core::SnapshotId) -> Result<Option<PointId>> { unreachable!() }
-        fn exact_rows(&mut self, _: &[u8], _: contextdb_core::SnapshotId, _: Option<contextdb_core::RowId>, _: usize) -> Result<Vec<contextdb_core::RowId>> { unreachable!() }
-        fn checkpoint(&mut self) -> Result<()> { unreachable!() }
-        fn before_distance(&mut self) -> Result<()> { unreachable!() }
-        fn before_visit(&mut self) -> Result<()> { unreachable!() }
-        fn visible_count(&mut self, _: contextdb_core::SnapshotId) -> Result<usize> { unreachable!() }
-        fn row_window(&mut self, _: contextdb_core::SnapshotId, _: Option<contextdb_core::RowId>, _: usize) -> Result<Vec<contextdb_core::RowId>> { unreachable!() }
-        fn row_bounds(&mut self) -> Result<Option<(contextdb_core::RowId, contextdb_core::RowId, usize)>> { unreachable!() }
-        fn point_at_or_after(&mut self, _: contextdb_core::RowId) -> Result<Option<(contextdb_core::RowId, PointId)>> { unreachable!() }
-        fn exact_graph_row_after(&mut self, _: &[u8], _: Option<contextdb_core::RowId>) -> Result<Option<contextdb_core::RowId>> { unreachable!() }
-        fn member_after(&mut self, _: usize, _: Option<(contextdb_core::RowId, usize)>) -> Result<Option<(contextdb_core::RowId, usize, contextdb_core::Lsn)>> { unreachable!() }
-        fn group_after(&mut self, _: u64, _: Option<usize>) -> Result<Option<usize>> { unreachable!() }
+        fn load_point(&mut self, _: PointId) -> Result<paged_builder::PagedVectorPoint> {
+            panic!("must use copy admission")
+        }
+        fn identity(&mut self, _: usize) -> Result<paged_builder::PagedVectorIdentity> {
+            unreachable!()
+        }
+        fn point_for_row(
+            &mut self,
+            _: contextdb_core::RowId,
+            _: contextdb_core::SnapshotId,
+        ) -> Result<Option<PointId>> {
+            unreachable!()
+        }
+        fn exact_rows(
+            &mut self,
+            _: &[u8],
+            _: contextdb_core::SnapshotId,
+            _: Option<contextdb_core::RowId>,
+            _: usize,
+        ) -> Result<Vec<contextdb_core::RowId>> {
+            unreachable!()
+        }
+        fn checkpoint(&mut self) -> Result<()> {
+            unreachable!()
+        }
+        fn before_distance(&mut self) -> Result<()> {
+            unreachable!()
+        }
+        fn before_visit(&mut self) -> Result<()> {
+            unreachable!()
+        }
+        fn visible_count(&mut self, _: contextdb_core::SnapshotId) -> Result<usize> {
+            unreachable!()
+        }
+        fn row_window(
+            &mut self,
+            _: contextdb_core::SnapshotId,
+            _: Option<contextdb_core::RowId>,
+            _: usize,
+        ) -> Result<Vec<contextdb_core::RowId>> {
+            unreachable!()
+        }
+        fn row_bounds(
+            &mut self,
+        ) -> Result<Option<(contextdb_core::RowId, contextdb_core::RowId, usize)>> {
+            unreachable!()
+        }
+        fn point_at_or_after(
+            &mut self,
+            _: contextdb_core::RowId,
+        ) -> Result<Option<(contextdb_core::RowId, PointId)>> {
+            unreachable!()
+        }
+        fn exact_graph_row_after(
+            &mut self,
+            _: &[u8],
+            _: Option<contextdb_core::RowId>,
+        ) -> Result<Option<contextdb_core::RowId>> {
+            unreachable!()
+        }
+        fn member_after(
+            &mut self,
+            _: usize,
+            _: Option<(contextdb_core::RowId, usize)>,
+        ) -> Result<Option<(contextdb_core::RowId, usize, contextdb_core::Lsn)>> {
+            unreachable!()
+        }
+        fn group_after(&mut self, _: u64, _: Option<usize>) -> Result<Option<usize>> {
+            unreachable!()
+        }
     }
 
     #[test]
@@ -6508,7 +6570,9 @@ mod admitted_navigation_body_tests {
         let payer = budget();
         let session = NavigationSession::new(Some(MemoryBudgetOwner::from(payer.clone())));
         let cached = PointId(0, 0);
-        session.lock().remember_point(0, cached, &point(cached, 5.0));
+        session
+            .lock()
+            .remember_point(0, cached, &point(cached, 5.0));
         assert!(session.lock().point(0, cached).unwrap().values.is_some());
         let fixed_limit = payer.used.load(Ordering::SeqCst);
         payer.limit.store(fixed_limit, Ordering::SeqCst);
@@ -6517,11 +6581,17 @@ mod admitted_navigation_body_tests {
         let mut reader = AdmittingPointReader { bytes, copied: 0 };
         let reclaim = || session.reclaim();
         let loaded = paged_builder::AdmittedPagedReader::with_reclamation(
-            &mut reader, session.owner(), &reclaim,
-        ).load_point(PointId(0, 1)).unwrap();
+            &mut reader,
+            session.owner(),
+            &reclaim,
+        )
+        .load_point(PointId(0, 1))
+        .unwrap();
         assert_eq!(reader.copied, 1);
         assert!(session.lock().point(0, cached).is_none());
-        let paged_builder::PagedVectorPoint::F32(body) = &*loaded else { panic!("expected F32 body"); };
+        let paged_builder::PagedVectorPoint::F32(body) = &*loaded else {
+            panic!("expected F32 body");
+        };
         assert_eq!(body.id, PointId(0, 1));
         assert_eq!(body.values, vec![9.0; 128]);
         assert_eq!(payer.used.load(Ordering::SeqCst), bytes);
@@ -6532,10 +6602,17 @@ mod admitted_navigation_body_tests {
         // limit must fail at the original native admission before any copy.
         reader.bytes = fixed_limit + 1;
         let error = paged_builder::AdmittedPagedReader::with_reclamation(
-            &mut reader, session.owner(), &reclaim,
-        ).load_point(PointId(0, 2)).err().expect("the unchanged finite limit must refuse before copying");
-        assert!(matches!(error, Error::MemoryBudgetExceeded { operation, requested_bytes, budget_limit_bytes, .. }
-            if operation == "read_paged_vector_window" && requested_bytes == fixed_limit + 1 && budget_limit_bytes == fixed_limit));
+            &mut reader,
+            session.owner(),
+            &reclaim,
+        )
+        .load_point(PointId(0, 2))
+        .err()
+        .expect("the unchanged finite limit must refuse before copying");
+        assert!(
+            matches!(error, Error::MemoryBudgetExceeded { operation, requested_bytes, budget_limit_bytes, .. }
+            if operation == "read_paged_vector_window" && requested_bytes == fixed_limit + 1 && budget_limit_bytes == fixed_limit)
+        );
         assert_eq!(reader.copied, 1);
         assert_eq!(payer.used.load(Ordering::SeqCst), 0);
     }

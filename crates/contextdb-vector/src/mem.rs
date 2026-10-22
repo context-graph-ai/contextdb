@@ -739,12 +739,17 @@ fn admit_row_check_with_navigation<E: From<Error>>(
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     before_work: &mut impl FnMut() -> std::result::Result<(), E>,
 ) -> bool {
-    ledger.admit(source_position, row, &mut |bytes| {
-        let mut admission = owner.scratch();
-        navigation.reserve(&mut admission, bytes).map_err(E::from)?;
-        drop(admission);
-        before_retain(bytes)
-    }, before_work)
+    ledger.admit(
+        source_position,
+        row,
+        &mut |bytes| {
+            let mut admission = owner.scratch();
+            navigation.reserve(&mut admission, bytes).map_err(E::from)?;
+            drop(admission);
+            before_retain(bytes)
+        },
+        before_work,
+    )
 }
 
 /// Run one vector operation with finite, typed SQL partition prefixes.
@@ -9965,14 +9970,26 @@ mod indexed_row_check_empty_merge_tests {
         limit: std::sync::atomic::AtomicUsize,
     }
     impl MemoryBudget for NavigationPressureBudget {
-        fn try_allocate_for(&self, bytes: usize, subsystem: &str, operation: &str, hint: &str) -> Result<()> {
+        fn try_allocate_for(
+            &self,
+            bytes: usize,
+            subsystem: &str,
+            operation: &str,
+            hint: &str,
+        ) -> Result<()> {
             use std::sync::atomic::Ordering::SeqCst;
             let limit = self.limit.load(SeqCst);
-            self.used.fetch_update(SeqCst, SeqCst, |used| used.checked_add(bytes).filter(|next| *next <= limit))
+            self.used
+                .fetch_update(SeqCst, SeqCst, |used| {
+                    used.checked_add(bytes).filter(|next| *next <= limit)
+                })
                 .map_err(|used| Error::MemoryBudgetExceeded {
-                    subsystem: subsystem.to_owned().into(), operation: operation.to_owned().into(),
-                    requested_bytes: bytes, available_bytes: limit.saturating_sub(used),
-                    budget_limit_bytes: limit, hint: hint.to_owned().into(),
+                    subsystem: subsystem.to_owned().into(),
+                    operation: operation.to_owned().into(),
+                    requested_bytes: bytes,
+                    available_bytes: limit.saturating_sub(used),
+                    budget_limit_bytes: limit,
+                    hint: hint.to_owned().into(),
                 })?;
             Ok(())
         }
@@ -9981,40 +9998,79 @@ mod indexed_row_check_empty_merge_tests {
             assert!(self.used.fetch_sub(bytes, SeqCst) >= bytes);
         }
     }
-    fn full_navigation(payer: Arc<NavigationPressureBudget>) -> crate::hnsw::union::NavigationSession {
+    fn full_navigation(
+        payer: Arc<NavigationPressureBudget>,
+    ) -> crate::hnsw::union::NavigationSession {
         use crate::hnsw::paged_builder::{PagedPoint, PagedVectorPoint};
         let navigation = crate::hnsw::union::NavigationSession::new(Some(payer.into()));
         navigation.fill_base_body_for_test(&PagedVectorPoint::F32(PagedPoint {
-            id: crate::hnsw::PointId(0,0), origin_id: 1,
-            values: vec![1.0;128], neighbours: vec![Vec::new()],
+            id: crate::hnsw::PointId(0, 0),
+            origin_id: 1,
+            values: vec![1.0; 128],
+            neighbours: vec![Vec::new()],
         }));
         navigation
     }
     #[test]
     fn actual_row_check_admission_reclaims_full_base_cache_before_predicate() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        let payer = Arc::new(NavigationPressureBudget { used: AtomicUsize::new(0), limit: AtomicUsize::new(1024*1024) });
+        let payer = Arc::new(NavigationPressureBudget {
+            used: AtomicUsize::new(0),
+            limit: AtomicUsize::new(1024 * 1024),
+        });
         let owner = crate::VectorCopyAdmission::new(payer.clone());
         let retained = RefCell::new(owner.scratch());
         let calls = Cell::new(0);
-        let mut predicate = |row| { assert_eq!(row, RowId(1)); calls.set(calls.get()+1); Ok::<_,Error>(true) };
+        let mut predicate = |row| {
+            assert_eq!(row, RowId(1));
+            calls.set(calls.get() + 1);
+            Ok::<_, Error>(true)
+        };
         let release = |bytes| retained.borrow_mut().release(bytes);
-        let mut ledger = RowCheckLedger::new(RowCheck { allowance: 1, check: &mut predicate }, 1,
-            &release, &mut |bytes| retained.borrow_mut().reserve(bytes)).unwrap();
+        let mut ledger = RowCheckLedger::new(
+            RowCheck {
+                allowance: 1,
+                check: &mut predicate,
+            },
+            1,
+            &release,
+            &mut |bytes| retained.borrow_mut().reserve(bytes),
+        )
+        .unwrap();
         let navigation = full_navigation(payer.clone());
         let fixed_limit = payer.used.load(SeqCst);
         payer.limit.store(fixed_limit, SeqCst);
-        assert!(admit_row_check_with_navigation(&mut ledger, 0, RowId(1), &navigation, &owner,
-            &mut |bytes| retained.borrow_mut().reserve(bytes), &mut || Ok(())));
+        assert!(admit_row_check_with_navigation(
+            &mut ledger,
+            0,
+            RowId(1),
+            &navigation,
+            &owner,
+            &mut |bytes| retained.borrow_mut().reserve(bytes),
+            &mut || Ok(())
+        ));
         assert_eq!(calls.get(), 1);
-        assert!(!navigation.has_base_body_for_test(), "the actual row-check probe must evict before the verdict allocation");
+        assert!(
+            !navigation.has_base_body_for_test(),
+            "the actual row-check probe must evict before the verdict allocation"
+        );
         assert_eq!(payer.limit.load(SeqCst), fixed_limit);
         assert!(ledger.error.is_none());
         // Cached verdicts retain the established one-check semantics.
-        assert!(admit_row_check_with_navigation(&mut ledger, 0, RowId(1), &navigation, &owner,
-            &mut |bytes| retained.borrow_mut().reserve(bytes), &mut || Ok(())));
+        assert!(admit_row_check_with_navigation(
+            &mut ledger,
+            0,
+            RowId(1),
+            &navigation,
+            &owner,
+            &mut |bytes| retained.borrow_mut().reserve(bytes),
+            &mut || Ok(())
+        ));
         assert_eq!(calls.get(), 1);
-        drop(ledger); drop(navigation); drop(retained); drop(owner);
+        drop(ledger);
+        drop(navigation);
+        drop(retained);
+        drop(owner);
         assert_eq!(payer.used.load(SeqCst), 0);
     }
 }
