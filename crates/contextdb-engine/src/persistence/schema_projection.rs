@@ -259,7 +259,7 @@ impl ReceivedSchemaRecordStream {
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_original<T: serde::de::DeserializeOwned>(&self, original: &OriginalPersistenceFrame<'_>,
-        mut visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
+        visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
         self.visit_original_range(original, (0,self.end,self.count), visit)
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
@@ -281,7 +281,7 @@ impl ReceivedSchemaRecordStream {
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit<T: serde::de::DeserializeOwned>(&self, memory: &crate::read_image_memory::ImageMemoryHandle,
-        mut visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
+        visit: impl FnMut(&T) -> Result<()>) -> Result<()> {
         self.visit_range(memory, (0,self.end,self.count), visit)
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
@@ -1287,23 +1287,51 @@ impl ProjectedIndexes {
         commitments: &mut historical_index_commitment::CommitmentBatch,
     ) -> Result<Self> {
         let mut credit = persistence.proof_admission();
-        credit.admit(meta.estimated_bytes().saturating_mul(8).saturating_add(1024))?;
+        let overflow = || Error::Other("projected index workspace capacity overflow".into());
+        let (declaration_bytes, declaration_capacity, _) =
+            crate::executor::relational_declaration_plan(meta)?;
+        let heads_bytes = std::alloc::Layout::array::<Option<ProjectedIndexHead>>(declaration_capacity)
+            .map_err(|_| overflow())?.size();
+        // Retain the existing fixed table/control grant. The checked shared
+        // plan covers declaration destination, auto payloads and sort scratch;
+        // the complete head-slot backing is separately admitted before edits.
+        credit.admit(declaration_bytes.checked_add(heads_bytes)
+            .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(overflow)?)?;
         let declarations = RedbPersistence::relational_index_declarations(meta);
+        // One HistoricalPostings wrapper at a time owns a table-name string
+        // and cloned declaration payload. Physical hashed names use exact
+        // fixed capacities; table/registry names retain the fixed grant above.
+        let mut clone_bytes = 0usize;
+        for declaration in &declarations {
+            let mut bytes = declaration.name.len().checked_add(
+                declaration.columns.len().checked_mul(std::mem::size_of::<(String, contextdb_core::SortDirection)>())
+                    .ok_or_else(overflow)?).ok_or_else(overflow)?;
+            for (name, _) in &declaration.columns {
+                bytes = bytes.checked_add(name.len()).ok_or_else(overflow)?;
+            }
+            clone_bytes = clone_bytes.max(bytes);
+        }
+        credit.admit(clone_bytes.checked_add(table.len()).ok_or_else(overflow)?)?;
         // Remove current posting publications one at a time. No historical
         // key list survives this cursor step or becomes rebuild working state.
         for declaration in &declarations {
             let current_name = RedbPersistence::current_relational_index_table_name(table, &declaration.name);
-            let current_definition = TableDefinition::<DurableRelationalIndexKey, &[u8]>::new(&current_name);
+            let current_definition = TableDefinition::<BorrowedRelationalIndexKey, &[u8]>::new(&current_name);
             loop {
                 let mut window = persistence.proof_admission();
                 let key = {
                     let mut current = write.open_table(current_definition).map_err(RedbPersistence::storage_error)?;
                     let first = current.iter().map_err(RedbPersistence::storage_error)?
                         .next().transpose().map_err(RedbPersistence::storage_error)?;
-                    let key = first.map(|(key, _)| key.value());
+                    let key = first.map(|(key, _)| {
+                        let bytes = key.value();
+                        let owned = bytes.len().checked_mul(4).and_then(|bytes| bytes.checked_add(256))
+                            .ok_or_else(overflow)?;
+                        window.admit(owned)?;
+                        Ok::<_, Error>(DurableRelationalIndexKey(bytes.to_vec()))
+                    }).transpose()?;
                     if let Some(key) = key.as_ref() {
-                        window.admit(key.0.len().saturating_mul(4).saturating_add(256))?;
-                        current.remove(key).map_err(RedbPersistence::storage_error)?;
+                        current.remove(key.0.as_slice()).map_err(RedbPersistence::storage_error)?;
                     }
                     key
                 };
@@ -1351,7 +1379,8 @@ impl ProjectedIndexes {
             }
             after = Some((key, window));
         }
-        let heads = (0..declarations.len()).map(|_| None).collect();
+        let mut heads = Vec::with_capacity(declarations.len());
+        heads.resize_with(declarations.len(), || None);
         Ok(Self { declarations, heads, row: None, _credit: credit })
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]

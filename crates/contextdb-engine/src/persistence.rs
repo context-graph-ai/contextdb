@@ -808,6 +808,24 @@ impl RedbKey for DurableRelationalIndexKey {
     }
 }
 
+/// Borrow the existing index-position encoding so callers can admit an owned
+/// key before its copy. Physical type identity and ordering are unchanged.
+#[derive(Debug)]
+struct BorrowedRelationalIndexKey;
+impl RedbValue for BorrowedRelationalIndexKey {
+    type SelfType<'a> = &'a [u8];
+    type AsBytes<'a> = &'a [u8];
+    fn fixed_width() -> Option<usize> { DurableRelationalIndexKey::fixed_width() }
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a> where Self: 'a { data }
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a> { value }
+    fn type_name() -> redb::TypeName { DurableRelationalIndexKey::type_name() }
+}
+impl RedbKey for BorrowedRelationalIndexKey {
+    fn compare(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+        DurableRelationalIndexKey::compare(left, right)
+    }
+}
+
 /// A cursor's native storage pin overlaps publication of its external hold.
 pub(crate) struct OwnerCursorStoragePin {
     read: Arc<redb::ReadTransaction>,
@@ -44256,23 +44274,25 @@ graph_commit_result }.map_err(Self::storage_error)?;
         Ok(())
     }
 
-    fn relational_index_table_name(table: &str, index: &str) -> String {
+    fn relational_index_family_name(table: &str, index: &str, suffix: &str) -> String {
         let mut hash = blake3::Hasher::new();
         hash.update(table.as_bytes());
         hash.update(&[0]);
         hash.update(index.as_bytes());
         let encoded = hash.finalize().to_hex();
-        let mut name = String::with_capacity(12 + encoded.len());
+        let mut name = String::with_capacity(12 + encoded.len() + suffix.len());
         name.push_str("__rel_index_");
         name.push_str(encoded.as_str());
+        name.push_str(suffix);
         name
     }
 
+    fn relational_index_table_name(table: &str, index: &str) -> String {
+        Self::relational_index_family_name(table, index, "")
+    }
+
     fn current_relational_index_table_name(table: &str, index: &str) -> String {
-        format!(
-            "{}_current",
-            Self::relational_index_table_name(table, index)
-        )
+        Self::relational_index_family_name(table, index, "_current")
     }
 
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
