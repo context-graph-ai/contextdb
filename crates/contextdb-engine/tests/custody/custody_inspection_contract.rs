@@ -118,7 +118,7 @@ fn shown(db: &Database, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
         .iter()
         .map(|row| row.iter().map(|cell| format!("{cell:?}")).collect())
         .collect();
-    (result.columns().clone(), rows)
+    (result.columns().to_vec(), rows)
 }
 
 /// Everything an inspection must leave exactly where it found it: the log

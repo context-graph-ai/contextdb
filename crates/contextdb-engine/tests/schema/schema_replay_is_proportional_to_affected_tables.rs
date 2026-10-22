@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use support::*;
 
+include!("schema_replay_exchange_helpers.rs");
+
 fn phase(name: &str) {
     println!("SCHEMA_REPLAY_PHASE {name}");
     std::io::stdout()
