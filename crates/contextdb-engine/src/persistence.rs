@@ -34152,6 +34152,22 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// Maintenance pins one committed root and separates navigation from
     /// materialization. Only a selected singleton's resource refusal may be
     /// handled locally by the caller; navigation errors remain terminal.
+    /// Keep navigation on one authenticated root while callers decode and
+    /// release individual catalogs before preparing the next route.
+    pub(crate) fn maintenance_vector_catalog_cursor(
+        &self,
+    ) -> Result<Option<redb::BoundedByteCursor<'static>>> {
+        self.with_db(|db| {
+            let read = db.begin_read().map_err(Self::storage_error)?;
+            let table = match read.open_byte_table_bounded(VECTOR_PARTITION_GENERATION_CATALOG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(error) => return Err(Self::storage_error(error)),
+            };
+            Ok(Some(table.cursor_bounded()))
+        })
+    }
+
     pub(crate) fn scan_vector_catalog_for_maintenance(
         &self,
         mut inspect: impl FnMut(redb::BoundedByteHandle<'_>) -> Result<()>,

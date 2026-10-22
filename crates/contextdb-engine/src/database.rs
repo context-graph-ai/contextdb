@@ -25572,16 +25572,17 @@ impl MaintenanceContext {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(VectorJournalCleanupRetryOutcome::default());
         };
-        let mut inventory = self.maintenance_catalog_inventory()?;
+        let stream = self.maintenance_catalog_stream()?;
         #[cfg(test)]
         vector_journal_cleanup_cancellation_tests::after_inventory_capture_for_test();
         self.build_checkpoint()?;
         let mut outcome = VectorJournalCleanupRetryOutcome {
-            first_failure_details: inventory.failures.first,
+            first_failure_details: None,
             failed_partitions: FailedMaintenancePartitions::default(),
         };
         let mut terminal = None;
-        inventory.catalogs.retain_mut(|entry| {
+        let inventory = self.visit_maintenance_catalog_stream(stream, |entry| {
+          let retain = (|| {
             if terminal.is_some() {
                 return false;
             }
@@ -25647,7 +25648,7 @@ impl MaintenanceContext {
                 } else {
                     Ok(true)
                 };
-                match covered {
+                let completed = match covered {
                     Ok(false) => Ok(()),
                     Err(
                         error @ (Error::MemoryBudgetExceeded { .. }
@@ -25678,7 +25679,11 @@ impl MaintenanceContext {
                             )
                         }
                     }
+                };
+                if completed.is_ok() && partition_state_present {
+                    self.vector.clear_partition_maintenance_failure(&partition)?;
                 }
+                completed
             });
             #[cfg(test)]
             vector_journal_cleanup_cancellation_tests::after_retry_for_test(catalog);
@@ -25708,11 +25713,15 @@ impl MaintenanceContext {
                     true
                 }
             }
-        });
+          })();
+          Ok(retain)
+        })?;
+        outcome.first_failure_details = outcome.first_failure_details.or(inventory.failures.first);
         if let Some(error) = terminal {
             return Err(error);
         }
         outcome.failed_partitions.inventory = Some(inventory);
+        outcome.failed_partitions.sources = Some(Arc::clone(&self.vector));
         Ok(outcome)
     }
 

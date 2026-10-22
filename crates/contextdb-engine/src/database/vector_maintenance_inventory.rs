@@ -34,6 +34,7 @@ pub(super) struct MaintenanceCatalogInventory {
 #[derive(Default)]
 pub(super) struct FailedMaintenancePartitions {
     pub(super) inventory: Option<MaintenanceCatalogInventory>,
+    pub(super) sources: Option<Arc<VectorStore>>,
 }
 
 impl FailedMaintenancePartitions {
@@ -43,6 +44,10 @@ impl FailedMaintenancePartitions {
                 entry.catalog.index == route.index
                     && entry.catalog.partition_key == route.partition_key
             })
+        }) || self.sources.as_ref().is_some_and(|sources| {
+            sources.try_partition_state(&route.index, &route.partition_key)
+                .and_then(|state| state.source_maintenance_metadata().failure)
+                .is_some_and(|failure| failure.operation == CLEANUP)
         })
     }
 }
@@ -117,6 +122,11 @@ struct InventoryPhase {
     failures: MaintenanceMetadataFailures,
     source_memory: OwnedMemoryReservation,
     memory: OwnedMemoryReservation,
+}
+
+pub(super) struct MaintenanceCatalogStream {
+    inventory: MaintenanceCatalogInventory,
+    cursor: Option<redb::BoundedByteCursor<'static>>,
 }
 
 struct MaintenanceIndexes {
@@ -197,6 +207,13 @@ impl MaintenanceContext {
     /// Caller holds the existing commit boundary. Strong state handles are
     /// consumed before it releases, so DDL cannot detach their directory owner.
     fn maintenance_inventory_phase_locked(&self) -> Result<InventoryPhase> {
+        self.maintenance_inventory_phase_with_catalog_retention_locked(true)
+    }
+
+    fn maintenance_inventory_phase_with_catalog_retention_locked(
+        &self,
+        retain_catalogs: bool,
+    ) -> Result<InventoryPhase> {
         let indexes = match self.maintenance_indexes() {
             Ok(indexes) => indexes,
             Err(error @ Error::MemoryBudgetExceeded { .. }) => {
@@ -472,7 +489,7 @@ impl MaintenanceContext {
                                 workspace,
                             ));
                         }
-                    } else {
+                    } else if retain_catalogs {
                         self.admit_inventory_slot(
                             "catalogs",
                             &mut phase.memory,
@@ -593,7 +610,7 @@ impl MaintenanceContext {
         }
     }
 
-    fn finish_inventory_phase_locked(&self, phase: InventoryPhase) -> MaintenanceCatalogInventory {
+    fn apply_inventory_source_outcomes(&self, phase: &InventoryPhase) {
         // Every source view has returned before the callback-free adapter takes
         // maintenance/registry guards. No retained state escapes this boundary.
         for source in &phase.sources {
@@ -604,6 +621,14 @@ impl MaintenanceContext {
                 source.quarantine,
             );
         }
+    }
+
+    fn finish_inventory_phase_locked(&self, phase: InventoryPhase) -> MaintenanceCatalogInventory {
+        self.apply_inventory_source_outcomes(&phase);
+        Self::release_inventory_sources(phase)
+    }
+
+    fn release_inventory_sources(phase: InventoryPhase) -> MaintenanceCatalogInventory {
         let InventoryPhase {
             complete,
             catalogs,
@@ -618,6 +643,131 @@ impl MaintenanceContext {
             failures,
             _memory: memory,
         }
+    }
+
+    /// Capture the fixed catalog root after validating all source attribution.
+    /// Decoded catalogs are released as validation proceeds; only the borrowed
+    /// source outcomes remain beside the cursor through this finite pass.
+    pub(super) fn maintenance_catalog_stream_locked(&self) -> Result<MaintenanceCatalogStream> {
+        let phase = self.maintenance_inventory_phase_with_catalog_retention_locked(false)?;
+        // A durable cleanup failure stays visible until its retry completes.
+        // Preserve that marker while releasing every sampled strong source
+        // before callbacks can retire a registry's original directory owner.
+        for source in &phase.sources {
+            let pending = source.metadata.failure.filter(|failure|
+                failure.operation == CLEANUP && failure.message.contains("durable"));
+            self.vector.apply_partition_source_maintenance_metadata(
+                &phase.indexes.indexes[source.index], &source.state,
+                source.failure.or(pending), source.quarantine,
+            );
+        }
+        let cursor = if phase.complete {
+            match self.persistence.as_ref() {
+                Some(persistence) => vector_source_page_admission::with_preparation_source_page_admission(
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                    || persistence.maintenance_vector_catalog_cursor(),
+                )?,
+                None => None,
+            }
+        } else { None };
+        Ok(MaintenanceCatalogStream { inventory: Self::release_inventory_sources(phase), cursor })
+    }
+
+    pub(super) fn maintenance_catalog_stream(&self) -> Result<MaintenanceCatalogStream> {
+        self.tx_mgr.with_commit_lock(|| self.maintenance_catalog_stream_locked())
+    }
+
+    /// Consume the captured root one catalog at a time. A callback retains only
+    /// failed work; successful entries physically drop before the next decode.
+    pub(super) fn visit_maintenance_catalog_stream(
+        &self,
+        mut stream: MaintenanceCatalogStream,
+        mut visit: impl FnMut(&mut AdmittedMaintenanceCatalog) -> Result<bool>,
+    ) -> Result<MaintenanceCatalogInventory> {
+        let mut retained = Vec::new();
+        let mut memory = OwnedMemoryReservation::new(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+        );
+        let mut failures = MaintenanceMetadataFailures { first: stream.inventory.failures.first };
+        if let (Some(persistence), Some(cursor)) = (self.persistence.as_ref(), stream.cursor.as_mut()) {
+            loop {
+                self.build_checkpoint()?;
+                let next = vector_source_page_admission::with_preparation_source_page_admission(
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                    || cursor.next().transpose().map_err(RedbPersistence::storage_error),
+                );
+                let handle = match next {
+                    Ok(Some(handle)) => handle,
+                    Ok(None) => break,
+                    Err(error @ Error::MemoryBudgetExceeded { .. }) => {
+                        failures.first.get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let inspected = vector_source_page_admission::with_preparation_source_page_admission(
+                    crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                    || -> Result<Option<AdmittedMaintenanceCatalog>> {
+                        let (_key, encoded) = handle.materialize().map_err(RedbPersistence::storage_error)?;
+                        let mut workspace = self.maintenance_workspace(
+                            RedbPersistence::maintenance_vector_catalog_decode_bound(encoded.value().len()),
+                            PREPARE,
+                        )?;
+                        let catalog = match persistence.decode_maintenance_vector_catalog(encoded.value()) {
+                            Ok(catalog) => catalog,
+                            Err(Error::StoreCorrupted { .. }) => return Ok(None),
+                            Err(error) => return Err(error),
+                        };
+                        let mut frames = OwnedMemoryReservation::new(
+                            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                        );
+                        frames.try_grow_for(
+                            RedbPersistence::maintenance_catalog_key_frame_bytes(&catalog.partition_key),
+                            "vector_maintenance", PREPARE, HINT,
+                        )?;
+                        if !RedbPersistence::maintenance_catalog_key_matches(&handle, &catalog.index, &catalog.partition_key)? {
+                            return Ok(None);
+                        }
+                        drop(frames);
+                        let metadata = self.vector.try_partition_state(&catalog.index, &catalog.partition_key)
+                            .map(|state| state.source_maintenance_metadata());
+                        if metadata.is_some_and(|metadata| metadata.quarantine.is_some()) {
+                            return Ok(None);
+                        }
+                        let pending_cleanup = metadata.and_then(|metadata| metadata.failure)
+                            .is_some_and(|failure| failure.operation == CLEANUP && failure.message.contains("durable"));
+                        workspace.resize_static(
+                            RedbPersistence::maintenance_vector_catalog_heap_bytes(&catalog),
+                            if pending_cleanup { CLEANUP } else { PREPARE }, HINT,
+                        )?;
+                        Ok(Some(AdmittedMaintenanceCatalog { catalog, workspace, pending_cleanup, source: None }))
+                    },
+                );
+                let mut entry = match inspected {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => continue,
+                    Err(error @ Error::MemoryBudgetExceeded { .. }) => {
+                        failures.first.get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if visit(&mut entry)? {
+                    if let Err(error) = self.admit_inventory_slot("catalogs", &mut memory, &mut retained) {
+                        failures.first.get_or_insert_with(|| VectorMaintenanceFailureDetails::from_error(&error));
+                        continue;
+                    }
+                    retained.push(entry);
+                }
+            }
+        }
+        Ok(MaintenanceCatalogInventory {
+            complete: stream.inventory.complete,
+            catalogs: retained,
+            routes: Vec::new(),
+            failures,
+            _memory: memory,
+        })
     }
 
     pub(super) fn maintenance_catalog_inventory_locked(
@@ -662,7 +812,7 @@ impl MaintenanceContext {
     pub(super) fn maintenance_closing_inventory_locked(
         &self,
     ) -> Result<MaintenanceCatalogInventory> {
-        let mut phase = self.maintenance_inventory_phase_locked()?;
+        let mut phase = self.maintenance_inventory_phase_with_catalog_retention_locked(false)?;
         if !phase.complete {
             return Ok(self.finish_inventory_phase_locked(phase));
         }
@@ -743,7 +893,8 @@ impl MaintenanceContext {
             return Ok(0);
         };
         let mut reclaimed = 0usize;
-        for entry in &mut inventory.catalogs {
+        let mut first_failure = None;
+        let mut reclaim = |entry: &mut AdmittedMaintenanceCatalog| -> Result<bool> {
             let catalog = &entry.catalog;
             let heap = RedbPersistence::maintenance_vector_catalog_heap_bytes(catalog);
             let mut route_memory = OwnedMemoryReservation::new(
@@ -814,14 +965,25 @@ impl MaintenanceContext {
                 Ok((count, _)) => reclaimed = reclaimed.saturating_add(count),
                 Err(error @ Error::MemoryBudgetExceeded { .. }) => {
                     let details = VectorMaintenanceFailureDetails::from_error(&error);
-                    inventory.failures.first.get_or_insert(details);
+                    first_failure.get_or_insert(details);
                     publication.abandon();
                     self.record_catalog_metadata_failure_locked(catalog, details);
-                    continue;
+                    return Ok(false);
                 }
                 Err(error) => return Err(error),
             }
+            Ok(false)
+        };
+        if inventory.catalogs.is_empty() {
+            let stream = self.maintenance_catalog_stream_locked()?;
+            let streamed = self.visit_maintenance_catalog_stream(stream, &mut reclaim)?;
+            inventory.failures.first = inventory.failures.first.or(streamed.failures.first);
+        } else {
+            for entry in &mut inventory.catalogs {
+                reclaim(entry)?;
+            }
         }
+        inventory.failures.first = inventory.failures.first.or(first_failure);
         Ok(reclaimed)
     }
 
@@ -830,7 +992,7 @@ impl MaintenanceContext {
             contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),
         );
         self.tx_mgr.with_commit_lock(|| {
-            let mut phase = self.maintenance_inventory_phase_locked()?;
+            let mut phase = self.maintenance_inventory_phase_with_catalog_retention_locked(false)?;
             if !phase.complete {
                 let inventory = self.finish_inventory_phase_locked(phase);
                 return Ok(MaintenanceBuildCandidates {
@@ -844,66 +1006,59 @@ impl MaintenanceContext {
             let sampled = (|| -> Result<()> {
             for (index_position, index) in phase.indexes.indexes.iter().enumerate() {
                 let layout = contextdb_vector::scoped_index_layout(&self.vector, index, &mut maintenance_vector_copy_owner)?;
-                let mut sampled_routes = Vec::new();
-                let mut sample_memory = OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
-                self.vector
-                    .with_partition_sources(index, |view| -> Result<()> {
+                // Copy one borrowed route, then release its source view before
+                // asking ordinary helpers for its metadata. Unrelated routes do
+                // not retain preparation workspaces beside this one.
+                for source_position in 0..phase.sources.len() {
+                    if phase.sources[source_position].index != index_position
+                        || phase.sources[source_position].metadata.historical_only
+                        || phase.sources[source_position].failed
+                    {
+                        continue;
+                    }
+                    let mut sampled_route = None;
+                    self.vector.with_partition_sources(index, |view| -> Result<()> {
                         view.visit(|key, state| -> Result<()> {
-                            let source_position = phase
-                                .sources
-                                .iter()
-                                .position(|source| {
-                                    source.index == index_position
-                                        && Arc::ptr_eq(&source.state, state)
-                                })
-                                .expect("sampled source");
-                            if phase.sources[source_position].metadata.historical_only
-                                || phase.sources[source_position].failed
-                            {
+                            if !Arc::ptr_eq(&phase.sources[source_position].state, state) {
                                 return Ok(());
                             }
-                            let route_heap = key
-                                .estimated_bytes()
+                            let route_heap = key.estimated_bytes()
                                 .saturating_sub(std::mem::size_of::<VectorPartitionKey>())
                                 .saturating_add(index.table.len())
                                 .saturating_add(index.column.len());
-                            // The sampled route and Info route coexist with the
-                            // journal prefix/canonical-key/validation-key owners.
                             let fixed = route_heap.saturating_mul(2).saturating_add(
                                 RedbPersistence::vector_journal_cleanup_key_reservation(index, key),
                             );
-                            let workspace = match self.maintenance_workspace(fixed, PREPARE) {
-                                Ok(workspace) => workspace,
-                                Err(error @ Error::MemoryBudgetExceeded { .. }) => {
-                                    let details =
-                                        VectorMaintenanceFailureDetails::from_error(&error);
-                                    phase.failures.first.get_or_insert(details);
-                                    phase.sources[source_position].failure = Some(details);
-                                    phase.sources[source_position].failed = true;
-                                    return Ok(());
-                                }
-                                Err(error) => return Err(error),
-                            };
-                            self.admit_inventory_slot("sampled_routes", &mut sample_memory, &mut sampled_routes)?;
-                            sampled_routes.push((
+                            let workspace = self.maintenance_workspace(fixed, PREPARE)?;
+                            sampled_route = Some((
                                 VectorPartitionRef::new(index.clone(), key.clone()),
-                                source_position,
-                                route_heap,
-                                fixed,
-                                workspace,
+                                route_heap, fixed, workspace,
                             ));
                             Ok(())
                         })
                     })?;
-                // Source views are gone before ordinary route helpers acquire
-                // their bulk/partition registry guards.
-                for (route, source_position, route_heap, fixed, mut workspace) in sampled_routes {
+                    let Some((route, route_heap, fixed, mut workspace)) = sampled_route else {
+                        continue;
+                    };
+                    // Inventory validation retained only source outcomes. Admit
+                    // and decode this route's own catalog after enumeration has
+                    // released every other catalog body.
+                    let fixed = fixed.saturating_add(Self::vector_route_inventory_bytes(&route));
+                    workspace.resize_static(fixed, PREPARE, HINT)?;
+                    let catalog = match self.persistence.as_ref().filter(|_| phase.sources[source_position].quarantine.is_none()) {
+                        Some(persistence) => vector_source_page_admission::with_preparation_source_page_admission(
+                            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+                            || persistence.load_vector_partition_generation_catalog_for(&route.index, &route.partition_key),
+                        )?,
+                        None => None,
+                    };
+                    let mut route_copy_owner = maintenance_vector_copy_owner.scratch();
                     let mut info = match vector_source_page_admission::with_preparation_source_page_admission(
                         crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
                         || self.vector.try_partition_info(
                             &route.index,
                             &route.partition_key,
-                            &mut maintenance_vector_copy_owner,
+                            &mut route_copy_owner,
                         ),
                     ) {
                         Ok(Some(info)) => info,
@@ -945,20 +1100,8 @@ impl MaintenanceContext {
                         .state
                         .graph_generation_status()
                         .fresh_tail_entries;
-                    let covered_lsn = phase
-                        .catalogs
-                        .iter()
-                        .find(|entry| {
-                            entry.catalog.index == route.index
-                                && entry.catalog.partition_key == route.partition_key
-                        })
-                        .map(|entry| {
-                            entry
-                                .catalog
-                                .change
-                                .unwrap_or(entry.catalog.base)
-                                .covered_lsn
-                        })
+                    let covered_lsn = catalog.as_ref()
+                        .map(|catalog| catalog.change.unwrap_or(catalog.base).covered_lsn)
                         .unwrap_or(Lsn(0));
                     let uncovered = if retired_rebuild || info.quarantine_reason.is_some() {
                         false
@@ -1002,17 +1145,13 @@ impl MaintenanceContext {
                     } else {
                         false
                     };
-                    let catalog = phase.catalogs.iter().find(|entry| {
-                        entry.catalog.index == route.index
-                            && entry.catalog.partition_key == route.partition_key
-                    }).map(|entry| &entry.catalog);
                     let ordinary_need = layout.maintenance_need(&info).is_some();
                     let reader_need = if ordinary_need || info.quarantine_reason.is_some() {
                         false
                     } else {
                         match vector_source_page_admission::with_preparation_source_page_admission(
                             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
-                            || self.reader_serving_replacement_needed(&route, catalog),
+                            || self.reader_serving_replacement_needed(&route, catalog.as_ref()),
                         ) {
                             Ok(needed) => needed,
                             Err(error @ Error::MemoryBudgetExceeded { .. }) => {
@@ -1027,6 +1166,7 @@ impl MaintenanceContext {
                             Err(error) => return Err(error),
                         }
                     };
+                    drop(catalog);
                     if retired_rebuild || ordinary_need
                         || reader_need
                         || (!info.graph_available && (fresh != 0 || uncovered))
@@ -1048,17 +1188,19 @@ impl MaintenanceContext {
             // Catalog-backed routes without a live indexed state still need
             // their uncovered journal represented before physical cleanup.
             // Retired raw history is such a route, just like an absent source.
-            for entry in &mut phase.catalogs {
+            let stream = self.maintenance_catalog_stream_locked()?;
+            let orphan_inventory = self.visit_maintenance_catalog_stream(stream, |entry| {
                 let catalog = &entry.catalog;
-                if entry.source.is_some_and(|position| {
-                    !phase.sources[position].metadata.historical_only
-                        || phase.sources[position].failed
+                let source = self.vector.try_partition_state(&catalog.index, &catalog.partition_key);
+                if source.as_ref().is_some_and(|state| {
+                    !state.source_maintenance_metadata().historical_only
+                        || phase.sources.iter().any(|source| Arc::ptr_eq(&source.state, state) && source.failed)
                 }) || !self.vector.contains_index(&catalog.index)
                 {
-                    continue;
+                    return Ok(false);
                 }
                 let Some(persistence) = self.persistence.as_ref() else {
-                    continue;
+                    return Ok(false);
                 };
                 let heap = RedbPersistence::maintenance_vector_catalog_heap_bytes(catalog);
                 let fixed =
@@ -1094,7 +1236,7 @@ impl MaintenanceContext {
                                 phase.failures.first.get_or_insert_with(|| {
                                     VectorMaintenanceFailureDetails::from_error(&error)
                                 });
-                                continue;
+                                return Ok(false);
                             }
                             Err(error) => return Err(error),
                         };
@@ -1119,7 +1261,9 @@ impl MaintenanceContext {
                     }
                     Err(error) => return Err(error),
                 }
-            }
+                Ok(false)
+            })?;
+            phase.failures.first = phase.failures.first.or(orphan_inventory.failures.first);
                 let sort_bytes = candidate_sort_heap_bytes(candidates.len());
                 let mut sort_memory = OwnedMemoryReservation::new(crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant));
                 if sort_bytes != 0 {
