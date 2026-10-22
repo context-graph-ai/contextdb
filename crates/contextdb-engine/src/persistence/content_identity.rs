@@ -998,7 +998,6 @@ fn edge_mutation_with_owner(
     let properties = edge
         .properties
         .iter()
-        .map(|(name, value)| (name, value))
         .collect::<BTreeMap<_, _>>();
     Ok(ContentIdentityMutation::put(
         LogicalFamily::Graph,
@@ -3806,15 +3805,13 @@ impl ProofAdmission {
     ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
         let budget = match (&self.reader_budget, &self.accountant) {
             (Some(reader), _) => reader.clone(),
-            (None, Some(accountant)) => accountant.read_budget()?.into(),
+            (None, Some(accountant)) => accountant.read_budget()?,
             (None, None) => crate::memory_accounting::AccountantHandle::from(Arc::new(
                 crate::memory_accounting::MemoryAccountant::no_limit(),
             ))
-            .read_budget()?.into(),
+            .read_budget()?,
         };
-        Ok(contextdb_core::read_memory::ReadMemoryOwner::from(
-            budget,
-        ))
+        Ok(budget)
     }
 
     /// Whether what this admission admits is charged to a database accountant.
@@ -9410,9 +9407,7 @@ pub(crate) mod original_writer {
         pub(crate) fn verification_owner(
             &self,
         ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
-            Ok(contextdb_core::read_memory::ReadMemoryOwner::from(
-                self.original.accountant().read_budget()?,
-            ))
+            Ok(self.original.accountant().read_budget()?)
         }
         pub(crate) fn held(&self) -> usize {
             self.held

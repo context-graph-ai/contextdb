@@ -689,7 +689,7 @@ impl RequestContext {
             return Err(Self::limit_failure(ReadFailureLimit::Memory, limits.memory));
         }
         let funding_owner = native_operation.as_ref().map(|operation| operation.owner())
-            .unwrap_or_else(|| contextdb_core::read_memory::ReadMemoryOwner::from(reader_budget.clone()));
+            .unwrap_or_else(|| reader_budget.clone());
         let counter_invoice = ControlArc::<std::sync::atomic::AtomicUsize>::admit_owned(funding_owner.clone())?;
         let weak_invoice = ControlArc::<WeakSourceDecodeBudget>::admit_owned(funding_owner.clone())?;
         let vector_invoice = ControlArc::<crate::vector_read_memory::ReaderVectorBudget>::admit_owned(funding_owner.clone())?;
@@ -2214,7 +2214,7 @@ impl RequestContext {
         #[cfg(feature = "test-seams")]
         crate::vector_read_memory::statement_child_proof::funding_next(&self.reader_budget);
         Ok(trace.into_owned(owner.clone(), PrepaidTraceCredit {
-            owner: owner.into(), credit, _control_invoice: owner_control.original_invoice(),
+            owner: owner, credit, _control_invoice: owner_control.original_invoice(),
         })?)
     }
 
@@ -2243,7 +2243,7 @@ impl RequestContext {
         )?;
         let credit = self.state().memory.try_split_off(bytes)?;
         result.answer_charge = crate::read_image_memory::QueryAnswerCharge::holding_reader(credit)?;
-        result.retained_read_memory = Some(contextdb_core::read_memory::ReadMemoryOwner::from(self.reader_budget.clone()));
+        result.retained_read_memory = Some(self.reader_budget.clone());
         Ok(())
     }
 
@@ -6121,7 +6121,7 @@ impl Writer for CheckedCountingWriter<'_> {
                 .get()
                 .checked_add(bytes.len())
                 .ok_or(bincode::error::EncodeError::Other((
-                    "bounded canonical size overflow").into()))?;
+                    "bounded canonical size overflow")))?;
         self.bytes.set(next);
         Ok(())
     }
@@ -16038,11 +16038,11 @@ fn copy_vector_row_filter_meta(meta: &TableMeta) -> TableMeta {
         expires_column: meta.expires_column.clone(),
         indexes: meta.indexes.clone(),
         composite_foreign_keys: meta.composite_foreign_keys.clone(),
-        sync_direction: meta.sync_direction.clone(),
+        sync_direction: meta.sync_direction,
         retain_declared_unit: meta.retain_declared_unit,
         primary_key_columns: meta.primary_key_columns.clone(),
-        conflict_policy: meta.conflict_policy.clone(),
-        history_policy: meta.history_policy.clone(),
+        conflict_policy: meta.conflict_policy,
+        history_policy: meta.history_policy,
         delivery_manifest_tables: meta.delivery_manifest_tables.clone(),
         edge_discard: meta.edge_discard,
         maintained_counts: meta.maintained_counts.clone(),
@@ -19850,7 +19850,7 @@ pub(super) fn open_cursor(
         BoundedCursorLifecycle::Exhausted(columns, first.observation.clone())
     };
     let execution = Arc::new(BoundedCursorExecutionState {
-        read_memory: (read_memory.clone()).into(),
+        read_memory: (read_memory.clone()),
         lifecycle: Mutex::new(lifecycle),
         publication: publication.clone(),
         erased: std::sync::atomic::AtomicBool::new(false),

@@ -2381,12 +2381,11 @@ impl OrdinaryResultReceiver {
         if self.state() != ResultReceiveState::Receiving {
             return Err(invalid_channel_data());
         }
-        if let Some(owner) = self.chunks.owner() {
-            if !response.credit.as_ref().is_some_and(|credit| credit.is_funded_by(&owner)) {
+        if let Some(owner) = self.chunks.owner()
+            && !response.credit.as_ref().is_some_and(|credit| credit.is_funded_by(&owner)) {
                 self.discard_buffered();
                 return Err(invalid_channel_data());
             }
-        }
         match response.value {
             LocalResponse::ResultChunk { chunk } => {
                 if chunk.bytes.len() > MAX_FRAME_BYTES {

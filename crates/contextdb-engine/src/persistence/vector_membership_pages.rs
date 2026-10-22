@@ -466,7 +466,7 @@ pub(super) fn typed_metadata_error(error: Error) -> Error {
     match error {
         Error::Other(reason) => Error::VectorMetadataIo {
             operation: "vector membership metadata".into(),
-            reason: reason,
+            reason,
         },
         error => error,
     }
@@ -689,7 +689,7 @@ fn decode_member(key: &[u8], encoded: &[u8]) -> Result<VectorPartitionMembership
         VectorPartitionRecordKind::Membership,
         encoded,
     )
-    .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
+    .map_err(|failure| failure.into_error(corruption))?;
     if source_key(&record) != key {
         return Err(corruption(
             "membership source key does not match its authenticated identity",
@@ -711,7 +711,7 @@ fn decode_primary_member(
         VectorPartitionRecordKind::Membership,
         encoded,
     )
-    .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
+    .map_err(|failure| failure.into_error(corruption))?;
     if RedbPersistence::vector_partition_membership_key(&record) != membership_key {
         return Err(corruption(
             "one owning row version has conflicting vector placements",
@@ -871,7 +871,7 @@ fn validate_body_placement_transition<const CHECK_OVERLAP: bool>(
                 VectorPartitionRecordKind::Membership,
                 value.value(),
             )
-            .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
+            .map_err(|failure| failure.into_error(corruption))?;
         if reverse_key(&other).as_slice() != key.value() {
             return Err(corruption(
                 "reverse membership key disagrees with its body identity",
@@ -1063,7 +1063,7 @@ fn publish_membership_impl<const CHECK_OVERLAP: bool>(
                     VectorPartitionRecordKind::GenerationCatalog,
                     value.value(),
                 )
-                .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
+                .map_err(|failure| failure.into_error(corruption))?;
             partition.pending.covered_tx = catalog.change.unwrap_or(catalog.base).covered_tx;
             partition.base_pending = catalog.change.map(|_| PendingCounts {
                 covered_tx: catalog.base.covered_tx,
@@ -1878,7 +1878,7 @@ pub(super) fn decode_reverse_member(
         VectorPartitionRecordKind::Membership,
         encoded,
     )
-    .map_err(|failure| failure.into_error(|reason| corruption(reason)))?;
+    .map_err(|failure| failure.into_error(corruption))?;
     if reverse_key(&record) != key {
         return Err(corruption(
             "reverse membership key disagrees with its authenticated identity",

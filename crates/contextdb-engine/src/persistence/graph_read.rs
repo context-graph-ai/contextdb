@@ -236,7 +236,7 @@ impl GraphReadSource for RetainedGraphSource {
         let control = credit(memory.clone(), std::mem::size_of::<RetainedGraphSnapshot>())?;
         Ok(Arc::new(RetainedGraphSnapshot {
             source: self.0.clone(),
-            memory: memory.into(),
+            memory: memory,
             _control: control,
         }))
     }
@@ -1755,7 +1755,7 @@ pub(super) fn with_graph_proof_in_read<T>(
     let memory: contextdb_core::read_memory::ReadMemoryOwner = match owner {
         writer_source::SourceWindowOwner::Read(memory) => memory.clone(),
         writer_source::SourceWindowOwner::Write(memory, original_use) => {
-            memory.read_budget_for_original(original_use.clone())?.into()
+            memory.read_budget_for_original(original_use.clone())?
         }
     };
     with_pages(memory.clone(), || {
@@ -1776,7 +1776,7 @@ pub(super) fn with_graph_proof_in_read<T>(
             )?;
             let context = GraphProofContext {
                 image: None,
-                proof_memory: (memory.clone()).into(),
+                proof_memory: (memory.clone()),
                 creation_reuse_eligible: matches!(owner, writer_source::SourceWindowOwner::Read(_)),
                 verifier: Some(&verifier),
                 scratch: Some(scratch.clone()),

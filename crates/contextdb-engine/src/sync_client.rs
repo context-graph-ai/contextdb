@@ -852,7 +852,7 @@ impl SyncClient {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         // A caller-supplied reader keeps every charge on that reader.
-        let owner = contextdb_core::read_memory::ReadMemoryOwner::from(read_memory.clone());
+        let owner = read_memory.clone();
         self.fetch_delivery_outcomes_on(since, owner, read_memory)
             .await
     }

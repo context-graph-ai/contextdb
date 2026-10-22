@@ -1096,8 +1096,8 @@ pub(crate) fn still_quarantined(identity: (u64, u64)) -> bool {
     while let Some(plan) = current {
         let mut slot = plan.quarantine.lock().unwrap_or_else(|p| p.into_inner());
         let mut remove = false;
-        if slot.identity == identity {
-            if let Some((_, helper)) = &mut slot.retained {
+        if slot.identity == identity
+            && let Some((_, helper)) = &mut slot.retained {
                 if let Ok(Some(_)) = helper.reap(false) {
                     helper.release_stack();
                     remove = true;
@@ -1105,7 +1105,6 @@ pub(crate) fn still_quarantined(identity: (u64, u64)) -> bool {
                     remains = true;
                 }
             }
-        }
         current = slot.next.clone();
         if remove {
             let next = slot.next.take();

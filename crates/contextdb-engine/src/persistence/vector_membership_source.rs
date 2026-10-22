@@ -244,7 +244,7 @@ pub(crate) fn enter_historical_read_intent(
         slot.borrow_mut().replace(HistoricalReadIntent {
             owner,
             snapshot,
-            memory: memory.into(),
+            memory: memory,
         })
     });
     HistoricalReadIntentScope {
@@ -319,7 +319,7 @@ fn scan_storage_error(error: redb::StorageError) -> Error {
                     }
                     NativeStorageFailure::AllocatorFailed { site, layout } => {
                         Some(NativeStorageFailure::AllocatorFailed {
-                            site: *site,
+                            site: site,
                             layout: *layout,
                         })
                     }
@@ -498,7 +498,7 @@ pub(crate) fn enter_read_operation(
             checkpoint: checkpoint
                 .as_ref()
                 .map(|context| context.vector_checkpoint()),
-            memory: memory.into(),
+            memory: memory,
             scan_allowance,
         },
         credit,
@@ -1287,10 +1287,10 @@ pub(crate) fn select_live_fallback(
             VectorPartitionRecordKind::Membership,
             payload,
         )
-        .map_err(|reason| damage(reason))?;
+        .map_err(damage)?;
         window.reserve(
             vector_partition_route_native_capacity(payload)
-                .map_err(|reason| damage(reason))?
+                .map_err(damage)?
                 .checked_mul(6)
                 .ok_or_else(|| damage("vector route clone capacity overflow"))?,
         )?;
@@ -1299,7 +1299,7 @@ pub(crate) fn select_live_fallback(
                 VectorPartitionRecordKind::Membership,
                 value.value(),
             )
-            .map_err(|failure| failure.into_error(|reason| damage(reason)))?;
+            .map_err(|failure| failure.into_error(damage))?;
         let partition = VectorPartitionRef::new(record.index.clone(), record.partition_key.clone());
         decode_forward(&partition, key.value(), value.value())?;
         authenticate_membership_companions(&owner, &root.read, key.value(), value.value(), &record)?;
@@ -1517,9 +1517,9 @@ pub(super) fn decode_forward_for_route(
     // scalar; only the two owned index strings below are new engine buffers.
     let _decode = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, value)
-        .map_err(|reason| damage(reason))?;
+        .map_err(damage)?;
     let route_end = vector_partition_expected_route_prefix(payload, index, partition_key)
-        .map_err(|reason| damage(reason))?;
+        .map_err(damage)?;
     let suffix = &payload[route_end..];
     let ((row_id, row_created_tx, row_lsn, vector_created_tx, vector_lsn, visible_from, deleted_tx), consumed):
         ((RowId, TxId, Lsn, TxId, Lsn, TxId, Option<TxId>), usize) =
@@ -1656,11 +1656,9 @@ impl DurableMembershipSource {
                 .map(|capture| capture())
                 .transpose()?
                 .flatten()
-        {
-            if operation.storage_identity() != captured.storage_identity() {
+            && operation.storage_identity() != captured.storage_identity() {
                 return Err(damage("membership catalog escaped its operation capture"));
             }
-        }
         let published = (self
             .published_root
             .as_ref()
@@ -2001,7 +1999,7 @@ impl DurableMembershipSource {
                     VectorPartitionRecordKind::Journal,
                     value.value(),
                 )
-                .map_err(|failure| failure.into_error(|reason| damage(reason)))?;
+                .map_err(|failure| failure.into_error(damage))?;
             if record.index != self.partition.index
                 || record.partition_key != self.partition.partition_key
             {
@@ -2368,9 +2366,9 @@ impl MembershipCursor {
             return Ok(None);
         };
         let payload = vector_partition_record_payload(VectorPartitionRecordKind::Membership, value.value())
-            .map_err(|reason| damage(reason))?;
+            .map_err(damage)?;
         prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Membership, payload)
-            .map_err(|reason| damage(reason))?;
+            .map_err(damage)?;
         let required = membership_cursor_owned_bytes(&self.partition, self.prefix.capacity(), key.value().len());
         if required > self.max_bytes {
             if !request(DormantVectorLoadRequest::Reserve(required - self.max_bytes)) {
@@ -2422,9 +2420,8 @@ impl RawVectorMembershipCursor for MembershipCursor {
         });
         // Only scalar identities escape. The decoded record and its owned
         // strings are physically gone before their per-call owner is retired.
-        if result.is_ok() {
-            if let Some(decoder) = decoder { decoder.release_query_vector_call(); }
-        }
+        if result.is_ok()
+            && let Some(decoder) = decoder { decoder.release_query_vector_call(); }
         result
     }
 
@@ -3112,9 +3109,9 @@ impl ReverseCursor {
             VectorPartitionRecordKind::Membership,
             payload,
         )
-        .map_err(|reason| damage(reason))?;
+        .map_err(damage)?;
         let native =
-            vector_partition_route_native_capacity(payload).map_err(|reason| damage(reason))?;
+            vector_partition_route_native_capacity(payload).map_err(damage)?;
         let needed = needed
             .checked_add(
                 native
@@ -3131,7 +3128,7 @@ impl ReverseCursor {
                 VectorPartitionRecordKind::Membership,
                 value.value(),
             )
-            .map_err(|failure| failure.into_error(|reason| damage(reason)))?;
+            .map_err(|failure| failure.into_error(damage))?;
         if vector_membership_pages::reverse_key(&record).as_slice() != key.value()
             || record.index != self.index
             || record.row_id != self.row
@@ -3889,13 +3886,13 @@ pub(crate) fn stream_partition_journal_tail(
         // Ground actual codec & control pricing before record deserialization
         let payload =
             vector_partition_record_payload(VectorPartitionRecordKind::Journal, val_buf.as_slice())
-                .map_err(|reason| damage(reason))?;
+                .map_err(damage)?;
 
         prevalidate_vector_partition_metadata_routes(VectorPartitionRecordKind::Journal, payload)
-            .map_err(|reason| damage(reason))?;
+            .map_err(damage)?;
 
         let route_native_cap =
-            vector_partition_route_native_capacity(payload).map_err(|reason| damage(reason))?;
+            vector_partition_route_native_capacity(payload).map_err(damage)?;
         let decoded_route_bytes = route_native_cap
             .checked_mul(2)
             .ok_or_else(|| damage("journal record route capacity overflow"))?;
@@ -3914,7 +3911,7 @@ pub(crate) fn stream_partition_journal_tail(
             VectorPartitionRecordKind::Journal,
             val_buf.as_slice(),
         )
-        .map_err(|failure| failure.into_error(|reason| damage(reason)))?;
+        .map_err(|failure| failure.into_error(damage))?;
 
         if record.index != partition.index || record.partition_key != partition.partition_key {
             return Err(damage("journal route disagrees with membership source"));

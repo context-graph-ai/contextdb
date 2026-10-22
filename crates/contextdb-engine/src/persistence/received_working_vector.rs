@@ -1765,7 +1765,7 @@ impl WorkingVectorPartitionSource {
         match &self.owner {
             WorkingPartitionOwner::Query { control, .. } => Ok(control.funder()),
             WorkingPartitionOwner::Original { .. } =>
-                crate::memory_accounting::persistence_original_projection(&self.catalog.catalog.storage.lock())?.vector_budget().map(Into::into),
+                crate::memory_accounting::persistence_original_projection(&self.catalog.catalog.storage.lock())?.vector_budget(),
         }
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
@@ -1842,7 +1842,7 @@ impl DormantRawVectorLoader for WorkingVectorPartitionSource {
                     member.value.visible_from, member.value.deleted_tx), canonical_deleted));
         }
         resident.transfer();
-        Ok(contextdb_vector::store::LoadedRawVectorPartition { entries, resident_bytes, workspace_owner: workspace, accountant: (budget).into() })
+        Ok(contextdb_vector::store::LoadedRawVectorPartition { entries, resident_bytes, workspace_owner: workspace, accountant: (budget) })
     }
     fn load_candidate(&self, identity: &RawVectorDirectoryEntry, caller_charged: bool,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<contextdb_vector::store::LoadedRawVectorCandidate> {
@@ -2134,7 +2134,7 @@ impl ReceivedWorkingWrite {
         self.rewrite_vector_image(original,
             |frame, body| {
                 if body.index.table != table { return Ok(true); }
-                let Some((_, name)) = destination(&body.index) else { return Ok(false); };
+                let Some((_, name)) = destination(body.index) else { return Ok(false); };
                 if body.index.column != name {
                     frame.reserve(name.len())?;
                     body.index.column = crate::memory_accounting::preparation_copy_string(name)?;

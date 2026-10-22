@@ -8092,8 +8092,8 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
                     break;
                 }
                 let entry = &batch.entries[position].entry;
-                if entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
-                    if let Err(error) = self.events.transition_owned_sink_attempt(
+                if entry.attempts & UNCONFIRMED_ATTEMPT != 0
+                    && let Err(error) = self.events.transition_owned_sink_attempt(
                         &self.persistence,
                         &self.tx_mgr,
                         &self.sink.body,
@@ -8106,7 +8106,6 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
                         self.wait(&shutdown, Duration::from_millis(50));
                         continue 'dispatch;
                     }
-                }
                 let attempts = match self.events.transition_owned_sink_attempt(
                     &self.persistence,
                     &self.tx_mgr,
@@ -10825,7 +10824,7 @@ impl Database {
                 database: self,
                 ws,
                 original: &events.data().original,
-                read_memory: (read_memory.clone()).into(),
+                read_memory: (read_memory.clone()),
             };
             let snapshot = self.snapshot();
             for (table, id, _) in &ws.relational_deletes {

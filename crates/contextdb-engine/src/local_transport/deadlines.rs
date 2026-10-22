@@ -615,11 +615,9 @@ impl DeadlineClock for MonotonicDeadlineClock {
             let Some(waker) = next else { break; };
             // No pinned node pointer survives unlock. Unlink before invoking
             // arbitrary wake/drop code, and finish draining even on unwind.
-            if let Some(waker) = waker {
-                if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake())) {
-                    if panic.is_none() { panic = Some(error); }
-                }
-            }
+            if let Some(waker) = waker
+                && let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()))
+                    && panic.is_none() { panic = Some(error); }
         }
         if let Some(panic) = panic { std::panic::resume_unwind(panic); }
     }
@@ -1378,13 +1376,12 @@ impl Drop for OwnedTimerWait {
         { let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
           state.abandoned = true; state.waker = None; }
         self.state.1.notify_all();
-        if let Some(thread) = self.thread.take() {
-            if self.state.0.lock().unwrap_or_else(|p| p.into_inner()).owner
+        if let Some(thread) = self.thread.take()
+            && self.state.0.lock().unwrap_or_else(|p| p.into_inner()).owner
                 != Some(crate::owned_worker::current_thread_id())
             {
                 let _ = thread.join();
             }
-        }
     }
 }
 enum LegacyMonotonicWait<'a> {

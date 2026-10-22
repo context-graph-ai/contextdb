@@ -2997,13 +2997,12 @@ pub(crate) fn project_metadata(
     // request's result ceiling is refused on its own size, and the bytes
     // that carry it are admitted before they exist.
     let encoded_len = crate::read_contract::encoded_metadata_body_len(&body);
-    if arrives_whole {
-        if let Some(failure) =
+    if arrives_whole
+        && let Some(failure) =
             crate::metadata_page::admit_complete_metadata(encoded_len, limits.result_bytes)
         {
             return Err(DirectFileReaderError::ReadFailure(failure));
         }
-    }
     if reads_history {
         history_checkpoint().map_err(history_answer_error)?;
     }

@@ -1048,7 +1048,7 @@ impl SourceWindowOwner {
     ) -> Result<contextdb_core::read_memory::ReadCredit> {
         let budget: contextdb_core::read_memory::ReadMemoryOwner = match self {
             Self::Read(read) => read.clone(),
-            Self::Write(writer, _) => writer.read_budget()?.into(),
+            Self::Write(writer, _) => writer.read_budget()?,
         };
         contextdb_core::read_memory::ReadCredit::try_new(
             budget,
@@ -2865,7 +2865,7 @@ impl WriterReadCursor {
                 let edge: AdjEntry = decode_window_exact(value).map_err(|error| match error {
                     Error::Other(reason) => Error::StoreCorrupted {
                         path: "graph adjacency".into(),
-                        reason: reason,
+                        reason,
                     },
                     other => other,
                 })?;
@@ -2916,7 +2916,7 @@ impl WriterReadCursor {
                 vector_partition_record_payload(VectorPartitionRecordKind::Membership, value)
                     .map_err(|reason| Error::StoreCorrupted {
                         path: "vector_partition_membership".into(),
-                        reason: reason.into(),
+                        reason: reason,
                     })?,
             )?;
             if RedbPersistence::vector_partition_membership_key(&record) != key {

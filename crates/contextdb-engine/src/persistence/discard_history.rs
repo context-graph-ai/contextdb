@@ -69,7 +69,7 @@ impl OriginalDiscardHistory {
             let mut commits = write.open_table(COMMITS).map_err(RedbPersistence::storage_error)?;
             if !commits.is_empty().map_err(RedbPersistence::storage_error)? { return Err(invalid()); }
             let owner = writer_source::SourceWindowOwner::Read(
-                crate::memory_accounting::persistence_original_projection(original)?.read_budget()?.into());
+                crate::memory_accounting::persistence_original_projection(original)?.read_budget()?);
             let mut cursor = root.commit_cursor(owner, Lsn(0), root.lsn, false)?;
             while let Some((lsn, tx)) = cursor.next()? {
                 if commits.get(tx.0).map_err(RedbPersistence::storage_error)?.is_none() {
@@ -153,7 +153,7 @@ impl OriginalDiscardHistory {
         let actual: AdjEntry = window.decode(body.value())?;
         if actual != *edge { return Err(invalid()); }
         let owner = writer_source::SourceWindowOwner::Read(
-            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?.into());
+            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?);
         self.root.verify_graph_edge_at_root(&physical, body.value(), edge, false, &owner)?;
         let receipt_key = graph_history_record::lifecycle_key(&physical)?;
         let receipts = self.write.open_table(graph_history_record::GRAPH_PREDECESSOR_LIFECYCLE)
@@ -199,7 +199,7 @@ impl OriginalDiscardHistory {
         self.write.require_store(store)?;
         self.root.require_working_store(store)?;
         let owner = writer_source::SourceWindowOwner::Read(
-            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?.into());
+            crate::memory_accounting::persistence_original_projection(original)?.read_budget()?);
         // This cursor is constructed here, from begin's exact root and Original.
         // No caller can supply a decoded witness, occurrence id or coordinate.
         let mut cursor = self.root.change_log_cursor(owner, Lsn(0), self.root.lsn)?;

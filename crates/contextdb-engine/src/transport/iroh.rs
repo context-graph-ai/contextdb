@@ -2558,7 +2558,7 @@ impl IrohServer {
             .await
             .map_err(|err| {
                 TransportError::Other(
-                    (format!("response staging cleanup task failed: {err}")).into(),
+                    format!("response staging cleanup task failed: {err}"),
                 )
             })
             .and_then(|result| result);
@@ -3314,7 +3314,7 @@ impl IrohClientTransport {
         let mut assembled = Vec::new();
         assembled.try_reserve_exact(total).map_err(|err| {
             TransportError::Other(
-                (format!("cannot reserve {total} bytes for oversized response: {err}")).into(),
+                format!("cannot reserve {total} bytes for oversized response: {err}"),
             )
         })?;
         for sequence in 0..manifest.total_chunks {
@@ -3340,7 +3340,7 @@ impl IrohClientTransport {
             })
             .map_err(|err| {
                 TransportError::Other(
-                    (format!("cannot encode oversized response chunk request: {err}")).into(),
+                    format!("cannot encode oversized response chunk request: {err}"),
                 )
             })?;
             let mut last_error = None;
@@ -3435,7 +3435,7 @@ impl IrohClientTransport {
         })
         .map_err(|err| {
             TransportError::Other(
-                (format!("cannot encode oversized response completion: {err}")).into(),
+                format!("cannot encode oversized response completion: {err}"),
             )
         })?;
         let mut last_error = None;
@@ -3466,7 +3466,7 @@ impl IrohClientTransport {
                     })
                     .map_err(|err| {
                         TransportError::Other(
-                            (format!("cannot encode oversized response release: {err}")).into(),
+                            format!("cannot encode oversized response release: {err}"),
                         )
                     })?;
                     if let Ok(connection) = self.connected_state().await {
@@ -3910,7 +3910,7 @@ impl ServerTransport for IrohServerTransport {
                 let endpoint = lease.take().ok_or_else(|| {
                     TransportError::Other((
                         "a bound sync endpoint may be served only once; bind a new endpoint before restarting"
-                            .to_string()).into())
+                            .to_string()))
                 })?;
                 self.serve_lifecycle.begin(endpoint)
             };
@@ -4169,7 +4169,7 @@ async fn serve_sync_connection(
                         .await
                         .map_err(|err| {
                             TransportError::Other(
-                                (format!("oversized response chunk task failed: {err}")).into(),
+                                format!("oversized response chunk task failed: {err}"),
                             )
                         })
                         .and_then(|result| result)
@@ -4207,9 +4207,9 @@ async fn serve_sync_connection(
                             })
                             .await
                             .map_err(|err| {
-                                TransportError::Other((format!(
+                                TransportError::Other(format!(
                                 "oversized response completion validation task failed: {err}"
-                            )).into())
+                            ))
                             })
                             .and_then(|result| result);
                         match validation {
@@ -4236,8 +4236,7 @@ async fn serve_sync_connection(
                             .await
                             .map_err(|err| {
                                 TransportError::Other(
-                                    (format!("oversized response completion task failed: {err}"))
-                                        .into(),
+                                    format!("oversized response completion task failed: {err}"),
                                 )
                             })
                             .and_then(|result| result)
@@ -4272,7 +4271,7 @@ async fn serve_sync_connection(
                         .await
                         .map_err(|err| {
                             TransportError::Other(
-                                (format!("oversized response release task failed: {err}")).into(),
+                                format!("oversized response release task failed: {err}"),
                             )
                         })
                         .and_then(|result| result)
@@ -4292,15 +4291,14 @@ async fn serve_sync_connection(
                     match rmp_serde::to_vec_named(&chunk)
                         .map_err(|err| {
                             TransportError::Other(
-                                (format!("cannot encode oversized response chunk: {err}")).into(),
+                                format!("cannot encode oversized response chunk: {err}"),
                             )
                         })
                         .and_then(|bytes| {
                             if bytes.len() > MAX_RESPONSE_CHUNK_ENVELOPE_BYTES {
                                 Err(TransportError::Other(
                                     ("oversized response chunk envelope exceeds its ceiling"
-                                        .to_string())
-                                    .into(),
+                                        .to_string()),
                                 ))
                             } else {
                                 Ok(bytes)
@@ -4464,7 +4462,7 @@ async fn serve_sync_connection(
                 {
                     Ok(outcome) => outcome,
                     Err(err) => Err(TransportError::Other(
-                        (format!("oversized request staging task failed: {err}")).into(),
+                        format!("oversized request staging task failed: {err}"),
                     )),
                 }
             };
@@ -5035,8 +5033,7 @@ impl SyncReplyWriter {
                         .reserve_response_transfer()
                         .ok_or_else(|| {
                             TransportError::Other(
-                                ("too many unfinished oversized response transfers".to_string())
-                                    .into(),
+                                ("too many unfinished oversized response transfers".to_string()),
                             )
                         })?,
                 )
@@ -5046,7 +5043,7 @@ impl SyncReplyWriter {
             let mut slot = send_slot.lock().await;
             let Some((mut send, mut recv)) = slot.take() else {
                 return Err(TransportError::Other(
-                    ("reply already sent on this stream".to_string()).into(),
+                    ("reply already sent on this stream".to_string()),
                 ));
             };
             #[cfg(feature = "test-seams")]
@@ -5117,7 +5114,7 @@ impl SyncReplyWriter {
                     }
                     Ok(Err(err)) => Err(err),
                     Err(err) => Err(TransportError::Other(
-                        (format!("oversized response staging task failed: {err}")).into(),
+                        format!("oversized response staging task failed: {err}"),
                     )),
                 }
             } else {
@@ -5670,12 +5667,12 @@ async fn exchange_frame(
     if let Some(subject) = subject {
         let subject_bytes = subject.as_bytes();
         let subject_len = u16::try_from(subject_bytes.len())
-            .map_err(|_| TransportError::Other(("channel name too long".to_string()).into()))?;
+            .map_err(|_| TransportError::Other(("channel name too long".to_string())))?;
         write_all(&mut send, &subject_len.to_be_bytes()).await?;
         write_all(&mut send, subject_bytes).await?;
     }
     let payload_len = u32::try_from(payload.len()).map_err(|_| {
-        TransportError::Other(("request exceeds the frame ceiling".to_string()).into())
+        TransportError::Other(("request exceeds the frame ceiling".to_string()))
     })?;
     write_all(&mut send, &payload_len.to_be_bytes()).await?;
     write_all(&mut send, payload).await?;
@@ -5706,7 +5703,7 @@ async fn exchange_frame(
         )),
         REPLY_ADMISSION_REFUSED => Err(TransportError::Refused(decode_admission_refusal(&reply))),
         other => Err(TransportError::Other(
-            (format!("unknown reply status byte {other}")).into(),
+            format!("unknown reply status byte {other}"),
         )),
     }
 }
@@ -5896,7 +5893,7 @@ async fn exchange_large_request(
         let encoded =
             LargeRequestControl::FragmentV1(rmp_serde::from_slice(&encoded).map_err(|err| {
                 TransportError::Other(
-                    (format!("cannot decode encoded oversized request fragment: {err}")).into(),
+                    format!("cannot decode encoded oversized request fragment: {err}"),
                 )
             })?)
             .encode()?;
@@ -5918,7 +5915,7 @@ async fn exchange_large_request(
                             begin.total_fragments,
                             Some(u32::try_from(sequence + 1).map_err(|_| {
                                 TransportError::Other(
-                                    ("oversized request has too many fragments".to_string()).into(),
+                                    ("oversized request has too many fragments".to_string()),
                                 )
                             })?),
                         )?;
@@ -5956,7 +5953,7 @@ async fn exchange_large_request(
         ));
     }
     Err(TransportError::Other(
-        ("oversized request contained no fragments".to_string()).into(),
+        ("oversized request contained no fragments".to_string()),
     ))
 }
 
@@ -6152,7 +6149,7 @@ async fn write_reply(
 ) -> TransportResult<()> {
     write_all(send, &[status]).await?;
     let len = u32::try_from(payload.len()).map_err(|_| {
-        TransportError::Other(("reply exceeds the frame ceiling".to_string()).into())
+        TransportError::Other(("reply exceeds the frame ceiling".to_string()))
     })?;
     write_all(send, &len.to_be_bytes()).await?;
     write_all(send, payload).await?;
@@ -6167,12 +6164,12 @@ async fn write_reply(
         })?;
         if receipt[0] != REPLY_RECEIVED_ACK {
             return Err(TransportError::Other(
-                ("sync peer returned an invalid reply receipt".to_string()).into(),
+                ("sync peer returned an invalid reply receipt".to_string()),
             ));
         }
         recv.read_to_end(0).await.map_err(|err| match err {
             iroh::endpoint::ReadToEndError::TooLong => TransportError::Other(
-                ("sync peer sent trailing bytes after the reply receipt".to_string()).into(),
+                ("sync peer sent trailing bytes after the reply receipt".to_string()),
             ),
             iroh::endpoint::ReadToEndError::Read(_) => TransportError::Unreachable(
                 "sync endpoint connection lost before the reply receipt stream finished"

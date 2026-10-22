@@ -79,7 +79,7 @@ const SOURCE_SUFFIX_BYTES: usize = 24;
 pub(crate) fn corruption(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "vector_paged_generation_pages".into(),
-        reason: reason.into().into(),
+        reason: reason.into(),
     }
 }
 
@@ -1447,7 +1447,7 @@ impl<S: PageSource> PagedLookup<'_, '_, S> {
         };
         let (key, value) = &*entry;
         open_value(key, value)?;
-        if key.len() != prefix.len() + 16 || !key.starts_with(&prefix) {
+        if key.len() != prefix.len() + 16 || !key.starts_with(prefix) {
             return Err(corruption("paged exact directory key is invalid"));
         }
         let row = RowId(u64::from_be_bytes(

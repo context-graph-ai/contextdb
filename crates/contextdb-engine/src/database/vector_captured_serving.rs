@@ -347,7 +347,7 @@ impl CapturedServingSupplier {
             dimension: self.dimension,
             quantization: self.quantization,
             layout: self.layout.clone(),
-            funder: (self.funder.clone()).into(),
+            funder: (self.funder.clone()),
             _control: control,
         });
         Ok(CapturedVectorGraphLayer { descriptor, loader })
@@ -479,7 +479,7 @@ impl CapturedVectorSuffixSource for CapturedServingSupplier {
             dimension: self.dimension,
             quantization: self.quantization,
             policy: self.policy,
-            funder: (self.funder.clone()).into(),
+            funder: (self.funder.clone()),
             _control: control,
         });
         Ok(CapturedVectorSuffix {
@@ -554,7 +554,7 @@ pub(crate) fn captured_serving_selection(
         quantization: layout.quantization,
         policy,
         layout,
-        funder: (owner.funder()).into(),
+        funder: (owner.funder()),
         bindings: parking_lot::Mutex::new(Bindings::default()),
         _control: control,
     });
@@ -786,7 +786,7 @@ impl DormantVectorGraphLoader for CapturedLayerLoader {
         Ok(LoadedVectorGraphGeneration {
             graph,
             resident_bytes: current_resident,
-            accountant: (self.funder.clone()).into(),
+            accountant: (self.funder.clone()),
             caller_adopted_bytes: current_resident,
             fresh_tail: None,
         })
@@ -911,7 +911,7 @@ impl CapturedVectorSuffixLoader for CapturedSuffixLoader {
             tail: Some(LoadedVectorFreshTail {
                 graph,
                 resident_bytes: actual,
-                accountant: (self.funder.clone()).into(),
+                accountant: (self.funder.clone()),
                 replayed_through_lsn,
             }),
             caller_adopted_bytes: actual,

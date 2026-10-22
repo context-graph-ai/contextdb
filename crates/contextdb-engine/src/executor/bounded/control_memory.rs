@@ -41,7 +41,7 @@ impl<T> ControlArc<T> {
     pub(super) fn admit(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<ReadShared<ReadCredit>> {
         let owner = owner.into();
 
-        Self::admit_owned(contextdb_core::read_memory::ReadMemoryOwner::from(owner))
+        Self::admit_owned(owner)
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn admit_owned(owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>)

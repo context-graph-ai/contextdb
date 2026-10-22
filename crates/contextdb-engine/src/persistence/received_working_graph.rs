@@ -64,7 +64,7 @@ impl ReceivedWorkingWrite {
                 }
                 write.open_table(destination).map(|_| ()).map_err(RedbPersistence::storage_error)
             })?;
-            let mut cursor = root.cursor(writer_source::SourceWindowOwner::Read(read_memory.clone().into()),
+            let mut cursor = root.cursor(writer_source::SourceWindowOwner::Read(read_memory.clone()),
                 public.name(), writer_source::WriterCursorFamily::Bytes,
                 Bound::Unbounded, Bound::Unbounded, false)?;
             while let Some(window) = cursor.next_edge_for_working()? {

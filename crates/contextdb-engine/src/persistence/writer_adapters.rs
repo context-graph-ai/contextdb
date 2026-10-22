@@ -1075,7 +1075,7 @@ impl WriterGraphSnapshot {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = match &owner {
             SourceWindowOwner::Read(memory) => memory.clone(),
             SourceWindowOwner::Write(memory, original_use) => {
-                memory.read_budget_for_original(original_use.clone())?.into()
+                memory.read_budget_for_original(original_use.clone())?
             }
         };
         super::graph_read::with_pages(memory, || {

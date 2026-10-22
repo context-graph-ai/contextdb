@@ -1964,7 +1964,7 @@ impl StoreAccountantHandle {
             return accountant.vector_budget_for_original_reader();
         }
         let writer_use = self.original_writer_use(&accountant);
-        Ok(accountant.budget_adapter(Some(writer_use), false)?)
+        accountant.budget_adapter(Some(writer_use), false)
     }
     fn original_writer_use(&self, accountant: &AccountantHandle) -> WriterUse {
         assert!(
@@ -4092,11 +4092,10 @@ impl MemoryAccountant {
                 self.accountant.release(self.bytes);
                 // A callback may unwind after disarming the source token.
                 // Only then does this tentative destination own its root debit.
-                if self.moved {
-                    if let Some(original) = &self.original {
+                if self.moved
+                    && let Some(original) = &self.original {
                         contextdb_core::read_memory::ReadMemoryBudget::release(original, self.bytes);
                     }
-                }
             }
         }
         let mut pending = Pending { accountant: self, bytes, original: query_original, moved: false };
@@ -4518,9 +4517,8 @@ impl MemoryAccountant {
     ) -> contextdb_core::Result<()> {
         let original = self.admit_reader_original_native(bytes).map_err(contextdb_core::Error::NativeEngineOther)?;
         let result = self.try_allocate_with_provenance_local(bytes, provenance);
-        if result.is_ok() {
-            if let Some(original) = original { original.transfer(); }
-        }
+        if result.is_ok()
+            && let Some(original) = original { original.transfer(); }
         result
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
@@ -5492,11 +5490,10 @@ impl contextdb_vector::MemoryBudget for WriterVectorBudget {
             &**self.accountant(), old, new, subsystem, operation, hint);
         if result.is_ok() {
             if let Some(original) = original { original.transfer(); }
-            if new < old {
-                if let Some(owner) = self.accountant().query_reader_original() {
+            if new < old
+                && let Some(owner) = self.accountant().query_reader_original() {
                     contextdb_core::read_memory::ReadMemoryBudget::release(&owner, old - new);
                 }
-            }
         }
         result
     }
@@ -5672,7 +5669,7 @@ impl AccountantHandle {
                     requested_bytes, available_bytes, budget_limit_bytes, hint },
             other => other,
         });
-        if result.is_ok() { if let Some(original) = original { original.transfer(); } }
+        if result.is_ok() && let Some(original) = original { original.transfer(); }
         result
     }
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
@@ -10859,9 +10856,8 @@ impl MemoryAccountant {
     ) -> std::result::Result<(), contextdb_core::read_memory::NativeRefusal> {
         let original = self.admit_reader_original_native(bytes)?;
         let result = self.try_allocate_with_provenance_native_local(bytes, provenance);
-        if result.is_ok() {
-            if let Some(original) = original { original.transfer(); }
-        }
+        if result.is_ok()
+            && let Some(original) = original { original.transfer(); }
         result
     }
     fn try_allocate_with_provenance_native_local(

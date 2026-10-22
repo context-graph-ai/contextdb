@@ -1158,7 +1158,7 @@ impl Database {
         WriterReadScope {
             prior,
             _decode: None,
-            _read_memory: (read_memory).into(),
+            _read_memory: (read_memory),
             _same_thread: std::marker::PhantomData,
         }
     }
@@ -1275,7 +1275,7 @@ impl Database {
         Ok(WriterReadScope {
             prior,
             _decode: Some(image.enter()),
-            _read_memory: (read_memory).into(),
+            _read_memory: (read_memory),
             _same_thread: std::marker::PhantomData,
         })
     }

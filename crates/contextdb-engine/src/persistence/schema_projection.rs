@@ -1123,7 +1123,7 @@ impl RedbPersistence {
                 }
             }
             Self::retire_undeclared_relational_indexes_in_write(
-                &write, &self.path, name, &previous, meta, &mut self.proof_admission(),
+                &write, &self.path, name, previous, meta, &mut self.proof_admission(),
             )?;
             let mut indexes = ProjectedIndexes::prepare(self, &write, name, meta, &mut commitments)?;
             {
@@ -1198,7 +1198,7 @@ impl RedbPersistence {
                 &write,
                 &self.path,
                 name,
-                &previous,
+                previous,
                 meta,
                 &mut self.proof_admission(),
             )?;

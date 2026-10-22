@@ -281,14 +281,14 @@ pub(crate) fn accepted_identity(
         scratch.reserve(source.value().len().saturating_mul(8))?;
         let payload =
             vector_partition_record_payload(VectorPartitionRecordKind::Membership, source.value())
-                .map_err(|reason| damage(reason))?;
+                .map_err(damage)?;
         prevalidate_vector_partition_metadata_routes(
             VectorPartitionRecordKind::Membership,
             payload,
         )
-        .map_err(|reason| damage(reason))?;
+        .map_err(damage)?;
         let native =
-            vector_partition_route_native_capacity(payload).map_err(|reason| damage(reason))?;
+            vector_partition_route_native_capacity(payload).map_err(damage)?;
         scratch.reserve(native.saturating_mul(8))?;
         // All decoded fields are transient; only two scalar identities leave
         // this lookup. Release their codec charges after the record and keys

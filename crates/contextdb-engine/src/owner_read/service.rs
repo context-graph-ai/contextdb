@@ -1530,7 +1530,7 @@ impl OwnerReadService {
             "Reduce simultaneous connections or raise the declared reader limit.")
             .map_err(OwnerReadScaffoldError::Database)?;
         let refusal_controls = RequestControls::from_prepaid(refusal_controls,
-            contextdb_core::read_memory::ReadMemoryOwner::from(connection_parent.clone()));
+            connection_parent.clone());
         let connection_control = ReadCredit::try_new(connection_parent,
             ReadShared::<ConnectionInbox>::layout().size(),
             "reader", "connection_inbox",
@@ -1797,7 +1797,7 @@ impl OwnerReadService {
         } else {
             let parent: contextdb_core::read_memory::ReadMemoryOwner =
                 self.reading_handle(connection_id).query_request_provider().original_owner();
-            let owner = contextdb_core::read_memory::ReadMemoryOwner::from(parent.clone());
+            let owner = parent.clone();
             let invoice = ReadCredit::try_new(parent, CancellationRegistration::bytes(),
                 "reader", "connection_cancellation", "Reduce simultaneous connections or raise the declared reader limit.")
                 .map_err(OwnerReadScaffoldError::Database)?;
@@ -4773,10 +4773,10 @@ impl RequestPublication<'_, '_> {
                                 for response in &completed.responses {
                                     send_authoritative_response(
                                         &carrier,
-                                        &publish_stream,
+                                        publish_stream,
                                         &boundary,
                                         response,
-                                        &expectation,
+                                        expectation,
                                         completed
                                             .publication
                                             .as_ref()
@@ -4805,7 +4805,7 @@ impl RequestPublication<'_, '_> {
                         }
                         UnixLocalCarrier::send_message(
                             &carrier,
-                            &mut publish_stream,
+                            publish_stream,
                             &boundary,
                             LocalOutboundMessage::Response {
                                 response: &LocalResponse::CancelApplied {
@@ -4853,13 +4853,13 @@ impl RequestPublication<'_, '_> {
             }
         }
         if let Some(payload) = completed.terminal_panic.as_ref() {
-            inbound::send_terminal_panic(&mut publish_stream, payload.as_ref())
+            inbound::send_terminal_panic(publish_stream, payload.as_ref())
                 .map_err(|_| crate::local_transport::owner_disconnected())?;
             return Ok(());
         }
         if let Some(error) = completed.terminal_error.as_ref() {
             if let Some(control) = completed.query_control.as_ref() { control.terminal(); }
-            inbound::send_terminal_error(&mut publish_stream, error)
+            inbound::send_terminal_error(publish_stream, error)
                 .map_err(|_| crate::local_transport::owner_disconnected())?;
             return Ok(());
         }
@@ -4874,7 +4874,7 @@ impl RequestPublication<'_, '_> {
             fn drop(&mut self) { self.0.set_query_funding(None); }
         }
         boundary.set_query_funding(completed.query_memory.clone());
-        let _query_funding = QueryFundingReset(&boundary);
+        let _query_funding = QueryFundingReset(boundary);
         let publication = completed.publication.as_ref().map(|publication| {
             service.spec
                 .database
@@ -4887,13 +4887,13 @@ impl RequestPublication<'_, '_> {
             }
             if let Some(control) = completed.query_control.as_ref() {
                 control.terminal();
-                inbound::send_terminal_error(&mut publish_stream, &error)
+                inbound::send_terminal_error(publish_stream, &error)
                     .map_err(|_| crate::local_transport::owner_disconnected())?;
             } else {
                 let response = refusal_response(error, boundary.query_funding().expect("request boundary retains its owner"))
                                     .map_err(|error| match error { OwnerReadScaffoldError::Database(error) => crate::local_transport::query_funding::transport_error(error, effective_limits.memory), _ => crate::local_transport::owner_disconnected() })?;
-                UnixLocalCarrier::send_message(&carrier, &mut publish_stream, &boundary,
-                    LocalOutboundMessage::Response { response: &response, expectation: &expectation })?;
+                UnixLocalCarrier::send_message(carrier, &mut publish_stream, boundary,
+                    LocalOutboundMessage::Response { response: &response, expectation: expectation })?;
             }
             return Ok(());
         }
@@ -4916,19 +4916,19 @@ impl RequestPublication<'_, '_> {
         for response in &completed.responses {
             let sent = if let Some(publication) = completed.publication.as_ref() {
                 send_authoritative_response(
-                    &carrier,
-                    &publish_stream,
-                    &boundary,
+                    carrier,
+                    publish_stream,
+                    boundary,
                     response,
-                    &expectation,
+                    expectation,
                     publication,
                 )
                 .await
             } else {
                 UnixLocalCarrier::send_message(
-                    &carrier,
+                    carrier,
                     &mut publish_stream,
-                    &boundary,
+                    boundary,
                     LocalOutboundMessage::Response {
                         response,
                         expectation: &expectation,

@@ -906,11 +906,10 @@ struct EngineDiagnostic {
 }
 impl fmt::Display for EngineDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.corruption_envelope {
-            if let contextdb_core::Error::StoreCorrupted { path, reason } = &self.error {
+        if self.corruption_envelope
+            && let contextdb_core::Error::StoreCorrupted { path, reason } = &self.error {
                 return write!(formatter, "store {path} is corrupt: {reason}");
             }
-        }
         fmt::Display::fmt(&self.error, formatter)
     }
 }

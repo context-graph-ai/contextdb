@@ -2150,11 +2150,10 @@ impl Database {
 
         if let Some(captured) = self.captured_graph_decisions().filter(|c| Some(c.tx) == tx) {
             captured.check_table(table)?;
-            if let Some(rows) = captured.rows(table) {
-                if let Some(row) = rows.row(row_id) {
+            if let Some(rows) = captured.rows(table)
+                && let Some(row) = rows.row(row_id) {
                     return Ok(Some(row.clone()));
                 }
-            }
             if captured
                 .decisions
                 .relational_deletes
@@ -4392,8 +4391,8 @@ impl Database {
             };
 
             let incoming = matches!(cursor.phase, BoundedGraphScanPhase::Reverse);
-            if cursor.source_end.is_none() {
-                if let Some(end) = entries.last() {
+            if cursor.source_end.is_none()
+                && let Some(end) = entries.last() {
                     set_bounded_edge_anchor(
                         &mut cursor.source_end,
                         &mut cursor.retained_bytes,
@@ -4409,7 +4408,6 @@ impl Database {
                         &mut release_retained,
                     )?;
                 }
-            }
             // Fallible partition_point: every actual binary-search comparison
             // spends work before reading the candidate identity.
             if let Some(anchor) = cursor.last_inspected.as_ref() {
@@ -5072,12 +5070,11 @@ impl Database {
 
         let capture = cursor.lease.clone();
         let _decisions = capture.as_ref().map(|capture| capture.enter());
-        if let Some(captured) = self.captured_graph_decisions() {
-            if let Err(error) = captured.check() {
+        if let Some(captured) = self.captured_graph_decisions()
+            && let Err(error) = captured.check() {
                 cursor.lease.take();
                 return Err(E::from(error));
             }
-        }
         let gated = !self.access_is_admin();
         let snapshot = cursor.snapshot();
         // Rows remain in captured canonical custody; ranks and delete/ACL

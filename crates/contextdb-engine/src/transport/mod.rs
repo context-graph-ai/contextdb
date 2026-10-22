@@ -1063,7 +1063,7 @@ fn materialize_body(mut body: BoundedWireBody) -> WireFuture<'static, AdmittedWi
         }
         let length = usize::try_from(body.length).map_err(|_| {
             WireError::Transport(TransportError::Other(
-                ("body length cannot be represented on this host".to_owned()).into(),
+                ("body length cannot be represented on this host".to_owned()),
             ))
         })?;
         let mut admitted = AdmittedWireVec::allocate(length, body.reader.clone())?;

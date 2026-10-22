@@ -1210,7 +1210,7 @@ fn read_rows_for_jobs(
         let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
         work.rows_examined = work.rows_examined.saturating_add(examined);
         if !rows.is_empty() {
-            visit(&columns, &rows)?;
+            visit(columns, rows)?;
         }
     }
     Ok(())
@@ -1236,7 +1236,7 @@ fn job_row(
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    Ok(Some(job_snapshot_from_row(&columns, row)?))
+    Ok(Some(job_snapshot_from_row(columns, row)?))
 }
 
 /// Read one submitted job out of a `work_jobs` row. One place, so a job read
@@ -1320,9 +1320,9 @@ fn claim_rows(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let attempt_idx = column_index(&columns, "attempt")?;
-    let node_idx = column_index(&columns, "node_id")?;
-    let lease_idx = column_index(&columns, "lease_deadline")?;
+    let attempt_idx = column_index(columns, "attempt")?;
+    let node_idx = column_index(columns, "node_id")?;
+    let lease_idx = column_index(columns, "lease_deadline")?;
     rows.iter()
         .map(|row| {
             Ok(ClaimRow {
@@ -1351,7 +1351,7 @@ fn failure_attempts(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let attempt_idx = column_index(&columns, "attempt")?;
+    let attempt_idx = column_index(columns, "attempt")?;
     rows.iter()
         .map(|row| int_at(row, attempt_idx, "attempt"))
         .collect()
@@ -1432,7 +1432,7 @@ pub fn job_state_with_read_memory(
     let mut rows = LedgerJobRows {
         db,
         job_id,
-        read_memory: (read_memory.clone()).into(),
+        read_memory: (read_memory.clone()),
     };
     state_of_job(&job, &mut rows, now_ms)
 }
@@ -1533,7 +1533,7 @@ impl JobStateRows for ReadSessionJobRows<'_> {
             &params,
         )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-        let attempt_idx = column_index(&columns, "attempt")?;
+        let attempt_idx = column_index(columns, "attempt")?;
         rows.iter()
             .map(|row| int_at(row, attempt_idx, "attempt"))
             .collect()
@@ -1548,9 +1548,9 @@ impl JobStateRows for ReadSessionJobRows<'_> {
             &params,
         )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-        let attempt_idx = column_index(&columns, "attempt")?;
-        let node_idx = column_index(&columns, "node_id")?;
-        let lease_idx = column_index(&columns, "lease_deadline")?;
+        let attempt_idx = column_index(columns, "attempt")?;
+        let node_idx = column_index(columns, "node_id")?;
+        let lease_idx = column_index(columns, "lease_deadline")?;
         rows.iter()
             .map(|row| {
                 Ok(ClaimRow {
@@ -1948,7 +1948,7 @@ pub fn claimable_jobs_with_read_memory(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let id_idx = column_index(&columns, "job_id")?;
+    let id_idx = column_index(columns, "job_id")?;
     let mut matching = Vec::new();
     for row in rows {
         let job_id = text_at(row, id_idx, "job_id")?;
@@ -2240,7 +2240,7 @@ pub fn blob_ref_retention_eligible_with_read_memory(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let id_idx = column_index(&columns, "job_id")?;
+    let id_idx = column_index(columns, "job_id")?;
     for row in rows {
         let job_id = text_at(row, id_idx, "job_id")?;
         let Some(job) = job_row(db, &job_id, read_memory.clone())? else {
@@ -2406,7 +2406,7 @@ pub fn claim_holder_with_read_memory(
     };
     Ok(Some(text_at(
         row,
-        column_index(&columns, "node_id")?,
+        column_index(columns, "node_id")?,
         "node_id",
     )?))
 }
@@ -2501,16 +2501,16 @@ pub fn job_result_with_read_memory(
         return Ok(None);
     };
     Ok(Some(JobResult {
-        job_id: text_at(row, column_index(&columns, "job_id")?, "job_id")?,
-        attempt: int_at(row, column_index(&columns, "attempt")?, "attempt")?,
+        job_id: text_at(row, column_index(columns, "job_id")?, "job_id")?,
+        attempt: int_at(row, column_index(columns, "attempt")?, "attempt")?,
         executor_node_id: text_at(
             row,
-            column_index(&columns, "executor_node_id")?,
+            column_index(columns, "executor_node_id")?,
             "executor_node_id",
         )?,
-        output: decode_payload(&text_at(row, column_index(&columns, "output")?, "output")?)?,
-        receipt: json_at(row, column_index(&columns, "receipt")?, "receipt")?,
-        completed_at_ms: int_at(row, column_index(&columns, "completed_at")?, "completed_at")?,
+        output: decode_payload(&text_at(row, column_index(columns, "output")?, "output")?)?,
+        receipt: json_at(row, column_index(columns, "receipt")?, "receipt")?,
+        completed_at_ms: int_at(row, column_index(columns, "completed_at")?, "completed_at")?,
     }))
 }
 
@@ -2701,7 +2701,7 @@ pub fn advertised_tags_with_read_memory(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let tags_idx = column_index(&columns, "tags")?;
+    let tags_idx = column_index(columns, "tags")?;
     let mut union: Vec<String> = Vec::new();
     for row in rows {
         for tag in string_list(&json_at(row, tags_idx, "tags")?, "tags")? {
@@ -2782,8 +2782,8 @@ pub fn materialize_inputs_with_read_memory(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let seq_idx = column_index(&columns, "seq")?;
-    let payload_idx = column_index(&columns, "payload")?;
+    let seq_idx = column_index(columns, "seq")?;
+    let payload_idx = column_index(columns, "payload")?;
     let mut inputs: ExecutionInputs = rows
         .iter()
         .map(|row| {
@@ -2830,7 +2830,7 @@ fn terminal_since(
                 read_memory.clone(),
             )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-            let idx = column_index(&columns, "cancelled_at")?;
+            let idx = column_index(columns, "cancelled_at")?;
             rows.first()
                 .map(|row| int_at(row, idx, "cancelled_at"))
                 .transpose()
@@ -2845,7 +2845,7 @@ fn terminal_since(
                 read_memory.clone(),
             )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-            let idx = column_index(&columns, "failed_at")?;
+            let idx = column_index(columns, "failed_at")?;
             let mut latest = None;
             for row in rows {
                 let at = int_at(row, idx, "failed_at")?;
@@ -2885,7 +2885,7 @@ pub fn run_input_retention_with_read_memory(
         read_memory.clone(),
     )?;
     let (columns, rows) = (answered_rows.columns(), answered_rows.rows());
-    let id_idx = column_index(&columns, "job_id")?;
+    let id_idx = column_index(columns, "job_id")?;
     let mut removed = 0usize;
     for row in rows {
         let job_id = text_at(row, id_idx, "job_id")?;

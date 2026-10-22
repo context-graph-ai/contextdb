@@ -996,7 +996,7 @@ fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderE
         | Direct::DirectReadRequiresWriter { failure, .. } => Error::ReadFailure(failure),
 
         Direct::Cancelled => Error::ReadCancelled,
-        Direct::Engine(prose) => Error::Other(prose.into()),
+        Direct::Engine(prose) => Error::Other(prose),
         Direct::MemoryBudget {
             subsystem,
             operation,
@@ -1005,12 +1005,12 @@ fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderE
             budget_limit_bytes,
             hint,
         } => Error::MemoryBudgetExceeded {
-            subsystem: subsystem.into(),
-            operation: operation.into(),
+            subsystem: subsystem,
+            operation: operation,
             requested_bytes,
             available_bytes,
             budget_limit_bytes,
-            hint: hint.into(),
+            hint: hint,
         },
         // A store nobody can read is the one answer an operator has to act on,
         // so a reader must not hand them less than a writer does. The direct
@@ -3446,8 +3446,8 @@ impl ReadSession {
                     };
                 first_page.attach_publication(public_carrier);
                 let complete = !first_page.has_more;
-                if !complete {
-                    if let Err(error) =
+                if !complete
+                    && let Err(error) =
                         self.resources
                             .expiry
                             .ensure_driver(&self.expiry_driver, &clock, || {
@@ -3467,7 +3467,6 @@ impl ReadSession {
                         );
                         return Err(error);
                     }
-                }
                 if !complete {
                     self.resources
                         .active_cursors
@@ -3518,14 +3517,13 @@ impl ReadSession {
                         kernel_observer: self.kernel_observer.as_ref().map(Arc::clone),
                     }),
                 };
-                if !complete {
-                    if let Err(error) =
+                if !complete
+                    && let Err(error) =
                         start_owner_cursor_expiry_watch(&cursor.state, retained_owner.clone())
                     {
                         let _ = cursor.close();
                         return Err(error);
                     }
-                }
                 Ok(cursor)
             }
             ReadSessionState::DirectFile(reader) => {

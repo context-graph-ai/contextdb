@@ -554,10 +554,10 @@ impl StorageAdmissionScope {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
         if memory.native_reserve_supported() {
-            Self::reader_native_owner(ReadMemoryOwner::from(memory))
+            Self::reader_native_owner(memory)
         } else {
             Self::new_unqualified(StorageFunding::ReadUnqualified(
-                ReadMemoryOwner::from(memory),
+                memory,
             ))
             .map_err(NativeStorageFailure::Unqualified)
         }

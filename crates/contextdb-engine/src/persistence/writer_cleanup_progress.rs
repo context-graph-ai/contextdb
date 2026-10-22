@@ -22,7 +22,7 @@ pub(crate) struct CurrencyCleanupGroup {
 fn damage(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "currency_cleanup_progress".into(),
-        reason: reason.into().into(),
+        reason: reason.into(),
     }
 }
 

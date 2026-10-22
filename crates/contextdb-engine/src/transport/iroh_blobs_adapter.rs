@@ -188,7 +188,7 @@ impl iroh_blobs::api::remote::GetStreamPair for ControlledGetStreams {
             connection_id,
             ControlledRecv {
                 inner: recv,
-                read_memory: (self.read_memory).into(),
+                read_memory: (self.read_memory),
                 failure: self.failure,
                 checked: false,
             },
@@ -2771,7 +2771,7 @@ async fn run_verified_fetch(
     let control_failure = Arc::new(Mutex::new(None));
     let streams = ControlledGetStreams {
         connection: peer.connection.clone(),
-        read_memory: read_memory.into(),
+        read_memory: read_memory,
         failure: control_failure.clone(),
     };
     let progress = remote.fetch(streams, content);

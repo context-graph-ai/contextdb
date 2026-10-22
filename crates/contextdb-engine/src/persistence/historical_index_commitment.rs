@@ -748,7 +748,7 @@ impl CommitmentBatch {
                 continue;
             }
             if touched.postings != touched.versions {
-                return Err(crate::funded_error::corruption_display(self.funding.diagnostic_budget(), &table, format_args!(
+                return Err(crate::funded_error::corruption_display(self.funding.diagnostic_budget(), table, format_args!(
                         "historical index {index} postings do not cover what its row versions \
                          cover"
                     )));
@@ -1195,7 +1195,7 @@ pub(super) fn verify_in_read(
     let rows_name = RedbPersistence::rel_table_name(table);
     for declaration in &declarations {
         let index_name = RedbPersistence::relational_index_table_name(table, &declaration.name);
-        let corrupt = |path: &str, reason: String| crate::funded_error::corruption_display(Ok(credit_budget.clone()), &path, reason);
+        let corrupt = |path: &str, reason: String| crate::funded_error::corruption_display(Ok(credit_budget.clone()), path, reason);
         let identity = index_identity(declaration)?;
         let mut postings = BoundaryState::empty();
         let mut posting_count = 0_u64;

@@ -172,7 +172,7 @@ impl ReadPublicationScope {
         let failure = if let Some(memory) = &self.read_memory {
             ReadFailure::try_funded_reason(
                 ReadFailureKind::AuthoritativeErasure,
-                contextdb_core::read_memory::ReadMemoryOwner::from(memory.clone()),
+                memory.clone(),
                 bytes,
                 make_reason,
             )?
@@ -20375,15 +20375,14 @@ fn visit_auto_indexes<'a>(
         );
     }
     for column in &meta.columns {
-        if let Some(reference) = &column.references {
-            if exact_constraint_key_indexable(&column.column_type) {
+        if let Some(reference) = &column.references
+            && exact_constraint_key_indexable(&column.column_type) {
                 visit(
                     AutoPhase::SingleForeign,
                     One(&column.name),
                     AutoName::Foreign(One(&column.name), &reference.table, One(&reference.column)),
                 );
             }
-        }
     }
     for fk in &meta.composite_foreign_keys {
         if !fk.child_columns.is_empty() && indexable(&fk.child_columns) {

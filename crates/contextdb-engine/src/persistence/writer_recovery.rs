@@ -251,7 +251,7 @@ impl RedbPersistence {
             unreachable!("internal writer retention owner")
         };
         let memory: contextdb_core::read_memory::ReadMemoryOwner =
-            accountant.read_budget()?.into();
+            accountant.read_budget()?;
         graph_read::with_pages(memory, || {
             let _controls = owner.reserve(
                 2 * std::mem::size_of::<redb::ReadOnlyTable<&[u8], &[u8]>>()
@@ -1034,9 +1034,9 @@ impl RedbPersistence {
         actual: u64,
     ) -> Result<()> {
         let expected = Self::witnessed_row_count_in_read(read, &Self::rel_table_name(table))?
-            .ok_or_else(|| crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &table, "missing saved row cardinality".into()))?;
+            .ok_or_else(|| crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), table, "missing saved row cardinality".into()))?;
         if expected != actual {
-            return Err(crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), &table, "row family cardinality differs from its committed record".into()));
+            return Err(crate::funded_error::corruption_text(crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()), table, "row family cardinality differs from its committed record".into()));
         }
         Ok(())
     }

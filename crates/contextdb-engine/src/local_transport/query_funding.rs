@@ -222,12 +222,11 @@ impl ReadMemoryBudget for QueryOperationBudget {
         use std::sync::atomic::Ordering;
         if !self.terminal.load(Ordering::SeqCst) {
             let checkpoint = self.checkpoint.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            if let Some(checkpoint) = checkpoint {
-                if let Err(stop) = checkpoint.check() {
+            if let Some(checkpoint) = checkpoint
+                && let Err(stop) = checkpoint.check() {
                     *self.pending_stop.lock().unwrap_or_else(|p| p.into_inner()) = Some(stop);
                     return Err(stop.into_error());
                 }
-            }
         }
         if self.held.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
             |held| held.checked_add(bytes).filter(|next| *next <= self.limit)).is_err()
@@ -460,7 +459,7 @@ impl QueryMemory {
         let (owner, result) = ReadMemoryOwner::try_native_result_with(invoice, |invoice| {
             let budget = invoice._memory.memory.reader_budget().expect("query image retains its reader");
             let answer = invoice.unpublished.take().expect("receiver retains its unpublished answer");
-            (RetainedQueryBudget { budget: budget.into() }, answer)
+            (RetainedQueryBudget { budget: budget }, answer)
         }).map_err(contextdb_core::Error::NativeEngineOther)?;
         result.into_public_with_owner(owner)
     }
@@ -495,7 +494,7 @@ impl QueryMemory {
         // Clone the image only AFTER nullable allocation succeeds. Otherwise
         // no external image alias can outlive the original invoice on null.
         ReadMemoryOwner::try_native_result_with(invoice, |invoice| {
-            (RetainedQueryBudget { budget: budget.into() }, invoice._memory.image())
+            (RetainedQueryBudget { budget: budget }, invoice._memory.image())
         })
         .map_err(contextdb_core::Error::NativeEngineOther)
     }

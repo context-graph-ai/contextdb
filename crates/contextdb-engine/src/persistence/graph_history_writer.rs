@@ -36,7 +36,7 @@ const MATCH_CONSUMED: TableDefinition<&[u8], &[u8]> =
 fn corrupt(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     Error::StoreCorrupted {
         path: "graph_history".into(),
-        reason: reason.into().into(),
+        reason: reason.into(),
     }
 }
 #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]

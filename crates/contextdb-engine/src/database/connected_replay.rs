@@ -395,11 +395,10 @@ impl Database {
                             continue;
                         };
                         let mut renames = sync_column_renames_from_constraints(constraints);
-                        if let Some(rename) = sync_vector_rename_from_constraints(constraints) {
-                            if !renames.contains(&rename) {
+                        if let Some(rename) = sync_vector_rename_from_constraints(constraints)
+                            && !renames.contains(&rename) {
                                 renames.push(rename);
                             }
-                        }
                         let old_vector_shapes = previous
                             .as_ref()
                             .map(Self::sync_vector_columns)
@@ -445,14 +444,13 @@ impl Database {
                             }
                         }
                         for vector in &mut projected.vectors {
-                            if vector.index.table == *name {
-                                if let Some((_, to)) = renames
+                            if vector.index.table == *name
+                                && let Some((_, to)) = renames
                                     .iter()
                                     .find(|(from, _)| *from == vector.index.column)
                                 {
                                     vector.index.column = to.clone();
                                 }
-                            }
                         }
                         projected.vectors.retain(|vector| vector.index.table != *name || meta.columns.iter().any(|column| {
                             let original_column = renames.iter().find(|(_,to)|*to == vector.index.column)
@@ -1121,7 +1119,7 @@ impl<'a> PrivateUnitScope<'a> {
         }
         let previous = PRIVATE_UNIT.with(|slot| slot.replace(Some(PrivateUnitState {
             host: db.tx_mgr.identity(), tx, canonical_tx, end, callbacks_prepared: false, graph_origin: None, callback_config_cursor: 0, derived_shapes: HashMap::new(),
-            effects: PrivatePrefixEffects::new(owner.clone()), owner: owner.into(),
+            effects: PrivatePrefixEffects::new(owner.clone()), owner: owner,
         })));
         Ok(Self { db, tx, previous, active: true, _same_thread: std::marker::PhantomData })
     }
@@ -1555,13 +1553,11 @@ impl Database {
             // Inspect both sides of each source step. DROP or an ALTER that
             // removes edge shape must not hide the preceding graph lifetime;
             // a repeated final declaration must not hide an intermediate one.
-            if let Some(meta) = Self::ddl_affected_table(ddl).and_then(|table| tables.get(table)) {
-                if graph_bearing(meta) { return Ok(false); }
-            }
+            if let Some(meta) = Self::ddl_affected_table(ddl).and_then(|table| tables.get(table))
+                && graph_bearing(meta) { return Ok(false); }
             Self::apply_sync_table_ddl_to_projected_meta(&mut tables,ddl);
-            if let Some(meta) = Self::ddl_affected_table(ddl).and_then(|table| tables.get(table)) {
-                if graph_bearing(meta) { return Ok(false); }
-            }
+            if let Some(meta) = Self::ddl_affected_table(ddl).and_then(|table| tables.get(table))
+                && graph_bearing(meta) { return Ok(false); }
         }
         Ok(true)
     }

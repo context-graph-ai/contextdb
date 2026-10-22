@@ -201,14 +201,13 @@ impl BlobRepository {
             visit(write,original,5,|source| {
                 let staging=source.staging(original)?;
                 if staging.version!=RECORD_VERSION || !source.key_is_object(&staging.object_id)? {return Err(invalid());}
-                if let Some((staged_hash,staged_generation))=staging.provisional_generation {
-                    if staged_hash==hash {
+                if let Some((staged_hash,staged_generation))=staging.provisional_generation
+                    && staged_hash==hash {
                         let partial_key=BlobRepository::manifest_key(&hash,staged_generation);
                         if let Some(bytes)=get(write,original,2,&partial_key)? {witness(write,original,2,&partial_key,&bytes)?;}
                         witness_source(write,original,5,source)?;
                         object(write,&staging.object_id)?;
-                    }
-                } Ok(())
+                    } Ok(())
             })?;
             generation.last_purge_lsn=generation.last_purge_lsn.max(frontier.0);
             let encoded=_window.encode_blob(&generation)?;
@@ -272,7 +271,7 @@ fn apply_with_pages(write:&redb::WriteTransaction,projection:&BlobAuthoritativeP
                 let backing=write.open_table(BYTES).map_err(RedbPersistence::storage_error)?;
                 let first=chunk_key(ordinal,0)?;
                 let expected=backing.get(first.as_slice()).map_err(RedbPersistence::storage_error)?.ok_or_else(invalid)?;
-                if len!=8 || expected.value()!=&(source.value_len() as u64).to_be_bytes() {return Err(invalid());}
+                if len!=8 || expected.value()!=(source.value_len() as u64).to_be_bytes() {return Err(invalid());}
                 Ok(())
             } else {
                 if source.value_len()!=len {return Err(invalid());}

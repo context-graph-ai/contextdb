@@ -874,7 +874,7 @@ impl SyncServer {
                                 edge_node_id: edge,
                                 edge_incarnation: request.edge_incarnation,
                                 binding: rmp_serde::to_vec_named(&packet)
-                                    .map_err(|e| TransportError::Other((e.to_string()).into()))?,
+                                    .map_err(|e| TransportError::Other((e.to_string())))?,
                             })
                         }
                         Err(error) => {
@@ -898,7 +898,7 @@ impl SyncServer {
                     };
                     (req.responder)(
                         encode_named(MessageType::BindApplicationTablePolicyResponse, &response)
-                            .map_err(|e| TransportError::Other((e.to_string()).into()))?,
+                            .map_err(|e| TransportError::Other((e.to_string())))?,
                     )
                     .await
                 }) as crate::transport::TransportFuture<'static, ()>
@@ -1194,7 +1194,7 @@ fn hub_now_ms() -> i64 {
 }
 
 fn to_transport_error(err: contextdb_core::Error) -> TransportError {
-    TransportError::Other((err.to_string()).into())
+    TransportError::Other((err.to_string()))
 }
 
 /// Answer the status exchange FOR THE EDGE THAT ASKED. The asking identity is
@@ -1575,7 +1575,7 @@ async fn handle_push(
         let changeset = ChangeSet::try_from(wire)
             .map_err(|e| contextdb_core::Error::SyncError((e.to_string()).into()))?;
         return spawn_apply_and_reply(PushApplyWork {
-            read_memory: (read_memory.clone()).into(),
+            read_memory: (read_memory.clone()),
 
             db: state.db.clone(),
             local_node_id: state.local_node_id.clone(),
@@ -1834,7 +1834,7 @@ async fn handle_push(
                 tracing::warn!(%authenticated_peer, error = %err, "failed to record non-schema node last-contact");
             }
             spawn_apply_and_reply(PushApplyWork {
-                read_memory: (read_memory.clone()).into(),
+                read_memory: (read_memory.clone()),
 
                 db: state.db.clone(),
                 local_node_id: state.local_node_id.clone(),
@@ -3511,14 +3511,14 @@ fn legacy_delivery_reply(
         request.since.as_deref(),
         read_memory.clone(),
     )
-    .map_err(|e| TransportError::Other((e.to_string()).into()))?;
+    .map_err(|e| TransportError::Other((e.to_string())))?;
     let response = FetchDeliveryOutcomesResponse {
         format: 1,
         request_nonce: request.request_nonce,
         hub_node_id: hub,
         hub_incarnation: db
             .existing_sync_incarnation(tenant, read_memory.clone())
-            .map_err(|e| TransportError::Other((e.to_string()).into()))?
+            .map_err(|e| TransportError::Other((e.to_string())))?
             .ok_or_else(|| TransportError::Other("hub authority is not initialized".into()))?,
         tenant_id: tenant.as_str().into(),
         edge_node_id: edge,
@@ -3531,7 +3531,7 @@ fn legacy_delivery_reply(
         error: None,
     };
     encode_named(MessageType::FetchDeliveryOutcomesResponse, &response)
-        .map_err(|e| TransportError::Other((e.to_string()).into()))
+        .map_err(|e| TransportError::Other((e.to_string())))
 }
 
 /// Explicit-owner Legacy arm of the native delivery route. The installation's

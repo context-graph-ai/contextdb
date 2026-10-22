@@ -10641,7 +10641,7 @@ impl StagedCopyCharge {
 
 impl contextdb_vector::PrepaidVectorCopyCharge for StagedCopyCharge {
     fn accountant(&self) -> contextdb_vector::MemoryBudgetOwner {
-        contextdb_vector::MemoryBudgetOwner::clone(&self.vector_accountant).into()
+        contextdb_vector::MemoryBudgetOwner::clone(&self.vector_accountant)
     }
 
     fn retained_bytes(&self) -> usize {
@@ -21784,7 +21784,7 @@ impl DurableRawVectorSource {
         if let Self::Writable(persistence) = self
             && let Some(original) = persistence.proof_accountant_handle_for(accountant)
         {
-            return original.vector_budget().map(Into::into);
+            return original.vector_budget();
         }
         accountant.vector_budget_for_original_reader().map(Into::into)
     }
@@ -22180,7 +22180,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
             entries,
             resident_bytes,
             workspace_owner,
-            accountant: accountant.into(),
+            accountant: accountant,
         })
     }
 
@@ -22369,7 +22369,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
             entries,
             resident_bytes,
             workspace_owner,
-            accountant: accountant.into(),
+            accountant: accountant,
         })
     }
 
@@ -23986,13 +23986,13 @@ impl DurableVectorGenerationLoader {
         Ok(LoadedVectorGraphGeneration {
             graph,
             resident_bytes,
-            accountant: (vector_accountant.clone()).into(),
+            accountant: (vector_accountant.clone()),
             caller_adopted_bytes: 0,
             fresh_tail: fresh_tail.map(|(graph, resident_bytes, replayed_through_lsn)| {
                 LoadedVectorFreshTail {
                     graph,
                     resident_bytes,
-                    accountant: (vector_accountant.clone()).into(),
+                    accountant: (vector_accountant.clone()),
                     replayed_through_lsn,
                 }
             }),
@@ -24139,7 +24139,7 @@ fn paged_generation_graph_from(
     captured.authenticate()?;
     let read = &captured.read;
     let meta = crate::persistence::vector_paged::import_tail::resolve_native_change_backing(
-        &read, &original,
+        read, &original,
     )?;
     let progress = meta.progress()?;
     if progress.generation_id != descriptor.generation_id
@@ -24636,14 +24636,14 @@ impl DurableVectorGenerationLoader {
                     LoadedVectorFreshTail {
                         graph,
                         resident_bytes,
-                        accountant: (retained_accountant.clone()).into(),
+                        accountant: (retained_accountant.clone()),
                         replayed_through_lsn,
                     }
                 });
                 Ok(LoadedVectorGraphGeneration {
                     graph,
                     resident_bytes,
-                    accountant: (retained_accountant.clone()).into(),
+                    accountant: (retained_accountant.clone()),
                     caller_adopted_bytes: if caller_charged { retained } else { 0 },
                     fresh_tail,
                 })
@@ -26228,7 +26228,7 @@ impl MaintenanceContext {
         // image, exactly as it does on the local and received doors.
         let publication_watch = std::cell::RefCell::new(None::<PublicationInterruptionWatch>);
         let maintenance_read_memory: contextdb_core::read_memory::ReadMemoryOwner =
-            self.finalization.accountant.read_budget()?.into();
+            self.finalization.accountant.read_budget()?;
         let result = self.tx_mgr.commit_with_reserved_lsn_callback_mut(
             tx,
             maintenance_read_memory.clone(),
@@ -26426,7 +26426,7 @@ impl MaintenanceContext {
         // image, exactly as it does on the local and received doors.
         let publication_watch = std::cell::RefCell::new(None::<PublicationInterruptionWatch>);
         let maintenance_read_memory: contextdb_core::read_memory::ReadMemoryOwner =
-            self.finalization.accountant.read_budget()?.into();
+            self.finalization.accountant.read_budget()?;
         let result = host.commit_reserved_terminal(
             tx,
             maintenance_read_memory.clone(),
@@ -33533,7 +33533,7 @@ impl Database {
         let _decode_scope = decode_memory.enter();
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         let vector_accountant: contextdb_vector::MemoryBudgetOwner =
-            accountant.vector_budget()?.into();
+            accountant.vector_budget()?;
         let crate::persistence::ReadPersistenceImageParts {
             open_context,
             content_identity: _,
@@ -34888,13 +34888,12 @@ impl Database {
             Some((token, stage)) => (Some(token), Some(stage)),
             None => (None, None),
         };
-        if existing.is_none() {
-            if !self.tx_mgr.with_read(tx, |read| read.is_empty())? {
+        if existing.is_none()
+            && !self.tx_mgr.with_read(tx, |read| read.is_empty())? {
                 return Err(Error::Other((
                     "mixed DML and transactional local schema DDL is not supported; commit or roll back before changing schema"
                         .to_string()).into()));
             }
-        }
         let token = match token {
             Some(token) => token,
             None => {
@@ -44582,7 +44581,7 @@ impl Database {
         if working.graph_store.is_source_backed() {
             let source = crate::persistence::received_working_source::WorkingReadSource::current_for(working.tx_mgr.identity())?
                 .ok_or_else(|| Error::Other("received graph restamp is outside its working loan".into()))?;
-            if captures_graph { source.restamp_private_graph_occurrences(local_tx, |origin| graph_position(origin))?; }
+            if captures_graph { source.restamp_private_graph_occurrences(local_tx, &graph_position)?; }
             else {
                 source.rewrite_private_graph(|entry| {
                     let before = (entry.created_tx, entry.deleted_tx, entry.lsn);
@@ -44700,7 +44699,7 @@ impl Database {
             let quantization = working.vector_store.with_index_layout(&entry.index,|layout| layout.quantization)?;
             let mut scratch = image.owner.scratch();
             scratch.reserve(entry.vector.len().saturating_mul(8).saturating_add(512))?;
-            entry.vector = contextdb_vector::stored_vector_value(&entry.vector,quantization).into();
+            entry.vector = contextdb_vector::stored_vector_value(&entry.vector,quantization);
         }
         let deleted_row_ids = finalized
             .relational_deletes
@@ -46636,12 +46635,11 @@ impl Database {
                     if let Some(position) = accepted_positions.get(&(index.table.clone(),*row_id)) { *lsn = *position; }
                 }
                 ChangeLogEntry::EdgeDelete { source,target,edge_type,lsn } => {
-                    if let Some((coordinates,overlay)) = coordinates.zip(connected_overlay.as_ref()) {
-                        if let Some(edge) = overlay.projected.edges.iter().rev().find(|edge|
+                    if let Some((coordinates,overlay)) = coordinates.zip(connected_overlay.as_ref())
+                        && let Some(edge) = overlay.projected.edges.iter().rev().find(|edge|
                             edge.source == *source && edge.target == *target && edge.edge_type == *edge_type) {
                             *lsn = coordinates.local(edge.lsn)?;
                         }
-                    }
                 }
                 _ => {}
             }
@@ -46932,15 +46930,14 @@ impl Database {
                     working.tx_mgr.identity(),working.id,root,snapshot,lsn,|_|prepare_attempt())?
             }else{prepare_attempt()?};
             if let Some(mut stage)=prepared {
-                if let Some(loan) = working_preparation {
-                    if stage.durable_projection.graph_selection.is_some() {
+                if let Some(loan) = working_preparation
+                    && stage.durable_projection.graph_selection.is_some() {
                         // with_source has returned successfully and its loan
                         // has ended. Retain the same frozen graph under the
                         // authentic write/Original for terminal persistence.
                         stage.durable_projection.graph_selection =
                             Some(loan.write.freeze_graph_selection(loan.original)?);
                     }
-                }
                 return Ok(stage);
             }
             // The synchronous source loan ends before either retry or
@@ -49548,18 +49545,16 @@ impl Database {
                 &HashSet::new(),
                 None,
                 read_memory.clone(),
-            )? {
-                if let Some(found) = self.committed_indexed_point_row_at(
+            )?
+                && let Some(found) = self.committed_indexed_point_row_at(
                     &row.table,
                     row_id,
                     snapshot,
                     read_memory.clone(),
-                )? {
-                    if found.lsn == row.lsn {
+                )?
+                    && found.lsn == row.lsn {
                         return Ok(Some(found));
                     }
-                }
-            }
         }
         let mut changes = self
             .change_replay_since_unlocked(Lsn(row.lsn.0.saturating_sub(1)), read_memory.clone())?;
@@ -49579,11 +49574,10 @@ impl Database {
                     read_memory.clone(),
                     &unbounded_checkpoint,
                     None,
-                )? {
-                    if row.natural_key.matches_values(&found.values) {
+                )?
+                    && row.natural_key.matches_values(&found.values) {
                         return Ok(Some(found));
                     }
-                }
             }
         }
         if self.table_meta(&row.table).is_some() {
@@ -59671,11 +59665,10 @@ impl Database {
         {
             return Ok(None);
         }
-        if let Some(tx) = self.private_graph_read_tx(snapshot)? {
-            if let Some(properties) = self.private_graph_properties(tx, source, edge_type, target, read_memory.clone())? {
+        if let Some(tx) = self.private_graph_read_tx(snapshot)?
+            && let Some(properties) = self.private_graph_properties(tx, source, edge_type, target, read_memory.clone())? {
                 return Ok(properties);
             }
-        }
         self.edge_properties_unchecked_with_read_memory(
             source,
             target,
@@ -67532,7 +67525,7 @@ impl Database {
             _registration: registration,
             _slot: slot,
             _root: root,
-            _read_memory: (read_memory).into(),
+            _read_memory: (read_memory),
         })
     }
 
@@ -69196,14 +69189,13 @@ impl Database {
                         .map_err(E::from);
                 }
             }
-            if let Some(image) = capture.rows(table) {
-                if let Some(row) = image.row(row_id) {
+            if let Some(image) = capture.rows(table)
+                && let Some(row) = image.row(row_id) {
                     before_clone(crate::read_image_memory::RowReadAdmission::Copy(
                         row.estimated_bytes(),
                     ))?;
                     return Ok(Some(row.clone()));
                 }
-            }
             if capture
                 .decisions
                 .relational_deletes
@@ -76909,8 +76901,7 @@ impl Database {
     pub(crate) fn engine_sync_read_memory(
         &self,
     ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
-        self.finalization.accountant.read_budget().map(Into::into)
-    }
+        self.finalization.accountant.read_budget()}
 
     /// Measurement only: this store's writer accountant, whose high-water mark
     /// shows the peak of engine sync work such as serving a pull page.
@@ -91693,7 +91684,7 @@ impl Database {
             let private_preparation_owner=if private_replay.is_some() {
                 match crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
                     Some(source)=>source.with_original(|original|
-                        crate::memory_accounting::persistence_original_projection(original)?.read_budget())?.into(),
+                        crate::memory_accounting::persistence_original_projection(original)?.read_budget())?,
                     None=>read_memory.clone(),
                 }
             }else{read_memory.clone()};

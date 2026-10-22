@@ -73,11 +73,10 @@ impl GraphDecisionContext {
         )?;
         let mut rows = HashMap::new();
         for (table, _) in &ws.relational_inserts {
-            if !rows.contains_key(table) {
-                if let Some(image) = ws.ordered_staged_rows.statement_rows(table) {
+            if !rows.contains_key(table)
+                && let Some(image) = ws.ordered_staged_rows.statement_rows(table) {
                     rows.insert(table.clone(), image);
                 }
-            }
         }
         Ok((rows, credit))
     }
@@ -248,7 +247,7 @@ impl Database {
             legacy_rows,
             catalog,
             root: root.clone(),
-            reader: (memory.clone()).into(),
+            reader: (memory.clone()),
             _memory: credit,
             _rows_memory: rows_memory,
         })))
