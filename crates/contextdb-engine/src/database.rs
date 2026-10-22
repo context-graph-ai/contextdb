@@ -83282,6 +83282,7 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         consolidation_only: bool,
+        committed: &std::cell::Cell<bool>,
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -83380,13 +83381,12 @@ impl Database {
                 published_policy = self.vector_store.publish_policy_layout_update(prepared);
             }
         };
-        let committed = std::cell::Cell::new(false);
         let result = if let Some(persistence) = &self.persistence {
             // The durable occurrence is an admitted temporary encoding input,
             // not a resident history entry. Persistence keeps the occurrence
             // and its summary/configuration in the same durable transaction.
             let durable_ddl = [self.alter_table_ddl_for_meta(name, meta, Vec::new())];
-            publish_direct_metadata_after_commit(&self.tx_mgr, &committed, || {
+            publish_direct_metadata_after_commit(&self.tx_mgr, committed, || {
                 persistence.publish_vector_policy_metadata_and_ddl(
                     name,
                     meta,
@@ -83405,6 +83405,7 @@ impl Database {
             })
         } else {
             publish();
+            committed.set(true);
             Ok(())
         };
         result?;

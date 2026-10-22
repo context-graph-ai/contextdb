@@ -6347,6 +6347,7 @@ fn execute_alter_table_plan(
             metadata_only_projection = Some((old_meta, table_meta));
         }
     }
+    let mut post_commit_error = None;
     if let Some((old_meta, projected_meta)) = metadata_only_projection {
         // ALTER must retain every bound clause.
         crate::custody::policy::check_binding(db, &p.table, &projected_meta, read_memory.clone())?;
@@ -6392,7 +6393,8 @@ fn execute_alter_table_plan(
                 let index = vector_layout_update
                     .as_ref()
                     .expect("vector policy has an index");
-                return db.publish_local_vector_policy_metadata(
+                let committed = std::cell::Cell::new(false);
+                let result = db.publish_local_vector_policy_metadata(
                     &p.table,
                     &old_meta,
                     &projected_meta,
@@ -6401,7 +6403,16 @@ fn execute_alter_table_plan(
                     vector_copy_owner,
                     read_memory.clone(),
                     consolidation_only,
+                    &committed,
                 );
+                if committed.get() {
+                    // The durable declaration already exists. Let the same
+                    // DDL owner finish its LSN and captured-root publication
+                    // before returning the original postcommit diagnostic.
+                    post_commit_error = result.err();
+                    return Ok(());
+                }
+                return result;
             }
             let projected_rows = db.local_table_projection_rows(&p.table, &projected_meta)?;
             let ddl = vec![db.alter_table_ddl_for_meta(&p.table, &projected_meta, Vec::new())];
@@ -6452,6 +6463,9 @@ fn execute_alter_table_plan(
     }
     db.clear_statement_cache();
     db.reconcile_maintenance_thread();
+    if let Some(error) = post_commit_error {
+        return Err(error);
+    }
     Ok(OwnedQueryResult::empty_with_affected(0))
 }
 

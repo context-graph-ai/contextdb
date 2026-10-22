@@ -519,6 +519,11 @@ fn consolidation_failure_before_and_after_durability_keeps_one_authoritative_dec
         assert_eq!(graphs(&db), serving);
         assert_eq!(visible(&db), rows);
         assert_eq!(authored_rows(&db), authored);
+        if cut == 11 {
+            run(&db, "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION NONE");
+            assert_eq!(db.ddl_log_since(Lsn(0)).unwrap().len(), count + 2,
+                "a committed operation that returned an error must not reuse its durable DDL LSN");
+        }
         let authoritative = canonical(&db.table_meta("breadth_rows").unwrap());
         let history = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
         drop(root);
