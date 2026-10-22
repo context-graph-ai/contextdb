@@ -50,7 +50,7 @@ OVERSIZED = ('a_received_schema_transaction_never_publishes_a_prefix::'
 
 
 SYNC_ROUTING_FINGERPRINTS = {'crates/contextdb-engine/tests/sync_schema_transactions.rs': '2de1becdc822e29dc11ef5a28f15420c1a0ae8eab7984fbd2729553666d88052',
- 'crates/contextdb-engine/tests/sync/a_received_schema_transaction_never_publishes_a_prefix.rs': '703ad13191db6a817e27eff79bec2512e186434c6be013b52c57333ed5e360bd',
+ 'crates/contextdb-engine/tests/sync/a_received_schema_transaction_never_publishes_a_prefix.rs': '62f1416a889af8b44dac3ee5dc1ccd6191ef9ff642cc4d6cdf0b1d0fcc7c6377',
  'crates/contextdb-engine/tests/sync/schema_migration_chunked_transport.rs': 'a6570b71b1b899e1e8729eeefe08fa8ff0c89652c789785a55467a8b8fae2bac'}
 
 
