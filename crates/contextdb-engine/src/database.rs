@@ -11915,6 +11915,10 @@ pub(crate) struct VectorMemoryOwnershipReceipt {
     pub reader_last_query_trace: usize,
     /// Actual admitted controls of live declared-reader children.
     pub reader_child_controls: usize,
+    /// Original declared-reader root block, measured from its retained invoice.
+    pub reader_root_control: usize,
+    /// Disjoint live child payload debits; source/trace figures are subsets.
+    pub reader_child_payloads: usize,
     pub reader_acl_cache: usize,
     /// Actual reader parent total at the quiescent report boundary.
     pub reader_parent_total: usize,
@@ -11952,6 +11956,10 @@ pub struct VectorMemoryOwnershipReceiptForTest {
     pub reader_last_query_trace: usize,
     /// Actual admitted controls of live declared-reader children.
     pub reader_child_controls: usize,
+    /// Original declared-reader root block, measured from its retained invoice.
+    pub reader_root_control: usize,
+    /// Disjoint live child payload debits; source/trace figures are subsets.
+    pub reader_child_payloads: usize,
     pub reader_acl_cache: usize,
     /// Actual reader parent total at the quiescent report boundary.
     pub reader_parent_total: usize,
@@ -74463,6 +74471,8 @@ impl Database {
             reader_source_metadata,
             reader_last_query_trace,
             reader_child_controls: reader_child_controls as usize,
+            reader_root_control: self.declared_read_memory.root_control_bytes(),
+            reader_child_payloads: self.declared_read_memory.child_payload_bytes() as usize,
             reader_acl_cache: self.declared_read_memory.acl_cache_bytes() as usize,
             reader_parent_total: reader_parent_total as usize,
             raw_vector_bodies: sampled.raw_vector_bodies,
@@ -74495,6 +74505,8 @@ impl Database {
             reader_source_metadata: receipt.reader_source_metadata,
             reader_last_query_trace: receipt.reader_last_query_trace,
             reader_child_controls: receipt.reader_child_controls,
+            reader_root_control: receipt.reader_root_control,
+            reader_child_payloads: receipt.reader_child_payloads,
             reader_acl_cache: receipt.reader_acl_cache,
             reader_parent_total: receipt.reader_parent_total,
             raw_vector_bodies: receipt.raw_vector_bodies,

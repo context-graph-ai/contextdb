@@ -66,6 +66,8 @@ impl Database {
                 "reader_source_metadata": receipt.vector.reader_source_metadata,
                 "reader_last_query_trace": receipt.vector.reader_last_query_trace,
                 "reader_child_controls": receipt.vector.reader_child_controls,
+                "reader_root_control": receipt.vector.reader_root_control,
+                "reader_child_payloads": receipt.vector.reader_child_payloads,
                 "reader_acl_cache": receipt.vector.reader_acl_cache,
                 "reader_parent_total": receipt.vector.reader_parent_total,
                 "base_graph": receipt.vector.base_graph,

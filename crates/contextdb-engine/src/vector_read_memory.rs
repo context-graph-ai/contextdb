@@ -275,6 +275,7 @@ pub struct DeclaredReadMemory {
     file_child_high_water: std::sync::atomic::AtomicU64,
     retained: std::sync::atomic::AtomicU64,
     live_child_control_bytes: std::sync::atomic::AtomicU64,
+    live_child_payload_bytes: std::sync::atomic::AtomicU64,
     live_acl_cache_bytes: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "test-seams"))]
     observation: Option<root_observations::Token>,
@@ -322,6 +323,7 @@ impl DeclaredReadMemory {
             file_child_high_water: std::sync::atomic::AtomicU64::new(0),
             retained: std::sync::atomic::AtomicU64::new(0),
             live_child_control_bytes: std::sync::atomic::AtomicU64::new(0),
+            live_child_payload_bytes: std::sync::atomic::AtomicU64::new(0),
             live_acl_cache_bytes: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "test-seams"))]
             observation: None,
@@ -374,6 +376,16 @@ impl DeclaredReadMemory {
     /// Total admitted live reader storage, including this original root block.
     pub(crate) fn charged_bytes(&self) -> u64 {
         self.retained.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The actual original root allocation remains charged until physical free.
+    pub(crate) fn root_control_bytes(&self) -> usize {
+        self.terminal_bytes
+    }
+
+    /// Successful live child payload debits, excluding their native controls.
+    pub(crate) fn child_payload_bytes(&self) -> u64 {
+        self.live_child_payload_bytes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn acl_cache_bytes(&self) -> u64 {
@@ -570,6 +582,7 @@ impl Drop for DeclaredReadMemory {
         #[cfg(any(test, feature = "test-seams"))]
         if let Some(token) = self.observation { root_observations::payload_dropped(token, self); }
         debug_assert_eq!(self.live_child_control_bytes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        debug_assert_eq!(self.live_child_payload_bytes.load(std::sync::atomic::Ordering::SeqCst), 0);
         debug_assert_eq!(self.live_acl_cache_bytes.load(std::sync::atomic::Ordering::SeqCst), 0);
         debug_assert_eq!(self.retained.load(std::sync::atomic::Ordering::SeqCst),
             self.terminal_bytes as u64);
@@ -691,6 +704,10 @@ impl ReadMemoryBudget for NativeDeclaredChild {
             _capture.refused();
             return Err(error);
         }
+        // Both real owner admissions succeeded. Observe that exact debit;
+        // a refusal rolls back above and never enters this component.
+        self.parent.live_child_payload_bytes.fetch_add(
+            bytes as u64, std::sync::atomic::Ordering::SeqCst);
         let held = previous + bytes as u64;
         self.parent
             .file_child_high_water
@@ -741,6 +758,10 @@ impl ReadMemoryBudget for NativeDeclaredChild {
             _capture.refused();
             return Err(error);
         }
+        // Both real owner admissions succeeded. Observe that exact debit;
+        // a refusal rolls back above and never enters this component.
+        self.parent.live_child_payload_bytes.fetch_add(
+            bytes as u64, std::sync::atomic::Ordering::SeqCst);
         let held = previous + bytes as u64;
         self.parent
             .file_child_high_water
@@ -767,6 +788,9 @@ impl ReadMemoryBudget for NativeDeclaredChild {
             false, native_child_identity(&self.parent, &self.retained, self as *const Self as usize), bytes);
         let before = self.retained
             .fetch_sub(bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        let payload_before = self.parent.live_child_payload_bytes.fetch_sub(
+            bytes as u64, std::sync::atomic::Ordering::SeqCst);
+        assert!(payload_before >= bytes as u64, "reader payload observation underflow");
         #[cfg(any(test, feature = "test-seams"))]
         self.note_reader_budget_event("", "release", bytes, before - bytes as u64);
         #[cfg(any(test, feature = "test-seams"))]
