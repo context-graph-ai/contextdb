@@ -6424,4 +6424,36 @@ mod admitted_navigation_body_tests {
         session.release_navigation_before_body();
         assert_eq!(payer.used.load(Ordering::SeqCst), 0);
     }
+    #[test]
+    fn mandatory_navigation_admission_evicts_optional_base_bodies_at_the_same_limit() {
+        let payer = budget();
+        let id = PointId(0, 0);
+        let session = NavigationSession::new(Some(MemoryBudgetOwner::from(payer.clone())));
+        session.lock().remember_point(0, id, &point(id, 5.0));
+        let retained = payer.used.load(Ordering::SeqCst);
+        assert!(session.lock().point(0, id).unwrap().values.is_some());
+        payer.limit.store(retained, Ordering::SeqCst);
+        let mut mandatory = crate::memory_budget::VectorCopyAdmission::new(payer.clone());
+        session
+            .reserve_for(
+                &mut mandatory,
+                128 * std::mem::size_of::<f32>(),
+                "vector_index",
+                "mandatory_source_window",
+                "same original finite limit",
+            )
+            .unwrap();
+        assert!(
+            session.lock().point(0, id).is_none(),
+            "the original finite admission must evict the optional entry before succeeding"
+        );
+        assert_eq!(payer.limit.load(Ordering::SeqCst), retained);
+        assert_eq!(
+            payer.used.load(Ordering::SeqCst),
+            128 * std::mem::size_of::<f32>()
+        );
+        drop(mandatory);
+        drop(session);
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+    }
 }
