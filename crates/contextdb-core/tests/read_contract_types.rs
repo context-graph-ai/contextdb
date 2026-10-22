@@ -1536,33 +1536,75 @@ fn core_error_carries_read_failure_without_losing_its_structured_kind() {
 
 #[test]
 fn cursor_page_validation_requires_only_column_row_coherence() {
-    let empty = CursorPage {
-        columns: vec!["id".to_owned()],
-        rows: vec![],
-        has_more: false,
-    };
+    use contextdb_core::read_contract::CursorPageStorage;
+    use contextdb_core::read_memory::{ReadCredit, ReadMemoryOwner};
+
+    #[derive(Debug)]
+    struct Page {
+        columns: Vec<String>,
+        rows: Vec<Vec<contextdb_core::Value>>,
+        has_more: bool,
+        _payload: ReadCredit,
+    }
+    impl CursorPageStorage for Page {
+        fn columns(&self) -> &[String] { &self.columns }
+        fn rows(&self) -> &[Vec<contextdb_core::Value>] { &self.rows }
+        fn has_more(&self) -> bool { self.has_more }
+    }
+    // Use the production publication route available with default features.
+    // Every carrier and retained payload keeps this store's original reader.
+    fn page(
+        owner: ReadMemoryOwner,
+        columns: Vec<String>,
+        rows: Vec<Vec<contextdb_core::Value>>,
+        has_more: bool,
+    ) -> CursorPage {
+        let payload_bytes = columns.capacity() * std::mem::size_of::<String>()
+            + columns.iter().map(String::capacity).sum::<usize>()
+            + rows.capacity() * std::mem::size_of::<Vec<contextdb_core::Value>>()
+            + rows.iter().map(|row| {
+                row.capacity() * std::mem::size_of::<contextdb_core::Value>()
+                    + row.iter().map(|value| match value {
+                        contextdb_core::Value::Text(text) => text.capacity(),
+                        _ => 0,
+                    }).sum::<usize>()
+            }).sum::<usize>();
+        let payload = ReadCredit::try_new_owned(
+            owner.clone(), payload_bytes, "reader", "cursor_page_fixture",
+            "Release the retained test page.",
+        ).expect("admit the actual retained fixture buffers");
+        CursorPage::try_prepare::<Page>(owner)
+            .expect("admit the exact immutable carrier layout")
+            .publish(Page { columns, rows, has_more, _payload: payload })
+    }
+    let db = contextdb_engine::Database::open_memory();
+    let owner = db.declared_reader_memory().expect("use the store's declared reader");
+    let empty = page(owner.clone(), vec!["id".to_owned()], vec![], false);
     assert_eq!(empty.validate(), Ok(()));
 
-    let populated = CursorPage {
-        columns: vec!["id".to_owned(), "payload".to_owned()],
-        rows: vec![
+    let populated = page(
+        owner.clone(),
+        vec!["id".to_owned(), "payload".to_owned()],
+        vec![
             vec![
                 contextdb_core::Value::Int64(1),
                 contextdb_core::Value::Text("first".to_owned()),
             ],
             vec![contextdb_core::Value::Int64(2), contextdb_core::Value::Null],
         ],
-        has_more: true,
-    };
+        true,
+    );
     assert_eq!(populated.validate(), Ok(()));
 
-    let wrong_arity = CursorPage {
-        rows: vec![
-            populated.rows[0].clone(),
+    let wrong_arity = page(
+        owner,
+        populated.columns().to_vec(),
+        vec![
+            populated.rows()[0].clone(),
             vec![contextdb_core::Value::Int64(2)],
         ],
-        ..populated.clone()
-    };
+        populated.has_more(),
+    );
     assert_eq!(
         wrong_arity.validate(),
         Err(ReadContractViolation::CursorRowArityMismatch {
