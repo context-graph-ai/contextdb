@@ -17,7 +17,7 @@ impl WriteSetApplicator for TestStore {
     fn apply(
         &self,
         ws: &WriteSet,
-        _read_memory: std::sync::Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+        _read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> contextdb_core::Result<()> {
         if ws.relational_deletes.is_empty() || ws.relational_inserts.is_empty() {
             self.relational.apply_deletes_ref(&ws.relational_deletes);

@@ -1662,7 +1662,7 @@ impl QueryAnswerCharge {
         match self {
             Self::None => 0,
             Self::Reader(credit) => credit.bytes(),
-            Self::Image(charge) => charge.previous.held() + charge.image.value.held(),
+            Self::Image(charge) => charge._previous.held() + charge.image.value.held(),
             Self::Receiver(image) => image.held(),
         }
     }
