@@ -727,6 +727,46 @@ impl<'check, 'storage, E: From<Error>> RowCheckLedger<'check, 'storage, E> {
     }
 }
 
+// These are the union's actual mandatory row-filter doors. Keep reclamation
+// immediately beside the source operation so the source's existing admission,
+// visibility, cancellation, and copied value stay on the original funder.
+fn streamed_tail_row_with_navigation(
+    tail: &dyn crate::store::CapturedVectorStreamedTail,
+    row: RowId,
+    snapshot: SnapshotId,
+    navigation: &crate::hnsw::union::NavigationSession,
+    owner: &mut crate::VectorCopyAdmission,
+    before_read: &mut dyn FnMut() -> bool,
+) -> Result<bool> {
+    navigation.release_navigation_before_body();
+    tail.includes_row(row, snapshot, owner, before_read)
+}
+
+fn journal_row_with_navigation(
+    state: &crate::store::VectorQueryState,
+    row: RowId,
+    snapshot: SnapshotId,
+    covered_tx: TxId,
+    navigation: &crate::hnsw::union::NavigationSession,
+    owner: &mut crate::VectorCopyAdmission,
+) -> Result<Option<Lsn>> {
+    state
+        .bounded_visible_directory_entry_by_row_with_copy_admission::<Error>(
+            row,
+            snapshot,
+            &mut || Ok(()),
+            owner,
+            Some(&mut |token, bytes, component, operation, hint| {
+                navigation.reserve_for(token, bytes, component, operation, hint)
+            }),
+        )
+        .map(|entry| {
+            entry
+                .filter(|entry| entry.membership.visible_from <= covered_tx)
+                .map(|entry| entry.lsn)
+        })
+}
+
 // The row predicate owns its retained verdict charge. Probe that same funder
 // before asking it to allocate, so optional navigation can yield without
 // changing the predicate's existing charge or work callbacks.
@@ -6569,10 +6609,11 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                         // This membership door has no admission callback.
                                         // Retire optional navigation before its mandatory
                                         // source window, using the same original funder.
-                                        navigation_session.release_navigation_before_body();
-                                        match tail.includes_row(
+                                        match streamed_tail_row_with_navigation(
+                                            &**tail,
                                             row_id,
                                             snapshot,
+                                            &navigation_session,
                                             &mut admitted_owner.borrow_mut(),
                                             &mut || match (*source_checkpoints.borrow_mut())() {
                                                 Ok(()) => true,
@@ -6600,21 +6641,15 @@ impl<S: WriteSetApplicator> MemVectorExecutor<S> {
                                         return visible.is_some();
                                     }
                                     if let Some(covered_tx) = source.journal_suffix_frontier() {
-                                        match source.state.bounded_visible_directory_entry_by_row_with_copy_admission::<Error>(
+                                        match journal_row_with_navigation(
+                                            &source.state,
                                             row_id,
                                             snapshot,
-                                            &mut || Ok(()),
+                                            covered_tx,
+                                            &navigation_session,
                                             &mut admitted_owner.borrow_mut(),
-                                            Some(&mut |token, bytes, component, operation, hint| {
-                                                navigation_session.reserve_for(token, bytes, component, operation, hint)
-                                            }),
                                         ) {
-                                            Ok(entry) => {
-                                                let visible = entry
-                                                    .filter(|entry| {
-                                                        entry.membership.visible_from <= covered_tx
-                                                    })
-                                                    .map(|entry| entry.lsn);
+                                            Ok(visible) => {
                                                 last_visible.set(Some((position, row_id, visible)));
                                                 return visible.is_some();
                                             }
@@ -10021,7 +10056,12 @@ mod indexed_row_check_empty_merge_tests {
         let owner = crate::VectorCopyAdmission::new(payer.clone());
         let retained = Cell::new(0usize);
         let mut admit = |bytes| {
-            payer.try_allocate_for(bytes, "vector_index", "row_check_retained", "same original finite predicate funder")?;
+            payer.try_allocate_for(
+                bytes,
+                "vector_index",
+                "row_check_retained",
+                "same original finite predicate funder",
+            )?;
             retained.set(retained.get() + bytes);
             Ok::<_, Error>(())
         };
@@ -10080,5 +10120,284 @@ mod indexed_row_check_empty_merge_tests {
         assert_eq!(retained.get(), 0);
         drop(owner);
         assert_eq!(payer.used.load(SeqCst), 0);
+    }
+
+    struct PressureTail {
+        bytes: usize,
+        copies: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::store::CapturedVectorStreamedTail for PressureTail {
+        fn validate(&self) -> Result<()> {
+            Ok(())
+        }
+        fn includes(
+            &self,
+            _: &crate::store::RawVectorDirectoryEntry,
+            _: &crate::store::RawVectorDirectoryEntry,
+            _: SnapshotId,
+            _: &mut crate::VectorCopyAdmission,
+            _: &mut dyn FnMut() -> bool,
+        ) -> Result<bool> {
+            unreachable!()
+        }
+        fn includes_row(
+            &self,
+            row: RowId,
+            _: SnapshotId,
+            owner: &mut crate::VectorCopyAdmission,
+            before_read: &mut dyn FnMut() -> bool,
+        ) -> Result<bool> {
+            if !before_read() {
+                return Err(Error::ReadCancelled);
+            }
+            let mut window = owner.scratch();
+            window.reserve_for(
+                self.bytes,
+                "working_vector",
+                "streamed_tail_membership",
+                "same original source window",
+            )?;
+            let decoded = vec![0u8; self.bytes];
+            self.copies
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(decoded);
+            drop(window);
+            Ok(row == RowId(1))
+        }
+    }
+    #[test]
+    fn actual_streamed_tail_caller_releases_full_base_cache_before_opaque_source_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let payer = Arc::new(NavigationPressureBudget {
+            used: AtomicUsize::new(0),
+            limit: AtomicUsize::new(1024 * 1024),
+        });
+        let mut owner = crate::VectorCopyAdmission::new(payer.clone());
+        let navigation = full_navigation(payer.clone());
+        let fixed_limit = payer.used.load(SeqCst);
+        payer.limit.store(fixed_limit, SeqCst);
+        let tail = PressureTail {
+            bytes: 512,
+            copies: AtomicUsize::new(0),
+        };
+        assert!(
+            streamed_tail_row_with_navigation(
+                &tail,
+                RowId(1),
+                SnapshotId::from_tx(TxId(1)),
+                &navigation,
+                &mut owner,
+                &mut || true
+            )
+            .unwrap()
+        );
+        assert!(!navigation.has_base_body_for_test());
+        assert_eq!(tail.copies.load(SeqCst), 1);
+        assert_eq!(payer.used.load(SeqCst), 0);
+        assert_eq!(payer.limit.load(SeqCst), fixed_limit);
+        let huge = PressureTail {
+            bytes: fixed_limit + 1,
+            copies: AtomicUsize::new(0),
+        };
+        let refused = streamed_tail_row_with_navigation(
+            &huge,
+            RowId(1),
+            SnapshotId::from_tx(TxId(1)),
+            &navigation,
+            &mut owner,
+            &mut || true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refused, Error::MemoryBudgetExceeded { operation, budget_limit_bytes, .. }
+            if operation == "streamed_tail_membership" && budget_limit_bytes == fixed_limit)
+        );
+        assert_eq!(huge.copies.load(SeqCst), 0);
+        assert!(matches!(
+            streamed_tail_row_with_navigation(
+                &tail,
+                RowId(1),
+                SnapshotId::from_tx(TxId(1)),
+                &navigation,
+                &mut owner,
+                &mut || false
+            ),
+            Err(Error::ReadCancelled)
+        ));
+        assert_eq!(payer.used.load(SeqCst), 0);
+    }
+
+    struct PressureDirectory {
+        entry: crate::store::RawVectorDirectoryEntry,
+        bytes: std::sync::atomic::AtomicUsize,
+        copies: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::store::RawVectorMembershipSource for PressureDirectory {
+        fn capture_serving_selection(
+            &self,
+            _: SnapshotId,
+            _: Option<&crate::store::VectorGraphGeneration>,
+            _: Option<&crate::store::VectorGraphGeneration>,
+            _: &mut crate::VectorCopyAdmission,
+        ) -> Result<crate::store::CapturedVectorServingSelection> {
+            unreachable!()
+        }
+        fn published_summary(&self) -> crate::store::RawVectorMembershipSummary {
+            Default::default()
+        }
+        fn visible_count(
+            &self,
+            _: SnapshotId,
+            _: &mut dyn FnMut() -> bool,
+            _: &mut crate::VectorCopyAdmission,
+        ) -> Result<usize> {
+            unreachable!()
+        }
+        fn visible_by_row(
+            &self,
+            _: RowId,
+            _: SnapshotId,
+            _: &mut dyn FnMut() -> bool,
+            _: &mut crate::VectorCopyAdmission,
+        ) -> Result<Option<crate::store::RawVectorDirectoryEntry>> {
+            panic!("journal caller must retain its actual copy-admission callback")
+        }
+        fn visible_by_row_with_copy_admission(
+            &self,
+            row: RowId,
+            _: SnapshotId,
+            before_read: &mut dyn FnMut() -> bool,
+            owner: &mut crate::VectorCopyAdmission,
+            admit: &mut dyn FnMut(
+                &mut crate::VectorCopyAdmission,
+                usize,
+                &str,
+                &str,
+                &str,
+            ) -> Result<()>,
+        ) -> Result<Option<crate::store::RawVectorDirectoryEntry>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if !before_read() {
+                return Err(Error::ReadCancelled);
+            }
+            let bytes = self.bytes.load(SeqCst);
+            let mut window = owner.scratch();
+            admit(
+                &mut window,
+                bytes,
+                "vector_source",
+                "journal_directory_window",
+                "same original directory window",
+            )?;
+            let decoded = vec![0u8; bytes];
+            self.copies.fetch_add(1, SeqCst);
+            let entry = (row == self.entry.row_id).then(|| self.entry.clone());
+            drop(decoded);
+            drop(window);
+            Ok(entry)
+        }
+        fn contains_row_lsn(
+            &self,
+            _: RowId,
+            _: Lsn,
+            _: &mut dyn FnMut() -> bool,
+            _: &mut crate::VectorCopyAdmission,
+        ) -> Result<bool> {
+            unreachable!()
+        }
+        fn identity_by_row_lsn(
+            &self,
+            _: RowId,
+            _: Lsn,
+            _: &mut dyn FnMut() -> bool,
+            _: &mut crate::VectorCopyAdmission,
+        ) -> Result<Option<crate::store::RawVectorDirectoryEntry>> {
+            unreachable!()
+        }
+        fn open(
+            &self,
+            _: &mut dyn FnMut(crate::store::DormantVectorLoadRequest) -> bool,
+        ) -> Result<Box<dyn crate::store::RawVectorMembershipCursor>> {
+            unreachable!()
+        }
+    }
+    #[test]
+    fn actual_journal_directory_caller_reclaims_full_base_cache_before_copy_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (executor, index, snapshot, mut fixture_owner) = fixture(4);
+        let state: crate::store::VectorQueryState =
+            executor.store.try_state(&index).unwrap().into();
+        let entry = state
+            .bounded_visible_directory_entry_by_row_with_copy_admission::<Error>(
+                RowId(1),
+                snapshot,
+                &mut || Ok(()),
+                &mut fixture_owner,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let directory = Arc::new(PressureDirectory {
+            entry: entry.clone(),
+            bytes: AtomicUsize::new(512),
+            copies: AtomicUsize::new(0),
+        });
+        // Only fixture assembly replaces the source. The test below drives the
+        // real IndexState directory reader and its native callback door.
+        state.install_membership_source_for_test(directory.clone());
+        let payer = Arc::new(NavigationPressureBudget {
+            used: AtomicUsize::new(0),
+            limit: AtomicUsize::new(1024 * 1024),
+        });
+        let mut owner = crate::VectorCopyAdmission::new(payer.clone());
+        let navigation = full_navigation(payer.clone());
+        let fixed_limit = payer.used.load(SeqCst);
+        payer.limit.store(fixed_limit, SeqCst);
+        assert_eq!(
+            journal_row_with_navigation(
+                &state,
+                RowId(1),
+                snapshot,
+                entry.membership.visible_from,
+                &navigation,
+                &mut owner
+            )
+            .unwrap(),
+            Some(entry.lsn)
+        );
+        assert!(!navigation.has_base_body_for_test());
+        assert_eq!(directory.copies.load(SeqCst), 1);
+        assert_eq!(payer.used.load(SeqCst), 0);
+        // The saved frontier still decides visibility after the same source
+        // lookup; reclaiming the cache cannot admit a newer journal interval.
+        assert_eq!(
+            journal_row_with_navigation(
+                &state,
+                RowId(1),
+                snapshot,
+                TxId(0),
+                &navigation,
+                &mut owner
+            )
+            .unwrap(),
+            None
+        );
+        directory.bytes.store(fixed_limit + 1, SeqCst);
+        let refused = journal_row_with_navigation(
+            &state,
+            RowId(1),
+            snapshot,
+            entry.membership.visible_from,
+            &navigation,
+            &mut owner,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refused, Error::MemoryBudgetExceeded { operation, budget_limit_bytes, .. }
+            if operation == "journal_directory_window" && budget_limit_bytes == fixed_limit)
+        );
+        assert_eq!(directory.copies.load(SeqCst), 2);
+        assert_eq!(payer.used.load(SeqCst), 0);
+        assert_eq!(payer.limit.load(SeqCst), fixed_limit);
     }
 }
