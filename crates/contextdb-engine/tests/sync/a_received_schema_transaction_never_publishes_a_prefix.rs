@@ -114,10 +114,9 @@ fn assert_baseline_content(db: &Database, phase: &str) {
         .execute("SELECT label FROM baseline_ledger ORDER BY label", &empty())
         .unwrap_or_else(|error| {
             panic!("{phase}: the receiver's prior table must read back: {error}")
-        })
-        .rows;
+        });
     assert_eq!(
-        labels.len(),
+        labels.rows().len(),
         BASELINE_ROWS as usize,
         "{phase}: the receiver's prior content must survive whole"
     );
@@ -130,7 +129,7 @@ fn assert_baseline_content(db: &Database, phase: &str) {
             .unwrap_or_else(|error| panic!(
                 "{phase}: the receiver's prior dependent table must read back: {error}"
             ))
-            .rows
+            .rows()
             .len(),
         BASELINE_ROWS as usize
     );
@@ -781,7 +780,7 @@ fn assert_components_usable(db: &Database, seed: u128) {
             ]),
         )
         .expect("received vector/rank/index surface answers")
-        .rows,
+        .rows(),
         vec![vec![Value::Uuid(passage)]]
     );
 }
@@ -826,7 +825,7 @@ async fn assert_second_edge_readback(
         second
             .execute("SELECT label FROM baseline_ledger", &empty())
             .expect("the further peer holds the declaration")
-            .rows
+            .rows()
             .is_empty(),
         "{phase}: a table the receiver declared SYNC OFF must send no rows onward"
     );
@@ -1453,10 +1452,10 @@ fn source_boundary(author: &Database, migration: &[DdlChange], migration_lsn: Ls
 fn control_rows(db: &Database) -> Vec<i64> {
     db.execute("SELECT id FROM receiver_control ORDER BY id", &empty())
         .expect("read unrelated control rows")
-        .rows
-        .into_iter()
-        .map(|row| match row.into_iter().next() {
-            Some(Value::Int64(value)) => value,
+        .rows()
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::Int64(value)) => *value,
             other => panic!("expected one integer control value, got {other:?}"),
         })
         .collect()
