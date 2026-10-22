@@ -6644,6 +6644,7 @@ fn execute_plan_once(
             pending_sort_keys,
             vector_copy_owner,
             read_memory,
+            native_trace_refund,
         ),
     }
 }
@@ -6661,6 +6662,7 @@ fn execute_plan_with_working_state(
     pending_sort_keys: Option<&[contextdb_planner::SortKey]>,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    native_trace_refund: Option<&crate::executor::bounded::NativeTraceRefund>,
 ) -> Result<OwnedQueryResult> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -6669,7 +6671,9 @@ fn execute_plan_with_working_state(
     #[cfg(test)]
     let _layer = eager_plan_layer_frame::Layer::enter(&__frame_probe as *const u8 as usize);
     match plan {
-        PhysicalPlan::WindowRank { .. } => execute_kernel_plan(db, plan, params, tx, read_memory),
+        PhysicalPlan::WindowRank { .. } => {
+            execute_kernel_plan(db, plan, params, tx, read_memory, native_trace_refund)
+        }
         // The SQL doors read and write the canonical authority journal.
         PhysicalPlan::DeclareTenantTablePolicy(p) => crate::custody::policy::declare(
             db,
@@ -6917,9 +6921,14 @@ fn execute_plan_with_working_state(
             result.trace = crate::database::QueryTrace::scan();
             Ok(result)
         }
-        PhysicalPlan::GraphBfs { .. } => {
-            execute_kernel_plan(db, plan, params, tx, read_memory.clone())
-        }
+        PhysicalPlan::GraphBfs { .. } => execute_kernel_plan(
+            db,
+            plan,
+            params,
+            tx,
+            read_memory.clone(),
+            native_trace_refund,
+        ),
         PhysicalPlan::VectorSearch {
             table,
             column,
@@ -7044,7 +7053,10 @@ fn execute_plan_with_working_state(
                 );
                 semantic_query.sort_key = Some(sort_key.clone());
                 semantic_query.search_mode = Some(resolved_search_mode);
-                let trace_owner = bounded::TraceMemoryOwner::try_new(read_memory.clone())?;
+                let trace_owner = bounded::TraceMemoryOwner::try_new_with_native_refund(
+                    read_memory.clone(),
+                    native_trace_refund,
+                )?;
                 let search = || {
                     db.with_snapshot_override(snapshot, || {
                         db.semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
@@ -7137,7 +7149,10 @@ fn execute_plan_with_working_state(
                     cascade: None,
                 }));
             }
-            let trace_owner = bounded::TraceMemoryOwner::try_new(read_memory.clone())?;
+            let trace_owner = bounded::TraceMemoryOwner::try_new_with_native_refund(
+                read_memory.clone(),
+                native_trace_refund,
+            )?;
             let mut search = || {
                 db.query_vector_strict_in_tx_with_strategy(
                     tx,
@@ -7275,6 +7290,7 @@ fn execute_plan_with_working_state(
                 pending_sort_keys,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             )?;
             if projection_aggregates(columns) {
                 let mut running = Vec::with_capacity(columns.len());
@@ -7373,6 +7389,7 @@ fn execute_plan_with_working_state(
                 Some(keys.as_slice()),
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             )?;
 
             // Sort elision path B: the input already used an IndexScan whose
@@ -7443,6 +7460,7 @@ fn execute_plan_with_working_state(
                 pending_sort_keys,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             )?;
             input_result.rows.truncate(*count as usize);
             Ok(input_result)
@@ -7459,6 +7477,7 @@ fn execute_plan_with_working_state(
                 pending_sort_keys,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             )?;
             // A genuine evaluation error (e.g. dividing by zero, negating a
             // non-numeric value) must fail the statement, never be treated
@@ -7489,6 +7508,7 @@ fn execute_plan_with_working_state(
                 pending_sort_keys,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             )?;
             let mut seen = HashSet::<Vec<u8>>::new();
             let rows = std::mem::take(&mut input_result.result.rows)
@@ -7507,15 +7527,23 @@ fn execute_plan_with_working_state(
             left_alias,
             right_alias,
         } => {
-            let left_result =
-                execute_plan(db, left, params, tx, vector_copy_owner, read_memory.clone())?;
-            let right_result = execute_plan(
+            let left_result = execute_plan_with_native_trace_refund(
+                db,
+                left,
+                params,
+                tx,
+                vector_copy_owner,
+                read_memory.clone(),
+                native_trace_refund,
+            )?;
+            let right_result = execute_plan_with_native_trace_refund(
                 db,
                 right,
                 params,
                 tx,
                 vector_copy_owner,
                 read_memory.clone(),
+                native_trace_refund,
             )?;
             let right_duplicate_names =
                 duplicate_column_names(&left_result.columns, &right_result.columns);
@@ -7901,7 +7929,15 @@ fn execute_plan_with_working_state(
         PhysicalPlan::Pipeline(plans) => {
             let mut last = OwnedQueryResult::empty();
             for p in plans {
-                last = execute_plan(db, p, params, tx, vector_copy_owner, read_memory.clone())?;
+                last = execute_plan_with_native_trace_refund(
+                    db,
+                    p,
+                    params,
+                    tx,
+                    vector_copy_owner,
+                    read_memory.clone(),
+                    native_trace_refund,
+                )?;
             }
             Ok(last)
         }

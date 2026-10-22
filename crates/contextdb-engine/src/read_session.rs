@@ -3016,7 +3016,7 @@ impl ReadSession {
                     |read_memory, native_trace_refund| {
                         let executed =
                             crate::executor::execute_bounded_on_target_with_native_trace_refund(
-                                database,
+                                database.as_ref(),
                                 sql,
                                 params,
                                 read_memory,

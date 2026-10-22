@@ -23,6 +23,7 @@ struct Capture {
     requests: [Request; 3], // native child, external keeper, forwarding Arc
     trace_requests: [Request; 2], // independently observed keeper, provider
     trace_ordinals: [usize; 2],
+    trace_invoices: [(usize, usize); 2],
     trace_stages: usize,
     trace_before: usize,
     trace_parent: [usize; 2],
@@ -47,7 +48,7 @@ thread_local! {
     static CAPTURE: Cell<Capture> = const { Cell::new(Capture {
         active: false, invalid: false, parent: 0, parent_counter: 0,
         baseline: 0, children: 0, stages: 0, requests: [(0, 0, 0); 3],
-        trace_requests: [(0,0,0); 2], trace_ordinals: [0; 2], trace_stages: 0,
+        trace_requests: [(0,0,0); 2], trace_ordinals: [0; 2], trace_invoices: [(0,0); 2], trace_stages: 0,
         trace_before: 0, trace_parent: [0; 2], trace_credits: [0; 2],
         child_limit: 0, declared_limit: 0, parent_after_constructor: [0; 3], allocator_funding: [0; 3],
         child_payload: 0, child_counter: 0, child_at_keeper: 0,
@@ -159,6 +160,7 @@ pub(crate) fn trace_control_allocated(
             return;
         }
         c.trace_requests[stage] = (pointer, bytes, align);
+        c.trace_invoices[stage] = (payer, invoice);
         c.trace_ordinals[stage] = ordinal;
         c.trace_parent[stage] =
             unsafe { &*(c.parent_counter as *const AtomicU64) }.load(Ordering::SeqCst) as usize;
@@ -399,19 +401,26 @@ impl Observation {
             } else {
                 c.trace_requests[i - c.stages]
             };
-            assert!(
-                original_control_cut_is_complete(OriginalControlCut {
-                    request,
-                    original_payer: c.payer,
-                    invoice_payer: c.payer,
-                    invoice_bytes: request.1,
-                    free: *free,
-                    independent_live: live[i],
-                    baseline: c.baseline as usize,
-                }),
-                "every independently still-live original native and trace control must remain paid through this physical free: index={i} request={request:?} free={free:?} live={}",
-                live[i]
+            assert_eq!(
+                c.baseline as usize + live[i],
+                free.0,
+                "every independently still-live original control is paid at its physical free"
             );
+            if i >= c.stages {
+                let (invoice_payer, invoice_bytes) = c.trace_invoices[i - c.stages];
+                assert!(
+                    original_control_cut_is_complete(OriginalControlCut {
+                        request,
+                        original_payer: c.payer,
+                        invoice_payer,
+                        invoice_bytes,
+                        free: *free,
+                        independent_live: live[i],
+                        baseline: c.baseline as usize,
+                    }),
+                    "actual allocation-time trace invoice must match its independent physical request"
+                );
+            }
         }
         assert_eq!(db.declared_read_memory.charged_bytes(), c.baseline);
     }
@@ -1001,25 +1010,33 @@ fn ordinary_native_physical_cut_rejects_missing_duplicate_early_wrong_and_extra_
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for file in [false, true] {
         let (_dir, db) = fixture(file);
-        sql(&db, "CREATE TABLE cut_rows (id INT PRIMARY KEY)");
-        sql(&db, "INSERT INTO cut_rows VALUES (1)");
-        sql(&db, "SELECT id FROM cut_rows");
+        sql(
+            &db,
+            "CREATE TABLE cut_rows (id INT PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE EXACT)",
+        );
+        let params = HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
+        db.execute("INSERT INTO cut_rows VALUES (1, $q)", &params)
+            .unwrap();
+        let query = "SELECT id FROM cut_rows ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 1";
+        db.execute(query, &params).unwrap();
+        db.clear_last_vector_search_trace();
         let observation = Observation::begin(&db);
-        let (answer, _, _) = observed(&db, || {
-            db.execute("SELECT id FROM cut_rows", &HashMap::new())
-        });
-        assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(1)]]);
+        let (answer, _, _) = observed(&db, || db.execute(query, &params));
+        let answer = answer.unwrap();
+        assert_eq!(answer.rows(), vec![vec![Value::Int64(1)]]);
+        drop(answer);
+        db.clear_last_vector_search_trace();
         let c = observation.assert_admitted();
         observation.assert_freed(&db);
-        let frees = oracle::source_free_for_test(c.stages);
-        let live = oracle::source_live_at_free_for_test(c.stages);
+        let frees = oracle::source_free_for_test(c.stages + c.trace_stages);
+        let live = oracle::source_live_at_free_for_test(c.stages + c.trace_stages);
         let valid = OriginalControlCut {
-            request: c.requests[1],
+            request: c.trace_requests[1],
             original_payer: c.payer,
-            invoice_payer: c.payer,
-            invoice_bytes: c.requests[1].1,
-            free: frees[1],
-            independent_live: live[1],
+            invoice_payer: c.trace_invoices[1].0,
+            invoice_bytes: c.trace_invoices[1].1,
+            free: frees[4],
+            independent_live: live[4],
             baseline: c.baseline as usize,
         };
         assert!(original_control_cut_is_complete(valid));
