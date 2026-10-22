@@ -6303,3 +6303,125 @@ mod settled_scratch_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod admitted_navigation_body_tests {
+    use super::*;
+    use crate::memory_budget::{MemoryBudget, MemoryBudgetOwner};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug)]
+    struct Budget {
+        used: AtomicUsize,
+        limit: AtomicUsize,
+    }
+    impl MemoryBudget for Budget {
+        fn try_allocate_for(
+            &self,
+            bytes: usize,
+            subsystem: &str,
+            operation: &str,
+            hint: &str,
+        ) -> Result<()> {
+            let limit = self.limit.load(Ordering::SeqCst);
+            self.used
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                    used.checked_add(bytes).filter(|next| *next <= limit)
+                })
+                .map_err(|used| Error::MemoryBudgetExceeded {
+                    subsystem: subsystem.into(),
+                    operation: operation.into(),
+                    requested_bytes: bytes,
+                    available_bytes: limit.saturating_sub(used),
+                    budget_limit_bytes: limit,
+                    hint: hint.into(),
+                })?;
+            Ok(())
+        }
+        fn release(&self, bytes: usize) {
+            assert!(self.used.fetch_sub(bytes, Ordering::SeqCst) >= bytes);
+        }
+    }
+    fn budget() -> Arc<Budget> {
+        Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: AtomicUsize::new(1024 * 1024),
+        })
+    }
+    fn point(id: PointId, value: f32) -> paged_builder::PagedVectorPoint {
+        paged_builder::PagedVectorPoint::F32(paged_builder::PagedPoint {
+            id,
+            origin_id: 7,
+            values: vec![value; 128],
+            neighbours: vec![Vec::new()],
+        })
+    }
+    #[test]
+    fn base_body_cache_separates_captured_layers_and_releases_the_original_funder() {
+        let payer = budget();
+        let mut cache = NavigationCache::new(Some(MemoryBudgetOwner::from(payer.clone())));
+        let id = PointId(0, 0);
+        cache.remember_point(0, id, &point(id, 1.0));
+        let held = payer.used.load(Ordering::SeqCst);
+        assert!(held >= 128 * std::mem::size_of::<f32>());
+        assert_eq!(
+            cache.point(0, id).unwrap().values.as_deref(),
+            Some(&[1.0; 128][..])
+        );
+        // A later captured layer with the same point identity must never read
+        // the earlier layer's values. Both generations can remain live.
+        cache.remember_point(1, id, &point(id, 2.0));
+        assert_eq!(
+            cache.point(1, id).unwrap().values.as_deref(),
+            Some(&[2.0; 128][..])
+        );
+        assert_eq!(
+            cache.point(0, id).unwrap().values.as_deref(),
+            Some(&[1.0; 128][..])
+        );
+        assert!(payer.used.load(Ordering::SeqCst) > held);
+        assert!(cache.evict_lru());
+        assert!(cache.point(1, id).is_none());
+        assert_eq!(
+            cache.point(0, id).unwrap().values.as_deref(),
+            Some(&[1.0; 128][..])
+        );
+        drop(cache);
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn optional_base_body_refusal_preserves_navigation_and_unwind_refunds_it() {
+        let payer = budget();
+        let id = PointId(0, 0);
+        let mut cache = NavigationCache::new(Some(MemoryBudgetOwner::from(payer.clone())));
+        // Admit table/adjacency first using an empty body. Reuse the measured
+        // actual charge as the next cache's ceiling; the real body cannot fit.
+        cache.remember_point(
+            0,
+            id,
+            &paged_builder::PagedVectorPoint::F32(paged_builder::PagedPoint {
+                id,
+                origin_id: 7,
+                values: Vec::new(),
+                neighbours: vec![Vec::new()],
+            }),
+        );
+        let navigation_only = payer.used.load(Ordering::SeqCst);
+        drop(cache);
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+        payer.limit.store(navigation_only, Ordering::SeqCst);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cache = NavigationCache::new(Some(MemoryBudgetOwner::from(payer.clone())));
+            cache.remember_point(0, id, &point(id, 3.0));
+            assert_eq!(cache.point(0, id).unwrap().origin, 7);
+            assert!(cache.point(0, id).unwrap().values.is_none());
+            assert_eq!(payer.used.load(Ordering::SeqCst), navigation_only);
+            panic!("caller unwinds with admitted optional navigation");
+        }));
+        assert!(result.is_err());
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+        let session = NavigationSession::new(Some(MemoryBudgetOwner::from(payer.clone())));
+        session.lock().remember_point(0, id, &point(id, 4.0));
+        session.release_navigation_before_body();
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+    }
+}
