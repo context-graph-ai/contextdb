@@ -63049,6 +63049,8 @@ impl Database {
                 .get(table)
                 .map_or(0, Vec::len) as u64,
         );
+        #[cfg(test)]
+        consolidation_metadata_contract_tests::note_projection_rows(1);
         self.table_versions_for_projection(table)
     }
 
@@ -83189,7 +83191,7 @@ impl Database {
         .and_then(|swap| swap.prepare_schema_generation(self, std::iter::once(name)))
     }
 
-    pub(crate) fn allows_local_ef_search_metadata_publication(&self) -> bool {
+    pub(crate) fn allows_local_vector_policy_metadata_publication(&self) -> bool {
         self.finalization
             .local_policy_metadata_enabled
             .load(Ordering::SeqCst)
@@ -83197,13 +83199,13 @@ impl Database {
             && !self.private_received_rows_hold_delete_invoices()
     }
 
-    /// Publish an already validated, local-autocommit EF_SEARCH declaration.
+    /// Publish an already validated, local-autocommit search-breadth or consolidation declaration.
     /// No row, posting or historical body changes ownership on this path.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn publish_local_ef_search_metadata(
+    pub(crate) fn publish_local_vector_policy_metadata(
         &self,
         name: &str,
         old_meta: &TableMeta,
@@ -83212,6 +83214,7 @@ impl Database {
         lsn: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        consolidation_only: bool,
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -83227,7 +83230,11 @@ impl Database {
         let mut metadata_memory = self.reserve_original_preparation_for(
             retained_table_metadata_bytes(&self.relational_store, meta),
             "ddl",
-            "prepare_ef_search_metadata",
+            if consolidation_only {
+                "prepare_consolidation_metadata"
+            } else {
+                "prepare_ef_search_metadata"
+            },
             "Reduce schema metadata or raise MEMORY_LIMIT.",
         )?;
         let mut memory_swap = PreparedMemorySwap::from_original_preparation(
@@ -83244,7 +83251,11 @@ impl Database {
                 .saturating_add(meta.metadata_bytes().saturating_mul(32))
                 .saturating_add(name.len().saturating_mul(32)),
             "ddl",
-            "prepare_ef_search_history",
+            if consolidation_only {
+                "prepare_consolidation_history"
+            } else {
+                "prepare_ef_search_history"
+            },
             "Reduce schema metadata or raise MEMORY_LIMIT.",
         )?;
         vector_copy_owner.reserve(std::mem::size_of::<VectorIndexLayout>().saturating_add(
@@ -83283,6 +83294,7 @@ impl Database {
         // Every fallible preparation, including the captured writer schema,
         // precedes durability. Move the successor payloads into an infallible
         // callback that runs before the postcommit observation boundary.
+        let mut published_policy = None;
         let publish = || {
             let old = {
                 let mut metadata = self.relational_store.table_meta.write();
@@ -83295,19 +83307,19 @@ impl Database {
             self.publish_memory_schema_history(memory_history);
             memory_swap.commit_after_swap();
             if let Some(prepared) = prepared_policy {
-                // EF_SEARCH does not change maintenance_need. Do not perform
-                // a fallible storage recheck inside the committed write's
-                // sticky admission scope.
-                self.vector_store.publish_policy_layout_update(prepared);
+                // Apply the already admitted layout after durable success.
+                // A consolidation recheck belongs outside this committed
+                // write's sticky admission scope, never inside publication.
+                published_policy = self.vector_store.publish_policy_layout_update(prepared);
             }
         };
-        if let Some(persistence) = &self.persistence {
+        let result = if let Some(persistence) = &self.persistence {
             // The durable occurrence is an admitted temporary encoding input,
             // not a resident history entry. Persistence keeps the occurrence
             // and its summary/configuration in the same durable transaction.
             let durable_ddl = [self.alter_table_ddl_for_meta(name, meta, Vec::new())];
             self.publish_direct_metadata(|| {
-                persistence.publish_ef_search_metadata_and_ddl(
+                persistence.publish_vector_policy_metadata_and_ddl(
                     name,
                     meta,
                     values
@@ -83323,7 +83335,22 @@ impl Database {
         } else {
             publish();
             Ok(())
+        };
+        result?;
+        if consolidation_only {
+            if let Some(published) = published_policy {
+                // Match ordinary local/received policy publication: a refused
+                // inspection-only recheck keeps its failure mark until the
+                // next maintenance pass. Durable metadata remains authoritative.
+                if let Ok(read_memory) = self.declared_reader_memory() {
+                    let mut owner = crate::vector_read_memory::admission(read_memory);
+                    let _ = self
+                        .vector_store
+                        .recheck_policy_maintenance_failures(&published, &mut owner);
+                }
+            }
         }
+        Ok(())
     }
 
     /// Settle what a change to `table`'s INDEX SET costs -- or gives back --
@@ -119760,3 +119787,7 @@ pub(crate) mod ordinary_native_owner_tests;
 
 #[cfg(test)]
 pub(crate) mod ef_search_metadata_contract_tests;
+
+#[cfg(test)]
+#[path = "database/consolidation_metadata_contract_tests.rs"]
+mod consolidation_metadata_contract_tests;

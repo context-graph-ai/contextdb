@@ -1853,6 +1853,8 @@ impl RedbPersistence {
                 }
                 #[cfg(test)]
                 crate::database::ef_search_metadata_contract_tests::note_projection_rows(1);
+                #[cfg(test)]
+                crate::database::consolidation_metadata_contract_tests::note_projection_rows(1);
                 let mut window = self.proof_admission();
                 window.admit(
                     source_row
@@ -2011,12 +2013,10 @@ impl RedbPersistence {
                 let mut decoded_rows = 0u64;
                 loop {
                     let mut window = self.proof_admission();
-                    let row_memory = crate::read_image_memory::ImageMemory::funded_for_original(
-                        self.require_decode_original()?,
-                        "writer_source",
-                        "decode_stored_value",
-                        "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
-                    )?;
+                    // Declare the owner before the decoded row, but admit it
+                    // only after the cursor finds an actual record. An empty
+                    // terminating pass needs no decoder allocation or credit.
+                    let mut row_memory = None;
                     // Every fingerprint update may finalize closed table pages.
                     // End the source table and access guards before that update.
                     let selected = {
@@ -2041,7 +2041,13 @@ impl RedbPersistence {
                                         "invalid schema projection key".into(),
                                     )
                                 })?;
-                                row_memory
+                                row_memory = Some(crate::read_image_memory::ImageMemory::funded_for_original(
+                                    self.require_decode_original()?,
+                                    "writer_source",
+                                    "decode_stored_value",
+                                    "Raise MEMORY_LIMIT to decode this writer operation's stored values.",
+                                )?);
+                                row_memory.as_ref().expect("stored row has its decode owner")
                                     .scope(|| Self::decode_versioned_row(value.value(), None))
                                     .map(|row| (key, row))
                             })
@@ -2054,7 +2060,7 @@ impl RedbPersistence {
                     {
                         decoded_rows += 1;
                         if decoded_rows.is_multiple_of(1000) {
-                            phase.record("head_indexes", decoded_rows, Some(&row_memory));
+                            phase.record("head_indexes", decoded_rows, row_memory.as_deref());
                         }
                     }
                     after = Some(key);

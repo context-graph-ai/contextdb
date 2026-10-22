@@ -5186,8 +5186,20 @@ fn execute_create_table_plan(
 }
 
 // Exhaustive destructuring makes every new metadata field a compile-time
-// classification decision. Only query breadth may bypass the general projection.
+// classification decision. Only explicitly selected policy fields may bypass projection.
 fn metadata_equal_except_ef_search(old: &TableMeta, new: &TableMeta) -> bool {
+    metadata_equal_by_column(old, new, column_equal_except_ef_search)
+}
+
+fn metadata_equal_except_consolidation(old: &TableMeta, new: &TableMeta) -> bool {
+    metadata_equal_by_column(old, new, column_equal_except_consolidation)
+}
+
+fn metadata_equal_by_column(
+    old: &TableMeta,
+    new: &TableMeta,
+    equal: fn(&ColumnDef, &ColumnDef) -> bool,
+) -> bool {
     let TableMeta {
         columns: old_columns,
         immutable: old_immutable,
@@ -5255,7 +5267,7 @@ fn metadata_equal_except_ef_search(old: &TableMeta, new: &TableMeta) -> bool {
         && old_columns
             .iter()
             .zip(new_columns)
-            .all(|(old, new)| column_equal_except_ef_search(old, new))
+            .all(|(old, new)| equal(old, new))
 }
 
 fn column_equal_except_ef_search(old: &ColumnDef, new: &ColumnDef) -> bool {
@@ -5346,6 +5358,94 @@ fn column_equal_except_ef_search(old: &ColumnDef, new: &ColumnDef) -> bool {
         && old_consolidation_change_percent == new_consolidation_change_percent
         && old_consolidation_tombstone_percent == new_consolidation_tombstone_percent
         && old_consolidation_disabled == new_consolidation_disabled
+}
+
+fn column_equal_except_consolidation(old: &ColumnDef, new: &ColumnDef) -> bool {
+    let ColumnDef {
+        name: old_name,
+        column_type: old_column_type,
+        nullable: old_nullable,
+        primary_key: old_primary_key,
+        unique: old_unique,
+        default: old_default,
+        references: old_references,
+        expires: old_expires,
+        immutable: old_immutable,
+        quantization: old_quantization,
+        rank_policy: old_rank_policy,
+        context_id: old_context_id,
+        scope_label: old_scope_label,
+        acl_ref: old_acl_ref,
+        partition_key_columns: old_partition_key_columns,
+        max_partitions: old_max_partitions,
+        search_mode: old_search_mode,
+        auto_index_at: old_auto_index_at,
+        flat_below: old_flat_below,
+        auto_expansion_ceiling: old_auto_expansion_ceiling,
+        hnsw_m: old_hnsw_m,
+        hnsw_ef_construction: old_hnsw_ef_construction,
+        hnsw_ef_search: old_hnsw_ef_search,
+        hnsw_search_radius_millionths: old_hnsw_search_radius_millionths,
+        vector_policy_revision: old_vector_policy_revision,
+        consolidation_change_percent: _,
+        consolidation_tombstone_percent: _,
+        consolidation_disabled: _,
+    } = old;
+    let ColumnDef {
+        name: new_name,
+        column_type: new_column_type,
+        nullable: new_nullable,
+        primary_key: new_primary_key,
+        unique: new_unique,
+        default: new_default,
+        references: new_references,
+        expires: new_expires,
+        immutable: new_immutable,
+        quantization: new_quantization,
+        rank_policy: new_rank_policy,
+        context_id: new_context_id,
+        scope_label: new_scope_label,
+        acl_ref: new_acl_ref,
+        partition_key_columns: new_partition_key_columns,
+        max_partitions: new_max_partitions,
+        search_mode: new_search_mode,
+        auto_index_at: new_auto_index_at,
+        flat_below: new_flat_below,
+        auto_expansion_ceiling: new_auto_expansion_ceiling,
+        hnsw_m: new_hnsw_m,
+        hnsw_ef_construction: new_hnsw_ef_construction,
+        hnsw_ef_search: new_hnsw_ef_search,
+        hnsw_search_radius_millionths: new_hnsw_search_radius_millionths,
+        vector_policy_revision: new_vector_policy_revision,
+        consolidation_change_percent: _,
+        consolidation_tombstone_percent: _,
+        consolidation_disabled: _,
+    } = new;
+    old_name == new_name
+        && old_column_type == new_column_type
+        && old_nullable == new_nullable
+        && old_primary_key == new_primary_key
+        && old_unique == new_unique
+        && old_default == new_default
+        && old_references == new_references
+        && old_expires == new_expires
+        && old_immutable == new_immutable
+        && old_quantization == new_quantization
+        && old_rank_policy == new_rank_policy
+        && old_context_id == new_context_id
+        && old_scope_label == new_scope_label
+        && old_acl_ref == new_acl_ref
+        && old_partition_key_columns == new_partition_key_columns
+        && old_max_partitions == new_max_partitions
+        && old_search_mode == new_search_mode
+        && old_auto_index_at == new_auto_index_at
+        && old_flat_below == new_flat_below
+        && old_auto_expansion_ceiling == new_auto_expansion_ceiling
+        && old_hnsw_m == new_hnsw_m
+        && old_hnsw_ef_construction == new_hnsw_ef_construction
+        && old_hnsw_ef_search == new_hnsw_ef_search
+        && old_hnsw_search_radius_millionths == new_hnsw_search_radius_millionths
+        && old_vector_policy_revision == new_vector_policy_revision
 }
 
 /// `ALTER TABLE`, off the recursing executor's own stack frame. See
@@ -6280,13 +6380,19 @@ fn execute_alter_table_plan(
             // Classify the resolved declaration, not the partial SET HNSW AST:
             // DEFAULT can also clear topology or radius. Restatements still
             // author a DDL occurrence even when the effective breadth is equal.
+            let consolidation_only =
+                matches!(&p.action, AlterAction::SetVectorConsolidation { .. })
+                    && metadata_equal_except_consolidation(&old_meta, &projected_meta);
+            let ef_search_only = matches!(&p.action, AlterAction::SetVectorHnsw { .. })
+                && metadata_equal_except_ef_search(&old_meta, &projected_meta);
             if tx.is_none()
-                && matches!(&p.action, AlterAction::SetVectorHnsw { .. })
-                && db.allows_local_ef_search_metadata_publication()
-                && metadata_equal_except_ef_search(&old_meta, &projected_meta)
+                && db.allows_local_vector_policy_metadata_publication()
+                && (ef_search_only || consolidation_only)
             {
-                let index = vector_layout_update.as_ref().expect("HNSW has an index");
-                return db.publish_local_ef_search_metadata(
+                let index = vector_layout_update
+                    .as_ref()
+                    .expect("vector policy has an index");
+                return db.publish_local_vector_policy_metadata(
                     &p.table,
                     &old_meta,
                     &projected_meta,
@@ -6294,6 +6400,7 @@ fn execute_alter_table_plan(
                     lsn,
                     vector_copy_owner,
                     read_memory.clone(),
+                    consolidation_only,
                 );
             }
             let projected_rows = db.local_table_projection_rows(&p.table, &projected_meta)?;

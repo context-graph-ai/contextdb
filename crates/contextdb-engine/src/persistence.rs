@@ -33023,13 +33023,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
         )
     }
 
-    /// The caller has proved that only EF_SEARCH differs. Existing rows,
+    /// The caller proved that only search breadth or consolidation differs. Existing rows,
     /// postings, counts, vector bodies and authored history remain valid.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn publish_ef_search_metadata_and_ddl(
+    pub(crate) fn publish_vector_policy_metadata_and_ddl(
         &self,
         name: &str,
         meta: &TableMeta,

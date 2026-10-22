@@ -3807,9 +3807,14 @@ impl MaintenancePhase {
         let slot = records.1 % records.0.len();
         records.0[slot] = Some(record);
         records.1 += 1;
+        drop(records);
         // Bounded formatting to the captured descriptor preserves the last
         // phase even when the unchanged timeout terminates the process.
-        eprintln!(
+        use std::io::Write;
+        let stderr = std::io::stderr();
+        let mut output = stderr.lock();
+        let _ = writeln!(
+            output,
             "maintenance_phase pid={} scope={} parent={} operation={} phase={} elapsed_ns={} rows={} payer={} used={} held={} control={} subsystem={} admission={} open_residue={}",
             record.pid,
             record.scope,
