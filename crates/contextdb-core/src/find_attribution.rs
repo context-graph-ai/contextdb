@@ -872,8 +872,20 @@ pub mod inline_phases {
         Release,
         PageRead,
         PageAuth,
+        Origin,
+        RowLookup,
+        RowVersion,
+        Neighbours,
+        Distance,
+        LoadPoint,
+        Identity,
+        NavigationLock,
+        DurableDistance,
+        PagedDistance,
+        ResidentF32Distance,
+        ResidentQuantizedDistance,
     }
-    const N: usize = 15;
+    const N: usize = 27;
     const NAMES: [&str; N] = [
         "planning",
         "candidate_drain",
@@ -890,6 +902,18 @@ pub mod inline_phases {
         "release",
         "page_read",
         "page_auth",
+        "origin",
+        "row_lookup",
+        "row_version",
+        "neighbours",
+        "distance",
+        "load_point",
+        "identity",
+        "navigation_lock",
+        "durable_distance",
+        "paged_distance",
+        "resident_f32_distance",
+        "resident_quantized_distance",
     ];
     struct State {
         active: Cell<bool>,
@@ -981,9 +1005,9 @@ pub mod inline_phases {
                 )
             });
             // A record's finite field count and maximum decimal widths fit
-            // within 2KiB (< native PIPE_BUF). Format on the stack and flush
+            // within 4KiB (native PIPE_BUF). Format on the stack and flush
             // once after snapshotting; no per-piece stderr writes or heap.
-            let mut buffer = [0u8; 2048];
+            let mut buffer = [0u8; 4096];
             let mut output = std::io::Cursor::new(buffer.as_mut_slice());
             let formatted = (|| -> std::io::Result<()> {
                 write!(

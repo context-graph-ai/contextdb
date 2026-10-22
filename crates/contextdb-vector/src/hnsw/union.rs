@@ -388,6 +388,9 @@ impl NavigationSession {
         }
     }
     fn lock(&self) -> parking_lot::MutexGuard<'_, NavigationCache> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::NavigationLock,
+        );
         self.navigation.lock()
     }
     pub(crate) fn owner(&self) -> Option<crate::memory_budget::MemoryBudgetOwner> {
@@ -852,6 +855,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
         point: PointId,
         before_source: &mut S,
     ) -> std::result::Result<Option<usize>, E> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Origin,
+        );
         Ok(match &self.graph {
             LayerGraph::Durable { reader, .. } => (|| -> std::result::Result<Option<usize>, E> {
                 before_source()?;
@@ -1047,6 +1053,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
         origin: usize,
         before_source: &mut S,
     ) -> std::result::Result<Option<RowId>, E> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::RowLookup,
+        );
         match &self.graph {
             LayerGraph::Durable { reader, .. } => (|| {
                 before_source()?;
@@ -1078,6 +1087,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
         origin: usize,
         before_source: &mut S,
     ) -> std::result::Result<Option<Lsn>, E> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::RowVersion,
+        );
         match &self.graph {
             LayerGraph::Durable { reader, .. } => {
                 if let Some(lsn) = self
@@ -1120,6 +1132,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
         S: FnMut() -> std::result::Result<(), E>,
         A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
     {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Neighbours,
+        );
         match &self.graph {
             LayerGraph::Durable { tail, reader } => {
                 {
@@ -1232,8 +1247,14 @@ impl<'a, 's> OpenLayer<'a, 's> {
         A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
         R: FnMut(HnswSearchScratchEvent),
     {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Distance,
+        );
         match &mut self.graph {
             LayerGraph::Durable { tail, reader } => {
+                let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::DurableDistance,
+                );
                 (|| {
                     {
                         let _phase = contextdb_core::find_attribution::inline_phases::enter(
@@ -1306,6 +1327,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
                 })()
             }
             LayerGraph::Paged { paged, reader } => {
+                let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::PagedDistance,
+                );
                 let Some(stored) = paged.point(point) else {
                     return Ok(None);
                 };
@@ -1324,6 +1348,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     .map_err(map_core_bounded_error)
             }
             LayerGraph::ResidentF32 { points, distance } => {
+                let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::ResidentF32Distance,
+                );
                 let Some(stored) = points.resident_point(&point) else {
                     return Ok(None);
                 };
@@ -1336,6 +1363,7 @@ impl<'a, 's> OpenLayer<'a, 's> {
                 Ok(Some(distance.eval(query.values, stored.get_v())))
             }
             LayerGraph::ResidentQuantized { points, distance } => {
+                let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResidentQuantizedDistance);
                 let Some(stored) = points.resident_point(&point) else {
                     return Ok(None);
                 };

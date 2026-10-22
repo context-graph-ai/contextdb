@@ -10824,6 +10824,10 @@ impl VectorState {
                     let candidates = (self.candidate_filter && !self.row_checked)
                         .then_some(self.candidate_ids.as_slice());
                     let groups = self.with_partition_scope(context, || {
+                        let _inline_grouping =
+                            contextdb_core::find_attribution::inline_phases::enter(
+                                contextdb_core::find_attribution::inline_phases::Phase::Grouping,
+                            );
                         context.with_vector_copies(|vector_copy_owner| {
                             vector_copy_owner.with_raw_only_sources(
                                 self.search_mode == contextdb_core::VectorSearchMode::Exact

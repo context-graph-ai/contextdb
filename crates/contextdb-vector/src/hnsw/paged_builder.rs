@@ -540,6 +540,9 @@ impl<'a> AdmittedPagedReader<'a> {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(crate) fn load_point(&mut self, id: PointId) -> Result<ScopedVectorCopy<PagedVectorPoint>> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::LoadPoint,
+        );
         match self.read(PagedVectorReadRequest::Point { id })? {
             PagedVectorReadValue::Point(value) => Ok(value),
             _ => Err(Error::Other(
@@ -555,6 +558,9 @@ impl<'a> AdmittedPagedReader<'a> {
         &mut self,
         data_id: usize,
     ) -> Result<ScopedVectorCopy<PagedVectorIdentity>> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Identity,
+        );
         match self.read(PagedVectorReadRequest::Identity { data_id })? {
             PagedVectorReadValue::Identity(value) => Ok(value),
             _ => Err(Error::Other(
