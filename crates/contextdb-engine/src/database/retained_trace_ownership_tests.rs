@@ -1447,8 +1447,10 @@ fn retained_trace_keeper_native_null_returns_controls_and_keeps_payload_paid_thr
     let allowance = parent.effective_limit_for_physical_test();
     let writer_before = db.accountant().usage().used;
     let _capture = Capture::begin();
-    let (answer, first) = statement::observe(&parent, allowance, || query(&db));
-    assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(0)]]);
+    let (_, first) = statement::observe(&parent, allowance, || {
+        let answer = query(&db);
+        assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(0)]]);
+    });
     let old = invoice(&db);
     let controls = assert_owner_request(OWNER.with(Cell::get), old, &first);
     assert_invoice(old, &first, controls);
@@ -1558,8 +1560,10 @@ fn retained_trace_late_box_refusal_frees_payload_before_returning_original_invoi
     let allowance = parent.effective_limit_for_physical_test();
     let writer_before = db.accountant().usage().used;
     let _capture = Capture::begin();
-    let (answer, first) = statement::observe(&parent, allowance, || query(&db));
-    assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(0)]]);
+    let (_, first) = statement::observe(&parent, allowance, || {
+        let answer = query(&db);
+        assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(0)]]);
+    });
     let old = invoice(&db);
     let controls = assert_owner_request(OWNER.with(Cell::get), old, &first);
     assert_invoice(old, &first, controls);
@@ -1799,8 +1803,10 @@ fn retained_trace_provider_callback_unwind_keeps_pending_payload_paid_through_na
     let allowance = parent.effective_limit_for_physical_test();
     let writer_before = db.accountant().usage().used;
     let _capture = Capture::begin();
-    let (answer, first) = statement::observe(&parent, allowance, || query(&db));
-    assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(0)]]);
+    let (_, first) = statement::observe(&parent, allowance, || {
+        let answer = query(&db);
+        assert_eq!(answer.unwrap().rows(), vec![vec![Value::Int64(0)]]);
+    });
     let old = invoice(&db);
     let controls = assert_owner_request(OWNER.with(Cell::get), old, &first);
     assert_invoice(old, &first, controls);

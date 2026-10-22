@@ -635,6 +635,13 @@ impl DeclaredReadRoot {
         let initial_held = payload.retained.load(std::sync::atomic::Ordering::SeqCst);
         ReadMemoryOwner::try_native_typed_unqualified(payload, invoice).map(|child| {
             let owner = child.owner();
+            #[cfg(all(test, feature = "test-seams"))]
+            crate::database::ordinary_native_owner_tests::child_allocated(
+                self,
+                &self.retained,
+                owner.accounting_identity(),
+                ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>(),
+            );
             #[cfg(any(test, feature = "test-seams"))]
             register_native_child_observer(self, &owner, &child, request_before, initial_held);
             NativeReadChildReceipt { owner }
