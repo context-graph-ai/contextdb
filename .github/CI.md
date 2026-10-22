@@ -51,6 +51,12 @@ fails the same full result. Receipts record each exact command. Qualification on
 different SHA supplies no verdict on the PR SHA. Hardware latency qualification
 remains the existing dormant/manual path.
 
+The optional production-release route runs the mixed `acceptance` target with
+`nightly-tests,test-seams`, because its private observation fixtures require that
+feature. The public `acceptance_long_running` and `acceptance_sync` targets keep
+`nightly-tests` without `test-seams`; the optional production Cargo-default route
+also keeps `nightly-tests`. Each target retains its own command and receipt.
+
 Six named engine assertions are temporarily declared but ignored while their rc2
 work lands on `dev`: the four corpus profile assertions (CDB-160), the indexed-route
 work assertion (CDB-161), and the oversized authenticated
