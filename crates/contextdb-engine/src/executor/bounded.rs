@@ -465,7 +465,7 @@ struct RequestContext {
     live_source_pages: ControlArc<std::sync::atomic::AtomicUsize>,
     /// The caller-supplied budget retained by this executing request.
     reader_budget: contextdb_core::read_memory::ReadMemoryOwner,
-    native_budget_control: Option<contextdb_core::read_memory::ReadShared<ReadCredit>>,
+    _native_budget_control: Option<contextdb_core::read_memory::ReadShared<ReadCredit>>,
     /// Bound-range sizes of tied index candidates, probed once per request so
     /// preflight, ordering and build choose the same index.
     index_ranges: crate::executor::IndexRangeMemo,
@@ -735,7 +735,7 @@ impl RequestContext {
             }),
             live_source_pages,
             reader_budget,
-            native_budget_control,
+            _native_budget_control: native_budget_control,
             #[cfg(any(test, feature = "test-seams"))]
             probe: Mutex::new(probe),
         }});
@@ -21062,6 +21062,7 @@ fn window_capacity_bytes(
 // Private native control prototype. Logical strong lifetimes own T; every
 // strong or weak alias owns one physical count in the unchanged shared cell.
 // No caller is switched to this kernel until request/cursor integration exists.
+#[expect(dead_code, reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it.")]
 struct NativeControlCell<T> {
     strong: std::sync::atomic::AtomicUsize,
     payload: std::cell::UnsafeCell<Option<contextdb_core::read_memory::OwnedReadBox<T>>>,
@@ -21073,14 +21074,17 @@ struct NativeControlCell<T> {
 // borrowed T is protected by a logical strong; T handles its own shared mutation.
 unsafe impl<T: Send + Sync> Sync for NativeControlCell<T> {}
 
+#[expect(dead_code, reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it.")]
 struct NativeControlStrong<T> {
     cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
 }
 
+#[expect(dead_code, reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it.")]
 struct NativeControlWeak<T> {
     cell: contextdb_core::read_memory::ReadShared<NativeControlCell<T>>,
 }
 
+#[expect(dead_code, reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it.")]
 impl<T> NativeControlStrong<T> {
     /// Native companion of `try_new_with` for an infallible producer: both
     /// layouts are admitted with native forms before either allocation, and a
@@ -21198,6 +21202,7 @@ impl<T> Clone for NativeControlWeak<T> {
 }
 
 impl<T> NativeControlWeak<T> {
+    #[expect(dead_code, reason = "The private native control prototype is retained pending request/cursor integration; no production caller has adopted it.")]
     fn upgrade(&self) -> Option<NativeControlStrong<T>> {
         use std::sync::atomic::Ordering;
         // The borrowed weak and this new physical owner keep the cell alive

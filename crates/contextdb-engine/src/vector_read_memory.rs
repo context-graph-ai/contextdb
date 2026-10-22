@@ -7,15 +7,15 @@ use contextdb_vector::{MemoryBudget, VectorCopyAdmission};
 use std::sync::Arc;
 
 #[derive(Debug)]
-pub(crate) struct ReaderVectorBudget(
-    Arc<dyn ReadMemoryBudget>,
-    Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
-    Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
-);
+pub(crate) struct ReaderVectorBudget {
+    reader: Arc<dyn ReadMemoryBudget>,
+    _read_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+    vector_invoice: Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>>,
+}
 
 impl MemoryBudget for ReaderVectorBudget {
     fn control_invoice(&self) -> Option<contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>> {
-        self.2.clone()
+        self.vector_invoice.clone()
     }
     /// A refusal names the admission that asked for the bytes, so a reader
     /// can tell which one its declared memory could not hold.
@@ -26,7 +26,7 @@ impl MemoryBudget for ReaderVectorBudget {
         operation: &str,
         hint: &str,
     ) -> Result<()> {
-        let result = self.0
+        let result = self.reader
             .try_reserve(
                 bytes,
                 "vector_copy",
@@ -51,7 +51,7 @@ impl MemoryBudget for ReaderVectorBudget {
             });
         #[cfg(any(test, feature = "test-seams"))]
         if result.is_ok() {
-            let identity = Arc::as_ptr(&self.0) as *const () as usize;
+            let identity = Arc::as_ptr(&self.reader) as *const () as usize;
             READER_BUDGET_LEDGER.with(|ledger| {
                 if let Some(entries) = ledger.borrow_mut().as_mut() {
                     if let Some(event) = entries.last_mut().filter(|event|
@@ -65,7 +65,7 @@ impl MemoryBudget for ReaderVectorBudget {
     }
 
     fn release(&self, bytes: usize) {
-        self.0.release(bytes);
+        self.reader.release(bytes);
     }
 }
 
@@ -101,8 +101,8 @@ pub(crate) fn admission_prepaid(
     read_invoice: contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>,
     vector_invoice: contextdb_core::read_memory::ReadShared<contextdb_core::read_memory::ReadCredit>,
 ) -> VectorCopyAdmission {
-    VectorCopyAdmission::new(Arc::new(ReaderVectorBudget(
-        read_memory, Some(read_invoice), Some(vector_invoice))))
+    VectorCopyAdmission::new(Arc::new(ReaderVectorBudget {
+        reader: read_memory, _read_invoice: Some(read_invoice), vector_invoice: Some(vector_invoice) }))
 }
 
 pub trait ReadRequestBudgetProvider: std::fmt::Debug + Send + Sync {

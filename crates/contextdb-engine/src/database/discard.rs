@@ -1153,8 +1153,8 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<OriginalDiscardStageHolder> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        let mut holder: Option<OriginalDiscardStageHolder> = None;
-        let mut preparation_slot: Option<OwnedMemoryReservation> = None;
+        let mut holder: Option<OriginalDiscardStageHolder>;
+        let mut preparation_slot: Option<OwnedMemoryReservation>;
         self.validate_owned_event_host(&host.events, host)?;
         let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
         let lsn = (*held.read().commit_lsn).ok_or_else(EngineMetadataJournal::identity_error)?;

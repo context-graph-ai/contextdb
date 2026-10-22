@@ -1960,7 +1960,7 @@ pub fn split_canonical_result(
 pub(crate) fn split_payload_answer_funded(
     mut payload: Funded<Vec<u8>>,
     terminal: impl Fn(Vec<u8>) -> LocalResponse,
-    memory_ceiling: u64,
+    _memory_ceiling: u64,
 ) -> Result<Funded<Vec<LocalResponse>>, LocalTransportError> {
     let empty = crate::read_contract::encoded_size(&terminal(Vec::new()))
         .map_err(transport_decode_error)?;

@@ -29,7 +29,7 @@ enum CompactDiagnostic {
 struct DiagnosticPayload {
     // Physical diagnostic destruction precedes its source invoice and scopes.
     diagnostic: Diagnostic,
-    original: Option<OwnedMemoryReservation>,
+    _original: Option<OwnedMemoryReservation>,
     storage: Option<OriginalScopeCustody>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,8 +437,8 @@ struct DiagnosticBlock {
     invoice: ManuallyDrop<DiagnosticInvoice>,
 }
 enum DiagnosticInvoice {
-    Original(OwnedMemoryReservation),
-    Storage(crate::persistence::native_storage_admission::StorageAllocation),
+    Original { _owner: OwnedMemoryReservation },
+    Storage { _owner: crate::persistence::native_storage_admission::StorageAllocation },
 }
 struct DiagnosticFree {
     pointer: NonNull<DiagnosticBlock>,
@@ -465,12 +465,12 @@ impl PreparedDiagnostic {
         let layout = Layout::new::<DiagnosticBlock>();
         let invoice = crate::memory_accounting::reserve_preparation_original_native(
             original, layout.size(), subsystem, operation, hint)?;
-        Self::allocate_paid(DiagnosticInvoice::Original(invoice))
+        Self::allocate_paid(DiagnosticInvoice::Original { _owner: invoice })
     }
     pub(crate) fn allocate_scope(scope: &crate::persistence::native_storage_admission::StorageAdmissionScope)
         -> std::result::Result<Self, NativeRefusal> {
         let invoice = scope.reserve_diagnostic(Layout::new::<DiagnosticBlock>())?;
-        Self::allocate_paid(DiagnosticInvoice::Storage(invoice))
+        Self::allocate_paid(DiagnosticInvoice::Storage { _owner: invoice })
     }
     fn allocate_paid(invoice: DiagnosticInvoice) -> std::result::Result<Self, NativeRefusal> {
         let layout = Layout::new::<DiagnosticBlock>();
@@ -489,7 +489,7 @@ impl PreparedDiagnostic {
         original: Option<OwnedMemoryReservation>,
     ) -> OriginalError {
         unsafe { self.pointer.as_mut() }.payload = ManuallyDrop::new(Some(DiagnosticPayload {
-            diagnostic, original, storage: None,
+            diagnostic, _original: original, storage: None,
         }));
         OriginalError { diagnostic: CompactDiagnostic::Prepared(self), storage: None }
     }
