@@ -3908,9 +3908,8 @@ impl ServerTransport for IrohServerTransport {
             let endpoint = {
                 let mut lease = self.endpoint.lock().await;
                 let endpoint = lease.take().ok_or_else(|| {
-                    TransportError::Other((
-                        "a bound sync endpoint may be served only once; bind a new endpoint before restarting"
-                            .to_string()))
+                    TransportError::Other("a bound sync endpoint may be served only once; bind a new endpoint before restarting"
+                            .to_string())
                 })?;
                 self.serve_lifecycle.begin(endpoint)
             };
@@ -4182,8 +4181,7 @@ async fn serve_sync_connection(
                             } else {
                                 Err(TransportError::Other(
                                     ("too many unfinished oversized response transfers"
-                                        .to_string())
-                                    .into(),
+                                        .to_string()),
                                 ))
                             }
                         })
@@ -4222,8 +4220,7 @@ async fn serve_sync_connection(
                             {
                                 Err(TransportError::Other(
                                     ("too many unfinished oversized response transfers"
-                                        .to_string())
-                                    .into(),
+                                        .to_string()),
                                 ))
                             }
                             Ok(()) => tokio::task::spawn_blocking(move || {
@@ -4297,8 +4294,8 @@ async fn serve_sync_connection(
                         .and_then(|bytes| {
                             if bytes.len() > MAX_RESPONSE_CHUNK_ENVELOPE_BYTES {
                                 Err(TransportError::Other(
-                                    ("oversized response chunk envelope exceeds its ceiling"
-                                        .to_string()),
+                                    "oversized response chunk envelope exceeds its ceiling"
+                                        .to_string(),
                                 ))
                             } else {
                                 Ok(bytes)
@@ -5033,7 +5030,7 @@ impl SyncReplyWriter {
                         .reserve_response_transfer()
                         .ok_or_else(|| {
                             TransportError::Other(
-                                ("too many unfinished oversized response transfers".to_string()),
+                                "too many unfinished oversized response transfers".to_string(),
                             )
                         })?,
                 )
@@ -5043,7 +5040,7 @@ impl SyncReplyWriter {
             let mut slot = send_slot.lock().await;
             let Some((mut send, mut recv)) = slot.take() else {
                 return Err(TransportError::Other(
-                    ("reply already sent on this stream".to_string()),
+                    "reply already sent on this stream".to_string(),
                 ));
             };
             #[cfg(feature = "test-seams")]
@@ -5667,12 +5664,12 @@ async fn exchange_frame(
     if let Some(subject) = subject {
         let subject_bytes = subject.as_bytes();
         let subject_len = u16::try_from(subject_bytes.len())
-            .map_err(|_| TransportError::Other(("channel name too long".to_string())))?;
+            .map_err(|_| TransportError::Other("channel name too long".to_string()))?;
         write_all(&mut send, &subject_len.to_be_bytes()).await?;
         write_all(&mut send, subject_bytes).await?;
     }
     let payload_len = u32::try_from(payload.len()).map_err(|_| {
-        TransportError::Other(("request exceeds the frame ceiling".to_string()))
+        TransportError::Other("request exceeds the frame ceiling".to_string())
     })?;
     write_all(&mut send, &payload_len.to_be_bytes()).await?;
     write_all(&mut send, payload).await?;
@@ -5915,7 +5912,7 @@ async fn exchange_large_request(
                             begin.total_fragments,
                             Some(u32::try_from(sequence + 1).map_err(|_| {
                                 TransportError::Other(
-                                    ("oversized request has too many fragments".to_string()),
+                                    "oversized request has too many fragments".to_string(),
                                 )
                             })?),
                         )?;
@@ -5953,7 +5950,7 @@ async fn exchange_large_request(
         ));
     }
     Err(TransportError::Other(
-        ("oversized request contained no fragments".to_string()),
+        "oversized request contained no fragments".to_string(),
     ))
 }
 
@@ -6149,7 +6146,7 @@ async fn write_reply(
 ) -> TransportResult<()> {
     write_all(send, &[status]).await?;
     let len = u32::try_from(payload.len()).map_err(|_| {
-        TransportError::Other(("reply exceeds the frame ceiling".to_string()))
+        TransportError::Other("reply exceeds the frame ceiling".to_string())
     })?;
     write_all(send, &len.to_be_bytes()).await?;
     write_all(send, payload).await?;
@@ -6164,12 +6161,12 @@ async fn write_reply(
         })?;
         if receipt[0] != REPLY_RECEIVED_ACK {
             return Err(TransportError::Other(
-                ("sync peer returned an invalid reply receipt".to_string()),
+                "sync peer returned an invalid reply receipt".to_string(),
             ));
         }
         recv.read_to_end(0).await.map_err(|err| match err {
             iroh::endpoint::ReadToEndError::TooLong => TransportError::Other(
-                ("sync peer sent trailing bytes after the reply receipt".to_string()),
+                "sync peer sent trailing bytes after the reply receipt".to_string(),
             ),
             iroh::endpoint::ReadToEndError::Read(_) => TransportError::Unreachable(
                 "sync endpoint connection lost before the reply receipt stream finished"

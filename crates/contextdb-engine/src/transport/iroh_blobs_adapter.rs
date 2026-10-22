@@ -2771,7 +2771,7 @@ async fn run_verified_fetch(
     let control_failure = Arc::new(Mutex::new(None));
     let streams = ControlledGetStreams {
         connection: peer.connection.clone(),
-        read_memory: read_memory,
+        read_memory,
         failure: control_failure.clone(),
     };
     let progress = remote.fetch(streams, content);

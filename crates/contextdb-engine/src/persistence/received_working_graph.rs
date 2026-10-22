@@ -593,7 +593,7 @@ impl ReceivedWorkingWrite {
         let key = original_graph_key(&frame, predecessor_or_creation, false)?;
         let encoded = frame.encode(&coordinate.stored())?;
         self.with_write(|write| {
-            let mut table = write.open_table(if deletion { WORKING_GRAPH_DELETIONS } else { WORKING_GRAPH_CREATIONS })
+            let table = write.open_table(if deletion { WORKING_GRAPH_DELETIONS } else { WORKING_GRAPH_CREATIONS })
                 .map_err(RedbPersistence::storage_error)?;
             {
                 let existing = table.get(key.as_slice()).map_err(RedbPersistence::storage_error)?;

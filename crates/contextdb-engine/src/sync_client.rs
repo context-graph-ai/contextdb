@@ -2936,7 +2936,7 @@ impl SyncClient {
                 .map(|ordinary| PullPage {
                     ordinary,
                     dependency_units: Vec::new(),
-                    _read_memory: (read_memory.clone()).into(),
+                    _read_memory: (read_memory.clone()),
                     _image_memory: decoded_memory.clone(),
                 })
                 .map_err(|e| Error::SyncError((e.to_string()).into())),
@@ -2946,7 +2946,7 @@ impl SyncClient {
                 Ok(PullPage {
                     ordinary: response.ordinary,
                     dependency_units: response.units,
-                    _read_memory: (read_memory.clone()).into(),
+                    _read_memory: (read_memory.clone()),
                     _image_memory: decoded_memory.clone(),
                 })
             }

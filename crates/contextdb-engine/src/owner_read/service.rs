@@ -4562,7 +4562,7 @@ impl RequestPublication<'_, '_> {
 
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     async fn run(self) -> Result<(), crate::local_transport::LocalTransportError> {
-        let Self { service, carrier, mut publish_stream, connection_id, request_ordinal,
+        let Self { service, carrier, publish_stream, connection_id, request_ordinal,
             boundary, expectation, effective_limits, slot, progress, inbox, ended,
             active_cursor_fetch, cursor_fetch_id } = self;
         let cursor_fetch_request = cursor_fetch_id.is_some();
@@ -4642,7 +4642,7 @@ impl RequestPublication<'_, '_> {
                                 boundary,
                                 LocalOutboundMessage::Response {
                                     response,
-                                    expectation: expectation,
+                                    expectation,
                                 },
                             )?;
                         }
@@ -4659,7 +4659,7 @@ impl RequestPublication<'_, '_> {
                             response: &LocalResponse::CancelApplied {
                                 request_ordinal: named,
                             },
-                            expectation: expectation,
+                            expectation,
                         },
                     )?;
                     caller_cancelled_fetch |= cursor_fetch_request && named == request_ordinal;
@@ -4674,7 +4674,7 @@ impl RequestPublication<'_, '_> {
                         boundary,
                         LocalOutboundMessage::Response {
                             response: &LocalResponse::Progress { progress },
-                            expectation: expectation,
+                            expectation,
                         },
                     )?;
                 }
@@ -4734,7 +4734,7 @@ impl RequestPublication<'_, '_> {
                                     boundary,
                                     LocalOutboundMessage::Response {
                                         response: &response,
-                                        expectation: expectation,
+                                        expectation,
                                     },
                                 )?;
                                 return Ok(());
@@ -4761,7 +4761,7 @@ impl RequestPublication<'_, '_> {
                                     boundary,
                                     LocalOutboundMessage::Response {
                                         response: &response,
-                                        expectation: expectation,
+                                        expectation,
                                     },
                                 )?;
                                 return Ok(());
@@ -4812,7 +4812,7 @@ impl RequestPublication<'_, '_> {
                                 response: &LocalResponse::CancelApplied {
                                     request_ordinal: named,
                                 },
-                                expectation: expectation,
+                                expectation,
                             },
                         )?;
                         if named == request_ordinal {
@@ -4843,7 +4843,7 @@ impl RequestPublication<'_, '_> {
                                     boundary,
                                     LocalOutboundMessage::Response {
                                         response,
-                                        expectation: expectation,
+                                        expectation,
                                     },
                                 )?;
                             }
@@ -4932,7 +4932,7 @@ impl RequestPublication<'_, '_> {
                     boundary,
                     LocalOutboundMessage::Response {
                         response,
-                        expectation: expectation,
+                        expectation,
                     },
                 )
             };

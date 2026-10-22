@@ -24576,7 +24576,7 @@ impl DurableVectorGenerationLoader {
                 self.accountant.release(loader_reservation);
                 Err(error)
             }
-            Ok((graph, mut fresh_tail)) => {
+            Ok((graph, fresh_tail)) => {
                 // One admitted adapter follows every independently surviving graph
                 // from this invocation, including the fresh tail and a zero-byte owner.
                 let retained_accountant = match self.accountant.vector_budget() {
@@ -91650,7 +91650,7 @@ impl Database {
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_changes_with_private_source_order(
         &self,
-        mut changes: ChangeSet,
+        changes: ChangeSet,
         policies: &ConflictPolicies,
         arrivals: &HashMap<Lsn, Option<Lsn>>,
         adoption: SyncAdoption,
