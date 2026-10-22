@@ -190,7 +190,7 @@ fn insert_documents(database: &Database) {
 fn described(result: &QueryResult) -> String {
     format!(
         "plan={:?} index_used={:?} rows={:?}",
-        result.trace.physical_plan, result.trace.index_used, result.rows
+        result.trace().physical_plan, result.trace().index_used, result.rows()
     )
 }
 
@@ -241,12 +241,12 @@ fn both_doors_take_the_same_route(
         .execute(sql, sql_params)
         .unwrap_or_else(|error| panic!("the executor answers {what}: {error}"));
     assert!(
-        eager.trace.physical_plan.contains(expected_route),
+        eager.trace().physical_plan.contains(expected_route),
         "{what}: the executor must report the route this statement requires: {:?}",
-        eager.trace.physical_plan
+        eager.trace().physical_plan
     );
     assert!(
-        !eager.rows.is_empty(),
+        !eager.rows().is_empty(),
         "{what}: the executor finds neighbours to compare"
     );
 

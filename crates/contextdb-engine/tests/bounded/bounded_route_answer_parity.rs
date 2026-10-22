@@ -114,7 +114,7 @@ fn a_traversal_pinned_to_a_start_node_reports_that_node_s_edge_to_itself() {
         )
         .expect("the eager route serves the pinned traversal");
     assert_eq!(
-        eager.rows.len(),
+        eager.rows().len(),
         1,
         "the stored edge is the answer on the eager route"
     );
@@ -125,11 +125,11 @@ fn a_traversal_pinned_to_a_start_node_reports_that_node_s_edge_to_itself() {
     )
     .expect("a pinned traversal must be served");
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         1,
         "an edge from a node to itself is an edge; the pinned traversal returned {:?} where \
          the same statement on the eager route returns the stored edge",
-        outcome.result.rows
+        outcome.result.rows()
     );
 }
 
@@ -147,12 +147,12 @@ fn an_unpinned_traversal_and_a_pinned_traversal_agree_about_an_edge_to_itself() 
     .expect("a pinned traversal must be served");
 
     assert_eq!(
-        pinned.result.rows.len(),
-        open.result.rows.len(),
+        pinned.result.rows().len(),
+        open.result.rows().len(),
         "pinning the start node narrows which edges are traversed, not whether an edge from \
          a node to itself exists; unpinned returned {:?} and pinned returned {:?}",
-        open.result.rows,
-        pinned.result.rows
+        open.result.rows(),
+        pinned.result.rows()
     );
 }
 
@@ -248,7 +248,7 @@ fn a_nearest_neighbour_read_answers_with_the_rows_visible_at_its_snapshot() {
         .execute(VECTOR_SQL, &query)
         .expect("the eager route serves the nearest-neighbour read");
     assert_eq!(
-        eager.rows.len(),
+        eager.rows().len(),
         VECTOR_TOP_K,
         "the eager route answers with the neighbours the caller asked for"
     );
@@ -266,12 +266,12 @@ fn a_nearest_neighbour_read_answers_with_the_rows_visible_at_its_snapshot() {
          that source for the parity it asserts to be the reachable one"
     );
     assert_eq!(
-        outcome.result.rows.len(),
-        eager.rows.len(),
+        outcome.result.rows().len(),
+        eager.rows().len(),
         "{VISIBLE_VECTORS} rows are visible and {VECTOR_TOP_K} neighbours were asked for; the \
          bounded route returned {} where the same statement on the eager route returns {}",
-        outcome.result.rows.len(),
-        eager.rows.len()
+        outcome.result.rows().len(),
+        eager.rows().len()
     );
 }
 

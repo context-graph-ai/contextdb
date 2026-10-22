@@ -195,12 +195,12 @@ fn seed_relational(db: &Database, table: &str, rows: usize, payload_width: usize
 
 fn ids(result: &contextdb_engine::QueryResult) -> Vec<i64> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.ends_with(".id"))
         .expect("query result contains id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[id_column] {
             Value::Int64(value) => value,
@@ -336,7 +336,7 @@ fn relational_and_index_sources_charge_each_inspection_before_limit_or_sort() {
                 &clock,
             ),
         );
-        assert_eq!(outcome.result.rows.len(), 2);
+        assert_eq!(outcome.result.rows().len(), 2);
         assert_eq!(
             outcome
                 .telemetry
@@ -372,7 +372,7 @@ fn relational_and_index_sources_charge_each_inspection_before_limit_or_sort() {
                 &clock,
             ),
         );
-        assert_eq!(range.result.rows.len(), 3);
+        assert_eq!(range.result.rows().len(), 3);
         assert_eq!(
             range
                 .telemetry
@@ -594,11 +594,11 @@ const WIDE_GRAPH_SQL: &str = "SELECT COUNT(*) AS candidate_count FROM GRAPH_TABL
 
 fn scalar_i64(result: &contextdb_engine::QueryResult, column: &str) -> i64 {
     let column_index = result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == column)
         .unwrap_or_else(|| panic!("result contains {column}"));
-    match result.rows.as_slice() {
+    match result.rows() {
         [row] => match row[column_index] {
             Value::Int64(value) => value,
             ref other => panic!("{column} must be INTEGER, got {other:?}"),
@@ -732,7 +732,7 @@ fn scoped_graph_traversal_obeys_request_budget_beyond_legacy_visited_ceiling() {
                 &params([("context", Value::Uuid(context))]),
             )
             .expect("relational node metadata survives fixture seeding")
-            .rows
+            .rows()
             .len(),
         target_count + 1,
         "the scoped start and every scoped target have context-bearing node rows"
@@ -744,7 +744,7 @@ fn scoped_graph_traversal_obeys_request_budget_beyond_legacy_visited_ceiling() {
                 &params([("context", Value::Uuid(context))]),
             )
             .expect("relational edge metadata survives fixture seeding")
-            .rows
+            .rows()
             .len(),
         target_count,
         "every graph target has a context-bearing relational edge row"
@@ -838,12 +838,12 @@ fn seed_vectors(
 
 fn uuid_ids(result: &contextdb_engine::QueryResult) -> Vec<Uuid> {
     let id_column = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.ends_with(".id"))
         .expect("result id column");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[id_column] {
             Value::Uuid(id) => id,
@@ -854,11 +854,11 @@ fn uuid_ids(result: &contextdb_engine::QueryResult) -> Vec<Uuid> {
 
 fn cursor_page_ids(page: &contextdb_core::read_contract::CursorPage) -> Vec<i64> {
     let id_column = page
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "id" || column.ends_with(".id"))
         .expect("cursor page contains id");
-    page.rows
+    page.rows()
         .iter()
         .map(|row| match row[id_column] {
             Value::Int64(id) => id,
@@ -1059,7 +1059,7 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
             &clock,
         ),
     );
-    assert_eq!(brute_outcome.result.rows.len(), 3);
+    assert_eq!(brute_outcome.result.rows().len(), 3);
     assert!(uuid_ids(&brute_outcome.result).contains(&brute_ids[0]));
     assert!(
         brute_outcome
@@ -1104,7 +1104,7 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
             &clock,
         ),
     );
-    assert_eq!(hnsw_outcome.result.rows.len(), 5);
+    assert_eq!(hnsw_outcome.result.rows().len(), 5);
     assert!(uuid_ids(&hnsw_outcome.result).contains(&hnsw_ids[0]));
     assert!(
         hnsw.__debug_last_query_vector_used_hnsw_for_test(),
@@ -1132,7 +1132,7 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
             &clock,
         ),
     );
-    assert_eq!(ranked_outcome.result.rows.len(), 4);
+    assert_eq!(ranked_outcome.result.rows().len(), 4);
     assert!(
         uuid_ids(&ranked_outcome.result)
             .into_iter()
@@ -1246,7 +1246,7 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
             &clock,
         ),
     );
-    assert_eq!(scoped_relational.result.rows.len(), 5);
+    assert_eq!(scoped_relational.result.rows().len(), 5);
     assert!(
         scoped_relational
             .telemetry
@@ -1293,15 +1293,15 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
             &clock,
         ),
     );
-    assert_eq!(scoped_graph.result.rows.len(), 1);
+    assert_eq!(scoped_graph.result.rows().len(), 1);
     let graph_target_column = scoped_graph
         .result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "target")
         .expect("graph projection target column");
     assert_eq!(
-        scoped_graph.result.rows[0][graph_target_column],
+        scoped_graph.result.rows()[0][graph_target_column],
         Value::Uuid(visible_graph_target),
         "the hidden graph target must never leak through traversal materialization"
     );
@@ -1341,7 +1341,7 @@ fn vector_rank_and_access_candidate_work_is_bounded_before_materialization() {
             &clock,
         ),
     );
-    assert_eq!(secured.result.rows.len(), 5);
+    assert_eq!(secured.result.rows().len(), 5);
     assert!(
         secured
             .telemetry
@@ -1485,7 +1485,7 @@ fn hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop() {
     let ordinary_result = db
         .execute(sql, &params([("query", Value::Vector(vector_for(1)))]))
         .expect("ordinary HNSW search remains behaviorally unchanged");
-    assert_eq!(ordinary_result.rows, observed_result.rows);
+    assert_eq!(ordinary_result.rows(), observed_result.rows());
     assert_eq!(
         observer.events.load(Ordering::SeqCst),
         observed_events,
@@ -1495,7 +1495,7 @@ fn hnsw_candidate_observer_is_inside_the_real_prebuilt_distance_loop() {
 
 struct SourceLoopPoisonProbe {
     clock: ManualClock,
-    reader: Arc<contextdb_engine::vector_read_memory::DeclaredReadMemory>,
+    reader: contextdb_engine::vector_read_memory::DeclaredReadRoot,
     baseline_accounted_bytes: usize,
     poison_before_work_at: Option<u64>,
     poison_reservation_above: Option<u64>,
@@ -1512,7 +1512,7 @@ struct SourceLoopPoisonProbe {
 impl SourceLoopPoisonProbe {
     fn new(
         clock: ManualClock,
-        reader: Arc<contextdb_engine::vector_read_memory::DeclaredReadMemory>,
+        reader: contextdb_engine::vector_read_memory::DeclaredReadRoot,
         _baseline_accounted_bytes: usize,
     ) -> Self {
         Self {
@@ -2180,7 +2180,7 @@ fn mostly_invisible_vector_history_is_charged_at_direct_and_cursor_boundaries() 
         })
         .expect("the roomy cursor first fetch succeeds");
     let cursor_work = cursor.telemetry.work_units;
-    assert_eq!(cursor.first_page.rows.len(), 1);
+    assert_eq!(cursor.first_page.rows().len(), 1);
     assert_eq!(
         cursor_probe.source_items(bounded::TestSourceTouch::BruteForceVectorCandidate),
         STORED_VERSIONS,
@@ -2284,7 +2284,7 @@ fn active_time_and_cancellation_are_manual_clock_and_source_wake_driven() {
         &db,
         &request(sql, HashMap::new(), no_wall_time_limit, &clock),
     );
-    assert_eq!(no_wall_time.result.rows.len(), 7);
+    assert_eq!(no_wall_time.result.rows().len(), 7);
     assert_eq!(
         clock.now_ms(),
         0,
@@ -2303,7 +2303,7 @@ fn active_time_and_cancellation_are_manual_clock_and_source_wake_driven() {
     assert_eq!(
         bounded_success(&db, &exact_active_request)
             .result
-            .rows
+            .rows()
             .len(),
         7,
         "the exact manual active-time boundary succeeds"
@@ -2378,9 +2378,9 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
         .unwrap_or_else(|error| {
             panic!("bounded cursor must open this production fixture; got {error:?}")
         });
-    assert_eq!(profiled_open.first_page.rows.len(), 4);
+    assert_eq!(profiled_open.first_page.rows().len(), 4);
     assert_eq!(cursor_page_ids(&profiled_open.first_page), vec![0, 1, 2, 3]);
-    assert!(profiled_open.first_page.has_more);
+    assert!(profiled_open.first_page.has_more());
     let first_page_bytes = cursor_page_encoded_size(&profiled_open.first_page)
         .expect("canonical cursor-page encoding is the byte budget source")
         as u64;
@@ -2397,8 +2397,8 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
         &request(sql, HashMap::new(), one_row_smaller_page, &clock),
     )
     .expect("cursor_page_rows shapes the first complete page");
-    assert_eq!(smaller_page.first_page.rows.len(), 3);
-    assert!(smaller_page.first_page.has_more);
+    assert_eq!(smaller_page.first_page.rows().len(), 3);
+    assert!(smaller_page.first_page.has_more());
     let three_row_bytes = cursor_page_encoded_size(&smaller_page.first_page)
         .expect("canonical three-row cursor page size") as u64;
     assert!(three_row_bytes < first_page_bytes - 1);
@@ -2410,7 +2410,7 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
         &request(sql, HashMap::new(), exact_page_bytes, &clock),
     )
     .expect("a complete page exactly at its encoded-byte ceiling succeeds");
-    assert_eq!(exact_open.first_page.rows.len(), 4);
+    assert_eq!(exact_open.first_page.rows().len(), 4);
     assert_eq!(cursor_page_ids(&exact_open.first_page), vec![0, 1, 2, 3]);
     let mut one_byte_below_full_page = exact_page_bytes;
     one_byte_below_full_page.cursor_page_bytes -= 1;
@@ -2419,14 +2419,14 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
         &request(sql, HashMap::new(), one_byte_below_full_page, &clock),
     )
     .expect("a byte-limited page stops after its last complete row");
-    assert_eq!(partial_open.first_page.rows.len(), 3);
+    assert_eq!(partial_open.first_page.rows().len(), 3);
     assert_eq!(cursor_page_ids(&partial_open.first_page), vec![0, 1, 2]);
     assert_eq!(
-        partial_open.first_page.rows, smaller_page.first_page.rows,
+        partial_open.first_page.rows(), smaller_page.first_page.rows(),
         "byte stopping preserves every value in each complete row"
     );
     assert!(
-        partial_open.first_page.has_more,
+        partial_open.first_page.has_more(),
         "byte stopping reports the unconsumed fourth row truthfully"
     );
     assert_eq!(
@@ -2456,8 +2456,8 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
         &request(wide_sql, HashMap::new(), wide_profile_limits, &clock),
     )
     .expect("profile the runtime-derived complete single-row page");
-    assert_eq!(wide_profile.first_page.rows.len(), 1);
-    assert!(!wide_profile.first_page.has_more);
+    assert_eq!(wide_profile.first_page.rows().len(), 1);
+    assert!(!wide_profile.first_page.has_more());
     let required_page_bytes = cursor_page_encoded_size(&wide_profile.first_page)
         .expect("canonical encoded size for the complete single-row page")
         as u64;
@@ -2761,9 +2761,9 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
     db.__reset_relational_scan_rows_touched();
     let mut open = bounded::open_cursor(Arc::clone(&db), &per_fetch_request)
         .expect("first four rows fit one work/active-time budget");
-    assert_eq!(open.first_page.rows.len(), 4);
+    assert_eq!(open.first_page.rows().len(), 4);
     assert_eq!(cursor_page_ids(&open.first_page), vec![0, 1, 2, 3]);
-    assert!(open.first_page.has_more);
+    assert!(open.first_page.has_more());
     assert_eq!(
         open.telemetry.work_units, 4,
         "opening a four-row page touches only its first four ordered source entries"
@@ -2782,7 +2782,7 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
             .fetch(NonZeroUsize::new(4), fetch_cancel.clone())
             .expect("each fetch gets a fresh work and active-time budget");
         assert_eq!(
-            page.page.rows.len(),
+            page.page.rows().len(),
             4,
             "cursor fetch beginning at {expected_start} stays a complete page"
         );
@@ -2808,10 +2808,10 @@ fn cursor_pages_are_complete_byte_bounded_and_per_fetch_budgeted() {
         .cursor
         .fetch(NonZeroUsize::new(4), fetch_cancel)
         .expect("final cursor page");
-    assert_eq!(terminal.page.rows.len(), 3);
+    assert_eq!(terminal.page.rows().len(), 3);
     assert_eq!(cursor_page_ids(&terminal.page), vec![40, 41, 42]);
     assert!(
-        !terminal.page.has_more,
+        !terminal.page.has_more(),
         "only genuine exhaustion ends the cursor"
     );
     assert_eq!(
@@ -2850,7 +2850,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
         ),
     )
     .expect("open cursor with retained source state");
-    assert!(memory_cursor.first_page.has_more);
+    assert!(memory_cursor.first_page.has_more());
     drop(memory_cursor.first_page);
     let memory_while_open = reader.retained_bytes_for_test();
     assert!(
@@ -2882,14 +2882,14 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
         ),
     )
     .expect("open cursor for exhaustion release");
-    let mut has_more = exhausted_cursor.first_page.has_more;
+    let mut has_more = exhausted_cursor.first_page.has_more();
     drop(exhausted_cursor.first_page);
     while has_more {
         let page = exhausted_cursor
             .cursor
             .fetch(NonZeroUsize::new(2), OwnerReadCancellation::new())
             .expect("drain cursor to genuine exhaustion");
-        has_more = page.page.has_more;
+        has_more = page.page.has_more();
     }
     exhausted_cursor
         .cursor
@@ -2936,7 +2936,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
         ),
     )
     .expect("open snapshot-pinning cursor");
-    assert!(snapshot_cursor.first_page.has_more);
+    assert!(snapshot_cursor.first_page.has_more());
     drop(snapshot_cursor.first_page);
     assert!(
         reader.retained_bytes_for_test() > snapshot_baseline_memory,
@@ -2970,7 +2970,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
             .cursor
             .fetch(NonZeroUsize::new(2), OwnerReadCancellation::new())
             .expect("drain cursor with the superseded row still in its future");
-        has_more = page.page.has_more;
+        has_more = page.page.has_more();
     }
     let used_after_exhaustion = reader.retained_bytes_for_test();
     assert!(
@@ -3025,7 +3025,7 @@ fn cursor_terminal_paths_release_accounted_memory_and_snapshot_pin() {
         ),
     )
     .expect("open cursor for expiry release");
-    assert!(expiry_cursor.first_page.has_more);
+    assert!(expiry_cursor.first_page.has_more());
     memory_db
         .execute(
             "UPDATE cursor_expiry_rows SET payload = $payload WHERE id = 4",

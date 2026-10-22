@@ -109,7 +109,7 @@ fn asserted_newest(
     arm: &str,
 ) {
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![
             Value::Int64(expected_sequence),
             Value::Text("committed".to_owned())
@@ -117,9 +117,9 @@ fn asserted_newest(
         "{arm} returns the stream's newest committed event"
     );
     assert!(
-        result.trace.sort_elided,
+        result.trace().sort_elided,
         "{arm} lets the automatic unique source-stream index supply descending sequence order; trace={:?}",
-        result.trace
+        result.trace()
     );
     let automatic_stream_index = database
         .table_meta("events")
@@ -137,7 +137,7 @@ fn asserted_newest(
         })
         .expect("the UNIQUE source stream creates its automatic composite index");
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some(automatic_stream_index.name.as_str()),
         "{arm} chooses the automatic UNIQUE index before the equivalent declared index"
     );
@@ -181,7 +181,7 @@ fn staged_newest(
             panic!("read {arm} newest event through its transaction overlay: {error:?}")
         });
     assert_eq!(
-        staged.rows,
+        staged.rows(),
         vec![vec![
             Value::Int64(staged_sequence),
             Value::Text("staged".to_owned())
@@ -189,9 +189,9 @@ fn staged_newest(
         "the {arm} transaction-open reverse walk merges its staged newer event"
     );
     assert!(
-        staged.trace.sort_elided,
+        staged.trace().sort_elided,
         "the {arm} transaction keeps declared-index sort elision while merging its staged row; trace={:?}",
-        staged.trace
+        staged.trace()
     );
     database
         .rollback(transaction)
@@ -237,11 +237,11 @@ fn composite_prefix_newest_row_examines_constant_entries() {
     );
 
     assert_eq!(
-        small_result.trace.rows_examined, large_result.trace.rows_examined,
+        small_result.trace().rows_examined, large_result.trace().rows_examined,
         "the 10- and 20,010-event streams examine the same number of index entries"
     );
     assert_eq!(
-        small_result.trace.rows_examined, neighbour_result.trace.rows_examined,
+        small_result.trace().rows_examined, neighbour_result.trace().rows_examined,
         "a stream's lookup ignores the 20,000 same-context events in another stream"
     );
 
@@ -268,11 +268,11 @@ fn composite_prefix_newest_row_examines_constant_entries() {
     );
 
     assert_eq!(
-        small_staged.trace.rows_examined, large_staged.trace.rows_examined,
+        small_staged.trace().rows_examined, large_staged.trace().rows_examined,
         "transactional lookup examines the same number of entries for 10 and 20,010 committed stream rows"
     );
     assert_eq!(
-        small_staged.trace.rows_examined, neighbour_staged.trace.rows_examined,
+        small_staged.trace().rows_examined, neighbour_staged.trace().rows_examined,
         "transactional lookup ignores 20,000 same-context rows in another stream"
     );
     for (outside, staged, arm) in [
@@ -285,11 +285,11 @@ fn composite_prefix_newest_row_examines_constant_entries() {
         ),
     ] {
         assert!(
-            staged.trace.rows_examined >= outside.trace.rows_examined
-                && staged.trace.rows_examined <= outside.trace.rows_examined + 1,
+            staged.trace().rows_examined >= outside.trace().rows_examined
+                && staged.trace().rows_examined <= outside.trace().rows_examined + 1,
             "the {arm} transactional lookup examines its committed reverse-walk entries plus at most its one staged row; outside={:?}, staged={:?}",
-            outside.trace,
-            staged.trace
+            outside.trace(),
+            staged.trace()
         );
     }
 }
@@ -341,7 +341,7 @@ fn historical_in_list_rebuild_seeks_each_declared_run_from_its_own_edge() {
         )
         .expect("rebuild and read both historical IN-list runs");
     let mut ids = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Int64(id), Value::Int64(_)] => *id,
@@ -355,11 +355,11 @@ fn historical_in_list_rebuild_seeks_each_declared_run_from_its_own_edge() {
         "an old-snapshot IN(high, low) rebuild keeps both independently sought runs"
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some("historical_members_key")
     );
     assert_eq!(
-        result.trace.rows_examined, 4,
+        result.trace().rows_examined, 4,
         "the rebuild and answer each touch exactly the two listed postings, never the gap or the newer root"
     );
 }
@@ -404,7 +404,7 @@ fn transaction_ordered_merge_uses_every_directed_sort_key() {
         )
         .expect("merge staged and committed rows in the index order");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![
             vec![Value::Text("staged-null".to_owned()), Value::Null],
             vec![Value::Text("committed-five".to_owned()), Value::Int64(5),],
@@ -413,9 +413,9 @@ fn transaction_ordered_merge_uses_every_directed_sort_key() {
         "the pinned leading key and tied middle key defer to the final DESC NULL-first key for both staged sorting and committed merging"
     );
     assert!(
-        result.trace.sort_elided,
+        result.trace().sort_elided,
         "the full mixed-direction declared order remains index supplied; trace={:?}",
-        result.trace
+        result.trace()
     );
     database
         .rollback(transaction)
@@ -428,15 +428,15 @@ fn assert_cutoff_answer(
     key_column: &str,
 ) {
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![Value::Int64(3), Value::Int64(10)]],
         "the {key_column} reverse walk returns the row at the inclusive cutoff"
     );
-    assert_eq!(result.trace.index_used.as_deref(), Some(expected_index));
+    assert_eq!(result.trace().index_used.as_deref(), Some(expected_index));
     assert!(
-        result.trace.sort_elided,
+        result.trace().sort_elided,
         "the {key_column} reverse walk remains index supplied; trace={:?}",
-        result.trace
+        result.trace()
     );
 }
 
@@ -520,23 +520,23 @@ fn reverse_range_seek_ignores_twenty_thousand_keys_above_the_cutoff() {
 
     assert_eq!(
         (
-            large_single.trace.rows_examined,
-            large_composite.trace.rows_examined,
+            large_single.trace().rows_examined,
+            large_composite.trace().rows_examined,
         ),
         (
-            small_single.trace.rows_examined,
-            small_composite.trace.rows_examined,
+            small_single.trace().rows_examined,
+            small_composite.trace().rows_examined,
         ),
         "neither the full-width nor padded composite reverse seek examines any of the 20,000 keys above its upper edge; small=({:?}, {:?}), large=({:?}, {:?})",
-        small_single.trace,
-        small_composite.trace,
-        large_single.trace,
-        large_composite.trace,
+        small_single.trace(),
+        small_composite.trace(),
+        large_single.trace(),
+        large_composite.trace(),
     );
     assert_eq!(
         (
-            large_single.trace.rows_examined,
-            large_composite.trace.rows_examined,
+            large_single.trace().rows_examined,
+            large_composite.trace().rows_examined,
         ),
         (1, 1),
         "each bounded reverse seek touches only its answer"
@@ -644,7 +644,7 @@ fn durable_newest_event_reader_child() {
                     &HashMap::new()
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("p".repeat(65536))]]
         );
     }
@@ -657,8 +657,8 @@ fn durable_newest_event_reader_child() {
         completed - 1,
         "fresh saved index after displacement",
     );
-    assert!(answer.trace.sort_elided);
+    assert!(answer.trace().sort_elided);
     assert!(database.__writer_cache_stats_for_test().unwrap().1 > displaced.1);
-    println!("DURABLE_NEWEST {}", answer.trace.rows_examined);
+    println!("DURABLE_NEWEST {}", answer.trace().rows_examined);
     database.close().unwrap();
 }

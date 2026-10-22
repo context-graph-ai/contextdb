@@ -60,14 +60,14 @@ fn newest_event_merges_staged_order_without_sort() {
                 .unwrap()
         });
         assert_eq!(
-            inside.rows,
+            inside.rows(),
             vec![vec![
                 Value::Int64(committed + 1),
                 Value::Text("staged-newest".to_owned())
             ]]
         );
         assert!(
-            inside.trace.sort_elided,
+            inside.trace().sort_elided,
             "the declared index supplies the transactional order"
         );
         // A staged delete and inserts must remain private to this transaction.
@@ -105,9 +105,9 @@ fn newest_event_merges_staged_order_without_sort() {
             committed - 2,
             "delete-only staged lookup",
         );
-        assert!(answer.trace.sort_elided);
+        assert!(answer.trace().sort_elided);
         assert_eq!(work.staged_sort_calls, 0);
-        deleted_only.push(answer.trace.rows_examined);
+        deleted_only.push(answer.trace().rows_examined);
         asserted_newest(
             &database,
             &newest(&database, context, stream),
@@ -116,8 +116,8 @@ fn newest_event_merges_staged_order_without_sort() {
         );
         database.rollback(deleted).unwrap();
         observed.push((
-            outside.trace.rows_examined,
-            inside.trace.rows_examined,
+            outside.trace().rows_examined,
+            inside.trace().rows_examined,
             outside_work,
             inside_work,
         ));

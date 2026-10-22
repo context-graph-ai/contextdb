@@ -103,29 +103,29 @@ fn a_bounded_primary_key_read_reaches_its_row_instead_of_walking_the_table() {
     .expect("a bounded primary-key read must be served");
 
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         1,
         "the equality predicate names exactly one stored row"
     );
     assert_eq!(
-        outcome.result.trace.physical_plan, "IndexScan",
+        outcome.result.trace().physical_plan, "IndexScan",
         "a primary-key equality is answered through the key's own index"
     );
     assert!(
         outcome
             .result
-            .trace
+            .trace()
             .index_used
             .as_deref()
             .is_some_and(|index| index.starts_with("__pk_")),
         "the trace names the index that answered, got {:?}",
-        outcome.result.trace.index_used
+        outcome.result.trace().index_used
     );
     assert!(
-        outcome.result.trace.rows_examined <= SEEK_ENTRY_BUDGET,
+        outcome.result.trace().rows_examined <= SEEK_ENTRY_BUDGET,
         "reaching one key must cost about one key; the trace reports {} examined against \
          {STORED_ROWS} stored rows",
-        outcome.result.trace.rows_examined
+        outcome.result.trace().rows_examined
     );
 }
 
@@ -158,9 +158,9 @@ fn a_bounded_primary_key_read_answers_the_same_rows_as_a_full_scan() {
     )
     .expect("the scanning read must be served");
 
-    assert_eq!(seek.result.columns, scan.result.columns);
+    assert_eq!(seek.result.columns(), scan.result.columns());
     assert_eq!(
-        seek.result.rows, scan.result.rows,
+        seek.result.rows(), scan.result.rows(),
         "a seek and a scan must answer the same rows for the same predicate"
     );
 }
@@ -179,17 +179,17 @@ fn a_range_over_a_synthesized_index_keeps_scanning() {
     .expect("a bounded range read must be served");
 
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         2,
         "the range names the two rows above its bound"
     );
     assert_eq!(
-        outcome.result.trace.physical_plan, "Scan",
+        outcome.result.trace().physical_plan, "Scan",
         "a range names no whole key, so an exact-lookup index cannot answer it and the read \
          stays on the scan path"
     );
     assert_eq!(
-        outcome.result.trace.index_used, None,
+        outcome.result.trace().index_used, None,
         "a read that scanned must not report an index it did not use"
     );
 }

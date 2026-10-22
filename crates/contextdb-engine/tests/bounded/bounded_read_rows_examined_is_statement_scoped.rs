@@ -83,15 +83,15 @@ fn a_bounded_scan_reports_the_rows_it_examined() {
     let bounded_scan = bounded(&database, SCAN);
     println!(
         "OBSERVED scan: executor examined {} | bounded examined {}",
-        eager_scan.trace.rows_examined, bounded_scan.trace.rows_examined
+        eager_scan.trace().rows_examined, bounded_scan.trace().rows_examined
     );
 
     assert_eq!(
-        eager_scan.trace.rows_examined, SEEDED_ROWS,
+        eager_scan.trace().rows_examined, SEEDED_ROWS,
         "the fixture holds exactly {SEEDED_ROWS} rows and the executor scanned all of them"
     );
     assert_eq!(
-        bounded_scan.trace.rows_examined, SEEDED_ROWS,
+        bounded_scan.trace().rows_examined, SEEDED_ROWS,
         "a bounded scan of the same {SEEDED_ROWS} rows examined all of them too, and says so"
     );
 }
@@ -100,20 +100,20 @@ fn a_bounded_scan_reports_the_rows_it_examined() {
 fn a_bounded_scan_still_reports_its_own_rows_after_unrelated_schema_work() {
     let database = seeded();
 
-    let before = bounded(&database, SCAN).trace.rows_examined;
+    let before = bounded(&database, SCAN).trace().rows_examined;
     let schema_work = eager(
         &database,
         "CREATE TABLE unrelated_to_the_scan (id INTEGER PRIMARY KEY)",
     );
-    let after = bounded(&database, SCAN).trace.rows_examined;
+    let after = bounded(&database, SCAN).trace().rows_examined;
     println!(
         "OBSERVED across schema work: bounded examined {before}, then the schema statement \
          examined {}, then bounded examined {after}",
-        schema_work.trace.rows_examined
+        schema_work.trace().rows_examined
     );
 
     assert_eq!(
-        schema_work.trace.rows_examined, 0,
+        schema_work.trace().rows_examined, 0,
         "a statement that creates a table examines no rows"
     );
     assert_eq!(
@@ -154,8 +154,8 @@ fn a_bounded_read_examines_what_the_executor_examines_for_every_shape() {
             "SELECT COUNT(*) FROM traced",
         ),
     ] {
-        let eager_examined = eager(&database, sql).trace.rows_examined;
-        let bounded_examined = bounded(&database, sql).trace.rows_examined;
+        let eager_examined = eager(&database, sql).trace().rows_examined;
+        let bounded_examined = bounded(&database, sql).trace().rows_examined;
         println!(
             "OBSERVED {what}: executor examined {eager_examined} | bounded examined \
              {bounded_examined}"

@@ -105,7 +105,7 @@ fn source_params() -> HashMap<String, Value> {
 }
 
 fn answer(result: &QueryResult) -> String {
-    format!("{:?}", result.rows)
+    format!("{:?}", result.rows())
 }
 
 fn eager(database: &Database) -> QueryResult {

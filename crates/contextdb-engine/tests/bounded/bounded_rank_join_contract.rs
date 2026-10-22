@@ -164,7 +164,7 @@ fn a_ranked_read_resolves_its_joined_row_without_reading_the_joined_table() {
         .expect("a ranked vector read must be served");
 
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         RANKED_LIMIT as usize,
         "the ranked read answers with the candidates it asked for"
     );
@@ -203,5 +203,5 @@ fn a_ranked_read_is_served_under_a_work_ceiling_sized_for_its_candidates() {
             limits.work
         ),
     };
-    assert_eq!(served.result.rows.len(), RANKED_LIMIT as usize);
+    assert_eq!(served.result.rows().len(), RANKED_LIMIT as usize);
 }

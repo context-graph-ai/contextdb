@@ -83,11 +83,11 @@ fn described(trace: &QueryTrace) -> String {
 /// doors row-by-row would fail on something neither of them promises; those
 /// answers are compared as sets and the ordered ones as sequences.
 fn answer(result: &QueryResult, ordered: bool) -> String {
-    let mut rows: Vec<String> = result.rows.iter().map(|row| format!("{row:?}")).collect();
+    let mut rows: Vec<String> = result.rows().iter().map(|row| format!("{row:?}")).collect();
     if !ordered {
         rows.sort();
     }
-    format!("columns={:?} rows={rows:?}", result.columns)
+    format!("columns={:?} rows={rows:?}", result.columns())
 }
 
 struct Case {
@@ -408,12 +408,12 @@ fn a_bounded_read_describes_its_plan_the_way_the_executor_does() {
             .execute(&case.sql, &case.params)
             .unwrap_or_else(|error| panic!("a bounded read answers {}: {error}", case.name));
 
-        covered.insert(eager.trace.physical_plan);
+        covered.insert(eager.trace().physical_plan);
         println!(
             "OBSERVED {}: executor {} | bounded {}",
             case.name,
-            described(&eager.trace),
-            described(&bounded.trace)
+            described(&eager.trace()),
+            described(&bounded.trace())
         );
 
         if answer(&bounded, case.ordered) != answer(&eager, case.ordered) {
@@ -424,12 +424,12 @@ fn a_bounded_read_describes_its_plan_the_way_the_executor_does() {
                 answer(&bounded, case.ordered)
             ));
         }
-        if described(&bounded.trace) != described(&eager.trace) {
+        if described(&bounded.trace()) != described(&eager.trace()) {
             disagreements.push(format!(
                 "{}: the executor describes the plan as {} and a bounded read describes it as {}",
                 case.name,
-                described(&eager.trace),
-                described(&bounded.trace)
+                described(&eager.trace()),
+                described(&bounded.trace())
             ));
         }
     }
@@ -466,7 +466,7 @@ fn a_bounded_read_names_the_stored_column_a_query_vector_came_from() {
         .execute(sql, &anchor)
         .expect("the executor answers");
     assert_eq!(
-        eager.trace.query_vector_source,
+        eager.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding")),
         "the executor names the column the query vector was read from"
     );
@@ -477,7 +477,7 @@ fn a_bounded_read_names_the_stored_column_a_query_vector_came_from() {
         .execute(sql, &anchor)
         .expect("a bounded read answers");
     assert_eq!(
-        bounded.trace.query_vector_source, eager.trace.query_vector_source,
+        bounded.trace().query_vector_source, eager.trace().query_vector_source,
         "a bounded read names the same stored column the executor names"
     );
 }
@@ -566,12 +566,12 @@ fn a_bounded_read_probes_adjacency_when_only_the_end_of_a_hop_is_pinned() {
         // The oracle itself is checked, so this case cannot degrade into two
         // doors agreeing on a full scan.
         assert_eq!(
-            eager.trace.physical_plan, "AdjacencyProbe",
+            eager.trace().physical_plan, "AdjacencyProbe",
             "the executor probes adjacency for {what} rather than walking every edge: {:?}",
-            eager.trace
+            eager.trace()
         );
         assert_eq!(
-            eager.rows.len(),
+            eager.rows().len(),
             1,
             "exactly one edge of this type ends at the pinned node"
         );
@@ -592,10 +592,10 @@ fn a_bounded_read_probes_adjacency_when_only_the_end_of_a_hop_is_pinned() {
         };
         println!(
             "OBSERVED {what}: executor {} examined={} | bounded {} examined={}",
-            described(&eager.trace),
-            eager.trace.rows_examined,
-            described(&bounded.trace),
-            bounded.trace.rows_examined
+            described(&eager.trace()),
+            eager.trace().rows_examined,
+            described(&bounded.trace()),
+            bounded.trace().rows_examined
         );
 
         if answer(&bounded, false) != answer(&eager, false) {
@@ -605,18 +605,18 @@ fn a_bounded_read_probes_adjacency_when_only_the_end_of_a_hop_is_pinned() {
                 answer(&bounded, false)
             ));
         }
-        if described(&bounded.trace) != described(&eager.trace) {
+        if described(&bounded.trace()) != described(&eager.trace()) {
             disagreements.push(format!(
                 "{what}: the executor describes the plan as {} and a bounded read describes it \
                  as {}",
-                described(&eager.trace),
-                described(&bounded.trace)
+                described(&eager.trace()),
+                described(&bounded.trace())
             ));
         }
-        if bounded.trace.rows_examined != eager.trace.rows_examined {
+        if bounded.trace().rows_examined != eager.trace().rows_examined {
             disagreements.push(format!(
                 "{what}: the executor examined {} rows and a bounded read reports {}",
-                eager.trace.rows_examined, bounded.trace.rows_examined
+                eager.trace().rows_examined, bounded.trace().rows_examined
             ));
         }
     }
@@ -785,9 +785,9 @@ fn a_bounded_read_probes_adjacency_when_the_start_is_named_by_something_other_th
         // The oracle itself is checked, so this case cannot degrade into two
         // doors agreeing on a full scan.
         assert_eq!(
-            eager.trace.physical_plan, "AdjacencyProbe",
+            eager.trace().physical_plan, "AdjacencyProbe",
             "the executor resolves the start and then probes adjacency for {what}: {:?}",
-            eager.trace
+            eager.trace()
         );
 
         let bounded = match database
@@ -806,10 +806,10 @@ fn a_bounded_read_probes_adjacency_when_the_start_is_named_by_something_other_th
         };
         println!(
             "OBSERVED {what}: executor {} examined={} | bounded {} examined={}",
-            described(&eager.trace),
-            eager.trace.rows_examined,
-            described(&bounded.trace),
-            bounded.trace.rows_examined
+            described(&eager.trace()),
+            eager.trace().rows_examined,
+            described(&bounded.trace()),
+            bounded.trace().rows_examined
         );
 
         if answer(&bounded, false) != answer(&eager, false) {
@@ -819,18 +819,18 @@ fn a_bounded_read_probes_adjacency_when_the_start_is_named_by_something_other_th
                 answer(&bounded, false)
             ));
         }
-        if described(&bounded.trace) != described(&eager.trace) {
+        if described(&bounded.trace()) != described(&eager.trace()) {
             disagreements.push(format!(
                 "{what}: the executor describes the plan as {} and a bounded read describes it \
                  as {}",
-                described(&eager.trace),
-                described(&bounded.trace)
+                described(&eager.trace()),
+                described(&bounded.trace())
             ));
         }
-        if bounded.trace.rows_examined != eager.trace.rows_examined {
+        if bounded.trace().rows_examined != eager.trace().rows_examined {
             disagreements.push(format!(
                 "{what}: the executor examined {} rows and a bounded read reports {}",
-                eager.trace.rows_examined, bounded.trace.rows_examined
+                eager.trace().rows_examined, bounded.trace().rows_examined
             ));
         }
     }
@@ -906,15 +906,15 @@ fn a_bounded_probe_counts_the_entries_in_its_answer_not_the_ones_it_stepped_over
         .execute(sql, &hub)
         .expect("the executor answers the probe");
     assert_eq!(
-        eager.rows.len() as u128,
+        eager.rows().len() as u128,
         LIVE_LINKS,
         "the probe returns only the live edges of the type it asked for"
     );
     assert_eq!(
-        eager.trace.rows_examined as u128, LIVE_LINKS,
+        eager.trace().rows_examined as u128, LIVE_LINKS,
         "the executor counts what it returned, not the removed and wrong-typed entries it \
          skipped past: {:?}",
-        eager.trace
+        eager.trace()
     );
 
     let bounded = database
@@ -925,7 +925,7 @@ fn a_bounded_probe_counts_the_entries_in_its_answer_not_the_ones_it_stepped_over
     println!(
         "OBSERVED a crowded adjacency list ({LIVE_LINKS} live, {REMOVED_LINKS} removed, \
          {OTHER_TYPE_EDGES} of another type): executor examined {} | bounded examined {}",
-        eager.trace.rows_examined, bounded.trace.rows_examined
+        eager.trace().rows_examined, bounded.trace().rows_examined
     );
 
     assert_eq!(
@@ -934,10 +934,10 @@ fn a_bounded_probe_counts_the_entries_in_its_answer_not_the_ones_it_stepped_over
         "both doors return the same live edges"
     );
     assert_eq!(
-        bounded.trace.rows_examined, eager.trace.rows_examined,
+        bounded.trace().rows_examined, eager.trace().rows_examined,
         "rows examined is what an operator reads to tell a probe that touched a handful of edges \
          from one that walked a list: the executor reports {} and a bounded read reports {}, \
          which is every entry it stepped over rather than the ones its answer is made of",
-        eager.trace.rows_examined, bounded.trace.rows_examined
+        eager.trace().rows_examined, bounded.trace().rows_examined
     );
 }

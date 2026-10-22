@@ -73,7 +73,7 @@ fn stream_resume_seeks_after_prefix_and_exclusive_ordinal() {
                 &HashMap::new(),
             ).unwrap();
             assert_eq!(
-                result.rows,
+                result.rows(),
                 expected
                     .into_iter()
                     .map(|(id, ordinal)| vec![Value::Int64(id), Value::Int64(ordinal)])
@@ -81,15 +81,15 @@ fn stream_resume_seeks_after_prefix_and_exclusive_ordinal() {
                 "{completed}/{direction}: the exclusive ordinal excludes both boundary duplicates"
             );
             assert_eq!(
-                result.trace.index_used.as_deref(),
+                result.trace().index_used.as_deref(),
                 Some("resume_stream_position")
             );
             assert!(
-                result.trace.sort_elided,
+                result.trace().sort_elided,
                 "resume must use declared suffix order: {:?}",
-                result.trace
+                result.trace()
             );
-            arm.push(result.trace.rows_examined);
+            arm.push(result.trace().rows_examined);
         }
         measurements.push(arm);
     }
@@ -357,14 +357,14 @@ fn measure_consumer_tail(database: &Database, completed: i64) -> (u64, u64) {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        result.rows, expected,
+        result.rows(), expected,
         "the batch claim returns only its ordered pending session tail"
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some("idx_event_search_source_events_session_claim")
     );
-    assert!(result.trace.sort_elided);
+    assert!(result.trace().sort_elided);
     let discovery = database.execute(
             "SELECT ordinal FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND source_sequence > $committed ORDER BY source_sequence ASC LIMIT 1",
             &HashMap::from([
@@ -376,13 +376,13 @@ fn measure_consumer_tail(database: &Database, completed: i64) -> (u64, u64) {
                 ("committed".into(), Value::Int64(completed)),
             ]),
         ).unwrap();
-    assert_eq!(discovery.rows, vec![vec![Value::Int64(100_000)]]);
+    assert_eq!(discovery.rows(), vec![vec![Value::Int64(100_000)]]);
     assert_eq!(
-        discovery.trace.index_used.as_deref(),
+        discovery.trace().index_used.as_deref(),
         Some("idx_event_search_source_events_session_sequence")
     );
-    assert!(discovery.trace.sort_elided);
-    (result.trace.rows_examined, discovery.trace.rows_examined)
+    assert!(discovery.trace().sort_elided);
+    (result.trace().rows_examined, discovery.trace().rows_examined)
 }
 #[test]
 fn durable_consumer_reader_child() {
@@ -411,7 +411,7 @@ fn durable_consumer_reader_child() {
                     &HashMap::new()
                 )
                 .unwrap()
-                .rows,
+                .rows(),
             vec![vec![Value::Text("p".repeat(65536))]]
         );
     }

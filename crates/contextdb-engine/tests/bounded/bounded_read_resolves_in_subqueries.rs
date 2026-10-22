@@ -94,7 +94,7 @@ const IN_SUBQUERY: &str =
     "SELECT name FROM employees WHERE dept IN (SELECT name FROM departments) ORDER BY name";
 
 fn answer(result: &QueryResult) -> String {
-    format!("columns={:?} rows={:?}", result.columns, result.rows)
+    format!("columns={:?} rows={:?}", result.columns(), result.rows())
 }
 
 fn both_doors_agree(database: &Database, what: &str, disagreements: &mut Vec<String>) {
@@ -102,7 +102,7 @@ fn both_doors_agree(database: &Database, what: &str, disagreements: &mut Vec<Str
         .execute(IN_SUBQUERY, &empty())
         .unwrap_or_else(|error| panic!("the executor answers {what}: {error}"));
     assert_eq!(
-        eager.rows.len(),
+        eager.rows().len(),
         3,
         "{what}: the fixture keeps the three people in a department that exists"
     );

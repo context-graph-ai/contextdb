@@ -115,7 +115,7 @@ fn source_params() -> HashMap<String, Value> {
 }
 
 fn answer(result: &QueryResult) -> String {
-    format!("{:?}", result.rows)
+    format!("{:?}", result.rows())
 }
 
 fn eager(database: &Database) -> contextdb_core::Result<QueryResult> {
@@ -280,7 +280,7 @@ fn clearing_the_vector_a_search_measures_from_fails_the_same_way_through_both_do
         Ok(answered) => panic!(
             "a bounded read answered {:?} from a vector this transaction cleared -- falling back \
              on the committed vector answers a question nobody asked",
-            answered.rows
+            answered.rows()
         ),
         Err(bounded_refusal) => assert_eq!(
             format!("{bounded_refusal:?}"),

@@ -149,7 +149,7 @@ fn a_traversal_that_accumulates_edges_grows_its_state_in_amortized_steps() {
 
     let outcome = bounded::execute(&db, &request).expect("an open traversal must be served");
     assert_eq!(
-        outcome.result.rows.len(),
+        outcome.result.rows().len(),
         ACCUMULATED_EDGES as usize,
         "the traversal reports every stored edge"
     );

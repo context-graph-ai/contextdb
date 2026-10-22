@@ -178,7 +178,7 @@ fn a_nearest_neighbour_read_answers_the_same_rows_when_the_index_graph_falls_sho
         .execute(VECTOR_SQL, &query_params())
         .expect("the eager route serves the nearest-neighbour read");
     assert_eq!(
-        eager.rows.len(),
+        eager.rows().len(),
         VECTOR_TOP_K,
         "the eager route reads the stored vectors exactly when the graph hands back \
          {SHORT_GRAPH_CANDIDATES} usable candidates for {VECTOR_TOP_K} requested neighbours; \
@@ -195,14 +195,14 @@ fn a_nearest_neighbour_read_answers_the_same_rows_when_the_index_graph_falls_sho
          shortfall at all"
     );
     assert_eq!(
-        outcome.result.rows,
-        eager.rows,
+        outcome.result.rows(),
+        eager.rows(),
         "the graph handed back {SHORT_GRAPH_CANDIDATES} usable candidates for {VECTOR_TOP_K} \
          requested neighbours; the bounded route returned {} rows where the same statement on \
          the eager route returns {}, so a caller on the bounded route is quietly served a \
          shorter answer from the same committed state",
-        outcome.result.rows.len(),
-        eager.rows.len()
+        outcome.result.rows().len(),
+        eager.rows().len()
     );
 }
 
@@ -231,14 +231,14 @@ fn a_budget_too_small_for_the_read_a_graph_shortfall_requires_is_refused_not_sho
 
     match bounded::execute(&db, &request) {
         Ok(outcome) => assert_eq!(
-            outcome.result.rows.len(),
+            outcome.result.rows().len(),
             VECTOR_TOP_K,
             "a read served inside a {} unit budget answered with {} of {VECTOR_TOP_K} requested \
              neighbours; a caller told its read succeeded cannot tell that the graph shortfall \
              cost it rows, so the short answer must instead be a refusal naming the ceiling it \
              could not pay",
             limits.work,
-            outcome.result.rows.len()
+            outcome.result.rows().len()
         ),
         Err(bounded::TestError::Refused(refusal)) => {
             assert_eq!(
