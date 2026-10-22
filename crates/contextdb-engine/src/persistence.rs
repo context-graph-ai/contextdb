@@ -27,10 +27,12 @@ use crate::database::trigger::TriggerPersistenceCommit;
 use crate::direct_file_reader::DirectTypedImageDigest;
 use crate::local_transport::{RuntimeDirectory, derive_channel_address};
 use crate::sync_types::DdlChange;
+#[cfg(target_os = "linux")]
+use contextdb_core::read_contract::ReaderProcessIdentity;
 use contextdb_core::read_contract::{
     ChannelAddress, DatabaseIdentity, HeldByReadersDetail, HeldByWriterDetail, LocalUserIdentity,
     OwnerReadCancellation, OwnerReadStatus, OwnerServingReason, OwnerServingState, ReadFailure,
-    ReadFailureDetail, ReadFailureKind, ReaderBreadcrumb, ReaderProcessIdentity, WriterRunNumber,
+    ReadFailureDetail, ReadFailureKind, ReaderBreadcrumb, WriterRunNumber,
 };
 use contextdb_core::{
     AdjEntry, ColumnType, DirectedValue, Error, ForeignKeyReference, IndexDecl, IndexKey,
@@ -2887,7 +2889,10 @@ mod macos_process_info_observation {
             // preserve the original panic instead of causing a double panic.
             if !std::thread::panicking() {
                 let finished = finished.expect("native observation scope is absent");
-                assert!(!finished.rejected, "native observation sequence was rejected");
+                assert!(
+                    !finished.rejected,
+                    "native observation sequence was rejected"
+                );
                 assert!(
                     finished.pending.is_empty(),
                     "native observation scope has {} unused results ({} calls, {} consumed)",
@@ -2902,7 +2907,10 @@ mod macos_process_info_observation {
     /// Runs on this thread only. Nested scopes suspend the outer queue and
     /// counters; leaving either scope restores its predecessor and native errno.
     /// A caught sequence panic still rejects the scope on normal exit.
-    pub(super) fn with_observations<R>(observations: Vec<Observation>, run: impl FnOnce() -> R) -> R {
+    pub(super) fn with_observations<R>(
+        observations: Vec<Observation>,
+        run: impl FnOnce() -> R,
+    ) -> R {
         // SAFETY: Darwin's __error returns this thread's live errno slot.
         let errno = unsafe { *libc::__error() };
         let previous = STATE.with(|slot| {
@@ -2956,7 +2964,10 @@ mod macos_process_info_observation {
 #[cfg(target_os = "macos")]
 fn macos_process_info(
     process_id: u32,
-) -> std::io::Result<(libc::proc_bsdinfo, contextdb_core::read_contract::ProcessStartIdentity)> {
+) -> std::io::Result<(
+    libc::proc_bsdinfo,
+    contextdb_core::read_contract::ProcessStartIdentity,
+)> {
     let pid = libc::c_int::try_from(process_id)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if pid == 0 {
@@ -3021,7 +3032,10 @@ fn macos_process_info(
                 "macOS process start identity was rejected",
             )
         })?;
-    Ok((info, contextdb_core::read_contract::ProcessStartIdentity(packed)))
+    Ok((
+        info,
+        contextdb_core::read_contract::ProcessStartIdentity(packed),
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -3032,7 +3046,10 @@ fn macos_reader_process_display_name(info: &libc::proc_bsdinfo) -> Option<String
         let Some(end) = field.iter().position(|byte| *byte == 0) else {
             continue;
         };
-        let bytes = field[..end].iter().map(|byte| *byte as u8).collect::<Vec<_>>();
+        let bytes = field[..end]
+            .iter()
+            .map(|byte| *byte as u8)
+            .collect::<Vec<_>>();
         if let Ok(name) = std::str::from_utf8(&bytes)
             && safe_reader_process_display_name(name)
         {
