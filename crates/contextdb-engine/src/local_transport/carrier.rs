@@ -393,6 +393,91 @@ impl UnixLocalCarrier {
         }
     }
 
+    /// Engine startup keeps this probe on its admitted caller frame. The
+    /// existing supplied clock owns the deadline and the native wake cell;
+    /// no std Thread handle is materialized on a callback-owned pthread.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn probe_stale_funded(
+        &self,
+        path: &std::path::Path,
+        expected_owner: &LocalHandshake,
+        clock: &std::sync::Arc<dyn DeadlineClock>,
+        deadline_ms: u64,
+        owner: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> crate::owner_read::OwnerReadScaffoldResult<StaleChannelEvidence> {
+        let probe_owner = owner.clone();
+        let future = async move {
+            let owner = probe_owner;
+            let result: Result<StaleChannelEvidence, LocalTransportError> = async {
+                use std::os::unix::fs::FileTypeExt;
+
+                let metadata = std::fs::symlink_metadata(path)
+                    .map_err(|_| LocalTransportError::StaleChannelUnverifiable)?;
+                if !metadata.file_type().is_socket() {
+                    return Err(LocalTransportError::StaleChannelUnverifiable);
+                }
+                let filesystem = StaleFilesystemEvidence::Exact(
+                    super::channel_filesystem_identity(path)
+                        .map_err(|_| LocalTransportError::StaleChannelUnverifiable)?,
+                );
+                let attempt = super::deadline_operation_funded(
+                    clock.as_ref(),
+                    super::DeadlineStage::StaleProbe,
+                    deadline_ms,
+                    owner.clone(),
+                    || async { connect_readiness(path)?.await },
+                )
+                .await;
+                let stream = match attempt {
+                    Ok(ConnectAttempt::Connected(stream)) => stream,
+                    Ok(ConnectAttempt::NoListener) => {
+                        return Ok(StaleChannelEvidence {
+                            identity: StaleIdentityEvidence::VerifiedOwner,
+                            liveness: LivenessEvidence::NoResponderBeforeDeadline,
+                            filesystem,
+                        });
+                    }
+                    Ok(ConnectAttempt::AddressAbsent) => {
+                        return Err(LocalTransportError::StaleChannelUnverifiable);
+                    }
+                    Err(error) if error == super::owner_timeout() => {
+                        return Ok(StaleChannelEvidence {
+                            identity: StaleIdentityEvidence::VerifiedOwner,
+                            liveness: LivenessEvidence::NoResponderBeforeDeadline,
+                            filesystem,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut stream = stream;
+                match super::authenticate_framed_stream_handshake_funded(
+                    &mut stream,
+                    expected_owner,
+                    clock.as_ref(),
+                    deadline_ms,
+                    owner.clone(),
+                )
+                .await
+                {
+                    Ok(_) => Ok(StaleChannelEvidence {
+                        identity: StaleIdentityEvidence::VerifiedOwner,
+                        liveness: LivenessEvidence::LiveResponder,
+                        filesystem,
+                    }),
+                    Err(error) if error == super::owner_timeout() => Ok(StaleChannelEvidence {
+                        identity: StaleIdentityEvidence::VerifiedOwner,
+                        liveness: LivenessEvidence::NoResponderBeforeDeadline,
+                        filesystem,
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+            .await;
+            result.map_err(crate::owner_read::OwnerReadScaffoldError::from_local)
+        };
+        super::deadlines::drive_local(future, clock, owner)
+    }
+
     pub fn remove_after_proven_stale(
         &self,
         path: &std::path::Path,

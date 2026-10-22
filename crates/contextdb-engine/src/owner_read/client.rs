@@ -690,7 +690,8 @@ impl CancelCoordination {
         *self
             .reading
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(crate::owned_worker::current_thread_id());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(crate::owned_worker::current_thread_id());
         ReadingHere { coordination: self }
     }
 

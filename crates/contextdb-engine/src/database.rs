@@ -31021,9 +31021,10 @@ impl Database {
     ) -> std::result::Result<Arc<crate::owner_read::OwnerReadService>, String> {
         use crate::local_transport::{
             ChannelPathFacts, LocalConfigurationSource, LocalHandshake, OWNER_ONLY_MODE,
-            StaleChannelAction, StaleChannelProbe, UnixLocalCarrier, channel_socket_path,
-            reconcile_stale_channel,
+            StaleChannelAction, UnixLocalCarrier, channel_socket_path,
         };
+        #[cfg(not(target_os = "linux"))]
+        use crate::local_transport::{StaleChannelProbe, reconcile_stale_channel};
         use crate::owner_read::{OwnerReadService, OwnerServiceSpec, ValidatedOwnerListener};
         use contextdb_core::read_contract::{DeadlineClock, OwnerReadStatus, OwnerServingState};
 
@@ -31058,7 +31059,24 @@ impl Database {
                     .now_ms()
                     .checked_add(ReadClientTimeouts::default().connect_ms)
                     .ok_or_else(|| "owner-channel startup deadline overflow".to_owned())?;
-                match reconcile_stale_channel(
+                #[cfg(target_os = "linux")]
+                let action = {
+                    let evidence = UnixLocalCarrier
+                        .probe_stale_funded(
+                            &channel_path,
+                            &handshake,
+                            &clock,
+                            deadline_ms,
+                            self.finalization
+                                .accountant
+                                .read_budget()
+                                .map_err(|error| error.to_string())?,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    UnixLocalCarrier.remove_after_proven_stale(&channel_path, evidence)
+                };
+                #[cfg(not(target_os = "linux"))]
+                let action = reconcile_stale_channel(
                     &UnixLocalCarrier,
                     &StaleChannelProbe {
                         path: channel_path.clone(),
@@ -31066,9 +31084,8 @@ impl Database {
                     },
                     clock.as_ref(),
                     deadline_ms,
-                )
-                .map_err(|error| error.to_string())?
-                {
+                );
+                match action.map_err(|error| error.to_string())? {
                     StaleChannelAction::RemoveAndRetry => {}
                     StaleChannelAction::Preserve => {
                         return Err(
@@ -31109,7 +31126,6 @@ impl Database {
         );
         OwnerReadService::start(spec).map_err(|error| error.to_string())
     }
-
     #[cfg(unix)]
     fn owner_read_clock(&self) -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
         #[cfg(any(test, feature = "test-seams"))]

@@ -4250,28 +4250,69 @@ async fn send_authoritative_response(
 #[cfg(unix)]
 async fn await_authoritative_response_send<T>(
     budget: &crate::executor::ReadPublicationBudget,
-    mut send: impl std::future::Future<Output = Result<T, crate::local_transport::LocalTransportError>> + Unpin,
+    mut send: impl std::future::Future<Output = Result<T, crate::local_transport::LocalTransportError>>
+    + Unpin,
     owner: &contextdb_core::read_memory::ReadMemoryOwner,
 ) -> Result<T, crate::local_transport::LocalTransportError> {
-    let mut expiry = crate::local_transport::wait_until_owned(budget.clock.as_ref(), budget.deadline_ms(), owner)
-        .map_err(|error| crate::local_transport::query_funding::transport_error(error, u64::MAX))?;
+    let mut expiry = crate::local_transport::wait_until_owned(
+        budget.clock.as_ref(),
+        budget.deadline_ms(),
+        owner,
+    )
+    .map_err(|error| crate::local_transport::query_funding::transport_error(error, u64::MAX))?;
     let mut expiry_completed = false;
+    #[cfg(target_os = "linux")]
+    let park = crate::local_transport::native_driver::NativeCallerPark::try_new(owner.clone())
+        .map_err(|error| crate::local_transport::query_funding::transport_error(error, u64::MAX))?;
+    #[cfg(target_os = "linux")]
+    let binding =
+        match contextdb_core::read_contract::NativeClockBinding::try_select(&budget.clock, owner) {
+            Ok(binding) => Some(binding),
+            Err(contextdb_core::Error::ReadSessionNotImplemented) => None,
+            Err(error) => {
+                return Err(crate::local_transport::query_funding::transport_error(
+                    error,
+                    u64::MAX,
+                ));
+            }
+        };
+    #[cfg(target_os = "linux")]
+    let waiting_wake = park.wake.clone();
+    #[cfg(not(target_os = "linux"))]
     let waiting_thread = std::thread::current();
     let _cancellation = budget
         .cancellation
-        .try_tell_on_cancel(move || waiting_thread.unpark())
+        .try_tell_on_cancel(move || {
+            #[cfg(target_os = "linux")]
+            contextdb_core::read_memory::NativeReadWake::wake_read(&*waiting_wake);
+            #[cfg(not(target_os = "linux"))]
+            waiting_thread.unpark();
+        })
         .map_err(|error| crate::local_transport::query_funding::transport_error(error, u64::MAX))?;
-    std::future::poll_fn(|context| {
+    std::future::poll_fn(|_context| {
+        #[cfg(target_os = "linux")]
+        let waker = park.waker();
+        #[cfg(target_os = "linux")]
+        let mut native_context = std::task::Context::from_waker(&waker);
+        #[cfg(target_os = "linux")]
+        let context = &mut native_context;
+        #[cfg(not(target_os = "linux"))]
+        let context = _context;
         loop {
+            #[cfg(target_os = "linux")]
+            budget.clock.drive_native_deadlines();
             if !expiry_completed {
-                expiry_completed = std::future::Future::poll(std::pin::Pin::new(&mut expiry), context).is_ready();
+                expiry_completed =
+                    std::future::Future::poll(std::pin::Pin::new(&mut expiry), context).is_ready();
             }
             // A completed frame has already published its answer. The caller
             // can advance its clock after receiving it, before this owner
             // thread observes completion; that later deadline cannot withdraw
             // the answer or disconnect the next request. Pending sends remain
             // subject to their original cancellation and active-time budget.
-            if let Poll::Ready(result) = std::future::Future::poll(std::pin::Pin::new(&mut send), context) {
+            if let Poll::Ready(result) =
+                std::future::Future::poll(std::pin::Pin::new(&mut send), context)
+            {
                 return Poll::Ready(result);
             }
             if budget.cancellation.is_cancelled() {
@@ -4282,6 +4323,7 @@ async fn await_authoritative_response_send<T>(
                     budget.exceeded_failure(),
                 )));
             }
+            #[cfg(not(target_os = "linux"))]
             if !expiry_completed {
                 return Poll::Pending;
             }
@@ -4291,6 +4333,26 @@ async fn await_authoritative_response_send<T>(
                     // executor work to starve. The send worker and cancellation
                     // listener both unpark it, while the timeout supplies the
                     // wake that a failed timer arm could not create.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let result = match &binding {
+                            Some(binding) => binding.park_until(budget.deadline_ms(), &park),
+                            None => park.wake.park_once(Some(
+                                u64::try_from(remaining.as_millis())
+                                    .unwrap_or(u64::MAX)
+                                    .max(1),
+                            )),
+                        };
+                        if let Err(error) = result {
+                            return Poll::Ready(Err(
+                                crate::local_transport::query_funding::transport_error(
+                                    error,
+                                    u64::MAX,
+                                ),
+                            ));
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
                     std::thread::park_timeout(remaining);
                 }
                 crate::executor::ReadPublicationDeadline::Elapsed => continue,

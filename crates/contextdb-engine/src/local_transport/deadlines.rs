@@ -1369,7 +1369,10 @@ impl Drop for OwnedTimerWait {
         self.state.1.notify_all();
         if let Some(thread) = self.thread.take() {
             if self.state.0.lock().unwrap_or_else(|p| p.into_inner()).owner
-                != Some(crate::owned_worker::current_thread_id()) { let _ = thread.join(); }
+                != Some(crate::owned_worker::current_thread_id())
+            {
+                let _ = thread.join();
+            }
         }
     }
 }
