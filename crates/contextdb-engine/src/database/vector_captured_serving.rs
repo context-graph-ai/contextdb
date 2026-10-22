@@ -24,6 +24,7 @@ fn refusal(reason: impl Into<contextdb_core::error::DiagnosticText>) -> Error {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<()> {
     if request(DormantVectorLoadRequest::Checkpoint) {
         Ok(())
@@ -32,6 +33,7 @@ fn checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Resu
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reserve(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool, bytes: usize) -> Result<()> {
     if bytes == 0 || request(DormantVectorLoadRequest::Reserve(bytes)) {
         Ok(())
@@ -54,6 +56,7 @@ pub(crate) struct CapturedVectorRootLease {
 }
 
 impl CapturedVectorRootLease {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn writable(
         read: Arc<redb::ReadTransaction>,
         writer: WriterSnapshotHandle,
@@ -67,6 +70,7 @@ impl CapturedVectorRootLease {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retained(
         read: Arc<redb::ReadTransaction>,
         source: RetainedReadSource,
@@ -82,6 +86,7 @@ impl CapturedVectorRootLease {
 
     /// Authoritative erasure published after capture refuses every later
     /// read of the erased table through this root with its typed refusal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn check_scope(&self, table: &str) -> Result<()> {
         match &self.holder {
             CapturedRootHolder::Writer(writer) => writer.check_table_scope(table),
@@ -95,6 +100,7 @@ impl CapturedVectorRootLease {
     }
 
     /// Run one in-read step on the captured read after its scope check.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_read<T>(
         &self,
         index: &VectorIndexRef,
@@ -115,6 +121,7 @@ impl CapturedVectorRootLease {
 
     /// Authenticate the read against the actual sealed lease and its original
     /// holder. Writer aliases preserve the existing equivalent-user-root rule.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn paged_expected_root(&self)
         -> Result<(redb::StorageSnapshotIdentity, SnapshotId, Lsn)> {
         match &self.holder {
@@ -136,6 +143,7 @@ impl CapturedVectorRootLease {
 
     /// Paged readers of a captured layer reopen tables on this same read and
     /// keep this lease alive while any of them is open.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn paged_root_capture(
         self: &Arc<Self>,
     ) -> crate::persistence::vector_paged::PagedRootCapture {
@@ -166,6 +174,7 @@ fn catalog_identity(descriptor: VectorPartitionGenerationDescriptor) -> VectorGr
 
 /// Writable admission for one sealed layer: its resident graph plus the
 /// encoded payload that coexists with it during decode.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn writable_admission(
     identity: VectorGraphGeneration,
     resident_bytes: u64,
@@ -260,6 +269,7 @@ impl CapturedServingSupplier {
     /// The saved residency of a frozen identity, as this root's catalog
     /// names it. Writable registry descriptors already carry the saved
     /// value; a committed image's frozen placeholders take it from here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn saved_resident_bytes(
         &self,
         descriptor: &DormantVectorGraphGeneration,
@@ -296,6 +306,7 @@ impl CapturedServingSupplier {
         Ok(descriptor.resident_bytes as u64)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn loader_control(
         &self,
         owner: &mut VectorCopyAdmission,
@@ -314,6 +325,7 @@ impl CapturedServingSupplier {
         Ok(control)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn layer(
         &self,
         descriptor: DormantVectorGraphGeneration,
@@ -405,6 +417,7 @@ impl CapturedVectorSuffixSource for CapturedServingSupplier {
         Ok(layer)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind_serving_frontier(
         &self,
         base: Option<VectorGraphGeneration>,
@@ -479,6 +492,7 @@ impl CapturedVectorSuffixSource for CapturedServingSupplier {
 }
 
 /// Build the root-owned serving selection for one captured root.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn captured_serving_selection(
     lease: CapturedVectorRootLease,
     partition: &VectorPartitionRef,
@@ -794,6 +808,7 @@ struct CapturedSuffixLoader {
 }
 
 impl CapturedVectorSuffixLoader for CapturedSuffixLoader {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(
         &self,
         caller_reserved_load_bytes: usize,

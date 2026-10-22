@@ -111,12 +111,14 @@ impl QueryResult {
 
     /// Allocate the complete publication cell before running the producer.
     /// Durable writes can therefore never fail on carrier admission afterward.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn publish_with(
         owner: impl Into<ReadMemoryOwner>,
         make: impl FnOnce() -> Result<OwnedQueryResult>,
     ) -> Result<Self> {
         Self::publish_with_owner(owner.into(), make)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn publish_with_owner(
         owner: ReadMemoryOwner,
         make: impl FnOnce() -> Result<OwnedQueryResult>,
@@ -168,6 +170,7 @@ impl OwnedQueryResult {
 
     /// Read-only routes may allocate the carrier after execution, before
     /// publication. Mutating Database doors use publish_with before execution.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn into_public(self) -> Result<QueryResult> {
         let owner = self
             .retained_read_memory
@@ -181,6 +184,7 @@ impl OwnedQueryResult {
             })?;
         QueryResult::publish_with_owner(owner, || Ok(self))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn into_public_with_owner(self, owner: ReadMemoryOwner) -> Result<QueryResult> {
         QueryResult::publish_with_owner(owner, || Ok(self))
     }

@@ -135,6 +135,7 @@ struct MaintenanceIndexes {
 }
 
 impl MaintenanceContext {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn maintenance_indexes(&self) -> Result<MaintenanceIndexes> {
         let mut memory = OwnedMemoryReservation::new(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
@@ -168,6 +169,7 @@ impl MaintenanceContext {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn maintenance_workspace(
         &self,
         bytes: usize,
@@ -181,6 +183,7 @@ impl MaintenanceContext {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_inventory_slot<T>(
         &self,
         _slot: &'static str,
@@ -206,10 +209,12 @@ impl MaintenanceContext {
 
     /// Caller holds the existing commit boundary. Strong state handles are
     /// consumed before it releases, so DDL cannot detach their directory owner.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn maintenance_inventory_phase_locked(&self) -> Result<InventoryPhase> {
         self.maintenance_inventory_phase_with_catalog_retention_locked(true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn maintenance_inventory_phase_with_catalog_retention_locked(
         &self,
         retain_catalogs: bool,
@@ -648,6 +653,7 @@ impl MaintenanceContext {
     /// Capture the fixed catalog root after validating all source attribution.
     /// Decoded catalogs are released as validation proceeds; only the borrowed
     /// source outcomes remain beside the cursor through this finite pass.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn maintenance_catalog_stream_locked(&self) -> Result<MaintenanceCatalogStream> {
         let phase = self.maintenance_inventory_phase_with_catalog_retention_locked(false)?;
         // A durable cleanup failure stays visible until its retry completes.
@@ -673,12 +679,14 @@ impl MaintenanceContext {
         Ok(MaintenanceCatalogStream { inventory: Self::release_inventory_sources(phase), cursor })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn maintenance_catalog_stream(&self) -> Result<MaintenanceCatalogStream> {
         self.tx_mgr.with_commit_lock(|| self.maintenance_catalog_stream_locked())
     }
 
     /// Consume the captured root one catalog at a time. A callback retains only
     /// failed work; successful entries physically drop before the next decode.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_maintenance_catalog_stream(
         &self,
         mut stream: MaintenanceCatalogStream,
@@ -774,6 +782,7 @@ impl MaintenanceContext {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn maintenance_catalog_inventory_locked(
         &self,
     ) -> Result<MaintenanceCatalogInventory> {
@@ -781,6 +790,7 @@ impl MaintenanceContext {
         Ok(self.finish_inventory_phase_locked(phase))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn maintenance_catalog_inventory(&self) -> Result<MaintenanceCatalogInventory> {
         self.tx_mgr
             .with_commit_lock(|| self.maintenance_catalog_inventory_locked())
@@ -816,6 +826,7 @@ impl MaintenanceContext {
     /// Reclaim selected source graphs one route at a time. Strong source
     /// handles are released before the caller retires registry states, and
     /// no list of unrelated owned routes occupies reclamation headroom.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reclaim_closing_source_graphs_locked(
         &self,
         registered_snapshots: &[SnapshotId],
@@ -871,6 +882,7 @@ impl MaintenanceContext {
         Ok((self.finish_inventory_phase_locked(phase), reclaimed))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reclaim_catalogs_locked(
         &self,
         inventory: &mut MaintenanceCatalogInventory,
@@ -975,6 +987,7 @@ impl MaintenanceContext {
         Ok(reclaimed)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn maintenance_build_candidates(&self) -> Result<MaintenanceBuildCandidates> {
         let mut maintenance_vector_copy_owner = contextdb_vector::VectorCopyAdmission::new(
             contextdb_vector::MemoryBudgetOwner::clone(&self.finalization.vector_accountant),

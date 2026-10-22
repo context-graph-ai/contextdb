@@ -290,6 +290,7 @@ impl SinkQueue {
 
 /// Give `entry` its rewritten attempt count for `persist` and keep it only if
 /// `persist` succeeds; the entry is borrowed, never copied.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn with_rewritten_attempts<T>(
     entry: &mut SinkQueueEntry,
     attempts: u32,
@@ -312,6 +313,7 @@ pub(crate) struct SinkWindowCopyCharge {
 }
 
 impl SinkWindowCopyCharge {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve(owner: &crate::read_image_memory::ImageMemoryHandle, bytes: usize) -> Result<Self> {
         owner.reserve(bytes)?;
         Ok(Self {
@@ -580,6 +582,7 @@ impl EventBusState {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin_dispatcher_queue_mutation(&self) -> Result<QueueMutationLease> {
         let mut state = self.queue_mutation_state.lock();
         while state.mutation_blocked && !state.dispatcher_writes_closed {
@@ -621,6 +624,7 @@ impl EventBusState {
     /// taking the transaction commit mutex, then move the returned guard into
     /// `freeze_for_commit_locked_purge` from that mutex's active-prepare
     /// callback.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn begin_authoritative_purge_queue_drain(
         &self,
     ) -> Result<AuthoritativePurgeQueueDrainGuard> {
@@ -655,6 +659,7 @@ impl EventBusState {
     /// Build the complete post-purge queue image before durability.  The
     /// payload, attempt count, and access gate remain in their original
     /// `SinkQueueEntry`; publication later swaps this opaque VecDeque map.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_authoritative_purge_queue_replacement(
         &self,
         queue_mutation_token: AuthoritativePurgeQueueMutationToken,
@@ -878,6 +883,7 @@ pub(crate) struct EventBusResourceCleanup {
 }
 
 impl EventBusResourceCleanup {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn close(mut self) {
         if self.publish_quiescence
             && let Some(persistence) = &self.persistence
@@ -1084,6 +1090,7 @@ impl EventBusState {
         self.next_queue_id.load(Ordering::SeqCst)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ensure_queue_capacity(&self, events: &[PreparedSinkEvent]) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         let capacity = self.queue_capacity_for_test.load(Ordering::SeqCst);
@@ -1174,6 +1181,7 @@ impl Database {
     /// Source-order coordination belongs to `ReceivedSchemaStage`; this helper
     /// deliberately does not append category-local DDL to the log.
     #[allow(dead_code)] // consumed when received-schema publication joins the staged Redb transaction
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_received_event_bus_publication(
         &self,
         ddl: &[DdlChange],
@@ -1190,6 +1198,7 @@ impl Database {
         self.prepare_received_event_bus_publication_from_projection(definitions)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn received_event_bus_projection_bytes(&self) -> Result<usize> {
         let definitions = self.event_bus.definitions.lock();
         let encoded = bincode::serde::encode_into_std_write(
@@ -1237,6 +1246,7 @@ impl Database {
         *self.event_bus.definitions.lock() = definitions;
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn apply_received_event_bus_ddl_to_projection(
         &self,
         definitions: &mut EventBusDefinitions,
@@ -1248,6 +1258,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_received_event_bus_publication_from_projection(
         &self,
         definitions: EventBusDefinitions,
@@ -1301,6 +1312,7 @@ impl Database {
         self.event_bus.waiters.notify_all();
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn load_event_bus_state_from_persistence(&self) -> Result<()> {
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
             let Some(persistence) = self.persistence.as_deref() else {
@@ -1453,6 +1465,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn put_event_type_def(definitions: &mut EventBusDefinitions, def: EventTypeDef) -> Result<()> {
         if let Some(existing) = definitions.event_types.get(&def.name) {
             if existing == &def {
@@ -1467,6 +1480,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn put_sink_def(definitions: &mut EventBusDefinitions, def: SinkDef) -> Result<()> {
         if let Some(existing) = definitions.sinks.get(&def.name) {
             if existing == &def {
@@ -1481,6 +1495,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn put_route_def(definitions: &mut EventBusDefinitions, def: RouteDef) -> Result<String> {
         let route_table = definitions
             .event_types
@@ -1512,6 +1527,7 @@ impl Database {
             .or(Some(String::new()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn validate_event_bus_ddl_batch_with_table_lookup<F>(
         &self,
         ddl: &[DdlChange],
@@ -1534,6 +1550,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn stage_event_bus_ddl_in_tx(&self, tx: TxId, ddl: DdlChange) -> Result<()> {
         if self.pending_local_schema_stages.lock().contains_key(&tx) {
             return Err(Error::Other((
@@ -1558,6 +1575,7 @@ impl Database {
             .unwrap_or_default()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn apply_event_bus_ddl_from_user(
         &self,
         ddl: Vec<DdlChange>,
@@ -1569,6 +1587,7 @@ impl Database {
         self.apply_event_bus_ddl_batch(ddl, read_memory.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn stage_event_bus_ddl_for_commit(
         &self,
         lsn: Lsn,
@@ -1638,6 +1657,7 @@ impl Database {
             .remove(&lsn);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn apply_event_bus_ddl_batch(
         &self,
         ddl: Vec<DdlChange>,
@@ -1655,6 +1675,7 @@ impl Database {
         self.commit_event_bus_definitions_and_log_batch(projected, ddl, read_memory.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn event_bus_definitions_with_ddl(
         &self,
         tx: Option<TxId>,
@@ -1670,6 +1691,7 @@ impl Database {
         Ok(projected)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_event_bus_ddl_to_definitions(
         &self,
         definitions: &mut EventBusDefinitions,
@@ -1680,6 +1702,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_event_bus_ddl_to_definitions_with_table_lookup(
         definitions: &mut EventBusDefinitions,
         ddl: &DdlChange,
@@ -1868,6 +1891,7 @@ impl Database {
         next
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn event_bus_config_values_without_table(
         &self,
         table: &str,
@@ -1900,6 +1924,7 @@ impl Database {
     /// context and scope-label constraints, plus the resolved registration
     /// principal, are captured at registration time and gate every replayed and
     /// live delivery before the callback is invoked.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_sink<F>(
         &self,
         name: &str,
@@ -1952,6 +1977,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_sink_with_access<F>(
         &self,
         name: &str,
@@ -2091,6 +2117,7 @@ impl Database {
     /// delivery metrics and whether a callback is currently registered), and
     /// route. Backs the CLI's `.events status` introspection and is a real
     /// public accessor, not a test seam.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn direct_events_status_funded(
         &self, owner: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<crate::local_transport::query_funding::Funded<crate::direct_file_reader::DirectEventsStatus>> {
@@ -2251,6 +2278,7 @@ impl Database {
             .unwrap_or(0)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_sink_events_for_write_set(
         &self,
         ws: &contextdb_tx::WriteSet,
@@ -2261,6 +2289,7 @@ impl Database {
         self.prepare_sink_events_for_write_set_with_event_bus_ddl(ws, &[], read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_sink_events_for_write_set_with_event_bus_ddl(
         &self,
         ws: &contextdb_tx::WriteSet,
@@ -2482,6 +2511,7 @@ impl Database {
         self.event_bus.next_queue_id.store(next, Ordering::SeqCst);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_private_prefix_sink_events(&self, tx: TxId, lsn: Lsn,
         targets: &super::connected_replay::PrivateChangedRows, initial_len: usize,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
@@ -2527,6 +2557,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_private_prefix_sink_candidate(&self, tx: TxId, out: &mut Vec<PreparedSinkEvent>,
         definitions: &EventBusDefinitions, candidate: RowEventCandidateRef<'_>, lsn: Lsn,
         ws: &contextdb_tx::WriteSet, cache: &mut HashMap<String, EventGateSnapshot>,
@@ -2556,6 +2587,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_prepared_sink_events_for_candidate(
         &self,
         out: &mut Vec<PreparedSinkEvent>,
@@ -2617,6 +2649,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn event_gate_snapshot_cached(
         &self,
         table: &str,
@@ -2641,6 +2674,7 @@ impl Database {
         self.event_gate_snapshot_with_meta(&meta, values, ws, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn event_gate_snapshot_with_meta(
         &self,
         meta: &TableMeta,
@@ -2694,6 +2728,7 @@ impl Database {
         Ok(gate)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn grant_rows_for_acl(
         &self,
         acl_ref: &AclRef,
@@ -2754,6 +2789,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_event_grant_copy(
         memory: &mut crate::memory_accounting::OwnedMemoryReservation,
         first: bool,
@@ -2906,6 +2942,7 @@ impl Database {
         true
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ensure_sink_dispatcher_running(&self, sink: &str) -> Result<()> {
         #[cfg(target_os = "linux")]
         crate::owned_worker::ensure_finisher()?;
@@ -2967,6 +3004,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn require_admin_event_bus_ddl(&self) -> Result<()> {
         if self.has_access_constraints_for_query() {
             return Err(Error::Other((
@@ -2975,6 +3013,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_event_bus_definitions_and_log_batch(
         &self,
         definitions: EventBusDefinitions,
@@ -2989,6 +3028,7 @@ impl Database {
         self.commit_event_bus_ddl_changes(ddl, read_memory.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_event_bus_ddl_changes(
         &self,
         ddl: Vec<DdlChange>,
@@ -3064,11 +3104,13 @@ impl Database {
 
     /// Encoded event-bus definitions for checkpoint export of in-memory
     /// sources, serialized exactly as file-backed DDL persistence would have.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn export_event_bus_config_values(&self) -> Result<EncodedConfigValues> {
         let definitions = self.event_bus.definitions.lock().clone();
         Self::encoded_event_bus_config_values(&definitions)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn encoded_event_bus_config_values(
         definitions: &EventBusDefinitions,
     ) -> Result<EncodedConfigValues> {
@@ -3095,6 +3137,7 @@ impl Database {
         ])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_event_candidates(
         &self,
         ws: &contextdb_tx::WriteSet,
@@ -3693,6 +3736,7 @@ impl EventBusWorker {
         state.uncertain += uncertain;
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn transition_attempt(&self, entry_id: u64, start: bool, uncertain: bool) -> Result<u32> {
         self.tx_mgr.with_maintenance_publication(|publication| {
             let _queue_mutation = self.event_bus.begin_dispatcher_queue_mutation()?;
@@ -3756,6 +3800,7 @@ impl EventBusWorker {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ack_front_entries(&self, entry_ids: &[u64]) -> Result<()> {
         if entry_ids.is_empty() {
             return Ok(());
@@ -3815,6 +3860,7 @@ impl EventBusWorker {
 }
 
 impl EventTrigger {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn from_ddl_trigger(trigger: &str) -> Result<Self> {
         match trigger.to_ascii_uppercase().as_str() {
             "INSERT" => Ok(Self::Insert),
@@ -3836,6 +3882,7 @@ impl EventTrigger {
 }
 
 impl PersistedSinkType {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn from_ddl_sink_type(sink_type: &str) -> Result<Self> {
         match sink_type.to_ascii_uppercase().as_str() {
             "WEBHOOK" => Ok(Self::Webhook),
@@ -4017,6 +4064,7 @@ fn principal_matches_grant(principal: &Principal, grant: &HashMap<String, Value>
         && grant.get("principal_id") == Some(&Value::Text(principal_id.to_string()))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn persist_sink_queue_update(
     persistence: &Option<Arc<RedbPersistence>>,
     sink: &str,
@@ -4037,6 +4085,7 @@ fn persist_sink_queue_update(
     )
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn persist_sink_queue_removals(
     persistence: &Option<Arc<RedbPersistence>>,
     sink: &str,
@@ -4143,6 +4192,7 @@ impl Database {
     /// Append the original next-action config body only after its actual writer
     /// has admitted the key and encoded value. The guarded splice retains that
     /// same reservation through publication and original source retirement.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn stage_next_action_id_in_prepared_write_set(
         &self,
         guard: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -4209,6 +4259,7 @@ impl Database {
 /// queue/stage/state guards; the borrowing private handle retains that physical
 /// storage for the whole callback. The actual handle impl is composed only
 /// after its frozen definition is available.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn with_owned_persistence_original_seed<R>(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     f: impl for<'o> FnOnce(&'o crate::memory_accounting::OwnedMemoryReservation) -> Result<R>,
@@ -4230,14 +4281,17 @@ use contextdb_tx::{OriginalAuxInvoice, OriginalCopyGrant, SourceFunder};
 fn owned_event_overflow() -> Error {
     Error::Other("event preparation allocation size overflow".into())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn owned_event_add(a: usize, b: usize) -> Result<usize> {
     a.checked_add(b).ok_or_else(owned_event_overflow)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn owned_event_array<T>(count: usize) -> Result<usize> {
     std::alloc::Layout::array::<T>(count)
         .map(|layout| layout.size())
         .map_err(|_| owned_event_overflow())
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn reserve_owned_event_bytes(
     original: &OwnedMemoryReservation,
     bytes: usize,
@@ -4263,6 +4317,7 @@ pub(super) struct OwnedEventSharedWeak<T> {
     credit: Option<Arc<OriginalAuxInvoice>>,
 }
 impl<T> OwnedEventShared<T> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_new(
         body: T,
         original: &OwnedMemoryReservation,
@@ -4373,6 +4428,7 @@ pub(super) struct OwnedEventValueCredits {
     key_array: OwnedMemoryReservation,
     value_array: OwnedMemoryReservation,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn copy_owned_event_values(
     original: &OwnedMemoryReservation,
     source: &HashMap<String, Value>,
@@ -4411,6 +4467,7 @@ pub(super) struct OwnedEventGateCredits {
     child_array: OwnedMemoryReservation,
     metadata: OwnedMemoryReservation,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn owned_gate_metadata_bytes(gate: &EventGateSnapshot) -> Result<usize> {
     let mut bytes = gate.context_column.as_ref().map_or(0, String::len);
     if let Some(scope) = &gate.scope_read {
@@ -4432,6 +4489,7 @@ fn owned_gate_metadata_bytes(gate: &EventGateSnapshot) -> Result<usize> {
     }
     Ok(bytes)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn copy_owned_prepaid_text(text: &str) -> Result<String> {
     let copy = text.to_owned();
     if copy.capacity() != text.len() {
@@ -4439,6 +4497,7 @@ fn copy_owned_prepaid_text(text: &str) -> Result<String> {
     }
     Ok(copy)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn copy_owned_event_gate(
     original: &OwnedMemoryReservation,
     source: &EventGateSnapshot,
@@ -4516,6 +4575,7 @@ pub(super) struct OwnedSinkQueueEntry {
     pub(super) entry: SinkQueueEntry,
     credit: OwnedSinkEventCredit,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn copy_owned_sink_queue_entry(
     original: &OwnedMemoryReservation,
     source: &SinkQueueEntry,
@@ -4568,6 +4628,7 @@ impl OwnedPreparedSinkEvents {
     pub(super) fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_copy(
         original: &OwnedMemoryReservation,
         source: &[PreparedSinkEvent],
@@ -4597,6 +4658,7 @@ impl OwnedPreparedSinkEvents {
         }
         Ok(owner)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn empty(original: &OwnedMemoryReservation) -> Result<Self> {
         Self::try_copy(original, &[])
     }
@@ -4715,6 +4777,7 @@ impl OwnedEventBusHandle {
         Arc::ptr_eq(&self.storage.get().common, common)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_new_for_writer(
         common: Arc<EventBusState>,
         writer: &WriterBudget,
@@ -4724,6 +4787,7 @@ impl OwnedEventBusHandle {
         Self::try_new(common, original, &writer.accountant(), funder)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_new(
         common: Arc<EventBusState>,
         original: OwnedMemoryReservation,
@@ -4827,6 +4891,7 @@ impl OwnedEventBusHandle {
             window_refused: state.is_some_and(|s| s.window_refused),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn with_owned_queue_entries<R>(
         &self,
         sink: &str,
@@ -4863,6 +4928,7 @@ impl OwnedEventBusHandle {
             return f(present.then_some(&snapshot.body));
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn stage_owned_commit_events(
         &self,
         lsn: Lsn,
@@ -4954,6 +5020,7 @@ impl OwnedEventBusHandle {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_owned_commit_events<R>(
         &self,
         lsn: Lsn,
@@ -5126,6 +5193,7 @@ pub(super) struct OwnedQueuePreparation {
     )>,
 }
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_owned_queue_name(
         &self,
         name: &str,
@@ -5150,6 +5218,7 @@ impl OwnedEventBusHandle {
             MAX_SINK_QUEUE_DEPTH
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reserve_owned_queue_publication(
         &self,
         events: &OwnedPreparedSinkEvents,
@@ -5168,6 +5237,7 @@ impl OwnedEventBusHandle {
         std::mem::swap(&mut token.entries, &mut pins);
         Ok(token)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_owned_queue_names(
         &self,
         events: &[PreparedSinkEvent],
@@ -5379,6 +5449,7 @@ impl OwnedEventBusHandle {
         drop(plans);
         Ok(token)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_sink_events(
         &self,
         source: &[PreparedSinkEvent],
@@ -5436,6 +5507,7 @@ impl OwnedEventBusHandle {
         drop(events);
         self.data().common.waiters.notify_all();
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn suspend_owned_append_for_discard(
         &self,
         events: &mut OwnedPreparedSinkEvents,
@@ -5536,6 +5608,7 @@ pub(super) struct OwnedPurgeQueuePublication {
     token: AuthoritativePurgeQueueMutationToken,
 }
 impl OwnedPurgeQueuePublication {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_unconfirmed(
         &self, mut visit: impl FnMut(&str, u64) -> Result<()>,
     ) -> Result<()> {
@@ -5547,6 +5620,7 @@ impl OwnedPurgeQueuePublication {
     }
 }
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_purge_queue_replacement(
         &self,
         token: AuthoritativePurgeQueueMutationToken,
@@ -5845,6 +5919,7 @@ pub(super) struct OwnedEventBTreeInternal<K, V> {
     data: OwnedEventBTreeLeaf<K, V>,
     edges: [std::mem::MaybeUninit<std::ptr::NonNull<OwnedEventBTreeLeaf<K, V>>>; 12],
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn owned_event_btree_bytes<K, V>(members: usize) -> Result<usize> {
     if members == 0 {
         return Ok(0);
@@ -5888,6 +5963,7 @@ pub(super) struct OwnedDefinitionsProjection {
     allocation: OwnedMemoryReservation,
 }
 impl OwnedDefinitionsProjection {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_copy_filtered(
         original: &OwnedMemoryReservation,
         source: &EventBusDefinitions,
@@ -6030,6 +6106,7 @@ impl<T: Serialize> Serialize for OwnedEventSequence<'_, T> {
         sequence.end()
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn encode_owned_event_value<T: Serialize>(original: &OwnedMemoryReservation, value: &T,
 ) -> Result<OwnedEventBody<Vec<u8>, OwnedMemoryReservation>> {
     let mut diagnostic = Some(OriginalError::prepare(original,
@@ -6070,12 +6147,14 @@ fn encode_owned_event_value_in<T: Serialize, E>(
     Ok(owner)
 }
 impl OwnedEncodedEventBusConfig {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_new(
         original: &OwnedMemoryReservation,
         definitions: &EventBusDefinitions,
     ) -> Result<Self> {
         Self::try_new_capacity(original, definitions, 0)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_empty(original: &OwnedMemoryReservation) -> Result<Self> {
         let (body, credit) = new_owned_native_vec(original, 0)?;
         let values = OwnedEventBody { body, credit };
@@ -6087,6 +6166,7 @@ impl OwnedEncodedEventBusConfig {
             body_array: credit,
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_new_capacity(
         original: &OwnedMemoryReservation,
         definitions: &EventBusDefinitions,
@@ -6130,6 +6210,7 @@ impl OwnedEncodedEventBusConfig {
         )?;
         Ok(owner)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn push<T: Serialize>(
         &mut self,
         original: &OwnedMemoryReservation,
@@ -6165,6 +6246,7 @@ pub(super) struct OwnedDefinitionPublication {
     retirement: OwnedEventBody<Option<(String, OwnedSinkQueue)>, Option<OwnedMemoryReservation>>,
 }
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_definition_publication(
         &self,
         projection: OwnedDefinitionsProjection,
@@ -6173,6 +6255,7 @@ impl OwnedEventBusHandle {
     ) -> Result<OwnedDefinitionPublication> {
         self.prepare_owned_definition_publication_with_extra_config(projection, mode, lease, 0)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_owned_definition_publication_with_extra_config(
         &self,
         projection: OwnedDefinitionsProjection,
@@ -6358,6 +6441,7 @@ impl OwnedEventBusHandle {
         drop(publication.retirement);
         self.data().common.waiters.notify_all();
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_event_bus_without_table(
         &self,
         table: &str,
@@ -6381,6 +6465,7 @@ impl OwnedEventBusHandle {
         self.prepare_owned_definition_publication(projection, OwnedDefinitionMode::Additive, lease)
             .map(Some)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn export_owned_event_bus_config_values(
         &self,
     ) -> Result<OwnedEncodedEventBusConfig> {
@@ -6728,6 +6813,7 @@ impl OwnedNativeQueueFailure {
 }
 
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn claim_owned_checked_out(
         &self,
         sink: &str,
@@ -6794,6 +6880,7 @@ impl OwnedEventBusHandle {
             return Ok(claim);
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn empty_owned_dispatch_batch(&self, maximum: usize) -> Result<OwnedSinkDispatchBatch> {
         let original = &self.data().original;
         let control = reserve_owned_event_bytes(
@@ -6836,6 +6923,7 @@ impl OwnedEventBusHandle {
             body_lifetime,
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn checkout_owned_sink_batch(
         &self,
         sink: &str,
@@ -7493,6 +7581,7 @@ pub(crate) trait OwnedSinkQueuePersistence {
     type Update<'o>;
     type Removals<'o>;
     fn is_durable(&self) -> bool;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_cold_source<R>(
         &self,
         _original: &OwnedMemoryReservation,
@@ -7500,6 +7589,7 @@ pub(crate) trait OwnedSinkQueuePersistence {
     ) -> Result<R> {
         Err(Error::Other("native queue persistence has no cold source capability".into()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_cold_source_funded<R>(
         &self, original: &OwnedMemoryReservation,
         visit: impl for<'s> FnOnce(&crate::persistence::OwnedColdEventSource<'s>) -> OriginalResult<R>,
@@ -7508,6 +7598,7 @@ pub(crate) trait OwnedSinkQueuePersistence {
         self.with_cold_source(original, |source| Ok(visit(source)))
             .map_err(|error| diagnostic.error(error))?
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_update<'o>(
         &self,
         original: &'o OwnedMemoryReservation,
@@ -7524,6 +7615,7 @@ pub(crate) trait OwnedSinkQueuePersistence {
         self.prepare_update(original, sink, entry_id, encoded, uncertain, unconfirmed_delta)
             .map_err(|error| diagnostic.error(error))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_update(&self, prepared: Self::Update<'_>) -> Result<()>;
     fn commit_update_at_boundary(
         &self,
@@ -7541,6 +7633,7 @@ pub(crate) trait OwnedSinkQueuePersistence {
         }
         failure.capture(result);
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_removals<'o>(
         &self,
         original: &'o OwnedMemoryReservation,
@@ -7548,6 +7641,7 @@ pub(crate) trait OwnedSinkQueuePersistence {
         ids: &'o [u64],
         unconfirmed: u64,
     ) -> Result<Self::Removals<'o>>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_removals(&self, prepared: Self::Removals<'_>) -> Result<()>;
     fn commit_removals_at_boundary(
         &self,
@@ -7604,6 +7698,7 @@ struct OwnedRuntimeLaunch {
     control: OwnedMemoryReservation,
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn start_owned_sink_worker<P: OwnedSinkQueuePersistence + Send + 'static>(
         &self,
         events: &OwnedEventBusHandle,
@@ -7692,6 +7787,7 @@ pub(super) struct OwnedMetricsAllocation {
     buckets: OwnedMemoryReservation,
 }
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_owned_metrics_slots(&self, names: &[String]) -> Result<()> {
         let original = &self.data().original;
         loop {
@@ -7805,6 +7901,7 @@ impl OwnedEventBusHandle {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn copy_owned_sink_registration(
         &self,
         sink: &str,
@@ -7874,6 +7971,7 @@ pub(super) struct OwnedEventBusWorker<P> {
     control: OwnedMemoryReservation,
 }
 impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_new(
         events: OwnedEventBusHandle,
         sink: &str,
@@ -8149,6 +8247,7 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
 }
 
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn merge_owned_commit_escrow(
         &self,
         stage: &mut OwnedCommitEventStage,
@@ -8214,6 +8313,7 @@ pub(super) trait OwnedEncodedEventSource<E = Error> {
     fn next_action_id(&self) -> std::result::Result<u64, E>;
 }
 pub(super) trait OwnedEventEntryDecoder {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn decode(
         &self,
         original: &OwnedMemoryReservation,
@@ -8305,6 +8405,7 @@ struct OwnedColdWindow<E = Error> {
     refusal: Option<E>,
 }
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_owned_cold_window(&self, source: &crate::persistence::OwnedColdEventSource<'_>,
         sink: &str, after: Option<u64>, upper: Option<u64>) -> Result<OwnedColdWindow> {
         self.read_owned_cold_window_in(source, sink, after, upper,
@@ -8571,6 +8672,7 @@ impl OwnedEventEntryDecoder for OwnedPersistentEventEntryDecoder {
 
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn decode_owned_startup_definitions<T: serde::de::DeserializeOwned>(
     source: &crate::persistence::OwnedEncodedEventSource<'_>,
     original: &OwnedMemoryReservation,
@@ -8598,6 +8700,7 @@ fn decode_owned_startup_definitions_funded<T: serde::de::DeserializeOwned>(
 }
 
 impl OwnedDefinitionsProjection {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn decode_persistent_startup(
         source: &crate::persistence::OwnedEncodedEventSource<'_>,
         original: &OwnedMemoryReservation,
@@ -8715,6 +8818,7 @@ impl OwnedEventBusHandle {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn install_owned_persistent_startup(
         &self,
         encoded: &crate::persistence::OwnedEncodedEventSource<'_>,
@@ -8744,6 +8848,7 @@ pub(super) struct OwnedEventStartupImage {
     next_action_id: u64,
 }
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_event_bus_image<
         S: OwnedEncodedEventSource,
         D: OwnedEventEntryDecoder,
@@ -8898,6 +9003,7 @@ impl OwnedEventBusHandle {
         }
         Ok(image)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn install_owned_event_bus_image(
         &self,
         mut image: OwnedEventStartupImage,
@@ -8989,6 +9095,7 @@ pub(super) struct OwnedRouteView<'a> {
     where_in: Option<(&'a str, &'a [String])>,
 }
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_definition_projection_with_ddl(
         &self,
         ddl: &[DdlChange],
@@ -9449,6 +9556,7 @@ pub(super) struct OwnedEventDdlInput {
     array: OwnedMemoryReservation,
 }
 impl OwnedEventDdlInput {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_copy(original: &OwnedMemoryReservation, ddl: &[DdlChange]) -> Result<Self> {
         let mut bytes = 0;
         for change in ddl {
@@ -9565,6 +9673,7 @@ impl OwnedEventDdlInput {
         Ok(owner)
     }
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn owned_ddl_sidecar_key(
     original: &OwnedMemoryReservation,
     lsn: Lsn,
@@ -9594,6 +9703,7 @@ fn owned_ddl_sidecar_key(
     Ok(owner)
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn stage_owned_event_bus_ddl_for_commit(
         &self,
         events: &OwnedEventBusHandle,
@@ -9683,6 +9793,7 @@ impl Database {
             }),
         ))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn commit_owned_event_bus_ddl_changes<P: OwnedEventDdlPersistence>(
         &self,
         events: &OwnedEventBusHandle,
@@ -9747,12 +9858,14 @@ pub(super) struct OwnedEventDdlLogBodies {
 }
 pub(super) trait OwnedEventDdlPersistence {
     type Log;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_log(
         &self,
         original: &OwnedMemoryReservation,
         lsn: Lsn,
         commit: &EventBusPersistenceCommit,
     ) -> Result<Self::Log>;
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn flush(&self, lsn: Lsn, commit: &EventBusPersistenceCommit) -> Result<()>;
     fn publish_log(&self, log: Self::Log, lsn: Lsn, bodies: OwnedEventDdlLogBodies);
 }
@@ -9761,6 +9874,7 @@ pub(super) trait OwnedEventDdlPersistence {
 // the original insertion/update/delete traversal, including ACL grant rows.
 // No implementation here calls an allocating Legacy candidate/gate builder.
 pub(super) trait OwnedEventCandidateSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit(
         &self,
         visit: impl for<'r> FnMut(
@@ -9770,6 +9884,7 @@ pub(super) trait OwnedEventCandidateSource {
     ) -> Result<()>;
 }
 impl OwnedPreparedSinkEvents {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn with_capacity(
         original: &OwnedMemoryReservation,
         capacity: usize,
@@ -9792,6 +9907,7 @@ impl OwnedPreparedSinkEvents {
     }
 }
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_candidate_events<S: OwnedEventCandidateSource>(
         &self,
         source: &S,
@@ -9897,6 +10013,7 @@ pub(super) struct OwnedDeleteReleaseBytes {
     vector_array: OwnedMemoryReservation,
 }
 impl OwnedDeleteReleaseBytes {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_copy(
         original: &OwnedMemoryReservation,
         relational: &[usize],
@@ -9923,6 +10040,7 @@ impl Database {
         // simply destroys these arrays; it never calls this settlement door.
         drop(bytes);
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn apply_owned_event_bus_ddl_from_user<P: OwnedEventDdlPersistence>(
         &self,
         events: &OwnedEventBusHandle,
@@ -9963,6 +10081,7 @@ pub(super) struct OwnedPreparedEventGate {
     credit: OwnedEventGateCredits,
 }
 impl OwnedPreparedEventGate {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_from_meta(original: &OwnedMemoryReservation, meta: Option<&TableMeta>) -> Result<Self> {
         let context = meta
             .and_then(|meta| meta.columns.iter().find(|column| column.context_id))
@@ -10016,6 +10135,7 @@ impl OwnedPreparedEventGate {
         }
         Ok(owner)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn try_from_projection(
         original: &OwnedMemoryReservation,
         meta: Option<&TableMeta>,
@@ -10171,6 +10291,7 @@ impl OwnedEventCandidateSource for OwnedReceivedEventCandidates<'_> {
     }
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_received_owned_sink_events_from_projection(
         &self,
         events: &OwnedEventBusHandle,
@@ -10211,6 +10332,7 @@ impl Database {
 }
 
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn suspend_owned_registered_append_for_discard(
         &self,
         registration: &OwnedEventStageRegistration,
@@ -10295,6 +10417,7 @@ struct OwnedEventCopiedSet<K> {
     buckets: OwnedMemoryReservation,
 }
 impl OwnedEventBusHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_owned_registered_stage_identity<R>(
         &self,
         registration: &OwnedEventStageRegistration,
@@ -10468,6 +10591,7 @@ impl OwnedEventCandidateSource for OwnedOrdinaryEventCandidates<'_> {
     }
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_owned_event_preimage<R>(
         &self,
         original: &OwnedMemoryReservation,
@@ -10500,6 +10624,7 @@ impl Database {
         drop(lookup_memory);
         f(row)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_owned_event_grants(
         &self,
         acl: &AclRef,
@@ -10545,6 +10670,7 @@ impl Database {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_event_gate(
         &self,
         original: &OwnedMemoryReservation,
@@ -10656,6 +10782,7 @@ impl Database {
             Ok(owner)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_sink_events_in_prepared_write_set(
         &self,
         events: &OwnedEventBusHandle,
@@ -10732,6 +10859,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_owned_event_meta_pair<R>(
         &self,
         table: &str,
@@ -10765,6 +10893,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn validate_owned_received_event_host(&self,events:&OwnedEventBusHandle,
         host:&EngineDatabaseTransactions)->Result<()> {
         self.validate_owned_event_host(events,host)?;
@@ -10774,6 +10903,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn validate_owned_event_host(
         &self,
         events: &OwnedEventBusHandle,
@@ -10801,6 +10931,7 @@ impl OwnedEventBusHandle {
     /// The companion owns this immutable seed outside every mutable queue,
     /// stage and state guard. The shared storage cannot retire while self is
     /// lent, including callback failure and unwinding.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_owned_persistence_original<R>(
         &self,
         f: impl for<'o> FnOnce(&'o OwnedMemoryReservation) -> Result<R>,
@@ -10810,6 +10941,7 @@ impl OwnedEventBusHandle {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn validate_owned_cron_store(
         &self,
         events: &OwnedEventBusHandle,
@@ -10833,6 +10965,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_owned_delete_release_bytes_in_prepared_write_set(
         &self,
         events: &OwnedEventBusHandle,
@@ -10904,6 +11037,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_owned_delete_release_bytes(
         &self,
         original: &OwnedMemoryReservation,
@@ -10973,6 +11107,7 @@ impl Database {
     /// Final paged replay already installed its adjudicated rows in scratch.
     /// Gates therefore read that completed source without overlaying the same
     /// WriteSet a second time. Only changed-row lookup state is retained.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_received_sink_events_from_source(
         &self,ws:&contextdb_tx::WriteSet,definitions:&EventBusDefinitions,
         write:&crate::persistence::received_working::ReceivedWorkingWrite,
@@ -11021,6 +11156,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_received_sink_candidate_from_source(
         &self,out:&mut Vec<PreparedSinkEvent>,definitions:&EventBusDefinitions,
         candidate:RowEventCandidateRef<'_>,lsn:Lsn,cache:&mut HashMap<String,EventGateSnapshot>,

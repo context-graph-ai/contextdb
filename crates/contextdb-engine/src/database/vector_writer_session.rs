@@ -31,6 +31,7 @@ pub(super) struct CarriedWriterTail {
 }
 
 impl CarriedWriterTail {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn recharge(
         &mut self,
         accountant: impl Into<contextdb_vector::MemoryBudgetOwner>,
@@ -75,6 +76,7 @@ impl Database {
             .saturating_add(64 * 1024)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn writer_tail_layout(&self, partition: &VectorPartitionRef) -> Result<[u8; 32]> {
         self.vector_store
             .with_index_layout(&partition.index, |layout| {
@@ -87,6 +89,7 @@ impl Database {
     /// Detach opportunistically at an import close. Failure discards the cache;
     /// normal durable recovery remains the sole authority for subsequent opens.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn detach_writer_vector_session(
         &self,
         session: &WriterVectorSession,
@@ -159,6 +162,7 @@ impl Database {
         self.reattach_carried_writer_tail(saved);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reattach_carried_writer_tail(&self, saved: Option<CarriedWriterTail>) {
         let Some(mut saved) = saved else {
             return;

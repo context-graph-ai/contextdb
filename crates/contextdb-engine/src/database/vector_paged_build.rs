@@ -34,6 +34,7 @@ pub(crate) const PAGED_GENERATION_RESIDENT_BYTES: u64 = 4096;
 
 /// Exact batch plan for one declaration. Every term is the vector crate's own
 /// validation minimum, independent of the partition's population.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn paged_batch_plan(declaration: &PagedDeclaration) -> Result<PagedVectorBatchPlan> {
     let m = declaration.hnsw_m as usize;
     let ef_construction = declaration.hnsw_ef_construction as usize;
@@ -73,6 +74,7 @@ pub(crate) fn paged_batch_plan(declaration: &PagedDeclaration) -> Result<PagedVe
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn declaration_for(
     layout: &VectorIndexLayout,
     policy: &contextdb_vector::store::ResolvedVectorPolicy,
@@ -99,6 +101,7 @@ fn progress_state(reason: PagedBuildReason) -> &'static str {
 }
 
 /// Engine hooks shared by every batch of one registered build.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn paged_build_hooks(
     vector: &Arc<VectorStore>,
     tx_mgr: &DatabaseTransactionHost,
@@ -166,6 +169,7 @@ pub(super) fn paged_build_hooks(
 
 /// Register one durable build with the vector store and publish its durable
 /// progress as the partition's reported maintenance progress.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn register_paged_build(
     vector: &Arc<VectorStore>,
     tx_mgr: &DatabaseTransactionHost,
@@ -205,6 +209,7 @@ pub(super) fn register_paged_build(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn report_durable_progress(
     vector: &VectorStore,
     partition: &VectorPartitionRef,
@@ -231,6 +236,7 @@ fn report_durable_progress(
 impl Database {
     /// Restore every unpublished paged build: its construction floor first,
     /// then its restartable builder. Runs during open, before any cleanup.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn restore_paged_vector_builds(
         &self,
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -324,6 +330,7 @@ impl Database {
 /// Serving readers of published paged generations capture the writer's
 /// captured operation root, or the published root outside a read scope; they
 /// never begin a fresh storage read.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn install_paged_root_capture(
     persistence: &RedbPersistence,
     tx_mgr: &DatabaseTransactionHost,
@@ -354,6 +361,7 @@ impl MaintenanceContext {
     /// Peak of a whole generation load, including the encoded record and
     /// decoder/route workspace. Inputs are authenticated metadata or the
     /// existing codec capacity bound; this never visits vector bodies.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn whole_reader_load_bytes(
         partition: &VectorPartitionRef,
         resident: usize,
@@ -365,6 +373,7 @@ impl MaintenanceContext {
             .saturating_add(metadata))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn captured_whole_reader_serving_fits(
         &self,
         partition: &VectorPartitionRef,
@@ -393,6 +402,7 @@ impl MaintenanceContext {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn whole_reader_serving_fits(
         &self,
         partition: &VectorPartitionRef,
@@ -437,6 +447,7 @@ impl MaintenanceContext {
     /// A selected whole base/change that exceeds the store's reader declaration
     /// is a replacement need even when ordinary consolidation is not due.
     /// Native paged catalogs have only their small serving metadata here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reader_serving_replacement_needed(
         &self,
         partition: &VectorPartitionRef,
@@ -484,6 +495,7 @@ impl MaintenanceContext {
     /// Advance this partition's paged base build, starting one when the
     /// maintained route needs a new base. `None` leaves the partition to the
     /// existing sealed-change and repair paths.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn advance_paged_vector_build(
         &self,
         partition: &VectorPartitionRef,
@@ -506,6 +518,7 @@ impl MaintenanceContext {
     /// a fresh build pins its frontier at the target, and a complete build
     /// catches up only commits at or before it, publishing at its truthful
     /// frontier otherwise. Never chases commits after the target.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn advance_paged_vector_build_toward(
         &self,
         partition: &VectorPartitionRef,
@@ -524,6 +537,7 @@ impl MaintenanceContext {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn advance_paged_vector_build_bounded(
         &self,
         partition: &VectorPartitionRef,
@@ -840,6 +854,7 @@ impl MaintenanceContext {
     /// A paged build replaces or creates a BASE generation over live rows.
     /// Sealed changes over a base without one, delete-only routes and empty
     /// routes keep their existing suffix-sized publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn paged_base_build_applies(
         &self,
         partition: &VectorPartitionRef,
@@ -881,6 +896,7 @@ impl MaintenanceContext {
     /// Whether the resident whole build's complete construction workspace fits
     /// the writer's current headroom. Only a build that cannot be funded whole
     /// moves to finite paged batches.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn whole_build_fits(
         &self,
         partition: &VectorPartitionRef,
@@ -934,6 +950,7 @@ impl MaintenanceContext {
 
     /// Price the same suffix and prior-base owners as resident publication.
     /// A base larger than free headroom must not make every suffix retry fail.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn change_build_plan(
         &self,
         partition: &VectorPartitionRef,
@@ -1037,6 +1054,7 @@ impl MaintenanceContext {
             .is_none_or(|available| available >= needed)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn change_build_fits(
         &self,
         partition: &VectorPartitionRef,
@@ -1051,6 +1069,7 @@ impl MaintenanceContext {
     /// Persist a new frontier record and hold its floor, under the commit
     /// gate. Returns `None` when the existing sealed-change path owns this
     /// partition's next publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn start_paged_vector_build(
         &self,
         partition: &VectorPartitionRef,
@@ -1064,6 +1083,7 @@ impl MaintenanceContext {
     /// Start a replacement build whose frontier is `frontier` when given (an
     /// import's fixed target, never later than the store's current one), or
     /// the store's current frontier.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn start_paged_vector_build_at(
         &self,
         partition: &VectorPartitionRef,
@@ -1239,6 +1259,7 @@ impl MaintenanceContext {
     /// the ordinary native publication and writer-root installation. The
     /// frontier/floor were captured by the caller before any body was copied.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn publish_resident_paged_generation(
         &self,
         partition: &VectorPartitionRef,
@@ -1396,6 +1417,7 @@ impl MaintenanceContext {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn publish_paged_vector_build(
         &self,
         partition: &VectorPartitionRef,
@@ -1613,6 +1635,7 @@ impl MaintenanceContext {
     }
 
     /// Finite page cleanup for retired or abandoned paged generations.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn reclaim_paged_vector_storage(&self) -> Result<()> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
@@ -1690,6 +1713,7 @@ impl MaintenanceContext {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_vector_authoritative_erasure(&self) -> Result<()> {
         match self.reclaim_paged_vector_storage() {
             Ok(()) => {}
@@ -1749,6 +1773,7 @@ impl contextdb_vector::hnsw::paged_builder::PagedVectorPersistence for SealedPag
 impl MaintenanceContext {
     /// Routes with a durable unpublished build that this cycle's sampled
     /// inventory did not select. One small control record per pending build.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn unselected_paged_builds(
         &self,
         selected: &[MaintenanceBuildCandidate],

@@ -13,6 +13,7 @@ pub(crate) struct HiddenPullScan {
     incarnation: Option<Incarnation>,
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_pull_scan(
         &self,
         tenant: &TenantId,
@@ -69,6 +70,7 @@ impl Database {
             }))
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn remember_hidden_custody_pull(&self, scan: HiddenPullScan) -> Result<()> {
         self.with_custody_store(|store| {
             // One entry per authenticated peer, independent of receipt history.

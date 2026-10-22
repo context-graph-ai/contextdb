@@ -47,6 +47,7 @@ impl Database {
     /// Import completion seam: completed routes have durable graph coverage.
     /// Replacement work remains owned by the ordinary maintenance scheduler.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn persist_import_vector_tails(&self) -> Result<bool> {
         let read_memory = self.declared_reader_memory()?;
         let mut operation = self.assert_open_operation();
@@ -179,6 +180,7 @@ impl MaintenanceContext {
     /// declared memory limit. Without an active owner, persistence opens a
     /// private reader at the shipped default reader memory and refuses any
     /// suffix whose vectors exceed it, whatever the consumer declared.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn writer_maintenance_decode(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
         crate::read_image_memory::ImageMemory::enter_writer_operation(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
@@ -193,6 +195,7 @@ impl MaintenanceContext {
     /// control and any quantized scratch -- is charged to the declared writer
     /// limit by a per-call owner, live for that one value and returned when
     /// the next value's decode begins, never accumulated across values.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_import_cohort(
         &self,
         site: &'static str,
@@ -324,6 +327,7 @@ impl MaintenanceContext {
     }
 
     /// The transaction the commit index records at exactly `lsn`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_tx_at(&self, lsn: Lsn) -> Result<TxId> {
         match self
             .tx_mgr
@@ -338,6 +342,7 @@ impl MaintenanceContext {
     /// The next cohort of a route's uncovered suffix after `covered`, never
     /// past the import's fixed `target`: whole committed LSNs, oldest first,
     /// while their decoded vectors fit this writer's cohort share.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn import_cohort_plan(
         &self,
         persistence: &RedbPersistence,
@@ -367,6 +372,7 @@ impl MaintenanceContext {
     /// target until a publication moves its coverage. Returns false when the
     /// route cannot advance now (quarantined, no build possible, no durable
     /// progress, or superseded twice): the import reports it incomplete.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rebuild_route_to_target(
         &self,
         persistence: &Arc<RedbPersistence>,
@@ -425,6 +431,7 @@ impl MaintenanceContext {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist_import_vector_tails(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -484,6 +491,7 @@ impl MaintenanceContext {
         Ok(complete)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist_import_vector_tail_cohort(
         &self,
         persistence: &Arc<RedbPersistence>,
@@ -793,6 +801,7 @@ impl MaintenanceContext {
 impl MaintenanceContext {
     /// Absorb one committed cohort into the completed replacement, leaving
     /// every later cohort for a future finite scheduler wake.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn catch_up_native_import_candidate(
         &self,
         partition: &VectorPartitionRef,
@@ -949,6 +958,7 @@ impl MaintenanceContext {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn native_tail_write_bound(
     plan: contextdb_vector::hnsw::paged_builder::PagedVectorBatchPlan,
 ) -> Result<usize> {

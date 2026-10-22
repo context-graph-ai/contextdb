@@ -44,6 +44,7 @@ impl MetadataCopyCharges {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn from_original(original: &crate::memory_accounting::OwnedMemoryReservation) -> Result<Self> {
         let seed = crate::memory_accounting::reserve_preparation_from_original(original, 0,
             "sync", "received_metadata_controls", "Raise MEMORY_LIMIT to prepare received metadata.")?;
@@ -53,6 +54,7 @@ impl MetadataCopyCharges {
             writer_use: ManuallyDrop::new(None), native_backing: Some(seed),
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn from_original_array<const N: usize>(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         charges: [StagedCopyCharge; N],
@@ -64,6 +66,7 @@ impl MetadataCopyCharges {
     }
 
     /// Preserve vec![a, b, c]'s exact initial capacity in the no-op stage.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn from_array<const N: usize>(
         accountant: &crate::memory_accounting::AccountantHandle,
         charges: [StagedCopyCharge; N],
@@ -77,6 +80,7 @@ impl MetadataCopyCharges {
         Ok(owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn push(&mut self, charge: StagedCopyCharge) -> Result<()> {
         if self.charges.len() == self.charges.capacity() {
             let required = self
@@ -103,6 +107,7 @@ impl MetadataCopyCharges {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn grow_to(&mut self, capacity: usize) -> Result<()> {
         if capacity == 0 || std::mem::size_of::<StagedCopyCharge>() == 0 {
             // Vec's zero-capacity and ZST paths make no physical allocation.

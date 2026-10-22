@@ -30,11 +30,13 @@ struct Source<'a> {
     context: &'a NativeReadOpenContext,
 }
 impl Source<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cursor(&self, prefix: &str) -> Selected<ReadShared<Mutex<NativeRawConfigCursor>>> {
         Ok(self
             .root
             .native_raw_config_prefix(self.operation, self.context, prefix)?)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scan(
         &self,
         selectors: &[Selector<'_>],
@@ -104,6 +106,7 @@ impl Source<'_> {
     }
 }
 impl Source<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn collect(&self, selectors: &[Selector<'_>]) -> Selected<NativeCustodySelection> {
         if selectors
             .iter()
@@ -128,6 +131,7 @@ impl Source<'_> {
         selection.sort_dedup();
         Ok(selection)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_companions(&self, selection: &NativeCustodySelection) -> Selected<()> {
         for selected in selection.windows() {
             let view = selected.view()?;
@@ -196,6 +200,7 @@ impl Source<'_> {
     }
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn native_custody_selection_on(
         &self,
         operation: &NativeReadRequest,
@@ -223,6 +228,7 @@ impl Database {
         source.context.checkpoint().map_err(Failure::Unqualified)?;
         Ok(selection)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_records_native(
         &self,
         selectors: &[&str],
@@ -243,6 +249,7 @@ impl Database {
         }
         self.native_custody_selection_on(operation, context, admitted.as_slice())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_submission_native(
         &self,
         submission: uuid::Uuid,
@@ -255,6 +262,7 @@ impl Database {
             NativeBuffer::format(&operation.owner(), format_args!("submission:{submission}"))?;
         self.native_custody_selection_on(operation, context, &[Selector::Group(group.text()?)])
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_authority_native(
         &self,
         operation: &NativeReadRequest,
@@ -266,6 +274,7 @@ impl Database {
             &[Selector::Group("authority"), Selector::Group("policies")],
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_native_custody_selection(
         &self,
         selection: &NativeCustodySelection,
@@ -339,6 +348,7 @@ impl NamespaceInput<'_> {
     }
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_outcomes_native(
         &self,
         tenant: &TenantId,
@@ -362,6 +372,7 @@ impl Database {
         )
     }
     #[allow(clippy::too_many_arguments)] // Keep the existing selector inputs and private validator explicit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_outcomes_native_with_after(
         &self,
         tenant: &TenantId,
@@ -556,6 +567,7 @@ impl Database {
             more,
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_checkpoint_exact_native(
         &self,
         key: &str,

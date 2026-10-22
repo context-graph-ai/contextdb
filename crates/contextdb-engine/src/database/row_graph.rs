@@ -81,6 +81,7 @@ impl Database {
             .map_or(0, |journal| journal.state.lock().sequence)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_legacy_row_graph_undo(
         &self,
         tx: TxId,
@@ -179,6 +180,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn stage_row_graph_insert(
         &self,
         tx: TxId,
@@ -273,6 +275,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retire_row_graph(
         &self,
         tx: TxId,
@@ -416,6 +419,7 @@ impl Database {
 
     /// Borrow the selected version through its exact owner key in both storage
     /// modes. Missing ownership is corruption, never a fallback to a sibling.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn with_row_graph_witness<R>(
         &self,
         table: &str,
@@ -490,6 +494,7 @@ impl Database {
         Ok(result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn selected_row_graph_witnesses(
         &self,
         selections: &[AuthoritativePurgeSelection],
@@ -536,6 +541,7 @@ impl Database {
         Ok((selected, memory))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn copy_row_graph_entries(
         &self,
         entries: &[OwnedAdjEntry],
@@ -566,6 +572,7 @@ impl Database {
         Ok((copied, memory))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_row_graph_adjacency_at_root(
         &self,
         root: Option<crate::persistence::graph_read::EngineGraphReadRoot>,
@@ -598,6 +605,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn row_graph_witnesses_for_table_drop(
         &self,
         table: &str,
@@ -646,6 +654,7 @@ impl Database {
 
     /// Declared identities accept siblings. The existing no-key SQL rule
     /// still checks the logical triad, excluding the just-staged row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_graph_identity_allowed(
         &self,
         tx: TxId,
@@ -713,6 +722,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_row_graph_projection(
         &self,
         table: &str,
@@ -764,6 +774,7 @@ impl Database {
 
     /// Replace the exact witness using the caller's checkpoint and guard.
     /// Equal owner headers do not preserve an obsolete projected edge body.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn replace_row_graph_in_held_guard(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -840,6 +851,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn replace_row_graph_in_prepared_write_set(
         &self,
         ws: &mut WriteSet,
@@ -937,6 +949,7 @@ pub(super) fn row_graph_matches_final_row(entry: &OwnedAdjEntry, table: &str, ro
             == Some(entry.entry.edge_type.as_str())
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn canonicalize_row_graph_in_held_guard(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -986,6 +999,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_graph_shape_loss(&self, table: &str, before: &TableMeta,
         after: &TableMeta, copies: &mut contextdb_vector::VectorCopyAdmission,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>)

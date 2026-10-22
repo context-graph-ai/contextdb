@@ -7,6 +7,7 @@ use crate::custody::{
 };
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_incumbent_digest(
         &self,
         root: &RowRef,

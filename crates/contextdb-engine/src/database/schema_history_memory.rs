@@ -180,6 +180,7 @@ pub(super) struct SchemaHistoryMemory {
     pending_bytes: usize,
 }
 impl SchemaHistoryMemory {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_capacity(&mut self, logs: usize, generations: usize) -> Result<()> {
         let mut log = self.ddl_log.write();
         let required = log
@@ -312,6 +313,7 @@ pub(crate) struct PreparedSchemaHistory {
     slots: HistorySlots,
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn initialize_schema_history_memory(&self) -> Result<()> {
         let mut retained = self.finalization.schema_history_memory.lock();
         if retained.is_none() {
@@ -339,6 +341,7 @@ impl Database {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_staged_memory_schema_history(
         &self,
         lsn: Lsn,
@@ -355,6 +358,7 @@ impl Database {
         };
         self.prepare_memory_schema_history(lsn, start, ddl, sidecars)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_memory_schema_history(
         &self,
         lsn: Lsn,
@@ -376,6 +380,7 @@ impl Database {
         )
         .map(Some)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_memory_history_entries<'a>(
         &self,
         ddl: impl Iterator<Item = (Lsn, &'a DdlChange)> + Clone,
@@ -408,6 +413,7 @@ impl Database {
             payload_bytes,
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_memory_history_entries_priced<'a>(
         &self,
         ddl: impl Iterator<Item = (Lsn, &'a DdlChange)> + Clone,

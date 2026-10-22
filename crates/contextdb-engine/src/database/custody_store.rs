@@ -38,6 +38,7 @@ pub(crate) struct CustodyDelta {
 
 impl Database {
     // The existing outbound builder delegates manifested membership.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn dependency_complete_outbound_units(
         &self,
         changes: ChangeSet,
@@ -68,6 +69,7 @@ impl Database {
         Ok(connected)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_parent_refs(
         &self,
         row: &RowChange,
@@ -123,6 +125,7 @@ impl Database {
         }
         Ok(parents)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn with_custody_store<T>(
         &self,
         f: impl FnOnce(&mut Store) -> Result<T>,
@@ -131,12 +134,14 @@ impl Database {
     }
     /// The latest published writer root. Commit preparation validates and
     /// retires against it, so it sees every commit published before this one.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn latest_custody_root(
         &self,
     ) -> Result<crate::persistence::writer_source::WriterSnapshotHandle> {
         super::writer_read::durable_root(self.tx_mgr.capture_published_read().handle)?
             .ok_or_else(|| Error::Other("writer publication has no durable root".into()))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_custody_store_at<T>(
         &self,
         at: CustodyRoot,
@@ -849,6 +854,7 @@ impl Database {
         ));
         Ok(Some(out))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_records(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -861,6 +867,7 @@ impl Database {
             read_memory.clone(),
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_records_in(
         &self,
         selectors: &[String],
@@ -872,6 +879,7 @@ impl Database {
     }
     /// The operation memory of one custody read: its own control is admitted
     /// to the reader before the shared owner exists.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn custody_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -883,6 +891,7 @@ impl Database {
             read_memory,
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn custody_records_in_at<S: AsRef<str>>(
         &self,
         at: CustodyRoot,
@@ -894,6 +903,7 @@ impl Database {
         let memory = self.custody_read_memory(read_memory)?;
         self.custody_select_at(at, memory, selectors)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn custody_select_at<S: AsRef<str>>(
         &self,
         at: CustodyRoot,
@@ -906,6 +916,7 @@ impl Database {
             Ok(records)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn verify_selected_custody_records(&self, store: &Store, records: &[Record]) -> Result<()> {
         // A durable answer was decoded and verified from the persisted bytes.
         if store.is_durable() {
@@ -931,6 +942,7 @@ impl Database {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_table(
         &self,
         table: &str,
@@ -945,6 +957,7 @@ impl Database {
             Ok(records)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_rows(
         &self,
         rows: &[crate::custody::records::RowRef],
@@ -959,6 +972,7 @@ impl Database {
             Ok(records)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_authority(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -971,6 +985,7 @@ impl Database {
             read_memory.clone(),
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_submission(
         &self,
         submission: uuid::Uuid,
@@ -984,6 +999,7 @@ impl Database {
             read_memory.clone(),
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_root(
         &self,
         root: &crate::custody::records::RowRef,
@@ -1023,6 +1039,7 @@ impl Database {
         let answer_memory = self.custody_read_memory(read_memory)?;
         self.custody_select_at(CustodyRoot::Operation, answer_memory, selectors.as_slice())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_pending_manifests(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -1033,6 +1050,7 @@ impl Database {
         self.with_custody_store(|store| store.pending(memory, self))
     }
     // Only complete adjudication may publish a batch bookmark.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn finish_custody_push(
         &self,
         receipt: &SyncApplyReceipt,
@@ -1059,6 +1077,7 @@ impl Database {
     // Retain ordinary arbitration, provenance and diagnostics
     // while holding its receipt at the already-adjudicated batch frontier.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_custody_remainder(
         &self,
         changes: ChangeSet,
@@ -1103,6 +1122,7 @@ impl Database {
             read_memory.clone(),
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn custody_row(
         &self,
         reference: &crate::custody::records::RowRef,
@@ -1136,6 +1156,7 @@ impl Database {
     // A replacement or deletion ends ownership of the
     // previous committed manifest. Preserve its signed history and terminals;
     // current rows require a registration from their own writing transaction.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retire_changed_custody_roots(
         &self,
         ws: &mut WriteSet,
@@ -1327,6 +1348,7 @@ impl Database {
     }
 
     /// The resident form, for a store without a durable writer root.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retire_changed_custody_roots_resident(
         &self,
         ws: &mut WriteSet,
@@ -1433,6 +1455,7 @@ impl Database {
     /// is lent before source/peer guards and its commit boundary fixes the
     /// published base. No mutable ordinary WriteSet or old custody debit is
     /// used to price the independently allocated native delete targets.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retire_changed_custody_roots_in_prepared_write_set(
         &self,
         original: &OwnedMemoryReservation,
@@ -1521,6 +1544,7 @@ impl Database {
     /// so it is released only after the write set is dropped. Its own list
     /// holds at most one entry per preparation of the commit (two when a
     /// discard drain is present).
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_custody_commit(
         &self,
         ws: &mut WriteSet,
@@ -1576,6 +1600,7 @@ impl Database {
         self.prepare_custody_delta(&ws.config_writes, &ws.config_deletes, memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_custody_commit_in_prepared_write_set(
         &self,
         host: &EngineDatabaseTransactions,
@@ -1608,6 +1633,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_custody_delta(
         &self,
         writes: &[(String, Vec<u8>)],
@@ -1673,6 +1699,7 @@ pub(super) struct OwnedCustodyDelta {
     changes: crate::custody::preparation::OwnedPreparationValue<Vec<OwnedCustodyChange>>,
     _publication: crate::custody::store::Publication,
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn custody_groups_owned(
     db: &Database,
     record: &Record,
@@ -1778,6 +1805,7 @@ fn custody_groups_owned(
         },
     )
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn custody_record_matches_group(db: &Database, record: &Record, group: &str) -> Result<bool> {
     custody_groups_owned(db, record)?
         .with_value(|groups| Ok(groups.iter().any(|g| g.with_value(|g| g == group))))

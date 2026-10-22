@@ -52,6 +52,7 @@ impl<'a> MaintenanceFrontier<'a> {
     /// Mutating maintenance holds the existing commit guard to keep this
     /// canonical frontier and its metadata coherent. The read-only pending
     /// probe may retain the immutable published frontier without that guard.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn capture(
         store: &'a RelationalStore,
         manager: &DatabaseTransactionHost,
@@ -93,6 +94,7 @@ impl<'a> MaintenanceFrontier<'a> {
     /// The repeated candidate, protection and mutation walks share one finite
     /// physical window. Only its key bounds survive between walks; row bodies
     /// are released with each admitted cursor window.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retention_batch(
         mut self,
         metas: &HashMap<String, TableMeta>,
@@ -279,6 +281,7 @@ impl<'a> MaintenanceFrontier<'a> {
     /// Called when `parent` (selected) is held back by a live referencing
     /// `child` that this pass did not select. When the child is itself
     /// expired, both are queued so a later pass judges them together.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn note_cohort_blocker(
         &self,
         metas: &HashMap<String, TableMeta>,
@@ -327,6 +330,7 @@ impl<'a> MaintenanceFrontier<'a> {
     /// The durable cohort queue for the next pass: queued members this pass
     /// still had to protect, then newly discovered cross-window blockers.
     /// Members that expired, were pruned, or stopped being candidates leave.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn cohort_progress(
         &self,
         protected: impl Fn(&str, &[u8; 24]) -> bool,
@@ -367,6 +371,7 @@ impl<'a> MaintenanceFrontier<'a> {
         )))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn no_future_stamps(&self, table: &str, horizon: u64) -> Result<bool> {
         match &self.root {
             Some(root) => Ok(RedbPersistence::retention_clock_upper_in_read(root, table)?
@@ -377,6 +382,7 @@ impl<'a> MaintenanceFrontier<'a> {
 
     /// A diagnostic has its own finite continuation. Publish only a completed
     /// recount; partial windows never replace the last complete tally.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn future_stamp_count(
         &self,
         table: &str,
@@ -472,6 +478,7 @@ impl<'a> MaintenanceFrontier<'a> {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn cleanup_rotation(&self) -> Result<Option<[u8; 32]>> {
         self.source
             .as_ref()
@@ -480,6 +487,7 @@ impl<'a> MaintenanceFrontier<'a> {
 
     /// Once a finite cleanup has started, its remaining windows must run even
     /// when earlier windows took the superseded population below the start gate.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn cleanup_in_progress(&self, table: &str, meta: &TableMeta) -> Result<bool> {
         let Some(source) = &self.source else {
             return Ok(false);
@@ -493,6 +501,7 @@ impl<'a> MaintenanceFrontier<'a> {
         self.source.is_some()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn has_table(&self, table: &str) -> Result<bool> {
         if let Some(source) = &self.source {
             return match source.validate_table(table) {
@@ -507,6 +516,7 @@ impl<'a> MaintenanceFrontier<'a> {
             .is_some_and(|tables| tables.contains_key(table)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit(
         &self,
         table: &str,
@@ -517,6 +527,7 @@ impl<'a> MaintenanceFrontier<'a> {
 
     /// FK protection probes the complete captured child frontier, independently
     /// of the candidate window. Current-only postings avoid retained history.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_references(
         &self,
         table: &str,
@@ -585,6 +596,7 @@ impl<'a> MaintenanceFrontier<'a> {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_selected(
         &self,
         table: &str,
@@ -641,6 +653,7 @@ impl<'a> MaintenanceFrontier<'a> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_row(
         &self,
         table: &str,
@@ -668,6 +681,7 @@ impl<'a> MaintenanceFrontier<'a> {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn sync_source_kind(
         &self,
         table: &str,
@@ -681,6 +695,7 @@ impl<'a> MaintenanceFrontier<'a> {
 
     /// Each physical keeper/protection record spends one unit of the shared
     /// cycle allowance. Positions become durable beside the selected removals.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn select_durable_cleanup(
         &self,
         table: &str,

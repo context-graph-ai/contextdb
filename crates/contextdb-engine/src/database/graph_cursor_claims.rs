@@ -36,6 +36,7 @@ impl GraphDecisionContext {
     pub(super) fn rows(&self, table: &str) -> Option<Arc<contextdb_tx::StatementRows>> {
         self.legacy_rows.get(table).cloned()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn sealed_rows(
         &self,
         table: &str,
@@ -48,6 +49,7 @@ impl GraphDecisionContext {
             .map(|directory| directory.table_rows(table, memory))
             .transpose()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_rows(
         ws: &WriteSet,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -79,12 +81,14 @@ impl GraphDecisionContext {
         }
         Ok((rows, credit))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn check_table(&self, table: &str) -> Result<()> {
         if let Some(root) = &self.root {
             root.check_table_scope(table)?;
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn check(&self) -> Result<()> {
         for edge in &self.decisions.row_adj_inserts {
             self.check_table(&edge.owner.table)?;
@@ -101,6 +105,7 @@ impl Database {
                 .map(|(_, guard)| guard.0.clone())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_graph_decision_metadata(
         &self,
         read: contextdb_tx::manager::EngineRead<'_>,
@@ -248,6 +253,7 @@ impl Database {
             _rows_memory: rows_memory,
         })))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn graph_cursor_prepared_read_guard(
         &self,
         ws: &WriteSet,
@@ -268,6 +274,7 @@ impl Database {
             memory,
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn graph_cursor_held_read_guard(
         &self,
         held: &contextdb_tx::manager::EngineGuard<'_>,
@@ -290,6 +297,7 @@ impl Database {
             memory,
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_cursor_read_guard(
         &self,
         tx: Option<TxId>,
@@ -383,6 +391,7 @@ fn staged_binding<'a>(
     }
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn wrap_graph_bfs_cursor(
         &self,
         _tx: Option<TxId>,

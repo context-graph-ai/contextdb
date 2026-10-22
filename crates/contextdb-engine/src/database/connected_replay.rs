@@ -21,6 +21,7 @@ pub(super) struct ConnectedCoordinates {
 }
 
 impl ConnectedCoordinates {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare(
         changes: &ChangeSet,
         start: Lsn,
@@ -65,12 +66,14 @@ impl ConnectedCoordinates {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn local(&self, source: Lsn) -> Result<Lsn> {
         self.groups.get(&source).copied().ok_or_else(|| {
             Error::SyncError("received member has no reserved subgroup coordinate".into())
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn stage_membership(&self, writes: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
         for local in self.groups.values() {
             writes.push((
@@ -89,6 +92,7 @@ fn membership_position(lsn: Lsn) -> Vec<contextdb_core::DirectedValue> {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn connected_membership_at(
         &self,
         lsn: Lsn,
@@ -150,6 +154,7 @@ impl Database {
             .map(|(_, entry)| (Lsn(entry.row_id.0), Lsn(entry.created_tx.0))))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn connected_history_end(
         &self,
         lsn: Lsn,
@@ -162,6 +167,7 @@ impl Database {
             .map_or(lsn, |(_, end)| end))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn connected_history_since(
         &self,
         lsn: Lsn,
@@ -180,6 +186,7 @@ impl Database {
             }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_connected_membership_delta(
         &self,
         writes: &[(String, Vec<u8>)],
@@ -230,6 +237,7 @@ pub(super) struct ConnectedOverlay {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn connected_source_positions(
         &self,
         changes: &ChangeSet,
@@ -260,6 +268,7 @@ impl Database {
         Ok((credit, positions))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_connected_overlay(
         &self,
         changes: &ChangeSet,
@@ -270,6 +279,7 @@ impl Database {
         self.prepare_connected_overlay_with_vectors(changes,owner,false)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_connected_overlay_with_vectors(
         &self,changes: &ChangeSet,owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         source_vectors: bool,
@@ -521,6 +531,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn preflight_connected_overlay(
         &self,
         changes: &ChangeSet,
@@ -556,6 +567,7 @@ impl Database {
 }
 
 impl ConnectedOverlay {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn admit_source_vector_archives(&mut self,source: &ChangeSet) -> Result<()> {
         let bytes = source.vectors.iter().map(|vector| vector.vector.len().saturating_mul(4)
             .saturating_add(vector.index.column.len()).saturating_add(256)).fold(0usize,usize::saturating_add);
@@ -579,6 +591,7 @@ impl ConnectedOverlay {
 
     /// The latest accepted mutation of each receiver-owned row, never the
     /// last competing wire member. The overlay credit funds this scalar map.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn accepted_row_positions(
         &self,
         finalized: &WriteSet,
@@ -613,6 +626,7 @@ impl ConnectedOverlay {
 
     /// Canonicalizing the working write set may erase an insert followed by
     /// a delete. The accepted source history must still carry both members.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn accepted_row_history(
         &self,
         finalized: &WriteSet,
@@ -659,6 +673,7 @@ impl ConnectedOverlay {
         Ok(history)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn authored_rows(
         &self,
         finalized: &WriteSet,
@@ -732,6 +747,7 @@ impl Database {
     /// Group ordinary source transactions separately, and connected positions
     /// by their one durable acceptance. The caller's output admission owns the
     /// grouping allocations until encoding/publication finishes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn connected_delivery_groups(
         &self,
         changes: ChangeSet,
@@ -793,6 +809,7 @@ impl Database {
         Ok(groups.into_values().collect())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn connected_delivery_ceiling(
         &self,
         lsn: Lsn,
@@ -813,6 +830,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn expand_connected_positions(
         &self,
         positions: &mut HashSet<Lsn>,
@@ -841,6 +859,7 @@ pub(super) enum PrivateApplyPhases {
     Ordered { groups: std::vec::IntoIter<ChangeSet>, _credit: ReadCredit },
 }
 impl PrivateApplyPhases {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare(changes: ChangeSet, coordinates: Option<&ConnectedCoordinates>,
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
@@ -882,7 +901,9 @@ impl PrivateChangedRows {
 
         Self { rows: HashMap::new(), _credit: ReadCredit::new(owner) }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn insert(&mut self, table: &str, row: RowId) -> Result<()> { self.insert_kind(table, row, 1) }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn insert_kind(&mut self, table: &str, row: RowId, kind: u8) -> Result<()> {
         if let Some(existing) = self.rows.get_mut(table).and_then(|rows| rows.get_mut(&row)) {
             existing.kind |= kind;
@@ -898,6 +919,7 @@ impl PrivateChangedRows {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_before(&mut self, table: &str, row: &VersionedRow) -> Result<()> {
         self.insert_kind(table, row.row_id, 2)?;
         if self.before(table, row.row_id).is_some() { return Ok(()); }
@@ -952,6 +974,7 @@ pub(super) struct PrivatePrefixEffects {
     captured_rows_invoice:Option<ReadCredit>,
 }
 impl PrivatePrefixEffects {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn for_refusal_metadata(configs: &[(String, Vec<u8>)], result: &ApplyResult,
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
@@ -967,6 +990,7 @@ impl PrivatePrefixEffects {
 
     /// Only final surviving callback rows need a position in the current image.
     /// Earlier callback bodies/history remain independently retained below.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn add_derived_positions(&mut self, finalized: &WriteSet,
         positions: &mut BTreeMap<(String, RowId), Lsn>) -> Result<()> {
         for (table,row) in &finalized.relational_inserts {
@@ -979,6 +1003,7 @@ impl PrivatePrefixEffects {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn synthetic_firings_for_commit(&mut self) -> Result<&[PrivateSyntheticTriggerFiring]> {
         self._credit.try_grow_for(self.synthetic_firings.iter().fold(0usize,|bytes,firing| bytes
             .saturating_add(firing.trigger_name.len()).saturating_add(std::mem::size_of::<TriggerAuditEntry>()
@@ -987,6 +1012,7 @@ impl PrivatePrefixEffects {
         Ok(&self.synthetic_firings)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn take_prepared_sinks(&mut self, current: u64) -> Result<Option<event_bus::PreparedReceivedSinkEvents>> {
         let Some((base, next_queue_id)) = self.sink_cursor else { return Ok(None); };
         if current != base {
@@ -994,6 +1020,7 @@ impl PrivatePrefixEffects {
         }
         Ok(Some(event_bus::PreparedReceivedSinkEvents { events: std::mem::take(&mut self.sink_events), next_queue_id }))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn committed_audits(&mut self, tx: TxId) -> Result<Vec<TriggerAuditEntry>> {
         let bytes = self.audits.iter().map(|(_, pending)| pending.trigger_name.len()
             .saturating_add(std::mem::size_of::<TriggerAuditEntry>().saturating_mul(4))
@@ -1063,6 +1090,7 @@ impl<'a> PrivatePhaseScope<'a> {
         })));
         Self { db, tx, previous, active: true, _same_thread: std::marker::PhantomData }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn finish(mut self) -> Result<PrivateChangedRows> {
         let current = PRIVATE_PHASE.with(|slot| slot.replace(self.previous.take()));
         self.active = false;
@@ -1083,6 +1111,7 @@ pub(super) struct PrivateUnitScope<'a> {
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl<'a> PrivateUnitScope<'a> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn enter(db: &'a Database, tx: TxId, canonical_tx: TxId, end: Lsn,
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Self> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
@@ -1096,6 +1125,7 @@ impl<'a> PrivateUnitScope<'a> {
         })));
         Ok(Self { db, tx, previous, active: true, _same_thread: std::marker::PhantomData })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn finish(mut self) -> Result<PrivatePrefixEffects> {
         let current = PRIVATE_UNIT.with(|slot| slot.replace(self.previous.take()));
         self.active = false;
@@ -1139,6 +1169,7 @@ impl Drop for PrivateUnitScope<'_> {
     }
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn note_private_source_row_change(&self, tx: TxId, table: &str, row: RowId) -> Result<()> {
         PRIVATE_PHASE.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1148,6 +1179,7 @@ impl Database {
             }
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn note_private_pending_row_replacement(&self, tx: TxId, table: &str, row: RowId) -> Result<()> {
         PRIVATE_PHASE.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1184,6 +1216,7 @@ impl Database {
             Ok(())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_callback_copy_credit(&self, tx: TxId, name: &str, table: &str,
         values: &HashMap<String, Value>) -> Result<Option<ReadCredit>> {
         let owner = PRIVATE_UNIT.with(|slot| slot.borrow().as_ref().filter(|state|
@@ -1196,6 +1229,7 @@ impl Database {
                 "Raise the declared memory limit to prepare this callback context.")
         }).transpose()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn admit_private_prefix_audit(&self, tx: TxId, name: &str) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1206,6 +1240,7 @@ impl Database {
             Ok(())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retain_private_prefix_audits(&self, tx: TxId, lsn: Lsn,
         pending: Vec<trigger::PendingTriggerAudit>) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
@@ -1220,6 +1255,7 @@ impl Database {
             Ok(())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn admit_private_prefix_sink_event(&self, tx: TxId, bytes: usize) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1229,6 +1265,7 @@ impl Database {
                 "Raise the declared memory limit to retain this unit's sink events.")
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retain_private_prefix_sink_events(&self, tx: TxId, base: u64, next: u64,
         events: Vec<event_bus::PreparedSinkEvent>) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
@@ -1247,6 +1284,7 @@ impl Database {
             && PRIVATE_UNIT.with(|slot| slot.borrow().as_ref().is_some_and(|state|
                 state.host == self.tx_mgr.identity() && state.callbacks_prepared))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_private_callbacks_for_commit(&self, tx: TxId) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1256,6 +1294,7 @@ impl Database {
             Ok(())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retain_private_final_audits(&self, tx: TxId,
         pending: Vec<trigger::PendingTriggerAudit>) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
@@ -1288,6 +1327,7 @@ impl Database {
 impl Database {
     /// Retire graph inserts owned by pending graph-table rows before DROP
     /// destroys the row identities used by the existing graph projection.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn drop_private_pending_graph_rows(&self, tx: TxId, table: &str) -> Result<()> {
         if !self.table_meta(table).is_some_and(|meta| has_graph_edge_table_shape(&meta)) {
             return Ok(());
@@ -1365,6 +1405,7 @@ impl Database {
     /// Retire pending row bodies through their recorded owners before DROP
     /// destroys the declaration needed by legacy fallback pricing. No row
     /// mutation policy is consulted: this is the private schema projection.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn drop_private_pending_relational_rows(&self, tx: TxId, table: &str) -> Result<()> {
         self.tx_mgr.with_write_set(tx, |ws| -> Result<()> {
             if ws.ordered_staged_rows.checkpoint_active() {
@@ -1394,6 +1435,7 @@ impl Database {
     /// Transform one private pending body at a time after an ALTER, including
     /// callback-derived rows. The old admission stays live until its body is
     /// destroyed; the replacement and its postings own independent invoices.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn alter_private_pending_relational_rows(&self, tx: TxId,
         ddl: &DdlChange, previous: Option<&TableMeta>, owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
@@ -1477,6 +1519,7 @@ impl Database {
     /// A graph-backed table can accompany table-only schema replay when no
     /// source operation touches it. Graph lifetimes still use the established
     /// replacement kernel; mixed data units remain outside this opening.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_source_order_supported(changes: &ChangeSet,
         live: &HashMap<String, TableMeta>, projected: &HashMap<String, TableMeta>,
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<bool> {
@@ -1529,12 +1572,14 @@ pub(super) struct PrivateTriggerBaseline {
     _credit: ReadCredit,
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_trigger_row_copy_credit(&self, tx: TxId, table: &str,
         row: &VersionedRow) -> Result<Option<ReadCredit>> {
         self.private_replay_owner(tx).map(|owner| ReadCredit::try_new(owner,
             crate::memory_accounting::preparation_row_copy_bytes(row)?.saturating_add(table.len()).saturating_add(256),
             "sync", "connected_trigger_row_copy", "Raise the declared memory limit to dispatch this source row.")).transpose()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn capture_private_trigger_baseline(&self, tx: TxId) -> Result<Option<PrivateTriggerBaseline>> {
         let Some(owner) = self.private_replay_owner(tx) else { return Ok(None); };
         self.tx_mgr.with_write_set(tx, |ws| -> Result<Option<PrivateTriggerBaseline>> {
@@ -1580,6 +1625,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn admit_private_trigger_snapshot(&self, tx: TxId,
         declarations: Option<&BTreeMap<String,TriggerDeclaration>>, credit: Option<&mut ReadCredit>) -> Result<()> {
         let Some(credit) = credit else { return Ok(()); };
@@ -1602,6 +1648,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn admit_private_trigger_guard(&self, tx: TxId, name: &str) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1617,6 +1664,7 @@ impl Database {
 impl Database {
     /// DROP destroys the old layout, so settle pending vectors while their
     /// admission-time quantization still exists. No body is refunded live.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn drop_private_pending_vectors(&self, tx: TxId, table: &str,
         vector_owner: &mut contextdb_vector::VectorCopyAdmission) -> Result<()> {
         loop {
@@ -1652,6 +1700,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_callback_start(&self, tx: TxId) -> Result<usize> {
         PRIVATE_UNIT.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1672,6 +1721,7 @@ impl Database {
             })?
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_callback_end(&self, tx: TxId, initial_rows: usize, materialized_edge: bool, phase_lsn: Lsn) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1790,6 +1840,7 @@ impl PrivatePendingVectorAlter {
     }
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn detach_private_pending_vectors_for_alter(&self, tx: TxId, ddl: &DdlChange,
         owner: &mut contextdb_vector::VectorCopyAdmission,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Option<PrivatePendingVectorAlter>> {
@@ -1856,6 +1907,7 @@ impl Database {
         }
         Ok(Some(plan))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn restore_private_pending_vectors_after_alter(&self, tx: TxId, mut plan: PrivatePendingVectorAlter) -> Result<()> {
         // The directory/old-shape credit now follows the output write set;
         // failure after restoring only some entries cannot refund live keys.
@@ -1915,6 +1967,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retain_private_vector_alter_credit(&self, tx: TxId, credit: &mut ReadCredit) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1927,6 +1980,7 @@ impl Database {
             Ok(())
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_private_vector_alter_output(&self, tx: TxId, bytes: usize) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
             let mut state = slot.borrow_mut();
@@ -1939,6 +1993,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn retain_private_synthetic_firing(&self, tx: TxId, table: &str, row: RowId,
         trigger_name: &str, lsn: Lsn) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
@@ -1970,6 +2025,7 @@ pub(super) struct PrivateGraphMutation {
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn set_private_graph_phase(&self, tx: TxId,
         origin: crate::persistence::received_working_graph::WorkingGraphOrigin) -> Result<()> {
         PRIVATE_UNIT.with(|slot| {
@@ -1986,6 +2042,7 @@ impl Database {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_private_graph_mutation(&self, tx: TxId, from: NodeId,
         kind: &str, to: NodeId) -> Result<Option<PrivateGraphMutation>> {
         let origin = PRIVATE_UNIT.with(|slot| slot.borrow().as_ref().filter(|state|
@@ -2008,6 +2065,7 @@ impl Database {
                 before_bytes, deleted, origin, _owner: frame.into_reservation() }))
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn finish_private_graph_mutation(&self, tx: TxId,
         mutation: Option<PrivateGraphMutation>) -> Result<()> {
         let Some(mutation) = mutation else { return Ok(()); };
@@ -2046,6 +2104,7 @@ impl Drop for PrivateGraphStatementCheckpoint {
     }
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn checkpoint_private_graph_statement(&self, tx: TxId) -> Result<Option<PrivateGraphStatementCheckpoint>> {
         let Some(source) = crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())?
             else { return Ok(None); };
@@ -2064,6 +2123,7 @@ impl Database {
                 marker, _owner: Some(frame.into_reservation()), active: true }))
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn restore_private_graph_statement(&self, tx: TxId,
         checkpoint: &mut PrivateGraphStatementCheckpoint) -> Result<()> {
         let source = checkpoint.source.clone();
@@ -2096,12 +2156,14 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_graph_capture_active(&self, tx: TxId) -> Result<bool> {
         if self.private_replay_owner(tx).is_none() { return Ok(false); }
         match crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())? {
             Some(source) => source.private_graph_capturing(), None => Ok(false),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn replace_private_graph_statement_original(&self, tx: TxId,
         owner: &mut Option<crate::memory_accounting::OwnedMemoryReservation>)
         -> Result<Option<crate::memory_accounting::OwnedMemoryReservation>> {
@@ -2121,6 +2183,7 @@ pub(super) struct PrivateGraphSchemaTransition {
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_private_graph_schema_transition(&self, tx: TxId, ddl: &DdlChange)
         -> Result<Option<PrivateGraphSchemaTransition>> {
         if !self.private_graph_capture_active(tx)? { return Ok(None); }
@@ -2139,6 +2202,7 @@ impl Database {
             Ok(Some(PrivateGraphSchemaTransition { table, previous, _owner: frame.into_reservation() }))
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn finish_private_graph_schema_transition(&self, tx: TxId,
         transition: Option<PrivateGraphSchemaTransition>) -> Result<()> {
         let Some(transition) = transition else { return Ok(()); };
@@ -2175,6 +2239,7 @@ pub(super) struct PrivatePendingGraphProperties {
 }
 impl PrivateGraphMutation {
     pub(super) fn pending_bytes(&self) -> usize { self.before_bytes }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn merged_pending_properties(&self, incoming: &HashMap<String, Value>)
         -> Result<Option<PrivatePendingGraphProperties>> {
         let Some(before) = &self.before else { return Ok(None); };
@@ -2195,6 +2260,7 @@ impl PrivateGraphMutation {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn publish_private_graph_declarations(&self,
         source: &crate::persistence::received_working_source::WorkingReadSource,
         declarations: &mut crate::persistence::received_working_source::OriginalGraphDeclarations) -> Result<()> {
@@ -2211,6 +2277,7 @@ pub(super) struct PrivateGraphTargets {
     _owner: crate::memory_accounting::OwnedMemoryReservation,
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_graph_read_tx(&self, snapshot: SnapshotId) -> Result<Option<TxId>> {
         let tx = PRIVATE_UNIT.with(|slot| slot.borrow().as_ref().filter(|state|
             state.host == self.tx_mgr.identity()).map(|state| state.tx));
@@ -2219,6 +2286,7 @@ impl Database {
             _ => Ok(None),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_graph_read_hides(&self, tx: TxId, edge: &AdjEntry) -> Result<bool> {
         self.tx_mgr.with_write_set(tx, |ws| {
             ws.adj_deletes.iter().any(|(source, kind, target, _)| *source == edge.source
@@ -2227,6 +2295,7 @@ impl Database {
                     && pending.target == edge.target && pending.edge_type == edge.edge_type)
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_graph_targets(&self, tx: TxId, source: NodeId, kind: &str) -> Result<PrivateGraphTargets> {
         let working = crate::persistence::received_working_source::WorkingReadSource::current_for(self.tx_mgr.identity())?
             .ok_or_else(|| Error::Other("private graph count lost its source".into()))?;
@@ -2240,6 +2309,7 @@ impl Database {
             Ok(PrivateGraphTargets { targets, _owner: frame.into_reservation() })
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn private_graph_properties(&self, tx: TxId, source: NodeId, kind: &str, target: NodeId,
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Option<Option<HashMap<String, Value>>>> {
         let reader: contextdb_core::read_memory::ReadMemoryOwner = reader.into();

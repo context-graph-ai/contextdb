@@ -9204,6 +9204,7 @@ impl DdlProvenanceSource {
     /// captured before direction, destination, dependency, or size filtering.
     /// Equality alone is insufficient for duplicate DDL at one local LSN: the
     /// first unused occurrence owns its ordinal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn surviving_entries<'a>(&'a self, changes: &ChangeSet) -> Result<Vec<&'a SourceDdlIdentity>> {
         if changes.ddl.len() != changes.ddl_lsn.len() {
             return Err(Error::SyncError((
@@ -9390,6 +9391,7 @@ pub(crate) struct AuthoredRowShape {
     _credit: contextdb_core::read_memory::ReadCredit,
 }
 impl AuthoredRowShape {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(meta: &TableMeta,
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Arc<Self>> {
@@ -9942,6 +9944,7 @@ impl PublicationInterruptionWatch {
 /// then published under the commit boundary, retiring the writer's own
 /// predecessor before another batch begins. A commit that lands between the
 /// batch and that publication already published a root that contains it.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn publish_storage_compaction_batch(
     manager: &DatabaseTransactionHost,
     persistence: &Arc<RedbPersistence>,
@@ -9964,6 +9967,7 @@ fn publish_storage_compaction_batch(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn publish_storage_compaction_batch_with_deferral(
     manager: &DatabaseTransactionHost,
     persistence: &Arc<RedbPersistence>,
@@ -10481,6 +10485,7 @@ struct TemporaryMemoryReservation {
 }
 
 impl TemporaryMemoryReservation {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve(
         accountant: crate::memory_accounting::AccountantHandle,
         bytes: usize,
@@ -10500,6 +10505,7 @@ impl TemporaryMemoryReservation {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_for_database(database: &Database, bytes: usize, operation: &'static str) -> Result<Self> {
         if matches!(database.tx_mgr, DatabaseTransactionHost::Owned(_)) {
             let original = database.reserve_original_preparation_for(bytes, "ddl", operation,
@@ -10510,6 +10516,7 @@ impl TemporaryMemoryReservation {
         } else { Self::reserve(crate::memory_accounting::AccountantHandle::clone(&database.finalization.accountant), bytes, operation) }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn absorb(&mut self, mut other: Self) -> Result<()> {
         match (&mut self.original, &mut other.original) {
             (Some(left), Some(right)) => return crate::memory_accounting::merge_preparation_original(left, right),
@@ -10552,6 +10559,7 @@ struct StagedCopyCharge {
 }
 
 impl StagedCopyCharge {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit(
         accountant: &crate::memory_accounting::AccountantHandle,
         vector_accountant: contextdb_vector::MemoryBudgetOwner,
@@ -10570,6 +10578,7 @@ impl StagedCopyCharge {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_for_host(
         host: &DatabaseTransactionHost,
         accountant: &crate::memory_accounting::AccountantHandle,
@@ -10609,6 +10618,7 @@ impl StagedCopyCharge {
     }
 
     /// Admit the sole outer Box at the existing fallible prepaid handoff.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_prepaid_box(mut self) -> Result<Self> {
         assert!(
             self.own_control.is_none(),
@@ -10726,6 +10736,7 @@ enum ReceivedStagingMiss {
 }
 
 impl ReceivedStagingAccess {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(source: &Database, staged_tables: &HashSet<String>) -> Result<Arc<Self>> {
         use std::mem::ManuallyDrop;
         // Preserve the historical bookkeeping allowance; it establishes no
@@ -10845,6 +10856,7 @@ impl Drop for ReceivedStagingAccess {
 }
 
 impl PreparedMemorySwap {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn from_original_preparation(original: &mut OwnedMemoryReservation,
         old_bytes: usize, new_bytes: usize, retired_bytes_released_by_store: usize) -> Result<Self> {
         if retired_bytes_released_by_store > old_bytes { return Err(EngineMetadataJournal::identity_error()); }
@@ -10877,6 +10889,7 @@ impl PreparedMemorySwap {
     /// charged until this guard settles the relational/graph/vector payload
     /// delta.  Keeping the full old total at this boundary makes that special
     /// release explicit rather than silently under-counting index memory.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(
         accountant: crate::memory_accounting::AccountantHandle,
         old_bytes: usize,
@@ -10894,6 +10907,7 @@ impl PreparedMemorySwap {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_for(
         accountant: crate::memory_accounting::AccountantHandle,
         old_bytes: usize,
@@ -10924,6 +10938,7 @@ impl PreparedMemorySwap {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_schema_generation(mut self, db: &Database, names: impl Iterator<Item=impl AsRef<str>>) -> Result<Self> {
         if !db.relational_store.uses_disk_backed_committed_bodies() {
             self.history = Some(db.relational_store.prepare_schema_generation(names, db.engine_sync_read_memory()?)?);
@@ -10990,6 +11005,7 @@ struct ReceivedSchemaSemanticProjection {
 /// persistence access is allowed while establishing the durable identity and
 /// ordered bytes of the received vector.
 #[allow(dead_code)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn plan_received_schema_source_order(
     local_lsn: Lsn,
     ddl: &[DdlChange],
@@ -11002,6 +11018,7 @@ fn plan_received_schema_source_order(
     plan_received_schema_source_order_with_coordinates(local_lsn, ddl, ddl_lsn, received, None)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn plan_received_schema_source_order_with_coordinates(
     local_lsn: Lsn,
     ddl: &[DdlChange],
@@ -11220,6 +11237,7 @@ struct DurableLineageRecord {
 
 /// The ordered pending source stores a reference to the canonical lifecycle
 /// record. Decode under the caller's admitted scope, without retaining a copy.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn pending_delete_index_position(key: &str, bytes: &[u8]) -> Result<Option<Lsn>> {
     if !key.starts_with(Database::DURABLE_LINEAGE_CONFIG_PREFIX) {
         return Ok(None);
@@ -11241,6 +11259,7 @@ struct DurableLineageRecoveryBounds {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn lineage_recovery_floors_for_write(
         key: &str,
         bytes: &[u8],
@@ -11263,6 +11282,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn erasure_frontier_for_write(
         key: &str,
         bytes: &[u8],
@@ -11286,11 +11306,13 @@ impl Database {
 }
 
 impl DurableLineageRecoveryBounds {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit(&mut self, key: &str, bytes: &[u8]) -> Result<()> {
         let record = RedbPersistence::decode_config_value::<DurableLineageRecord>(bytes)?;
         self.admit_record(key, &record)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_record(&mut self, key: &str, record: &DurableLineageRecord) -> Result<()> {
         let is_history = key.starts_with(Database::DURABLE_PURGED_LINEAGE_HISTORY_PREFIX);
         let expected_key = if is_history {
@@ -12310,6 +12332,7 @@ impl RetainedVectorSearchTrace {
             self.owner,
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn from_owned(
         trace: contextdb_vector::mem::OwnedVectorSearchTrace,
         executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
@@ -12355,6 +12378,7 @@ impl RetainedVectorSearchTrace {
                 std::mem::size_of::<contextdb_vector::store::VectorGraphGeneration>(),
             ))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new(
         trace: VectorSearchDebugTrace,
         executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
@@ -12378,6 +12402,7 @@ impl RetainedVectorSearchTrace {
             }
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn set_final_row_ids(&mut self, rows: &[(RowId, f32)]) -> Result<()> {
         self.owner
             .reserve(rows.len().saturating_mul(std::mem::size_of::<RowId>()))?;
@@ -12407,6 +12432,7 @@ pub struct VectorSearchTraceObservation {
     _memory: contextdb_core::read_memory::ReadCredit,
 }
 impl VectorSearchTraceObservation {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy_from(
         trace: &contextdb_vector::mem::OwnedVectorSearchTrace,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -12663,6 +12689,7 @@ impl SnapshotInspector {
     const MAX_TEXT_VALUE_BYTES: usize = 32 * 1024;
     const MAX_EXACT_VALUE_OUTPUT_BYTES: usize = 1024 * 1024;
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open(
         artifact: impl AsRef<Path>,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -12710,6 +12737,7 @@ impl SnapshotInspector {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn inspect_key(
         &self,
         table: &str,
@@ -12905,6 +12933,7 @@ impl SnapshotInspector {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn inspect_blob(&self, hash: [u8; 32]) -> Result<BlobInspection> {
         use crate::blob_repository::{BlobManifestState, BlobTagRole};
 
@@ -12962,6 +12991,7 @@ impl SnapshotInspector {
     /// snapshot re-encoding cannot change the result; vectors and private
     /// sidecars retain exact persisted key/value-byte coverage. Large
     /// row/vector values never enter the report.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn inspect_sync_apply_state(&self) -> Result<SyncApplyStateInspection> {
         let persistence = self.database.persistence.as_ref().ok_or_else(|| {
             Error::Other(("snapshot inspection copy is not file-backed".to_string()).into())
@@ -12995,6 +13025,7 @@ impl SnapshotInspector {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn close(self) -> Result<()> {
         self.database.close()
     }
@@ -13116,6 +13147,7 @@ struct IncomingPurgeFrontierAdoption {
 }
 
 impl IncomingPurgeFrontierAdoption {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn at_frontier(&self, frontier: Lsn) -> Result<DurableLineageRecord> {
         let mut record = if let Some(existing) = &self.existing {
             if existing.table != self.table
@@ -14347,6 +14379,7 @@ enum DatabaseHostConstruction {
 }
 
 impl DatabaseHostConstruction {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(self, common: Arc<EventBusState>, writer: &WriterBudget)
         -> Result<Option<OwnedHostAssembly>>
     {
@@ -14370,6 +14403,7 @@ struct OwnedHostAssembly {
     accountant: crate::memory_accounting::AccountantHandle,
 }
 impl OwnedHostAssembly {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(common: Arc<EventBusState>, writer: &WriterBudget) -> Result<Self> {
         let funder = writer.prepare_source_funder()?;
         let events = event_bus::OwnedEventBusHandle::try_new_for_writer(common, writer, &funder)?;
@@ -14382,6 +14416,7 @@ impl DatabaseTransactionHost {
     /// Assemble one restricted host around the actual persistent applicator.
     /// Selection waits for the remaining original producers to migrate; this
     /// constructor performs no fallback or second-manager construction.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_owned_persistent(
         persistent: PersistentCompositeStore,
         assembly: OwnedHostAssembly,
@@ -14414,6 +14449,7 @@ impl DatabaseTransactionHost {
 
     /// Assemble the memory host around its actual original-funded applicator.
     /// Private received adjudicators keep their separate borrowed Legacy host.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_owned_memory(composite: CompositeStore, assembly: OwnedHostAssembly) -> Result<Self> {
         let OwnedHostAssembly { events, funder, accountant } = assembly;
         let prepared = OwnedMemoryDynStore::prepare(composite, events.clone(), &funder)?;
@@ -14509,6 +14545,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_commit_directory_cursor(
         &self,
         lower: std::ops::Bound<Lsn>,
@@ -14525,6 +14562,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_commit_index_prefix(&self, up_to: Lsn) -> Result<BTreeMap<Lsn, TxId>> {
         match self {
             Self::Legacy(manager) => manager.try_commit_index_prefix(up_to),
@@ -14555,6 +14593,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_commit_index_census(&self) -> Result<(usize, Lsn)> {
         match self {
             Self::Legacy(manager) => manager.try_commit_index_census(),
@@ -14565,6 +14604,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_commit_index_census_with_context(
         &self,
         context: &contextdb_tx::ReadCommitContext<'_>,
@@ -14579,6 +14619,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_commit_index_contains(&self, lsn: Lsn) -> Result<bool> {
         match self {
             Self::Legacy(manager) => manager.try_commit_index_contains(lsn),
@@ -14589,6 +14630,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_commit_index_contains_with_context(
         &self,
         lsn: Lsn,
@@ -14604,6 +14646,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_commit_index_floor(&self, upper: std::ops::Bound<Lsn>) -> Result<Option<(Lsn, TxId)>> {
         match self {
             Self::Legacy(manager) => manager.try_commit_index_floor(upper),
@@ -14614,6 +14657,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_commit_index_floor_with_context(
         &self,
         upper: std::ops::Bound<Lsn>,
@@ -14629,6 +14673,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_commit_index_get_with_context(
         &self,
         lsn: Lsn,
@@ -14644,6 +14689,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_snapshot_at_lsn_with_context(
         &self,
         lsn: Lsn,
@@ -14669,6 +14715,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_remove_commit_index_entries(&self, lsns: &[Lsn]) -> Result<u64> {
         match self {
             Self::Legacy(manager) => manager.try_remove_commit_index_entries(lsns),
@@ -14680,6 +14727,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn allocate_ddl_lsn<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(Lsn) -> Result<R>,
@@ -14695,6 +14743,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn allocate_ddl_lsn_maybe<F, R>(&self, f: F) -> Result<Option<R>>
     where
         F: FnOnce(Lsn) -> Result<Option<R>>,
@@ -14741,6 +14790,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_with_commit_lock_cancellable_for<F, R, D>(
         &self,
         duration: Duration,
@@ -14774,6 +14824,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_maintenance_publication<F, R>(&self, f: F) -> Result<R>
     where
         F: for<'guard> FnOnce(
@@ -14791,6 +14842,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_original_maintenance_publication<R>(
         &self,
         original: &OwnedMemoryReservation,
@@ -14821,6 +14873,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_deferred_metadata_write<R>(&self, write: impl FnOnce() -> Result<R>) -> Result<R> {
         let publish = || {
             let reservation = self.reserve_deferred_metadata_publication()?;
@@ -14848,6 +14901,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_deferred_metadata_publication(
         &self,
     ) -> Result<Option<Box<dyn std::any::Any + Send>>> {
@@ -14872,6 +14926,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn transaction_read(&self, tx: TxId) -> Result<contextdb_tx::native_capture::EnginePublishedRead> {
         match self {
             Self::Legacy(manager) => manager.transaction_read(tx).map(Into::into),
@@ -14882,6 +14937,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_shadows_committed(&self, tx: TxId, table: &str, row: RowId) -> Result<bool> {
         match self {
             Self::Legacy(manager) => manager.row_shadows_committed(tx, table, row),
@@ -14893,6 +14949,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn advance_for_sync(&self, tx: TxId, table: &str, incoming: TxId) -> Result<()> {
         match self {
             Self::Legacy(manager) => manager.advance_for_sync(tx, table, incoming),
@@ -14904,6 +14961,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rollback_empty_without_commit_lock(&self, tx: TxId) -> Result<()> {
         match self {
             Self::Legacy(manager) => manager.rollback_empty_without_commit_lock(tx),
@@ -14914,6 +14972,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_begin(&self) -> Result<TxId> {
         // A transaction begin is a boundary: its admissions check the process
         // ceiling as it stands now.
@@ -14927,6 +14986,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_write_set<F, R>(&self, tx: TxId, f: F) -> Result<R>
     where
         F: FnOnce(&mut WriteSet) -> R,
@@ -14940,6 +15000,7 @@ impl DatabaseTransactionHost {
     /// Move ordinary config bodies on the legacy host; the owning host copies
     /// the borrowed input through its genuine source funder before publication.
     /// The input remains live until the prepared target has its own custody.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_config_writes<I>(&self, tx: TxId, writes: I) -> Result<()>
     where
         I: AsRef<[(String, Vec<u8>)]> + IntoIterator<Item = (String, Vec<u8>)>,
@@ -14965,6 +15026,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_ordinary_read<R>(
         &self,
         tx: TxId,
@@ -14982,6 +15044,7 @@ impl DatabaseTransactionHost {
 
     /// Scalar changes use the lower host's prepared mutation so its original
     /// checkpoint journal observes the same update as the ordinary image.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn update_flags(
         &self,
         tx: TxId,
@@ -15026,6 +15089,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn cloned_write_set(&self, tx: TxId) -> Result<WriteSet> {
         match self {
             Self::Legacy(manager) => manager.cloned_write_set(tx),
@@ -15033,6 +15097,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rollback_write_set(&self, tx: TxId) -> Result<WriteSet> {
         match self {
             Self::Legacy(manager) => manager.rollback_write_set(tx),
@@ -15061,6 +15126,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_with_reserved_lsn_callback_mut<F, G>(
         &self,
         tx: TxId,
@@ -15088,6 +15154,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_with_lsn_precanonicalized_active_prepare_and_applied_mut<F, G>(
         &self,
         tx: TxId,
@@ -15122,6 +15189,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_received_interval<F, G, H>(
         &self,
         tx: TxId,
@@ -15159,6 +15227,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_ordered_staged_cursor<F, R>(
         &self,
         tx: TxId,
@@ -15207,6 +15276,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rollback(&self, tx: TxId) -> Result<()> {
         match self {
             Self::Legacy(manager) => manager.rollback(tx),
@@ -15269,6 +15339,7 @@ impl DatabaseTransactionHost {
 
     /// Borrow only immutable ordinary fields while holding this exact manager's
     /// active-map lock. Owned callers cannot obtain a bare WriteSet.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_read<R>(
         &self,
         tx: TxId,
@@ -15323,6 +15394,7 @@ impl DatabaseTransactionHost {
             }),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_write_set_detached<F, R>(&self, tx: TxId, f: F) -> Result<R>
     where
         F: FnOnce(&mut WriteSet) -> R,
@@ -15998,6 +16070,7 @@ struct EngineDatabaseTransactions {
 }
 
 impl ReceivedSchemaStage {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy_operational_from(
         &mut self, transactions: &DatabaseTransactionHost, tx: TxId,
         original: &OwnedMemoryReservation,
@@ -16005,9 +16078,11 @@ impl ReceivedSchemaStage {
         if self.operational_copy_admission.is_some() {
             return Err(Error::Other("received operational image already owns its admission".into()));
         }
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn add(a: usize, b: usize) -> Result<usize> {
             a.checked_add(b).ok_or_else(|| Error::Other("operational copy size overflow".into()))
         }
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn array<T>(len: usize) -> Result<usize> {
             std::alloc::Layout::array::<T>(len).map(|layout| layout.size())
                 .map_err(|_| Error::Other("operational copy size overflow".into()))
@@ -16069,6 +16144,7 @@ impl ReceivedSchemaStage {
     /// Build a separate native terminal image while the complete stage and its
     /// original capture invoices remain alive. These are newly admitted bodies,
     /// never a relabeling of the stage's legacy numeric byte debit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_native_adoption(
         &self,
         guard: &contextdb_tx::manager::EngineGuard<'_>,
@@ -16169,6 +16245,7 @@ impl EngineDatabaseTransactions {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind_terminal_apply(
         &self, guard: &contextdb_tx::manager::EngineGuard<'_>,
         identity: contextdb_tx::manager::EngineTerminalIdentity,
@@ -16181,6 +16258,7 @@ impl EngineDatabaseTransactions {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rollback_terminal(&self, tx: TxId) -> Result<OwnedDatabaseTerminal> {
         self.transactions.with_transactions(|lower| {
             lower.rollback_owned_with_peer(
@@ -16191,6 +16269,7 @@ impl EngineDatabaseTransactions {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rollback_empty_terminal(&self, tx: TxId) -> Result<OwnedDatabaseTerminal> {
         self.transactions.with_transactions(|lower| {
             lower.rollback_empty_owned_with_peer(
@@ -16214,6 +16293,7 @@ impl EngineDatabaseTransactions {
     // Restricted prepared mutations are the only writable preparation door.
     // Callers must migrate their entire payload/delivery bodies before using
     // these forwards; the immutable ordinary image is never a mutable adapter.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_terminal(
         &self,
         tx: TxId,
@@ -16242,6 +16322,7 @@ impl EngineDatabaseTransactions {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_reserved_terminal(
         &self,
         tx: TxId,
@@ -16273,6 +16354,7 @@ impl EngineDatabaseTransactions {
     /// Consume the actual producer debit through this host's original funder.
     /// Validation and the caller's row identity/time selection precede this
     /// door; native preparation retains sealed and distinct ordinary bodies.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_original_row(
         &self,
         store: Arc<RelationalStore>,
@@ -16289,6 +16371,7 @@ impl EngineDatabaseTransactions {
         relational.stage_engine_row(tx, table, original.row, invoice)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_new(
         transactions: EngineTransactionHandle<DynStore>,
         accountant: &crate::memory_accounting::AccountantHandle,
@@ -16520,6 +16603,7 @@ struct EngineDatabaseHandle {
 }
 
 impl EngineDatabaseHandle {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn try_new(
         host: EngineDatabaseTransactions,
         funder: &contextdb_tx::SourceFunder,
@@ -16656,6 +16740,7 @@ struct OriginalEpochInputs {
     control_bytes: usize,
 }
 impl OriginalEpochInputs {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new(original: &OwnedMemoryReservation) -> Result<Self> {
         Ok(Self {
             values: Vec::new(),
@@ -16666,6 +16751,7 @@ impl OriginalEpochInputs {
             control_bytes: 0,
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn push_index(&mut self, original: &OwnedMemoryReservation, index: &VectorIndexRef) -> Result<()> {
         if self.values.len() == self.values.capacity() {
             let capacity = self.values.capacity().checked_mul(2)
@@ -16697,6 +16783,7 @@ impl OriginalEpochInputs {
         self.values.push((index,0));
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sort_dedup(&mut self) -> Result<()> {
         self.values.sort_unstable_by(|a,b| a.0.table.cmp(&b.0.table).then(a.0.column.cmp(&b.0.column)));
         let removed = self.values.windows(2).filter(|pair| pair[0].0 == pair[1].0)
@@ -16763,6 +16850,7 @@ impl<T> MetadataBuffer<T> {
             credit: None,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(
         capacity: usize,
         original: &OwnedMemoryReservation,
@@ -16811,6 +16899,7 @@ impl<T> Drop for MetadataBuffer<T> {
 }
 
 impl<T> MetadataBuffer<AdmittedMetadataValue<T>> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_one(
         body: T,
         invoice: OwnedMemoryReservation,
@@ -16870,6 +16959,7 @@ struct MetadataSplice<T> {
     storage: Option<MetadataBuffer<AdmittedMetadataValue<T>>>,
 }
 impl<T> MetadataSplice<T> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(
         at: usize,
         selections: &[usize],
@@ -17122,6 +17212,7 @@ struct MetadataNode<T> {
     credit: Option<OwnedMemoryReservation>,
 }
 impl<T> MetadataNode<T> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(value: T, original: &OwnedMemoryReservation) -> Result<Self> {
         let credit = crate::memory_accounting::reserve_preparation_from_original(
             original,
@@ -17206,6 +17297,7 @@ struct ValidatedMetadataReturn<'j> {
     original_present: bool,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_temporary_detach(
     journal: &EngineMetadataJournal,
     identity: contextdb_tx::manager::EngineTerminalIdentity,
@@ -17282,6 +17374,7 @@ fn consume_temporary_nonfallible(ticket: ValidatedTemporaryMetadata<'_>) -> Owne
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn validate_temporary_return<'j>(
     journal: &'j EngineMetadataJournal,
     identity: contextdb_tx::manager::EngineTerminalIdentity,
@@ -17372,6 +17465,7 @@ fn unwrap_temporary_peer(peer: OwnedTemporaryMetadata) -> OwnedTerminalMetadata 
     peer.original
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn take_owned_conditions(peer: &mut OwnedTemporaryMetadata) -> Result<ConditionalBuffer> {
     match peer.original.node.as_mut() {
         None if !peer.original_present => Ok(MetadataBuffer::empty()),
@@ -17413,6 +17507,7 @@ struct FundedWorkingGraphSource {
     control: contextdb_tx::SourceCharge,
 }
 impl FundedWorkingGraphSource {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(funder: &contextdb_tx::SourceFunder) -> Result<Self> {
         let control = contextdb_tx::SourceCharge::admit_funded(funder.clone(),
             contextdb_tx::staged_source::source_arc_layout::<writer_read::ScopedGraphSource>().size())?;
@@ -17443,6 +17538,7 @@ impl DatabaseCommitScope<'_, '_, '_> {
     /// Native received preparation borrows the actual companion seed before
     /// any stage/queue guard. The existing lower scope proves the original
     /// commit mutex is already held before the public write is opened.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_received_schema_stage(
         &self,
         database: &Database,
@@ -17486,6 +17582,7 @@ impl DatabaseCommitScope<'_, '_, '_> {
             inputs, delivery_prepare, vector_copy_owner, read_memory,
             crate::persistence::received_working::ReceivedWorkingWrite::begin_funded, |error| diagnostic.error(error))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_received_schema_stage_in<E>(
         &self,
         database: &Database,
@@ -17866,6 +17963,7 @@ impl EngineMetadataJournal {
         Error::Other("metadata checkpoint identity mismatch".into())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_metadata_checkpoint(
         &self,
         identity: (TxId, u64, u64, usize),
@@ -17875,6 +17973,7 @@ impl EngineMetadataJournal {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_metadata_checkpoint_from_original(
         &self,
         identity: (TxId, u64, u64, usize),
@@ -17978,6 +18077,7 @@ impl EngineMetadataJournal {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn mutation_binding(&self, tx: TxId) -> Result<((TxId, u64, u64, usize), u64, u64, usize)> {
         let binding = {
             let records = self.records.lock();
@@ -17997,6 +18097,7 @@ impl EngineMetadataJournal {
         let next_len = undo_len.checked_add(1).ok_or_else(Self::identity_error)?;
         Ok((identity, revision, next_revision, next_len))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_change(
         &self,
         binding: ((TxId, u64, u64, usize), u64, u64, usize),
@@ -18014,6 +18115,7 @@ impl EngineMetadataJournal {
             inverse: Some(inverse),
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_metadata_append(&self, tx: TxId, batch: AdmittedMetadataBatch)
         -> Result<PreparedMetadataMutation>
     {
@@ -18031,6 +18133,7 @@ impl EngineMetadataJournal {
         self.prepare_metadata_splice(tx, at, &[], batch)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_metadata_splice(
         &self,
         tx: TxId,
@@ -18093,6 +18196,7 @@ impl EngineMetadataJournal {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_metadata_epochs(
         &self,
         tx: TxId,
@@ -18111,6 +18215,7 @@ impl EngineMetadataJournal {
             }),
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_metadata_memo(
         &self,
         tx: TxId,
@@ -18163,6 +18268,7 @@ impl EngineMetadataJournal {
         record.revision = prepared.next_revision;
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn take_settled_metadata(
         &self,
         tx: TxId,
@@ -18597,10 +18703,12 @@ fn open_file_registry() -> &'static OpenFileRegistry {
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn canonical_database_path(path: &Path) -> Result<PathBuf> {
     canonical_database_path_inner(path, 0)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn canonical_database_path_inner(path: &Path, depth: usize) -> Result<PathBuf> {
     if depth > 32 {
         return Err(Error::Other((format!(
@@ -18683,6 +18791,7 @@ struct AdmittedDynStore<T: contextdb_tx::WriteSetApplicator> {
     control: Option<crate::memory_accounting::ControlCredit>,
 }
 impl<T: contextdb_tx::WriteSetApplicator> AdmittedDynStore<T> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(
         payload: T,
         accountant: &crate::memory_accounting::AccountantHandle,
@@ -18763,6 +18872,7 @@ struct PreparedOwnedPersistentDynStore {
     control: contextdb_tx::SourceCharge,
 }
 impl OwnedPersistentDynStore {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(payload: crate::persistent_store::OwnedPersistentCompositeStore,
         funder: &contextdb_tx::SourceFunder)
         -> Result<PreparedOwnedPersistentDynStore>
@@ -18814,6 +18924,7 @@ struct PreparedOwnedMemoryDynStore {
     control: contextdb_tx::SourceCharge,
 }
 impl OwnedMemoryDynStore {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(payload: CompositeStore, events: event_bus::OwnedEventBusHandle,
         funder: &contextdb_tx::SourceFunder) -> Result<PreparedOwnedMemoryDynStore> {
         let companion = events.clone();
@@ -19039,6 +19150,7 @@ impl StoreFinalization {
         assert!(previous.is_none(), "one retained-state owner per store");
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare(
         relational: Arc<RelationalStore>,
         graph: Arc<GraphStore>,
@@ -19284,6 +19396,7 @@ fn publication_scopes_conflict(left: &BTreeSet<String>, right: &BTreeSet<String>
 }
 
 impl ReadPublicationGate {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire_read(
         self: &Arc<Self>,
         scope: &crate::executor::ReadPublicationScope,
@@ -19845,6 +19958,7 @@ impl Drop for TriggerCloseWaiterGuard<'_> {
 }
 
 impl OpenRegistryReservation {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire(path: PathBuf) -> Result<Self> {
         let registry = open_file_registry();
         let mut entries = registry.entries.lock();
@@ -19907,6 +20021,7 @@ impl Drop for OpenRegistryReservation {
 /// `readers` is the runtime directory this deployment's direct readers publish
 /// themselves in, so a refusal names the readers actually holding the store.
 /// `None` means nobody stated one and the platform default is where they are.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn acquire_registry_and_persistence(
     canonical_path: &Path,
     open_disposition: OpenDisposition,
@@ -20051,6 +20166,7 @@ impl ReadRegistrationBudget {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn remaining(&self) -> Result<Duration> {
         let elapsed = self
             .clock
@@ -20135,6 +20251,7 @@ impl Database {
         });
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn stage_delivery_registration(
         &self,
         tx: TxId,
@@ -20214,6 +20331,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_delivery_prepared(
         &self,
         tx: TxId,
@@ -20240,6 +20358,7 @@ impl Database {
         .map(|_| ())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn rotate_custody_incarnation(
         &self,
         tenant: &TenantId,
@@ -20320,6 +20439,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_delivery_metadata<F>(
         &self,
         prepare: F,
@@ -20830,6 +20950,7 @@ struct SnapshotPinPool {
 }
 
 impl SnapshotPinPool {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire(
         self: &Arc<Self>,
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -20897,6 +21018,7 @@ impl Default for SnapshotFloorRegistry {
 }
 
 impl SnapshotFloorRegistry {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fund_pin_slots(&self, accountant: crate::memory_accounting::AccountantHandle) -> Result<()> {
         let mut configured = self.pin_slots.lock();
         if configured.is_some() {
@@ -20924,6 +21046,7 @@ impl SnapshotFloorRegistry {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn acquire_pin_slot(
         &self,
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -21184,6 +21307,7 @@ impl SnapshotFloorRegistry {
     /// bounds the wait. A withdrawn caller gets `None` rather than a hold it
     /// no longer wants. `idle_window` is the window a SUSPENDED cursor
     /// publishes, so removal defers to it only while it is entitled to a page.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_withdrawable_with_budget(
         self: &Arc<Self>,
         snapshot: SnapshotId,
@@ -21225,6 +21349,7 @@ impl SnapshotFloorRegistry {
     /// A durable root already protects the physical versions selected by this
     /// read. Register its logical floor without waiting for a sampled removal
     /// pass; its source handle remains owned by the reader through completion.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_pinned_root_with_budget(
         self: &Arc<Self>,
         snapshot: SnapshotId,
@@ -21252,6 +21377,7 @@ impl SnapshotFloorRegistry {
     /// removal pass. Admission cannot park for a pass while that mutex is
     /// held. If this invariant is broken, refuse the read instead of waiting
     /// with the writer blocked and claiming to protect an unsafe snapshot.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_withdrawable_at_commit_boundary(
         self: &Arc<Self>,
         snapshot: SnapshotId,
@@ -21339,6 +21465,7 @@ impl SnapshotFloorRegistry {
     /// buffer into the guard's retained slice. The registry lock stays held
     /// from the authoritative count through admission and sampling, and the
     /// pass marker is installed before that lock is released.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin_removal_pass_with_sample_admission(
         self: &Arc<Self>,
         watermark: TxId,
@@ -21649,6 +21776,7 @@ impl DurableRawVectorSource {
     // Production writer constructors attach this exact live pair first. The
     // absent/mismatched/committed-image constructors are reader-only and are
     // never repurposed by a later first matching writer attachment.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_budget(
         &self,
         accountant: &crate::memory_accounting::AccountantHandle,
@@ -21661,6 +21789,7 @@ impl DurableRawVectorSource {
         accountant.vector_budget_for_original_reader().map(Into::into)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stream_memberships<T>(
         &self,
         partition: &VectorPartitionRef,
@@ -21691,6 +21820,7 @@ impl DurableRawVectorSource {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_candidate(
         &self,
         partition: &VectorPartitionRef,
@@ -21725,6 +21855,7 @@ impl DurableRawVectorSource {
     fn historical_operation(&self) -> bool {
         self.membership_owner().historical_operation()
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_candidate_before(
         &self,
         partition: &VectorPartitionRef,
@@ -21788,6 +21919,7 @@ impl DurableRawVectorSource {
 impl DurableRawVectorPartitionLoader {
     const RAW_LOAD_PAGE_BOUND: (usize, usize) = (64, 64 * 1024);
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn membership_lifetime_slots(count: usize) -> Result<usize> {
         let slot_bytes =
             std::mem::size_of::<(RowId, TxId, Lsn, TxId)>() + std::mem::size_of::<Option<TxId>>();
@@ -21814,6 +21946,7 @@ impl DurableRawVectorPartitionLoader {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_membership_lifetime(
         seen: &mut BTreeMap<(RowId, TxId, Lsn, TxId), Option<TxId>>,
         membership: &VectorPartitionMembershipRecord,
@@ -21844,6 +21977,7 @@ impl DurableRawVectorPartitionLoader {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize> {
         left.checked_mul(right).ok_or_else(|| {
             Error::Other((format!(
@@ -21852,6 +21986,7 @@ impl DurableRawVectorPartitionLoader {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn checked_add(left: usize, right: usize, name: &str) -> Result<usize> {
         left.checked_add(right).ok_or_else(|| {
             Error::Other((format!(
@@ -21860,6 +21995,7 @@ impl DurableRawVectorPartitionLoader {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stored_bytes_per_entry(&self) -> Result<usize> {
         match self.quantization {
             VectorQuantization::F32 => Self::checked_mul(
@@ -21874,6 +22010,7 @@ impl DurableRawVectorPartitionLoader {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<()> {
         if request(DormantVectorLoadRequest::Checkpoint) {
             Ok(())
@@ -21937,6 +22074,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
         true
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_all(
         &self,
         owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -22050,6 +22188,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
         true
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(
         &self,
         directory: &[RawVectorDirectoryEntry],
@@ -22234,6 +22373,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_candidate(
         &self,
         identity: &RawVectorDirectoryEntry,
@@ -22320,6 +22460,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_candidate_with_scan(
         &self,
         scan: &mut dyn RawVectorBodyScan,
@@ -22350,6 +22491,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
         scan.bind_streamed_membership(&self.partition, receipt)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_selected_candidate(
         &self,
         selected: &dyn contextdb_vector::store::RawVectorMembershipSelection,
@@ -22394,6 +22536,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_streamed_candidate_with_scan(
         &self,
         scan: &mut dyn RawVectorBodyScan,
@@ -22449,6 +22592,7 @@ impl DormantRawVectorLoader for DurableRawVectorPartitionLoader {
         Some(Box::new(allowance.enter()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_candidate_with_scan_once(
         &self,
         scan: &mut dyn RawVectorBodyScan,
@@ -22569,6 +22713,7 @@ impl contextdb_vector::store::RawVectorBodyScan for crate::persistence::Writable
 impl DurableRawVectorPartitionLoader {
     /// Admit one candidate body's peak before it is read, read it with
     /// `fetch`, and check it is exactly the directory identity asked for.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_candidate_via(
         &self,
         identity: &RawVectorDirectoryEntry,
@@ -22691,6 +22836,7 @@ impl DurableRawVectorPartitionLoader {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn durable_raw_vector_partitions(
     vector: &VectorStore,
     source: DurableRawVectorSource,
@@ -22806,6 +22952,7 @@ fn durable_raw_vector_partitions(
 
 /// Read-only partitions retain a registered source and summary geometry;
 /// placement intervals and reverse identities remain in that pinned store.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn register_retained_raw_vector_partitions(
     vector: &VectorStore,
     source: &crate::persistence::RetainedReadSource,
@@ -22923,6 +23070,7 @@ struct LoaderCallbackCaptures {
     accountant: std::mem::ManuallyDrop<crate::memory_accounting::StoreAccountantHandle>,
 }
 impl LoaderCallbackCaptures {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load(
         &self,
         partition: &VectorPartitionRef,
@@ -22991,6 +23139,7 @@ impl Drop for LoaderCallbackCaptures {
 /// partition with a maintained summary. Registration reads only those
 /// summary records; no membership record is enumerated and no directory is
 /// retained. Every later operation reads its captured writer root.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn register_dormant_raw_vector_partitions(
     vector: &VectorStore,
     manager: &DatabaseTransactionHost,
@@ -23197,6 +23346,7 @@ impl DurableVectorGenerationSource {
         matches!(self, Self::CommittedImage(_))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_paged_graph<T>(
         &self,
         partition: &VectorPartitionRef,
@@ -23227,6 +23377,7 @@ impl DurableVectorGenerationSource {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn tail_entry_count(
         &self,
         index: &VectorIndexRef,
@@ -23249,6 +23400,7 @@ impl DurableVectorGenerationSource {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn record_bytes(
         &self,
         partition: &VectorPartitionRef,
@@ -23280,6 +23432,7 @@ impl DurableVectorGenerationSource {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_base(
         &self,
         index: &VectorIndexRef,
@@ -23304,6 +23457,7 @@ impl DurableVectorGenerationSource {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_change(
         &self,
         index: &VectorIndexRef,
@@ -23336,6 +23490,7 @@ impl DurableVectorGenerationSource {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_tail(
         &self,
         index: &VectorIndexRef,
@@ -23365,6 +23520,7 @@ impl DurableVectorGenerationSource {
 }
 
 impl DurableVectorGenerationLoader {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn descriptor_usize(value: u64, name: &str) -> Result<usize> {
         usize::try_from(value).map_err(|_| {
             Error::Other((format!(
@@ -23373,6 +23529,7 @@ impl DurableVectorGenerationLoader {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize> {
         left.checked_mul(right).ok_or_else(|| {
             Error::Other((format!(
@@ -23381,6 +23538,7 @@ impl DurableVectorGenerationLoader {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn checked_add(left: usize, right: usize, name: &str) -> Result<usize> {
         left.checked_add(right).ok_or_else(|| {
             Error::Other((format!(
@@ -23389,6 +23547,7 @@ impl DurableVectorGenerationLoader {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn tail_reservation(&self, count: usize) -> Result<(usize, usize)> {
         vector_tail_reservation(
             count,
@@ -23398,10 +23557,12 @@ impl DurableVectorGenerationLoader {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn route_metadata_workspace(&self) -> Result<usize> {
         vector_route_metadata_workspace(&self.partition)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<()> {
         if request(DormantVectorLoadRequest::Checkpoint) {
             Ok(())
@@ -23410,6 +23571,7 @@ impl DurableVectorGenerationLoader {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_retained(
         &self,
         generation: DormantVectorGraphGeneration,
@@ -23841,6 +24003,7 @@ impl DurableVectorGenerationLoader {
 impl DurableVectorGenerationLoader {
     /// Serve a published paged base from its native pages through readers of
     /// the writer's published root. Nothing population-sized is decoded.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn paged_generation_graph(&self, meta_bytes: &[u8]) -> Result<HnswIndex> {
         let capture = match &self.source {
             DurableVectorGenerationSource::Writable(persistence) => {
@@ -23867,6 +24030,7 @@ impl DurableVectorGenerationLoader {
 
 /// Resident and construction workspace of a journal-suffix graph of `count`
 /// points, shared by every loader that rebuilds a suffix.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn vector_tail_reservation(
     count: usize,
     dimension: usize,
@@ -23912,6 +24076,7 @@ fn vector_tail_reservation(
 
 /// Route metadata that coexists with one generation or suffix load,
 /// independent of graph size.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn vector_route_metadata_workspace(partition: &VectorPartitionRef) -> Result<usize> {
     // Expected-prefix prevalidation caps decoded route lengths before serde.
     // Two base/change routes, geometric component capacity, physical keys,
@@ -23939,6 +24104,7 @@ fn vector_route_metadata_workspace(partition: &VectorPartitionRef) -> Result<usi
 /// Serve a published paged base from its native pages through readers the
 /// supplied capture opens. Its page cache is charged to `accountant`.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn paged_generation_graph_from(
     capture: crate::persistence::vector_paged::PagedRootCapture,
     partition: &VectorPartitionRef,
@@ -24095,6 +24261,7 @@ impl DormantVectorGraphLoader for DurableVectorGenerationLoader {
 }
 
 impl DurableVectorGenerationLoader {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_selected_tail(
         &self,
         generation: DormantVectorGraphGeneration,
@@ -24508,6 +24675,7 @@ fn committed_layer_least_load(
     contextdb_vector::hnsw::HnswIndex::paged_reader_resident_bound(points, m)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn durable_vector_generation_identity(
     descriptor: VectorPartitionGenerationDescriptor,
     layout: &VectorIndexLayout,
@@ -24542,6 +24710,7 @@ fn durable_vector_generation_identity(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn register_dormant_vector_generations(
     vector: &VectorStore,
     persistence: &Arc<RedbPersistence>,
@@ -24561,6 +24730,7 @@ fn register_dormant_vector_generations(
     )
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn register_loaded_dormant_vector_generations(
     vector: &VectorStore,
     loaded: LoadedVectorPartitionGenerationCatalog,
@@ -24792,6 +24962,7 @@ fn register_loaded_dormant_vector_generations(
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn vector_partition_routes(
     vector: &VectorStore,
     vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -24835,6 +25006,7 @@ enum DatabaseAssemblyBudget {
     ReadImage(crate::memory_accounting::AccountantHandle),
 }
 impl DatabaseAssemblyBudget {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn into_accountant(
         self,
     ) -> Result<(
@@ -24861,6 +25033,7 @@ impl DatabaseAssemblyBudget {
 // live malloc objects. Add the whole requested live stack separately. Native
 // qualification must reconcile the complete process with the writer ceiling.
 const RESIDENT_INSERTION_RUNTIME_RETAINED_PER_WORKER: usize = 71_307_264;
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn resident_insertion_runtime_bytes(width: usize) -> Result<usize> {
     HnswIndex::INSERTION_WORKER_STACK_BYTES
         .checked_add(RESIDENT_INSERTION_RUNTIME_RETAINED_PER_WORKER)
@@ -24887,6 +25060,7 @@ struct VectorGenerationWorkspacePlan {
 }
 
 impl VectorGenerationWorkspacePlan {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new(
         raw_count: usize,
         graph_count: usize,
@@ -25141,6 +25315,7 @@ impl VectorPartitionPublicationOutcome {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn publish_direct_metadata<R>(
     tx_mgr: &DatabaseTransactionHost,
     write: impl FnOnce() -> Result<R>,
@@ -25319,6 +25494,7 @@ impl MaintenanceContext {
         self.pending_local_schema_stages.lock().remove(&original_tx);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rollback_without_callback_tx_control(&self, tx: TxId) -> Result<()> {
         match &self.tx_mgr {
             DatabaseTransactionHost::Owned(handle) => {
@@ -25333,6 +25509,7 @@ impl MaintenanceContext {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn publish_direct_metadata<R>(&self, write: impl FnOnce() -> Result<R>) -> Result<R> {
         publish_direct_metadata(&self.tx_mgr, write)
     }
@@ -25342,6 +25519,7 @@ impl MaintenanceContext {
     /// write admitted while a backlog remains commits between steps instead
     /// of waiting for the whole cleanup. `decode` installs the decode owner a
     /// step runs under, if the caller has one.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn truncate_vector_journal_in_published_steps(
         &self,
         persistence: &RedbPersistence,
@@ -25366,6 +25544,7 @@ impl MaintenanceContext {
             self.build_checkpoint()?;
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retain_published_vector_cleanup_failure(
         &self,
         partition: &VectorPartitionRef,
@@ -25385,6 +25564,7 @@ impl MaintenanceContext {
     /// protects, at a stop request (through `build_checkpoint` before every step), or as soon as a
     /// foreground writer waits for the write slot. Committed steps stay durable; whatever remains is
     /// reclaimed by later cycles.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reclaim_deferred_storage(&self) -> Result<()> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
@@ -25417,6 +25597,7 @@ impl MaintenanceContext {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn build_checkpoint(&self) -> Result<()> {
         #[cfg(test)]
         resident_history_test_seams::note_checkpoint();
@@ -25444,6 +25625,7 @@ impl MaintenanceContext {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_generation_disk(&self, bytes: usize) -> Result<()> {
         self.build_checkpoint()?;
         let limit = self.disk_limit.load(Ordering::SeqCst);
@@ -25460,6 +25642,7 @@ impl MaintenanceContext {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retry_one_vector_journal_truncation(
         &self,
         persistence: &RedbPersistence,
@@ -25484,6 +25667,7 @@ impl MaintenanceContext {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retry_one_vector_journal_truncation_with_source_admission(
         &self,
         persistence: &RedbPersistence,
@@ -25510,6 +25694,7 @@ impl MaintenanceContext {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retry_one_vector_journal_truncation_in_workspace(
         &self,
         persistence: &RedbPersistence,
@@ -25570,6 +25755,7 @@ impl MaintenanceContext {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retry_vector_journal_truncations(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -25738,6 +25924,7 @@ impl MaintenanceContext {
         declared_serving_cache_bytes(self.vector_serving_cache_bytes.load(Ordering::SeqCst))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn install_published_vector_catalog(
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
@@ -25757,6 +25944,7 @@ impl MaintenanceContext {
         self.install_published_vector_catalog_at_boundary(catalog, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn install_published_vector_catalog_at_boundary(
         &self,
         catalog: &VectorPartitionGenerationCatalogRecord,
@@ -25923,6 +26111,7 @@ impl MaintenanceContext {
     /// the commit lock, since
     /// this is called from `run_cycle` after both `run_pruning` and
     /// `run_currency` have already returned.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn maybe_auto_compact(&self) -> Result<CompactionReport> {
         // The policy that governs this cycle's decision, named in its receipt.
         let (policy, min_interval) = {
@@ -26018,6 +26207,7 @@ impl MaintenanceContext {
         self.stamp_expired_rows_for(now, RetentionPreparation::Expiry)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stamp_expired_rows_for(
         &self,
         now: Wallclock,
@@ -26217,6 +26407,7 @@ impl MaintenanceContext {
 
     /// Retention's reserved callback owns every produced body before the
     /// paired terminal extracts the original source and journal nodes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stamp_expired_rows_owned(
         &self,
         host: &EngineDatabaseTransactions,
@@ -26431,6 +26622,7 @@ impl MaintenanceContext {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_retention_aux(
         &self,
         host: &EngineDatabaseTransactions,
@@ -26465,6 +26657,7 @@ impl MaintenanceContext {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_retention_expiry_config(
         &self,
         host: &EngineDatabaseTransactions,
@@ -26536,6 +26729,7 @@ impl MaintenanceContext {
 
     /// A pruning-only pass is a boundary of its own: it observes the process
     /// ceiling once before its first admission.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn run_pruning(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -26547,6 +26741,7 @@ impl MaintenanceContext {
     }
 
     /// Pruning under a boundary that has already observed the process ceiling.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn run_pruning_within_cycle(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -26698,6 +26893,7 @@ impl MaintenanceContext {
     /// rarer, interval-gated automatic path `run_cycle` drives separately
     /// (`MaintenanceContext::maybe_auto_compact`) — see
     /// [`AUTO_COMPACT_MIN_INTERVAL`].
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn run_currency(
         &self,
         gate: CurrencyGate,
@@ -26795,6 +26991,7 @@ impl MaintenanceContext {
     /// consumer of retention: entries older than the shipped default window
     /// age out, including entries a DROP TABLE orphaned. The in-memory ring
     /// keeps its own bounded semantics and is never touched here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn run_trigger_audit_retention(&self) -> Result<u64> {
         let now = Wallclock::now();
         let window = Duration::from_secs(self.trigger_audit_retention_secs.load(Ordering::SeqCst));
@@ -26832,6 +27029,7 @@ impl MaintenanceContext {
                     .no_snapshots_besides_construction_floors())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retire_snapshot_free_vector_partitions(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -26873,6 +27071,7 @@ impl MaintenanceContext {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reclaim_snapshot_free_vector_graphs(&self) -> Result<MaintenanceMetadataFailures> {
         if !self.vector.has_retired_graph_generations() {
             return Ok(MaintenanceMetadataFailures::default());
@@ -26898,6 +27097,7 @@ impl MaintenanceContext {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_partitions_requiring_build(&self) -> Result<MaintenanceBuildCandidates> {
         self.maintenance_build_candidates()
     }
@@ -26915,6 +27115,7 @@ impl MaintenanceContext {
             .saturating_mul(64)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist_built_vector_partition(
         &self,
         partition: &VectorPartitionRef,
@@ -28374,6 +28575,7 @@ impl MaintenanceContext {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn run_cycle(
         &self,
         gate: CurrencyGate,
@@ -28852,6 +29054,7 @@ impl StorageCompactionPolicy {
     /// Refuse a declared value outside its range. The SQL statement and the
     /// Rust setter both pass through here, so they refuse the same values with
     /// the same issue; a persisted declaration is checked again at open.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn validate(&self) -> Result<()> {
         use contextdb_core::StorageCompactionDeclarationIssue as Issue;
         let refuse = |issue| Err(Error::InvalidStorageCompactionDeclaration { issue });
@@ -29197,6 +29400,7 @@ struct StagedTupleLookup {
 }
 
 impl StagedTupleLookup {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rebuild(db: &Database, ws: &WriteSet) -> Result<Self> {
         let columns_by_table = db.staged_tuple_key_columns_by_table();
         Ok(Self::from_write_set(&columns_by_table, ws))
@@ -29434,6 +29638,7 @@ impl PruningRuntime {
 /// the mutable accountant that enforces it. This is a safe bootstrap surface:
 /// callers provide only the declared byte limit and every later limit change
 /// still goes through [`Database::set_memory_limit`].
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn open_memory_with_startup_limit(
     plugin: Arc<dyn DatabasePlugin>,
     memory_limit: Option<usize>,
@@ -29443,6 +29648,7 @@ pub fn open_memory_with_startup_limit(
 
 /// Open a file-backed database with numeric startup ceilings. The mutable
 /// memory-accounting capability never crosses the engine boundary.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub fn open_with_startup_limits(
     path: impl AsRef<Path>,
     plugin: Arc<dyn DatabasePlugin>,
@@ -29462,6 +29668,7 @@ pub fn open_with_startup_limits(
 
 impl Database {
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn build_db(
         tx_mgr: DatabaseTransactionHost,
         relational: Arc<RelationalStore>,
@@ -30630,10 +30837,12 @@ impl Database {
     /// is told what to stop rather than only that they cannot proceed. See the
     /// "Store ownership and concurrency" section on [`Database`]. Use
     /// [`Database::open_memory`] for an ephemeral instance.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_builtin_with_options(path, DatabaseOpenOptions::default())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_builtin_with_options(
         path: impl AsRef<Path>,
         options: DatabaseOpenOptions,
@@ -30655,6 +30864,7 @@ impl Database {
     /// Every convenience opener builds its options and arrives here, so the
     /// configuration a database was opened with is the configuration it can
     /// be asked about afterwards.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open_with_options(path: impl AsRef<Path>, options: DatabaseOpenOptions) -> Result<Self> {
         #[cfg(any(test, feature = "test-seams"))]
         {
@@ -30707,6 +30917,7 @@ impl Database {
     }
 
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open_with_writer_vector_session(
         path: impl AsRef<Path>,
         options: DatabaseOpenOptions,
@@ -30738,6 +30949,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_constructed(
         path: &Path,
         config: OpenConfiguration,
@@ -30746,6 +30958,7 @@ impl Database {
         Self::open_constructed_carrying(path, config, binding, None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_constructed_carrying(
         path: &Path,
         config: OpenConfiguration,
@@ -30793,10 +31006,12 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_configured(path: &Path, options: DatabaseOpenOptions) -> Result<Self> {
         Self::open_configured_carrying(path, options, None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_configured_carrying(
         path: &Path,
         options: DatabaseOpenOptions,
@@ -30815,6 +31030,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_configured_carrying_with_host(
         path: &Path,
         options: DatabaseOpenOptions,
@@ -31156,6 +31372,7 @@ impl Database {
     }
 
     /// Create an in-process bounded read view over this live database.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn read_session(&self, limits: ReadLimits) -> Result<ReadSession> {
         let _operation = self.open_operation()?;
         Ok(ReadSession::from_live_database(
@@ -31178,6 +31395,7 @@ impl Database {
     /// figure is progress against the ceiling of the same name in `limits`,
     /// and reporting adds no work of its own beyond the observer's, which
     /// runs inline on the reading thread and so is part of that read's cost.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn read_session_with_progress(
         &self,
         limits: ReadLimits,
@@ -31389,6 +31607,7 @@ impl Database {
     /// through the configured drain deadline. The writer has already frozen
     /// and published quiescence; crossing the deadline keeps its resources
     /// owned so a later close or final drop can finish the drain.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn drain_owner_reads(&self) -> Result<()> {
         let Some(service) = &self.owner_read_service else {
             return Ok(());
@@ -31405,6 +31624,7 @@ impl Database {
     /// The writer has crossed its last operation barrier and stopped its
     /// background writers. The still-held companion lock authenticates this
     /// promise until the final owner resource is released.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn publish_quiescent_owner(&self) -> Result<()> {
         if !self.resource_owner {
             return Ok(());
@@ -31422,6 +31642,7 @@ impl Database {
     /// Settle eligible storage frees before handoff disables all writes.
     /// The operation barrier and joined background writers keep this the
     /// owner's last sequence of durable cleanup commits.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn drain_storage_before_handoff(&self) -> Result<()> {
         if self.resource_owner
             && let Some(persistence) = &self.persistence
@@ -31460,6 +31681,7 @@ impl Database {
     /// why a saturated owner still answers its own process. A store with no
     /// running owner service, or one configured without a handler, is told so
     /// plainly rather than being made to wait.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn request_owner_in_process(
         &self,
         namespace: &str,
@@ -31561,6 +31783,7 @@ impl Database {
     /// `DatabaseLocked` before either the database or its coordination lock is
     /// changed; after the owner exits the same operation creates a fresh,
     /// current-format root.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn force_reset(path: impl AsRef<Path>) -> Result<()> {
         let canonical_path = canonical_database_path(path.as_ref())?;
         let registry_reservation = OpenRegistryReservation::acquire(canonical_path.clone())?;
@@ -31605,6 +31828,7 @@ impl Database {
             .wait_until_authoritative_purge_waits_for_hash_for_test(hash, timeout)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open_with_contexts<P: AsRef<Path>>(
         path: P,
         contexts: std::collections::BTreeSet<contextdb_core::types::ContextId>,
@@ -31618,6 +31842,7 @@ impl Database {
         Self::open_memory_with_constraints(Some(contexts), None, None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open_with_scope_labels<P: AsRef<Path>>(
         path: P,
         labels: std::collections::BTreeSet<contextdb_core::types::ScopeLabel>,
@@ -31631,6 +31856,7 @@ impl Database {
         Self::open_memory_with_constraints(None, Some(labels), None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open_as_principal<P: AsRef<Path>>(
         path: P,
         principal: contextdb_core::types::Principal,
@@ -31642,6 +31868,7 @@ impl Database {
         Self::open_memory_with_constraints(None, None, Some(principal))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open_with_constraints<P: AsRef<Path>>(
         path: P,
         contexts: Option<std::collections::BTreeSet<contextdb_core::types::ContextId>>,
@@ -32884,6 +33111,7 @@ impl Database {
             finalization: Arc::clone(&self.finalization),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_loaded(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -32939,6 +33167,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_loaded_from_persistence(
         registry_reservation: OpenRegistryReservation,
         persistence: Arc<RedbPersistence>,
@@ -33288,6 +33517,7 @@ impl Database {
     /// Every repair the writable path performs while loading is absent by
     /// construction: a store that would need one was refused before the image
     /// was ever built.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn open_committed_image(
         parts: crate::persistence::ReadPersistenceImageParts,
         plugin: Arc<dyn DatabasePlugin>,
@@ -33653,6 +33883,7 @@ impl Database {
         Ok(db)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_memory_internal(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
@@ -33663,6 +33894,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_memory_internal_with_transaction_snapshot(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
@@ -33674,6 +33906,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_memory_internal_with_working_graph(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
@@ -33688,6 +33921,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_memory_internal_with_host(
         plugin: Arc<dyn DatabasePlugin>,
         writer_budget: WriterBudget,
@@ -33802,6 +34036,7 @@ impl Database {
         Ok(db)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn begin(&self) -> Result<TxId> {
         let _operation = self.open_operation_after_public_tx_control_wait("begin")?;
         self.tx_mgr.try_begin()
@@ -33834,6 +34069,7 @@ impl Database {
         *self.trigger_deadlock_timeout_override.lock() = Some(timeout);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_operation_after_public_tx_control_wait(
         &self,
         surface: &'static str,
@@ -33841,6 +34077,7 @@ impl Database {
         self.open_operation_after_public_tx_control_wait_for_tx(surface, None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_operation_after_public_tx_control_wait_for_tx(
         &self,
         surface: &'static str,
@@ -33859,6 +34096,7 @@ impl Database {
         self.open_operation()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_callback_reentry_allowed(&self) -> Result<()> {
         if CRON_CALLBACK_ACTIVE.with(|active| active.get()) {
             return Err(Error::CallbackReentry {
@@ -33874,6 +34112,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_public_tx_control_cross_thread_allowed_for_surface(
         &self,
         surface: &'static str,
@@ -33892,6 +34131,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn wait_for_same_db_trigger_callback_idle(&self, surface: &'static str) -> Result<()> {
         let timeout = self.trigger_deadlock_timeout();
         let started = Instant::now();
@@ -33965,12 +34205,14 @@ impl Database {
     // Internal engine-managed writes still need callback-active gates, and
     // trigger contention stays scoped to this database so independent embedded
     // handles do not poison each other through process-wide state.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin_for_internal_write(&self) -> Result<TxId> {
         let _operation = self.open_operation()?;
         self.assert_internal_write_callbacks_allowed()?;
         self.tx_mgr.try_begin()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn begin_for_public_autocommit_write(&self) -> Result<TxId> {
         let _operation = self.open_operation_after_internal_write_wait("execute")?;
         self.tx_mgr.try_begin()
@@ -33995,6 +34237,7 @@ impl Database {
         SQL_WRITE_CONTROL_BYPASS_STACK.with(|stack| stack.borrow().contains(&(db_id, tx)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_internal_write_callbacks_allowed(&self) -> Result<()> {
         if !Self::callback_active_process_wide() {
             return Ok(());
@@ -34016,6 +34259,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_operation_after_internal_write_wait(
         &self,
         surface: &'static str,
@@ -34079,6 +34323,7 @@ impl Database {
                 && TRIGGER_CALLBACK_VECTOR_SCHEMA_GATE.with(|slot| slot.get()) == Some(gate_id))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_callback_tx_bound_write_allowed(&self, tx: TxId) -> Result<()> {
         if CRON_CALLBACK_ACTIVE.with(|active| active.get())
             && !self.cron_callback_tx_bound_matches(tx)
@@ -34098,6 +34343,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_trigger_callback_tx_not_captured_cross_thread(&self, tx: TxId) -> Result<()> {
         if self.trigger.callback_tx_active(tx) && !self.trigger_callback_tx_bound_matches(tx) {
             return Err(Error::CallbackActiveCrossThread {
@@ -34107,6 +34353,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_operation_after_write_control_wait(
         &self,
         tx: TxId,
@@ -34126,6 +34373,7 @@ impl Database {
         self.open_operation()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_operation_after_statement_callback_wait(
         &self,
         stmt: &Statement,
@@ -34140,6 +34388,7 @@ impl Database {
         self.open_operation()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_write_control_cross_thread_allowed_for_surface(
         &self,
         surface: &'static str,
@@ -34158,6 +34407,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_internal_write_cross_thread_allowed(&self, surface: &'static str) -> Result<()> {
         if self.cron.callback_active_on_other_thread() {
             return Err(Error::CallbackActiveCrossThread {
@@ -34181,6 +34431,7 @@ impl Database {
         self.begin().unwrap_or_else(|err| panic!("{err}"))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn commit(&self, tx: TxId) -> Result<()> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
@@ -34189,12 +34440,14 @@ impl Database {
 
     /// Commit and return the finalized transaction id, without a post-commit read.
     /// A transaction that makes no durable change returns `None`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn commit_returning_txid(&self, tx: TxId) -> Result<Option<TxId>> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.commit_returning_txid_with_read_memory(tx, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_with_read_memory(
         &self,
         tx: TxId,
@@ -34207,6 +34460,7 @@ impl Database {
             .map(|_| ())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_returning_txid_with_read_memory(
         &self,
         tx: TxId,
@@ -34280,12 +34534,14 @@ impl Database {
         );
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn rollback(&self, tx: TxId) -> Result<()> {
         let _operation =
             self.open_operation_after_public_tx_control_wait_for_tx("rollback", Some(tx))?;
         self.rollback_without_callback_tx_control(tx)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rollback_without_callback_tx_control(&self, tx: TxId) -> Result<()> {
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
             let terminal = handle.with_host(|host| host.rollback_terminal(tx))?;
@@ -34314,11 +34570,13 @@ impl Database {
     }
 
     /// Admit preparation payload against this database's original writer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reserve_owned_preparation(&self, bytes: usize) -> Result<OwnedMemoryReservation> {
         self.reserve_original_preparation_for(bytes, "delivery", "prepare_owned_records",
             "Reduce delivery metadata or raise MEMORY_LIMIT.")
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_preparation_original<R>(
         &self,
         prepare: impl for<'o> FnOnce(&'o OwnedMemoryReservation) -> Result<R>,
@@ -34334,6 +34592,7 @@ impl Database {
     /// Explicit writer-source loan for preparation that has no received source.
     /// Received callers with an explicit source lend that source's Original instead.
     /// This seam performs no ambient source selection or registration reconstruction.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_writer_preparation_original<R>(
         &self,
         prepare: impl for<'o> FnOnce(&'o OwnedMemoryReservation) -> Result<R>,
@@ -34352,6 +34611,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_original_preparation_for(
         &self, bytes: usize, subsystem: &str, operation: &str, hint: &str,
     ) -> Result<OwnedMemoryReservation> {
@@ -34380,6 +34640,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_owned_delivery_meta<R>(
         &self,
         table: &str,
@@ -34402,6 +34663,7 @@ impl Database {
 
     /// Stage one delivery-owned configuration body through the paired
     /// transaction host after the original source reservation is admitted.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn stage_owned_delivery_aux(
         &self,
         guard: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -34471,6 +34733,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ensure_no_mixed_local_schema_dml(&self, tx: TxId) -> Result<()> {
         if self.pending_local_schema_stages.lock().contains_key(&tx) {
             return Err(Error::Other((
@@ -34510,6 +34773,7 @@ impl Database {
             .saturating_add(4096)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn local_schema_original_baseline_bytes(&self) -> Result<usize> {
         let base = self.local_schema_pending_baseline_bytes();
         if matches!(self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
@@ -34519,6 +34783,7 @@ impl Database {
         } else { Ok(base) }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new_pending_local_schema_stage(&self) -> Result<PendingLocalSchemaStage> {
         let temporary_memory = TemporaryMemoryReservation::reserve_for_database(
             self,
@@ -34544,6 +34809,7 @@ impl Database {
         sql.len().saturating_mul(32).saturating_add(4096)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_local_schema_base_generation(
         &self,
         pending: &mut PendingLocalSchemaStage,
@@ -34579,6 +34845,7 @@ impl Database {
     /// clone deliberately uses the ordinary executor, so sequential DDL gets
     /// its established validation without publishing a half-transaction
     /// schema to the live database.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_local_schema_statement(
         &self,
         tx: TxId,
@@ -34768,6 +35035,7 @@ impl Database {
         USER_COMMIT_TRIGGER_REENTRY.with(|slot| slot.replace(false))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         #[cfg(test)]
         let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
@@ -34780,6 +35048,7 @@ impl Database {
 
     /// Acquire the built-in ordinary reader before any answer or vector setup.
     /// Scalar refusal needs no diagnostic allocation before an owner exists.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ordinary_read_child(&self) -> Result<crate::vector_read_memory::NativeReadChildReceipt> {
         use contextdb_core::read_memory::NativeRefusal;
         self.declared_read_memory.native_child().map_err(|refusal| match refusal {
@@ -34802,6 +35071,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn execute_with_read_memory(
         &self,
         sql: &str,
@@ -34815,6 +35085,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn execute_owned_with_read_memory(
         &self,
         sql: &str,
@@ -34845,6 +35116,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn execute_with_rows_examined_scope(
         &self,
         sql: &str,
@@ -35085,6 +35357,7 @@ impl Database {
         *self.session_tx.lock()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_statement_allowed_inside_cron_callback(
         &self,
         stmt: &Statement,
@@ -35141,6 +35414,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_statement_allowed_during_cross_thread_callback(
         &self,
         forbidden_in_callback: bool,
@@ -35175,6 +35449,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_statement_allowed_for_callbacks_for_surface(
         &self,
         stmt: &Statement,
@@ -35299,10 +35574,12 @@ impl Database {
         !Self::write_set_vector_schema_refs(ws).is_empty()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn record_vector_schema_epoch(&self, tx: TxId, index: &VectorIndexRef) -> Result<()> {
         self.record_vector_schema_epochs(tx, [index.clone()])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn record_vector_schema_epochs(
         &self,
         tx: TxId,
@@ -35409,6 +35686,7 @@ impl Database {
         });
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn trigger_insert_table_has_state_machine(&self, table: &str) -> Result<bool> {
         let db_key = self.id;
         if let Some(cached) = TRIGGER_INSERT_STATE_MACHINE_CACHE.with(|cache| {
@@ -35441,6 +35719,7 @@ impl Database {
         self.statement_cache.read().len()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn execute_autocommit(
         &self,
         plan: &PhysicalPlan,
@@ -35532,6 +35811,7 @@ impl Database {
     /// established embedding API promises an answer, not a ceiling -- and a
     /// plan the kernel has no source for is run by the executor exactly as it
     /// always was.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn run_read_plan(
         &self,
         plan: &PhysicalPlan,
@@ -35632,12 +35912,14 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn explain(&self, sql: &str) -> Result<String> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.explain_with_read_memory(sql, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn explain_with_read_memory(
         &self,
         sql: &str,
@@ -35679,12 +35961,14 @@ impl Database {
 
     /// Plan and disclose a statement without executing it. Vector facts come
     /// from passive catalog, authorization, and policy reads only.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn explain_output(&self, sql: &str) -> Result<ExplainOutput> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.explain_output_with_read_memory(sql, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn explain_output_with_read_memory(
         &self,
         sql: &str,
@@ -35703,6 +35987,7 @@ impl Database {
 
     /// Parameter-aware passive planning used by the CLI rendering helper.
     /// Values inform route selection only; no statement is executed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn explain_output_with_params(
         &self,
         sql: &str,
@@ -35795,6 +36080,7 @@ impl Database {
 
     /// Read authorization from resident access metadata. This never invokes a
     /// table scan or loads a vector or graph.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_metadata_authorized_candidates(
         &self,
         index: &VectorIndexRef,
@@ -35867,6 +36153,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_policy_facts_for_explain(
         &self,
         shape: &VectorExplainShape<'_>,
@@ -36002,6 +36289,7 @@ impl Database {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_search_disclosure(
         &self,
         shape: &VectorExplainShape<'_>,
@@ -36285,6 +36573,7 @@ impl Database {
     /// selected. A complete key can be resolved directly; computing every
     /// partition's pending/tombstone counts first would walk every unrelated
     /// raw directory merely to discard those facts afterward.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_partition_infos_for_prefixes(
         &self,
         index: &VectorIndexRef,
@@ -36336,6 +36625,7 @@ impl Database {
     /// as the length of the list, the very count `aggregate_allowed_vectors`
     /// withholds for that same unnamed scope. A bound key, or no key
     /// predicate at all, reports each partition the caller actually named.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_partition_hnsw_disclosure(
         &self,
         index: &VectorIndexRef,
@@ -36664,6 +36954,7 @@ impl Database {
     /// its sealed generations. Partition inspection already computes this
     /// from the raw directory and generation frontier, so explain can report
     /// the fresh exact tail without loading or replaying that tail.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_pending_tail_without_load(
         &self,
         index: &VectorIndexRef,
@@ -36711,6 +37002,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_search_disclosure_for_runtime(
         &self,
         index: VectorIndexRef,
@@ -36751,6 +37043,7 @@ impl Database {
     /// Describe a vector answer from the same admitted partition groups that
     /// execution consumed, without repeating candidate membership work.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn completed_vector_search_disclosure(
         &self,
         index: VectorIndexRef,
@@ -36936,6 +37229,7 @@ impl Database {
         drop(prior);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_hnsw_strategy_for_explain(
         &self,
         shape: &VectorExplainShape,
@@ -36973,6 +37267,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn execute_in_tx(
         &self,
         tx: TxId,
@@ -36987,6 +37282,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn execute_in_tx_with_read_memory(
         &self,
         tx: TxId,
@@ -37014,6 +37310,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn run_callback_dml_plan(
         &self,
         tx: TxId,
@@ -37041,6 +37338,7 @@ impl Database {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn execute_in_tx_with_rows_examined_scope(
         &self,
         tx: TxId,
@@ -37180,6 +37478,7 @@ impl Database {
     /// `key_column = key_value` to keep the supplied column values until this
     /// transaction commits. Returns `Ok(false)` when the row is not visible or
     /// does not currently match the predicates.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn guard_row_conditions_in_tx(
         &self,
         tx: TxId,
@@ -37201,6 +37500,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn guard_row_conditions_in_tx_with_read_memory(
         &self,
         tx: TxId,
@@ -37314,6 +37614,7 @@ impl Database {
         Ok(true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_with_source(
         &self,
         tx: TxId,
@@ -37327,6 +37628,7 @@ impl Database {
             .map(|_| ())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_with_source_returning_txid(
         &self,
         tx: TxId,
@@ -37357,6 +37659,7 @@ impl Database {
         .map(|outcome| outcome.committed_tx)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_and_register_local_schema_stage(
         &self,
         tx: TxId,
@@ -37836,6 +38139,7 @@ impl Database {
         self.reconcile_maintenance_thread();
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_with_source_and_event_bus_ddl(
         &self,
         tx: TxId,
@@ -37856,6 +38160,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_with_source_and_sync_ddl(
         &self,
         tx: TxId,
@@ -37882,6 +38187,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_with_source_and_sync_ddl_and_trigger_audit_projection(
         &self,
         tx: TxId,
@@ -38632,6 +38938,7 @@ impl Database {
         outcome
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reject_user_conditional_update_conflicts(
         source: CommitSource,
         outcome: &CommitValidationOutcome,
@@ -38747,6 +39054,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn execute_statement_with_plan(
         &self,
         stmt: &Statement,
@@ -38902,6 +39210,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn run_planned_statement(
         &self,
         stmt: &Statement,
@@ -38992,6 +39301,7 @@ impl Database {
     }
 
     /// Handle `INSERT INTO GRAPH (source_id, target_id, edge_type) VALUES (...)`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn execute_graph_insert(
         &self,
         ins: &contextdb_parser::ast::Insert,
@@ -39392,6 +39702,7 @@ impl Database {
 
     /// Pre-resolve InSubquery expressions within SELECT statements that have CTEs.
     /// This allows CTE-backed subqueries in WHERE clauses to be evaluated before planning.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pre_resolve_cte_subqueries(
         &self,
         stmt: &Statement,
@@ -39434,6 +39745,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn insert_row(
         &self,
         tx: TxId,
@@ -39445,6 +39757,7 @@ impl Database {
         self.insert_row_with_read_memory(tx, table, values, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_row_with_read_memory(
         &self,
         tx: TxId,
@@ -39479,6 +39792,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_row_prepaid(
         &self,
         tx: TxId,
@@ -39502,6 +39816,7 @@ impl Database {
     /// Carry the SQL producer's original reservation into the row caller.
     /// Host selection preserves the Legacy caller and routes Owned through
     /// the paired original producer before any native factory is enabled.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_row_prepaid_owned(
         &self,
         tx: TxId,
@@ -39524,6 +39839,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn insert_row_with_admission(
         &self,
         tx: TxId,
@@ -39580,6 +39896,7 @@ impl Database {
     /// The ordinary Owned row producer consumes the caller's existing debit.
     /// Row lineage uses its own original auxiliary producer. Vector placement
     /// remains a prerequisite; refusal restores the coupled checkpoint.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn insert_row_within_operation_owned(
         &self,
         host: &EngineDatabaseTransactions,
@@ -39636,6 +39953,7 @@ impl Database {
 
     /// Construct genuine independent vector originals before any row slot is
     /// blanked or staged. The selected companion admits every target first.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_original_row_vectors(
         &self, tx: TxId, table: &str, row: RowId,
         values: &HashMap<ColName, Value>, meta: &TableMeta,
@@ -39682,6 +40000,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_original_row_vectors(
         &self, host: &EngineDatabaseTransactions, tx: TxId,
         mut vectors: OriginalDatabaseVectors,
@@ -39736,6 +40055,7 @@ impl Database {
 
     /// Identity and time stay at the original caller. Only publication changes:
     /// the original invoice is adopted before the hidden relational producer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn insert_original_relational_row(
         &self,
         host: &EngineDatabaseTransactions,
@@ -39803,6 +40123,7 @@ impl Database {
     }
 
     /// SQL keeps an unused reservation on its duplicate-UNIQUE no-op path.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_row_with_unique_noop_owned(
         &self,
         tx: TxId,
@@ -39870,6 +40191,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn insert_row_within_operation(
         &self,
         tx: TxId,
@@ -40011,6 +40333,7 @@ impl Database {
     /// same PK does not self-collide. The old row's index entry still looks
     /// visible at the committed-watermark snapshot because its `deleted_tx`
     /// equals the current (uncommitted) `tx`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_row_replacing(
         &self,
         tx: TxId,
@@ -40073,6 +40396,7 @@ impl Database {
         Ok(inserted)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_row_replacing_owned(
         &self,
         tx: TxId,
@@ -40156,6 +40480,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replace_row_after_update_validation_owned(
         &self,
         tx: TxId,
@@ -40211,6 +40536,7 @@ impl Database {
         .map(|(row, _, _)| row)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replace_row_after_update_validation_counted_owned(
         &self,
         tx: TxId,
@@ -40241,6 +40567,7 @@ impl Database {
 
     /// Sequential replacement keeps every inverse in the existing paired
     /// checkpoint. No empty-current candidate or bare WriteSet is imported.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn replace_original_row_counted(
         &self,
         host: &EngineDatabaseTransactions,
@@ -40314,6 +40641,7 @@ impl Database {
 
     /// The deletion's own original string is admitted before allocation; the
     /// guarded splice also admits its controls before native publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_original_relational_delete(
         &self,
         host: &EngineDatabaseTransactions,
@@ -40358,6 +40686,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replace_row_after_update_validation(
         &self,
         tx: TxId,
@@ -40396,6 +40725,7 @@ impl Database {
     /// A relational delete discards a same-transaction insert before commit.
     /// Return that insert's admission now, since commit/rollback will no
     /// longer find it in the write set to settle the charge.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_relational_row_releasing_staged(
         &self,
         tx: TxId,
@@ -40418,6 +40748,7 @@ impl Database {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_relational_row_releasing_staged_inner(
         &self,
         tx: TxId,
@@ -40617,6 +40948,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replace_row_after_update_validation_counted(
         &self,
         tx: TxId,
@@ -40644,6 +40976,7 @@ impl Database {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn replace_row_after_update_validation_counted_inner(
         &self,
         tx: TxId,
@@ -40757,6 +41090,7 @@ impl Database {
     /// stamp against the holder's own clock, so a replicated row keeps its age
     /// instead of being handed a fresh window on arrival. `None` (an origin
     /// that recorded no stamp) falls back to stamping the row here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_row_for_sync(
         &self,
         tx: TxId,
@@ -40802,6 +41136,7 @@ impl Database {
 
     /// Upsert a row that arrived over sync. See [`Self::insert_row_for_sync`]
     /// for what `created_at` carries and why.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn upsert_row_for_sync(
         &self,
         tx: TxId,
@@ -40974,6 +41309,7 @@ impl Database {
 
     /// Stage a synced row, honouring the birth time it carried when it has
     /// one and stamping locally when it does not.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn insert_synced_row_at(
         &self,
         tx: TxId,
@@ -41035,6 +41371,7 @@ impl Database {
     /// (see `sync_source_lsn_updates`), so it describes the CURRENT version,
     /// never the row's history: a pulled row that was then edited locally
     /// reads `false`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn row_version_arrived_by_sync(
         &self,
         table: &str,
@@ -41044,6 +41381,7 @@ impl Database {
         self.row_version_arrived_by_sync_with_read_memory(table, natural_key, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_version_arrived_by_sync_with_read_memory(
         &self,
         table: &str,
@@ -41111,11 +41449,13 @@ impl Database {
     /// Whether this exact outgoing row change was supplied by sync. Live rows
     /// use their relational provenance sidecar; deletes use their current
     /// tombstone marker or the durable accepted ancestry of a received delete.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn row_change_arrived_by_sync(&self, row: &RowChange) -> Result<bool> {
         let read_memory = self.declared_reader_memory()?;
         self.row_change_arrived_by_sync_with_read_memory(row, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_change_arrived_by_sync_with_read_memory(
         &self,
         row: &RowChange,
@@ -41126,6 +41466,7 @@ impl Database {
         self.checked_row_change_arrived_by_sync(row, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn checked_row_change_arrived_by_sync(
         &self,
         row: &RowChange,
@@ -41217,6 +41558,7 @@ impl Database {
             .is_none())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_arrival_config_key(record: &DurableGraphArrival) -> Result<String> {
         let identity = rmp_serde::to_vec(&(record.source, record.target, &record.edge_type))
             .map_err(|error| {
@@ -41232,6 +41574,7 @@ impl Database {
         (record.source, record.target, record.edge_type.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_graph_arrival_memory(
         &self, record: &DurableGraphArrival,
     ) -> Result<(GraphIdentity, FundedGraphArrival)> {
@@ -41253,6 +41596,7 @@ impl Database {
         }))))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_pulled_graph_arrivals(
         &self,
         ws: &mut WriteSet,
@@ -41300,11 +41644,13 @@ impl Database {
     /// Insert and delete are distinct so a later local operation on the same
     /// `(source,target,type)` is never mistaken for an echo.
     /// A durable arrival lookup refusal is returned to the caller.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn graph_change_arrived_by_sync(&self, edge: &EdgeChange) -> Result<bool> {
         let read_memory = self.declared_reader_memory()?;
         self.graph_change_arrived_by_sync_with_read_memory(edge, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_change_arrived_by_sync_with_read_memory(
         &self,
         edge: &EdgeChange,
@@ -41329,11 +41675,13 @@ impl Database {
     /// the owner plus its local commit LSN rather than a table/LSN group.
     /// Delete provenance is intentionally session-local, matching the current
     /// tombstone retention boundary.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn vector_change_arrived_by_sync(&self, vector: &VectorChange) -> Result<bool> {
         let read_memory = self.declared_reader_memory()?;
         self.vector_change_arrived_by_sync_with_read_memory(vector, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_change_arrived_by_sync_with_read_memory(
         &self,
         vector: &VectorChange,
@@ -41346,6 +41694,7 @@ impl Database {
 
     /// Checked form of [`Self::vector_change_arrived_by_sync`]: a durable
     /// history read failure is returned, never read as "not synced".
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn checked_vector_change_arrived_by_sync(
         &self,
         vector: &VectorChange,
@@ -41454,6 +41803,7 @@ impl Database {
 
     /// Every purged life of the key whose lifecycle suffix is `suffix`: the
     /// current record when it is purged, then every earlier purged life.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn purged_lineage_records_for_suffix(
         &self,
         state: &InMemoryLineageState,
@@ -41486,6 +41836,7 @@ impl Database {
         Ok(records)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn purged_lineage_records(
         &self,
         state: &InMemoryLineageState,
@@ -41499,6 +41850,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn purged_lineage_records_at_generation(
         &self,
         table: &str,
@@ -41511,6 +41863,7 @@ impl Database {
 
     /// Every purged life that a later life has displaced from its key's
     /// lifecycle record.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn list_purged_lineage_history(
         &self,
         state: &InMemoryLineageState,
@@ -41531,6 +41884,7 @@ impl Database {
     /// entry of every purged record a write replaces with another life. The
     /// caller persists these entries in the same durable write, so a purged
     /// life's tombstone is never overwritten.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn purged_lives_displaced_by(
         &self,
         writes: &[(String, DurableLineageRecord)],
@@ -41554,6 +41908,7 @@ impl Database {
         Ok(displaced)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn encoded_purged_lives_displaced_by(
         &self,
         writes: &[(String, Vec<u8>, DurableLineageRecord)],
@@ -41574,6 +41929,7 @@ impl Database {
         .collect()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_unbound_creation_lineage(
         &self,
         state: &InMemoryLineageState,
@@ -41585,6 +41941,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_row_lineage_sidecar(
         &self,
         state: &InMemoryLineageState,
@@ -41596,6 +41953,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn store_row_lineage_sidecar(
         &self,
         state: &mut InMemoryLineageState,
@@ -41613,6 +41971,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn load_lineage_record(
         &self,
         state: &InMemoryLineageState,
@@ -41624,6 +41983,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn store_lineage_record(
         &self,
         state: &mut InMemoryLineageState,
@@ -41646,6 +42006,7 @@ impl Database {
     /// Publish a delete record and its exact local-row sidecar as one durable
     /// unit. The caller holds `lineage_state_lock`, which is also the memory
     /// backend's atomicity boundary.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn store_lineage_record_and_row_sidecar(
         &self,
         state: &mut InMemoryLineageState,
@@ -41678,6 +42039,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn list_lineage_records(
         &self,
         state: &InMemoryLineageState,
@@ -41694,6 +42056,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn local_delete_sidecar_from_record(
         record: &DurableLineageRecord,
     ) -> Result<DurableRowLineageSidecar> {
@@ -41729,6 +42092,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn local_delete_sidecar_slot_is_eligible(
         &self,
         state: &InMemoryLineageState,
@@ -41743,6 +42107,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_in_memory_lineage_delta(
         &self,
         config_writes: &[(String, Vec<u8>)],
@@ -41787,6 +42152,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_graph_arrival<T>(
         &self,
         identity: &GraphIdentity,
@@ -41946,6 +42312,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn has_received_ddl_arrivals(&self) -> Result<bool> {
         let (_, root) = self.capture_writer_statement()?;
         if let Some(root) = root {
@@ -41958,6 +42325,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_received_ddl_arrivals(
         &self,
         mut visit: impl FnMut((Lsn, u32), &DurableReceivedDdlArrival) -> Result<()>,
@@ -41996,6 +42364,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_received_ddl_arrival<T>(
         &self,
         occurrence: (Lsn, u32),
@@ -42011,6 +42380,7 @@ impl Database {
         visit(self.received_ddl_arrivals.read().get(&occurrence))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_received_ddl_arrival_at_root<T>(
         &self,
         root: &crate::persistence::WriterSnapshotHandle,
@@ -42034,6 +42404,7 @@ impl Database {
         visit(record.as_ref().map(|record| &record.value))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_superseded_ddl_occurrence<T>(
         &self,
         occurrence: (Lsn, u32),
@@ -42054,6 +42425,7 @@ impl Database {
         visit(self.superseded_ddl_occurrences.read().get(&occurrence))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_superseded_ddl_occurrence_at_root<T>(
         &self,
         root: &crate::persistence::WriterSnapshotHandle,
@@ -42077,6 +42449,7 @@ impl Database {
         visit(record.as_ref().map(|record| &record.value))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_ddl_occurrence_config(
         diagnostic_owner: &contextdb_core::read_memory::ReadMemoryOwner,
         key: &str,
@@ -42125,6 +42498,7 @@ impl Database {
     /// A local schema commit is superseded only in full: marking part of one
     /// commit would let a later push carry a fragment of a transaction whose
     /// remaining statements the peer has never seen.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn superseded_local_ddl_occurrences(
         &self,
         local_ddl_log: &[(Lsn, DdlChange)],
@@ -42215,6 +42589,7 @@ impl Database {
         Ok(candidates)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn declaration_comparison_encoded_len(change: &DdlChange) -> Result<usize> {
         struct Counter {
             bytes: usize,
@@ -42252,6 +42627,7 @@ impl Database {
         Ok(counter.bytes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_superseded_local_ddl_occurrences(
         &self,
         received_ddl: &[DdlChange],
@@ -42450,6 +42826,7 @@ impl Database {
 
     /// The first locally recorded, not yet received or superseded occurrence
     /// of `change` among the occurrences recorded for `table`, in log order.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_superseded_table_occurrence(
         &self,
         root: &crate::persistence::WriterSnapshotHandle,
@@ -42529,6 +42906,7 @@ impl Database {
         Ok(None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn canonical_local_ddl_arrival_digest(
         ddl: &DdlChange,
         local_lsn: Lsn,
@@ -42565,6 +42943,7 @@ impl Database {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_schema_manifest_markers(
         received: &crate::protocol::ReceivedDdlContext,
     ) -> Result<Vec<DurableReceivedSchemaManifestMarker>> {
@@ -42591,6 +42970,7 @@ impl Database {
         Ok(markers)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_received_schema_manifest_key(
         received: &crate::protocol::ReceivedDdlContext,
     ) -> Result<String> {
@@ -42611,6 +42991,7 @@ impl Database {
     /// Read retry evidence while the private manifest lock is held through
     /// the later commit. File-backed databases read Redb; memory databases
     /// read the shared lifetime mirror.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn classify_received_schema_manifest(
         &self,
         received: Option<&crate::protocol::ReceivedDdlContext>,
@@ -42684,6 +43065,7 @@ impl Database {
             "received schema migration mixes applied and absent markers".to_string()).into()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_schema_manifest(
         received: &crate::protocol::ReceivedDdlContext,
         result: &ApplyResult,
@@ -42700,6 +43082,7 @@ impl Database {
 
     /// Borrow the committed catalog while selecting both directions of every
     /// dependency. Only the selected declarations become owned scratch state.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn selected_received_catalog(
         &self,
         changes: &ChangeSet,
@@ -42893,6 +43276,7 @@ impl Database {
     /// snapshots use this to prove that their live schema is exactly the
     /// schema described by durable received-DDL evidence, rather than merely
     /// sharing one old received marker with it.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn project_received_schema_from_empty(
         &self,
         ddl: &[DdlChange],
@@ -42909,6 +43293,7 @@ impl Database {
     /// checkpoint runs per statement, and each statement's growth of the
     /// reconstructed schema -- no more than the statement itself carries --
     /// is admitted before it is applied.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn project_received_schema_from_empty_projected(
         &self,
         ddl: &[DdlChange],
@@ -42945,6 +43330,7 @@ impl Database {
     /// publication copies exist. Counting serialization borrows the live maps;
     /// the multiplier covers simultaneous semantic, replay and publication
     /// images, their encoded values, and collection node overhead.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn admit_received_side_metadata(&self, changes: &ChangeSet) -> Result<StagedCopyCharge> {
         let bytes = if Self::received_side_metadata_required(changes) {
             let event_bytes = self.received_event_bus_projection_bytes()?;
@@ -42992,6 +43378,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn project_received_schema_from_state(
         &self,
         tables: HashMap<String, TableMeta>,
@@ -43008,6 +43395,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn project_received_schema_from_state_projected(
         &self,
         mut tables: HashMap<String, TableMeta>,
@@ -43068,6 +43456,7 @@ impl Database {
     /// row provenance and accepted-author writes for this private stage.
     /// The forwarding peer in `ReceivedDdlContext` is deliberately absent:
     /// a relay is not the immutable author of the row it carries.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_received_schema_lineage_sidecars(
         &self,
         changes: &ChangeSet,
@@ -43190,6 +43579,7 @@ impl Database {
     /// Clone only declarations needed to validate locally authored CREATE /
     /// ALTER ADD / trigger DDL. Row, edge, and vector payloads remain solely
     /// in the live database and are never duplicated by a long-lived BEGIN.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn detached_local_schema_working_database(&self) -> Result<Database> {
         let working = if matches!(self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
             self.with_preparation_original(|original| Database::open_memory_internal_with_working_graph(
@@ -43238,6 +43628,7 @@ impl Database {
         Ok(working)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn new_received_metadata_copy_charges(&self) -> Result<MetadataCopyCharges> {
         match &self.tx_mgr {
             DatabaseTransactionHost::Legacy(_) => Ok(MetadataCopyCharges::new(&self.finalization.accountant)),
@@ -43245,6 +43636,7 @@ impl Database {
                 host.events.with_owned_persistence_original(MetadataCopyCharges::from_original)),
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_metadata_copy_charges_from_array<const N: usize>(
         &self, charges: [StagedCopyCharge; N],
     ) -> Result<MetadataCopyCharges> {
@@ -43287,6 +43679,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn detached_received_schema_working_database_with_sources(
         &self,
         projected_tables: &HashMap<String, TableMeta>,
@@ -43926,6 +44319,7 @@ impl Database {
 
     /// Copy canonical bodies with their exact source placement records.
     /// The returned executing credit remains attached through publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy_partitioned_vector_membership_image(
         &self,
         matches_index: impl Fn(&VectorIndexRef) -> bool,
@@ -44001,6 +44395,7 @@ impl Database {
     /// but its transaction manager starts at one.  Before its image becomes a
     /// received-schema stage, restamp every mutation it finalized with the
     /// caller-reserved receiver commit identity.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn restamp_detached_received_schema_commit(
         working: &Database,
         finalized: &mut WriteSet,
@@ -44378,6 +44773,7 @@ impl Database {
     /// directly assigns a receiver row id, MVCC identity, vector owner, or
     /// delete/terminal outcome in the prepared image.
     #[allow(dead_code)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_received_schema_stage(
         &self,
         local_lsn: Lsn,
@@ -44412,6 +44808,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_received_schema_stage_with_adjudication(
         &self,
         local_lsn: Lsn,
@@ -44437,6 +44834,7 @@ impl Database {
     }
 
     /// Tables whose registered vector index no longer has a vector column.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_retired_vector_tables(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -44458,6 +44856,7 @@ impl Database {
             .collect())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_vector_lifetime_changes(
         &self,
         live: &HashMap<String, TableMeta>,
@@ -44518,6 +44917,7 @@ impl Database {
     /// Vector indexes whose declared layout this received unit changes. An open
     /// transaction that staged a vector against one of them must learn at
     /// commit that the index changed under it.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_unit_changed_vector_refs(
         &self,
         changes: &ChangeSet,
@@ -44573,6 +44973,7 @@ impl Database {
     /// nothing here. Such a unit has no replay identity or receipt to record,
     /// so installing it would only allocate a local commit position for work
     /// that already exists -- an echo a peer would then pull back.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn unattested_schema_unit_changes_nothing(
         &self,
         changes: &ChangeSet,
@@ -44721,6 +45122,7 @@ impl Database {
             && *live_trigger == side_semantic.trigger
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_received_schema_stage_with_delivery(
         &self,
         local_lsn: Lsn,
@@ -44738,6 +45140,7 @@ impl Database {
             validated_lineages, inputs, delivery_prepare, vector_copy_owner, read_memory, None, None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_received_schema_stage_with_interval(
         &self,
         local_lsn: Lsn,
@@ -46610,6 +47013,7 @@ impl Database {
     /// seeing its own arriving shape early.
     #[allow(dead_code)]
     #[must_use = "an unheld registration removes the stage again immediately"]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_received_schema_stage(
         &self,
         local_lsn: Lsn,
@@ -46670,6 +47074,7 @@ impl Database {
         self.received_schema_stages.lock().remove(&local_lsn)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn attach_received_schema_operational_rows(
         &self,
         stage: &mut ReceivedSchemaStage,
@@ -47014,6 +47419,7 @@ impl Database {
     /// whole-migration stage. An identical durable manifest returns its
     /// stored result before beginning another transaction.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_received_schema_stage<F, G>(
         &self,
         changes: &ChangeSet,
@@ -47517,6 +47923,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn lineage_attestation_bytes(
         tenant_id: &TenantId,
         table: &str,
@@ -47541,6 +47948,7 @@ impl Database {
         .map_err(|err| Error::SyncError((format!("cannot encode lineage attestation: {err}")).into()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn verify_lineage_attestation(
         tenant_id: &TenantId,
         table: &str,
@@ -47568,6 +47976,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_local_creation_lineage(
         &self,
         tx: TxId,
@@ -47617,6 +48026,7 @@ impl Database {
     /// Encode the existing config record directly into its original admitted
     /// buffers. The borrowed serialization has the same field order and bytes
     /// as DurableUnboundCreationLineage; no transient identity Vec is copied.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_original_creation_lineage(
         &self,
         host: &EngineDatabaseTransactions,
@@ -47774,12 +48184,14 @@ impl Database {
     /// decodes under its own writer-funded scope that ends with the record,
     /// so the commit's decoder charge stays one record, never one per staged
     /// row retained on the committing caller's reader.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_record_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
         crate::read_image_memory::ImageMemory::enter_writer_operation(
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stamp_unbound_creation_lineages_at_commit(
         &self,
         ws: &mut contextdb_tx::WriteSet,
@@ -47867,6 +48279,7 @@ impl Database {
     /// Native terminal stamping operates on one original-funded record at a
     /// time. It never lends a mutable WriteSet or relabels a decoder credit as
     /// the independently copied target's original invoice.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stamp_unbound_creation_lineages_in_prepared_write_set(
         &self,
         host: &EngineDatabaseTransactions,
@@ -48011,6 +48424,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_original_terminal_config<T: serde::Serialize>(
         held: &contextdb_tx::manager::EngineGuard<'_>,
         original: &OwnedMemoryReservation,
@@ -48030,6 +48444,7 @@ impl Database {
 
     /// Stream the established MessagePack identity bytes as hex into an
     /// exactly admitted native key, without an intermediate identity buffer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn original_terminal_identity_key(
         original: &OwnedMemoryReservation,
         table: &str,
@@ -48102,6 +48517,7 @@ impl Database {
         Ok(key)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stamp_durable_delete_positions_at_commit(
         &self,
         ws: &mut contextdb_tx::WriteSet,
@@ -48124,6 +48540,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_delivery_row_lineages(
         &self,
         ws: &mut dyn crate::custody::preparation::CommitWriteSource,
@@ -48241,6 +48658,7 @@ impl Database {
         Ok(result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn staged_unbound_creation_lineage(
         &self,
         tx: TxId,
@@ -48262,6 +48680,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bind_unbound_creation_lineage_with_state(
         &self,
         state: &mut InMemoryLineageState,
@@ -48371,6 +48790,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_outbound_lineage_signatures(
         &self,
         row: &RowChange,
@@ -48477,6 +48897,7 @@ impl Database {
     /// Bind one still-pending delete while holding the shared lineage state.
     /// A reply that has accepted or retired this exact delete wins before this
     /// method can recreate it, for either backend.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_delete_lineage(
         &self,
         row: &RowChange,
@@ -48677,6 +49098,7 @@ impl Database {
         Err(Error::ConditionalUpdateConflict { count: 1 })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn transaction_lineage_table_generation(
         &self,
         tx: TxId,
@@ -48765,6 +49187,7 @@ impl Database {
         Ok(generation)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn transaction_lineage_table_generation_owned(
         &self, tx: TxId, table: &str,
         root: crate::persistence::WriterSnapshotHandle,
@@ -48845,6 +49268,7 @@ impl Database {
         Ok(generation)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn durable_lineage_table_generation(
         &self,
         table: &str,
@@ -48879,6 +49303,7 @@ impl Database {
     /// Return the authoritative generation counter even when no live table
     /// currently owns it.  A dropped table deliberately retains this counter
     /// so a later same-name CREATE cannot reuse its former identity.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_table_generation_counter(&self, table: &str) -> Result<u64> {
         if let Some(persistence) = &self.persistence {
             return persistence
@@ -48897,6 +49322,7 @@ impl Database {
     /// missing record is valid only for this first CREATE; reopening a schema
     /// without its record is corruption and is never reconstructed from DDL
     /// history.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn next_table_generation_for_create(
         &self,
         table: &str,
@@ -48926,6 +49352,7 @@ impl Database {
             .ok_or_else(|| Error::SyncError((format!("schema generation overflow for {table}")).into()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_created_table_generation_and_ddl(
         &self,
         name: &str,
@@ -48992,6 +49419,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ddl_generation_sidecar_values(
         &self,
         lsn: Lsn,
@@ -49012,6 +49440,7 @@ impl Database {
             .collect()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ddl_generation_sidecars(
         &self,
         ddl: &[DdlChange],
@@ -49034,6 +49463,7 @@ impl Database {
             .collect()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn record_ddl_generation_sidecars(
         &self,
         lsn: Lsn,
@@ -49066,6 +49496,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_lineage_record(
         &self,
         table: &str,
@@ -49078,6 +49509,7 @@ impl Database {
         self.durable_lineage_record_at_generation(table, natural_key, generation)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_lineage_record_at_generation(
         &self,
         table: &str,
@@ -49094,6 +49526,7 @@ impl Database {
     // A retained occurrence can outlive its current table and indexes. Resolve
     // its storage identity from the exact change group, then authenticate the
     // addressed body; a current natural-key index cannot prove that identity.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn exact_outbound_row_occurrence(
         &self,
         row: &RowChange,
@@ -49167,6 +49600,7 @@ impl Database {
         Ok(None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn outbound_row_generation(
         &self,
         row: &RowChange,
@@ -49237,6 +49671,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn outbound_row_lineages(
         &self,
         changes: &ChangeSet,
@@ -49552,6 +49987,7 @@ impl Database {
     /// reconstructs evidence from schema text, while the direction overlay
     /// mirrors the CREATE/ALTER/DROP semantics of
     /// `latest_declared_table_directions` in received-vector order.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn advance_authenticated_pull_schema_projection(
         &self,
         table_generations: &mut HashMap<String, u64>,
@@ -49627,6 +50063,7 @@ impl Database {
     /// page-generation projection. A table missing from the projection uses
     /// the durable local generation; an entry in the projection is never
     /// inferred from DDL text or another unit's context.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_received_row_lineages_against_generation_projection(
         &self, tenant_id: &TenantId, changes: &ChangeSet,
         lineages: &[(String,NaturalKey,Lsn,crate::protocol::WireRowLineage)],
@@ -49643,6 +50080,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_received_row_lineage_generation(
         tenant_id: &TenantId, row: &RowChange,
         lineages: &[(String,NaturalKey,Lsn,crate::protocol::WireRowLineage)], generation: u64,
@@ -49673,6 +50111,7 @@ impl Database {
     /// Validate authenticated provenance before any row mutation. Every data
     /// row has exactly one full-identity sidecar, its root must be the creator
     /// tuple's canonical root, and its table generation must still be live.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_received_row_lineages(
         &self,
         tenant_id: &TenantId,
@@ -49700,6 +50139,7 @@ impl Database {
     /// projected by the ordered received DDL vector, not the receiver's
     /// pre-apply metadata. The raw path above remains deliberately
     /// fail-closed when DDL is present.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_received_row_lineages_with_received_ddl(
         &self,
         tenant_id: &TenantId,
@@ -49713,6 +50153,7 @@ impl Database {
         self.validate_source_ordered_row_lineages(tenant_id,changes,lineages,received_ddl,&HashMap::new(),read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_source_ordered_row_lineages(
         &self, tenant_id: &TenantId, changes: &ChangeSet,
         lineages: &[(String,NaturalKey,Lsn,crate::protocol::WireRowLineage)],
@@ -49733,6 +50174,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn classify_source_ordered_pull_replays(
         &self, tenant: &TenantId, changes: ChangeSet,
         lineages: &[(String,NaturalKey,Lsn,crate::protocol::WireRowLineage)],
@@ -49770,6 +50212,7 @@ impl Database {
     /// table/key/generation; Redb retains it across reopen and memory retains
     /// it for this database life. A peer cannot forge a new ancestry by
     /// choosing someone else's author tuple.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_incoming_push_lineages(
         &self,
         tenant_id: &TenantId,
@@ -49790,6 +50233,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_incoming_push_lineage_authorship(
         &self,
         changes: &ChangeSet,
@@ -49850,6 +50294,7 @@ impl Database {
     /// This is the narrow continuation KEEP FIRST permits: a competing edge,
     /// a relay, a stale ordered replay, or a same-key replacement all fail at
     /// least one of these checks.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authenticated_fresh_creator_deletes(
         &self,
         rows: &[RowChange],
@@ -49940,6 +50385,7 @@ impl Database {
             .flatten()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_incoming_push_lineages_with_received_ddl(
         &self,
         tenant_id: &TenantId,
@@ -49967,6 +50413,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn classify_purged_lineage_descendants(
         &self,
         changes: ChangeSet,
@@ -50081,6 +50528,7 @@ impl Database {
     /// row from that generation is refused as removed-generation work.  The
     /// caller may send this receipt only when it covers the whole request, so
     /// no unclassified member can mutate beside it.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn retired_generation_refusals(
         &self,
         tenant_id: &TenantId,
@@ -50198,6 +50646,7 @@ impl Database {
     /// terminally refused before the normal row-apply path.  The receipt is
     /// the durable acknowledgement boundary: a dropped response can then be
     /// reconciled by the edge without retransmitting the same retired rows.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_terminal_sync_refusals_with_receipt(
         &self,
         receipt: SyncApplyReceipt,
@@ -50259,6 +50708,7 @@ impl Database {
     /// Capabilities needed to replay this table's authored schema history.
     /// Current metadata alone cannot release an immutable CREATE/ALTER vector.
     #[cfg(feature = "sync-orchestration")]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authored_schema_capabilities(
         &self,
         table: &str,
@@ -50326,6 +50776,7 @@ impl Database {
     /// Ordinary pulls suppress an exact replay only after the accepted delete
     /// still owns an absent full natural key. Dependency-complete units remain
     /// atomic: a matching terminated member rejects the whole unit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn drop_accepted_lineage_replays_against_generation_projection(
         &self,
         tenant_id: &TenantId,
@@ -50365,6 +50816,7 @@ impl Database {
         self.suppress_accepted_lineage_replays(changes, lineages, true, read_memory.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reject_dependency_complete_accepted_lineage_replays_against_generation_projection(
         &self,
         tenant_id: &TenantId,
@@ -50395,6 +50847,7 @@ impl Database {
     /// Push has no ordinary-pull cursor to consume a suppressed replay. Keep
     /// its accepted-delete check strict and return the original changes only
     /// after every live member has cleared the dependency-style classifier.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reject_accepted_lineage_replays(
         &self,
         tenant_id: &TenantId,
@@ -50411,6 +50864,7 @@ impl Database {
             .changes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reject_accepted_lineage_replays_with_received_ddl(
         &self,
         tenant_id: &TenantId,
@@ -50444,6 +50898,7 @@ impl Database {
             .changes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn suppress_accepted_lineage_replays(
         &self,
         changes: ChangeSet,
@@ -50463,6 +50918,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn suppress_accepted_lineage_replays_with_generation_projection(
         &self,
         changes: ChangeSet,
@@ -50621,6 +51077,7 @@ impl Database {
     /// removal. Redb retains the record across close/open; an in-memory
     /// database retains it for its shared handle life. Without it the vanished
     /// row cannot be offered to the hub again.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn stage_local_delete_obligation(
         &self,
         tx: TxId,
@@ -50747,6 +51204,7 @@ impl Database {
         self.tx_mgr.append_config_writes(tx, [(generation_key, generation), (key, record)])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn stamp_pending_delete_author_tuple(
         &self,
         rows: &[RowChange],
@@ -50780,6 +51238,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_pending_deletes_since(
         &self,
         since_lsn: Lsn,
@@ -50813,6 +51272,7 @@ impl Database {
         Ok(changes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn has_durable_pending_delete_obligations(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -50850,6 +51310,7 @@ impl Database {
     /// answer's bounds: the checkpoint runs per deletion, and a deletion's
     /// place in the answer is admitted before it is added -- whatever older
     /// rows the same deletion removed first.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reconcile_durable_pending_deletes_projected(
         mut changes: ChangeSet,
         pending: Vec<DurablePendingDelete>,
@@ -50911,6 +51372,7 @@ impl Database {
     /// record, each record's decoding and each deletion are admitted before
     /// they are made, and a record that cannot be read refuses the answer
     /// instead of leaving that deletion out.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_pending_deletes_projected(
         &self,
         since_lsn: Lsn,
@@ -51019,6 +51481,7 @@ impl Database {
             .unwrap_or_default()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_durable_pending_delete_changes(
         &self,
         since_lsn: Lsn,
@@ -51037,6 +51500,7 @@ impl Database {
     /// already-held absence transportable to the new hub. Redb carries that
     /// state across restart, while memory carries it only for this database
     /// life.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_destination_reupload_deletes(
         &self,
         changes: ChangeSet,
@@ -51050,6 +51514,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn append_destination_reupload_deletes_with_read_memory(
         &self,
         mut changes: ChangeSet,
@@ -51136,6 +51601,7 @@ impl Database {
             .remove(&Self::sync_tombstone_key(table, natural_key));
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_id_for_delete_change(
         &self,
         row: &RowChange,
@@ -51163,6 +51629,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn find_history_change<T>(
         &self,
         first: Lsn,
@@ -51202,6 +51669,7 @@ impl Database {
     /// from an older ordered arrival. This intentionally does not reconstruct
     /// tombstones on restart; this in-memory retention fence lasts only for
     /// the lifetime of the open database.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn incoming_row_is_stale_against_sync_tombstone(
         &self,
         row: &RowChange,
@@ -51435,6 +51903,7 @@ impl Database {
     /// refusal markers, accepted ordering, delete lifecycle and push progress
     /// become durable together before any memory state is published.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_hub_push_reply_while_authoritative(
         &self,
         tenant_id: &TenantId,
@@ -51596,6 +52065,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn complete_sync_push_confirmation_while_authoritative(
         &self, tenant_id: &TenantId, through: Lsn,
     ) -> Result<()> {
@@ -51618,6 +52088,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persisted_sync_pending_push_result(&self, tenant_id: &TenantId) -> Result<Option<ApplyResult>> {
         let result = if let Some(persistence) = &self.persistence {
             persistence.load_config_value::<crate::protocol::WireApplyResult>(&tenant_id.config_key("sync_pending_push_result"))?
@@ -51632,6 +52103,7 @@ impl Database {
     /// with an explicit destination move. Callers use the closure for their
     /// in-memory client state; database writers called from that closure must
     /// use their `_while_authoritative` form so they do not re-lock the peer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_authoritative_hub_reply<T>(
         &self,
         hub_node_id: &str,
@@ -51648,6 +52120,7 @@ impl Database {
     /// come before the public-operation and destination locks: taking the
     /// ordinary reply wrapper first would retain a schema read lease and then
     /// deadlock when received apply upgrades to the write side.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_authoritative_hub_received_apply<T>(
         &self,
         hub_node_id: &str,
@@ -51665,6 +52138,7 @@ impl Database {
         effect(self)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ensure_authoritative_hub_locked(
         &self,
         hub_node_id: &str,
@@ -51740,6 +52214,7 @@ impl Database {
     /// The commit lock makes the current-version check and durable sidecar
     /// state change one boundary. A concurrent local write cannot be
     /// accidentally reclassified after this method chose its entries.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn invalidate_accepted_local_ordering_after_hub_regression(
         &self,
         hub_applied_source_watermark: Lsn,
@@ -51751,6 +52226,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn invalidate_accepted_local_ordering_after_hub_regression_with_read_memory(
         &self,
         hub_applied_source_watermark: Lsn,
@@ -51808,6 +52284,7 @@ impl Database {
     /// Pending before a pull can consume its echo. `through_inclusive = None`
     /// intentionally includes later local writes too: a restored-hub ordinary
     /// pull must not overwrite any current local work past its frontier.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn mark_outbound_rows_pending(
         &self,
         after_exclusive: Lsn,
@@ -51821,6 +52298,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn mark_outbound_rows_pending_with_read_memory(
         &self,
         after_exclusive: Lsn,
@@ -51924,6 +52402,7 @@ impl Database {
     }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn reconciled_push_rows_have_arrivals(
         &self,
         changes: &ChangeSet,
@@ -51980,6 +52459,7 @@ impl Database {
         Ok(true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn has_unconfirmed_push_rows(
         &self,
         after: Lsn,
@@ -52057,6 +52537,7 @@ impl Database {
     /// Select only authenticated echoes of the local lineage before applying a
     /// pull page. Equal values from a different creator do not acknowledge the
     /// local mutation. This reuses ordinary row provenance, with no new receipt.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn matching_pending_reconciliation_rows(
         &self,
         rows: &[RowChange],
@@ -52095,6 +52576,7 @@ impl Database {
     /// under the commit lock. Production callers first select authenticated
     /// lineage matches; retained history keeps evidence if a later page edit
     /// has already replaced the visible row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn refresh_confirmed_pending_rows(
         &self,
         rows: &[RowChange],
@@ -52104,6 +52586,7 @@ impl Database {
         self.refresh_confirmed_pending_rows_with_read_memory(rows, arrivals, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn refresh_confirmed_pending_rows_with_read_memory(
         &self,
         rows: &[RowChange],
@@ -52215,6 +52698,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_index_for_read_image(
         &self,
         context: &contextdb_tx::ReadCommitContext<'_>,
@@ -52283,6 +52767,7 @@ impl Database {
     /// record is proved against the committed identity; the deleted edges'
     /// tombstones are checked against the commit index here, as a complete
     /// open checks them.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ensure_image_history(&self) -> Result<()> {
         self.ensure_image_history_with_read_memory(&|| Ok(()), self.declared_reader_memory()?)
             .map_err(ImageHistoryError::into_engine_error)
@@ -52291,6 +52776,7 @@ impl Database {
     /// [`Self::ensure_image_history`] for a request that owns a cancellation
     /// and an active-time budget: `checkpoint` is called as the walk advances
     /// and its refusal ends the walk, leaving nothing loaded or charged.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ensure_image_history_within(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
@@ -52298,6 +52784,7 @@ impl Database {
         self.ensure_image_history_with_read_memory(checkpoint, self.declared_reader_memory()?)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ensure_image_history_with_read_memory(
         &self,
         checkpoint: &dyn Fn() -> Result<()>,
@@ -52395,6 +52882,7 @@ impl Database {
         coords
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn set_sync_row_source_lsn(
         &self,
         tx: TxId,
@@ -52408,6 +52896,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn set_sync_row_source_lsn_kind(
         &self,
         tx: TxId,
@@ -52447,6 +52936,7 @@ impl Database {
     /// stands. The row is not restaged: an immutable table refuses a rewrite,
     /// and republishing correct values would put a mutation in the change log
     /// that no peer asked for.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn mark_sync_row_provenance(
         &self,
         tx: TxId,
@@ -52499,6 +52989,7 @@ impl Database {
     /// dim equality there. SQL execution (`exec_insert`/`exec_update`) still
     /// performs the full dim check because it always threads through the
     /// executor module's coercion helpers.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn coerce_row_for_insert(
         &self,
         table: &str,
@@ -52534,6 +53025,7 @@ impl Database {
         Ok(out)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_primary_key_values_present(
         &self,
         table: &str,
@@ -52558,6 +53050,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_row_with_unique_noop(
         &self,
         tx: TxId,
@@ -52629,6 +53122,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn upsert_row(
         &self,
         tx: TxId,
@@ -52648,6 +53142,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn upsert_row_with_read_memory(
         &self,
         tx: TxId,
@@ -52688,6 +53183,7 @@ impl Database {
         })()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn upsert_row_within_operation(
         &self,
         tx: TxId,
@@ -52911,6 +53407,7 @@ impl Database {
         Ok(UpsertResult::Updated)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_row_constraints(
         &self,
         tx: TxId,
@@ -52937,6 +53434,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn check_row_constraints(
         &self,
         tx: TxId,
@@ -52973,6 +53471,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn check_row_constraints_at_snapshot(
         &self,
         tx: TxId,
@@ -53187,6 +53686,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn merge_unique_conflict(
         &self,
         tx: TxId,
@@ -53229,6 +53729,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_id_is_staged_insert(&self, tx: TxId, table: &str, row_id: RowId) -> Result<bool> {
         self.tx_mgr.with_read(tx, |ws| {
             ws.relational_inserts
@@ -53267,6 +53768,7 @@ impl Database {
 
     /// Look up `(table, column) = value` using a single-column index when one
     /// exists, layered with the tx's staged inserts and deletes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn probe_column_for_constraint(
         &self,
         tx: TxId,
@@ -53415,6 +53917,7 @@ impl Database {
     /// Probe a composite UNIQUE (a, b, ...) using the first index whose
     /// leading prefix matches `cols`. The probe walks the range for the full
     /// key prefix.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn probe_composite_unique(
         &self,
         tx: TxId,
@@ -53565,6 +54068,7 @@ impl Database {
         Ok(overlap)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn rewrite_txid_placeholders(
         &self,
         origin_tx: TxId,
@@ -53621,6 +54125,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_validate(
         &self,
         origin_tx: TxId,
@@ -53757,6 +54262,7 @@ impl Database {
         Ok(validation)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_vector_schema_epochs(
         &self,
         ws: &WriteSet,
@@ -53783,6 +54289,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_vector_write_set_schema(
         &self,
         ws: &WriteSet,
@@ -54035,6 +54542,7 @@ impl Database {
         indexes
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rewrite_commit_time_upserts_for_write_set(
         &self,
         ws: &mut WriteSet,
@@ -54103,6 +54611,7 @@ impl Database {
     /// raise an outbound deletion obligation for a row this node did not
     /// delete. A row this same transaction is inserting is not gone -- it has
     /// simply not been committed yet -- so its delete stays.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn discard_deletes_of_rows_that_are_already_gone(
         &self,
         ws: &mut WriteSet,
@@ -54166,6 +54675,7 @@ impl Database {
         deleted
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn deleted_row_snapshots_by_table(
         &self,
         ws: &WriteSet,
@@ -54334,6 +54844,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn committed_unique_conflict_row_id(
         &self,
         table: &str,
@@ -54390,6 +54901,7 @@ impl Database {
         Ok(rows.into_iter().next().map(|row| row.row_id))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn indexed_visible_row_id_by_columns(
         &self,
         table: &str,
@@ -54633,6 +55145,7 @@ impl Database {
         Ok(Some(indexed_row_id))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn required_indexed_visible_row_by_columns(
         &self,
         table: &str,
@@ -54668,6 +55181,7 @@ impl Database {
             .map(Option::flatten)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn required_indexed_visible_row_by_column(
         &self,
         table: &str,
@@ -54692,6 +55206,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn committed_unique_conflict(
         &self,
         table: &str,
@@ -54817,6 +55332,7 @@ impl Database {
         }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_row_exists_by_column(
         &self,
         table: &str,
@@ -54885,6 +55401,7 @@ impl Database {
 
     /// The committed row carrying a whole sync identity — every key column
     /// matched through the covering index.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_row_by_natural_key(
         &self,
         table: &str,
@@ -54906,6 +55423,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn indexed_visible_row_exists_by_columns(
         &self,
         table: &str,
@@ -55015,6 +55533,7 @@ impl Database {
         Ok(row_id.is_some())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_commit_time_upsert(
         &self,
         ws: &mut WriteSet,
@@ -55209,6 +55728,7 @@ impl Database {
             .position(|(candidate_table, row)| candidate_table == table && row.row_id == row_id)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_commit_time_upsert_replacement(
         &self,
         table: &str,
@@ -55241,6 +55761,7 @@ impl Database {
         self.validate_commit_time_upsert_vectors(table, values)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_commit_time_upsert_state_transition(
         &self,
         table: &str,
@@ -55277,6 +55798,7 @@ impl Database {
         )))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_commit_time_upsert_vectors(
         &self,
         table: &str,
@@ -55305,6 +55827,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reconcile_commit_time_upsert_vectors(
         &self,
         ws: &mut WriteSet,
@@ -55510,6 +56033,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_original_commit_time_upsert_if_needed(
         &self,
         ws: &mut WriteSet,
@@ -55583,6 +56107,7 @@ impl Database {
         Ok(None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_unique_constraints_in_write_set(
         &self,
         ws: &mut WriteSet,
@@ -55868,6 +56393,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reject_if_incoming_lineage_matches_purged(
         record: &DurableLineageRecord,
         table: &str,
@@ -55908,6 +56434,7 @@ impl Database {
     /// an update of the destroyed row. Local work is fenced by its pinned
     /// RowId; authenticated sync work is fenced by the exact staged creator
     /// sidecar, so remote RowIds and delete-only writes never decide ancestry.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reject_purged_lineage_recreation(
         &self,
         ws: &WriteSet,
@@ -56016,6 +56543,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_foreign_keys_in_write_set(
         &self,
         ws: &WriteSet,
@@ -56160,6 +56688,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_composite_foreign_keys_in_write_set(
         &self,
         ws: &WriteSet,
@@ -56309,6 +56838,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn revalidate_conditional_updates(
         &self,
         ws: &mut WriteSet,
@@ -56406,6 +56936,7 @@ impl Database {
     /// instance. If that row is replaced or edited before commit, fail the
     /// entire sync transaction so its receipt and lineage writes cannot be
     /// acknowledged without the delete.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_sync_lineage_guards(
         &self,
         snapshot: SnapshotId,
@@ -56429,6 +56960,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn release_insert_allocations_for_slice(
         &self,
         ws: &WriteSet,
@@ -56478,6 +57010,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn propagate_state_change_if_needed(
         &self,
         tx: TxId,
@@ -56541,6 +57074,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn propagate(
         &self,
         tx: TxId,
@@ -56733,6 +57267,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn propagate_state_change_in_prepared_write_set(
         &self,
         ws: &mut WriteSet,
@@ -56769,6 +57304,7 @@ impl Database {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn propagate_in_prepared_write_set(
         &self,
         ws: &mut WriteSet,
@@ -56951,6 +57487,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn enqueue_fk_children_in_prepared_write_set(
         &self,
         ws: &WriteSet,
@@ -57009,6 +57546,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn enqueue_edge_children_in_prepared_write_set(
         &self,
         ws: &WriteSet,
@@ -57079,6 +57617,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_vector_exclusions_in_prepared_write_set(
         &self,
         ws: &mut WriteSet,
@@ -57130,6 +57669,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scan_in_prepared_write_set(
         &self,
         ws: &WriteSet,
@@ -57173,6 +57713,7 @@ impl Database {
         Ok(result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scan_filter_in_prepared_write_set(
         &self,
         ws: &WriteSet,
@@ -57191,6 +57732,7 @@ impl Database {
             .collect())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn point_lookup_in_prepared_write_set(
         &self,
         ws: &WriteSet,
@@ -57209,6 +57751,7 @@ impl Database {
             .find(|row| row.values.get(col) == Some(value)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_by_id_in_prepared_write_set(
         &self,
         ws: &WriteSet,
@@ -57226,6 +57769,7 @@ impl Database {
             .find(|row| row.row_id == row_id))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn logical_row_ids_for_uuid_in_prepared_write_set(
         &self,
         ws: &WriteSet,
@@ -57245,6 +57789,7 @@ impl Database {
             .collect())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn upsert_row_in_prepared_write_set(
         &self,
         ws: &mut WriteSet,
@@ -57351,6 +57896,7 @@ impl Database {
         Ok(true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_row_in_prepared_write_set(
         &self,
         ws: &mut WriteSet,
@@ -57412,6 +57958,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_vector_in_prepared_write_set(
         &self,
         ws: &mut WriteSet,
@@ -57577,6 +58124,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn enqueue_edge_children(
         &self,
         ctx: &PropagationContext<'_>,
@@ -57643,6 +58191,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_vector_exclusions(
         &self,
         ctx: &PropagationContext<'_>,
@@ -57694,12 +58243,14 @@ impl Database {
     /// removing the relational body alone leaves every vector behind: the row
     /// is gone from `SELECT` and still answered by nearest-neighbour search,
     /// and the store keeps paying for what it holds.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn delete_row(&self, tx: TxId, table: &str, row_id: RowId) -> Result<()> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.delete_row_with_read_memory(tx, table, row_id, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn delete_row_with_read_memory(
         &self,
         tx: TxId,
@@ -57722,6 +58273,7 @@ impl Database {
 
     /// Remove only the relational body of a row whose vectors the caller is
     /// about to move or re-place itself, as row replacement does.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn delete_row_keeping_vectors(
         &self,
         tx: TxId,
@@ -57742,6 +58294,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_row_inner(
         &self,
         tx: TxId,
@@ -57839,12 +58392,14 @@ impl Database {
             .unwrap_or_default()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn scan(&self, table: &str, snapshot: SnapshotId) -> Result<Vec<VersionedRow>> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.scan_with_read_memory(table, snapshot, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn scan_with_read_memory(
         &self,
         table: &str,
@@ -57871,6 +58426,7 @@ impl Database {
 
     /// Clone a selected committed row under the executing read's retained
     /// credit. The shared bounded source kernel performs the actual read.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn constraint_row_at_admitted(
         &self,
         table: &str,
@@ -57940,6 +58496,7 @@ impl Database {
         }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn committed_row_at_admitted(
         &self,
         table: &str,
@@ -57968,6 +58525,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn committed_row_at(
         &self,
         table: &str,
@@ -58015,6 +58573,7 @@ impl Database {
 
     /// Rehydrate the identity selected by the captured, witnessed index point
     /// lookup above without enumerating its retained version manifest again.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn committed_indexed_point_row_at(
         &self,
         table: &str,
@@ -58048,6 +58607,7 @@ impl Database {
         row
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn committed_rows_at(
         &self,
         table: &str,
@@ -58132,6 +58692,7 @@ impl Database {
             })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn local_table_projection_rows(&self, table: &str, arriving: &TableMeta) -> Result<Vec<VersionedRow>> {
         if self.local_table_projection_streamed(table, arriving) {
             // The durable preparation streams its addressed source directly.
@@ -58147,6 +58708,7 @@ impl Database {
     /// Schema replacement rewrites every retained MVCC version, including
     /// tombstoned history. A file-backed writer therefore has to source the
     /// projection from Redb rather than its lightweight resident directory.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn table_versions_for_projection(&self, table: &str) -> Result<Vec<VersionedRow>> {
         if self.relational_store.uses_disk_backed_committed_bodies() {
             self.table_meta(table)
@@ -58196,6 +58758,7 @@ impl Database {
             .unwrap_or_default())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn overlay_transaction_rows(
         &self,
         tx: TxId,
@@ -58234,6 +58797,7 @@ impl Database {
 
     /// Every row the statement's snapshot (and transaction, if any) can see, before any access
     /// gate. Only for a caller that applies the complete predicate and then the refusing gate.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn scan_rows_ungated_for_select(
         &self,
         tx: Option<TxId>,
@@ -58259,6 +58823,7 @@ impl Database {
         Ok(rows)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn scan_in_tx_raw(
         &self,
         tx: TxId,
@@ -58286,6 +58851,7 @@ impl Database {
     /// Compute the in-tx overlay (deleted row_ids + matching staged inserts)
     /// for an index-driven scan of `table` matching `shape` on `column`.
     /// Internal helper for the IndexScan executor arm.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn index_scan_tx_overlay(
         &self,
         tx: TxId,
@@ -58347,6 +58913,7 @@ impl Database {
         Ok(overlay)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn scan_filter(
         &self,
         table: &str,
@@ -58364,6 +58931,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn scan_filter_with_read_memory(
         &self,
         table: &str,
@@ -58387,6 +58955,7 @@ impl Database {
         Ok(rows.into_iter().filter(|row| predicate(row)).collect())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn point_lookup(
         &self,
         table: &str,
@@ -58430,6 +58999,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn point_lookup_with_read_memory(
         &self,
         table: &str,
@@ -58476,6 +59046,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn point_lookup_in_tx(
         &self,
         tx: TxId,
@@ -58512,6 +59083,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn record_relational_delete_predicate(
         &self,
         tx: TxId,
@@ -58542,6 +59114,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn conflict_lookup_in_tx(
         &self,
         tx: TxId,
@@ -58623,6 +59196,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn unique_row_lookup_in_tx(
         &self,
         tx: TxId,
@@ -58734,6 +59308,7 @@ impl Database {
         row_ids.into_iter().collect()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn insert_edge(
         &self,
         tx: TxId,
@@ -58746,6 +59321,7 @@ impl Database {
         self.insert_edge_with_read_memory(tx, source, target, edge_type, properties, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_edge_with_read_memory(
         &self,
         tx: TxId,
@@ -58850,6 +59426,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn delete_edge(
         &self,
         tx: TxId,
@@ -58861,6 +59438,7 @@ impl Database {
         self.delete_edge_with_read_memory(tx, source, target, edge_type, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn delete_edge_with_read_memory(
         &self,
         tx: TxId,
@@ -58894,6 +59472,7 @@ impl Database {
     /// Traversal storage is admitted on the reader budget during execution.
     /// The returned result is caller-owned; its execution credit is released
     /// at this public boundary, as for other returned query results.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn query_bfs(
         &self,
         start: NodeId,
@@ -58913,6 +59492,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn query_bfs_with_read_memory(
         &self,
         start: NodeId,
@@ -58957,6 +59537,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn edge_count(
         &self,
         source: NodeId,
@@ -58967,6 +59548,7 @@ impl Database {
         self.edge_count_with_read_memory(source, edge_type, snapshot, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn edge_count_with_read_memory(
         &self,
         source: NodeId,
@@ -59051,6 +59633,7 @@ impl Database {
         Ok(count)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn get_edge_properties(
         &self,
         source: NodeId,
@@ -59062,6 +59645,7 @@ impl Database {
         self.get_edge_properties_with_read_memory(source, target, edge_type, snapshot, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn get_edge_properties_with_read_memory(
         &self,
         source: NodeId,
@@ -59103,6 +59687,7 @@ impl Database {
 
     // Internal write pricing follows write authorization; it must see the
     // complete entry even when the writer cannot expose it as a read answer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn edge_properties_unchecked_with_read_memory(
         &self,
         source: NodeId,
@@ -59228,6 +59813,7 @@ impl Database {
     /// takes the value from the store the column declared. What comes back is
     /// what every other route already answers with -- the stored
     /// approximation, not the caller's original -- so no answer changes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn supplement_quantized_vectors(
         &self,
         table: &str,
@@ -59275,6 +59861,7 @@ impl Database {
     /// `None` is the explicit `SELECT *` case; `Some(&[])` deliberately loads
     /// no vector body. Lazy partitions may fail while loading, so this route
     /// must preserve that error instead of returning a row with a false NULL.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn supplement_selected_vector_columns(
         &self,
         table: &str,
@@ -59330,6 +59917,7 @@ impl Database {
     /// Filling it here is what keeps the payload a peer receives exactly what
     /// it received before -- the same dequantized vector, under the same
     /// column name, in the same shape -- on every route that builds one.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn outbound_row_values(
         &self,
         table: &str,
@@ -59356,6 +59944,7 @@ impl Database {
         Ok(values)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fill_quantized_from_store(
         &self,
         table: &str,
@@ -59376,6 +59965,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fill_quantized_columns(
         &self,
         table: &str,
@@ -59415,6 +60005,7 @@ impl Database {
     /// vector index, so a row handed back unfilled carries NULL where the
     /// embedding belongs: a predicate testing it never matches, and a caller
     /// reading it is told the row has no vector.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn supplement_rows_for_caller(
         &self,
         table: &str,
@@ -59483,6 +60074,7 @@ impl Database {
     /// loaded. A transaction's staged vector remains authoritative over the
     /// committed body.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bounded_score_committed_vector_row(
         &self,
         index: &VectorIndexRef,
@@ -59524,6 +60116,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authenticate_selected_row_vector(
         &self,
         index: &VectorIndexRef,
@@ -59556,6 +60149,7 @@ impl Database {
         Ok(Some(vector))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn load_row_vector_for_column(
         &self,
         tx: Option<TxId>,
@@ -59689,6 +60283,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn load_row_vector_for_column_identity(
         &self,
         tx: Option<TxId>,
@@ -59765,6 +60360,7 @@ impl Database {
     /// the caller's compensation release is the only one that hands the row's
     /// charge back. A row left staged behind a failure is released a second
     /// time by the rollback.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn write_row_vectors_or_unstage(
         &self,
         tx: TxId,
@@ -59793,6 +60389,7 @@ impl Database {
             .unwrap_or(0)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn write_row_vectors(
         &self,
         tx: TxId,
@@ -60068,6 +60665,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn insert_vector(
         &self,
         tx: TxId,
@@ -60087,6 +60685,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_vector_with_read_memory(
         &self,
         tx: TxId,
@@ -60138,6 +60737,7 @@ impl Database {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn insert_vector_strict(
         &self,
         tx: TxId,
@@ -60158,12 +60758,14 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn delete_vector(&self, tx: TxId, index: VectorIndexRef, row_id: RowId) -> Result<()> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.delete_vector_with_read_memory(tx, index, row_id, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn delete_vector_with_read_memory(
         &self,
         tx: TxId,
@@ -60200,6 +60802,7 @@ impl Database {
         }
         result
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_vector_within_operation(
         &self,
         tx: TxId,
@@ -60344,6 +60947,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_original_vector_cancellation(
         &self, tx: TxId, index: &VectorIndexRef, row: RowId, existing_live: bool,
     ) -> Result<crate::custody::preparation::OwnedPreparationValue<NativeVectorCancellation>> {
@@ -60409,6 +61013,7 @@ impl Database {
         Ok(plan)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn publish_original_vector_cancellation(
         &self, guard: &mut contextdb_tx::manager::EngineGuard<'_>,
         index: &VectorIndexRef, row: RowId, plan: &NativeVectorCancellation,
@@ -60452,6 +61057,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_original_vector_within_operation(
         &self, host: &EngineDatabaseTransactions, tx: TxId,
         index: &VectorIndexRef, row: RowId, existing_live: bool,
@@ -60461,6 +61067,7 @@ impl Database {
             lower.with_engine(tx, |guard| self.publish_original_vector_cancellation(guard, index, row, plan))))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn move_vector(
         &self,
         tx: TxId,
@@ -60791,6 +61398,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn move_original_vector(
         &self, host: &EngineDatabaseTransactions, tx: TxId, index: &VectorIndexRef,
         old: RowId, new: RowId, existing_live: bool, cancel_only: bool,
@@ -60947,6 +61555,7 @@ impl Database {
 
     /// Historical vector consumers keep the same physical capture and reader
     /// child through candidate discovery, resident/cold selection and scoring.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_read_scope(
         &self,
         snapshot: SnapshotId,
@@ -60960,6 +61569,7 @@ impl Database {
 
     /// Hold this guard before any engine-derived restriction or empty result.
     /// The supplied context is the executing bounded kernel's context.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_read_preflight(
         &self,
         snapshot: SnapshotId,
@@ -61025,6 +61635,7 @@ impl Database {
 
     /// The reservation transfer through which the store retains a durable
     /// generation a read loads, funded by that read's executing owner.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_load_transfer(
         &self,
         executing_owner: impl Into<contextdb_vector::MemoryBudgetOwner>,
@@ -61034,6 +61645,7 @@ impl Database {
 
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn callback(
             source: impl Into<contextdb_vector::MemoryBudgetOwner>,
             original: contextdb_core::read_memory::ReadMemoryOwner,
@@ -61069,6 +61681,7 @@ impl Database {
     /// One owner-door vector search over every admitted partition. Copied
     /// search output uses the supplied executing read owner; durable generation
     /// loading retains its existing store reservation transfer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn owner_vector_search(
         &self,
         index: VectorIndexRef,
@@ -61127,6 +61740,7 @@ impl Database {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn query_vector(
         &self,
         index: VectorIndexRef,
@@ -61153,6 +61767,7 @@ impl Database {
         Ok(rows)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn query_vector_with_read_memory(
         &self,
         index: VectorIndexRef,
@@ -61233,6 +61848,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn semantic_search(&self, query: SemanticQuery) -> Result<Vec<SearchResult>> {
         let read_memory = self.declared_reader_memory()?;
         let executing_owner = crate::vector_read_memory::budget(read_memory.clone());
@@ -61246,6 +61862,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn semantic_search_with_read_memory(
         &self,
         query: SemanticQuery,
@@ -61296,6 +61913,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn semantic_search_with_candidates(
         &self,
         query: SemanticQuery,
@@ -61319,6 +61937,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn semantic_search_with_candidates_under_schema_read(
         &self,
         query: SemanticQuery,
@@ -61341,6 +61960,7 @@ impl Database {
         .map(|(results, _)| results)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn semantic_search_with_candidates_under_schema_read_with_strategy(
         &self,
         query: SemanticQuery,
@@ -61368,6 +61988,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn semantic_search_with_candidates_under_schema_read_in_tx_with_strategy(
         &self,
         tx: Option<TxId>,
@@ -61716,6 +62337,7 @@ impl Database {
     /// Transaction, scope, snapshot, and mode are separate execution inputs;
     /// combining them would obscure the vector-query contract at each caller.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn query_vector_strict_in_tx_with_strategy(
         &self,
         tx: Option<TxId>,
@@ -61838,6 +62460,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn resolved_vector_search_mode(
         &self,
         index: &VectorIndexRef,
@@ -61858,6 +62481,7 @@ impl Database {
             })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn query_vector_strict_with_write_set_overlay(
         &self,
         ws: &WriteSet,
@@ -62133,6 +62757,7 @@ impl Database {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn query_vector_strict_with_captured_overlay(
         &self,
         captured: &CapturedVectorWriteSet,
@@ -62365,6 +62990,7 @@ impl Database {
             .store(cache.len() as u64, Ordering::SeqCst);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rebuild_rank_formula_cache_from_meta(
         &self,
         metas: &HashMap<String, TableMeta>,
@@ -62374,6 +63000,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_rank_formula_cache(
         metas: &HashMap<String, TableMeta>,
     ) -> Result<HashMap<(String, String), Arc<RankFormula>>> {
@@ -62402,6 +63029,7 @@ impl Database {
             .store(count, Ordering::SeqCst);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rank_formula(&self, table: &str, column: &str) -> Result<Arc<RankFormula>> {
         self.rank_formula_cache
             .read()
@@ -62415,6 +63043,7 @@ impl Database {
             })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_entry_count(
         &self,
         index: &VectorIndexRef,
@@ -62427,6 +63056,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_entry_count_in_tx(
         &self,
         tx: Option<TxId>,
@@ -62458,6 +63088,7 @@ impl Database {
     /// EXACT ranks every allowed vector; indexed ranking uses the column's
     /// resolved candidate breadth. The caller's LIMIT is resolved only once.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rank_policy_candidate_k(
         &self,
         index: &VectorIndexRef,
@@ -62516,6 +63147,7 @@ impl Database {
         candidate_k
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn semantic_where_candidate_bitmap(
         &self,
         tx: Option<TxId>,
@@ -62619,6 +63251,7 @@ impl Database {
         Ok((bitmap, complete))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_directory_candidate_bitmap(
         &self,
         tx: Option<TxId>,
@@ -62708,6 +63341,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn effective_vector_read_candidates(
         &self,
         index: &VectorIndexRef,
@@ -62738,6 +63372,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn find_row_by_id_at(
         &self,
         table: &str,
@@ -62752,6 +63387,7 @@ impl Database {
             .ok_or_else(|| Error::NotFound(format!("row {row_id} in table {table}")))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn joined_row_for_rank_policy(
         &self,
         tx: Option<TxId>,
@@ -62880,6 +63516,7 @@ impl Database {
         Ok(Some(row))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn joined_row_for_rank_policy_in_tx(
         &self,
         tx: TxId,
@@ -62972,6 +63609,7 @@ impl Database {
         );
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn search_result_values_in_tx(
         &self,
         tx: Option<TxId>,
@@ -63002,6 +63640,7 @@ impl Database {
         Ok(values)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn pending_vector_dimension(&self, tx: TxId, index: &VectorIndexRef) -> Result<Option<usize>> {
         self.tx_mgr.with_read(tx, |ws| {
             ws.vector_inserts
@@ -63029,6 +63668,7 @@ impl Database {
     /// admission and at the rollback that returns it alike. This is the raw
     /// body only: an F32 column's relational projection lives inside the row
     /// values and is carried by the row's own charge, never by the vector.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_insert_accounted_bytes(
         &self,
         index: &VectorIndexRef,
@@ -63191,6 +63831,7 @@ impl Database {
         source.visit_physical_vector_records(operation, context, tables, visit)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn assert_vector_index_exists_under_schema_read(
         &self,
         index: &VectorIndexRef,
@@ -63204,6 +63845,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_vector_under_schema_read(
         &self,
         index: &VectorIndexRef,
@@ -63293,11 +63935,13 @@ impl Database {
             .storage_bytes_per_entry(&index, &mut vector_copy_owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn has_live_vector(&self, row_id: RowId, snapshot: SnapshotId) -> Result<bool> {
         let read_memory = self.declared_reader_memory()?;
         self.has_live_vector_with_read_memory(row_id, snapshot, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn has_live_vector_with_read_memory(
         &self,
         row_id: RowId,
@@ -63334,6 +63978,7 @@ impl Database {
     }
 
     /// Materialize one live vector under the executing reader's owner.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn live_vector_entry(
         &self,
         row_id: RowId,
@@ -63349,6 +63994,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn live_vector_entry_with_read_memory(
         &self,
         row_id: RowId,
@@ -63425,6 +64071,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_store_has_live_entry_for_row(
         &self,
         index: &VectorIndexRef,
@@ -63436,6 +64083,7 @@ impl Database {
             .has_live_entry_for_row(index, row_id, snapshot, vector_copy_owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_store_live_entry_for_row(
         &self,
         index: &VectorIndexRef,
@@ -63460,6 +64108,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn natural_key_column_for_table(&self, table: &str) -> Result<String> {
         let meta = self
             .table_meta(table)
@@ -63471,6 +64120,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_id_for_natural_key_in_tx(
         &self,
         tx: Option<TxId>,
@@ -63520,6 +64170,7 @@ impl Database {
         Ok(Some(row_id))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_entry_for_row_in_tx(
         &self,
         tx: Option<TxId>,
@@ -63609,6 +64260,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn find_row_by_id_in_tx(
         &self,
         tx: Option<TxId>,
@@ -63652,6 +64304,7 @@ impl Database {
     /// Resolve a vector partition from its exact owning-row LSN. Durable
     /// versions use the captured, reader-funded group proof before projection;
     /// a staged replacement remains authoritative.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn row_projection_for_vector_load(
         &self,
         tx: Option<TxId>,
@@ -63776,6 +64429,7 @@ impl Database {
             .ok_or_else(|| Error::NotFound(format!("row {row_id} at LSN {lsn:?} in table {table}")))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_captured_row_in_selected_partitions(
         &self,
         captured: &CapturedVectorWriteSet,
@@ -63802,6 +64456,7 @@ impl Database {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_id_read_allowed_in_captured_set_for_query(
         &self,
         captured: &CapturedVectorWriteSet,
@@ -63830,6 +64485,7 @@ impl Database {
         self.borrowed_row_read_allowed_for_query(table, &row, snapshot, read_memory.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_staged_row_in_selected_partitions(
         &self,
         ws: &WriteSet,
@@ -63858,6 +64514,7 @@ impl Database {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_id_read_allowed_in_write_set_for_query(
         &self,
         ws: &WriteSet,
@@ -63917,6 +64574,7 @@ impl Database {
         );
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn graph_edges_after_table_drop(
         &self,
         table: &str,
@@ -63949,6 +64607,7 @@ impl Database {
         Ok(result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn metadata_table_page(
         &self, owner: contextdb_core::read_memory::ReadMemoryOwner,
         continuation: Option<&str>, page_bytes: u64,
@@ -63963,6 +64622,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn metadata_schema(
         &self,
         table: &str,
@@ -64085,6 +64745,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_purge_custody_keys(
         &self,
         selections: &[AuthoritativePurgeSelection],
@@ -64115,6 +64776,7 @@ impl Database {
     /// Resolve exactly one currently visible row life for the private
     /// authoritative-purge kernel.  This only reads durable creation/lineage
     /// evidence; it does not reserve, mutate, or publish anything.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn resolve_authoritative_purge_selection(
         &self,
         table: &str,
@@ -64209,6 +64871,7 @@ impl Database {
     /// selected life, and is returned as `lifecycle: None`. The pinned row is
     /// still visible, so no committed delete or purge can describe it; a
     /// record naming its row or its root must agree with it exactly.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_authoritative_purge_selection(
         &self,
         selection: &AuthoritativePurgeSelection,
@@ -64323,6 +64986,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_purge_lifecycle_template(
         selection: &AuthoritativePurgeSelection,
         witness: &AuthoritativePurgeLineageWitness,
@@ -64385,6 +65049,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_authoritative_purge_survivor_report(
         report_requested: bool,
         table: &str,
@@ -64466,6 +65131,7 @@ impl Database {
         }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_purge_selected_row_versions(
         &self, table: &str, selected: &HashSet<RowId>,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -64514,6 +65180,7 @@ impl Database {
         Ok(rows)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_purge_selected_blob_hashes(
         &self,
         selections: &[AuthoritativePurgeSelection],
@@ -64571,6 +65238,7 @@ impl Database {
         Ok(hashes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_purge_current_blob_references(
         &self,
         selections: &[AuthoritativePurgeSelection],
@@ -64628,6 +65296,7 @@ impl Database {
 
     /// Reserve the complete transient vector image and replacement-generation
     /// disk envelope before either erasure path faults a selected partition in.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reserve_authoritative_erasure_workspace(
         &self,
         selections: &[AuthoritativePurgeSelection],
@@ -64700,6 +65369,7 @@ impl Database {
     /// Enumerate every owned copy for a previously resolved immutable root.
     /// This is deliberately a pure read: the later commit kernel receives this
     /// prepared set but is the only code allowed to remove or publish state.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_authoritative_purge_set_batch(
         &self,
         selections: &[AuthoritativePurgeSelection],
@@ -65411,6 +66081,7 @@ impl Database {
 
     /// Resolve the exact visible row lives selected by one public `PURGE` and
     /// pass their same-table union to the one durable destruction boundary.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn commit_authoritative_purge_tables(
         &self,
         tables: &[(String, Vec<(NaturalKey, RowId)>)],
@@ -65484,6 +66155,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authoritative_purge_delivery_items_since(
         &self,
         since_lsn: Lsn,
@@ -65510,6 +66182,7 @@ impl Database {
         Ok(items.into_iter().map(|(_, item)| item).collect())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authoritative_purge_targets_retired_generation(
         &self,
         item: &AuthoritativePurgeDeliveryItem,
@@ -65526,6 +66199,7 @@ impl Database {
                 != item.table_generation)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retained_unbound_purge_selection(
         &self, item: &AuthoritativePurgeDeliveryItem,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -65589,6 +66263,7 @@ impl Database {
         Ok(None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn incoming_authoritative_purge_plan(
         &self,
         items: &[AuthoritativePurgeDeliveryItem],
@@ -65795,6 +66470,7 @@ impl Database {
         Ok(plan)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn preflight_incoming_authoritative_purge_batch_while_authoritative(
         &self,
         items: &[AuthoritativePurgeDeliveryItem],
@@ -65807,6 +66483,7 @@ impl Database {
             .map(|_| ())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_incoming_authoritative_purge_batch_while_authoritative(
         &self,
         items: &[AuthoritativePurgeDeliveryItem],
@@ -65856,6 +66533,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_incoming_purge_frontier_adoptions(
         &self,
         adoptions: &[IncomingPurgeFrontierAdoption],
@@ -65947,6 +66625,7 @@ impl Database {
     /// One file-backed destruction kernel for the same-table union selected
     /// by a public `PURGE`.  It consumes one queue drain, one frontier, and
     /// one Redb write transaction before direct prebuilt publication.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_authoritative_purge_kernel_batch(
         &self,
         selections: &[AuthoritativePurgeSelection],
@@ -66438,6 +67117,7 @@ impl Database {
             .arm_authoritative_purge_commit_failure_for_test();
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_purge_disk_source_provenance(
         &self, selected_table: &str, selected_row_ids: &HashSet<RowId>,
     ) -> Result<Vec<(String, RowId, Lsn, u8)>> {
@@ -66462,6 +67142,7 @@ impl Database {
         Ok(rows)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_purge_memory_source_provenance(
         &self,
         table: &str,
@@ -66510,6 +67191,7 @@ impl Database {
             .collect()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_purge_durable_sink_names(&self) -> Result<BTreeSet<String>> {
         let mut names = BTreeSet::new();
         if let Some(persistence) = &self.persistence {
@@ -66518,6 +67200,7 @@ impl Database {
         Ok(names)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn authoritative_purge_durable_sink_entries(
         &self,
         table: &str,
@@ -66767,6 +67450,7 @@ impl Database {
     /// is not automatically protected — see [`Database::pin_snapshot`] if you
     /// need to hold a snapshot across separate calls on a table declaring
     /// `RETAIN` or `HISTORY CURRENT ONLY`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn execute_at_snapshot(
         &self,
         sql: &str,
@@ -66781,6 +67465,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn execute_at_snapshot_with_read_memory(
         &self,
         sql: &str,
@@ -66822,6 +67507,7 @@ impl Database {
     /// prepaid capacity. Further pins reserve their exact registration bytes
     /// from the store's declared reader memory until unpin; insufficient
     /// memory returns a typed `snapshot_pin` refusal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn pin_snapshot(&self, snapshot: SnapshotId) -> contextdb_core::Result<SnapshotPin<'_>> {
         let read_memory = self.declared_reader_memory()?;
         let slot = self
@@ -66867,6 +67553,7 @@ impl Database {
     /// cheaply (a key move, a vector removed without a same-row
     /// replacement, a row deleted from a partitioned vector table, or a
     /// replacement whose partition key cannot be shown unchanged).
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn write_set_could_empty_a_vector_partition(&self, tx: TxId) -> Result<bool> {
         struct WriteSetShape {
             tables: Vec<TableName>,
@@ -67022,6 +67709,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_snapshot_override<T>(
         &self,
         snapshot: SnapshotId,
@@ -67123,6 +67811,7 @@ impl Database {
     /// its own rows sit in its write set. The rows themselves stay where they
     /// are until a read asks for one, so a bounded read charges each of them
     /// as it touches it rather than paying for the whole transaction up front.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn transaction_table_overlay(
         &self,
         tx: TxId,
@@ -67454,6 +68143,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn transaction_vector_overlay(
         &self,
         tx: TxId,
@@ -67481,6 +68171,7 @@ impl Database {
     /// The identity is charged before it is read and the payload before it is
     /// copied, so a vector this handle staged costs a bounded read what a
     /// committed entry of the same width costs.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn transaction_staged_vector(
         &self,
         _tx: TxId,
@@ -67568,6 +68259,7 @@ impl Database {
             }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bounded_vector_graph_snapshot_registration(
         &self,
         idle_window: Option<Arc<CursorIdleWindow>>,
@@ -67621,6 +68313,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bounded_read_snapshot_registration_with_root(
         &self,
         needs_vector_graph: bool,
@@ -67764,6 +68457,7 @@ impl Database {
         )))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn owner_cursor_physical_identity(&self) -> Result<Option<(u64, u64)>> {
         self.persistence
             .as_ref()
@@ -67778,6 +68472,7 @@ impl Database {
     /// holding rows back once that window passes. The returned window is the
     /// cursor's to stamp on every page it hands out. `None` carries the same
     /// meaning as on the read above: the caller withdrew during admission.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bounded_cursor_snapshot_registration_with_root(
         &self,
         needs_vector_graph: bool,
@@ -68113,6 +68808,7 @@ impl Database {
     /// "holds 0" for an unreadable store would read as "this declaration
     /// costs nothing", which is the opposite of what an operator asked.
     /// A store with no persistence at all genuinely holds no records.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn stored_maintained_count_values(
         &self,
         table: &str,
@@ -68127,6 +68823,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authenticated_relational_index_prefix_count(
         &self,
         table: &str,
@@ -68253,6 +68950,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn committed_maintained_count_groups<E: From<Error>>(
         &self,
         table: &str,
@@ -68347,6 +69045,7 @@ impl Database {
     /// execution. The bounded entrance keeps parsing before `on_query`, just
     /// like `Database::execute`, and hands this function that one AST rather
     /// than parsing the statement a second time.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_bounded_read_plan(
         &self,
         parsed: &Statement,
@@ -68455,6 +69154,7 @@ impl Database {
         visit(row.as_ref())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bounded_row_by_identity_admitted<E>(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -68648,6 +69348,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bounded_physical_table_cursor(
         &self,
         table: &str,
@@ -68788,6 +69489,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ordered_prefix_snapshot_is_current(
         &self,
         snapshot: SnapshotId,
@@ -69612,6 +70314,7 @@ impl Database {
     /// Neither available outcome is acceptable, so the read is refused rather
     /// than served unprotected. Statement-scoped reads on a callback thread
     /// are unchanged.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn assert_bounded_vector_read_is_schema_protected(&self) -> Result<()> {
         if self.callback_active_on_current_thread_for_this_db() {
             return Err(Error::InvalidStateTransition(
@@ -69628,6 +70331,7 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     /// The row checks a statement may spend checking its filter row by row:
     /// the walk budget its declared breadth gives it for `k`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn bounded_vector_row_check_allowance(
         &self,
         index: &VectorIndexRef,
@@ -69807,6 +70511,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn bounded_joined_row_for_rank_policy<E>(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -70452,6 +71157,7 @@ impl Database {
         VectorSchemaReadGuard::new_detached(db_id, refs, guards)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_schema_write(
         &self,
         index: &VectorIndexRef,
@@ -70459,6 +71165,7 @@ impl Database {
         self.vector_schema_write_many([index.clone()])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_schema_write_table(
         &self,
         table: &str,
@@ -70477,6 +71184,7 @@ impl Database {
     /// enter can only end when it runs a statement it can no longer reach.
     /// Cursors held by other sessions are waited for, and inspection that
     /// starts after this point queues behind the change.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_schema_write_many(
         &self,
         refs: impl IntoIterator<Item = VectorIndexRef>,
@@ -70491,6 +71199,7 @@ impl Database {
         Ok(VectorSchemaWriteGuard { _guards: guards })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn refuse_schema_change_under_own_open_cursor(&self, refs: &[VectorIndexRef]) -> Result<()> {
         let db_id = self.vector_schema_gate_id();
         let Some(index) = refs
@@ -70610,6 +71319,7 @@ impl Database {
         VectorSchemaGates::sorted_refs(refs)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn vector_store_schema_refs(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -70627,12 +71337,14 @@ impl Database {
     /// the row values out of the live relational store, and emits a
     /// `RowChange` the receiver can replay. row_id order is preserved.
     #[doc(hidden)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn change_log_rows_since(&self, since: Lsn) -> Result<Vec<RowChange>> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.change_log_rows_since_with_read_memory(since, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn change_log_rows_since_with_read_memory(
         &self,
         since: Lsn,
@@ -70877,12 +71589,14 @@ impl Database {
     }
 
     /// Run one pruning cycle and return the pruned row count or typed refusal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn run_pruning_cycle(&self) -> Result<u64> {
         crate::memory_accounting::observe_inherited_process_ceiling();
         let read_memory = self.finalization.accountant.read_budget()?;
         self.run_pruning_cycle_with_read_memory(read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn run_pruning_cycle_with_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -70899,12 +71613,14 @@ impl Database {
     /// errors are returned to the caller. This runs the retention pass only;
     /// use [`Self::run_maintenance_cycle`] to also advance
     /// current-only history cleanup and maintained vector indexes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn run_pruning_cycle_checked(&self) -> Result<PruningReport> {
         crate::memory_accounting::observe_inherited_process_ceiling();
         let read_memory = self.finalization.accountant.read_budget()?;
         self.run_pruning_cycle_checked_with_read_memory(read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn run_pruning_cycle_checked_with_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -70928,12 +71644,14 @@ impl Database {
     /// leave work for a later call. Existing snapshot-compatible routes keep
     /// serving while a replacement is prepared, and active readers defer
     /// reclamation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn run_maintenance_cycle(&self) -> Result<MaintenanceReport> {
         crate::memory_accounting::observe_inherited_process_ceiling();
         let read_memory = self.finalization.accountant.read_budget()?;
         self.run_maintenance_cycle_with_read_memory(read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn run_maintenance_cycle_with_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -71164,6 +71882,7 @@ impl Database {
     /// otherwise existing snapshots retain their handle and source pages.
     /// A reopen failure preserves the durable file and returns the existing
     /// `StoreHandleRecycleFailed` error. Memory databases have no file to compact.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn compact_now(&self) -> Result<CompactionReport> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
@@ -71472,6 +72191,7 @@ impl Database {
     /// It takes effect for partitions loaded after it, which is what a reader
     /// opening later sees; a generation already resident keeps the cache it
     /// was admitted for until it is reloaded.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn set_vector_serving_cache_bytes(&self, bytes: Option<usize>) -> Result<()> {
         let _operation = self.open_operation()?;
         if let Some(bytes) = bytes
@@ -71506,6 +72226,7 @@ impl Database {
     /// (`SET STORAGE_COMPACTION`). Clauses a statement omits keep their
     /// value; `Default` returns every setting to its default and removes the
     /// persisted declaration, so defaults stay silent.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn set_storage_compaction(
         &self,
         setting: &contextdb_parser::StorageCompactionSetting,
@@ -71558,6 +72279,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_maintenance_poll_interval(&self, interval: Duration) -> Result<()> {
         let milliseconds = u64::try_from(interval.as_millis()).map_err(|_| {
             Error::Other(("maintenance poll interval exceeds the supported range".to_string()).into())
@@ -71581,6 +72303,7 @@ impl Database {
     /// Persist and apply a positive maintenance polling cadence. An existing
     /// engine-owned worker samples the new value for its next wait without
     /// joining an active maintenance cycle.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn set_maintenance_poll_interval(&self, interval: Duration) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
         self.maintenance_poll_interval_update_probe.note_entered();
@@ -71682,6 +72405,7 @@ impl Database {
     /// the redb config store, so it does not survive this handle closing and
     /// a fresh [`Database`] being opened on the same path. Read back by
     /// [`Database::trigger_audit_retention`].
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn set_trigger_audit_retention(&self, window: Duration) -> Result<()> {
         let _operation = self.open_operation()?;
         self.trigger_audit_retention_secs
@@ -71694,11 +72418,13 @@ impl Database {
     ///
     /// `None` when the table does not exist. Stored-size failures and read
     /// memory refusals reach the caller instead of hiding an incomplete answer.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn table_size_estimate(&self, table: &str) -> Result<Option<TableSizeEstimate>> {
         let read_memory = self.declared_reader_memory()?;
         self.table_size_estimate_with_read_memory(table, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn table_size_estimate_with_read_memory(
         &self,
         table: &str,
@@ -71719,11 +72445,13 @@ impl Database {
     ///
     /// A table whose stored sizes cannot be read stops this with that failure
     /// rather than reporting a table that looks smaller than it is.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn table_size_estimates(&self) -> Result<Vec<TableSizeEstimate>> {
         let read_memory = self.declared_reader_memory()?;
         self.table_size_estimates_with_read_memory(read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn table_size_estimates_with_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -71748,6 +72476,7 @@ impl Database {
         Ok(estimates)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn table_size_estimate_for_meta(
         &self,
         table: &str,
@@ -71879,6 +72608,7 @@ impl Database {
     /// metadata survives reboot, so a different ticket cannot claim pull,
     /// push, or purge authority. Re-registering the same peer is a reconnect;
     /// use `change_retention_sync_peer` to move the durable destination.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_retention_sync_peer(&self, node_id: &str) -> Result<()> {
         self.register_retention_sync_peer_mode(node_id, false)
     }
@@ -71887,10 +72617,12 @@ impl Database {
     /// Construction alone can preserve a mismatched durable binding so the
     /// operator can use the existing destination-change recovery operation.
     /// All other registration failures still propagate to the constructor.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn register_retention_sync_peer_for_client(&self, node_id: &str) -> Result<()> {
         self.register_retention_sync_peer_mode(node_id, true)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_retention_sync_peer_mode(
         &self,
         node_id: &str,
@@ -71971,6 +72703,7 @@ impl Database {
     /// already holds the rows. After a clean change nothing local is deleted
     /// until the NEW destination confirms receipt, exactly as a first-ever
     /// upload.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn change_retention_sync_peer(
         &self,
         tenant_id: &TenantId,
@@ -72088,6 +72821,7 @@ impl Database {
     /// The opaque identity deliberately does not derive from the frontier: a
     /// move away and back to the same hub can have the same frontier while
     /// still requiring a new rebuild acknowledgement.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn destination_reupload_epoch(
         &self,
         tenant_id: &TenantId,
@@ -72132,6 +72866,7 @@ impl Database {
     /// has confirmed every selected source group. A stale client cannot clear
     /// a newer move because both the durable binding and target must still name
     /// the peer whose push just completed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn complete_destination_reupload(
         &self,
         tenant_id: &TenantId,
@@ -72143,6 +72878,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn complete_destination_reupload_while_authoritative(
         &self,
         tenant_id: &TenantId,
@@ -72242,11 +72978,13 @@ impl Database {
     /// every version they can still see. This does not compact the storage file;
     /// file compaction is a separate maintenance operation. Sync replay continues
     /// to resolve the surviving current state across cleanup.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn compact_currency_versions(&self) -> Result<CurrencyCompactionReport> {
         let read_memory = self.declared_reader_memory()?;
         self.compact_currency_versions_with_read_memory(read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn compact_currency_versions_with_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -72371,6 +73109,7 @@ impl Database {
     /// Verify historical indexes as one bounded read: `checkpoint` carries the
     /// request's cancellation and active-time limit and runs before every
     /// posting and row version, and the walk is charged to `memory`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn verify_historical_indexes_within(
         &self,
         table: &str,
@@ -72753,6 +73492,7 @@ impl Database {
         self.pruning_runtime.lock().wakes.load(Ordering::SeqCst)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn spawn_maintenance(&self, interval: Duration) {
         self.stop_pruning_thread();
 
@@ -72912,6 +73652,7 @@ impl Database {
 
     sync_test_seam! {
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_memory_with_plugin_and_accountant(
         plugin: Arc<dyn DatabasePlugin>,
         accountant: Arc<MemoryAccountant>,
@@ -72920,6 +73661,7 @@ impl Database {
     }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open_memory_with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Result<Self> {
         Self::open_with_plugin(MEMORY_DATABASE_PATH, plugin)
     }
@@ -72929,11 +73671,13 @@ impl Database {
     /// commit mutex is held only for a bounded snapshot capture (never across
     /// the copy), and pruning is deferred for the export's duration so rows
     /// alive-but-expired at the snapshot land in the artifact.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn export_snapshot(&self, dest: impl AsRef<Path>) -> Result<ExportReport> {
         let read_memory = self.declared_reader_memory()?;
         self.export_snapshot_with_read_memory(dest, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn export_snapshot_with_read_memory(
         &self,
         dest: impl AsRef<Path>,
@@ -73050,6 +73794,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_export_erasure_frontier(
         &self,
         snapshot_lsn: Lsn,
@@ -73086,6 +73831,7 @@ impl Database {
     /// Find a permanent lineage frontier that was committed after an export's
     /// capture point.  Called only while the transaction commit mutex is held
     /// immediately before publication, never while the export is copying.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn purge_frontier_after_snapshot(
         &self,
         snapshot_lsn: Lsn,
@@ -73120,6 +73866,7 @@ impl Database {
         publish()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn register_writer_cursor(
         &self,
         cursor: &Arc<crate::executor::BoundedCursorExecutionState>,
@@ -73142,6 +73889,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn authorize_authoritative_read_publication(
         &self,
         scope: &crate::executor::ReadPublicationScope,
@@ -73187,6 +73935,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn write_export_artifact(
         &self,
         dest: &Path,
@@ -73235,6 +73984,7 @@ impl Database {
         Ok(report)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn copy_snapshot_into_artifact(
         &self,
         artifact: &RedbPersistence,
@@ -73884,6 +74634,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn close(&self) -> Result<()> {
         let current_thread = crate::owned_worker::current_thread_id();
         let mut progress = self.close_progress.lock();
@@ -73934,6 +74685,7 @@ impl Database {
         *self.close_follower_observer.lock() = observer;
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn close_as_owner(&self) -> Result<()> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
@@ -74101,6 +74853,7 @@ impl Database {
         close_result.and(plugin_result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_operation(&self) -> Result<DatabaseOperationGuard<'_>> {
         let db_id = self.id;
         let nested = DB_OPERATION_STACK.with(|stack| stack.borrow().contains(&db_id));
@@ -74147,6 +74900,7 @@ impl Database {
     /// correct partial publication to patch back to. The handle refuses every
     /// later operation; reopening recovers the complete committed state from
     /// the durable image.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn refuse_after_interrupted_publication(&self) -> Result<()> {
         if self.publication_interrupted.load(Ordering::SeqCst)
             || self.tx_mgr.store().publication_interrupted()
@@ -74205,6 +74959,7 @@ impl Database {
     /// that may be waiting for this very `apply_changes` call to return.
     /// Timed lock acquisition is only a wake-up cadence: callback state, not
     /// elapsed time, decides the result.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn enter_apply_changes_schema_publication_gate(
         &self,
         surface: &'static str,
@@ -74299,6 +75054,7 @@ impl Database {
     }
 
     /// File-backed database with custom plugin.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn open_with_plugin(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -74316,6 +75072,7 @@ impl Database {
     /// Full constructor with an internal accountant. Test-only outside this
     /// crate; production callers use the numeric startup-limit functions.
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_with_config(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -74327,6 +75084,7 @@ impl Database {
 
     sync_test_seam! {
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn open_with_config_and_disk_limit(
         path: impl AsRef<Path>,
         plugin: Arc<dyn DatabasePlugin>,
@@ -74386,6 +75144,7 @@ impl Database {
     /// Sample at a quiescent boundary. Identity scratch belongs to this
     /// reporting operation's declared reader child and never to its writer.
     #[allow(dead_code)] // Ordinary core, available to memory ownership measurement callers.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_memory_ownership_receipt(&self) -> Result<VectorMemoryOwnershipReceipt> {
         let sampled = self.vector_store.memory_ownership_snapshot_for_test();
         let (source_metadata, reader_source_metadata) = {
@@ -74906,6 +75665,7 @@ impl Database {
             == Arc::as_ptr(&self.vector_store) as usize
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn register_vector_index_for_column(
         &self,
         table: &str,
@@ -74924,6 +75684,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn register_vector_index_for_column_with_identity(
         &self,
         table: &str,
@@ -74946,6 +75707,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_vector_layout_policy_for_ddl(
         &self,
         index: &VectorIndexRef,
@@ -74978,6 +75740,7 @@ impl Database {
         self.reconcile_maintenance_thread();
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_vector_index_rename<'a>(
         &'a self,
         old: &VectorIndexRef,
@@ -74987,6 +75750,7 @@ impl Database {
         self.vector_store.prepare_index_rename(old, new, owner)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_vector_index_replacement_rename<'a>(
         &'a self,
         old: &VectorIndexRef,
@@ -75003,6 +75767,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_vector_index_rename_for_ddl(
         &self,
         table: &str,
@@ -75034,6 +75799,7 @@ impl Database {
         self.reconcile_maintenance_thread();
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn drain_vector_index_maintenance_for_ddl(
         &self,
         index: &VectorIndexRef,
@@ -75058,6 +75824,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn drain_vector_table_maintenance_for_ddl(
         &self,
         table: &str,
@@ -75084,6 +75851,7 @@ impl Database {
         self.vector_store.maybe_pause_ddl_for_test(index);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn vector_inspection_infos(
         &self,
         target: Option<&VectorIndexRef>,
@@ -75152,6 +75920,7 @@ impl Database {
             .map(StartupState::Image)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn account_loaded_state(&self) -> Result<()> {
         if let Some(startup) = self.startup_state() {
             let mut identities = Vec::new();
@@ -75283,6 +76052,7 @@ impl Database {
     /// release of the version returns -- and is returned here so the caller
     /// can hand it back if its statement fails afterwards. A refusal leaves
     /// nothing charged.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn admit_retained_row_bytes(
         &self,
         table: &str,
@@ -75327,6 +76097,7 @@ impl Database {
         Ok(admitted)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn admit_retained_row_owned(
         &self,
         table: &str,
@@ -75428,6 +76199,7 @@ impl Database {
     /// abort at teardown instead of rolling that transaction back.
     /// Own the private abandoned payload ahead of its existing refund. Both
     /// normal errors and unwinding destroy every write-set carrier first.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn dispose_private_abandoned_write_set(&self, ws: WriteSet,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission) -> Result<()> {
         struct Refund<'a> { accountant: &'a crate::memory_accounting::AccountantHandle, bytes: usize }
@@ -75451,6 +76223,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn release_insert_allocations(
         &self,
         ws: &contextdb_tx::WriteSet,
@@ -75520,6 +76293,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn delete_release_bytes_for_write_set(
         &self,
         ws: &contextdb_tx::WriteSet,
@@ -75603,6 +76377,7 @@ impl Database {
         for bytes in &bytes.vectors { self.finalization.accountant.release(*bytes); }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn find_vector_by_index_and_row(
         &self,
         index: &VectorIndexRef,
@@ -75639,6 +76414,7 @@ impl Database {
             })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn write_set_checkpoint(&self, tx: TxId) -> Result<WriteSetCheckpoint<'_>> {
         if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
             return handle.with_host(|host| self.write_set_checkpoint_owned(host, tx));
@@ -75732,6 +76508,7 @@ impl Database {
     /// No Database open constructs this host. The existing operation read gate
     /// prevents close, not concurrent same-tx access: protected paired close
     /// now retains both locks; activation still needs complete producer migrations.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn write_set_checkpoint_owned<'a>(
         &'a self,
         host: &'a EngineDatabaseTransactions,
@@ -75757,6 +76534,7 @@ impl Database {
         Ok(checkpoint)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn write_set_counts(&self, tx: TxId) -> Result<WriteSetCounts> {
         self.tx_mgr.with_read(tx, |ws| WriteSetCounts {
             relational_inserts: ws.relational_inserts.len(),
@@ -75771,6 +76549,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn publish_owned_metadata(
         &self, tx: TxId,
         prepare: impl FnOnce(&EngineMetadataJournal) -> Result<PreparedMetadataMutation>,
@@ -75792,6 +76571,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_owned_metadata(&self, tx: TxId, batch: AdmittedMetadataBatch) -> Result<()> {
         self.publish_owned_metadata(tx, |journal| journal.prepare_metadata_append(tx, batch))
     }
@@ -75800,6 +76580,7 @@ impl Database {
     // stale-conditional-UPDATE silent no-ops from explicit row-guard atomic
     // rollbacks. Internal pub(crate) helper; struct refactor is overkill.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn record_conditional_update_guard(
         &self,
         tx: TxId,
@@ -75848,6 +76629,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn record_sync_lineage_guard(
         &self,
         tx: TxId,
@@ -75887,6 +76669,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn record_upsert_intent(
         &self,
         tx: TxId,
@@ -75956,6 +76739,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn restore_write_set_checkpoint(
         &self,
         tx: TxId,
@@ -75972,6 +76756,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn restore_legacy_write_set_checkpoint(
         &self,
         tx: TxId,
@@ -76081,6 +76866,7 @@ impl Database {
 
     /// A child of this store's already declared reader limit. Cloned views
     /// share the parent total, while each operation has separate charges.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn declared_reader_memory(
         &self,
     ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
@@ -76119,6 +76905,7 @@ impl Database {
     /// a pending unit back to push it. It is engine working memory, so the
     /// writer budget (MEMORY_LIMIT) funds it, never a caller's statement
     /// read limit.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn engine_sync_read_memory(
         &self,
     ) -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
@@ -76295,6 +77082,7 @@ impl Database {
         &self.relational_store
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn allocate_ddl_lsn<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(Lsn) -> Result<R>,
@@ -76311,6 +77099,7 @@ impl Database {
         committed
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn allocate_ddl_lsn_maybe<F, R>(&self, f: F) -> Result<Option<R>>
     where
         F: FnOnce(Lsn) -> Result<Option<R>>,
@@ -76330,6 +77119,7 @@ impl Database {
     /// Standalone durable metadata writes publish their successor before the
     /// ordinary commit guard ends. A previously captured reader root remains
     /// valid; a later scope captures this newly committed root.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn publish_direct_metadata<R>(&self, write: impl FnOnce() -> Result<R>) -> Result<R> {
         publish_direct_metadata(&self.tx_mgr, write)
     }
@@ -76341,6 +77131,7 @@ impl Database {
         self.tx_mgr.with_commit_lock(f)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn log_alter_table_ddl(
         &self,
         name: &str,
@@ -76365,6 +77156,7 @@ impl Database {
 
     /// Persist a replayed ALTER's result and log it with the author's own
     /// rename and drop markers, so the relayed DDL says what the author did.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_table_meta_rows_vectors_and_log_alter_table_ddl_with_markers(
         &self,
         name: &str,
@@ -76461,6 +77253,7 @@ impl Database {
     /// before its durable half runs. A larger projection owns its reservation
     /// after publication; a smaller projection releases only after the old
     /// in-memory image has actually been swapped out.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_local_table_projection_memory(
         &self,
         name: &str,
@@ -76531,6 +77324,7 @@ impl Database {
 
     /// Publish an already validated, local-autocommit EF_SEARCH declaration.
     /// No row, posting or historical body changes ownership on this path.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn publish_local_ef_search_metadata(
         &self,
         name: &str,
@@ -76668,6 +77462,7 @@ impl Database {
     ///
     /// Reserve BEFORE the change and `commit_after_swap` after it, so a
     /// refusal is the ordinary typed one and leaves the table untouched.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_index_set_change_memory(
         &self,
         table: &str,
@@ -76722,6 +77517,7 @@ impl Database {
     /// visible in memory.  The caller supplies the complete same-LSN DDL
     /// sequence, including any CASCADEd index drops, so provenance sidecars
     /// and Redb's indexed DDL keys share exactly one ordinal space.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_local_table_projection_and_ddl(
         &self,
         name: &str,
@@ -76763,6 +77559,7 @@ impl Database {
         Ok(memory_history)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_local_index_projection(
         &self,
         meta: &TableMeta,
@@ -76778,6 +77575,7 @@ impl Database {
     /// Publish the already-durable local table projection.  This is the sole
     /// executor path that changes in-memory table metadata/rows/indexes after
     /// the matching DDL and provenance have committed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn publish_local_table_projection_and_ddl(
         &self,
         name: &str,
@@ -76809,6 +77607,7 @@ impl Database {
         meta
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist_table_meta_rows_vectors_and_append_alter_table_ddl(
         &self,
         name: &str,
@@ -76872,6 +77671,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_memory_ddl_append(&self, lsn: Lsn, ddl: &[DdlChange],
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Option<PreparedSchemaHistory>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
@@ -76882,6 +77682,7 @@ impl Database {
         self.prepare_memory_schema_history(lsn, start, ddl, &sidecars)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_ddl_change(
         &self,
         lsn: Lsn,
@@ -76916,6 +77717,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn log_create_index_ddl(
         &self,
         table: &str,
@@ -76934,6 +77736,7 @@ impl Database {
         self.append_ddl_change(lsn, change, read_memory.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn log_drop_index_ddl(
         &self,
         table: &str,
@@ -76950,6 +77753,7 @@ impl Database {
         self.append_ddl_change(lsn, change, read_memory.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_table_meta(&self, name: &str, meta: &TableMeta) -> Result<()> {
         if let Some(persistence) = &self.persistence {
             self.publish_direct_metadata(|| persistence.flush_table_meta(name, meta))?;
@@ -76957,6 +77761,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn set_memory_limit(&self, limit: Option<usize>) -> Result<()> {
         let _operation = self.open_operation()?;
         let _update = self.limit_update_lock.lock();
@@ -77040,6 +77845,7 @@ impl Database {
         self.finalization.accountant.set_budget(limit)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn set_disk_limit(&self, limit: Option<u64>) -> Result<()> {
         let _operation = self.open_operation()?;
         let _update = self.limit_update_lock.lock();
@@ -77108,6 +77914,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn content_size_totals(
         &self,
         memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -77152,6 +77959,7 @@ impl Database {
             .flatten()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn check_disk_budget(&self, operation: &str) -> Result<()> {
         let _operation = self.open_operation()?;
         let Some(limit) = self.disk_limit() else {
@@ -77189,6 +77997,7 @@ impl Database {
         tenant_id.config_key(&format!("{prefix}{peer_node_id}"))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persisted_memory_schema_sync_holdback(
         &self,
         tenant_id: &TenantId,
@@ -77219,6 +78028,7 @@ impl Database {
         REFUSE_MEMORY_HOLDBACK_WRITE.with(|flag| flag.set(refuse));
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_memory_schema_sync_holdback(
         &self,
         tenant_id: &TenantId,
@@ -77256,6 +78066,7 @@ impl Database {
     /// memory, per peer. Empty is the ordinary state; an entry means the
     /// operator's declared limit could not hold a whole arriving unit and that
     /// table's schema is behind its author until the limit allows it.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn memory_held_received_schema_units(
         &self,
         tenant_id: &TenantId,
@@ -77358,6 +78169,7 @@ impl Database {
     /// re-delivered. The hold is what makes that state visible and durable, and
     /// what keeps LATER units for the SAME table from installing out of author
     /// order while this one waits. Units for every other table are untouched.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn hold_back_received_unit_for_memory(
         &self,
         ddl: &[DdlChange],
@@ -77409,6 +78221,7 @@ impl Database {
     /// an EARLIER author position, so the held table's schema cannot skip ahead
     /// of the unit that is waiting. The unit AT the held position is the retry
     /// and goes through.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn refuse_received_unit_behind_a_memory_holdback(
         &self,
         ddl: &[DdlChange],
@@ -77451,6 +78264,7 @@ impl Database {
     }
 
     /// Drop the memory hold on every table a unit has now installed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn release_memory_schema_holdback_for_applied_unit(
         &self,
         tables: &BTreeSet<String>,
@@ -77479,6 +78293,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persisted_outbound_schema_sync_holdback(
         &self,
         tenant_id: &TenantId,
@@ -77505,6 +78320,7 @@ impl Database {
             .cloned())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_outbound_schema_sync_holdback_while_authoritative(
         &self,
         tenant_id: &TenantId,
@@ -77537,6 +78353,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persisted_inbound_schema_sync_holdbacks(
         &self,
         tenant_id: &TenantId,
@@ -77571,6 +78388,7 @@ impl Database {
         Ok(states)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_inbound_schema_sync_holdback(
         &self,
         tenant_id: &TenantId,
@@ -77604,11 +78422,13 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn persisted_sync_watermarks(&self, tenant_id: &TenantId) -> Result<(Lsn, Lsn)> {
         let read_memory = self.declared_reader_memory()?;
         self.persisted_sync_watermarks_with_read_memory(tenant_id, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persisted_sync_watermarks_with_read_memory(
         &self,
         tenant_id: &TenantId,
@@ -77648,6 +78468,7 @@ impl Database {
     }
 
     sync_test_seam! {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist_sync_push_watermark(&self, tenant_id: &TenantId, watermark: Lsn) -> Result<()> {
         let _operation = self.open_operation()?;
         if let Some(persistence) = &self.persistence {
@@ -77684,6 +78505,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_sync_push_watermark_while_authoritative(
         &self,
         tenant_id: &TenantId,
@@ -77712,6 +78534,7 @@ impl Database {
     /// process restart; memory retains it only for reconstructed or scoped
     /// clients sharing this database life, so they cannot resend the same
     /// stampless rows before that pull completes.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn persisted_sync_pending_push_confirmation(
         &self,
         tenant_id: &TenantId,
@@ -77720,6 +78543,7 @@ impl Database {
         self.persisted_sync_pending_push_confirmation_with_read_memory(tenant_id, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persisted_sync_pending_push_confirmation_with_read_memory(
         &self,
         tenant_id: &TenantId,
@@ -77745,6 +78569,7 @@ impl Database {
     }
 
     sync_test_seam! {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist_sync_pending_push_confirmation(
         &self,
         tenant_id: &TenantId,
@@ -77799,6 +78624,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_sync_pending_push_confirmation_while_authoritative(
         &self,
         tenant_id: &TenantId,
@@ -77837,6 +78663,7 @@ impl Database {
     }
 
     sync_test_seam! {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist_sync_pull_watermark(&self, tenant_id: &TenantId, watermark: Lsn) -> Result<()> {
         let _operation = self.open_operation()?;
         if let Some(persistence) = &self.persistence {
@@ -77854,6 +78681,7 @@ impl Database {
     }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_sync_pull_watermark_while_authoritative(
         &self,
         tenant_id: &TenantId,
@@ -77882,6 +78710,7 @@ impl Database {
     /// Memory retains the same atomic pair only for reconstructed or scoped
     /// clients sharing this database life; `None` means no combined pull cursor
     /// has yet been recorded for this database life.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn persisted_sync_pull_cursor(
         &self,
         tenant_id: &TenantId,
@@ -77890,6 +78719,7 @@ impl Database {
         self.persisted_sync_pull_cursor_with_read_memory(tenant_id, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persisted_sync_pull_cursor_with_read_memory(
         &self,
         tenant_id: &TenantId,
@@ -77948,6 +78778,7 @@ impl Database {
     }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_sync_pull_cursor_while_authoritative(
         &self,
         tenant_id: &TenantId,
@@ -77972,6 +78803,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn existing_sync_incarnation(
         &self,
         tenant: &TenantId,
@@ -78007,11 +78839,13 @@ impl Database {
     /// in-memory open is a fresh life. The edge stamps it on every push and
     /// status exchange so the hub can key its per-edge record by
     /// `(node_id, incarnation)`.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_incarnation(&self, tenant_id: &TenantId) -> Result<Incarnation> {
         let read_memory = self.declared_reader_memory()?;
         self.sync_incarnation_with_read_memory(tenant_id, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn sync_incarnation_with_read_memory(&self, tenant_id: &TenantId,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<Incarnation> {
@@ -78086,6 +78920,7 @@ impl Database {
     /// it with the artifact at the snapshot point, exactly like the tenant sync
     /// watermark keys. In-memory databases retain this value for the life of
     /// the handle; `None` means no push has been applied for the tenant.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn persisted_sync_applied_push_watermark(
         &self,
         tenant_id: &TenantId,
@@ -78094,6 +78929,7 @@ impl Database {
         self.persisted_sync_applied_push_watermark_with_read_memory(tenant_id, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persisted_sync_applied_push_watermark_with_read_memory(
         &self,
         tenant_id: &TenantId,
@@ -78122,6 +78958,7 @@ impl Database {
     /// Persist the per-tenant applied-push watermark. Callers enforce
     /// monotonic advancement; this only writes the config value or the
     /// in-memory equivalent for ephemeral databases.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persist_sync_applied_push_watermark(
         &self,
         tenant_id: &TenantId,
@@ -78203,6 +79040,7 @@ impl Database {
     /// the same way as the per-tenant record (a config value, carried by
     /// `export_snapshot`; in-memory for ephemeral databases). `None` means this
     /// hub has applied nothing from that life of that edge.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn persisted_sync_applied_push_watermark_for_node_incarnation(
         &self,
         tenant_id: &TenantId,
@@ -78218,6 +79056,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persisted_sync_applied_push_watermark_for_node_incarnation_with_read_memory(
         &self,
         tenant_id: &TenantId,
@@ -78250,6 +79089,7 @@ impl Database {
     /// applied nothing from the edge. The delivery-confirmation path never reads
     /// this aggregate; it reads the exact `(node, incarnation)` record above so a
     /// rebuilt life cannot be vouched for by an older one.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn persisted_sync_applied_push_watermark_for_node(
         &self,
         tenant_id: &TenantId,
@@ -78278,11 +79118,13 @@ impl Database {
 
     /// Return ordered change occurrences after the watermark from one captured root.
     /// Durable integrity and memory-admission refusals reach the caller unchanged.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn change_log_since(&self, since_lsn: Lsn) -> Result<Vec<ChangeLogEntry>> {
         let read_memory = self.declared_reader_memory()?;
         self.change_log_since_with_read_memory(since_lsn, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn change_log_since_with_read_memory(
         &self,
         since_lsn: Lsn,
@@ -78330,6 +79172,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn gated_change_log_since(
         &self,
         since_lsn: Lsn,
@@ -78413,6 +79256,7 @@ impl Database {
         Ok(entries)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn change_replay_since_unlocked(
         &self,
         since_lsn: Lsn,
@@ -78441,6 +79285,7 @@ impl Database {
             .map(|entries| writer_read::ChangeReplay::Resident(entries.into_iter()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn change_log_since_unlocked(
         &self,
         since_lsn: Lsn,
@@ -78516,11 +79361,13 @@ impl Database {
 
     /// Returns declaration history, propagating durable read and admission failures.
     /// Callers without administrative access receive an empty history.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn ddl_log_since(&self, since_lsn: Lsn) -> Result<Vec<DdlChange>> {
         let read_memory = self.declared_reader_memory()?;
         self.ddl_log_since_with_read_memory(since_lsn, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ddl_log_since_with_read_memory(
         &self,
         since_lsn: Lsn,
@@ -78541,6 +79388,7 @@ impl Database {
     /// must not compare those LSNs with this database's history. A DROP leaves
     /// the last declaration intact here: the local policy still decides
     /// whether remote work for that former generation may be applied.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn declared_directions_for_tables<'a>(
         &self,
         tables: impl Iterator<Item = &'a str>,
@@ -78569,6 +79417,7 @@ impl Database {
         Ok(directions)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_sync_direction_history_for_changes(
         &self,
         changes: &ChangeSet,
@@ -78604,6 +79453,7 @@ impl Database {
         Ok(history)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn latest_declared_table_directions(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -78650,6 +79500,7 @@ impl Database {
     /// Reconstructs the durable declaration that governed every table
     /// generation. Live metadata is deliberately not consulted: a DROP removes
     /// it, while outbound history still needs the dropped generation's policy.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn try_sync_direction_history(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -78699,6 +79550,7 @@ impl Database {
             .expect("fixture declaration history")
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn checked_ddl_entries_since(
         &self,
         since: Lsn,
@@ -78709,6 +79561,7 @@ impl Database {
         self.ddl_log_entries_since_unlocked(since, read_memory.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_ddl_entries_since(
         &self,
         since: Lsn,
@@ -78744,6 +79597,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ddl_log_since_unlocked(
         &self,
         since_lsn: Lsn,
@@ -78758,6 +79612,7 @@ impl Database {
             .collect())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ddl_log_entries_since_unlocked(
         &self,
         since_lsn: Lsn,
@@ -78806,6 +79661,7 @@ impl Database {
     /// bind exactly this authored form.
     /// When the in-memory log no longer covers it (a persisted-state
     /// extraction), the durable log answers.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn raw_ddl_log_occurrence(
         &self,
         lsn: Lsn,
@@ -78956,6 +79812,7 @@ impl Database {
     }
 
     #[allow(dead_code)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn full_state_snapshot(
         &self,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -79107,6 +79964,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_authoritative_row_versions(
         &self,
         mut visit: impl FnMut(&str, &VersionedRow) -> Result<()>,
@@ -79141,6 +79999,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_authoritative_live_rows_for_outbound(
         &self,
         mut visit: impl FnMut(&str, &VersionedRow) -> Result<()>,
@@ -79202,6 +80061,7 @@ impl Database {
     /// position: when the durable schema log still projects to the snapshot's
     /// schema, it keeps its authored order and provenance instead of the
     /// rendered declarations.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persisted_state_from_snapshot(
         &self,
         changes: ChangeSet,
@@ -79222,6 +80082,7 @@ impl Database {
     /// growth of the reconstructed schema is admitted before the statement
     /// is applied with the checkpoint between statements, and the canonical
     /// copies the comparison makes are admitted before they exist.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persisted_state_from_snapshot_projected(
         &self,
         mut changes: ChangeSet,
@@ -79297,6 +80158,7 @@ impl Database {
         Ok((changes, source))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persisted_state_since_with_ddl_provenance(
         &self,
         since_lsn: Lsn,
@@ -79313,6 +80175,7 @@ impl Database {
     /// `through` wait for the next page. With `row_vectors`, each selected
     /// row's vectors come from that row's own values rather than from a copy
     /// of the whole vector store, so a page's memory follows the page.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persisted_state_since_through(
         &self,
         since_lsn: Lsn,
@@ -79581,6 +80444,7 @@ impl Database {
     /// it the extraction refuses, naming the table, exactly as
     /// [`Self::received_schema_as_authored`] does; it never serves received
     /// schema unattributed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn refuse_unattributed_received_history(
         &self,
         since_lsn: Lsn,
@@ -79621,6 +80485,7 @@ impl Database {
     /// history no longer reproduces the current schema, a received
     /// declaration's occurrence is gone, or its author's signed identity is
     /// missing -- it refuses, naming the table, rather than fabricate one.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_schema_as_authored(
         &self,
         since_lsn: Lsn,
@@ -79738,6 +80603,7 @@ impl Database {
     /// and held nothing, so any admission between here and the unit's first
     /// item spent the room the unit had just been told it had -- and the unit,
     /// once admitted, installed anyway.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preflight_sync_apply_memory(
         &self,
         changes: &ChangeSet,
@@ -79872,6 +80738,7 @@ impl Database {
             .map(Some)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn projected_sync_table_meta(
         &self,
         changes: &ChangeSet,
@@ -80344,6 +81211,7 @@ impl Database {
         meta.indexes.extend(user_indexes);
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn projected_sync_ddl_unit_bytes(
         &self,
         ddl: &[DdlChange],
@@ -80531,6 +81399,7 @@ impl Database {
         new_bytes - old_bytes + index_structures
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preflight_sync_ddl_mixed_apply(
         &self,
         changes: &ChangeSet,
@@ -80645,6 +81514,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preflight_sync_trigger_callback_required(
         &self,
         changes: &ChangeSet,
@@ -80654,6 +81524,7 @@ impl Database {
         Ok(self.sync_triggers_requiring_ready_gate(&projected_trigger_declarations))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preflight_sync_trigger_projection(
         &self,
         changes: &ChangeSet,
@@ -80677,6 +81548,7 @@ impl Database {
         Ok((side_metadata_charge, projected_trigger_declarations))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_projected_foreign_key_schema(
         projected: &HashMap<String, TableMeta>,
     ) -> Result<()> {
@@ -80692,6 +81564,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replace_table_meta_and_refresh_auto_indexes(
         &self,
         table: &str,
@@ -80761,6 +81634,7 @@ impl Database {
         Ok(new_meta)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_sync_table_ddl_against_projected_meta(
         projected: &HashMap<String, TableMeta>,
         change: &DdlChange,
@@ -80870,6 +81744,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_sync_alter_table_shape_ddl(
         projected: &HashMap<String, TableMeta>,
         name: &str,
@@ -80940,6 +81815,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_sync_table_shape_ddl(
         projected: &HashMap<String, TableMeta>,
         name: &str,
@@ -80993,6 +81869,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preflight_sync_rows_against_projected_schema(
         &self,
         rows: &[RowChange],
@@ -81086,6 +81963,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preflight_sync_vectors_against_projected_schema(
         &self,
         vectors: &[VectorChange],
@@ -81123,6 +82001,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preflight_sync_foreign_keys_against_lsn_prefix(
         &self,
         rows: &[RowChange],
@@ -81488,6 +82367,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_composite_fk_violation_for_values(
         &self,
         tx: TxId,
@@ -81612,6 +82492,7 @@ impl Database {
         policies.default
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_incoming_values_allowed_for_access(
         &self,
         table: &str,
@@ -81637,6 +82518,7 @@ impl Database {
         self.read_allowed_for_row(table, meta, &row, self.snapshot(), read_memory.clone())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_row_applies_over_committed(
         &self,
         row: &RowChange,
@@ -81766,6 +82648,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn projected_sync_incoming_values_for_applied_rows(
         &self,
         rows: &[RowChange],
@@ -81979,6 +82862,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_insert_constraint_error_for_values(
         &self,
         table: &str,
@@ -82000,6 +82884,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_projected_row_constraint_error_for_values(
         &self,
         table: &str,
@@ -82102,6 +82987,7 @@ impl Database {
         Ok(None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_committed_unique_conflict_for_values(
         &self,
         table: &str,
@@ -82158,6 +83044,7 @@ impl Database {
         Ok(None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_upsert_constraint_error_for_values(
         &self,
         table: &str,
@@ -82233,6 +83120,7 @@ impl Database {
         Ok(None)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retain_projected_rows_with_valid_composite_fks(
         &self,
         projected_rows: &mut Vec<ProjectedSyncRow>,
@@ -82267,6 +83155,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn projected_sync_parent_keys(
         &self,
         rows: Vec<ProjectedSyncRow>,
@@ -82354,6 +83243,7 @@ impl Database {
         Ok((incoming_values, SyncParentKeyProjectionOwner::new(owner)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn projected_composite_fk_violation_for_values(
         &self,
         child_meta: &TableMeta,
@@ -82438,6 +83328,7 @@ impl Database {
     /// name, exactly as a local drop removes them; those types join the graph
     /// image the unit replaces, so the staged drop removes the links and the
     /// durable install retires them.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_link_types_of_dropped_link_tables(
         &self, ddl: &[DdlChange], live_tables: &HashMap<String,TableMeta>,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -82501,6 +83392,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preflight_sync_edge_cycles(
         &self,
         changes: &ChangeSet,
@@ -82564,6 +83456,7 @@ impl Database {
     }
 
     /// Extracts changes from this database since the given LSN.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn changes_since_base(
         &self,
         since_lsn: Lsn,
@@ -82583,6 +83476,7 @@ impl Database {
     /// [`Self::changes_since_base`] under a history answer's bounds: its
     /// checkpoint runs between records and every copy the extraction keeps or
     /// builds is admitted before it is made.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn changes_since_base_projected(
         &self,
         since_lsn: Lsn,
@@ -83467,6 +84361,7 @@ impl Database {
         clippy::too_many_arguments,
         reason = "each source and output of one page stream is a distinct borrow"
     )]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn take_paged_side_groups(
         &self,
         ddl_source: &mut writer_read::DdlReplay,
@@ -83572,6 +84467,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn persisted_state_projected(
         &self,
         since_lsn: Lsn,
@@ -83621,6 +84517,7 @@ impl Database {
     /// as it is visited, and each copy the snapshot keeps -- a row's values,
     /// its vectors, a link, the rendered schema -- is admitted before it is
     /// made, with the projection's checkpoint between rows.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn retained_state_snapshot(
         &self,
         source: &crate::persistence::RetainedReadSource,
@@ -83789,6 +84686,7 @@ impl Database {
     /// change set and, when asked for, each row's arrival. Unlike the
     /// inspection helper it reports why it could not answer instead of
     /// answering empty.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn projected_changes_with_arrivals(
         &self,
         projection: &ChangeProjection<'_>,
@@ -83833,6 +84731,7 @@ impl Database {
     /// source state, rather than replaying historical parent versions, so an
     /// update made after a child was first committed cannot make the receiver
     /// observe the stale parent value.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn ordinary_dependency_complete_outbound_units(
         &self,
         changes: ChangeSet,
@@ -84195,6 +85094,7 @@ impl Database {
     /// referenced parent was absent at the caller's confirmed source frontier.
     /// This is an indexed current-state probe plus an indexed historical
     /// existence probe; it deliberately never replays the source history.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn dependency_row_has_unresolved_parent_at_frontier(
         &self,
         row: &RowChange,
@@ -84293,6 +85193,7 @@ impl Database {
         Ok(false)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn current_sync_row_by_columns(
         &self,
         table: &str,
@@ -84328,6 +85229,7 @@ impl Database {
             }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn validate_dependency_complete_unit(&self, changes: &ChangeSet) -> Result<()> {
         if !changes.ddl.is_empty() {
             changes
@@ -84414,12 +85316,14 @@ impl Database {
 
     /// Extract ordered changes and preserve every materialization refusal.
     /// The caller retains the owner through consumption and encoding.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn changes_since(&self, since_lsn: Lsn) -> Result<ChangeSet> {
         let read_memory = self.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         self.changes_since_with_read_memory(since_lsn, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn changes_since_with_read_memory(
         &self,
         since_lsn: Lsn,
@@ -84441,6 +85345,7 @@ impl Database {
         })()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn changes_since_under_schema_gate(
         &self,
         since_lsn: Lsn,
@@ -84466,6 +85371,7 @@ impl Database {
     /// change-log walk, so this covers every one of its internal paths
     /// (change-log replay AND the post-restart persisted-state fallback)
     /// uniformly, at the cost of one extra lookup per row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn changes_since_with_arrivals(
         &self,
         since_lsn: Lsn,
@@ -84498,6 +85404,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn changes_since_with_arrivals_with_read_memory(
         &self,
         since_lsn: Lsn,
@@ -84566,6 +85473,7 @@ impl Database {
     /// `page`, when given, is the page budget in bytes and the cell that
     /// receives the last complete source-LSN group served when the selection
     /// stopped short of the end of history (`None` when it covered everything).
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn checked_changes_since_with_arrivals(
         &self,
         since_lsn: Lsn,
@@ -84658,6 +85566,7 @@ impl Database {
         })()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn sync_arrivals_for_changes(
         &self,
         changes: &ChangeSet,
@@ -84683,6 +85592,7 @@ impl Database {
     }
 
     /// Build the arrival sidecar with a checkpoint and admission per row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_arrivals_for_changes_within(
         &self,
         changes: &ChangeSet,
@@ -84753,6 +85663,7 @@ impl Database {
         Ok(arrivals)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn ddl_provenance_sidecar_for_source_entry(
         &self,
         source: &DdlProvenanceSource,
@@ -84786,6 +85697,7 @@ impl Database {
     /// whether an occurrence may carry new evidence must be able to leave an
     /// occurrence alone, while a caller validating existing evidence still
     /// treats absence as corrupt provenance.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn recorded_ddl_generation_sidecar(
         &self,
         lsn: Lsn,
@@ -84811,6 +85723,7 @@ impl Database {
     /// Return the durable raw DDL history rather than the ephemeral in-memory
     /// log when this database has persistence. A forced log gap must not turn
     /// old received schema into unprovable synthetic output after a move.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_ddl_history_for_provenance(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -84851,6 +85764,7 @@ impl Database {
     /// group must be marked and each marker must rebind to that exact local
     /// DDL, ordinal, table, and generation. A partial or mismatched group is
     /// corrupt provenance, so outbound work stops rather than guessing.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_ddl_arrival_marks(
         &self,
         source: &DdlProvenanceSource,
@@ -84928,6 +85842,7 @@ impl Database {
     /// A synthetic snapshot carries replay positions rather than local log
     /// positions, so it holds no superseded occurrences: its own evidence is
     /// the received-arrival proof against the destination frontier.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn superseded_ddl_occurrence_marks(
         &self,
         source: &DdlProvenanceSource,
@@ -84998,6 +85913,7 @@ impl Database {
     /// frontier. Newer received DDL is suppressed; newer unmarked DDL fails
     /// closed because absence of a received marker is not positive local-origin
     /// evidence.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn filter_outbound_received_ddl(
         &self,
         mut changes: ChangeSet,
@@ -85051,6 +85967,7 @@ impl Database {
     /// instead of trusting whichever peer delivered it. Received schema keeps
     /// the author's stored signature, or stays explicitly unattested when it
     /// arrived through the unattested apply door.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn outbound_ddl_provenance(
         &self,
         changes: &ChangeSet,
@@ -85194,6 +86111,7 @@ impl Database {
     /// deterministic: re-emitting the same record to another peer, or after a
     /// restart, reproduces the identical signature.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn signed_local_ddl_author(
         tenant_id: &TenantId,
         local_node_id: &str,
@@ -85327,6 +86245,7 @@ impl Database {
     /// reached this transaction's accepted path. The config write shares the
     /// row commit, so a crash cannot expose a winner without its evidence (or
     /// evidence for a row whose mutation rolled back).
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_accepted_sync_row_authors(
         &self,
         tx: TxId,
@@ -85373,6 +86292,7 @@ impl Database {
             .collect())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn accepted_sync_row_author(
         &self,
         table: &str,
@@ -85462,6 +86382,7 @@ impl Database {
         Self::terminal_refusal_marker_context_prefix(context) + "marker."
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn terminal_refusal_marker_is_current(
         &self,
         table: &str,
@@ -85508,6 +86429,7 @@ impl Database {
             .is_some_and(|(lsn, row_id)| lsn == marker_lsn && row_id == marker_row_id))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn terminal_refusal_marker_matches(
         &self,
         context: &TerminalRefusalPullContext,
@@ -85558,6 +86480,7 @@ impl Database {
         Ok(current_matches)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn has_terminal_refusal_markers(
         &self,
         context: &TerminalRefusalPullContext,
@@ -85639,6 +86562,7 @@ impl Database {
         Ok(valid)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn terminal_refusal_scan_state(
         &self,
         context: &TerminalRefusalPullContext,
@@ -85665,6 +86589,7 @@ impl Database {
         Ok(state)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_terminal_refusal_scan_state(
         &self,
         context: &TerminalRefusalPullContext,
@@ -85712,6 +86637,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn clear_terminal_refusal_scan_state(
         &self,
         context: &TerminalRefusalPullContext,
@@ -86249,6 +87175,7 @@ impl Database {
     /// root its writer last published. Reads that consume an index's physical
     /// postings refuse such an index; a read that asks only the canonical
     /// tree still answers and records it here. Repair: recreate the store.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn index_root_damage(&self) -> Result<Vec<(String, String)>> {
         let _operation = self.open_operation()?;
         let Some(persistence) = self.persistence.as_ref() else {
@@ -86271,6 +87198,7 @@ impl Database {
 
     /// Indexes a canonical-only read of the store at `path`, in this process,
     /// found disagreeing with their writer's published root.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn observed_index_root_damage(path: impl AsRef<Path>) -> Result<Vec<(String, String)>> {
         let path = canonical_database_path(path.as_ref())?;
         Ok(crate::persistence::history_root_witness::observed_index_root_damage(&path))
@@ -86390,6 +87318,7 @@ impl Database {
     /// [`Error::CallbackActiveCrossThread`]. Same-DB cross-thread writers wait
     /// and proceed; unrelated cross-DB writers proceed independently;
     /// same-thread callback reentry returns [`Error::CallbackReentry`].
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn complete_initialization(&self) -> Result<()> {
         let _operation = self.open_operation()?;
         let declarations = self.trigger.declarations.lock();
@@ -86498,6 +87427,7 @@ impl Database {
     /// fire_a.join().unwrap();
     /// writer_b.join().unwrap();
     /// ```
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_transactional_trigger_callback<F>(&self, name: &str, callback: F) -> Result<()>
     where
         F: Fn(&Database, &TriggerContext) -> Result<()> + Send + Sync + 'static,
@@ -86526,6 +87456,7 @@ impl Database {
     /// This callback runs before durable commit and is never an external
     /// notification hook. Same-database writers wait while it runs; same-thread
     /// reentry is refused and the bounded wait can return a callback-active error.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn register_trigger_callback<F>(&self, name: &str, callback: F) -> Result<()>
     where
         F: Fn(&Database, &TriggerContext) -> Result<()> + Send + Sync + 'static,
@@ -86598,6 +87529,7 @@ impl Database {
     ///
     /// Deadlock-guard timeout diagnostics are emitted via `tracing::warn!`
     /// rather than this audit history. See [`Error::CallbackActiveCrossThread`].
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn trigger_audit_history(
         &self,
         filter: TriggerAuditFilter,
@@ -86666,6 +87598,7 @@ impl Database {
     /// hub-adoption, which would let a pushed value displace the value already
     /// held. Every production pull states its role through the sync client's
     /// own entry point.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_changes(
         &self,
         changes: ChangeSet,
@@ -86676,6 +87609,7 @@ impl Database {
         self.apply_changes_with_read_memory(changes, policies, &mut vector_copy_owner, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_changes_with_read_memory(
         &self,
         changes: ChangeSet,
@@ -86832,6 +87766,7 @@ impl Database {
     /// value already here is the first-accepted one, so KEEP FIRST keeps it and
     /// the pushed value is refused, exactly as a receipted push would be.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_authenticated_received_changes_with_lineages_as_hub_push(
         &self,
         changes: ChangeSet,
@@ -86904,6 +87839,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_authenticated_received_changes_with_lineages_while_schema_publication_held(
         &self,
         changes: ChangeSet,
@@ -86937,6 +87873,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_authenticated_received_changes_with_lineages_impl(
         &self,
         changes: ChangeSet,
@@ -87078,6 +88015,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_authenticated_received_changes_with_outcome(
         &self,
         changes: ChangeSet,
@@ -87216,6 +88154,7 @@ impl Database {
         Ok(result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn apply_delivery_prepared(
         &self,
         changes: ChangeSet,
@@ -87261,6 +88200,7 @@ impl Database {
         Ok(result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_authenticated_received_plugin_output(
         expected: &ChangeSet,
         actual: &ChangeSet,
@@ -87293,6 +88233,7 @@ impl Database {
 
     // Use authenticated arrival provenance to distinguish this
     // node's own declaration from policy it merely adopted and relays.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn locally_declared_custody_policy(
         &self,
         table: &str,
@@ -87377,6 +88318,7 @@ impl Database {
     /// small per-occurrence generation records (each names its table) and
     /// decodes only those occurrences' log positions. Unrelated declarations
     /// -- other tables, event routes with large filters -- are never read.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_locally_declared_custody_policy(
         &self,
         root: &crate::persistence::WriterSnapshotHandle,
@@ -87480,6 +88422,7 @@ impl Database {
     /// table statement, and with what typed refusal. The caller refuses the
     /// statement's WHOLE authored transaction on a refusal: an authenticated
     /// transaction is never installed in part.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn arriving_statement_refusal(
         &self,
         change: &DdlChange,
@@ -87588,6 +88531,7 @@ impl Database {
     /// - a table that EXISTS here holds the later deliveries from the peer
     ///   that sent the refused transaction (`source`), until a transaction
     ///   from that peer restates the table in a form this node accepts.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_policy_plan(
         &self,
         changes: &ChangeSet,
@@ -87611,6 +88555,7 @@ impl Database {
     /// Apply attempts also hold schema units refused while reading policy
     /// state, before the staged door is reached. Keep policy previews pure
     /// and preserve non-memory refusals and successful planning unchanged.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_policy_plan_for_apply(
         &self,
         changes: &ChangeSet,
@@ -87651,6 +88596,7 @@ impl Database {
         planned
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_policy_plan_for_push(
         &self,
         changes: &ChangeSet,
@@ -87721,6 +88667,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_policy_plan_with_refusals(
         &self,
         changes: &ChangeSet,
@@ -87743,6 +88690,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn received_policy_plan_with_projection(
         &self,
         changes: &ChangeSet,
@@ -88189,6 +89137,7 @@ impl Database {
     /// Judge a pull unit against earlier units on the same page before schema
     /// generations or row provenance are projected. Reuse the apply planner,
     /// but retain its holds only in this page's temporary state.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn preflight_pull_unit_policy(
         &self,
         changes: ChangeSet,
@@ -88299,6 +89248,7 @@ impl Database {
     /// never had accepted here, so it is neither checked nor installed. A
     /// transaction in the same delivery that creates or restates the table is
     /// left to the apply's plan to judge, with its data.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn split_data_held_behind_refused_units(
         &self,
         mut changes: ChangeSet,
@@ -88445,6 +89395,7 @@ impl Database {
 
     /// Read only one bounded candidate batch. The encoded payload is admitted
     /// before decoding; audit history and other candidate facts are untouched.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn refused_schema_local_facts(
         &self,
         tenant: &TenantId,
@@ -88510,6 +89461,7 @@ impl Database {
 
     /// Commit positive facts and the next candidate position together. A
     /// crash may replay one request but cannot skip its unrecorded refusal.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_refused_schema_lookup_batch(
         &self,
         tenant: &TenantId,
@@ -88556,6 +89508,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_refused_schema_local_facts(
         &self,
         tenant: &TenantId,
@@ -88590,6 +89543,7 @@ impl Database {
     }
 
     /// Resume one edge's candidate pass after a reconstructed SyncClient.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn refused_schema_lookup_checkpoint(
         &self,
         tenant: &TenantId,
@@ -88611,6 +89565,7 @@ impl Database {
     }
 
     /// Replace or clear one checkpoint as a single durable config value.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn persist_refused_schema_lookup_checkpoint(
         &self,
         tenant: &TenantId,
@@ -88644,6 +89599,7 @@ impl Database {
 
     /// Fetch only the requested outcomes. Refusal history may be arbitrarily
     /// large, while a status request contains at most one bounded digest batch.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn refused_schema_unit_outcomes_for_digests(
         &self,
         tenant: &TenantId,
@@ -88709,6 +89665,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn record_refused_schema_units(
         &self,
         plan: &ReceivedPolicyPlan,
@@ -88794,6 +89751,7 @@ impl Database {
 
     /// Capture pending authenticated data BEFORE the transport filters held groups.
     /// No receipt or applied progress is written by staging.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn stage_policy_held_received_data(
         &self,
         changes: &ChangeSet,
@@ -88926,6 +89884,7 @@ impl Database {
 
     /// Replay released obligations in source order. An apply outcome is committed
     /// atomically with its rows before the pending payload is removed.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replay_released_policy_data(
         &self,
         tenant: &TenantId,
@@ -89063,6 +90022,7 @@ impl Database {
 
     const POLICY_HOLD_RELEASE_PREFIX: &'static str = "sync_policy_hold_release.v1.";
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn policy_hold_release_key(hold: &DurablePolicyHold) -> Result<String> {
         // Preserve the original persisted identity when adding dependency metadata.
         // MessagePack encodes this tuple exactly like the original eight-field hold.
@@ -89085,6 +90045,7 @@ impl Database {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn policy_hold_releases_for_correction(
         &self,
         changes: &ChangeSet,
@@ -89177,6 +90138,7 @@ impl Database {
         format!("{}{source_node_id}/{table}", Self::POLICY_HOLD_PREFIX)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn policy_hold_storage_key(hold: &DurablePolicyHold) -> Result<String> {
         // A hold without an authenticated scope uses the source/table address
         // for both reads and removal.
@@ -89215,6 +90177,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn policy_hold_scope(
         tenant: Option<&TenantId>,
         source: Option<&str>,
@@ -89226,6 +90189,7 @@ impl Database {
         Ok(blake3::hash(&bytes).to_hex().to_string())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn policy_hold_index_keys(key: &str, hold: &DurablePolicyHold) -> Result<Vec<String>> {
         let scope = Self::policy_hold_scope(
             hold.tenant_id.as_ref(),
@@ -89253,6 +90217,7 @@ impl Database {
         Ok(indexes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn policy_hold_index_values(
         key: &str,
         hold: &DurablePolicyHold,
@@ -89278,6 +90243,7 @@ impl Database {
                         .is_none_or(|life| identity.is_some_and(|(_, id)| life == id))))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn scoped_policy_hold_entries(
         &self,
         source: Option<&str>,
@@ -89425,6 +90391,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn policy_holds_for_changes(
         &self,
         changes: &ChangeSet,
@@ -89471,6 +90438,7 @@ impl Database {
         ))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn policy_hold_entries(&self) -> Result<Vec<(String, DurablePolicyHold)>> {
         if let Some(persistence) = &self.persistence {
             let mut active = Vec::new();
@@ -89506,6 +90474,7 @@ impl Database {
 
     /// Every durable hold this node keeps behind a refused authored
     /// transaction.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn policy_holds(&self) -> Result<Vec<DurablePolicyHold>> {
         Ok(self
             .policy_hold_entries()?
@@ -89517,6 +90486,7 @@ impl Database {
     /// Record the holds a refused transaction leaves. The first refusal of a
     /// table from a peer is the one later deliveries wait behind; a later
     /// refusal of the same table does not move it.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn record_policy_holds(&self, holds: &[DurablePolicyHold]) -> Result<()> {
         for hold in holds {
             let key = Self::policy_hold_storage_key(hold)?;
@@ -89556,6 +90526,7 @@ impl Database {
     /// installed: nothing from its peer waits behind an earlier refusal of
     /// that table, and nothing waits behind a refused creation of a table that
     /// now exists.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn release_policy_holds(
         &self,
         source: Option<&str>,
@@ -89599,6 +90570,7 @@ impl Database {
     /// table policy: who sent it, whose transaction it was and at which source
     /// position, the table, and the refusal the author must act on. Empty is
     /// the ordinary state.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub fn policy_held_received_tables(&self) -> Result<Vec<PolicyHeldReceivedTable>> {
         let _operation = self.open_operation()?;
         let mut held = self
@@ -89618,6 +90590,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_changes_impl(
         &self,
         mut changes: ChangeSet,
@@ -90196,6 +91169,7 @@ impl Database {
     /// log in the author's order. A unit refused here stops the replay; the
     /// units before it stay installed, as they did at the source.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_unattested_source_units(
         &self,
         units: Vec<ChangeSet>,
@@ -90367,6 +91341,7 @@ impl Database {
 
     /// Refuse a change set carrying the maximum transaction identity before
     /// the allocator is touched.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn refuse_max_txid_values(changes: &ChangeSet) -> Result<()> {
         for row in &changes.rows {
             for v in row.values.values() {
@@ -90383,12 +91358,14 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_public_changeset_ddl_lsn(changes: &ChangeSet) -> Result<()> {
         changes
             .validate_ddl_lsn_cardinality()
             .map_err(|error| Error::SyncError(error.into()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn preflight_sync_apply_trigger_ready(
         &self,
         changes: &ChangeSet,
@@ -90469,6 +91446,7 @@ impl Database {
     /// version that agrees on all of them has its shed columns read back from
     /// its own durable version, so a large body is never loaded to reject a
     /// row that already differs.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn sync_incoming_row_matches_committed(
         &self,
         values: &HashMap<ColName, Value>,
@@ -90545,6 +91523,7 @@ impl Database {
     /// commits between this branch's point lookup and this transaction's final
     /// validation. In that race the staged replacement is discarded and the
     /// newer writer's own ordinary change-log entry is what the edge pulls.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_authoritative_row_after_sync_refusal(
         &self,
         tx: TxId,
@@ -90652,6 +91631,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_changes_single_lsn_group(
         &self,
         changes: ChangeSet,
@@ -90678,6 +91658,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_changes_with_private_source_order(
         &self,
         mut changes: ChangeSet,
@@ -93731,6 +94712,7 @@ impl Database {
     /// and later commit its finalized local WriteSet atomically with schema.
     /// The ordinary no-schema path still calls it immediately, unchanged.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_adjudicated_sync_apply(
         &self,
         tx: TxId,
@@ -93788,6 +94770,7 @@ impl Database {
     /// Record the adjudicator's exact accepted occurrence, before a later
     /// member can replace its same-key cached row. This marker lives only in
     /// the private working write set and is removed before durable staging.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_detached_accepted_row(&self, tx: TxId, row: &RowChange,
         local_row_id: Option<RowId>, connected: bool,
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<()> {
@@ -93800,6 +94783,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn detached_accepted_row_key(row: &RowChange,
         owner: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<String> {
         let owner: contextdb_core::read_memory::ReadMemoryOwner = owner.into();
@@ -93820,6 +94804,7 @@ impl Database {
         Ok(format!("__contextdb.detached.accepted_row.v1.{:020}.{}", row.lsn.0, blake3::hash(&encoded).to_hex()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_received_row_lineages(
         &self,
         tx: TxId,
@@ -94019,6 +95004,7 @@ impl Database {
         lock
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn sync_push_outcome_key(
         tenant_id: &TenantId,
         node_id: &str,
@@ -94156,6 +95142,7 @@ impl Database {
 
     /// Exact authenticated request lookup in the existing durable apply path.
     /// A retry returns the committed result; it never arbitrates old work again.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn replay_sync_push_outcome(
         &self,
         key: &SyncPushOutcomeKey,
@@ -94223,6 +95210,7 @@ impl Database {
         }))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn durable_sync_push_outcome(
         context: &SyncPushOutcomeContext,
         result: ApplyResult,
@@ -94298,6 +95286,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_sync_push_outcome(
         &self,
         tx: TxId,
@@ -94314,6 +95303,7 @@ impl Database {
         self.tx_mgr.append_config_writes(tx, [(context.key.storage_key.clone(), bytes)])
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_sync_apply_receipt(
         &self,
         tx: TxId,
@@ -94370,6 +95360,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_hub_node_contact(
         &self,
         tx: TxId,
@@ -94391,6 +95382,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_sync_apply_outcome_only(
         &self,
         receipt: &SyncApplyReceipt,
@@ -94436,6 +95428,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_sync_apply_receipt_only(
         &self,
         receipt: &SyncApplyReceipt,
@@ -94476,6 +95469,7 @@ impl Database {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn dependency_unit_refusal_conflicts(
         &self,
         rows: &[RowChange],
@@ -94606,6 +95600,7 @@ impl Database {
             .map(|conflicts| conflicts.into_iter().flatten().collect())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn restore_vector_owner_rows(
         &self,
         rows: &mut Vec<RowChange>,
@@ -94624,6 +95619,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn restore_vector_owner_rows_projected(
         &self,
         rows: &mut Vec<RowChange>,
@@ -94719,6 +95715,7 @@ impl Database {
     /// are read here, one row at a time, when the change is built -- never by
     /// re-materialising the table. Under a bounded projection the stored size
     /// of the version is admitted before its body is read.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn shed_committed_values_for_change(
         &self,
         table: &str,
@@ -94791,6 +95788,7 @@ impl Database {
 
     /// The row version a change names. On the writer route `admit_copy`
     /// admits the version's copy before it is made.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_for_change(
         &self,
         table: &str,
@@ -94882,6 +95880,7 @@ impl Database {
         self.resident_row_for_change(table, row_id, lsn, read_memory, checkpoint, admit_copy)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn resident_row_for_change(
         &self,
         table: &str,
@@ -94938,6 +95937,7 @@ impl Database {
         copy(row).map(Some)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn history_change_snapshot_at(
         &self,
         lsn: Lsn,
@@ -94965,6 +95965,7 @@ impl Database {
 
     /// A row version for a change, its copy admitted first under a bounded
     /// projection.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_for_change_projected(
         &self,
         table: &str,
@@ -95009,6 +96010,7 @@ impl Database {
         Ok(row)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn with_change_table_meta<T>(
         &self, table: &str, row: &VersionedRow,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -95032,6 +96034,7 @@ impl Database {
 
     /// [`Self::row_change_values_from_row`], with the copied values admitted
     /// before they are copied under a bounded projection.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_change_values_projected(
         &self,
         table: &str,
@@ -95052,6 +96055,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_change_values_projected_at(
         &self,
         table: &str,
@@ -95106,6 +96110,7 @@ impl Database {
         Ok(Some((natural_key, values)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_change_values_from_row(
         &self,
         table: &str,
@@ -95124,6 +96129,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_change_values_from_row_at(
         &self,
         table: &str,
@@ -95161,6 +96167,7 @@ impl Database {
         Ok(Some((natural_key, values)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_id_for_natural_key(
         &self,
         table: &str,
@@ -95187,6 +96194,7 @@ impl Database {
     /// The visible row carrying a whole sync identity, matched on every key
     /// column — the composite-aware sibling of [`Self::row_id_for_natural_key`].
     // Like existing row scopes, custody metadata follows the root's visibility.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn delivery_root_visible(
         &self,
         table: &str,
@@ -95219,6 +96227,7 @@ impl Database {
             .is_empty())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_id_for_natural_key_full(
         &self,
         table: &str,
@@ -95240,6 +96249,7 @@ impl Database {
             .map(|row| row.row_id))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_read_allowed_for_change(
         &self,
         table: &str,
@@ -95271,6 +96281,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn row_id_read_allowed_for_change(
         &self,
         table: &str,
@@ -95294,6 +96305,7 @@ impl Database {
         self.row_read_allowed_for_change(table, &row, snapshot, read_memory)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn graph_edge_read_allowed_for_change(
         &self,
         source: NodeId,
@@ -95318,6 +96330,7 @@ impl Database {
         )
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn edge_properties(
         &self,
         source: NodeId,
@@ -95492,6 +96505,7 @@ fn bounded_rank_clone_size_error(operation: &str) -> Error {
     )).into())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bounded_rank_clone_checked_add(
     left: usize,
     right: usize,
@@ -95501,6 +96515,7 @@ fn bounded_rank_clone_checked_add(
         .ok_or_else(|| bounded_rank_clone_size_error(operation))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bounded_rank_clone_checked_mul(
     left: usize,
     right: usize,
@@ -95510,6 +96525,7 @@ fn bounded_rank_clone_checked_mul(
         .ok_or_else(|| bounded_rank_clone_size_error(operation))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bounded_rank_value_clone_planned_bytes(value: &Value) -> std::result::Result<usize, Error> {
     match value {
         Value::Text(value) => Ok(value.len()),
@@ -95529,6 +96545,7 @@ fn bounded_rank_value_clone_planned_bytes(value: &Value) -> std::result::Result<
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bounded_rank_value_retained_bytes(value: &Value) -> std::result::Result<usize, Error> {
     match value {
         Value::Text(value) => Ok(value.capacity()),
@@ -95548,6 +96565,7 @@ fn bounded_rank_value_retained_bytes(value: &Value) -> std::result::Result<usize
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bounded_rank_row_clone_planned_bytes(row: &VersionedRow) -> std::result::Result<usize, Error> {
     let mut bytes = bounded_rank_clone_checked_add(
         std::mem::size_of::<VersionedRow>(),
@@ -95569,6 +96587,7 @@ fn bounded_rank_row_clone_planned_bytes(row: &VersionedRow) -> std::result::Resu
     Ok(bytes)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn bounded_rank_row_retained_bytes(row: &VersionedRow) -> std::result::Result<usize, Error> {
     let mut bytes = bounded_rank_clone_checked_add(
         std::mem::size_of::<VersionedRow>(),
@@ -95709,6 +96728,7 @@ fn projected_point_lookup(
         .cloned()
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn sync_visible_point_lookup(
     db: &Database,
     cache: &HashMap<String, Vec<VersionedRow>>,
@@ -96099,6 +97119,7 @@ pub(crate) enum StartupState<'a> {
 }
 
 impl StartupState<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn config_value<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,
@@ -96113,6 +97134,7 @@ impl StartupState<'_> {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn sink_queue<T: serde::de::DeserializeOwned>(&self, sink: &str) -> Result<Vec<T>> {
         match self {
             Self::Durable(persistence) => persistence.load_sink_queue(sink),
@@ -96139,6 +97161,7 @@ impl StartupState<'_> {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn trigger_audit_state(
         &self,
         ring_capacity: usize,
@@ -96247,6 +97270,7 @@ impl PurgeReplay {
             peeked: None,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn fill(&mut self) -> Result<()> {
         if self.peeked.is_none()
             && let Some(cursor) = self.cursor.as_mut()
@@ -96282,10 +97306,12 @@ impl PurgeReplay {
         }
         Ok(())
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn peek_lsn(&mut self) -> Result<Option<Lsn>> {
         self.fill()?;
         Ok(self.peeked.as_ref().map(|window| window.value.0))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn next_item(
         &mut self,
     ) -> Result<
@@ -96323,10 +97349,12 @@ impl PurgeReplay {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn unbounded_checkpoint() -> Result<()> {
     Ok(())
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn unbounded_admission(_: usize) -> Result<()> {
     Ok(())
 }
@@ -96613,6 +97641,7 @@ fn same_vector_storage_shape(left: &VectorIndexLayout, right: &VectorIndexLayout
 
 // The prepared delta and generation encoding simultaneously retain these
 // input images. Keep their copy charge with the enclosing purge workspace.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn admit_erasure_vector_input_copies(
     schemas: &[(VectorIndexRef, VectorIndexLayout)],
     entries: &[PartitionedVectorEntry],
@@ -96686,6 +97715,7 @@ fn vector_layouts_from_meta(
     layouts
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn register_vector_layouts(
     vector: &VectorStore,
     table_meta: &HashMap<String, TableMeta>,
@@ -96712,6 +97742,7 @@ fn register_vector_layouts(
 /// the relational row version that owns that occurrence. A still-live vector
 /// may outlive its original body-only row version after compaction; in that
 /// case the newest live successor is the established owner fallback.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn partition_loaded_vectors_from_rows(
     relational: &RelationalStore,
     table_meta: &HashMap<String, TableMeta>,
@@ -98167,6 +99198,7 @@ fn staged_tuple_exists(ws: &WriteSet, table: &str, columns: &[String], values: &
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn prune_expired_rows(
     ctx: &MaintenanceContext,
     sync_watermark: Lsn,
@@ -98928,6 +99960,7 @@ fn prune_expired_rows(
 }
 
 // Retention owns its catalog/key/reader-chain buffers until publication.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn prepare_retention_cleanup_generations<'a>(
     vector: &VectorStore,
     persistence: Option<&Arc<RedbPersistence>>,
@@ -98997,6 +100030,7 @@ fn prepare_retention_cleanup_generations<'a>(
 
 /// Capture snapshot-protected chains before any durable cleanup. The caller
 /// holds its commit and removal guards until disk and memory both agree.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn prepare_cleanup_generations<'a>(
     vector: &VectorStore,
     persistence: Option<&Arc<RedbPersistence>>,
@@ -99030,6 +100064,7 @@ fn prepare_cleanup_generations<'a>(
 
 /// Select without mutating either durable or in-memory state. Currency cleanup
 /// includes these candidates in the same transaction as their last references.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn scoped_commit_index_candidates(
     tx_mgr: &DatabaseTransactionHost,
     lsn_refcounts: &ChangeLogLsnRefcounts,
@@ -99119,6 +100154,7 @@ fn build_change_log_aux_indexes(
 ///
 /// A refusal drops what was built so far; `memory`'s owner gives its charge
 /// back with it.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn build_admitted_change_log_aux_indexes(
     log: &[ChangeLogEntry],
     memory: &crate::read_image_memory::ImageMemory,
@@ -99246,6 +100282,7 @@ impl ChangeLogAuxIndexFixtureForTest {
 /// this. Also returns the per-LSN breakdown (`removed_lsn_counts`), which
 /// `scoped_commit_index_removal` needs to know which LSNs the change log
 /// still covers after this pass.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn count_pruned_change_log_entries_at_root(
     tx_mgr: &DatabaseTransactionHost,
     resident: &ChangeLogTableIndex,
@@ -99385,9 +100422,11 @@ fn apply_removed_lsn_counts(
 // the selected vector's already-priced slots; only nested backing is counted.
 // Vec/String clones allocate their initialized length. HashMap::clone keeps
 // its native bucket capacity, including spare buckets in a sparse source.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn cleanup_declaration_copy_bytes(meta: &TableMeta) -> Result<usize> {
     struct Plan(usize);
     impl Plan {
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn add(&mut self, bytes: usize) -> Result<()> {
             self.0 = self
                 .0
@@ -99395,6 +100434,7 @@ fn cleanup_declaration_copy_bytes(meta: &TableMeta) -> Result<usize> {
                 .ok_or_else(EngineMetadataJournal::identity_error)?;
             Ok(())
         }
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn array<T>(&mut self, values: &[T]) -> Result<()> {
             self.add(
                 std::alloc::Layout::array::<T>(values.len())
@@ -99402,15 +100442,18 @@ fn cleanup_declaration_copy_bytes(meta: &TableMeta) -> Result<usize> {
                     .size(),
             )
         }
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn text(&mut self, value: &str) -> Result<()> {
             self.add(value.len())
         }
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn optional_text(&mut self, value: &Option<String>) -> Result<()> {
             if let Some(value) = value {
                 self.text(value)?;
             }
             Ok(())
         }
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn names(&mut self, values: &[String]) -> Result<()> {
             self.array(values)?;
             for value in values {
@@ -99418,6 +100461,7 @@ fn cleanup_declaration_copy_bytes(meta: &TableMeta) -> Result<usize> {
             }
             Ok(())
         }
+        #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
         fn ordered(&mut self, values: &[(String, SortDirection)]) -> Result<()> {
             self.array(values)?;
             for (value, _) in values {
@@ -99566,6 +100610,7 @@ fn cleanup_declaration_copy_bytes(meta: &TableMeta) -> Result<usize> {
 /// converges to current truth. These tables are all `LatestWins`, so the dropped
 /// intermediate versions had no consumer value: a peer applies only the latest.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn compact_currency_versions_inner(
     relational_store: &Arc<RelationalStore>,
     _graph_store: &Arc<GraphStore>,
@@ -100134,6 +101179,7 @@ fn compact_currency_versions_inner(
 /// `threshold` superseded versions across the eligible `tables`? Reads only the
 /// relational tables lock (never the commit lock) and early-returns, so a quiet
 /// node does near-zero work per tick.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn currency_compaction_pending(
     relational_store: &Arc<RelationalStore>,
     manager: &DatabaseTransactionHost,
@@ -100324,6 +101370,7 @@ fn retention_candidate_workspace_bytes(table: &str, metas: &HashMap<String, Tabl
         .saturating_add(blocker_bytes.saturating_mul(2))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn retention_prune_candidates(
     metas: &HashMap<String, TableMeta>,
     frontier: &MaintenanceFrontier<'_>,
@@ -100364,6 +101411,7 @@ fn retention_prune_candidates(
     Ok(candidates)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn fk_protected_prune_candidates(
     metas: &HashMap<String, TableMeta>,
     frontier: &MaintenanceFrontier<'_>,
@@ -100401,6 +101449,7 @@ fn fk_protected_prune_candidates(
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn prune_blocker_for_referenced_parent(
     parent_table: &str,
     parent: &VersionedRow,
@@ -100472,6 +101521,7 @@ fn prune_blocker_for_referenced_parent(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn child_rows_contain_live_reference(
     metas: &HashMap<String, TableMeta>,
     parent_table: &str,
@@ -101468,6 +102518,7 @@ pub(crate) fn sync_vector_rename_constraint(from: &str, to: &str) -> String {
 
 /// Inspect only explicit signed operations; omission is never a column drop.
 /// This mirrors the existing marker spelling rules using borrowed slices.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn refuse_dag_defining_column_sync_ddl(
     projected: &HashMap<String, TableMeta>,
     change: &DdlChange,
@@ -101826,6 +102877,7 @@ fn constraint_declares_sync_safe(constraint: &str) -> bool {
 /// deliver rows by, on BOTH the CreateTable and AlterTable paths. Without this
 /// a foreign edge could install locally the exact declaration every local door
 /// rejects, and this engine would then delete undelivered rows on its behalf.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn refuse_keyless_sync_safe_sync_ddl(
     projected: &HashMap<String, TableMeta>,
     change: &DdlChange,
@@ -101879,6 +102931,7 @@ fn refuse_keyless_sync_safe_sync_ddl(
 /// work, so a refused statement leaves existing metadata untouched. Without
 /// this a peer could install here the declaration every local door rejects,
 /// and this engine would hold rows that never expire on its behalf.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn refuse_undeliverable_promise_sync_ddl(
     projected: &HashMap<String, TableMeta>,
     change: &DdlChange,
@@ -101923,6 +102976,7 @@ fn refuse_undeliverable_promise_sync_ddl(
 /// projection or apply work, so a refused statement leaves existing metadata
 /// untouched — matching `refuse_undeliverable_promise_sync_ddl` and
 /// `refuse_keyless_sync_safe_sync_ddl`, which this sits alongside.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn refuse_reclaimed_history_sync_ddl(change: &DdlChange) -> Result<()> {
     let (name, incoming) = match change {
         DdlChange::CreateTable {
@@ -102010,6 +103064,7 @@ fn refuse_reclaimed_history_sync_ddl(change: &DdlChange) -> Result<()> {
 /// a widened four-table list). The fresh-CreateTable arm's guard is widened
 /// to match either table set so a reserved-name column-shape and SYNC-
 /// CONFLICT check both run for these five too, not only the four.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn refuse_engine_owned_policy_sync_ddl(
     projected: &HashMap<String, TableMeta>,
     change: &DdlChange,
@@ -106601,6 +107656,7 @@ mod cdb126_reader_history_tests {
 mod writecost_reclaim_cancellation_tests;
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn lineage_attestation_owned(
         &self,
         tenant: &TenantId,
@@ -106636,6 +107692,7 @@ impl Database {
             ),
         )
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn verify_lineage_attestation_owned(
         &self,
         tenant: &TenantId,
@@ -106669,6 +107726,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_owned_delivery_meta_if_present<R>(
         &self,
         table: &str,
@@ -106687,6 +107745,7 @@ impl Database {
 impl Database {
     // The iterator borrows the original one-shot bodies inside the detached
     // HRTB callback. Never collect, clone, or reload those guards here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn revalidate_conditional_updates_in_prepared_write_set<'conditions>(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -106837,6 +107896,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rewrite_txid_placeholders_in_prepared_write_set(
         &self,
         origin_tx: TxId,
@@ -106888,6 +107948,7 @@ impl Database {
     /// Original slot winners are copied before any exact source removal. This
     /// consumer is called before the corresponding row slot is replaced.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn reconcile_commit_time_upsert_vectors_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -107063,6 +108124,7 @@ impl Database {
         .map_or(Ok(()), Ok)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn remove_vector_positions_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -107102,6 +108164,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn collect_commit_upsert_refs<'a>(
         &self,
         intents: impl DoubleEndedIterator<Item = &'a PendingUpsertIntent>,
@@ -107121,6 +108184,7 @@ impl Database {
         Ok(held)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_meta_owned(
         &self,
         table: &str,
@@ -107133,6 +108197,7 @@ impl Database {
         .ok_or_else(|| Error::TableNotFound(table.to_owned()))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_preparation_read_bytes(
         &self,
         held: &contextdb_tx::manager::EngineGuard<'_>,
@@ -107214,6 +108279,7 @@ impl Database {
         Ok(bytes)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn build_commit_upsert_row_owned(
         &self,
         table: &str,
@@ -107334,6 +108400,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_commit_relational_delete(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -107365,6 +108432,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_commit_time_upsert_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -107477,6 +108545,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn apply_original_commit_time_upsert_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -107572,6 +108641,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rewrite_commit_time_upserts_in_prepared_write_set<'a>(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -107638,6 +108708,7 @@ struct NativeCommitUniqueScratch {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_commit_unique_scratch(
         &self,
         held: &contextdb_tx::manager::EngineGuard<'_>,
@@ -107697,6 +108768,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_unique_constraints_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -107874,6 +108946,7 @@ impl Database {
 
 impl Database {
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn enqueue_commit_propagation_entry(
         &self,
         queue: &mut MetadataBuffer<
@@ -107914,6 +108987,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_commit_vector_delete(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -107948,6 +109022,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn delete_vector_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -108053,6 +109128,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn remove_commit_prior_row_slots(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -108089,6 +109165,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn upsert_state_row_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -108214,6 +109291,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn enqueue_propagation_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -108394,6 +109472,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn propagate_state_change_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -108488,6 +109567,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn discard_gone_deletes_in_restricted_source(
         &self,
         held: &mut contextdb_tx::manager::EngineGuard<'_>,
@@ -108600,6 +109680,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_validate_in_prepared_write_set(
         &self,
         origin_tx: TxId,
@@ -108699,6 +109780,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_commit_rows_in_restricted_source(
         &self,
         held: &contextdb_tx::manager::EngineGuard<'_>,
@@ -108781,6 +109863,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn point_commit_row_in_restricted_source(
         &self,
         held: &contextdb_tx::manager::EngineGuard<'_>,
@@ -108806,6 +109889,7 @@ impl Database {
         Ok(selected)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_row_ids_for_uuid_in_restricted_source(
         &self,
         held: &contextdb_tx::manager::EngineGuard<'_>,
@@ -108845,6 +109929,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn validate_foreign_keys_in_restricted_read_source(
         &self,
         ws: &WriteSet,
@@ -108992,6 +110077,7 @@ impl Database {
 
 impl Database {
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn committed_unique_conflict_row_id_in_restricted_source(
         &self,
         table: &str,
@@ -109066,6 +110152,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_commit_row_exists_by_column(
         &self,
         table: &str,
@@ -109106,6 +110193,7 @@ impl Database {
     /// Borrow the original resident version through reply sizing and writing.
     /// Durable bodies require their own unactivated native source companion;
     /// a resident projection must never stand in for their complete row.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_native_point_row<T>(
         &self,
         key: &(TableName, RowId),
@@ -109158,6 +110246,7 @@ struct OriginalPurgeNonEventPreparedSet {
     survivor_report: OwnedQueryResult,
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_original_discard_non_event_set_batch(
         &self,
         selections: &[AuthoritativePurgeSelection],
@@ -109701,6 +110790,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn original_discard_durable_sink_entries(
         &self,
         frame: &crate::persistence::OriginalPersistenceFrame<'_>,
@@ -109748,6 +110838,7 @@ impl Database {
 }
 
 impl PreparedMemorySwap {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepare_original(
         original: &crate::memory_accounting::OwnedMemoryReservation,
         old_bytes: usize,
@@ -109854,6 +110945,7 @@ impl Database {
     /// Read a committed incarnation with the SAME begin_request identity.
     /// The delivery caller must call this independently before fetch/cursor
     /// validation and again for its response, as its Legacy handler does.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn existing_sync_incarnation_native(
         &self,
         tenant: &TenantId,
@@ -109925,6 +111017,7 @@ mod received_row_graph_tests;
 mod staged_graph_order_tests;
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn accepted_commit_state_changes(
         &self,
         read: contextdb_tx::manager::EngineRead<'_>,
@@ -110030,6 +111123,7 @@ impl Database {
     /// Delivery records keep their established named MessagePack encoding.
     /// The temporary encoder and key die before their original reservation;
     /// the lower auxiliary target receives a distinct genuine source invoice.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn append_original_delivery_record(
         held: &mut contextdb_tx::manager::EngineGuard<'_>, original: &OwnedMemoryReservation,
         record: &crate::custody::records::Record,
@@ -110066,6 +111160,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn commit_owned_ordinary(
         &self, host: &EngineDatabaseTransactions, tx: TxId, source: CommitSource,
         event_bus_ddl: &[DdlChange], trigger_ddl: &[DdlChange],
@@ -110444,6 +111539,7 @@ impl Database {
 }
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn prepared_source_could_empty_vector_partition(
         &self, held: &contextdb_tx::manager::EngineGuard<'_>, original: &OwnedMemoryReservation,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -110497,6 +111593,7 @@ impl OriginalOrdinarySyncBaseline {
     fn contains_row(&self, table: &str, row: RowId) -> bool {
         self.rows.iter().any(|(name, id)| name == table && *id == row)
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn quote(read: &contextdb_tx::manager::EngineRead<'_>) -> Result<usize> {
         use crate::custody::preparation::preparation_array_bytes;
         let keys = read.config_writes.iter().filter(|(key, _)| key.starts_with("sync_creation_lineage.v1."));
@@ -110511,6 +111608,7 @@ impl OriginalOrdinarySyncBaseline {
     }
 }
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn capture_original_ordinary_sync_baseline(&self, tx: TxId, original: &OwnedMemoryReservation) -> Result<OriginalOrdinarySyncBaseline> {
         loop {
             let bytes = self.tx_mgr.with_read(tx, |read| OriginalOrdinarySyncBaseline::quote(&read))??;
@@ -110535,6 +111633,7 @@ impl Database {
             if let Some(copied) = copied { return Ok(copied); }
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn rewrite_txid_placeholders_after_sync_baseline(&self, tx: TxId,
         held: &mut contextdb_tx::manager::EngineGuard<'_>, baseline: &OriginalOrdinarySyncBaseline) -> Result<()> {
         held.with_tx_checkpoint(|held| {
@@ -110562,6 +111661,7 @@ impl Database {
 
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_original_graph_arrivals(&self, held: &mut contextdb_tx::manager::EngineGuard<'_>,
         original: &OwnedMemoryReservation, pulled: bool) -> Result<OriginalOrdinaryGraphArrivals> {
         let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;

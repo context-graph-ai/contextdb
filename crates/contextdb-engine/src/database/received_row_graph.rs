@@ -5,6 +5,7 @@ use contextdb_tx::OwnedAdjEntry;
 impl Database {
     /// Materialize only a resident selected image. Durable source-backed
     /// graphs have no resident accounting image and must not be scanned here.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn received_row_graph_image(
         graph: &GraphStore,
         affected_types: &HashSet<String>,
@@ -39,6 +40,7 @@ impl Database {
 
     /// Prepare both directions while the admitted borrowed source image
     /// remains available for durable projection and memory delta accounting.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_received_row_graph_image(
         edges: &[contextdb_graph::GraphAdjEntry],
         copy_owner: &mut contextdb_vector::VectorCopyAdmission,
@@ -75,6 +77,7 @@ impl Database {
     /// Copy only witnesses belonging to the affected retained row versions.
     /// The rows have already entered `working`; unrelated graph history is
     /// never enumerated, and equal endpoint siblings are resolved separately.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn copy_received_row_graph_witnesses(
         &self,
         working: &Database,
@@ -132,6 +135,7 @@ impl Database {
     /// Select dropped owners before any detached DDL can discard their rows.
     /// `copy_owner` is retained by the received-schema stage through durable
     /// and memory publication, including the vector's backing allocation.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn received_row_graph_drop_witnesses(
         &self,
         working: &Database,
@@ -184,6 +188,7 @@ impl Database {
     /// Restamp the accepted detached mutations, never their immutable delete
     /// before-owner. Call before the ordinary received-schema restamp rewrites
     /// the row insert identities. Its canonical reverse rebuild follows this.
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn restamp_received_row_graph(
         working: &Database,
         finalized: &mut WriteSet,

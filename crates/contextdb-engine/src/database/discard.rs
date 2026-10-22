@@ -11,6 +11,7 @@ pub(crate) struct Stage {
 pub(crate) type StageRegistry = Arc<Mutex<HashMap<Lsn, Stage>>>;
 
 impl Database {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn discard_policy(
         &self,
         table: &str,
@@ -81,6 +82,7 @@ impl Database {
         Ok(Some((hub, mode)))
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn stage_discard(
         &self,
         tx: TxId,
@@ -293,6 +295,7 @@ impl Database {
         Ok(result)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn original_discard_registration_refs(
         &self, host: &EngineDatabaseTransactions, tx: TxId,
     ) -> Result<MetadataBuffer<AdmittedMetadataValue<(RowRef, Vec<RowRef>)>>> {
@@ -326,6 +329,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn capture_original_discard_selections(
         &self, host: &EngineDatabaseTransactions, tx: TxId,
     ) -> Result<OriginalDiscardSelections> {
@@ -347,6 +351,7 @@ impl Database {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn capture_original_discard_blob_hashes(
         &self, host:&EngineDatabaseTransactions, selections:&[AuthoritativePurgeSelection],
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -363,6 +368,7 @@ impl Database {
             hashes.seal()
         })
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn original_discard_selected_blob_hashes(
         &self, selections:&[AuthoritativePurgeSelection],
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -400,6 +406,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn visit_original_discard_selected_versions(
         &self, table: &str, selected: RowId,
         mut visit: impl FnMut(&VersionedRow) -> Result<bool>,
@@ -430,6 +437,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visit_original_discard_work_rows(
         &self, mut visit: impl FnMut(&VersionedRow) -> Result<bool>,
         reader: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -450,6 +458,7 @@ impl Database {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn original_discard_current_blob_references(
         &self, host:&EngineDatabaseTransactions, original:&OwnedMemoryReservation,
         selections:&[AuthoritativePurgeSelection],
@@ -487,6 +496,7 @@ impl Database {
         survivors.seal()
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn stage_original_discard_selection(
         &self, host: &EngineDatabaseTransactions, tx: TxId,
         rows: &BTreeSet<(String, RowId)>, references: &[RowRef],
@@ -575,6 +585,7 @@ impl Database {
         result
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_discard_commit(
         &self,
         ws: &mut WriteSet,
@@ -815,6 +826,7 @@ impl Database {
 }
 
 impl StartupState<'_> {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn with_owned_encoded_event_source<R>(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -851,6 +863,7 @@ impl OwnedDiscardQueueCustody {
         private_interfaces,
         reason = "the type is crate-private on purpose; the crate-visible item is only reachable inside the crate"
     )]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn prepare_for_commit_locked_discard(
         events: &event_bus::OwnedEventBusHandle,
         own_append: &mut event_bus::OwnedPreparedSinkEvents,
@@ -878,6 +891,7 @@ impl OwnedDiscardQueueCustody {
         })
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn visit_unconfirmed(
         &self, visit: impl FnMut(&str, u64) -> Result<()>,
     ) -> Result<()> {
@@ -984,6 +998,7 @@ impl OriginalDiscardTerminal {
             stage: None,
         }
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(crate) fn install(&mut self, holder: OriginalDiscardStageHolder) -> Result<()> {
         if self.stage.is_some() || self.identity.is_some_and(|id| id != holder.identity) {
             return Err(Error::Other(
@@ -1013,6 +1028,7 @@ pub(crate) fn with_original_discard_terminal<R>(
     result
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn validate_original_discard_for_apply(
     ws: &WriteSet,
     registry: &StageRegistry,
@@ -1069,6 +1085,7 @@ pub(crate) fn publish_original_discard_for_apply(ws: &WriteSet) {
     });
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn original_discard_box<F: FnOnce() + Send + 'static>(
     original: &crate::memory_accounting::OwnedMemoryReservation,
     publication: F,
@@ -1088,6 +1105,7 @@ fn original_discard_box<F: FnOnce() + Send + 'static>(
     Ok((Box::new(publication), memory))
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn bind_original_discard_identity(
     identity: contextdb_tx::manager::EngineTerminalIdentity,
 ) -> Result<()> {
@@ -1108,6 +1126,7 @@ pub(super) fn bind_original_discard_identity(
     })
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn install_original_discard_stage(holder: OriginalDiscardStageHolder) -> Result<()> {
     ORIGINAL_DISCARD_TERMINAL.with(|slot| {
         let ptr = slot.get();
@@ -1125,6 +1144,7 @@ pub(super) fn install_original_discard_stage(holder: OriginalDiscardStageHolder)
 
 impl Database {
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     pub(super) fn prepare_original_discard_commit(&self, host: &EngineDatabaseTransactions,
         original: &OwnedMemoryReservation, identity: contextdb_tx::manager::EngineTerminalIdentity,
         held: &mut contextdb_tx::manager::EngineGuard<'_>, selections: &[AuthoritativePurgeSelection],
@@ -1349,6 +1369,7 @@ struct OriginalDiscardReplacement {
     memory: PreparedMemorySwap,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn discard_key_copy_bytes(key: &NaturalKey) -> Result<usize> {
     use crate::memory_accounting::preparation_value_copy_bytes;
     let mut bytes = key.column.len().checked_add(preparation_value_copy_bytes(&key.value)?)
@@ -1360,6 +1381,7 @@ fn discard_key_copy_bytes(key: &NaturalKey) -> Result<usize> {
     }
     Ok(bytes)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn discard_copy_key(key: &NaturalKey) -> Result<NaturalKey> {
     use crate::memory_accounting::{preparation_copy_string, preparation_copy_value};
     let mut rest = Vec::with_capacity(key.rest.len());
@@ -1367,18 +1389,22 @@ fn discard_copy_key(key: &NaturalKey) -> Result<NaturalKey> {
     for (name, value) in &key.rest { rest.push((preparation_copy_string(name)?, preparation_copy_value(value))); }
     Ok(NaturalKey { column: preparation_copy_string(&key.column)?, value: preparation_copy_value(&key.value), rest })
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn discard_reference_copy_bytes(reference: &RowRef) -> Result<usize> {
     reference.table.len().checked_add(discard_key_copy_bytes(&reference.key)?)
         .ok_or_else(EngineMetadataJournal::identity_error)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn discard_copy_reference(reference: &RowRef) -> Result<RowRef> {
     Ok(RowRef { table: crate::memory_accounting::preparation_copy_string(&reference.table)?, key: discard_copy_key(&reference.key)? })
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn discard_selection_copy_bytes(selection: &AuthoritativePurgeSelection) -> Result<usize> {
     selection.table.len().checked_add(selection.lineage_root.len())
         .and_then(|n| n.checked_add(discard_key_copy_bytes(&selection.natural_key).ok()?))
         .ok_or_else(EngineMetadataJournal::identity_error)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn discard_copy_selection(selection: &AuthoritativePurgeSelection) -> Result<AuthoritativePurgeSelection> {
     Ok(AuthoritativePurgeSelection {
         table: crate::memory_accounting::preparation_copy_string(&selection.table)?,
@@ -1394,6 +1420,7 @@ pub(super) struct OriginalDiscardSelections {
     _memory: OwnedMemoryReservation,
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn visit_discard_blob_hashes(value: &Value, mut visit: impl FnMut([u8; 32]) -> Result<()>) -> Result<()> {
     let Value::Json(value) = value else {
         return Err(Error::Other("work ledger: input_refs must be JSON".into()));
@@ -1420,10 +1447,12 @@ impl From<Error> for OriginalDiscardRowVisit {
     fn from(error: Error) -> Self { Self::Error(error) }
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn discard_key_pairs_copy_bytes(key: &NaturalKey) -> Result<usize> {
     discard_key_copy_bytes(key)?.checked_add(std::mem::size_of::<(String, Value)>())
         .ok_or_else(EngineMetadataJournal::identity_error)
 }
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(super) fn discard_copy_key_pairs(key: &NaturalKey) -> Result<Vec<(String, Value)>> {
     let count = key.rest.len().checked_add(1).ok_or_else(EngineMetadataJournal::identity_error)?;
     let mut pairs = Vec::with_capacity(count);
@@ -1440,6 +1469,7 @@ pub(super) fn discard_copy_key_pairs(key: &NaturalKey) -> Result<Vec<(String, Va
 // Only the exact scoped terminal may move its already prepared write into
 // persistence. A missing/foreign Original, store, LSN or visibility identity
 // refuses before any public write is staged.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 pub(crate) fn take_original_discard_write(
     store: &RedbPersistence, original: &OwnedMemoryReservation, ws: &WriteSet,
 ) -> Result<Option<crate::persistence::received_working::ReceivedWorkingWrite>> {
