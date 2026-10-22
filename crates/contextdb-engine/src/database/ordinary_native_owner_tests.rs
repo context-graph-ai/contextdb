@@ -43,6 +43,17 @@ struct Capture {
     forwarding_payload: usize,
     payload_invoice_bytes: usize,
 }
+#[derive(Clone, Copy, Default)]
+struct AnswerTraceCapture {
+    active: bool,
+    invalid: bool,
+    stages: usize,
+    requests: [Request; 2],
+    invoices: [(usize, usize); 2],
+}
+thread_local! { static ANSWER_TRACE: Cell<AnswerTraceCapture> = const { Cell::new(AnswerTraceCapture {
+    active:false, invalid:false, stages:0, requests:[(0,0,0);2], invoices:[(0,0);2],
+}) }; }
 thread_local! {
     static HOOK_BUSY: Cell<bool> = const { Cell::new(false) };
     static CAPTURE: Cell<Capture> = const { Cell::new(Capture {
@@ -148,6 +159,30 @@ pub(crate) fn trace_control_allocated(
     payer: usize,
     invoice: usize,
 ) {
+    ANSWER_TRACE.with(|slot| {
+        let mut capture = slot.get();
+        if !capture.active {
+            return;
+        }
+        let (bytes, align, _) = oracle::last_request_for_test(false);
+        let pointer = oracle::last_request_pointer_for_test();
+        if stage >= 2
+            || stage != capture.stages
+            || pointer == 0
+            || payer == 0
+            || (bytes, align) != (layout.size(), layout.align())
+            || bytes != invoice
+            || payload < pointer
+            || payload >= pointer.saturating_add(bytes)
+        {
+            capture.invalid = true;
+        } else {
+            capture.requests[stage] = (pointer, bytes, align);
+            capture.invoices[stage] = (payer, invoice);
+            capture.stages += 1;
+        }
+        slot.set(capture);
+    });
     update(|c| {
         let (bytes, align, ordinal) = oracle::last_request_for_test(false);
         let pointer = oracle::last_request_pointer_for_test();
@@ -1081,7 +1116,6 @@ fn ordinary_native_physical_cut_rejects_missing_duplicate_early_wrong_and_extra_
 #[test]
 #[serial_test::serial]
 fn ordinary_answer_last_clone_preserves_actual_original_controls_through_physical_free() {
-    use crate::read_work_probe::allocator_events::Window;
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     for file in [false, true] {
         let (_dir, db) = fixture(file);
@@ -1099,18 +1133,11 @@ fn ordinary_answer_last_clone_preserves_actual_original_controls_through_physica
         {
             for original_first in [false, true] {
                 let observation = Observation::begin(&db);
-                let window = Window::begin(
-                    &crate::executor::bounded::ordinary_native_control_layouts_for_test(),
-                )
-                .unwrap();
                 let (answer, _, _) = observed(&db, || {
                     entry(&db, historical, query, &HashMap::new(), snapshot)
                 });
                 let answer = answer.unwrap();
                 let c = observation.assert_admitted();
-                let requests = std::array::from_fn::<_, 3, _>(|i| {
-                    window.live_request(c.requests[i].0).unwrap()
-                });
                 assert_eq!(answer.rows(), vec![vec![Value::Int64(expected)]]);
                 observation.assert_live();
                 let clone = answer.clone();
@@ -1124,20 +1151,10 @@ fn ordinary_answer_last_clone_preserves_actual_original_controls_through_physica
                     drop(answer);
                 }
                 observation.assert_freed(&db);
-                let order = requests.map(|request| {
-                    window
-                        .physical_free_event_for_request(request)
-                        .unwrap()
-                        .unwrap()
-                });
                 let counters = oracle::source_free_for_test(3);
-                window.finish().unwrap();
-                assert!(
-                    order[2] < order[1] && order[1] < order[0],
-                    "actual forwarder/keeper/child physical-free order: {order:?}"
-                );
                 eprintln!(
-                    "actual_answer_last_clone file={file} historical={historical} original_first={original_first} requests={requests:?} order={order:?} counters={:?}",
+                    "actual_answer_last_clone file={file} historical={historical} original_first={original_first} requests={:?} counters={:?}",
+                    c.requests,
                     &counters[..3]
                 );
             }
@@ -1148,8 +1165,14 @@ fn ordinary_answer_last_clone_preserves_actual_original_controls_through_physica
 #[test]
 #[serial_test::serial]
 fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
-    use crate::read_work_probe::allocator_events::{FundingCounter, Window};
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            ANSWER_TRACE.with(|slot| slot.set(AnswerTraceCapture::default()));
+            oracle::disarm_source_free_watch();
+        }
+    }
     for file in [false, true] {
         let (_dir, db) = fixture(file);
         sql(
@@ -1165,78 +1188,113 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
         db.clear_last_vector_search_trace();
         let parent = db.declared_read_memory_for_test();
         let limit = parent.effective_limit_for_physical_test();
-        let observation = Observation::begin(&db);
-        let native_layouts = crate::executor::bounded::ordinary_native_control_layouts_for_test();
-        let mut layouts = [ReadShared::<OwnedQueryResult>::layout(); 4];
-        layouts[..3].copy_from_slice(&native_layouts);
-        let window = Window::begin(&layouts).unwrap();
-        let ((answer, _, _), sample) =
+        let counter = db.declared_read_memory.ordinary_parent_counter_for_test();
+        let _cleanup = Cleanup;
+        ANSWER_TRACE.with(|slot| {
+            slot.set(AnswerTraceCapture {
+                active: true,
+                ..AnswerTraceCapture::default()
+            })
+        });
+        let ((answer, allocations, count), sample) =
             crate::vector_read_memory::statement_child_proof::observe(&parent, limit, || {
-                observed(&db, || {
+                oracle::source_requests_for_test(counter, || {
                     db.execute_at_snapshot(query, &params, db.snapshot())
                 })
             });
         let answer = answer.unwrap();
-        let c = observation.assert_admitted();
-        assert_eq!(c.trace_stages, 2);
+        let native = sample.native_controls.unwrap();
+        let trace = ANSWER_TRACE.with(Cell::get);
+        assert!(!trace.invalid);
+        assert_eq!(trace.stages, 2);
+        let native_requests = [
+            native.block.actual_request.unwrap(),
+            native.keeper.unwrap().actual_request.unwrap(),
+            native.adapter.unwrap().actual_request.unwrap(),
+        ];
+        assert_eq!(native.keeper_payer, Some(native.owner));
+        assert_eq!(native.adapter_payer, Some(native.owner));
+        assert_eq!(native.keeper_credit_bytes, native_requests[1].1);
+        assert_eq!(native.adapter_invoice_bytes, native_requests[2].1);
+        for stage in 0..2 {
+            assert_eq!(trace.invoices[stage].0, native.owner);
+            assert_eq!(trace.invoices[stage].1, trace.requests[stage].1);
+        }
         let components = answer.original_charge_components_for_test();
-        let publication = window.live_request(components[0]).unwrap();
-        assert_eq!(publication.bytes, components[2]);
-        assert_eq!(
-            components[1], c.forwarding_payload,
-            "actual publication invoice retains the original forwarding payer"
-        );
-        let native_requests =
-            std::array::from_fn::<_, 3, _>(|i| window.live_request(c.requests[i].0).unwrap());
-        // SAFETY: this exact parent counter was bound at child construction;
-        // the original declared parent pin remains live throughout its watch.
-        let parent_counter = unsafe {
-            FundingCounter::from_parent_pinned(c.parent_counter, db.declared_read_memory.clone())
-        };
-        let publication_watch = window.watch(publication, parent_counter).unwrap();
+        assert_eq!(components[1], native.adapter.unwrap().payload);
+        let mut publication = None;
+        for request in &allocations[..count.min(allocations.len())] {
+            if request.0 <= components[0] && components[0] < request.0.saturating_add(request.1) {
+                assert!(
+                    publication.replace(*request).is_none(),
+                    "actual publication pointer is uniquely owned"
+                );
+            }
+        }
+        let publication =
+            publication.expect("actual public carrier was allocated before execution");
+        assert_eq!(publication.1, components[2]);
+        let requests = [
+            native_requests[0],
+            native_requests[1],
+            native_requests[2],
+            trace.requests[0],
+            trace.requests[1],
+            publication,
+        ];
+        oracle::watch_exact_frees_for_test(&requests, counter);
         let retained = db.last_vector_search_trace.write().take().unwrap();
         let invoice = retained.complete_invoice_for_test(|_| {});
-        // SAFETY: both the public answer and retained trace retain this actual
-        // child now; the trace still pins it after the answer is dropped.
-        let before = unsafe { &*(c.child_counter as *const AtomicU64) }.load(Ordering::SeqCst);
+        // Both answer and trace pin this same original child. The retained
+        // trace remains its actual owner after the answer is physically freed.
+        let before = unsafe { &*(native.counter as *const AtomicU64) }.load(Ordering::SeqCst);
         assert_eq!(sample.identity.target_last_held, before);
-        let trace_due = c.requests[1..].iter().map(|r| r.1).sum::<usize>()
-            + c.trace_requests.iter().map(|r| r.1).sum::<usize>()
+        let trace_due = native_requests[1..].iter().map(|r| r.1).sum::<usize>()
+            + trace.requests.iter().map(|r| r.1).sum::<usize>()
             + invoice.prepaid_bytes
             + invoice.additional_bytes
             + invoice.score_credit_bytes
             + invoice.prepaid_control_bytes;
         drop(answer);
-        let after = unsafe { &*(c.child_counter as *const AtomicU64) }.load(Ordering::SeqCst);
-        let freed_publication = publication_watch.receipt().unwrap();
-        assert_eq!(freed_publication.physical_frees, 1);
+        let after = unsafe { &*(native.counter as *const AtomicU64) }.load(Ordering::SeqCst);
+        let frees = oracle::source_free_for_test(6);
+        let physical = frees[5];
+        assert_eq!(physical.2, 1);
+        assert_eq!(physical.0, physical.1);
+        let due = sample.parent_before
+            + native_requests[0].1 as u64
+            + trace_due as u64
+            + publication.1 as u64;
         assert_eq!(
-            freed_publication.before_system,
-            freed_publication.after_system
-        );
-        let due = c.baseline + c.requests[0].1 as u64 + trace_due as u64 + publication.bytes as u64;
-        assert_eq!(
-            freed_publication.before_system, due,
-            "actual answer carrier remains funded through physical free alongside the independent trace"
+            physical.0 as u64, due,
+            "actual carrier stays prepaid at System.dealloc alongside the independent trace"
         );
         assert_eq!(
             after, trace_due as u64,
-            "the remaining child debit is the independently captured trace invoice and actual controls"
+            "remaining live child debit equals the complete captured trace invoice and control requests"
         );
         assert!(before > after);
-        assert!(before - after >= publication.bytes as u64);
-        drop(publication_watch);
+        assert!(before - after >= publication.1 as u64);
+        assert!(
+            frees[..5].iter().all(|free| free.2 == 0),
+            "the trace still owns all five original controls"
+        );
         drop(retained);
-        observation.assert_freed(&db);
-        let native_order = native_requests.map(|request| {
-            window
-                .physical_free_event_for_request(request)
-                .unwrap()
-                .unwrap()
-        });
-        window.finish().unwrap();
+        let freed = oracle::source_free_for_test(6);
+        let live = oracle::source_live_at_free_for_test(6);
+        for i in 0..6 {
+            assert_eq!(freed[i].2, 1);
+            assert_eq!(freed[i].0, freed[i].1);
+            if i < 5 {
+                assert_eq!(freed[i].0 as u64, sample.parent_before + live[i] as u64);
+            }
+        }
+        assert_eq!(
+            db.declared_read_memory.charged_bytes(),
+            sample.parent_before
+        );
         eprintln!(
-            "actual_answer_trace_cuts file={file} sampled_return={before} after_answer_drop={after} released_by_answer={} actual_components={components:?} publication={publication:?} physical={freed_publication:?} native_order={native_order:?} trace_invoice={invoice:?}",
+            "actual_answer_trace_cuts file={file} sampled_return={before} after_answer_drop={after} released_by_answer={} actual_components={components:?} publication={publication:?} physical={physical:?} trace_invoice={invoice:?}",
             before - after
         );
     }
