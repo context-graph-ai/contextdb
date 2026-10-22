@@ -2057,7 +2057,7 @@ impl RedbPersistence {
                                     .scope(|| Self::decode_versioned_row(value.value(), None))?;
                                 #[cfg(all(test, feature = "test-seams"))]
                                 crate::database::consolidation_metadata_contract_tests::observe_projection_decode_window(1, false, row_memory.as_ref().unwrap().held());
-                                Ok((key, decoded))
+                                Ok::<_, Error>((key, decoded))
                             })
                             .transpose()?
                     };

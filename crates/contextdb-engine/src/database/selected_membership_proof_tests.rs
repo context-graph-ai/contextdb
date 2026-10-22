@@ -35,6 +35,8 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
         let snapshot = db.snapshot();
         let child = db.ordinary_read_child().unwrap();
         crate::executor::bounded::with_native_read_memory(child, |memory| {
+            let image = crate::read_image_memory::ImageMemory::new_direct_reader(None, memory.clone())?;
+            image.scope(|| {
             let _intent = db.vector_historical_read_intent(snapshot, memory.clone());
             let mut copies = crate::vector_read_memory::admission(memory.clone());
             let _scope = db.vector_read_scope(snapshot, memory.clone(), &mut copies).unwrap();
@@ -69,8 +71,9 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
             crate::vector_read_memory::watch_native_admissions_for_test();
             let selected = source.select_visible_by_row(identity.row_id, snapshot, &mut || true, &mut copies).unwrap().unwrap();
             let mut body_window = copies.scratch();
+            let body_admissions = std::cell::Cell::new(0usize);
             let loaded = loader.load_selected_candidate(selected.as_ref(), true, &mut |request| match request {
-                DormantVectorLoadRequest::Reserve(bytes) => { body_window.reserve(bytes).unwrap(); true }
+                DormantVectorLoadRequest::Reserve(bytes) => { body_admissions.set(body_admissions.get() + 1); body_window.reserve(bytes).unwrap(); true }
                 _ => true,
             }).unwrap();
             assert_eq!(selected.identity(), identity, "selected record preserves the genuine cursor identity; the actual loader checks its body");
@@ -80,6 +83,7 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
             let row_controls = admissions.iter().filter(|a| a.admitted && a.parent == db.declared_read_memory.as_ref() as *const crate::vector_read_memory::DeclaredReadMemory as usize && a.operation == "historical_row_controls").count();
             assert_eq!(row_controls, 1, "one consumed membership interval needs one owning-row reconciliation: {work:?}, {history:?}");
             assert_eq!(work.decoded_rows, 1, "selection/body reuse the same authenticated owning row");
+            assert_eq!(body_admissions.get(), 1, "one actual selected-body reservation");
             assert_eq!(work.vector_body_accesses, 1);
             assert_eq!(work.decoded_vectors, 1);
             assert!(history.manifest_members_visited <= 2, "one version and at most one boundary witness: {history:?}");
@@ -87,6 +91,7 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
             drop(body_window);
             drop(selected);
             Ok(())
+            })
         }).unwrap();
         db.close().unwrap();
     }
