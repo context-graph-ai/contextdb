@@ -34819,19 +34819,9 @@ impl Database {
     ) -> Result<QueryResult> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        #[cfg(any(test, feature = "test-seams"))]
-        let before_lsn = self.tx_mgr.capture_published_read().lsn;
-        let result = QueryResult::publish_with(read_memory.clone(), || {
+        QueryResult::publish_with(read_memory.clone(), || {
             self.execute_owned_with_read_memory(sql, params, read_memory)
-        });
-        #[cfg(any(test, feature = "test-seams"))]
-        if result.is_ok() && self.tx_mgr.capture_published_read().lsn > before_lsn {
-            // Statement staging, commit callbacks and the terminal write set
-            // have physically dropped. Sample the still-live writer at this
-            // existing API boundary, before returning its answer to the caller.
-            self.emit_writer_memory_ownership_receipt_for_test("commit");
-        }
-        result
+        })
     }
 
     pub(crate) fn execute_owned_with_read_memory(
@@ -37923,11 +37913,11 @@ impl Database {
             read_memory.clone(),
         )?
         .enter();
-        if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
-            return handle.with_host(|host| self.commit_owned_ordinary(host, tx, source, event_bus_ddl,
+        let outcome = if let DatabaseTransactionHost::Owned(handle) = &self.tx_mgr {
+            handle.with_host(|host| self.commit_owned_ordinary(host, tx, source, event_bus_ddl,
                 trigger_ddl, sync_pull_trigger_audit_projection, sync_trigger_derived_rows_are_local,
-                delivery_prepare, vector_copy_owner, read_memory.clone()));
-        }
+                delivery_prepare, vector_copy_owner, read_memory.clone()))
+        } else {
         (|| {
             let vector_copy_owner = std::cell::RefCell::new(vector_copy_owner);
             let detached_capture = std::cell::Cell::new(None::<bool>);
@@ -38605,8 +38595,6 @@ impl Database {
 
             if !ws.is_empty() {
                 self.release_committed_row_body_allocations(&ws);
-                #[cfg(any(test, feature = "test-seams"))]
-                self.emit_writer_memory_ownership_receipt_for_test("commit");
                 self.plugin.post_commit(&ws, source);
                 let sink_events_to_publish = if self.persistence.is_some() {
                     ws.commit_lsn
@@ -38643,6 +38631,14 @@ impl Database {
                 conditional_conflict_count: 0,
             })
         })()
+        };
+        #[cfg(any(test, feature = "test-seams"))]
+        if matches!(&outcome, Ok(outcome) if outcome.committed_tx.is_some()) {
+            // The terminal write set and callback-local invoices have dropped;
+            // retained snapshot and adapter owners remain visible in the sum.
+            self.emit_writer_memory_ownership_receipt_for_test("commit");
+        }
+        outcome
     }
 
     fn reject_user_conditional_update_conflicts(
@@ -99975,10 +99971,14 @@ fn compact_currency_versions_inner(
         0
     };
 
+    // Only tables with selected row or vector removals belong to this
+    // atomic cleanup. Unchanged tables' generation catalogs are handled by
+    // catalog maintenance, without occupying this batch's removal workspace.
     let generation_cleanup = prepare_cleanup_generations(
         vector_store,
         persistence,
-        tables.iter().copied(),
+        row_keys.iter().map(|(table, _, _, _)| table.as_str())
+            .chain(released_vectors.iter().map(|version| version.index.table.as_str())),
         active_removal_pass.registered_snapshots(),
         &mut vector_copy_owner,
     )?;
