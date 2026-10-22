@@ -12590,11 +12590,8 @@ mod original_ddl_occurrences {
         bytes
     }
 
-    fn prefix(
-        change: &DdlChange,
-        admission: &mut content_identity::original_writer::ProofAdmission,
-    ) -> Result<Vec<u8>> {
-        let (kind, name) = match change {
+    fn prefix_parts(change: &DdlChange) -> (u8, &str) {
+        match change {
             DdlChange::CreateTable { name, .. } => (0, name),
             DdlChange::DropTable { name } => (1, name),
             DdlChange::AlterTable { name, .. } => (2, name),
@@ -12607,16 +12604,22 @@ mod original_ddl_occurrences {
             DdlChange::CreateRoute { name, .. } => (9, name),
             DdlChange::DropRoute { name, .. } => (10, name),
             DdlChange::CreateTriggerIncludingSync { name, .. } => (11, name),
-        };
-        // The decoded declaration already retains its exact original invoice.
-        // This closed serializer borrows only strings, vectors, tuples and
-        // primitive enums; HashWriter and the codec controls stay on the stack.
-        // Fund the one native selector buffer, including its eventual suffix,
-        // before allocation so appending the occurrence cannot grow it.
-        let bytes = name.len().checked_add(42 + 12)
-            .ok_or_else(|| damage("declaration selector capacity overflow"))?;
-        admission.admit(bytes)?;
-        let mut key = Vec::with_capacity(bytes);
+        }
+    }
+
+    fn prefix_buffer_bytes(change: &DdlChange) -> Result<usize> {
+        let (_, name) = prefix_parts(change);
+        name.len().checked_add(42 + 12)
+            .ok_or_else(|| damage("declaration selector capacity overflow"))
+    }
+
+    fn prefix(change: &DdlChange) -> Result<Vec<u8>> {
+        let (kind, name) = prefix_parts(change);
+        // Both callers prepay through their existing original owner. Include
+        // the writer's eventual suffix so appending it cannot grow the buffer.
+        // This closed serializer borrows strings, vectors, tuples and primitive
+        // enums; HashWriter and the codec controls stay on the stack.
+        let mut key = Vec::with_capacity(prefix_buffer_bytes(change)?);
         key.extend_from_slice(&[1, kind]);
         key.extend_from_slice(&(name.len() as u64).to_be_bytes());
         key.extend_from_slice(name.as_bytes());
@@ -12849,8 +12852,9 @@ mod original_ddl_occurrences {
                     // frame.decode retains the exact decoded-body invoice until
                     // every declaration use and physical payload free has ended.
                     let change: DdlChange = frame.decode(value.value())?;
-                    let mut selector = prefix(&change, admission)?;
-                    body_bytes = selector.capacity();
+                    body_bytes = prefix_buffer_bytes(&change)?;
+                    admission.admit(body_bytes)?;
+                    let mut selector = prefix(&change)?;
                     selector.extend_from_slice(&suffix(at));
                     let mut marker = |namespace: &str| -> Result<bool> {
                         let key = format!("{namespace}{:020}.{:06}", at.0.0, at.1);
