@@ -1416,9 +1416,16 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
         assert_eq!(refusal.refusals, 1);
         assert_eq!(refusal.peak, native_requests[0].1 as u64);
         assert_eq!(refusal.control_bytes, native_requests[0].1);
+        // A file-backed fixture can retain a separate setup owner. Its
+        // independently captured initial control set is unchanged by freeing
+        // all eight requests above; never count it as this query's dead trace.
+        let first_created = sample.identity.target_created.expect("actual first constructor");
+        assert_eq!(first_created.child_control_bytes, native_requests[0].1);
+        let standing_controls = first_created.live_controls_after
+            .checked_sub(native_requests[0].1 as u64).unwrap();
         assert_eq!(
-            actual.live_controls_before, native_requests[0].1 as u64,
-            "no old sibling control remains at this actual refusal"
+            actual.live_controls_before, standing_controls + native_requests[0].1 as u64,
+            "only the preexisting fixture controls and the new actual native block remain"
         );
         assert_eq!(refusal.parent_before, stable);
         assert_eq!(refusal.parent_after, stable);
@@ -1468,7 +1475,7 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
             let mut answer = None;
             let mut cursor = None;
             let mut page = None;
-            oracle::measured(|| {
+            let _ = observed(&db, || {
                 match route {
                     "request" => {
                         // Exercise the real provider's Native route and its
