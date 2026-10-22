@@ -100,25 +100,26 @@ fn progress_state(reason: PagedBuildReason) -> &'static str {
 
 /// Engine hooks shared by every batch of one registered build.
 pub(super) fn paged_build_hooks(
-    _vector: &Arc<VectorStore>,
+    vector: &Arc<VectorStore>,
     tx_mgr: &DatabaseTransactionHost,
     resource_closed: &Arc<AtomicBool>,
     publication_interrupted: &Arc<AtomicBool>,
-    _partition: &VectorPartitionRef,
+    partition: &VectorPartitionRef,
     record: &PagedBuildRecord,
 ) -> Result<PagedBuildHooks> {
     record.progress()?;
     let closed = Arc::clone(resource_closed);
     let interrupted = Arc::clone(publication_interrupted);
     let gate_manager = tx_mgr.downgrade();
-    #[cfg(any(test, feature = "test-seams"))]
-    let insertion_pause = {
-        let vector = Arc::downgrade(_vector);
-        let partition = _partition.clone();
+    let insertion_progress = {
+        let vector = Arc::downgrade(vector);
+        let partition = partition.clone();
         // A restored builder can be armed after open. Resolve the existing
         // pause at insertion time rather than freezing its state at registration.
         Arc::new(move |done| {
             if let Some(vector) = vector.upgrade() {
+                vector.advance_partition_paged_build_inspection(&partition, done);
+                #[cfg(any(test, feature = "test-seams"))]
                 vector.maybe_pause_paged_build_insertion_for_test(&partition, done);
             }
         })
@@ -133,12 +134,10 @@ pub(super) fn paged_build_hooks(
             }
             Ok(())
         }),
-        // Only an armed existing test pause observes unfinished identities.
-        // Durable progress remains at the preceding complete batch until commit.
-        #[cfg(any(test, feature = "test-seams"))]
-        inserted: insertion_pause,
-        #[cfg(not(any(test, feature = "test-seams")))]
-        inserted: Arc::new(|_| {}),
+        // Live inspection advances after a complete identity insertion. Durable
+        // progress still advances only when its entire batch commits; the caller
+        // restores that durable value after either success or abort.
+        inserted: insertion_progress,
         gate: Arc::new(move |work| {
             let manager = gate_manager
                 .upgrade()

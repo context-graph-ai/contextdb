@@ -14819,8 +14819,7 @@ impl VectorStore {
         Ok(progress)
     }
 
-    /// Report only committed paged-build progress. The existing armed pause
-    /// observes insertion inside the pending batch through its own callback.
+    /// Report the durable checkpoint after a paged batch completes or aborts.
     #[doc(hidden)]
     pub fn report_partition_paged_build_progress(
         &self,
@@ -14842,6 +14841,20 @@ impl VectorStore {
             vectors_done: vectors_done.min(vectors_total),
             checkpoint_tx,
         });
+    }
+
+    /// Advance live inspection without changing the durable builder cursor or
+    /// publishing any searchable generation. Uses the resident progress guard's
+    /// existing update path; the engine resets it to durable progress on abort.
+    #[doc(hidden)]
+    pub fn advance_partition_paged_build_inspection(
+        &self,
+        partition: &VectorPartitionRef,
+        vectors_done: usize,
+    ) {
+        if let Some(state) = self.try_partition_state(&partition.index, &partition.partition_key) {
+            state.set_maintenance_vectors_done(vectors_done);
+        }
     }
 
     /// Drop a registered paged build whose durable record was erased. Waits
