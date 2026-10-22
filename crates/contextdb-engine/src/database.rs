@@ -15262,6 +15262,41 @@ impl DatabaseTransactionHost {
 
     #[expect(
         clippy::result_large_err,
+        reason = "Preserve the existing public diagnostic through postcommit publication."
+    )]
+    fn with_deferred_metadata_write_after_commit<R>(&self, committed: &std::cell::Cell<bool>, write: impl FnOnce() -> Result<R>) -> Result<R> {
+        let publish = || {
+            let reservation = self.reserve_deferred_metadata_publication()?;
+            let result = write();
+            // A postcommit error cannot withdraw the already durable schema.
+            // Complete the existing prepaid publication on either outcome.
+            if committed.get() {
+                self.owe_metadata_publication(reservation);
+            }
+            result
+        };
+        match self {
+            Self::Legacy(_) => publish(),
+            Self::Owned(handle) => handle.with_host(|host| {
+                host.with_metadata_publication_scope(|| {
+                    if self.commit_boundary_held_by_current_thread() {
+                        publish()
+                    } else {
+                        // A native deferred Box must be completed by this
+                        // operation's commit boundary before its stack owner
+                        // ends. Inherit an existing guard; otherwise take the
+                        // same guard used by every other metadata publication.
+                        host.transactions.with_transactions(|transactions| {
+                            transactions.with_commit_lock(publish)
+                        })
+                    }
+                })
+            }),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn reserve_deferred_metadata_publication(
@@ -26417,6 +26452,31 @@ fn publish_direct_metadata<R>(
         let result = write()?;
         publication.complete();
         Ok(result)
+    })
+}
+
+// The narrow publisher knows exactly when its durable write and infallible
+// memory swap completed. Preserve that publication even if its later observer
+// reports an error; precommit failures still abandon their unused reservation.
+#[expect(
+    clippy::result_large_err,
+    reason = "Preserve the existing public diagnostic through postcommit publication."
+)]
+fn publish_direct_metadata_after_commit<R>(
+    tx_mgr: &DatabaseTransactionHost,
+    committed: &std::cell::Cell<bool>,
+    write: impl FnOnce() -> Result<R>,
+) -> Result<R> {
+    if tx_mgr.commit_boundary_held_by_current_thread() {
+        return tx_mgr.with_deferred_metadata_write_after_commit(committed, write);
+    }
+    tx_mgr.with_maintenance_publication(|publication| {
+        publication.reserve()?;
+        let result = write();
+        if committed.get() {
+            publication.complete();
+        }
+        result
     })
 }
 
@@ -83320,12 +83380,13 @@ impl Database {
                 published_policy = self.vector_store.publish_policy_layout_update(prepared);
             }
         };
+        let committed = std::cell::Cell::new(false);
         let result = if let Some(persistence) = &self.persistence {
             // The durable occurrence is an admitted temporary encoding input,
             // not a resident history entry. Persistence keeps the occurrence
             // and its summary/configuration in the same durable transaction.
             let durable_ddl = [self.alter_table_ddl_for_meta(name, meta, Vec::new())];
-            self.publish_direct_metadata(|| {
+            publish_direct_metadata_after_commit(&self.tx_mgr, &committed, || {
                 persistence.publish_vector_policy_metadata_and_ddl(
                     name,
                     meta,
@@ -83336,7 +83397,10 @@ impl Database {
                     lsn,
                     &durable_ddl,
                     &metadata_memory,
-                    publish,
+                    || {
+                        publish();
+                        committed.set(true);
+                    },
                 )
             })
         } else {

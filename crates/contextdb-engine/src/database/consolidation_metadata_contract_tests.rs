@@ -581,7 +581,7 @@ fn consolidation_crash_cuts_recover_complete_metadata_and_ddl_with_unchanged_dat
         assert!(!output.status.success());
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains(&format!("CURRENCY_RECLAIM_CRASH={cut}")),
+                .contains(&format!("POLICY_METADATA_CRASH={cut}")),
             "the child must reach its selected cut: {:?}",
             output
         );

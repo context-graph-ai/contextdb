@@ -52691,7 +52691,10 @@ fn policy_metadata_checkpoint_for_test(boundary: u8) -> Result<()> {
         Some(crash)
     });
     match crash {
-        Some(true) => std::process::abort(),
+        Some(true) => {
+            eprintln!("POLICY_METADATA_CRASH={boundary}");
+            std::process::abort()
+        },
         Some(false) => Err(Error::Other("injected policy metadata publication failure".into())),
         None => Ok(()),
     }
