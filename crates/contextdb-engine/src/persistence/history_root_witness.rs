@@ -69,6 +69,68 @@ fn matches(bytes: &[u8], root: Option<[u8; 32]>) -> bool {
             None => bytes[18..].iter().all(|byte| *byte == 0),
         }
 }
+// Fixed diagnostic custody: last sixteen actual authored-root producer cuts.
+// No engine invoice, mutation, verification or acceptance equation changes.
+#[cfg(any(test, feature = "test-seams"))]
+mod root_phase {
+    use std::cell::RefCell;
+    #[derive(Clone, Copy, Debug)]
+    struct Cut {
+        ordinal: u64,
+        phase: &'static str,
+        physical: Option<Option<[u8; 32]>>,
+        witness: Option<[u8; 50]>,
+    }
+    thread_local! { static CUTS: RefCell<([Option<Cut>;16],u64)> = const { RefCell::new(([None;16],0)) }; }
+    pub(super) fn observe(
+        name: &str,
+        phase: &'static str,
+        physical: Option<Option<[u8; 32]>>,
+        witness: Option<&[u8]>,
+        failed: bool,
+    ) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("CONTEXTDB_HISTORY_ROOT_PHASES").is_some())
+            || name != "__authored_row_bodies"
+        {
+            return;
+        }
+        let witness = witness.and_then(|bytes| bytes.try_into().ok());
+        CUTS.with(|slot| {
+            let mut cuts = slot.borrow_mut();
+            let ordinal = cuts.1 + 1;
+            cuts.0[(ordinal as usize - 1) % 16] = Some(Cut {
+                ordinal,
+                phase,
+                physical,
+                witness,
+            });
+            cuts.1 = ordinal;
+            if failed {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "authored_root_failure pid={} final_ordinal={ordinal}",
+                    std::process::id()
+                );
+                for index in 0..16 {
+                    let at = (ordinal as usize + index) % 16;
+                    if let Some(cut) = cuts.0[at] {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "authored_root_cut ordinal={} phase={} physical={:?} witness={:?}",
+                            cut.ordinal,
+                            cut.phase,
+                            cut.physical,
+                            cut.witness
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
 impl RedbPersistence {
     #[expect(
         clippy::result_large_err,
@@ -132,6 +194,21 @@ impl RedbPersistence {
         .map_err(Self::storage_error)?;
         let mut witnesses = write.open_table(WITNESSES).map_err(Self::storage_error)?;
         let previous = witnesses.get(name).map_err(Self::storage_error)?;
+        #[cfg(any(test, feature = "test-seams"))]
+        root_phase::observe(
+            name,
+            match event {
+                BeforeOpen => "before_open",
+                BeforeDelete => "before_delete",
+                BeforeRelocate => "before_relocate",
+                AfterClose => "after_close",
+                AfterRelocate => "after_relocate",
+                AfterDelete => "after_delete",
+            },
+            physical,
+            previous.as_ref().map(|value| value.value()),
+            false,
+        );
         match event {
             BeforeOpen | BeforeDelete | BeforeRelocate => {
                 match (physical, previous.as_ref()) {
@@ -167,6 +244,14 @@ impl RedbPersistence {
                 witnesses
                     .insert(name, encoded.as_slice())
                     .map_err(Self::storage_error)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                root_phase::observe(
+                    name,
+                    "witness_published",
+                    physical,
+                    Some(encoded.as_slice()),
+                    false,
+                );
             }
             AfterDelete => {
                 drop(previous);
@@ -307,6 +392,14 @@ impl RedbPersistence {
         let witness = witnesses
             .get(name)
             .map_err(|error| map_error(error.into()))?;
+        #[cfg(any(test, feature = "test-seams"))]
+        root_phase::observe(
+            name,
+            "captured_read",
+            physical,
+            witness.as_ref().map(|value| value.value()),
+            !matches!((physical,witness.as_ref()),(Some(root),Some(witness)) if matches(witness.value(),root)),
+        );
         match (physical, witness) {
             (Some(root), Some(witness)) if matches(witness.value(), root) => Ok(()),
             _ => Err(corruption(
