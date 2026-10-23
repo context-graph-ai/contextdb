@@ -52,6 +52,82 @@ pub(crate) struct HistoricalRowProof {
     _controls: SourceWindowCredit,
 }
 impl HistoricalRowProof {
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn assert_real_visitor_rejects_other_bindings_for_test(
+        &mut self,
+        root: &WriterSnapshotHandle,
+        other_root: &WriterSnapshotHandle,
+        table: &str,
+        row: RowId,
+        row_snapshot: SnapshotId,
+        operation_snapshot: SnapshotId,
+        memory: &contextdb_core::read_memory::ReadMemoryOwner,
+        other_memory: &contextdb_core::read_memory::ReadMemoryOwner,
+    ) {
+        let rejected =
+            |proof: &HistoricalRowProof,
+             root: &WriterSnapshotHandle,
+             table: &str,
+             operation_snapshot: SnapshotId,
+             memory: contextdb_core::read_memory::ReadMemoryOwner| {
+                let visits = std::cell::Cell::new(0usize);
+                let result = root.visit_historical_rows_with_proof(
+                    table,
+                    Some(row),
+                    row_snapshot,
+                    operation_snapshot,
+                    memory,
+                    proof,
+                    &mut || Ok(()),
+                    &mut |_| {
+                        visits.set(visits.get() + 1);
+                        Ok(())
+                    },
+                );
+                assert!(
+                    matches!(result, Err(Error::StoreCorrupted { .. })),
+                    "the actual row producer must reject the foreign fixed proof before visiting rows: {result:?}"
+                );
+                assert_eq!(visits.get(), 0);
+            };
+        rejected(
+            self,
+            root,
+            "other_proof",
+            operation_snapshot,
+            memory.clone(),
+        );
+        rejected(self, other_root, table, operation_snapshot, memory.clone());
+        rejected(self, root, table, operation_snapshot, other_memory.clone());
+        rejected(
+            self,
+            root,
+            table,
+            SnapshotId(operation_snapshot.0 + 1),
+            memory.clone(),
+        );
+        // Keep every actual root/owner/credit alive; move only this proof's
+        // pinned read alias to a different real storage snapshot for the call.
+        let saved = std::mem::replace(&mut self.read, other_root.owner_read().unwrap());
+        let visits = std::cell::Cell::new(0usize);
+        let result = root.visit_historical_rows_with_proof(
+            table,
+            Some(row),
+            row_snapshot,
+            operation_snapshot,
+            memory.clone(),
+            self,
+            &mut || Ok(()),
+            &mut |_| {
+                visits.set(visits.get() + 1);
+                Ok(())
+            },
+        );
+        self.read = saved;
+        assert!(matches!(result, Err(Error::StoreCorrupted { .. })));
+        assert_eq!(visits.get(), 0);
+    }
+
     pub(crate) fn matches(
         &self,
         root: &WriterSnapshotHandle,

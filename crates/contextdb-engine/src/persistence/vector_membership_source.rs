@@ -1559,7 +1559,7 @@ impl SelectedVectorMembership {
     pub(crate) fn assert_row_evidence_bindings_for_test(
         &self,
         other: &MembershipOwner,
-        other_reader: usize,
+        other_reader: &contextdb_core::read_memory::ReadMemoryOwner,
     ) {
         let evidence = self
             .row_evidence
@@ -1596,6 +1596,23 @@ impl SelectedVectorMembership {
             "another real source must be rejected"
         );
         let wrong_root = other.capture_fresh().unwrap();
+        let context = operation_for(&self.owner).unwrap();
+        let mut fixed = context.historical_rows.lock();
+        fixed
+            .as_mut()
+            .expect("actual selected load created the fixed proof")
+            .assert_real_visitor_rejects_other_bindings_for_test(
+                context.root.writer.as_ref().unwrap(),
+                wrong_root.writer.as_ref().unwrap(),
+                &self.record.index.table,
+                identity.row_id,
+                SnapshotId(identity.membership.visible_from.0),
+                context.snapshot,
+                &context.memory,
+                other_reader,
+            );
+        drop(fixed);
+
         assert_ne!(
             wrong_root.read.storage_snapshot_identity(),
             evidence.physical
@@ -1614,7 +1631,7 @@ impl SelectedVectorMembership {
             "another real physical root must be rejected"
         );
         let mut bad = copy();
-        bad.reader = other_reader;
+        bad.reader = other_reader.accounting_identity();
         assert_ne!(bad.reader, evidence.reader);
         assert!(
             verify(&bad).is_err(),
