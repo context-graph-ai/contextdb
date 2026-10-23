@@ -1390,6 +1390,13 @@ impl DirectFileReader {
             .map_err(crate::read_image::history_answer_error)
     }
 
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn original_parent_for_physical_test(
+        &self,
+    ) -> &crate::vector_read_memory::DeclaredReadRoot {
+        &self.declared_read_memory
+    }
+
     /// Obtain the existing reader's operation owner for private page fixtures.
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]

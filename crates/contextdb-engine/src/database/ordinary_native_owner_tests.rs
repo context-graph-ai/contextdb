@@ -387,6 +387,9 @@ fn original_control_cut_is_complete(cut: OriginalControlCut) -> bool {
 
 impl Observation {
     fn begin(db: &Database) -> Self {
+        Self::begin_parent(&db.declared_read_memory)
+    }
+    fn begin_parent(parent: &crate::vector_read_memory::DeclaredReadRoot) -> Self {
         // The existing exact-free oracle reads AtomicUsize. Do not qualify a
         // target where that read would differ from this real AtomicU64 counter.
         assert_eq!(
@@ -404,10 +407,10 @@ impl Observation {
             );
             slot.set(Capture {
                 active: true,
-                parent: db.declared_read_memory.as_ref() as *const DeclaredReadMemory as usize,
-                parent_counter: db.declared_read_memory.ordinary_parent_counter_for_test(),
-                baseline: db.declared_read_memory.charged_bytes(),
-                declared_limit: db.declared_read_memory.effective_limit_for_physical_test(),
+                parent: parent.as_ref() as *const DeclaredReadMemory as usize,
+                parent_counter: parent.ordinary_parent_counter_for_test(),
+                baseline: parent.charged_bytes(),
+                declared_limit: parent.effective_limit_for_physical_test(),
                 ..Capture::default()
             });
         });
@@ -565,10 +568,14 @@ impl Drop for Observation {
 // counter, not a mirrored balance. Only the three selected constructor requests
 // are consumed; later ordinary query allocations are outside this receipt.
 fn observed<T>(db: &Database, action: impl FnOnce() -> T) -> (T, [Request; 3], usize) {
-    let (value, requests, count) = oracle::source_requests_for_test(
-        db.declared_read_memory.ordinary_parent_counter_for_test(),
-        action,
-    );
+    observed_parent(&db.declared_read_memory, action)
+}
+fn observed_parent<T>(
+    parent: &crate::vector_read_memory::DeclaredReadRoot,
+    action: impl FnOnce() -> T,
+) -> (T, [Request; 3], usize) {
+    let (value, requests, count) =
+        oracle::source_requests_for_test(parent.ordinary_parent_counter_for_test(), action);
     let credits = oracle::source_request_credit_for_test();
     update(|c| {
         if c.stages > 3 || count < c.constructor_base + c.stages {
@@ -1626,21 +1633,29 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
             if let Some(page) = &page {
                 assert_eq!(page.rows(), vec![vec![Value::Int64(1)]]);
             }
-            assert_route_original_physical_invoices(&db, capture, route, file, || {
-                drop(answer);
-                drop(page);
-                drop(initial_page);
-                if let Some(cursor) = cursor {
-                    cursor.close().unwrap();
-                }
-                (route == "cursor").then_some(session)
-            });
+            assert_route_original_physical_invoices(
+                &db,
+                &db.declared_read_memory,
+                capture,
+                route,
+                file,
+                || {
+                    drop(answer);
+                    drop(page);
+                    drop(initial_page);
+                    if let Some(cursor) = cursor {
+                        cursor.close().unwrap();
+                    }
+                    (route == "cursor").then_some(session)
+                },
+            );
         }
     }
 }
 
 fn assert_route_original_physical_invoices(
     db: &Database,
+    parent: &crate::vector_read_memory::DeclaredReadRoot,
     capture: Observation,
     route: &str,
     file: bool,
@@ -1708,7 +1723,7 @@ fn assert_route_original_physical_invoices(
             "{route} keeps each actual original invoice through physical free, including the grouped payload and inline credits"
         );
     }
-    assert_eq!(db.declared_read_memory.charged_bytes(), controls.baseline);
+    assert_eq!(parent.charged_bytes(), controls.baseline);
     eprintln!(
         "actual_request_cursor_physical route={route} file={file} requests={:?} frees={:?}",
         &requests[..count],
@@ -1768,14 +1783,16 @@ fn actual_direct_file_public_readers_keep_original_invoices_through_physical_fre
                 "must be the actual committed direct-file route"
             );
             session
-                .__with_resident_history_for_test(|db| {
+                .with_direct_file_physical_context_for_test(|db, parent| {
                     db.clear_last_vector_search_trace();
-                    let capture = Observation::begin_at_actual_native_constructor(db);
-                    let (answer, _, _) = observed(db, || session.execute(query, &params).unwrap());
+                    let capture = Observation::begin_parent(parent);
+                    update(|c| c.allow_constructor_prefix = true);
+                    let (answer, _, _) =
+                        observed_parent(parent, || session.execute(query, &params).unwrap());
                     assert_eq!(answer.rows(), vec![vec![Value::Int64(0)]]);
                     // The live session owns only its standing root, not this
                     // per-operation native child or the escaped actual trace.
-                    assert_route_original_physical_invoices(db, capture, route, true, || {
+                    assert_route_original_physical_invoices(db, parent, capture, route, true, || {
                         drop(answer);
                         None
                     });
@@ -1790,17 +1807,20 @@ fn actual_direct_file_public_readers_keep_original_invoices_through_physical_fre
             let reader = DirectFileReader::open(&path, config).unwrap();
             let target = reader.execution_target();
             let db = target.resident_history_database_for_test().unwrap();
+            let parent = reader.original_parent_for_physical_test();
             db.clear_last_vector_search_trace();
-            let capture = Observation::begin_at_actual_native_constructor(db);
+            let capture = Observation::begin_parent(parent);
+            update(|c| c.allow_constructor_prefix = true);
             if route == "direct-reader-execute" {
-                let (answer, _, _) = observed(db, || reader.execute(query, &params).unwrap());
+                let (answer, _, _) =
+                    observed_parent(parent, || reader.execute(query, &params).unwrap());
                 assert_eq!(answer.result.rows(), vec![vec![Value::Int64(0)]]);
-                assert_route_original_physical_invoices(db, capture, route, true, || {
+                assert_route_original_physical_invoices(db, parent, capture, route, true, || {
                     drop(answer);
                     None
                 });
             } else {
-                let (mut opened, _, _) = observed(db, || {
+                let (mut opened, _, _) = observed_parent(parent, || {
                     reader.open_cursor(
                     "SELECT id FROM route_points ORDER BY v <=> $v USE VECTOR EXACT LIMIT 2",
                     &params, NonZeroUsize::MIN).unwrap()
@@ -1813,7 +1833,7 @@ fn actual_direct_file_public_readers_keep_original_invoices_through_physical_fre
                 let next = opened.cursor.fetch(Some(NonZeroUsize::MIN)).unwrap();
                 assert_eq!(next.page_for_test().rows, &[vec![Value::Int64(1)]]);
                 assert!(!next.page_for_test().has_more);
-                assert_route_original_physical_invoices(db, capture, route, true, || {
+                assert_route_original_physical_invoices(db, parent, capture, route, true, || {
                     drop(next);
                     drop(opened.first_page);
                     opened.cursor.close().unwrap();

@@ -6567,6 +6567,23 @@ pub(crate) fn owner_read_not_implemented_status() -> OwnerReadStatus {
 
 #[cfg(any(test, feature = "test-seams"))]
 impl ReadSession {
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn with_direct_file_physical_context_for_test<T>(
+        &self,
+        action: impl FnOnce(&Database, &crate::vector_read_memory::DeclaredReadRoot) -> Result<T>,
+    ) -> Result<T> {
+        let ReadSessionState::DirectFile(reader) = self.state.as_ref() else {
+            return Err(Error::PlanError(
+                "physical fixture requires the direct-file route".into(),
+            ));
+        };
+        let target = reader.execution_target();
+        action(
+            target.resident_history_database_for_test()?,
+            reader.original_parent_for_physical_test(),
+        )
+    }
+
     /// Use the Database already installed behind this session's execution
     /// target, preserving its captured root and fallible history capability.
     #[doc(hidden)]
