@@ -55,12 +55,12 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
         let other_owner = MembershipOwner::Writable(other.persistence.as_ref().unwrap().clone());
         let other_reader_memory = crate::executor::bounded::with_native_read_memory(
             db.ordinary_read_child().unwrap(),
-            |memory| Ok(memory.clone()),
+            |memory, _trace_refund| Ok(memory.clone()),
         )
         .unwrap();
         let snapshot = db.snapshot();
         let child = db.ordinary_read_child().unwrap();
-        crate::executor::bounded::with_native_read_memory(child, |memory| {
+        crate::executor::bounded::with_native_read_memory(child, |memory, _trace_refund| {
             let image = crate::read_image_memory::ImageMemory::new_direct_reader(None, memory.clone())?;
             image.scope(|| {
             let _intent = db.vector_historical_read_intent(snapshot, memory.clone());
