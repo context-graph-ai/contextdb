@@ -167,7 +167,7 @@ fn historical_receipt_preserves_old_and_current_indexed_answers_across_overwrite
         Some(VectorSearchRoute::Indexed)
     );
     assert_eq!(
-        old_answer.trace().vector_search.as_ref().unwrap().evidence,
+        old_answer.trace().vector_search.as_ref().unwrap().route_evidence,
         VectorSearchRouteEvidence::Executed
     );
     let history = observed.historical_counters();
@@ -188,7 +188,7 @@ fn historical_receipt_preserves_old_and_current_indexed_answers_across_overwrite
         Some(VectorSearchRoute::Indexed)
     );
     assert_eq!(
-        current.trace().vector_search.as_ref().unwrap().evidence,
+        current.trace().vector_search.as_ref().unwrap().route_evidence,
         VectorSearchRouteEvidence::Executed
     );
     drop(current);
