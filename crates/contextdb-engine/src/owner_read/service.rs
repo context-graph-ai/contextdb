@@ -796,6 +796,8 @@ struct OwnerServiceWorkerState {
 struct OwnerServiceWorkers {
     wake_writer: std::os::unix::net::UnixStream,
     state: Mutex<OwnerServiceWorkerState>,
+    #[cfg(feature = "test-seams")]
+    carrier_requests_changed: std::sync::Condvar,
 }
 
 #[cfg(unix)]
@@ -804,6 +806,8 @@ impl OwnerServiceWorkers {
         Self {
             wake_writer,
             state: Mutex::new(OwnerServiceWorkerState::default()),
+            #[cfg(feature = "test-seams")]
+            carrier_requests_changed: std::sync::Condvar::new(),
         }
     }
 
@@ -988,6 +992,8 @@ impl OwnerServiceWorkers {
             .active_carrier_requests
             .checked_sub(1)
             .expect("owner carrier-request count cannot underflow");
+        #[cfg(feature = "test-seams")]
+        self.carrier_requests_changed.notify_all();
     }
 
     fn active_carrier_requests(&self) -> usize {
@@ -2056,6 +2062,24 @@ impl OwnerReadService {
             )
             .unwrap_or(u64::MAX),
             accountant_used_bytes: u64::try_from(usage.used).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Wait for the carrier to finish requests whose terminal frames a test
+    /// has already received, before advancing its shared manual clock.
+    #[cfg(all(unix, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn wait_for_carrier_requests_for_test(&self, on_wait: impl FnOnce()) {
+        let mut state = self.workers.state.lock().expect("owner service workers");
+        if state.active_carrier_requests != 0 {
+            on_wait();
+        }
+        while state.active_carrier_requests != 0 {
+            state = self
+                .workers
+                .carrier_requests_changed
+                .wait(state)
+                .expect("owner carrier completion wait");
         }
     }
 

@@ -7,6 +7,9 @@
 //! process's actual thread names and resident set, then waits for this
 //! fixture's actual accept-thread and final-service events before measuring.
 
+#[path = "../fixtures/isolated_process.rs"]
+mod isolated_process;
+
 use contextdb_engine::local_transport::MonotonicDeadlineClock;
 use contextdb_engine::{
     Database, DatabaseOpenOptions, OwnerReadConfig, OwnerReadTestHooks, ReadRoute, ReadSession,
@@ -92,6 +95,12 @@ fn owner_thread_count() -> usize {
 
 #[test]
 fn census_counts_a_live_named_owner_thread() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "census_counts_a_live_named_owner_thread",
+    ) {
+        return;
+    }
     let baseline = owner_thread_count();
     let (ready, started) = mpsc::channel();
     let (release, wait) = mpsc::channel::<()>();
@@ -113,6 +122,12 @@ fn census_counts_a_live_named_owner_thread() {
 
 #[test]
 fn census_distinguishes_kernel_exit_and_rejects_malformed_flags() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "census_distinguishes_kernel_exit_and_rejects_malformed_flags",
+    ) {
+        return;
+    }
     let tasks = tempfile::tempdir().expect("task-scoped synthetic proc directory");
     let task = tasks.path().join("1");
     std::fs::create_dir(&task).unwrap();
@@ -139,6 +154,12 @@ fn census_distinguishes_kernel_exit_and_rejects_malformed_flags() {
 
 #[test]
 fn census_allows_disappeared_tasks_but_rejects_other_io_errors() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "census_allows_disappeared_tasks_but_rejects_other_io_errors",
+    ) {
+        return;
+    }
     let tasks = tempfile::tempdir().expect("task-scoped synthetic proc directory");
     let task = tasks.path().join("1");
     std::fs::create_dir(&task).unwrap();
@@ -154,6 +175,12 @@ fn census_allows_disappeared_tasks_but_rejects_other_io_errors() {
 
 #[test]
 fn census_accepts_enoent_and_esrch_but_panics_on_other_read_errors() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "census_accepts_enoent_and_esrch_but_panics_on_other_read_errors",
+    ) {
+        return;
+    }
     let path = Path::new("/proc/self/task/vanished/comm");
     assert_eq!(
         task_file_result(Ok("contextdb-owner\n".to_owned()), path),
@@ -323,16 +350,34 @@ fn run_cycles(arm: &str, close_before_drop: bool, retain_authenticated_idle_read
 
 #[test]
 fn writable_open_drop_cycles_return_threads_and_memory() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "writable_open_drop_cycles_return_threads_and_memory",
+    ) {
+        return;
+    }
     run_cycles("drop", false, false);
     run_cycles("close", true, false);
 }
 
 #[test]
 fn writable_drop_reaps_an_authenticated_idle_owner_reader() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "writable_drop_reaps_an_authenticated_idle_owner_reader",
+    ) {
+        return;
+    }
     run_cycles("connected-idle-drop", false, true);
 }
 
 #[test]
 fn writable_close_reaps_an_authenticated_idle_owner_reader() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "writable_close_reaps_an_authenticated_idle_owner_reader",
+    ) {
+        return;
+    }
     run_cycles("connected-idle-close", true, true);
 }

@@ -27,6 +27,8 @@ pub(crate) struct TriggerState {
     active_trigger_names: Mutex<Vec<String>>,
     pub(super) wait_lock: Mutex<()>,
     pub(super) waiters: Condvar,
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(super) wait_observed_changed: Condvar,
     pub(super) close_waiter_count: AtomicUsize,
     callback_active_count: AtomicUsize,
     pub(super) next_audit_index: AtomicU64,
@@ -146,6 +148,8 @@ impl TriggerState {
             active_trigger_names: Mutex::new(Vec::new()),
             wait_lock: Mutex::new(()),
             waiters: Condvar::new(),
+            #[cfg(any(test, feature = "test-seams"))]
+            wait_observed_changed: Condvar::new(),
             close_waiter_count: AtomicUsize::new(0),
             callback_active_count: AtomicUsize::new(0),
             next_audit_index: AtomicU64::new(0),

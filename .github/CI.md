@@ -3,8 +3,8 @@
 The normal gate publishes one source-bound inventory containing 29 unchanged logical PR
 command/feature tuples in 26 physical rows and 22 certified integration rows (26 on the
 fail-closed certificate fallback). It dispatches the resulting 49 or 53 physical
-rows in 18 reviewed execution bundles after `impact`. Each bundle contains at most
-three rows and attempts every constituent even after an earlier failure. Every
+rows in 16 reviewed execution bundles after `impact`. Each bundle contains at most
+four rows and attempts every constituent even after an earlier failure. Every
 failed, cancelled, skipped or missing bundle still fails the validator and stable
 `PR checks` aggregate. When integration is classified inactive, the same mapping
 retains all 26 physical PR rows and omits only empty integration-only bundles.
@@ -16,14 +16,16 @@ retains `target/redb`; features and profiles are never combined. A failed consti
 is retained while later constituents still run; missing receipts also fail it. Receipt upload includes every
 constituent directory, including evidence from a failed bundle. Single-shard local
 commands are unchanged. The impact job publishes the source-bound plan and all
-18 bundles once; the integration validator checks their disjoint canonical union,
+16 bundles once; the integration validator checks their disjoint canonical union,
 exact inner payloads, and successful bundle matrix result. Each constituent
 disables automatic job-ID suffixing and carries the historical `-test` suffix in
 its per-row cache key, preserving each old cache namespace; feature sets and
 target directories stay unchanged. The cache action uses its baseline behavior for failed jobs.
-The compile roots form `lint` → `features` → `build` → `cross-compile`; each
-successor runs after predecessor failure unless the workflow is cancelled, so the
-aggregate records every root error. `installed-smoke` remains an independent root.
+The compile roots form `lint` → `build`; `features` also needs only `lint`
+and runs as a sibling of `build`. Each successor runs after predecessor failure unless the
+workflow is cancelled, so the aggregate records every root error. `installed-smoke`,
+`lint-macos` and `cross-compile` (which consumes none of `build`'s outputs and has its own
+cache) remain independent roots, so the aarch64 build is never queued behind `build`.
 Setup savings are a forecast; hosted whole-gate timing remains unproven.
 
 > Normal correctness blocks merge; original scale/corpus qualification
@@ -136,9 +138,10 @@ Superseded PR runs are cancelled; push runs are not.
 |---|---|---|
 | `impact` | `python3 scripts/ci-inventory.py`, then `python3 scripts/ci-impact.py` (CI only) | Two steps in this order. The inventory step runs locally too: every workspace package and the redb fork is covered by a test shard with the right feature closure (fails closed otherwise). The impact step then classifies changed paths for integration (see below); it needs the GitHub Actions event file (`GITHUB_EVENT_PATH`), the `GITHUB_OUTPUT` file and a full-history checkout, so it is not a standalone local command. |
 | `lint` | `bash scripts/verify pr lint` | The job installs `ripgrep` before the offline controls. `python3 -B scripts/ci-build-tests.py`, `python3 -B scripts/ci-required-tests.py` and `python3 -B scripts/ci-inventory-tests.py` run in the lint job before `scripts/verify pr lint`: offline delivery, aggregate, target-inventory and timing-receipt regression controls, then `cargo fmt` and `clippy -D warnings` for the workspace **and** the separately-built redb fork. |
-| `test / bundle <number> / <behavior families>` — 18 bundles | `CI_CRATE=… CI_SHARD=… CI_FEATURES=… bash scripts/verify pr shard` | The bundles expand to the original 29 logical PR command/feature tuples plus every active integration row. Acceptance runs as separate remaining-module, long-running, and replication targets; vector decoding and delivery, many-context search, and layer search are separate work units. Their physical rows reuse the original logical parent's cache key and preserve its profile and feature closure. The normal plan has 49 physical rows when the source-bound dedup certificate applies and 53 in the conservative fallback. Default builds use parallel libtest execution; `test-seams` builds use one test thread. The engine's `test-seams,iroh` coverage is partitioned into seventeen physical rows by [`ci-shard-targets.txt`](../scripts/ci-shard-targets.txt). The inventory guard rejects missing or repeated targets and changed parent bindings. The lib shard alone covers examples and doctests within the split group. The redb fork retains its own target directory. |
+| `test / bundle <number> / <behavior families>` — 16 bundles | `CI_CRATE=… CI_SHARD=… CI_FEATURES=… bash scripts/verify pr shard` | The bundles expand to the original 29 logical PR command/feature tuples plus every active integration row. Acceptance runs as separate remaining-module, long-running, and replication targets; vector decoding and delivery, many-context search, and layer search are separate work units. Their physical rows reuse the original logical parent's cache key and preserve its profile and feature closure. The normal plan has 49 physical rows when the source-bound dedup certificate applies and 53 in the conservative fallback. Default builds use parallel libtest execution; `test-seams` builds use one test thread. The engine's `test-seams,iroh` coverage is partitioned into seventeen physical rows by [`ci-shard-targets.txt`](../scripts/ci-shard-targets.txt). The inventory guard rejects missing or repeated targets and changed parent bindings. The lib shard alone covers examples and doctests within the split group. The redb fork retains its own target directory. |
 | `build` | `bash scripts/verify pr build` | Release build of the workspace, then [`verify-packaged-engine.sh`](../scripts/verify-packaged-engine.sh) builds the engine only from packaged crate archives. |
 | `features` | `bash scripts/verify pr features` | Supported standalone feature shapes: engine default, engine `mdns`, server `mdns,production-smoke-driver`, plus `cargo doc` for the workspace. |
+| `lint-macos` | `bash scripts/verify pr lint` on `macos-latest` | The same `cargo fmt` and `clippy -D warnings` lint entry as `lint`, run natively on macOS in parallel so macOS-only build and lint breaks fail the PR. |
 | `installed-smoke` | `bash scripts/verify pr installed` | Installs release CLI and server binaries into a temporary root and runs [`installed-release-durable-sync-smoke.sh`](../scripts/installed-release-durable-sync-smoke.sh), the installed-binary durability and sync smoke over real files and ticketed Iroh. |
 | `cross-compile (<target>)` | `CI_TARGET=<target> bash scripts/verify pr cross` | Release build of CLI and server for `aarch64-unknown-linux-gnu`. The macOS targets are set aside until CDB-153 (the engine uses Linux-only `pipe2`/`SOCK_CLOEXEC`) is fixed. |
 | `integration / engine / test-profile / acceptance` and named families | see Extended integration | Nightly-only fixtures when the change affects runtime or integration paths; otherwise the job still runs and records why it was not required. |
@@ -297,7 +300,7 @@ active matrix. Failure, cancellation, a missing plan or an unexpected skip fails
 the reusable workflow and therefore the unchanged **PR checks** aggregate.
 Inactive integration emits the classified impact reason in logs and summary;
 only that explicit inactive mode admits the matrix's expected skip. The original
-PR checks still run. Normal PR lint/test/build/features/installed-smoke/cross jobs have 30-minute runaway
+PR checks still run. Normal PR lint/lint-macos/test/build/features/installed-smoke/cross jobs have 30-minute runaway
 caps; helper jobs keep five minutes. Integration slices use 30 minutes in normal mode
 and the existing 330 minutes in full qualification. These per-job caps do not bound the
 whole normal DAG, setup or queue; they do not establish end-to-end acceptance. The hard thirty-minute normal end-to-end
@@ -397,7 +400,8 @@ rule.
 - The installed smoke needs Bash and GNU `timeout` (`gtimeout` via
   `brew install coreutils` on macOS).
 - Cross builds need the target via `rustup target add` and, for aarch64 Linux,
-  `gcc-aarch64-linux-gnu`.
+  `gcc-aarch64-linux-gnu` locally; hosted CI uses no apt: `scripts/ci-install-zig-aarch64.sh`
+  downloads a version-pinned zig, verifies its SHA-256, and uses it as the aarch64 `cc`/`ar`/linker.
 - Disk: the full suite builds the workspace and the redb fork into separate
   target directories (`target/` and `target/redb/`); hosted Linux jobs free
   preinstalled tooling first with [`ci-free-disk.sh`](../scripts/ci-free-disk.sh).
@@ -526,12 +530,12 @@ measurement including cold setup and disclosed queue behavior. Policy adoption r
 pending owner approval.
 
 Normal integration alone partitions the three unchanged long-running acceptance cases:
-transfer runs exactly f25 and f26 in bundle02 slot3; incremental pull runs exactly
-f27 in bundle12 slot3. Source fingerprints and receipt case names/counts fail
+transfer runs exactly f25 and f26 in bundle14 slot1; incremental pull runs exactly
+f27 in bundle08 slot1. Source fingerprints and receipt case names/counts fail
 closed on inventory drift. Both retain the old long-running test cache binding.
-Server internal checks run in bundle07 slot3; internal and default core stay
-adjacent in bundle09. Full qualification, release and PR acceptance commands
-remain unchanged, and all three functional oracles remain required. The 18 bundles
-still use at most three slots. The observed 1,555 seconds before f27 is partial
+Server internal checks run in bundle06 slot2; core internal checks run in bundle06
+slot1 and default core runs in bundle15 slot1. Full qualification, release and PR acceptance commands
+remain unchanged, and all three functional oracles remain required. The 16 bundles
+still use at most four slots. The observed 1,555 seconds before f27 is partial
 cost evidence, not a completion bound; a complete hosted pass within 30 minutes
 remains unproved.

@@ -2,6 +2,9 @@ use contextdb_core::read_contract::{
     CursorExpiryKind, DeadlineClock, DeadlineWait, ReadFailureDetail, ReadFailureKind,
     ReadFailureLimit, ReadLimits,
 };
+#[path = "../fixtures/isolated_process.rs"]
+mod isolated_process;
+
 use contextdb_core::{
     Direction, Error, HistoryPolicy, IndexKind, Lsn, PropagationRule, RetainUnit, ScopeLabelKind,
     SortDirection, SyncDirection, TableMeta, TxId, Value, VectorQuantization,
@@ -1812,6 +1815,12 @@ fn direct_read_keeps_recursive_bytes_modes_links_and_companions_identical() {
 
 #[test]
 fn caller_driven_writer_policy_is_forgotten_by_the_fresh_direct_session() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "caller_driven_writer_policy_is_forgotten_by_the_fresh_direct_session",
+    ) {
+        return;
+    }
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture_after_caller_driven_writer(root.path());
@@ -2849,6 +2858,12 @@ fn assert_no_writable_subsystems(counters: &DirectReaderCounters) {
 
 #[test]
 fn direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "direct_module_uses_only_the_sanctioned_read_dependencies_and_real_probes",
+    ) {
+        return;
+    }
     // Inspecting custody data does not open a constructor or writer escape.
     for forbidden in [
         &["crate", "DeliveryOutcome", "new"][..],
@@ -3797,6 +3812,12 @@ fn assert_closed_cursor_aftermath(
 
 #[test]
 fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work",
+    ) {
+        return;
+    }
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "caller-cancellation-before-source-work");
@@ -3882,6 +3903,12 @@ fn pre_cancelled_calls_stop_execute_open_and_fetch_before_bounded_source_work() 
 
 #[test]
 fn convenience_calls_create_three_fresh_independent_cancellation_tokens() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "convenience_calls_create_three_fresh_independent_cancellation_tokens",
+    ) {
+        return;
+    }
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "independent-convenience-tokens");
@@ -3931,6 +3958,12 @@ fn convenience_calls_create_three_fresh_independent_cancellation_tokens() {
 
 #[test]
 fn terminal_page_immediately_releases_image_memory_and_cursor_state() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "terminal_page_immediately_releases_image_memory_and_cursor_state",
+    ) {
+        return;
+    }
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-terminal-release");
@@ -3992,6 +4025,12 @@ fn terminal_page_immediately_releases_image_memory_and_cursor_state() {
 
 #[test]
 fn explicit_close_before_exhaustion_releases_and_later_fetch_is_closed() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "explicit_close_before_exhaustion_releases_and_later_fetch_is_closed",
+    ) {
+        return;
+    }
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-explicit-close-release");
@@ -4024,6 +4063,12 @@ fn explicit_close_before_exhaustion_releases_and_later_fetch_is_closed() {
 
 #[test]
 fn cursor_page_byte_refusal_is_terminal_and_releases_the_cursor_charge() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "cursor_page_byte_refusal_is_terminal_and_releases_the_cursor_charge",
+    ) {
+        return;
+    }
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-page-byte-terminal-refusal");
@@ -4087,6 +4132,12 @@ fn cursor_page_byte_refusal_is_terminal_and_releases_the_cursor_charge() {
 
 #[test]
 fn manual_clock_idle_expiry_is_terminal_and_releases_owned_resources() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "manual_clock_idle_expiry_is_terminal_and_releases_owned_resources",
+    ) {
+        return;
+    }
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-manual-idle-expiry");
@@ -4130,6 +4181,12 @@ fn manual_clock_idle_expiry_is_terminal_and_releases_owned_resources() {
 
 #[test]
 fn manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "manual_clock_lifetime_expiry_survives_activity_then_releases_owned_resources",
+    ) {
+        return;
+    }
     let _serial = serialise_direct_file_test();
     let root = tempfile::tempdir().expect("scratch directory");
     let fixture = seed_fixture(root.path(), "cursor-manual-lifetime-expiry");

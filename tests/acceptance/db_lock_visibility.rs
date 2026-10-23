@@ -237,34 +237,31 @@ fn t19_05_database_locked_carries_path_and_pid() {
 }
 
 /// REGRESSION GUARD — t19_06: stale PID lock from a crashed prior process is reclaimable.
+#[cfg(target_os = "linux")]
 #[test]
 fn t19_06_crashed_holder_pid_lock_reclaimable() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("stale.redb");
 
     // Write a .lock file pointing to a known-dead PID. We pick u32::MAX because
-    // /proc/4294967295 will not exist on Linux. (Test is skipped on non-Linux
-    // since acquire_pid_lock's /proc check is Linux-specific; cfg-gate
-    // accordingly.)
-    #[cfg(target_os = "linux")]
-    {
-        let lock_path = path.with_extension("lock");
-        std::fs::write(&lock_path, format!("{}", u32::MAX)).unwrap();
+    // /proc/4294967295 will not exist on Linux. (The test is Linux-only
+    // since acquire_pid_lock's /proc check is Linux-specific.)
+    let lock_path = path.with_extension("lock");
+    std::fs::write(&lock_path, format!("{}", u32::MAX)).unwrap();
 
-        let h = Database::open(&path).expect("stale PID lock must be reclaimed");
-        // Sanity: write a row, read it back.
-        h.execute(
-            "CREATE TABLE t (id UUID PRIMARY KEY)",
-            &std::collections::HashMap::new(),
-        )
-        .unwrap();
-        let scan = h.scan("t", h.snapshot()).unwrap();
-        assert_eq!(
-            scan.len(),
-            0,
-            "fresh DB after stale-lock reclaim should be empty"
-        );
-    }
+    let h = Database::open(&path).expect("stale PID lock must be reclaimed");
+    // Sanity: write a row, read it back.
+    h.execute(
+        "CREATE TABLE t (id UUID PRIMARY KEY)",
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let scan = h.scan("t", h.snapshot()).unwrap();
+    assert_eq!(
+        scan.len(),
+        0,
+        "fresh DB after stale-lock reclaim should be empty"
+    );
 }
 
 /// RED — t19_07: cross-variant open rejection — all open APIs share the lock registry.

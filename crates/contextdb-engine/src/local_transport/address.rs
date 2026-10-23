@@ -2,6 +2,7 @@
 use super::validate_socket_path_length;
 use super::{LocalTransportError, validate_channel_addressability};
 use contextdb_core::read_contract::ChannelAddress;
+#[cfg(not(target_os = "macos"))]
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -16,12 +17,82 @@ pub fn derive_channel_address(store_path: &Path) -> Result<ChannelAddress, Local
 
 /// The opaque filesystem name for one channel address.
 pub fn opaque_channel_basename(address: ChannelAddress) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        macos_channel_basename(address)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        hex_channel_basename(address)
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+pub(super) fn macos_channel_basename(address: ChannelAddress) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(address.0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hex_channel_basename(address: ChannelAddress) -> String {
     let mut basename = String::with_capacity(address.0.len() * 2 + 5);
     for byte in address.0 {
         write!(&mut basename, "{byte:02x}").expect("writing into a string cannot fail");
     }
     basename.push_str(".sock");
     basename
+}
+
+#[cfg(test)]
+mod macos_channel_basename_tests {
+    use super::*;
+
+    #[test]
+    fn macos_basename_encodes_all_digest_bytes_in_43_url_safe_characters() {
+        assert_eq!(
+            macos_channel_basename(ChannelAddress([0; 32])),
+            "A".repeat(43)
+        );
+        let mut low = [0; 32];
+        low[31] = 1;
+        assert_eq!(
+            macos_channel_basename(ChannelAddress(low)),
+            format!("{}E", "A".repeat(42))
+        );
+        let high = [255; 32];
+        assert_eq!(
+            macos_channel_basename(ChannelAddress(high)),
+            format!("{}8", "_".repeat(42))
+        );
+        let name = macos_channel_basename(ChannelAddress([0x5a; 32]));
+        assert_eq!(name.len(), 43);
+        assert!(
+            name.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+    }
+
+    #[test]
+    fn macos_private_root_and_actual_basename_fit_sockaddr_un() {
+        let root = Path::new("/private/var/folders/ab/012345678901234567890123456789/T");
+        let channel = root
+            .join("c")
+            .join(macos_channel_basename(ChannelAddress([0; 32])));
+        assert!(
+            channel.as_os_str().as_encoded_bytes().len() <= 103,
+            "{}",
+            channel.display()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_public_basename_stays_hex_with_sock_suffix() {
+        assert_eq!(
+            opaque_channel_basename(ChannelAddress([0; 32])),
+            format!("{}.sock", "0".repeat(64))
+        );
+    }
 }
 
 /// Place one local channel below its validated runtime directory, never below

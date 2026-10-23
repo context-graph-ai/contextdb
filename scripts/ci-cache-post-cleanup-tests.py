@@ -123,9 +123,9 @@ class CachePostCleanupControls(unittest.TestCase):
         self.assertIn("run: bash scripts/ci-cache-post-cleanup.sh", block)
         self.assertNotIn("continue-on-error", block)
         test_job = workflow[workflow.index("  test-bundles:"):build]
-        self.assertEqual(test_job.count("Swatinem/rust-cache@" + PIN), 3)
-        self.assertEqual(test_job.count(". -> target"), 3)
-        self.assertEqual(test_job.count("crates/contextdb-redb -> ../../target/redb"), 3)
+        self.assertEqual(test_job.count("Swatinem/rust-cache@" + PIN), 4)
+        self.assertEqual(test_job.count(". -> target"), 4)
+        self.assertEqual(test_job.count("crates/contextdb-redb -> ../../target/redb"), 4)
 
 
 if __name__ == "__main__":

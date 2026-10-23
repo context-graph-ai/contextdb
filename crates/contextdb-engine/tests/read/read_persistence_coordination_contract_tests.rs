@@ -2481,6 +2481,57 @@ fn production_read_image_hydration_reports_live_readers_ignores_recycled_identit
         assert_breadcrumb_matches_live_linux_process(&first_breadcrumb);
         assert_breadcrumb_matches_live_linux_process(&second_breadcrumb);
     }
+    #[cfg(target_os = "macos")]
+    for claimed in [&first_breadcrumb, &second_breadcrumb] {
+        // Independently inspect the real paused child; the marker is no oracle.
+        // Reuse libc's native record, never a test-side Darwin ABI.
+        let pid = libc::c_int::try_from(claimed.process_id).unwrap();
+        // SAFETY: the native record consists only of integer fields.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of_val(&info)).unwrap();
+        // SAFETY: info is writable and the supplied size matches its allocation.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::addr_of_mut!(info).cast(),
+                size,
+            )
+        };
+        assert_eq!(
+            written, size,
+            "the live child must be independently inspectable"
+        );
+        assert_eq!(info.pbi_pid, claimed.process_id);
+        assert!(info.pbi_start_tvusec < 1_000_000);
+        let start = info
+            .pbi_start_tvsec
+            .checked_mul(1_000_000)
+            .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+            .expect("the child's native start must fit the identity representation");
+        assert_ne!(start, 0);
+        assert_eq!(claimed.process_start, ProcessStartIdentity(start));
+        let name = claimed.process_name.as_bytes();
+        assert!(!name.is_empty());
+        assert!(
+            name.iter()
+                .all(|byte| (0x20..=0x7e).contains(byte) && *byte != b'/' && *byte != b'\\')
+        );
+        assert!(
+            [&info.pbi_name[..], &info.pbi_comm[..]]
+                .iter()
+                .any(|field| {
+                    field.len() > name.len()
+                        && field[name.len()] == 0
+                        && field[..name.len()]
+                            .iter()
+                            .zip(name)
+                            .all(|(native, expected)| *native as u8 == *expected)
+                }),
+            "the reported name must equal a complete independently observed BSD name"
+        );
+    }
     let stale_breadcrumb = ReaderBreadcrumb {
         process_id: u32::MAX - 1,
         process_name: "stale-unlocked-reader".to_owned(),
@@ -4495,11 +4546,30 @@ fn assert_production_readers_are_named_where_the_writer_scans(runtime_directory:
     first
         .release()
         .expect("the first production read session finishes and releases its read lock");
+    match probe_writer(&path, runtime_directory) {
+        WriterProbeResult::HeldByReaders {
+            attempts,
+            observed_direct_readers,
+            verified_readers,
+            message,
+        } => {
+            assert_eq!(attempts, 1);
+            assert_eq!(observed_direct_readers, 1);
+            assert_eq!(verified_readers, vec![second_breadcrumb.clone()]);
+            assert!(message.contains(&second_breadcrumb.process_name));
+            assert!(message.contains(&format!("process {}", second_breadcrumb.process_id)));
+        }
+        other => panic!("the remaining production reader must still refuse the writer: {other:?}"),
+    }
     second
         .release()
         .expect("the second production read session finishes and releases its read lock");
     assert!(!first_breadcrumb_path.exists());
     assert!(!second_breadcrumb_path.exists());
+    assert!(matches!(
+        probe_writer(&path, runtime_directory),
+        WriterProbeResult::Acquired { attempts: 1 }
+    ));
 }
 
 /// A runtime root short enough that a local channel pathname below it still

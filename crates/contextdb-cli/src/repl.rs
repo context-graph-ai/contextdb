@@ -2342,6 +2342,80 @@ fn interactive_pull_progress_line(pages_read: u64, last_reported: u64) -> Option
     }
 }
 
+/// Drives the ordinary 200 ms progress cadence from authenticated pull-page
+/// responses in the CLI's own feature-gated integration tests.
+#[cfg(feature = "test-seams")]
+struct PullProgressClockForTest<'a> {
+    client: &'a SyncClient,
+    pause: Option<contextdb_engine::sync_client::PostPushReplyEffectsPause>,
+    ticks_left: u8,
+    rearm_on_next_wait: bool,
+    runtime: tokio::runtime::Runtime,
+}
+
+#[cfg(feature = "test-seams")]
+impl<'a> PullProgressClockForTest<'a> {
+    fn new_for_test(client: &'a SyncClient) -> Self {
+        Self {
+            client,
+            pause: Some(client.pause_after_pull_response_for_test()),
+            ticks_left: 0,
+            rearm_on_next_wait: false,
+            runtime: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test pull progress clock runtime"),
+        }
+    }
+
+    fn wait_tick_for_test(
+        &mut self,
+        stop: &std::sync::atomic::AtomicBool,
+        stop_notice: &tokio::sync::Notify,
+    ) -> bool {
+        if self.ticks_left == 0 {
+            // Arm the next real-page fence before letting the current page
+            // continue. The engine can then never outrun the next report.
+            if self.rearm_on_next_wait {
+                let previous = self.pause.take().expect("previous pull-page fence");
+                self.pause = Some(self.client.pause_after_pull_response_for_test());
+                drop(previous);
+            }
+            let pause = self.pause.as_ref().expect("armed pull-page fence");
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            let reached = self.runtime.block_on(async {
+                tokio::select! {
+                    () = pause.wait_until_reached() => true,
+                    () = stop_notice.notified() => false,
+                }
+            });
+            if !reached || stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            self.rearm_on_next_wait = true;
+            self.ticks_left = 10;
+        }
+        self.ticks_left -= 1;
+        true
+    }
+}
+
+#[cfg(feature = "test-seams")]
+struct PullProgressStopForTest<'a> {
+    stop: &'a std::sync::atomic::AtomicBool,
+    notice: &'a tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-seams")]
+impl Drop for PullProgressStopForTest<'_> {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notice.notify_one();
+    }
+}
+
 /// Runs `.sync pull`, streaming periodic liveness signals from the SAME
 /// per-call page counter (`SyncClient::pull_pages_read_this_pull`) while it
 /// runs, so a caller can tell a long multi-page pull is alive, not stuck.
@@ -2368,6 +2442,16 @@ fn pull_with_progress(
     let interactive_terminal = std::io::stdin().is_terminal();
     let stream_progress = json || interactive_terminal;
     let progress_stop = std::sync::atomic::AtomicBool::new(false);
+    #[cfg(feature = "test-seams")]
+    let progress_stop_notice = tokio::sync::Notify::new();
+    #[cfg(feature = "test-seams")]
+    let test_clock = (stream_progress
+        && std::env::var("CONTEXTDB_CLI_TEST_PULL_PROGRESS_CLOCK").as_deref() == Ok("pages"))
+    .then(|| PullProgressClockForTest::new_for_test(client));
+    #[cfg(feature = "test-seams")]
+    let test_clock_enabled = test_clock.is_some();
+    #[cfg(feature = "test-seams")]
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         if stream_progress {
             scope.spawn(|| {
@@ -2375,8 +2459,28 @@ fn pull_with_progress(
                 let mut waited = std::time::Duration::ZERO;
                 let tick = std::time::Duration::from_millis(200);
                 let report_every = std::time::Duration::from_secs(2);
+                #[cfg(feature = "test-seams")]
+                let mut test_clock = test_clock;
+                #[cfg(feature = "test-seams")]
+                if test_clock.is_some() {
+                    ready_tx.send(()).expect("pull progress start receiver");
+                }
                 while !progress_stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(tick);
+                    #[cfg(feature = "test-seams")]
+                    let sleep_for_tick = match test_clock.as_mut() {
+                        Some(clock) => {
+                            if !clock.wait_tick_for_test(&progress_stop, &progress_stop_notice) {
+                                break;
+                            }
+                            false
+                        }
+                        None => true,
+                    };
+                    #[cfg(not(feature = "test-seams"))]
+                    let sleep_for_tick = true;
+                    if sleep_for_tick {
+                        std::thread::sleep(tick);
+                    }
                     waited += tick;
                     if waited < report_every {
                         continue;
@@ -2397,7 +2501,19 @@ fn pull_with_progress(
                 }
             });
         }
+        #[cfg(feature = "test-seams")]
+        if test_clock_enabled && stream_progress {
+            ready_rx.recv().expect("pull progress clock initialized");
+        }
+        #[cfg(feature = "test-seams")]
+        let stop_on_drop = PullProgressStopForTest {
+            stop: &progress_stop,
+            notice: &progress_stop_notice,
+        };
         let result = rt.block_on(client.pull_default());
+        #[cfg(feature = "test-seams")]
+        drop(stop_on_drop);
+        #[cfg(not(feature = "test-seams"))]
         progress_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         result
     })

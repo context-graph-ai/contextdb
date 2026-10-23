@@ -4,96 +4,92 @@
     "schema_version": 1,
     "bundles": [
       [
-        "integration-acceptance-test",
-        "pr-bundle-transactions-relational",
-        "integration-engine-family-12"
-      ],
-      [
-        "pr-contextdb-engine-test-seams-4",
-        "integration-held-out-vector-native-reference",
-        "integration-acceptance-long-running-transfer-test"
-      ],
-      [
-        "pr-contextdb-engine-test-seams-2",
-        "integration-examples",
-        "pr-contextdb-engine-test-seams-14"
-      ],
-      [
-        "pr-contextdb-engine-test-seams-6",
-        "pr-bundle-parser-planner-redb",
-        "integration-acceptance-sync-test"
-      ],
-      [
-        "integration-engine-family-1",
-        "integration-engine-family-9",
-        "integration-doctests"
-      ],
-      [
-        "pr-contextdb-engine-test-seams-8",
-        "pr-contextdb-engine-test-seams-9",
-        "integration-acceptance-sync-release"
-      ],
-      [
-        "pr-contextdb-engine-test-seams-11",
-        "pr-contextdb-engine-test-seams-15",
-        "pr-contextdb-server-test-seams"
-      ],
-      [
-        "integration-engine-family-6",
-        "integration-indexed-search-work-latency"
-      ],
-      [
-        "pr-contextdb-core-test-seams",
-        "pr-contextdb-core"
-      ],
-      [
-        "integration-acceptance-release",
-        "integration-acceptance-long-running-release"
-      ],
-      [
-        "pr-contextdb-engine-test-seams-3",
-        "integration-sync-schema-transactions",
-        "pr-contextdb-engine-test-seams-13"
-      ],
-      [
-        "pr-contextdb-engine-test-seams-10",
-        "pr-contextdb-engine",
-        "integration-acceptance-long-running-test"
-      ],
-      [
-        "pr-contextdb-server",
-        "integration-engine-family-4",
-        "integration-engine-family-5"
-      ],
-      [
-        "pr-contextdb-engine-test-seams-7",
-        "pr-contextdb-engine-test-seams-16"
-      ],
-      [
-        "pr-contextdb-engine-test-seams-1",
-        "pr-contextdb-engine-test-seams-17"
-      ],
-      [
-        "integration-engine-family-2",
-        "integration-engine-family-3",
-        "pr-bundle-vector-index-graph"
+        "pr-contextdb-engine-test-seams-13",
+        "pr-contextdb-engine-test-seams-14",
+        "pr-contextdb-engine-test-seams-17",
+        "pr-contextdb-engine-test-seams-5"
       ],
       [
         "pr-contextdb-cli",
-        "integration-engine-family-8",
-        "integration-engine-family-7"
+        "integration-engine-family-4",
+        "integration-engine-family-8"
+      ],
+      [
+        "pr-contextdb-engine-test-seams-1",
+        "pr-contextdb-engine-test-seams-8"
+      ],
+      [
+        "pr-contextdb-server",
+        "integration-engine-family-9"
+      ],
+      [
+        "pr-contextdb-engine-test-seams-10",
+        "pr-contextdb-engine-test-seams-11",
+        "pr-contextdb-engine-test-seams-16",
+        "pr-contextdb-engine-test-seams-4"
+      ],
+      [
+        "pr-contextdb-core-test-seams",
+        "pr-contextdb-server-test-seams"
       ],
       [
         "pr-contextdb-engine-test-seams-12",
-        "integration-vector-graph-recall-profile",
-        "pr-contextdb-engine-test-seams-5"
+        "pr-contextdb-engine-test-seams-15",
+        "pr-contextdb-engine-test-seams-7",
+        "pr-contextdb-engine"
+      ],
+      [
+        "integration-acceptance-long-running-test",
+        "integration-acceptance-test",
+        "integration-engine-family-12",
+        "integration-engine-family-7"
+      ],
+      [
+        "pr-contextdb-engine-test-seams-6",
+        "pr-bundle-vector-index-graph"
+      ],
+      [
+        "integration-engine-family-1",
+        "integration-examples"
+      ],
+      [
+        "integration-acceptance-long-running-release",
+        "integration-acceptance-release",
+        "integration-acceptance-sync-release"
+      ],
+      [
+        "integration-engine-family-6"
+      ],
+      [
+        "pr-contextdb-engine-test-seams-2",
+        "pr-contextdb-engine-test-seams-3",
+        "pr-contextdb-engine-test-seams-9",
+        "pr-bundle-parser-planner-redb"
+      ],
+      [
+        "integration-acceptance-long-running-transfer-test",
+        "integration-acceptance-sync-test",
+        "integration-sync-schema-transactions",
+        "integration-vector-graph-recall-profile"
+      ],
+      [
+        "pr-contextdb-core",
+        "integration-engine-family-3",
+        "integration-held-out-vector-native-reference",
+        "integration-indexed-search-work-latency"
+      ],
+      [
+        "integration-doctests",
+        "integration-engine-family-2",
+        "integration-engine-family-5",
+        "pr-bundle-transactions-relational"
       ]
     ],
     "fallback_additions": {
-      "integration-engine-family-10": 8,
-      "integration-engine-family-11": 10,
-      "integration-engine-family-13": 14,
-      "integration-engine-family-14": 15
+      "integration-engine-family-10": 12,
+      "integration-engine-family-11": 12,
+      "integration-engine-family-13": 4,
+      "integration-engine-family-14": 4
     }
   },
   "pr_jobs": [

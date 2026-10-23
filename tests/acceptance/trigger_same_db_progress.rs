@@ -757,6 +757,20 @@ fn t30_04_no_trigger_callback_baseline_throughput_n32_writers() {
 #[serial]
 fn t30_05_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
     run_with_timeout(|| {
+        struct CallbackReleaseGuard(Option<mpsc::SyncSender<()>>);
+        impl CallbackReleaseGuard {
+            fn release(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.try_send(());
+                }
+            }
+        }
+        impl Drop for CallbackReleaseGuard {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
         let db = Arc::new(Database::open_memory());
         db.execute(
             "CREATE TABLE t (id UUID PRIMARY KEY, writer INTEGER, seq INTEGER)",
@@ -766,18 +780,19 @@ fn t30_05_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
         db.execute("CREATE TRIGGER tr ON t WHEN INSERT", &empty())
             .unwrap();
         let first_callback_seen = Arc::new(AtomicBool::new(false));
-        let first_callback_entered = Arc::new(AtomicBool::new(false));
-        let release_first_callback = Arc::new(AtomicBool::new(false));
-        let _release_guard = AtomicReleaseGuard(release_first_callback.clone());
+        let (first_callback_entered_tx, first_callback_entered_rx) = mpsc::sync_channel(1);
+        let (release_first_callback_tx, release_first_callback_rx) = mpsc::sync_channel(1);
+        let release_first_callback_rx = Mutex::new(release_first_callback_rx);
+        let mut release_guard = CallbackReleaseGuard(Some(release_first_callback_tx));
         let first_callback_seen_cb = first_callback_seen.clone();
-        let first_callback_entered_cb = first_callback_entered.clone();
-        let release_first_callback_cb = release_first_callback.clone();
         db.register_trigger_callback("tr", move |_db, _ctx| {
             if !first_callback_seen_cb.swap(true, AtomicOrdering::SeqCst) {
-                first_callback_entered_cb.store(true, AtomicOrdering::SeqCst);
-                while !release_first_callback_cb.load(AtomicOrdering::SeqCst) {
-                    thread::sleep(Duration::from_millis(1));
-                }
+                first_callback_entered_tx.send(()).expect("callback entry receiver");
+                release_first_callback_rx
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("callback release sender");
             }
             Ok(())
         })
@@ -789,14 +804,24 @@ fn t30_05_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
         let writer_barrier = Arc::new(Barrier::new(n_writers + 1));
         let committed = Arc::new(AtomicUsize::new(0));
         let typed_err_same_db = Arc::new(AtomicUsize::new(0));
+        let (contender_start_tx, contender_start_rx) = mpsc::sync_channel(1);
+        let mut contender_start_rx = Some(contender_start_rx);
         let mut handles = Vec::with_capacity(n_writers);
         for w in 0..n_writers {
             let db = db.clone();
             let writer_barrier = writer_barrier.clone();
             let committed = committed.clone();
             let typed_err_same_db = typed_err_same_db.clone();
+            let contender_start = if w == 0 {
+                contender_start_rx.take()
+            } else {
+                None
+            };
             handles.push(thread::spawn(move || {
                 writer_barrier.wait();
+                if let Some(start) = contender_start {
+                    start.recv().expect("designated contender start");
+                }
                 for s in 0..commits_per_writer {
                     let tx = match db.begin() {
                         Ok(tx) => tx,
@@ -827,30 +852,19 @@ fn t30_05_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
             }));
         }
         writer_barrier.wait();
-        let entered_deadline = Instant::now() + Duration::from_secs(2);
-        while !first_callback_entered.load(AtomicOrdering::SeqCst) {
-            if Instant::now() >= entered_deadline {
-                release_first_callback.store(true, AtomicOrdering::SeqCst);
-                panic!("first trigger callback did not enter; contention setup failed");
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        let overlap_deadline = Instant::now() + Duration::from_secs(1);
-        while typed_err_same_db.load(AtomicOrdering::SeqCst) == 0
-            && db
-                .trigger_progress_telemetry_snapshot_for_test()
-                .wait_observed
-                == 0
-            && Instant::now() < overlap_deadline
-        {
-            thread::sleep(Duration::from_millis(2));
-        }
-        let overlap_observed = typed_err_same_db.load(AtomicOrdering::SeqCst) > 0
-            || db
-                .trigger_progress_telemetry_snapshot_for_test()
-                .wait_observed
-                > 0;
-        release_first_callback.store(true, AtomicOrdering::SeqCst);
+        first_callback_entered_rx
+            .recv()
+            .expect("first trigger callback did not enter");
+        contender_start_tx
+            .send(())
+            .expect("designated contender did not start");
+        db.wait_until_trigger_wait_observed_for_test(1);
+        let overlap_observed = db
+            .trigger_progress_telemetry_snapshot_for_test()
+            .wait_observed
+            > 0;
+        assert!(overlap_observed, "a writer must reach the contention gate before release");
+        release_guard.release();
         for h in handles {
             h.join().unwrap();
         }
@@ -870,7 +884,7 @@ fn t30_05_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
         );
 
         let snap = db.trigger_progress_telemetry_snapshot_for_test();
-        let _ = snap.wait_observed; // informational for no-op callbacks; deterministic parks are asserted elsewhere.
+        assert!(snap.wait_observed > 0, "contention observation must persist after release");
         assert_eq!(
             snap.typed_err_observed_same_db, 0,
             "engine must report 0 same-DB typed-Err observations; snap={snap:?}"
