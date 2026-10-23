@@ -1236,6 +1236,10 @@ fn evidence_index(index: &VectorIndexRef) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 impl AuthenticatedOwningRow {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
+    )]
     pub(super) fn verify(
         &self,
         owner: &MembershipOwner,
@@ -1271,6 +1275,10 @@ struct AuthenticatedMembership {
     record: VectorPartitionMembershipRecord,
     row_evidence: Option<AuthenticatedOwningRow>,
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
+)]
 fn verify_row_lifecycle(
     identity: &RawVectorDirectoryEntry,
     row_deleted: Option<TxId>,
@@ -1292,6 +1300,10 @@ fn verify_row_lifecycle(
     }
     Ok(())
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
+)]
 fn authenticate_owning_row_with_evidence(
     owner: &MembershipOwner,
     read: &redb::ReadTransaction,
@@ -2604,6 +2616,10 @@ impl MembershipCursor {
             .map(|next| next.map(|next| next.record))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
+    )]
     fn next_authenticated_record(
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,

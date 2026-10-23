@@ -7250,7 +7250,7 @@ impl WritableRawVectorBodyScan {
         clippy::result_large_err,
         reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
     )]
-    pub(crate) fn read_partition_body_with_owning_row_before(
+    fn read_partition_body_with_owning_row_before(
         &mut self,
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
@@ -7622,7 +7622,7 @@ impl RetainedRawVectorBodyScan {
         clippy::result_large_err,
         reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
     )]
-    pub(crate) fn read_partition_body_with_owning_row_before(
+    fn read_partition_body_with_owning_row_before(
         &mut self,
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,
