@@ -748,7 +748,9 @@ fn unpartitioned_vector_membership_pages_reload_at_constant_residency() {
             // A second row through the SAME public statement/child path has
             // room for the real child control and no query workspace. The real
             // executing child must refuse, without losing a pre-existing debit.
-            let refusal_limit = reader.parent_before + reader.control_bytes as u64;
+            let refusal_baseline = reader_parent.retained_bytes_for_test();
+            assert_eq!(refusal_baseline, reader.parent_after);
+            let refusal_limit = refusal_baseline + reader.control_bytes as u64;
             assert!(refusal_limit < MEMBERSHIP_WORKSPACE as u64);
             let (refused, refused_reader) =
                 contextdb_engine::vector_read_memory::statement_child_proof::observe(
@@ -765,8 +767,8 @@ fn unpartitioned_vector_membership_pages_reload_at_constant_residency() {
             assert_eq!(refused_reader.parent_funding_mismatches, 0);
             assert_eq!(refused_reader.final_bytes, 0);
             assert_eq!(refused_reader.drops, 1);
-            assert_eq!(refused_reader.parent_before, reader.parent_before);
-            assert_eq!(refused_reader.parent_after, reader.parent_before);
+            assert_eq!(refused_reader.parent_before, refusal_baseline);
+            assert_eq!(refused_reader.parent_after, refusal_baseline);
             assert_eq!(db.accountant().usage().used, baseline);
             assert_eq!(db.accountant().high_water_for_test().saturating_sub(baseline), 0);
             db.set_memory_limit(Some(64 * 1024 * 1024)).unwrap();
