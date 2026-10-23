@@ -4699,6 +4699,8 @@ impl WriterSnapshotHandle {
                 .ok_or_else(|| Error::Other("historical row controls overflow".into()))?,
             "historical_row_controls",
         )?;
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::read_work_probe::note_owning_row_controls_admitted();
         graph_read::with_pages(read_memory.clone(), || {
             image.scope(|| {
                 before()?;

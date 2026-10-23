@@ -68,7 +68,6 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
                 partition, dimension: 4, quantization: VectorQuantization::F32, metadata_copy_owner: None,
             };
             let observed = crate::read_work_probe::ReadWorkObservationScope::enter(crate::read_work_probe::ReadWorkPhase::Query);
-            crate::vector_read_memory::watch_native_admissions_for_test();
             let selected = source.select_visible_by_row(identity.row_id, snapshot, &mut || true, &mut copies).unwrap().unwrap();
             let mut body_window = copies.scratch();
             let body_admissions = std::cell::Cell::new(0usize);
@@ -79,9 +78,8 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
             assert_eq!(selected.identity(), identity, "selected record preserves the genuine cursor identity; the actual loader checks its body");
             let work = observed.counters();
             let history = observed.historical_counters();
-            let admissions = crate::vector_read_memory::take_native_admissions_for_test();
-            let row_controls = admissions.iter().filter(|a| a.admitted && a.parent == db.declared_read_memory.as_ref() as *const crate::vector_read_memory::DeclaredReadMemory as usize && a.operation == "historical_row_controls").count();
-            assert_eq!(row_controls, 1, "one consumed membership interval needs one owning-row reconciliation: {work:?}, {history:?}");
+            assert_eq!(history.owning_row_controls_admitted, 1,
+                "one consumed membership interval needs one successfully admitted owning-row control: {work:?}, {history:?}");
             assert_eq!(work.decoded_rows, 1, "selection/body reuse the same authenticated owning row");
             assert_eq!(body_admissions.get(), 1, "one actual selected-body reservation");
             assert_eq!(work.vector_body_accesses, 1);
