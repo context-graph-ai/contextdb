@@ -46113,6 +46113,8 @@ impl Database {
             .local_policy_metadata_enabled
             .store(false, Ordering::SeqCst);
         let metadata = self.relational_store.table_meta.read().clone();
+        let read_memory = working.declared_reader_memory()?;
+        let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
         for (table, meta) in metadata {
             working.relational_store.create_table(&table, meta.clone());
             for index in &meta.indexes {
@@ -46129,6 +46131,17 @@ impl Database {
                         index.columns.clone(),
                     );
                 }
+            }
+            // Schema staging needs declared layouts even when no vector query
+            // has materialized a graph. Register descriptors only: row/vector
+            // payloads remain with the live database until commit preparation.
+            for column in &meta.columns {
+                working.register_vector_index_for_column(
+                    &table,
+                    column,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
+                )?;
             }
         }
         // The working image's retained-state owner returns the metadata fold

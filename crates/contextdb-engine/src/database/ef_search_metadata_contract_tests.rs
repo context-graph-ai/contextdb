@@ -46,6 +46,9 @@ fn record_authored(db: &Database, after: &mut Lsn, units: &mut Vec<ChangeSet>) {
     *after = db.current_lsn();
 }
 fn seed(db: &Database, rows: usize) -> Vec<ChangeSet> {
+    seed_with_saved_graphs(db, rows, true)
+}
+fn seed_with_saved_graphs(db: &Database, rows: usize, saved_graphs: bool) -> Vec<ChangeSet> {
     let mut units = Vec::new();
     let mut after = Lsn(0);
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -76,6 +79,13 @@ fn seed(db: &Database, rows: usize) -> Vec<ChangeSet> {
     // assertion would reject valid stores and miss the move-out regression.
     run(db, "ALTER TABLE breadth_rows ADD COLUMN marker TEXT");
     record_authored(db, &mut after, &mut units);
+    if !saved_graphs {
+        assert!(
+            graphs(db).iter().all(|(serial, _)| serial.is_none()),
+            "the pre-query control must not have a materialized serving graph"
+        );
+        return units;
+    }
     for _ in 0..8 {
         if ["embedding", "compressed"].iter().all(|name| {
             db.__debug_vector_hnsw_build_serial_for_test(index(name))
@@ -585,14 +595,16 @@ fn ef_search_history_survives_later_shape_change_reopen_export_and_replay() {
 // explicit staging. Mutant: classify every SET HNSW AST as EF-only.
 #[test]
 fn topology_radius_structural_and_transactional_alters_keep_general_semantics() {
-    for file in [false, true] {
+    for (file, saved_graphs) in [(false, false), (false, true), (true, false), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
         let db = if file {
             Database::open(dir.path().join("control.db")).unwrap()
         } else {
             Database::open_memory()
         };
-        let _ = seed(&db, 24);
+        let _ = seed_with_saved_graphs(&db, 24, saved_graphs);
+        let authored = authored_rows(&db);
+        let rows = visible(&db);
         let original = column(&db).vector_policy_revision;
         take_projected_rows();
         alter(&db, "(M = 24, EF_SEARCH = 11)");
@@ -660,7 +672,12 @@ fn topology_radius_structural_and_transactional_alters_keep_general_semantics() 
             None,
             "staged policy cannot leak into autocommit readers"
         );
+        assert_eq!(authored_rows(&db), authored);
+        assert_eq!(visible(&db), rows);
         db.rollback(tx).unwrap();
+        assert_eq!(column(&db).hnsw_ef_search, None);
+        assert_eq!(authored_rows(&db), authored);
+        assert_eq!(visible(&db), rows);
         assert_eq!(canonical(&db.ddl_log_since(Lsn(0)).unwrap()), before);
         let tx = db.begin().unwrap();
         db.execute_in_tx(
@@ -671,6 +688,12 @@ fn topology_radius_structural_and_transactional_alters_keep_general_semantics() 
         .unwrap();
         db.commit(tx).unwrap();
         assert_eq!(column(&db).hnsw_ef_search, Some(19));
+        assert_eq!(
+            db.ddl_log_since(Lsn(0)).unwrap().len(),
+            before.as_array().unwrap().len() + 1
+        );
+        assert_eq!(authored_rows(&db), authored);
+        assert_eq!(visible(&db), rows);
         run(&db, "ALTER TABLE breadth_rows ADD COLUMN added INTEGER");
         assert_eq!(
             db.execute("SELECT added FROM breadth_rows WHERE id = 1", &empty())

@@ -35,6 +35,9 @@ fn record_authored(db: &Database, after: &mut Lsn, units: &mut Vec<ChangeSet>) {
     *after = db.current_lsn();
 }
 fn seed(db: &Database, rows: usize) -> Vec<ChangeSet> {
+    seed_with_saved_graphs(db, rows, true)
+}
+fn seed_with_saved_graphs(db: &Database, rows: usize, saved_graphs: bool) -> Vec<ChangeSet> {
     let mut units = Vec::new();
     let mut after = Lsn(0);
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -65,6 +68,13 @@ fn seed(db: &Database, rows: usize) -> Vec<ChangeSet> {
     // assertion would reject valid stores and miss the move-out regression.
     run(db, "ALTER TABLE breadth_rows ADD COLUMN marker TEXT");
     record_authored(db, &mut after, &mut units);
+    if !saved_graphs {
+        assert!(
+            graphs(db).iter().all(|(serial, _)| serial.is_none()),
+            "the pre-query control must not have a materialized serving graph"
+        );
+        return units;
+    }
     for _ in 0..8 {
         if ["embedding", "compressed"].iter().all(|name| {
             db.__debug_vector_hnsw_build_serial_for_test(index(name))
@@ -442,14 +452,15 @@ fn consolidation_occurrences_replay_with_the_same_authored_ddl_and_row_history()
 
 #[test]
 fn consolidation_transaction_rollback_does_not_publish_local_autocommit_metadata() {
-    for file in [false, true] {
+    for (file, saved_graphs) in [(false, false), (false, true), (true, false), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
         let db = if file {
             Database::open(dir.path().join("transaction.db")).unwrap()
         } else {
             Database::open_memory()
         };
-        let _ = seed(&db, 24);
+        let _ = seed_with_saved_graphs(&db, 24, saved_graphs);
+        let authored = authored_rows(&db);
         let before = canonical(&db.table_meta("breadth_rows").unwrap());
         let history = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
         let rows = visible(&db);
@@ -465,6 +476,7 @@ fn consolidation_transaction_rollback_does_not_publish_local_autocommit_metadata
         assert_eq!(canonical(&db.table_meta("breadth_rows").unwrap()), before);
         assert_eq!(canonical(&db.ddl_log_since(Lsn(0)).unwrap()), history);
         assert_eq!(visible(&db), rows);
+        assert_eq!(authored_rows(&db), authored);
         let tx = db.begin().unwrap();
         db.execute_in_tx(
             tx,
@@ -474,6 +486,12 @@ fn consolidation_transaction_rollback_does_not_publish_local_autocommit_metadata
         .unwrap();
         db.commit(tx).unwrap();
         assert!(column(&db).consolidation_disabled);
+        assert_eq!(visible(&db), rows);
+        assert_eq!(authored_rows(&db), authored);
+        assert_eq!(
+            db.ddl_log_since(Lsn(0)).unwrap().len(),
+            history.as_array().unwrap().len() + 1
+        );
         db.close().unwrap();
     }
 }
