@@ -771,6 +771,7 @@ name = "contextdb-engine"
 version = "1.0.0"
 dependencies = [
  "bao-tree",
+ "base64",
  "bincode 2.0.1",
  "blake3",
  "bytes",

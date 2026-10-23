@@ -27,10 +27,12 @@ use crate::database::trigger::TriggerPersistenceCommit;
 use crate::direct_file_reader::DirectTypedImageDigest;
 use crate::local_transport::{RuntimeDirectory, derive_channel_address};
 use crate::sync_types::DdlChange;
+#[cfg(target_os = "linux")]
+use contextdb_core::read_contract::ReaderProcessIdentity;
 use contextdb_core::read_contract::{
     ChannelAddress, DatabaseIdentity, HeldByReadersDetail, HeldByWriterDetail, LocalUserIdentity,
     OwnerReadCancellation, OwnerReadStatus, OwnerServingReason, OwnerServingState, ReadFailure,
-    ReadFailureDetail, ReadFailureKind, ReaderBreadcrumb, ReaderProcessIdentity, WriterRunNumber,
+    ReadFailureDetail, ReadFailureKind, ReaderBreadcrumb, WriterRunNumber,
 };
 use contextdb_core::{
     AdjEntry, ColumnType, DirectedValue, Error, ForeignKeyReference, IndexDecl, IndexKey,
@@ -945,7 +947,7 @@ pub(crate) fn recorded_held_owner_status(database_path: &Path) -> Option<OwnerRe
         // A writer takes the claim-window byte before replacing the previous
         // run's durable record. While that byte is held, the bytes below can
         // still describe the departed writer and must not be attributed to
-        // the live holder merely because the whole-file writer lock is held.
+        // the live holder merely because the writer ownership lock is held.
         // The claim-window path is what waits for the arriving writer's own
         // decision; this status path deliberately has no answer yet.
         match take_companion_range_lock_shared(&file, COMPANION_CLAIM_WINDOW_LOCK_OFFSET).ok()? {
@@ -1003,10 +1005,12 @@ pub(crate) fn recorded_unserved_owner(database_path: &Path) -> Option<OwnerReadS
 /// byte of the record will ever occupy, and neither is ever read or written:
 /// taking one costs a lock call and nothing else, the companion's own content
 /// is untouched, and the kernel drops the hold the moment the holder's process
-/// dies. Byte-range locks are independent of the whole-file advisory lock a
-/// writer takes to claim the store, so a hold here never contends with a
-/// claim -- and both are on the companion beside the store, so nothing here
-/// opens, reads, locks, or creates anything in the store folder.
+/// dies. On Linux these byte-range locks are independent of the whole-file
+/// advisory lock a writer takes to claim the store. On macOS they overlap
+/// whole-file locks, so writer ownership uses its own non-overlapping byte.
+/// A hold here never contends with a writer ownership claim. All these locks
+/// are on the companion beside the store, so nothing here opens, reads,
+/// locks, or creates anything in the store folder.
 ///
 /// `CLAIM_WINDOW` is held by a writer from the moment it claims the store
 /// until it publishes its serving decision, so a caller arriving inside that
@@ -1019,6 +1023,8 @@ pub(crate) fn recorded_unserved_owner(database_path: &Path) -> Option<OwnerReadS
 /// written down about them.
 const COMPANION_CLAIM_WINDOW_LOCK_OFFSET: u64 = 1 << 40;
 const COMPANION_READER_HOLD_LOCK_OFFSET: u64 = (1 << 40) + 1;
+#[cfg(target_os = "macos")]
+const COMPANION_WRITER_OWNERSHIP_LOCK_OFFSET: u64 = (1 << 40) + 2;
 
 /// Whether one advisory byte-range lock was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1305,15 +1311,13 @@ impl std::task::Wake for PipeWaker {
 /// What a coordination wait sleeps on while a companion byte it wants is held
 /// by somebody else.
 ///
-/// The hold itself is not something the kernel will let a thread wait on and
-/// also be woken from, so the wait does not try: it sleeps on NOTIFICATIONS
-/// about the companion instead -- a holder closing its descriptor, a writer
-/// publishing a record -- and re-asks for the byte each time one arrives. That
-/// keeps every property the blocking acquisition had (the wake IS the event,
-/// nothing polls, no interval decides how quickly a caller learns) and adds
-/// the one it lacked: the wait belongs to the caller's own thread, so when the
-/// caller stops waiting there is nothing left anywhere still queued for a hold
-/// nobody wants.
+/// Linux watches companion notifications and the caller's wake pipe. macOS
+/// watches the wake pipe with a short lock-recheck interval because a blocking
+/// range acquisition cannot also observe cancellation. In both cases the
+/// caller's outer nonblocking lock probe decides whether the hold is released;
+/// waking alone never authorizes access. These waits stay on the caller's own
+/// thread and leave no queued acquisition behind. Other Unix targets retain
+/// their existing fallback, which can block on the hold without cancellation.
 #[cfg(unix)]
 struct CoordinationWatch {
     wake: Arc<WakePipe>,
@@ -1324,8 +1328,9 @@ struct CoordinationWatch {
 
 #[cfg(unix)]
 impl CoordinationWatch {
-    /// Arm the watch BEFORE asking for the byte, so a release that happens
-    /// between the ask and the sleep is already queued rather than missed.
+    /// Arm BEFORE asking for the byte so cancellation can queue a wake before
+    /// sleep begins. Linux also queues companion notifications; macOS rechecks
+    /// the hold at its private interval.
     fn arm(companion: &Path, stop: Option<&OwnerReadCancellation>) -> std::io::Result<Self> {
         let wake = Arc::new(WakePipe::new()?);
         #[cfg(any(test, feature = "test-seams"))]
@@ -1350,11 +1355,8 @@ impl CoordinationWatch {
         std::task::Waker::from(Arc::new(PipeWaker(Arc::clone(&self.wake))))
     }
 
-    /// Sleep until something about this companion happens, or until somebody
-    /// pokes the wake pipe. On a platform with no notification channel the
-    /// caller's own thread takes the blocking acquisition instead: the answer
-    /// is the same and nothing is left running either way, but a stop is
-    /// noticed at the next wake rather than at once.
+    /// Sleep until a companion notification, a wake-pipe poke, or the supplied
+    /// timeout, then let the caller recheck its cancellation and trusted lock.
     #[cfg(target_os = "linux")]
     fn sleep(
         &self,
@@ -1398,7 +1400,45 @@ impl CoordinationWatch {
         Ok(())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// Wait for cancellation or the next lock recheck without acquiring a hold.
+    #[cfg(target_os = "macos")]
+    fn sleep(
+        &self,
+        _held: &File,
+        _offset: u64,
+        timeout: Option<std::time::Duration>,
+    ) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        // A private scheduling bound, not a caller deadline or retry policy.
+        // Only the outer trusted nonblocking probe can establish release.
+        const LOCK_RECHECK_QUANTUM: std::time::Duration = std::time::Duration::from_millis(10);
+        let timeout = timeout
+            .unwrap_or(LOCK_RECHECK_QUANTUM)
+            .min(LOCK_RECHECK_QUANTUM);
+        // Round down so even a sub-millisecond remaining allowance is never
+        // extended. An interruption returns to the caller instead of renewing it.
+        let timeout_ms = timeout.as_millis() as libc::c_int;
+        let mut watched = libc::pollfd {
+            fd: self.wake.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Arm precedes the outer probe. Do not drain here: cancellation or a
+        // deadline wake queued between that probe and this poll must be seen.
+        let ready = unsafe { libc::poll(&mut watched, 1, timeout_ms) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+            return Ok(());
+        }
+        self.wake.drain();
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn sleep(
         &self,
         held: &File,
@@ -1553,12 +1593,11 @@ pub(crate) fn observe_unsettled_claim(database_path: &Path) -> Option<UnsettledC
 
 /// Wait out a writer's claim window inside the budget the caller declared.
 ///
-/// Nothing polls and nothing sleeps for an interval: the caller's thread sleeps
-/// on the companion's own notifications and re-asks for the byte each time one
-/// arrives, so the writer publishing its decision IS what wakes this. The other
-/// thing that may end it is the caller's own declared budget, and that budget
-/// is spent against the CLOCK the caller supplied -- never against real time --
-/// so a proof advances a clock instead of waiting an hour.
+/// Linux rechecks on companion notifications; macOS rechecks at a short private
+/// interval while also watching the deadline's wake pipe. The caller's declared
+/// budget is still spent against the CLOCK it supplied -- never renewed by a
+/// recheck -- so a proof advances a clock instead of waiting an hour. Other
+/// Unix targets retain their blocking fallback and notice expiry at its next wake.
 ///
 /// The writer is never blocked or delayed: a shared request never stands in the
 /// way of the exclusive hold it already owns, and the store file is untouched.
@@ -1707,7 +1746,7 @@ fn active_companion_record(file: &mut File) -> Option<EncodedCompanionRecord> {
 /// out: taking the shared side of the same lock a writer takes exclusively
 /// answers it and is released immediately.
 fn writer_holds_companion(file: &File) -> Option<bool> {
-    match fs2::FileExt::try_lock_shared(file) {
+    match companion_ownership_lock(file, CompanionOwnershipLock::Shared) {
         Ok(()) => {
             unlock_file(file);
             Some(false)
@@ -2720,7 +2759,11 @@ fn current_reader_breadcrumb() -> std::io::Result<ReaderBreadcrumb> {
             "the current process name could not be verified",
         ))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_reader_breadcrumb(process_id)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = process_id;
         Err(std::io::Error::new(
@@ -2741,7 +2784,21 @@ fn current_reader_registration_process() -> std::io::Result<ReaderBreadcrumb> {
             process_start: linux_process_start(std::process::id())?,
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let process_name = std::env::current_exe()?
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| safe_reader_process_display_name(name))
+            .unwrap_or("contextdb-reader")
+            .to_owned();
+        Ok(ReaderBreadcrumb {
+            process_id: std::process::id(),
+            process_name,
+            process_start: macos_process_start(std::process::id())?,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let process_name = std::env::current_exe()?
             .file_name()
@@ -2783,6 +2840,250 @@ fn linux_process_start(
         .parse::<u64>()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     Ok(contextdb_core::read_contract::ProcessStartIdentity(value))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_start(
+    process_id: u32,
+) -> std::io::Result<contextdb_core::read_contract::ProcessStartIdentity> {
+    macos_process_info(process_id).map(|(_, start)| start)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_process_info_observation {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    /// One raw native result, not a validated identity. Ordinals start at one
+    /// within each scope; every call must match both its ordinal and its PID.
+    pub(super) struct Observation {
+        pub(super) ordinal: usize,
+        pub(super) pid: libc::c_int,
+        pub(super) info: libc::proc_bsdinfo,
+        pub(super) written: libc::c_int,
+        pub(super) errno: libc::c_int,
+    }
+
+    struct State {
+        pending: VecDeque<Observation>,
+        calls: usize,
+        consumed: usize,
+        rejected: bool,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    struct Restore {
+        previous: Option<State>,
+        errno: libc::c_int,
+    }
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let finished = STATE.with(|slot| slot.replace(self.previous.take()));
+            // SAFETY: Darwin's __error returns this thread's live errno slot.
+            unsafe { *libc::__error() = self.errno };
+            // Restore first, even if a queue assertion fails. During unwinding,
+            // preserve the original panic instead of causing a double panic.
+            if !std::thread::panicking() {
+                let finished = finished.expect("native observation scope is absent");
+                assert!(
+                    !finished.rejected,
+                    "native observation sequence was rejected"
+                );
+                assert!(
+                    finished.pending.is_empty(),
+                    "native observation scope has {} unused results ({} calls, {} consumed)",
+                    finished.pending.len(),
+                    finished.calls,
+                    finished.consumed,
+                );
+            }
+        }
+    }
+
+    /// Runs on this thread only. Nested scopes suspend the outer queue and
+    /// counters; leaving either scope restores its predecessor and native errno.
+    /// A caught sequence panic still rejects the scope on normal exit.
+    pub(super) fn with_observations<R>(
+        observations: Vec<Observation>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        // SAFETY: Darwin's __error returns this thread's live errno slot.
+        let errno = unsafe { *libc::__error() };
+        let previous = STATE.with(|slot| {
+            slot.replace(Some(State {
+                pending: observations.into(),
+                calls: 0,
+                consumed: 0,
+                rejected: false,
+            }))
+        });
+        let _restore = Restore { previous, errno };
+        run()
+    }
+
+    /// (raw calls attempted, queued results consumed) in the active scope.
+    pub(super) fn counts() -> (usize, usize) {
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            let state = state.as_ref().expect("native observation scope is absent");
+            (state.calls, state.consumed)
+        })
+    }
+
+    /// None selects the unchanged libc call. An active empty/misordered queue
+    /// panics rather than falling through to a real process observation.
+    pub(super) fn observe(pid: libc::c_int, info: &mut libc::proc_bsdinfo) -> Option<libc::c_int> {
+        STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let state = slot.as_mut()?;
+            state.calls += 1;
+            state.rejected |= state.pending.front().is_none_or(|observation| {
+                observation.ordinal != state.calls || observation.pid != pid
+            });
+            assert!(
+                !state.rejected,
+                "native observation mismatch or exhausted queue at call {} for PID {}",
+                state.calls, pid,
+            );
+            let observation = state.pending.pop_front().expect("checked pending result");
+            *info = observation.info;
+            state.consumed += 1;
+            if observation.written <= 0 {
+                // SAFETY: Darwin's __error returns this thread's live errno slot.
+                unsafe { *libc::__error() = observation.errno };
+            }
+            Some(observation.written)
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_info(
+    process_id: u32,
+) -> std::io::Result<(
+    libc::proc_bsdinfo,
+    contextdb_core::read_contract::ProcessStartIdentity,
+)> {
+    let pid = libc::c_int::try_from(process_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if pid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a process id of 0 has no reader start identity",
+        ));
+    }
+    // SAFETY: `proc_bsdinfo` is a plain integer record. All-zero is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    const _: () = assert!(std::mem::size_of::<libc::proc_bsdinfo>() == 136);
+    #[cfg(all(test, target_os = "macos"))]
+    let written = macos_process_info_observation::observe(pid, &mut info).unwrap_or_else(|| {
+        // SAFETY: same native record, size, flavor and argument as the non-test call below.
+        unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::addr_of_mut!(info).cast(),
+                size,
+            )
+        }
+    });
+    // SAFETY: `info` is a live `proc_bsdinfo` and `size` is its byte length.
+    // `PROC_PIDTBSDINFO` with arg 0 returns that record and does not select a zombie.
+    #[cfg(not(test))]
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if written <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if written != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS process information has an unexpected size",
+        ));
+    }
+    if info.pbi_pid != process_id || info.pbi_start_tvusec >= 1_000_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS process start identity was rejected",
+        ));
+    }
+    let packed = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+        .filter(|packed| *packed != 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "macOS process start identity was rejected",
+            )
+        })?;
+    Ok((
+        info,
+        contextdb_core::read_contract::ProcessStartIdentity(packed),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_reader_process_display_name(info: &libc::proc_bsdinfo) -> Option<String> {
+    // Inspect only the native fixed-size buffers, never an unbounded CStr or
+    // caller-supplied argv. Either kernel-observed name can identify a reader.
+    for field in [&info.pbi_name[..], &info.pbi_comm[..]] {
+        let Some(end) = field.iter().position(|byte| *byte == 0) else {
+            continue;
+        };
+        let bytes = field[..end]
+            .iter()
+            .map(|byte| *byte as u8)
+            .collect::<Vec<_>>();
+        if let Ok(name) = std::str::from_utf8(&bytes)
+            && safe_reader_process_display_name(name)
+        {
+            return Some(name.to_owned());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_reader_breadcrumb(process_id: u32) -> std::io::Result<ReaderBreadcrumb> {
+    let (before, process_start) = macos_process_info(process_id)?;
+    let process_name = macos_reader_process_display_name(&before).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS reader has no safe operating-system process name",
+        )
+    })?;
+    // A PID may have been recycled while its name was inspected. Require the
+    // same nonzero microsecond start identity and display name on both sides.
+    let (after, after_start) = macos_process_info(process_id)?;
+    if after_start != process_start
+        || macos_reader_process_display_name(&after).as_deref() != Some(process_name.as_str())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS reader process identity changed during inspection",
+        ));
+    }
+    Ok(ReaderBreadcrumb {
+        process_id,
+        process_name,
+        process_start,
+    })
 }
 
 fn next_reader_breadcrumb_path(
@@ -4133,7 +4434,15 @@ fn verify_locked_reader_breadcrumb(breadcrumb: ReaderBreadcrumb) -> Option<Reade
         let observed = verified_linux_reader_process(&breadcrumb)?;
         breadcrumb.is_live_for(&observed).then_some(breadcrumb)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        if !safe_reader_process_display_name(&breadcrumb.process_name) {
+            return None;
+        }
+        let observed = macos_reader_breadcrumb(breadcrumb.process_id).ok()?;
+        (observed == breadcrumb).then_some(breadcrumb)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = breadcrumb;
         None
@@ -4494,9 +4803,93 @@ fn reader_snapshot_owns_descriptor(snapshot: &RegisteredReaderSnapshot) -> bool 
         .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == snapshot.physical_identity)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn reader_snapshot_owns_descriptor(snapshot: &RegisteredReaderSnapshot) -> bool {
+    let stored = snapshot.process.process_start;
+    if stored == contextdb_core::read_contract::ProcessStartIdentity(0) {
+        return false;
+    }
+    if macos_process_start(snapshot.process.process_id).ok() != Some(stored) {
+        return false;
+    }
+    if macos_descriptor_identity(snapshot.process.process_id, snapshot.descriptor_number).ok()
+        != Some(snapshot.physical_identity)
+    {
+        return false;
+    }
+    macos_process_start(snapshot.process.process_id).ok() == Some(stored)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn reader_snapshot_owns_descriptor(_snapshot: &RegisteredReaderSnapshot) -> bool {
     false
+}
+
+#[cfg(target_os = "macos")]
+fn macos_descriptor_identity(process_id: u32, descriptor: u32) -> std::io::Result<(u64, u64)> {
+    // libc 0.2.182 declares `vnode_info` and not `vnode_fdinfo`. Flavor 1 is
+    // `proc_fileinfo` plus `vnode_info`. Flavor 2 also applies a path check.
+    #[repr(C)]
+    struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+    #[repr(C)]
+    struct VnodeFdInfo {
+        pfi: ProcFileInfo,
+        pvi: libc::vnode_info,
+    }
+    const PROC_PIDFDVNODEINFO: libc::c_int = 1;
+    // `enum vtype`: `VNON` is 0 and `VREG` is 1.
+    const VREG: libc::c_int = 1;
+    const _: () = assert!(std::mem::size_of::<ProcFileInfo>() == 24);
+    const _: () = assert!(std::mem::size_of::<libc::vinfo_stat>() == 136);
+    const _: () = assert!(std::mem::size_of::<libc::vnode_info>() == 152);
+    const _: () = assert!(std::mem::size_of::<VnodeFdInfo>() == 176);
+
+    let pid = libc::c_int::try_from(process_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if pid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a process id of 0 has no reader descriptor",
+        ));
+    }
+    let fd = libc::c_int::try_from(descriptor)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: the record is plain integers. All-zero is a valid value.
+    let mut info: VnodeFdInfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<VnodeFdInfo>())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `info` is a live flavor-1 record and `size` is its byte length.
+    let written = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            fd,
+            PROC_PIDFDVNODEINFO,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return Err(std::io::Error::last_os_error());
+    }
+    if info.pfi.fi_type != libc::PROX_FDTYPE_VNODE
+        || info.pvi.vi_type != VREG
+        || (info.pvi.vi_stat.vst_mode & libc::S_IFMT) != libc::S_IFREG
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "reader descriptor is not the registered regular file",
+        ));
+    }
+    // `MetadataExt::dev` casts Apple `dev_t` (`i32`) with `as u64`, which
+    // sign-extends. `vst_dev` holds those same bits in a `u32`.
+    let device = (info.pvi.vi_stat.vst_dev as i32) as u64;
+    Ok((device, info.pvi.vi_stat.vst_ino))
 }
 
 #[cfg(unix)]
@@ -4812,20 +5205,18 @@ pub enum ReaderReleaseWait {
 /// says nothing about whether the store is free; and a store nobody is holding
 /// is released at once, whatever can or cannot be read about readers.
 ///
-/// It is EVENT-DRIVEN, and deliberately has no timer anywhere in it. The
-/// blocking acquisition puts this thread to sleep in the kernel until the last
-/// holder lets go -- or dies, which the kernel treats as the same event. The
-/// wake IS the release; nothing polls, and no interval decides how quickly a
-/// waiter learns. Nothing in the store folder is opened, read, or locked.
+/// Linux waits on companion notifications; macOS waits on the cancellation
+/// pipe with a private lock-recheck interval of at most 10 ms. Each wake returns
+/// to the trusted nonblocking companion probe: only taking the hold establishes
+/// release. Nothing in the store folder is opened, read, or locked.
 ///
 /// Known runtime directories can name an unobservable hold. The wait verdict
 /// itself comes from the companion hold.
 ///
-/// `stop` ends the wait immediately: the caller is told the moment the token
-/// is cancelled, through the token's own listener, so an interrupt is as
-/// prompt as a release. A wait ended that way answers `Stopped` while the
-/// kernel wait it started finishes on its own; that helper releases nothing
-/// and holds nothing once it does.
+/// On Linux and macOS, `stop` wakes the caller's own waiting thread through
+/// the token's listener and answers `Stopped`; no helper or queued lock remains.
+/// Other Unix targets retain their blocking fallback and observe cancellation
+/// only when that acquisition returns.
 /// The same wait, told the runtime ROOT an operator supplied.
 ///
 /// The root selects the breadcrumbs used to explain an unobservable hold.
@@ -4835,9 +5226,8 @@ pub enum ReaderReleaseWait {
 /// A root that cannot be read does not turn a released companion hold into
 /// `Unobservable`; open validation reports the root's configuration refusal.
 ///
-/// Every other part of the contract is [`wait_for_reader_release`]'s -- the
-/// kernel wake IS the event, there is no timer anywhere in it, and `stop` is
-/// answered as promptly as a release.
+/// Every other part of the contract, including platform-specific wake behavior,
+/// is [`wait_for_reader_release`]'s.
 pub fn wait_for_reader_release_in_runtime_dir(
     path: &Path,
     runtime_root: Option<&Path>,
@@ -4862,9 +5252,9 @@ pub fn wait_for_reader_release(
         Ok(file) => file,
         Err(error) => return unobservable_reader_hold(path, runtime, error),
     };
-    // Armed BEFORE the first ask, so a reader that lets go in the gap between
-    // the ask and the sleep has already left a notification queued rather than
-    // slipping past unseen.
+    // Arm BEFORE the first ask so cancellation cannot slip between the probe
+    // and sleep. Linux also queues release notifications; macOS bounds the next
+    // trusted release probe by its private recheck interval.
     let watch = match CoordinationWatch::arm(&companion, Some(stop)) {
         Ok(watch) => watch,
         Err(error) => return unobservable_reader_hold(path, runtime, error),
@@ -4885,15 +5275,10 @@ pub fn wait_for_reader_release(
         read_persistence_test_scaffold::note_reader_release_block_for_test(
             read_persistence_test_scaffold::ReaderReleaseBlockForTest::UntilHolderReleased,
         );
-        // The sleep IS the wait: this thread wakes when the kernel says
-        // something happened to the companion -- a holder closing its
-        // descriptor, which is what letting go looks like and what the kernel
-        // does for a holder that dies -- or when this caller asks to stop. No
-        // deadline of this wait's own is supplied, because a deadline is a poll
-        // interval and a poll interval is how long a caller keeps a free store
-        // hostage after it is free. And the sleeping is done HERE, on the
-        // caller's own thread, so a caller that stops waiting leaves nothing
-        // anywhere still queued for a hold nobody wants.
+        // The caller owns its deadline through `stop`; this wait adds none.
+        // Linux wakes on companion events or cancellation. macOS watches the
+        // cancellation pipe and schedules a trusted lock recheck within 10 ms.
+        // Both sleep here on the caller's thread, without a queued acquisition.
         if let Err(error) = watch.sleep(&held, COMPANION_READER_HOLD_LOCK_OFFSET, None) {
             return unobservable_reader_hold(path, runtime, error);
         }
@@ -34478,8 +34863,46 @@ impl Drop for RedbPersistence {
     }
 }
 
+/// Every companion ownership operation addresses the same lock, including
+/// the short shared probe and error cleanup. macOS whole-file locks overlap
+/// the reader and claim-window bytes, so ownership uses a separate OFD byte.
+/// An older whole-file owner still overlaps that byte and excludes a writer.
+#[derive(Clone, Copy)]
+enum CompanionOwnershipLock {
+    Shared,
+    Exclusive,
+    Unlock,
+}
+
+#[cfg(target_os = "macos")]
+fn companion_ownership_lock(file: &File, operation: CompanionOwnershipLock) -> std::io::Result<()> {
+    let lock_type = match operation {
+        CompanionOwnershipLock::Shared => RangeLockMode::Shared.lock_type(),
+        CompanionOwnershipLock::Exclusive => RangeLockMode::Exclusive.lock_type(),
+        CompanionOwnershipLock::Unlock => libc::F_UNLCK as libc::c_short,
+    };
+    match companion_range_lock(
+        file,
+        COMPANION_WRITER_OWNERSHIP_LOCK_OFFSET,
+        lock_type,
+        false,
+    )? {
+        RangeLockOutcome::Taken => Ok(()),
+        RangeLockOutcome::HeldByAnother => Err(std::io::ErrorKind::WouldBlock.into()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn companion_ownership_lock(file: &File, operation: CompanionOwnershipLock) -> std::io::Result<()> {
+    match operation {
+        CompanionOwnershipLock::Shared => fs2::FileExt::try_lock_shared(file),
+        CompanionOwnershipLock::Exclusive => fs2::FileExt::try_lock_exclusive(file),
+        CompanionOwnershipLock::Unlock => fs2::FileExt::unlock(file),
+    }
+}
+
 fn try_lock_exclusive(file: &File) -> Result<bool> {
-    match fs2::FileExt::try_lock_exclusive(file) {
+    match companion_ownership_lock(file, CompanionOwnershipLock::Exclusive) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
         Err(err) => Err(Error::Other(format!("companion lock error: {err}"))),
@@ -34487,8 +34910,12 @@ fn try_lock_exclusive(file: &File) -> Result<bool> {
 }
 
 fn unlock_file(file: &File) {
-    let _ = fs2::FileExt::unlock(file);
+    let _ = companion_ownership_lock(file, CompanionOwnershipLock::Unlock);
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "persistence/reader_coordination_wait_tests.rs"]
+mod reader_coordination_wait_tests;
 
 #[cfg(test)]
 mod reader_breadcrumb_location_proofs {
@@ -34547,6 +34974,834 @@ mod reader_breadcrumb_location_proofs {
         assert_eq!(verified.len(), 1);
         drop(guard);
         assert!(root.is_dir(), "reader teardown preserves the supplied root");
+
+        // A named holder must match the complete OS identity, not just a PID.
+        // These are claimed-marker mutations, not simulated OS observations.
+        let runtime = RuntimeDirectory::supplied(&root);
+        assert_ne!(breadcrumb.process_start.0, 0);
+        for (label, claimed) in [
+            (
+                "zero PID",
+                ReaderBreadcrumb {
+                    process_id: 0,
+                    ..breadcrumb.clone()
+                },
+            ),
+            (
+                "invalid PID",
+                ReaderBreadcrumb {
+                    process_id: u32::MAX,
+                    ..breadcrumb.clone()
+                },
+            ),
+            (
+                "zero start",
+                ReaderBreadcrumb {
+                    process_start: contextdb_core::read_contract::ProcessStartIdentity(0),
+                    ..breadcrumb.clone()
+                },
+            ),
+            (
+                "changed start",
+                ReaderBreadcrumb {
+                    process_start: contextdb_core::read_contract::ProcessStartIdentity(
+                        breadcrumb.process_start.0 ^ 1,
+                    ),
+                    ..breadcrumb.clone()
+                },
+            ),
+            (
+                "empty name",
+                ReaderBreadcrumb {
+                    process_name: String::new(),
+                    ..breadcrumb.clone()
+                },
+            ),
+            (
+                "control name",
+                ReaderBreadcrumb {
+                    process_name: "reader\x1b[2J".into(),
+                    ..breadcrumb.clone()
+                },
+            ),
+            (
+                "invented name",
+                ReaderBreadcrumb {
+                    process_name: format!("unobserved-{}", breadcrumb.process_name),
+                    ..breadcrumb.clone()
+                },
+            ),
+        ] {
+            let guard = ReaderBreadcrumbGuard::create(&store, &root, Some(&claimed))
+                .expect("publish a trusted locked negative control");
+            let (count, named) = observed_reader_holders(&store, &runtime)
+                .expect("inspect the real locked file and OS identity");
+            assert_eq!(count, 1, "{label}: an unverified holder still counts");
+            assert!(
+                named.is_empty(),
+                "{label}: must disclose no identity: {named:?}"
+            );
+            drop(guard);
+        }
+        let anonymous = ReaderBreadcrumbGuard::create(&store, &root, None)
+            .expect("publish the production anonymous marker");
+        assert_eq!(
+            observed_reader_holders(&store, &runtime).unwrap(),
+            (1, vec![])
+        );
+        drop(anonymous);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt as _, symlink};
+            let guard = ReaderBreadcrumbGuard::create(&store, &root, Some(&breadcrumb))
+                .expect("publish the trusted-file positive control");
+            let path = &guard.path;
+            assert!(open_trusted_reader_breadcrumb(path).is_ok());
+            for mode in [0o400, 0o640, 0o660, 0o644, 0o1600] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+                assert!(
+                    open_trusted_reader_breadcrumb(path).is_err(),
+                    "mode {mode:o}"
+                );
+                assert!(
+                    observed_reader_holders(&store, &runtime)
+                        .unwrap()
+                        .1
+                        .is_empty()
+                );
+            }
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let alias = directory.path().join("extra-link");
+            std::fs::hard_link(path, &alias).unwrap();
+            assert!(open_trusted_reader_breadcrumb(path).is_err());
+            assert!(
+                observed_reader_holders(&store, &runtime)
+                    .unwrap()
+                    .1
+                    .is_empty()
+            );
+            std::fs::remove_file(&alias).unwrap();
+
+            let displaced = directory.path().join("original-marker");
+            std::fs::rename(path, &displaced).unwrap();
+            symlink(&displaced, path).unwrap();
+            assert!(open_trusted_reader_breadcrumb(path).is_err());
+            assert!(
+                observed_reader_holders(&store, &runtime)
+                    .unwrap()
+                    .1
+                    .is_empty()
+            );
+            std::fs::remove_file(path).unwrap();
+            std::fs::rename(&displaced, path).unwrap();
+            assert_eq!(
+                observed_reader_holders(&store, &runtime).unwrap(),
+                (1, vec![breadcrumb.clone()]),
+                "restoring the same trusted locked inode restores the verified identity"
+            );
+            drop(guard);
+        }
+        assert_eq!(
+            observed_reader_holders(&store, &runtime).unwrap(),
+            (0, vec![])
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            // Decode actual libc fields; do not reproduce the Darwin ABI.
+            // None bytes means a buffer with no in-bounds NUL terminator.
+            let fields: &[(&str, Option<&[u8]>, Option<&str>)] = &[
+                ("safe", Some(b"native-reader"), Some("native-reader")),
+                ("empty", Some(b""), None),
+                ("non UTF-8", Some(b"\xff"), None),
+                ("non ASCII UTF-8", Some("é".as_bytes()), None),
+                ("escape", Some(b"r\x1b[2J"), None),
+                ("newline", Some(b"r\n"), None),
+                ("DEL", Some(b"r\x7f"), None),
+                ("slash", Some(b"r/x"), None),
+                ("backslash", Some(b"r\\x"), None),
+                ("unterminated", None, None),
+                (
+                    "different safe",
+                    Some(b"other-reader"),
+                    Some("other-reader"),
+                ),
+            ];
+            let fill = |field: &mut [libc::c_char], bytes: Option<&[u8]>| {
+                field.fill(b'X' as libc::c_char);
+                if let Some(bytes) = bytes {
+                    assert!(bytes.len() < field.len());
+                    for (dst, src) in field.iter_mut().zip(bytes) {
+                        *dst = *src as libc::c_char;
+                    }
+                    field[bytes.len()] = 0;
+                }
+            };
+            for &(name_label, name_bytes, name_expected) in fields {
+                for &(comm_label, comm_bytes, comm_expected) in fields {
+                    // SAFETY: libc's record consists solely of integer fields.
+                    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                    fill(&mut info.pbi_name, name_bytes);
+                    fill(&mut info.pbi_comm, comm_bytes);
+                    assert_eq!(
+                        macos_reader_process_display_name(&info).as_deref(),
+                        name_expected.or(comm_expected),
+                        "name={name_label}, comm={comm_label}"
+                    );
+                }
+            }
+            for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+                let error = macos_process_info(pid)
+                    .err()
+                    .expect("invalid PID must fail");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        native_observation_rows::run(&store, &root);
+    }
+
+    // Rows of the existing writer/reader identity proof, using only the approved
+    // raw-call seam. This module is absent from Linux and production builds.
+    #[cfg(target_os = "macos")]
+    mod native_observation_rows {
+        use super::super::macos_process_info_observation::{
+            Observation, counts, with_observations,
+        };
+        use super::*;
+        use contextdb_core::read_contract::ProcessStartIdentity;
+        use std::os::unix::fs::MetadataExt as _;
+
+        #[derive(Clone)]
+        struct Raw {
+            pid: u32,
+            sec: u64,
+            usec: u64,
+            name: Option<Vec<u8>>,
+            comm: Option<Vec<u8>>,
+            written: libc::c_int,
+            errno: libc::c_int,
+        }
+
+        fn stable(pid: u32) -> Raw {
+            Raw {
+                pid,
+                sec: 1,
+                usec: 2,
+                name: Some(b"native-reader".to_vec()),
+                comm: Some(b"native-reader".to_vec()),
+                written: libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap(),
+                errno: 0,
+            }
+        }
+
+        fn fill(field: &mut [libc::c_char], value: &Option<Vec<u8>>) {
+            field.fill(b'X' as libc::c_char);
+            if let Some(bytes) = value {
+                assert!(bytes.len() < field.len());
+                for (dst, src) in field.iter_mut().zip(bytes) {
+                    *dst = *src as libc::c_char;
+                }
+                field[bytes.len()] = 0;
+            }
+        }
+
+        fn queue(requested: u32, raws: &[Raw]) -> Vec<Observation> {
+            raws.iter()
+                .enumerate()
+                .map(|(index, raw)| {
+                    // SAFETY: the real libc record contains only integer fields.
+                    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                    info.pbi_pid = raw.pid;
+                    info.pbi_start_tvsec = raw.sec;
+                    info.pbi_start_tvusec = raw.usec;
+                    fill(&mut info.pbi_name, &raw.name);
+                    fill(&mut info.pbi_comm, &raw.comm);
+                    Observation {
+                        ordinal: index + 1,
+                        pid: libc::c_int::try_from(requested).unwrap(),
+                        info,
+                        written: raw.written,
+                        errno: raw.errno,
+                    }
+                })
+                .collect()
+        }
+
+        fn expected(pid: u32, packed: u64, name: &str) -> ReaderBreadcrumb {
+            ReaderBreadcrumb {
+                process_id: pid,
+                process_start: ProcessStartIdentity(packed),
+                process_name: name.into(),
+            }
+        }
+
+        fn descriptor(guard: &ReaderBreadcrumbGuard) -> (u64, u64) {
+            let held = guard.file.as_ref().unwrap().metadata().unwrap();
+            let (opened, path) = open_trusted_reader_breadcrumb(&guard.path).unwrap();
+            let opened = opened.metadata().unwrap();
+            assert_eq!((opened.dev(), opened.ino()), (held.dev(), held.ino()));
+            assert_eq!((path.dev(), path.ino()), (held.dev(), held.ino()));
+            assert_eq!(held.nlink(), 1);
+            assert_eq!(held.mode() & 0o7777, 0o600);
+            (held.dev(), held.ino())
+        }
+
+        fn positive(
+            store: &Path,
+            root: &Path,
+            guard: &ReaderBreadcrumbGuard,
+            raws: &[Raw],
+            want: &ReaderBreadcrumb,
+            inode: (u64, u64),
+        ) {
+            assert_eq!(descriptor(guard), inode);
+            with_observations(queue(want.process_id, raws), || {
+                assert_eq!(current_reader_breadcrumb().unwrap(), *want);
+                assert_eq!(counts(), (2, 2));
+            });
+            with_observations(queue(want.process_id, raws), || {
+                assert_eq!(
+                    observed_reader_holders(store, &RuntimeDirectory::supplied(root)).unwrap(),
+                    (1, vec![want.clone()])
+                );
+                assert_eq!(counts(), (2, 2));
+            });
+            assert_eq!(descriptor(guard), inode);
+        }
+
+        // Every failure is driven through BOTH the creator and the real locked
+        // verifier. The restored control uses the SAME held file descriptor.
+        fn reject(
+            store: &Path,
+            root: &Path,
+            label: &str,
+            requested: u32,
+            raws: &[Raw],
+            errno: Option<i32>,
+            invalid_input: bool,
+        ) {
+            let pid = std::process::id();
+            let want = expected(pid, 1_000_002, "native-reader");
+            let claim = ReaderBreadcrumb {
+                process_id: requested,
+                ..want.clone()
+            };
+            let mut guard = ReaderBreadcrumbGuard::create(store, root, Some(&claim)).unwrap();
+            let inode = descriptor(&guard);
+            let observations = || {
+                if invalid_input {
+                    vec![]
+                } else {
+                    queue(requested, raws)
+                }
+            };
+            with_observations(observations(), || {
+                let error = if requested == std::process::id() {
+                    current_reader_breadcrumb()
+                } else {
+                    macos_reader_breadcrumb(requested)
+                }
+                .unwrap_err();
+                if let Some(errno) = errno {
+                    assert_eq!(error.raw_os_error(), Some(errno), "{label}");
+                } else {
+                    assert_eq!(
+                        error.kind(),
+                        if invalid_input {
+                            std::io::ErrorKind::InvalidInput
+                        } else {
+                            std::io::ErrorKind::InvalidData
+                        },
+                        "{label}"
+                    );
+                }
+                assert_eq!(counts(), (raws.len(), raws.len()), "{label}: creator");
+            });
+            with_observations(observations(), || {
+                assert_eq!(
+                    observed_reader_holders(store, &RuntimeDirectory::supplied(root)).unwrap(),
+                    (1, vec![]),
+                    "{label}: rejected identity must remain anonymous"
+                );
+                assert_eq!(counts(), (raws.len(), raws.len()), "{label}: verifier");
+            });
+            assert_eq!(descriptor(&guard), inode);
+            // Invalid caller controls have a different claimed PID. Replace only
+            // the bytes on the held inode, using the production encoder.
+            if requested != pid {
+                let file = guard.file.as_mut().unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                file.set_len(0).unwrap();
+                file.write_all(&encode_reader_breadcrumb(&want).unwrap())
+                    .unwrap();
+                file.sync_data().unwrap();
+            }
+            let good = stable(pid);
+            positive(store, root, &guard, &[good.clone(), good], &want, inode);
+            drop(guard);
+            assert_eq!(
+                observed_reader_holders(store, &RuntimeDirectory::supplied(root)).unwrap(),
+                (0, vec![]),
+                "{label}: release"
+            );
+        }
+
+        fn both_reads(store: &Path, root: &Path, label: &str, bad: Raw, errno: Option<i32>) {
+            let good = stable(std::process::id());
+            // Validate raw-record failures directly as well: otherwise a later
+            // changed-tuple rejection could mask a broken arithmetic guard.
+            if !label.starts_with("invalid-name/") {
+                with_observations(queue(good.pid, &[bad.clone()]), || {
+                    let error = macos_process_info(good.pid)
+                        .err()
+                        .expect("raw record must be rejected");
+                    if let Some(errno) = errno {
+                        assert_eq!(error.raw_os_error(), Some(errno), "{label}");
+                    } else {
+                        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{label}");
+                    }
+                    assert_eq!(counts(), (1, 1));
+                });
+            }
+            // Second-read cases precede first-read cases so accepting an invalid
+            // selected name fails an outcome assertion before queue exhaustion.
+            reject(
+                store,
+                root,
+                &format!("{label}/second"),
+                good.pid,
+                &[good.clone(), bad.clone()],
+                errno,
+                false,
+            );
+            reject(
+                store,
+                root,
+                &format!("{label}/first"),
+                good.pid,
+                &[bad.clone()],
+                errno,
+                false,
+            );
+        }
+
+        pub(super) fn run(store: &Path, root: &Path) {
+            let pid = std::process::id();
+            assert!(pid > 1 && pid < i32::MAX as u32);
+            let good = stable(pid);
+            // Exact stable positives run before negatives; a skipped recheck or
+            // invented constant name must fail an identity/count assertion.
+            for name in ["native-reader", "other-reader"] {
+                let raw = Raw {
+                    name: Some(name.as_bytes().to_vec()),
+                    comm: Some(name.as_bytes().to_vec()),
+                    ..good.clone()
+                };
+                let want = expected(pid, 1_000_002, name);
+                let guard = ReaderBreadcrumbGuard::create(store, root, Some(&want)).unwrap();
+                positive(
+                    store,
+                    root,
+                    &guard,
+                    &[raw.clone(), raw],
+                    &want,
+                    descriptor(&guard),
+                );
+            }
+            // Raw failure is the Cartesian product, not representative samples.
+            for written in [-1, 0] {
+                for errno in [libc::EACCES, libc::ESRCH] {
+                    let bad = Raw {
+                        written,
+                        errno,
+                        ..good.clone()
+                    };
+                    both_reads(
+                        store,
+                        root,
+                        &format!("raw/{written}/errno/{errno}"),
+                        bad,
+                        Some(errno),
+                    );
+                }
+            }
+            let size = good.written;
+            for written in (1..size).chain(std::iter::once(size + 1)) {
+                both_reads(
+                    store,
+                    root,
+                    &format!("length/{written}"),
+                    Raw {
+                        written,
+                        ..good.clone()
+                    },
+                    None,
+                );
+            }
+            for returned in [0, pid - 1, pid + 1] {
+                both_reads(
+                    store,
+                    root,
+                    &format!("returned-pid/{returned}"),
+                    Raw {
+                        pid: returned,
+                        ..good.clone()
+                    },
+                    None,
+                );
+            }
+            for requested in [0, i32::MAX as u32 + 1, u32::MAX] {
+                // Leave a result ready for the specific forbidden truncated call.
+                // The valid case makes zero production calls; drain it only
+                // after asserting that, so queue exhaustion cannot mask a failure.
+                let mut pending = queue(
+                    pid,
+                    &[Raw {
+                        pid: requested,
+                        ..good.clone()
+                    }],
+                );
+                pending[0].pid = requested as libc::c_int;
+                with_observations(pending, || {
+                    let error = macos_process_info(requested)
+                        .err()
+                        .expect("caller PID must be rejected");
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                    assert_eq!(counts(), (0, 0), "production must reject before the FFI");
+                    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                    assert!(
+                        super::super::macos_process_info_observation::observe(
+                            requested as libc::c_int,
+                            &mut info
+                        )
+                        .is_some()
+                    );
+                    assert_eq!(
+                        counts(),
+                        (1, 1),
+                        "only the explicit test drain consumed the result"
+                    );
+                });
+                reject(
+                    store,
+                    root,
+                    &format!("caller-pid/{requested}"),
+                    requested,
+                    &[],
+                    None,
+                    true,
+                );
+            }
+            for (label, sec, usec) in [
+                ("zero-start", 0, 0),
+                ("microsecond-limit", 1, 1_000_000),
+                ("microsecond-max", 1, u64::MAX),
+                ("multiply-overflow", u64::MAX / 1_000_000 + 1, 0),
+                (
+                    "add-overflow",
+                    u64::MAX / 1_000_000,
+                    u64::MAX % 1_000_000 + 1,
+                ),
+                // Wrapping exactly at MAX+1 becomes zero and is also rejected
+                // by the nonzero guard. MAX+2 isolates checked-add itself.
+                (
+                    "add-overflow-nonzero",
+                    u64::MAX / 1_000_000,
+                    u64::MAX % 1_000_000 + 2,
+                ),
+            ] {
+                both_reads(
+                    store,
+                    root,
+                    label,
+                    Raw {
+                        sec,
+                        usec,
+                        ..good.clone()
+                    },
+                    None,
+                );
+            }
+            for (sec, usec, packed) in [
+                (0, 1, 1),
+                (1, 0, 1_000_000),
+                (1, 999_999, 1_999_999),
+                (u64::MAX / 1_000_000, u64::MAX % 1_000_000, u64::MAX),
+            ] {
+                let raw = Raw {
+                    sec,
+                    usec,
+                    ..good.clone()
+                };
+                let want = expected(pid, packed, "native-reader");
+                let guard = ReaderBreadcrumbGuard::create(store, root, Some(&want)).unwrap();
+                positive(
+                    store,
+                    root,
+                    &guard,
+                    &[raw.clone(), raw],
+                    &want,
+                    descriptor(&guard),
+                );
+            }
+            for (label, after) in [
+                (
+                    "changed-start",
+                    Raw {
+                        usec: 3,
+                        ..good.clone()
+                    },
+                ),
+                (
+                    "changed-pid",
+                    Raw {
+                        pid: pid + 1,
+                        ..good.clone()
+                    },
+                ),
+                (
+                    "changed-selected-name",
+                    Raw {
+                        name: Some(b"other-reader".to_vec()),
+                        ..good.clone()
+                    },
+                ),
+            ] {
+                reject(store, root, label, pid, &[good.clone(), after], None, false);
+            }
+            // All nine invalid fixtures from the independent name-field table.
+            let invalid: &[(&str, Option<&[u8]>)] = &[
+                ("empty", Some(b"")),
+                ("non-utf8", Some(b"\xff")),
+                ("non-ascii", Some("é".as_bytes())),
+                ("escape", Some(b"r\x1b[2J")),
+                ("newline", Some(b"r\n")),
+                ("del", Some(b"r\x7f")),
+                ("slash", Some(b"r/x")),
+                ("backslash", Some(b"r\\x")),
+                ("unterminated", None),
+            ];
+            for &(label, bytes) in invalid {
+                let value = bytes.map(<[u8]>::to_vec);
+                both_reads(
+                    store,
+                    root,
+                    &format!("invalid-name/{label}"),
+                    Raw {
+                        name: value.clone(),
+                        comm: value,
+                        ..good.clone()
+                    },
+                    None,
+                );
+                let recovered = Raw {
+                    name: bytes.map(<[u8]>::to_vec),
+                    ..good.clone()
+                };
+                let want = expected(pid, 1_000_002, "native-reader");
+                let guard = ReaderBreadcrumbGuard::create(store, root, Some(&want)).unwrap();
+                let inode = descriptor(&guard);
+                positive(
+                    store,
+                    root,
+                    &guard,
+                    &[recovered.clone(), recovered.clone()],
+                    &want,
+                    inode,
+                );
+                // Selected name is stable even when its source buffer changes.
+                positive(
+                    store,
+                    root,
+                    &guard,
+                    &[good.clone(), recovered.clone()],
+                    &want,
+                    inode,
+                );
+                positive(
+                    store,
+                    root,
+                    &guard,
+                    &[recovered, good.clone()],
+                    &want,
+                    inode,
+                );
+            }
+            // A safe primary wins over a different safe comm, observed exactly.
+            let primary = Raw {
+                comm: Some(b"other-reader".to_vec()),
+                ..good.clone()
+            };
+            let want = expected(pid, 1_000_002, "native-reader");
+            let guard = ReaderBreadcrumbGuard::create(store, root, Some(&want)).unwrap();
+            positive(
+                store,
+                root,
+                &guard,
+                &[primary.clone(), primary],
+                &want,
+                descriptor(&guard),
+            );
+            drop(guard);
+            for (label, claim) in [
+                ("claimed-start", expected(pid, 1_000_003, "native-reader")),
+                ("claimed-zero-start", expected(pid, 0, "native-reader")),
+                ("claimed-name", expected(pid, 1_000_002, "forged-reader")),
+            ] {
+                let mut guard = ReaderBreadcrumbGuard::create(store, root, Some(&claim)).unwrap();
+                let inode = descriptor(&guard);
+                with_observations(queue(pid, &[good.clone(), good.clone()]), || {
+                    // Creator succeeds with the observed tuple, not the claim.
+                    assert_eq!(macos_reader_breadcrumb(pid).unwrap(), want, "{label}");
+                    assert_eq!(counts(), (2, 2));
+                });
+                with_observations(queue(pid, &[good.clone(), good.clone()]), || {
+                    assert_eq!(
+                        observed_reader_holders(store, &RuntimeDirectory::supplied(root)).unwrap(),
+                        (1, vec![]),
+                        "{label}"
+                    );
+                    assert_eq!(counts(), (2, 2));
+                });
+                let file = guard.file.as_mut().unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                file.set_len(0).unwrap();
+                file.write_all(&encode_reader_breadcrumb(&want).unwrap())
+                    .unwrap();
+                file.sync_data().unwrap();
+                positive(
+                    store,
+                    root,
+                    &guard,
+                    &[good.clone(), good.clone()],
+                    &want,
+                    inode,
+                );
+            }
+            // Claimed PID is also the verifier's query PID; an observed different
+            // PID is rejected on the first native record, before tuple equality.
+            reject(
+                store,
+                root,
+                "claimed-pid",
+                pid + 1,
+                &[good.clone()],
+                None,
+                false,
+            );
+            let guard = ReaderBreadcrumbGuard::create(store, root, None).unwrap();
+            with_observations(vec![], || {
+                assert_eq!(
+                    observed_reader_holders(store, &RuntimeDirectory::supplied(root)).unwrap(),
+                    (1, vec![])
+                );
+                assert_eq!(counts(), (0, 0));
+            });
+            drop(guard);
+            scope_controls(pid, &good);
+        }
+
+        fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
+            if let Some(text) = panic.downcast_ref::<String>() {
+                text.clone()
+            } else if let Some(text) = panic.downcast_ref::<&str>() {
+                (*text).into()
+            } else {
+                panic!("unexpected panic payload")
+            }
+        }
+
+        fn scope_controls(pid: u32, good: &Raw) {
+            use std::panic::{AssertUnwindSafe, catch_unwind};
+            // SAFETY: Darwin's accessor returns this thread's live errno slot.
+            let errno = unsafe { *libc::__error() };
+            with_observations(queue(pid, &[good.clone(), good.clone()]), || {
+                macos_process_info(pid).unwrap();
+                assert_eq!(counts(), (1, 1));
+                let before = unsafe { *libc::__error() };
+                let bad = Raw {
+                    written: -1,
+                    errno: libc::EACCES,
+                    ..good.clone()
+                };
+                with_observations(queue(pid, &[bad]), || {
+                    assert_eq!(
+                        macos_process_info(pid)
+                            .err()
+                            .expect("raw failure")
+                            .raw_os_error(),
+                        Some(libc::EACCES)
+                    );
+                    assert_eq!(counts(), (1, 1));
+                });
+                assert_eq!(unsafe { *libc::__error() }, before);
+                assert_eq!(counts(), (1, 1));
+                let panic = catch_unwind(AssertUnwindSafe(|| {
+                    with_observations(queue(pid, &[good.clone()]), || {
+                        unsafe { *libc::__error() = libc::ESRCH };
+                        panic!("native scope original panic");
+                    });
+                }))
+                .unwrap_err();
+                assert_eq!(panic_text(panic), "native scope original panic");
+                assert_eq!(unsafe { *libc::__error() }, before);
+                assert_eq!(counts(), (1, 1));
+                macos_process_info(pid).unwrap();
+                assert_eq!(counts(), (2, 2));
+            });
+            assert_eq!(unsafe { *libc::__error() }, errno);
+            for mode in ["unused", "ordinal", "pid", "exhausted"] {
+                let mut observations = queue(pid, &[good.clone()]);
+                match mode {
+                    "ordinal" => observations[0].ordinal = 2,
+                    "pid" => observations[0].pid += 1,
+                    "exhausted" => observations.clear(),
+                    _ => {}
+                }
+                let panic = catch_unwind(AssertUnwindSafe(|| {
+                    with_observations(observations, || {
+                        if mode != "unused" {
+                            let rejection = catch_unwind(AssertUnwindSafe(|| {
+                                let _ = macos_process_info(pid);
+                            }));
+                            assert!(
+                                panic_text(rejection.unwrap_err())
+                                    .contains("native observation mismatch")
+                            );
+                            assert_eq!(counts(), (1, 0));
+                            // Catching the call panic cannot make scope exit pass.
+                        }
+                    });
+                }))
+                .unwrap_err();
+                let message = panic_text(panic);
+                assert!(
+                    message.contains(if mode == "unused" {
+                        "unused results"
+                    } else {
+                        "sequence was rejected"
+                    }),
+                    "{mode}: {message}"
+                );
+                assert_eq!(unsafe { *libc::__error() }, errno);
+                // A failed scope must leave no stale override behind. Calling
+                // observe directly avoids executing a real FFI call here.
+                let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                assert!(
+                    super::super::macos_process_info_observation::observe(
+                        pid as libc::c_int,
+                        &mut info
+                    )
+                    .is_none()
+                );
+                with_observations(queue(pid, &[good.clone()]), || {
+                    macos_process_info(pid).unwrap();
+                    assert_eq!(counts(), (1, 1));
+                });
+            }
+        }
     }
 
     /// A real store nobody is holding, released at once.
@@ -34700,6 +35955,110 @@ mod recorded_owner_state_proofs {
     /// open file the record was read from.
     #[test]
     fn a_record_nobody_is_holding_refuses_nobody() {
+        #[cfg(unix)]
+        {
+            // A reader hold and a writer claim are independent facts. Exercise
+            // their actual primitives before the recorded-owner control below.
+            let directory = tempfile::TempDir::new().expect("task-scoped lock directory");
+            let store = directory.path().join("independent-locks.db");
+            std::fs::write(&store, b"").expect("the store exists");
+            let initial = CompanionGuard::acquire(&store, CompanionAdmission::NewStore)
+                .expect("create the trusted companion");
+            initial.publish_writer_run(&store, true).unwrap();
+            drop(initial);
+
+            let path = companion_path(&store);
+            let reader = open_trusted_companion(&path).expect("separate reader description");
+            let contender = open_trusted_companion_for_exclusive_hold(&path)
+                .expect("separate competing writer description");
+            assert_eq!(
+                take_companion_range_lock_shared(&reader, COMPANION_READER_HOLD_LOCK_OFFSET)
+                    .unwrap(),
+                RangeLockOutcome::Taken
+            );
+            let writer = CompanionGuard::acquire(&store, CompanionAdmission::Existing)
+                .unwrap_or_else(|error| {
+                    panic!("a reader byte hold must coexist with a writer claim: {error}")
+                });
+            writer.publish_writer_run(&store, false).unwrap();
+
+            let assert_writer_still_owns = || {
+                assert!(
+                    !try_lock_exclusive(&contender).unwrap(),
+                    "a separate open in this process must not steal writer ownership"
+                );
+                assert!(matches!(
+                    CompanionGuard::acquire(&store, CompanionAdmission::Existing),
+                    Err(Error::ReadFailure(failure))
+                        if failure.kind() == ReadFailureKind::HeldByWriter
+                ));
+            };
+            assert_writer_still_owns();
+            assert_eq!(
+                take_companion_range_lock_shared(&contender, COMPANION_CLAIM_WINDOW_LOCK_OFFSET)
+                    .unwrap(),
+                RangeLockOutcome::HeldByAnother
+            );
+            assert_eq!(
+                take_companion_range_lock_exclusive(&contender, COMPANION_READER_HOLD_LOCK_OFFSET)
+                    .unwrap(),
+                RangeLockOutcome::HeldByAnother,
+                "same-process opens must also contend for the reader byte"
+            );
+
+            drop(open_trusted_companion(&path).expect("unrelated open and close"));
+            assert_writer_still_owns();
+            assert_eq!(
+                take_companion_range_lock_exclusive(&contender, COMPANION_READER_HOLD_LOCK_OFFSET)
+                    .unwrap(),
+                RangeLockOutcome::HeldByAnother,
+                "an unrelated descriptor close must not release the reader hold"
+            );
+
+            writer.close_claim_window();
+            assert_writer_still_owns();
+            assert_eq!(
+                take_companion_range_lock_exclusive(&contender, COMPANION_CLAIM_WINDOW_LOCK_OFFSET)
+                    .unwrap(),
+                RangeLockOutcome::Taken
+            );
+            release_companion_range_lock(&contender, COMPANION_CLAIM_WINDOW_LOCK_OFFSET);
+            assert_writer_still_owns();
+            {
+                let state = writer.lock_state().unwrap();
+                assert_eq!(
+                    take_companion_range_lock_shared(
+                        &state.file,
+                        COMPANION_READER_HOLD_LOCK_OFFSET
+                    )
+                    .unwrap(),
+                    RangeLockOutcome::Taken
+                );
+                release_companion_range_lock(&state.file, COMPANION_READER_HOLD_LOCK_OFFSET);
+            }
+            assert_writer_still_owns();
+            assert_eq!(
+                take_companion_range_lock_exclusive(&contender, COMPANION_READER_HOLD_LOCK_OFFSET)
+                    .unwrap(),
+                RangeLockOutcome::HeldByAnother,
+                "precise unlock on the writer must preserve the other reader's hold"
+            );
+
+            release_companion_range_lock(&reader, COMPANION_READER_HOLD_LOCK_OFFSET);
+            assert_writer_still_owns();
+            assert_eq!(
+                take_companion_range_lock_exclusive(&contender, COMPANION_READER_HOLD_LOCK_OFFSET)
+                    .unwrap(),
+                RangeLockOutcome::Taken,
+                "the reader byte becomes free while the writer still owns the store"
+            );
+            release_companion_range_lock(&contender, COMPANION_READER_HOLD_LOCK_OFFSET);
+            assert_writer_still_owns();
+            drop(writer);
+            assert!(try_lock_exclusive(&contender).unwrap());
+            unlock_file(&contender);
+        }
+
         let directory = tempfile::TempDir::new().expect("task-scoped store directory");
         let store = directory.path().join("released.db");
         std::fs::write(&store, b"").expect("the store exists");

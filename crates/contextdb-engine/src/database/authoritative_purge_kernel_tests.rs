@@ -4,7 +4,6 @@ use super::*;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
-    time::Duration,
 };
 use uuid::Uuid;
 
@@ -1201,6 +1200,20 @@ fn authoritative_file_purge_kernel_removes_only_the_immutable_selected_lineage()
 
 #[test]
 fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
+    authoritative_file_purge_kernel_export_fixture(false);
+}
+
+#[test]
+fn snapshot_export_caller_panic_releases_the_captured_export() {
+    let panic = std::panic::catch_unwind(|| authoritative_file_purge_kernel_export_fixture(true))
+        .expect_err("snapshot export caller must abort after capture");
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("snapshot export caller aborted after capture")
+    );
+}
+
+fn authoritative_file_purge_kernel_export_fixture(force_caller_panic: bool) {
     let seed = fixture_seed();
     let pinned_snapshot = seed.db.snapshot();
     let pinned = seed.db.pin_snapshot(pinned_snapshot);
@@ -1251,13 +1264,16 @@ fn authoritative_file_purge_kernel_fences_stale_transactions_and_exports() {
         .expect("stage unrelated survivor write");
 
     let export_path = seed.root.path().join("purged-export.redb");
-    let pause = seed.db.pause_after_export_snapshot_capture_for_test();
     std::thread::scope(|scope| {
+        let pause = seed.db.pause_after_export_snapshot_capture_for_test();
         let export = scope.spawn(|| seed.db.export_snapshot(&export_path));
         assert!(
-            pause.wait_until_reached(Duration::from_secs(5)),
+            pause.wait_until_reached_blocking(),
             "export must capture its snapshot before the private kernel commits"
         );
+        if force_caller_panic {
+            panic!("snapshot export caller aborted after capture");
+        }
         let note_frontier = seed
             .db
             .commit_authoritative_purge_kernel(&fixture.note_selection)

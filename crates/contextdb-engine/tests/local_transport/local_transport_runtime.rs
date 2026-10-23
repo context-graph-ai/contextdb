@@ -1,14 +1,18 @@
 use contextdb_core::read_contract::{ChannelAddress, LocalUserIdentity};
+#[cfg(target_os = "linux")]
+use contextdb_engine::local_transport::ProcessRuntimeDirectoryEnvironment;
 #[cfg(unix)]
 use contextdb_engine::local_transport::UnixLocalCarrier;
 #[cfg(target_os = "linux")]
 use contextdb_engine::local_transport::linux_filesystem_type_is_local;
+#[cfg(target_os = "macos")]
+use contextdb_engine::local_transport::resolve_runtime_directory;
 use contextdb_engine::local_transport::{
     ChannelPathFacts, ChannelPathViolation, LocalTransportError, OWNER_ONLY_MODE,
-    ProcessRuntimeDirectoryEnvironment, ResolvedRuntimeDirectory, RuntimeDirectoryEnvironment,
-    RuntimeDirectoryFacts, RuntimeDirectoryInspector, RuntimeDirectoryRequest,
-    RuntimeDirectorySource, RuntimeRootViolation, SystemRuntimeDirectoryInspector,
-    channel_socket_path, inspect_channel_path, opaque_channel_basename, prepare_runtime_directory,
+    ResolvedRuntimeDirectory, RuntimeDirectoryEnvironment, RuntimeDirectoryFacts,
+    RuntimeDirectoryInspector, RuntimeDirectoryRequest, RuntimeDirectorySource,
+    RuntimeRootViolation, SystemRuntimeDirectoryInspector, channel_socket_path,
+    inspect_channel_path, opaque_channel_basename, prepare_runtime_directory,
     prepare_runtime_directory_with_environment, resolve_runtime_directory_with_environment,
     unix_socket_path_limit, validate_channel_path, validate_runtime_root,
 };
@@ -302,32 +306,134 @@ fn linux_filesystem_locality_is_an_allowlist_and_unknown_types_are_refused() {
     assert!(!linux_filesystem_type_is_local(0x1234_5678));
 }
 
+#[cfg(target_os = "macos")]
+fn native_private_root() -> PathBuf {
+    PathBuf::from("/private/var/folders/ab/012345678901234567890123456789/T")
+}
+
 #[test]
 #[cfg(target_os = "macos")]
-fn local_channel_derives_the_macos_confstr_temporary_root() {
-    let owner = LocalUserIdentity(7_102);
-    let temporary_root = PathBuf::from("/var/folders/contextdb-user-temp");
-    let request = RuntimeDirectoryRequest {
-        explicit_root: None,
-        current_user: owner,
-    };
-    let inspector = FactsInspector::default().with(facts(temporary_root.clone(), owner));
-
+fn local_channel_derives_the_macos_private_default_channel() {
+    let owner = LocalUserIdentity(7_106);
+    let root = native_private_root();
+    let inspector = FactsInspector::default().with(facts(root.clone(), owner));
+    let resolved = resolve_runtime_directory_with_environment(
+        &RuntimeDirectoryRequest {
+            explicit_root: None,
+            current_user: owner,
+        },
+        &inspector,
+        &RuntimeEnvironment {
+            xdg: Some(PathBuf::from("/ignored-on-macos")),
+            effective_user: owner,
+            macos_temporary: Some(root.clone()),
+        },
+    )
+    .expect("macOS private default runtime resolution");
+    let expected_dir = root.join("c");
     assert_eq!(
-        resolve_runtime_directory_with_environment(
-            &request,
-            &inspector,
-            &RuntimeEnvironment {
-                xdg: Some(PathBuf::from("/ignored-on-macos")),
-                effective_user: owner,
-                macos_temporary: Some(temporary_root.clone()),
-            },
-        )
-        .expect("macOS temporary runtime resolution"),
+        resolved,
         ResolvedRuntimeDirectory {
-            path: temporary_root.join("contextdb"),
+            path: expected_dir.clone(),
             source: RuntimeDirectorySource::MacosTemporary,
         }
+    );
+    let socket = channel_socket_path(&expected_dir, ChannelAddress([0; 32]))
+        .expect("native private socket address fits");
+    assert!(socket.as_os_str().as_encoded_bytes().len() <= 103);
+    assert_eq!(socket.file_name().unwrap().as_encoded_bytes().len(), 43);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_default_channel_full_u64_uid_boundaries() {
+    let root = native_private_root();
+    for owner in [LocalUserIdentity(0), LocalUserIdentity(u64::MAX)] {
+        let inspector = FactsInspector::default().with(facts(root.clone(), owner));
+        let resolved = resolve_runtime_directory_with_environment(
+            &RuntimeDirectoryRequest {
+                explicit_root: None,
+                current_user: owner,
+            },
+            &inspector,
+            &RuntimeEnvironment {
+                xdg: None,
+                effective_user: owner,
+                macos_temporary: Some(root.clone()),
+            },
+        )
+        .expect("private root resolution for UID boundary");
+        assert_eq!(resolved.path, root.join("c"));
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_default_channel_path_length_bound_b57_accept_b58_refuse() {
+    let address = ChannelAddress([0x33; 32]);
+    // Parent + /c/ + 43-byte basename fits exactly at 103 when parent is 57 bytes.
+    let parent_b57 = PathBuf::from(format!("/{}", "p".repeat(56)));
+    assert_eq!(parent_b57.as_os_str().as_encoded_bytes().len(), 57);
+    let socket =
+        channel_socket_path(&parent_b57.join("c"), address).expect("103-byte socket address fits");
+    assert_eq!(socket.as_os_str().as_encoded_bytes().len(), 103);
+    let parent_b58 = PathBuf::from(format!("/{}", "p".repeat(57)));
+    assert_eq!(
+        channel_socket_path(&parent_b58.join("c"), address),
+        Err(LocalTransportError::ChannelPath(
+            ChannelPathViolation::PathTooLong
+        ))
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_default_channel_refuses_native_and_explicit_symlinks() {
+    let owner = LocalUserIdentity(7_102);
+    let alias = PathBuf::from("/private/var/folders/alias/T");
+    let root = native_private_root();
+    let mut alias_facts = facts(alias.clone(), owner);
+    alias_facts.resolved_root = root;
+    alias_facts.is_symbolic_link = true;
+    let inspector = FactsInspector::default().with(alias_facts);
+    assert_eq!(
+        resolve_runtime_directory_with_environment(
+            &RuntimeDirectoryRequest {
+                explicit_root: None,
+                current_user: owner
+            },
+            &inspector,
+            &RuntimeEnvironment {
+                xdg: None,
+                effective_user: owner,
+                macos_temporary: Some(alias)
+            },
+        ),
+        Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::SymbolicLink
+        ))
+    );
+
+    let explicit_symlink = PathBuf::from("/service/explicit-symlink");
+    let mut explicit_facts = facts(explicit_symlink.clone(), owner);
+    explicit_facts.is_symbolic_link = true;
+    let explicit_inspector = FactsInspector::default().with(explicit_facts);
+    assert_eq!(
+        resolve_runtime_directory_with_environment(
+            &RuntimeDirectoryRequest {
+                explicit_root: Some(explicit_symlink),
+                current_user: owner
+            },
+            &explicit_inspector,
+            &RuntimeEnvironment {
+                xdg: None,
+                effective_user: owner,
+                macos_temporary: None
+            },
+        ),
+        Err(LocalTransportError::RuntimeRoot(
+            RuntimeRootViolation::SymbolicLink
+        ))
     );
 }
 
@@ -414,11 +520,9 @@ fn local_channel_path_is_an_owner_only_socket_below_the_validated_runtime_direct
     }
 }
 
-/// A Unix socket pathname is capped at 107 bytes, and the channel basename
-/// alone is 69, so a runtime base created under a long ambient temporary
-/// directory cannot host a socket at all. These journeys therefore build
-/// their bases under a deliberately short root instead of inheriting the
-/// environment's temporary directory.
+/// A Unix socket pathname has a small platform limit, so a runtime base
+/// created under a long ambient temporary directory may not host a socket.
+/// These journeys use a deliberately short root.
 #[cfg(unix)]
 fn short_runtime_base() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -559,24 +663,24 @@ fn production_preparation_refuses_every_hostile_preexisting_runtime_child() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn process_environment_uses_the_native_macos_user_temporary_directory() {
-    let environment = ProcessRuntimeDirectoryEnvironment;
-    let temporary = environment
-        .macos_user_temporary_directory()
-        .expect("read _CS_DARWIN_USER_TEMP_DIR through confstr");
-    assert!(temporary.is_absolute());
+fn process_environment_resolves_the_native_macos_private_default_channel() {
     let current = LocalUserIdentity(nix::unistd::geteuid().as_raw() as u64);
+    let resolved = resolve_runtime_directory(
+        &RuntimeDirectoryRequest {
+            explicit_root: None,
+            current_user: current,
+        },
+        &SystemRuntimeDirectoryInspector,
+    )
+    .expect("resolve native macOS default runtime directory");
+    let native_root = contextdb_engine::local_transport::ProcessRuntimeDirectoryEnvironment
+        .macos_user_temporary_directory()
+        .expect("native private temporary directory");
+    let canonical_root = fs::canonicalize(native_root).expect("canonical native private root");
     assert_eq!(
-        resolve_runtime_directory(
-            &RuntimeDirectoryRequest {
-                explicit_root: None,
-                current_user: current,
-            },
-            &SystemRuntimeDirectoryInspector,
-        )
-        .expect("resolve through the process environment"),
+        resolved,
         ResolvedRuntimeDirectory {
-            path: temporary.join("contextdb"),
+            path: canonical_root.join("c"),
             source: RuntimeDirectorySource::MacosTemporary,
         }
     );
@@ -649,7 +753,10 @@ fn channel_names_are_distinct_opaque_and_survive_a_deep_runtime_directory() {
         first_path.file_name().and_then(|name| name.to_str()),
         Some(first_basename.as_str())
     );
+    #[cfg(target_os = "linux")]
     assert_eq!(first_basename.len(), 69);
+    #[cfg(target_os = "macos")]
+    assert_eq!(first_basename.len(), 43);
 
     let limit = unix_socket_path_limit().expect("Unix socket pathname limit");
     let too_long_runtime = PathBuf::from("/").join("r".repeat(limit));
