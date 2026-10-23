@@ -1534,6 +1534,104 @@ impl contextdb_vector::store::RawVectorMembershipSelection for SelectedVectorMem
 }
 
 impl SelectedVectorMembership {
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn assert_row_evidence_bindings_for_test(
+        &self,
+        other: &MembershipOwner,
+        other_reader: usize,
+    ) {
+        let evidence = self
+            .row_evidence
+            .as_ref()
+            .expect("actual historical selection carries owning-row evidence");
+        let identity = body_identity(&self.record);
+        let verify = |receipt: &AuthenticatedOwningRow| {
+            receipt.verify(
+                &self.owner,
+                &self.root.read,
+                &self.record.index,
+                &identity,
+                None,
+                &mut || Ok(()),
+            )
+        };
+        verify(evidence).unwrap();
+        let copy = || AuthenticatedOwningRow {
+            physical: evidence.physical,
+            source: evidence.source,
+            reader: evidence.reader,
+            snapshot: evidence.snapshot,
+            index: evidence.index,
+            identity: evidence.identity.clone(),
+            row_deleted: evidence.row_deleted,
+        };
+        // Each faulty binding retains all the other genuine receipt fields.
+        // These deterministic controls kill omission of each independent check.
+        let mut bad = copy();
+        bad.source = evidence_source(other);
+        assert_ne!(bad.source, evidence.source);
+        assert!(
+            verify(&bad).is_err(),
+            "another real source must be rejected"
+        );
+        let wrong_root = other.capture_fresh().unwrap();
+        assert_ne!(
+            wrong_root.read.storage_snapshot_identity(),
+            evidence.physical
+        );
+        assert!(
+            evidence
+                .verify(
+                    &self.owner,
+                    &wrong_root.read,
+                    &self.record.index,
+                    &identity,
+                    None,
+                    &mut || Ok(())
+                )
+                .is_err(),
+            "another real physical root must be rejected"
+        );
+        let mut bad = copy();
+        bad.reader = other_reader;
+        assert_ne!(bad.reader, evidence.reader);
+        assert!(
+            verify(&bad).is_err(),
+            "another actual reader must be rejected"
+        );
+        let mut bad = copy();
+        bad.snapshot = SnapshotId(evidence.snapshot.0 + 1);
+        assert!(
+            verify(&bad).is_err(),
+            "another logical snapshot must be rejected"
+        );
+        let mut bad = copy();
+        bad.index[0] ^= 1;
+        assert!(verify(&bad).is_err(), "another index must be rejected");
+        let mut bad = copy();
+        bad.identity.row_id.0 += 1;
+        assert!(verify(&bad).is_err(), "another row must be rejected");
+        let mut bad = copy();
+        bad.identity.lsn.0 += 1;
+        assert!(
+            verify(&bad).is_err(),
+            "another row version must be rejected"
+        );
+        assert!(
+            evidence
+                .verify(
+                    &self.owner,
+                    &self.root.read,
+                    &self.record.index,
+                    &identity,
+                    Some(Some(TxId(u64::MAX))),
+                    &mut || Ok(())
+                )
+                .is_err(),
+            "disagreeing canonical deletion closure must be rejected"
+        );
+    }
+
     pub(crate) fn record(&self) -> &VectorPartitionMembershipRecord {
         &self.record
     }
