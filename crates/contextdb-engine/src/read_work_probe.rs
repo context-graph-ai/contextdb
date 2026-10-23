@@ -135,6 +135,8 @@ struct AtomicCounters {
 
     historical_postings_fetched: AtomicU64,
     manifest_members_visited: AtomicU64,
+    owning_row_controls_admitted: AtomicU64,
+    owning_row_proof_setups: AtomicU64,
     dead_groups_stepped: AtomicU64,
     historical_posting_windows: AtomicU64,
 }
@@ -148,6 +150,10 @@ pub struct HistoricalReadWorkCounters {
     pub historical_postings_fetched: u64,
     /// Authenticated row-version manifest members a historical read visited.
     pub manifest_members_visited: u64,
+    /// Successful original-reader control reservations for owning-row reconciliation.
+    pub owning_row_controls_admitted: u64,
+    /// Fixed-root verifier/control setup for authenticated historical row visits.
+    pub owning_row_proof_setups: u64,
     /// (key, row) posting groups a historical scan stepped over because they
     /// held no version visible at its snapshot.
     pub dead_groups_stepped: u64,
@@ -161,6 +167,8 @@ impl AtomicCounters {
         HistoricalReadWorkCounters {
             historical_postings_fetched: self.historical_postings_fetched.load(Ordering::Relaxed),
             manifest_members_visited: self.manifest_members_visited.load(Ordering::Relaxed),
+            owning_row_controls_admitted: self.owning_row_controls_admitted.load(Ordering::Relaxed),
+            owning_row_proof_setups: self.owning_row_proof_setups.load(Ordering::Relaxed),
             dead_groups_stepped: self.dead_groups_stepped.load(Ordering::Relaxed),
             historical_posting_windows: self.historical_posting_windows.load(Ordering::Relaxed),
         }
@@ -429,6 +437,14 @@ pub(crate) fn note_historical_posting_fetched() {
     with_active(|counters| {
         counters
             .historical_postings_fetched
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+pub(crate) fn note_owning_row_controls_admitted() {
+    with_active(|counters| {
+        counters
+            .owning_row_controls_admitted
             .fetch_add(1, Ordering::Relaxed);
     });
 }
@@ -1309,4 +1325,12 @@ pub fn retained_trace_invoice(
 #[cfg(any(test, feature = "test-seams"))]
 pub fn retained_trace_payload_layouts() -> (std::alloc::Layout, std::alloc::Layout) {
     crate::executor::bounded::retained_trace_payload_layouts_for_test()
+}
+
+pub(crate) fn note_owning_row_proof_setup() {
+    with_active(|counters| {
+        counters
+            .owning_row_proof_setups
+            .fetch_add(1, Ordering::Relaxed);
+    });
 }

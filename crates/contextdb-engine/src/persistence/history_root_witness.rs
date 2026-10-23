@@ -45,9 +45,11 @@ fn valid_record(bytes: &[u8]) -> bool {
     match bytes[1] {
         0 => bytes[18..].iter().all(|b| *b == 0),
         1 => {
-            // A nonempty root needs a physical page and a positive entry count.
-            bytes[18..26].iter().any(|b| *b != 0)
-                && u64::from_le_bytes(bytes[42..50].try_into().unwrap()) != 0
+            // Redb encodes region 0, page 0, order 0 as eight zero bytes;
+            // that is a valid physical page, not the absent-root marker.
+            // The existence flag and positive entry count distinguish a
+            // nonempty root; matches() authenticates its complete descriptor.
+            u64::from_le_bytes(bytes[42..50].try_into().unwrap()) != 0
         }
         _ => false,
     }
@@ -69,6 +71,68 @@ fn matches(bytes: &[u8], root: Option<[u8; 32]>) -> bool {
             None => bytes[18..].iter().all(|byte| *byte == 0),
         }
 }
+// Fixed diagnostic custody: last sixteen actual authored-root producer cuts.
+// No engine invoice, mutation, verification or acceptance equation changes.
+#[cfg(any(test, feature = "test-seams"))]
+mod root_phase {
+    use std::cell::RefCell;
+    #[derive(Clone, Copy, Debug)]
+    struct Cut {
+        ordinal: u64,
+        phase: &'static str,
+        physical: Option<Option<[u8; 32]>>,
+        witness: Option<[u8; 50]>,
+    }
+    thread_local! { static CUTS: RefCell<([Option<Cut>;16],u64)> = const { RefCell::new(([None;16],0)) }; }
+    pub(super) fn observe(
+        name: &str,
+        phase: &'static str,
+        physical: Option<Option<[u8; 32]>>,
+        witness: Option<&[u8]>,
+        failed: bool,
+    ) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("CONTEXTDB_HISTORY_ROOT_PHASES").is_some())
+            || name != "__authored_row_bodies"
+        {
+            return;
+        }
+        let witness = witness.and_then(|bytes| bytes.try_into().ok());
+        CUTS.with(|slot| {
+            let mut cuts = slot.borrow_mut();
+            let ordinal = cuts.1 + 1;
+            cuts.0[(ordinal as usize - 1) % 16] = Some(Cut {
+                ordinal,
+                phase,
+                physical,
+                witness,
+            });
+            cuts.1 = ordinal;
+            if failed {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "authored_root_failure pid={} final_ordinal={ordinal}",
+                    std::process::id()
+                );
+                for index in 0..16 {
+                    let at = (ordinal as usize + index) % 16;
+                    if let Some(cut) = cuts.0[at] {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "authored_root_cut ordinal={} phase={} physical={:?} witness={:?}",
+                            cut.ordinal,
+                            cut.phase,
+                            cut.physical,
+                            cut.witness
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
 impl RedbPersistence {
     #[expect(
         clippy::result_large_err,
@@ -132,6 +196,21 @@ impl RedbPersistence {
         .map_err(Self::storage_error)?;
         let mut witnesses = write.open_table(WITNESSES).map_err(Self::storage_error)?;
         let previous = witnesses.get(name).map_err(Self::storage_error)?;
+        #[cfg(any(test, feature = "test-seams"))]
+        root_phase::observe(
+            name,
+            match event {
+                BeforeOpen => "before_open",
+                BeforeDelete => "before_delete",
+                BeforeRelocate => "before_relocate",
+                AfterClose => "after_close",
+                AfterRelocate => "after_relocate",
+                AfterDelete => "after_delete",
+            },
+            physical,
+            previous.as_ref().map(|value| value.value()),
+            false,
+        );
         match event {
             BeforeOpen | BeforeDelete | BeforeRelocate => {
                 match (physical, previous.as_ref()) {
@@ -167,6 +246,14 @@ impl RedbPersistence {
                 witnesses
                     .insert(name, encoded.as_slice())
                     .map_err(Self::storage_error)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                root_phase::observe(
+                    name,
+                    "witness_published",
+                    physical,
+                    Some(encoded.as_slice()),
+                    false,
+                );
             }
             AfterDelete => {
                 drop(previous);
@@ -307,6 +394,14 @@ impl RedbPersistence {
         let witness = witnesses
             .get(name)
             .map_err(|error| map_error(error.into()))?;
+        #[cfg(any(test, feature = "test-seams"))]
+        root_phase::observe(
+            name,
+            "captured_read",
+            physical,
+            witness.as_ref().map(|value| value.value()),
+            !matches!((physical,witness.as_ref()),(Some(root),Some(witness)) if matches(witness.value(),root)),
+        );
         match (physical, witness) {
             (Some(root), Some(witness)) if matches(witness.value(), root) => Ok(()),
             _ => Err(corruption(
@@ -385,6 +480,7 @@ mod tests {
         db
     }
     fn verify(db: &redb::Database) -> Result<()> {
+        let _operation = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         RedbPersistence::verify_history_root(&db.begin_read().unwrap(), "rel_fixture")
     }
     #[test]
@@ -858,7 +954,6 @@ mod tests {
         const LENGTH: usize = 8;
         assert_eq!(PAGE + CHECKSUM + LENGTH, root.len());
         assert_eq!(&root[PAGE + CHECKSUM..], &length.to_le_bytes());
-        assert!(root[..PAGE].iter().any(|byte| *byte != 0));
         assert_ne!(length, 0);
         stored
     }
@@ -894,6 +989,7 @@ mod tests {
     }
 
     fn assert_canonical_malformed(db: &redb::Database, bytes: &[u8]) {
+        let _operation = crate::read_image_memory::ImageMemory::enter_decode_call().unwrap();
         assert!(
             !valid_record(bytes),
             "producer predicate must reject this one-field record"
@@ -939,12 +1035,83 @@ mod tests {
     }
 
     #[test]
-    fn canonical_present_zero_page_witness_is_typed_malformed() {
+    fn canonical_present_zero_page_mismatch_stays_disclosed_false() {
+        let _operation = crate::read_image_memory::ImageMemory::enter_decode_call().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
             bytes[18..26].fill(0);
         });
         assert_one_span(&original, &bytes, 18, 26);
+        assert!(valid_record(&bytes));
+        let read = db.begin_read().unwrap();
+        let physical = read
+            .normal_table_root("rel_fixture")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_ne!(&bytes[18..], &physical[..]);
+        assert!(!RedbPersistence::verify_history_root_canonical(&read, "rel_fixture").unwrap());
+        match RedbPersistence::verify_history_root(&read, "rel_fixture") {
+            Err(Error::StoreCorrupted { reason, .. }) => {
+                assert!(
+                    reason.contains("does not match the captured historical root"),
+                    "{reason}"
+                );
+            }
+            other => panic!("mismatched witness must refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_page_record_requires_positive_length_and_complete_descriptor_match() {
+        let mut root = [0; 32];
+        root[8..24].copy_from_slice(&7u128.to_le_bytes());
+        root[24..].copy_from_slice(&1u64.to_le_bytes());
+        let bytes = record(Some(root), [1; 16]);
+        assert_eq!(&bytes[18..26], &[0; 8]);
+        assert!(valid_record(&bytes));
+        assert_eq!(witnessed_length(&bytes), Some(1));
+        assert!(matches(&bytes, Some(root)));
+        assert!(!matches(&bytes, None));
+        // Every physical descriptor byte is authenticated, including the
+        // otherwise legal zero page, checksum and positive entry count.
+        for index in 0..root.len() {
+            let mut different = root;
+            different[index] ^= 2;
+            assert!(!matches(&bytes, Some(different)), "descriptor byte {index}");
+        }
+        root[24..].fill(0);
+        assert!(!valid_record(&record(Some(root), [1; 16])));
+        assert!(!valid_record(&record(Some([0; 32]), [1; 16])));
+        let mut absent = record(None, [1; 16]);
+        assert!(valid_record(&absent));
+        absent[26] = 1;
+        assert!(!valid_record(&absent));
+    }
+
+    #[test]
+    fn canonical_present_all_zero_descriptor_is_typed_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
+            bytes[18..].fill(0);
+        });
+        assert_one_span(&original, &bytes, 18, RECORD_BYTES);
+        assert_canonical_malformed(&db, &bytes);
+    }
+
+    #[test]
+    fn canonical_truncated_witness_is_typed_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seeded(&dir.path().join("witness.db"));
+        let mut bytes = generated_present_record(&db);
+        bytes.pop();
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(WITNESSES)
+            .unwrap()
+            .insert("rel_fixture", bytes.as_slice())
+            .unwrap();
+        write.commit().unwrap();
         assert_canonical_malformed(&db, &bytes);
     }
 

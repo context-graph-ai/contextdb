@@ -7235,6 +7235,32 @@ impl WritableRawVectorBodyScan {
         membership_authenticated: bool,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<VectorEntry> {
+        self.read_partition_body_with_owning_row_before(
+            index,
+            partition_key,
+            identity,
+            expected_dimension,
+            quantization,
+            membership_authenticated,
+            None,
+            before,
+        )
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
+    )]
+    fn read_partition_body_with_owning_row_before(
+        &mut self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        identity: &RawVectorDirectoryEntry,
+        expected_dimension: usize,
+        quantization: VectorQuantization,
+        membership_authenticated: bool,
+        row_evidence: Option<&vector_membership_source::AuthenticatedOwningRow>,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<VectorEntry> {
         let owner = vector_membership_source::MembershipOwner::Writable(self.source.clone());
         let historical_memory =
             vector_membership_source::historical_operation_memory(&owner, &self._transaction)?;
@@ -7258,6 +7284,7 @@ impl WritableRawVectorBodyScan {
                 expected_dimension,
                 quantization,
                 membership_authenticated,
+                row_evidence,
                 before,
             )
         };
@@ -7278,6 +7305,7 @@ impl WritableRawVectorBodyScan {
         expected_dimension: usize,
         quantization: VectorQuantization,
         membership_authenticated: bool,
+        row_evidence: Option<&vector_membership_source::AuthenticatedOwningRow>,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<VectorEntry> {
         before()?;
@@ -7469,14 +7497,25 @@ impl WritableRawVectorBodyScan {
                 memory,
                 before,
             )?;
-            vector_membership_source::authenticate_owning_row(
-                &owner,
-                &self._transaction,
-                index,
-                identity,
-                Some(entry.deleted_tx),
-                before,
-            )?;
+            if let Some(evidence) = row_evidence {
+                evidence.verify(
+                    &owner,
+                    &self._transaction,
+                    index,
+                    identity,
+                    Some(entry.deleted_tx),
+                    before,
+                )?;
+            } else {
+                vector_membership_source::authenticate_owning_row(
+                    &owner,
+                    &self._transaction,
+                    index,
+                    identity,
+                    Some(entry.deleted_tx),
+                    before,
+                )?;
+            }
         } else if !self.producer_body_root {
             // The authenticated producer-root path never uses a content
             // verifier. Keep this fallback verifier on the stack for the call,
@@ -7568,6 +7607,32 @@ impl RetainedRawVectorBodyScan {
         membership_authenticated: bool,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<VectorEntry> {
+        self.read_partition_body_with_owning_row_before(
+            index,
+            partition_key,
+            identity,
+            expected_dimension,
+            quantization,
+            membership_authenticated,
+            None,
+            before,
+        )
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
+    )]
+    fn read_partition_body_with_owning_row_before(
+        &mut self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        identity: &RawVectorDirectoryEntry,
+        expected_dimension: usize,
+        quantization: VectorQuantization,
+        membership_authenticated: bool,
+        row_evidence: Option<&vector_membership_source::AuthenticatedOwningRow>,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<VectorEntry> {
         let owner = vector_membership_source::MembershipOwner::Retained(self.source.clone());
         let historical_memory =
             vector_membership_source::historical_operation_memory(&owner, &self._transaction)?;
@@ -7591,6 +7656,7 @@ impl RetainedRawVectorBodyScan {
                 expected_dimension,
                 quantization,
                 membership_authenticated,
+                row_evidence,
                 before,
             )
         };
@@ -7611,6 +7677,7 @@ impl RetainedRawVectorBodyScan {
         expected_dimension: usize,
         quantization: VectorQuantization,
         membership_authenticated: bool,
+        row_evidence: Option<&vector_membership_source::AuthenticatedOwningRow>,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<VectorEntry> {
         before()?;
@@ -7662,14 +7729,25 @@ impl RetainedRawVectorBodyScan {
                 memory,
                 before,
             )?;
-            vector_membership_source::authenticate_owning_row(
-                &owner,
-                &self._transaction,
-                index,
-                identity,
-                Some(entry.deleted_tx),
-                before,
-            )?;
+            if let Some(evidence) = row_evidence {
+                evidence.verify(
+                    &owner,
+                    &self._transaction,
+                    index,
+                    identity,
+                    Some(entry.deleted_tx),
+                    before,
+                )?;
+            } else {
+                vector_membership_source::authenticate_owning_row(
+                    &owner,
+                    &self._transaction,
+                    index,
+                    identity,
+                    Some(entry.deleted_tx),
+                    before,
+                )?;
+            }
         } else if !self.producer_body_root {
             let mut proof = source
                 .content_proof
@@ -33023,13 +33101,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
         )
     }
 
-    /// The caller has proved that only EF_SEARCH differs. Existing rows,
+    /// The caller proved that only search breadth or consolidation differs. Existing rows,
     /// postings, counts, vector bodies and authored history remain valid.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn publish_ef_search_metadata_and_ddl(
+    pub(crate) fn publish_vector_policy_metadata_and_ddl(
         &self,
         name: &str,
         meta: &TableMeta,
@@ -33070,6 +33148,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
         after_commit: impl FnOnce(),
     ) -> Result<()> {
         let _decode_scope = self.writer_decode_scope()?;
+        #[cfg(any(test, feature = "test-seams"))]
+        let phase = crate::read_image_memory::MaintenancePhase::enter("policy_metadata");
         self.prepare_proof_owner()?;
         let mut schema = match original {
             Some(original) => self.prepare_writer_policy_schema_change(original, name, meta)?,
@@ -33157,8 +33237,18 @@ graph_commit_result }.map_err(Self::storage_error)?;
             Self::write_writer_recovery_bounds_in_write(&write_txn, None)?;
             {
                 #[cfg(any(test, feature = "test-seams"))]
+                if !rebuild_indexes {
+                    policy_metadata_checkpoint_for_test(10)?;
+                }
+                #[cfg(any(test, feature = "test-seams"))]
                 graph_observation_checkpoint(10)?;
+                #[cfg(any(test, feature = "test-seams"))]
+                phase.record("durable_commit_enter", 0, None);
                 let graph_commit_result = write_txn.commit();
+                #[cfg(any(test, feature = "test-seams"))]
+                if graph_commit_result.is_ok() {
+                    phase.record("durable_commit_exit", 0, None);
+                }
                 if !rebuild_indexes && graph_commit_result.is_ok() {
                     self.complete_writer_schema_change(schema.take());
                     after_commit.take().expect("prepared metadata publication")();
@@ -33167,6 +33257,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 if graph_commit_result.is_ok() {
                     graph_publication_attempt.committed();
                     graph_observation_checkpoint(11)?;
+                    if !rebuild_indexes {
+                        policy_metadata_checkpoint_for_test(11)?;
+                    }
                 }
                 graph_commit_result
             }
@@ -52649,6 +52742,43 @@ fn retention_reclaim_checkpoint_for_test(boundary: u8) {
     if RETENTION_RECLAIM_CRASH.with(|armed| armed.get() == boundary) {
         eprintln!("RETENTION_RECLAIM_CRASH={boundary}");
         std::process::abort();
+    }
+}
+
+// These cuts belong only to the narrow policy publisher. The global currency
+// hook can be consumed by an earlier preparatory metadata transaction.
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static POLICY_METADATA_FAULT: std::cell::Cell<(u8, bool)> = const {
+        std::cell::Cell::new((0, false))
+    };
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) fn arm_policy_metadata_fault_for_test(boundary: u8, crash: bool) {
+    assert!(matches!(boundary, 10 | 11));
+    POLICY_METADATA_FAULT.with(|armed| armed.set((boundary, crash)));
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+fn policy_metadata_checkpoint_for_test(boundary: u8) -> Result<()> {
+    let crash = POLICY_METADATA_FAULT.with(|armed| {
+        let (selected, crash) = armed.get();
+        if selected != boundary {
+            return None;
+        }
+        armed.set((0, false));
+        Some(crash)
+    });
+    match crash {
+        Some(true) => {
+            eprintln!("POLICY_METADATA_CRASH={boundary}");
+            std::process::abort()
+        }
+        Some(false) => Err(Error::Other(
+            "injected policy metadata publication failure".into(),
+        )),
+        None => Ok(()),
     }
 }
 

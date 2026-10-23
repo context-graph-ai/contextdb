@@ -3755,3 +3755,138 @@ mod native_decode_tests {
         assert_eq!(parent.retained_bytes_for_test(), 0);
     }
 }
+
+// Private diagnostic storage is fixed and independent of rows or allocations.
+// PID and thread-local scope ordinal distinguish a crash child and nesting.
+#[cfg(any(test, feature = "test-seams"))]
+pub(crate) struct MaintenancePhase {
+    start: std::time::Instant,
+    operation: &'static str,
+    scope: u64,
+    parent: u64,
+}
+#[cfg(any(test, feature = "test-seams"))]
+thread_local! {
+    static MAINTENANCE_PHASE_SCOPE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[cfg(any(test, feature = "test-seams"))]
+impl MaintenancePhase {
+    pub(crate) fn enter(operation: &'static str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let scope = NEXT.fetch_add(1, Ordering::Relaxed);
+        let parent = MAINTENANCE_PHASE_SCOPE.with(|current| current.replace(scope));
+        let phase = Self {
+            start: std::time::Instant::now(),
+            operation,
+            scope,
+            parent,
+        };
+        phase.record("enter", 0, None);
+        phase
+    }
+    pub(crate) fn record(&self, phase: &'static str, rows: u64, image: Option<&ImageMemory>) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("CONTEXTDB_MAINTENANCE_PHASES").is_some()) {
+            return;
+        }
+        // Each slot is overwritten, never appended to an in-memory ledger.
+        #[derive(Clone, Copy)]
+        struct Record {
+            pid: u32,
+            scope: u64,
+            parent: u64,
+            operation: &'static str,
+            phase: &'static str,
+            elapsed_ns: u128,
+            rows: u64,
+            payer: usize,
+            used: usize,
+            held: usize,
+            control: usize,
+            subsystem: &'static str,
+            admission: &'static str,
+            open_residue: bool,
+        }
+        static RECORDS: std::sync::Mutex<([Option<Record>; 64], usize)> =
+            std::sync::Mutex::new(([None; 64], 0));
+        let active = ACTIVE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|active| ImageMemoryHandle::clone(&active.owner))
+        });
+        let image = image.or(active.as_deref());
+        let record = Record {
+            pid: std::process::id(),
+            scope: self.scope,
+            parent: self.parent,
+            operation: self.operation,
+            phase,
+            elapsed_ns: self.start.elapsed().as_nanos(),
+            rows,
+            payer: image.map_or(0, |i| i.accountant.used_counter_for_observation()),
+            used: image.map_or(0, |i| i.accountant.used_bytes_for_phase_observation()),
+            held: image.map_or(0, ImageMemory::held),
+            control: image.map_or(0, |i| {
+                i.control_bytes & !ADMITTED_TAG & !crate::memory_accounting::OPEN_RESIDUE_TAG
+            }),
+            subsystem: image.map_or("none", |i| i.subsystem),
+            admission: image.map_or("none", |i| i.operation),
+            open_residue: image
+                .is_some_and(|i| i.control_bytes & crate::memory_accounting::OPEN_RESIDUE_TAG != 0),
+        };
+        let mut records = RECORDS.lock().unwrap_or_else(|poison| poison.into_inner());
+        let slot = records.1 % records.0.len();
+        records.0[slot] = Some(record);
+        records.1 += 1;
+        drop(records);
+        // The canonical isolated helper retains child stderr until exit;
+        // write to an explicit append file so a timeout preserves lastphase.
+        // A fixed stack record is written after releasing the record mutex.
+        use std::io::Write;
+        static FILE: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+        let file = FILE.get_or_init(|| {
+            let path = std::env::var_os("CONTEXTDB_MAINTENANCE_PHASE_FILE")?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        });
+        let mut buffer = [0u8; 1024];
+        let mut output = std::io::Cursor::new(buffer.as_mut_slice());
+        let formatted = writeln!(
+            output,
+            "maintenance_phase pid={} scope={} parent={} operation={} phase={} elapsed_ns={} rows={} payer={} used={} held={} control={} subsystem={} admission={} open_residue={}",
+            record.pid,
+            record.scope,
+            record.parent,
+            record.operation,
+            record.phase,
+            record.elapsed_ns,
+            record.rows,
+            record.payer,
+            record.used,
+            record.held,
+            record.control,
+            record.subsystem,
+            record.admission,
+            record.open_residue
+        );
+        let len = output.position() as usize;
+        drop(output);
+        if formatted.is_ok() {
+            if let Some(mut file) = file.as_ref() {
+                let _ = file.write_all(&buffer[..len]);
+            } else {
+                let _ = std::io::stderr().write_all(&buffer[..len]);
+            }
+        }
+    }
+}
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for MaintenancePhase {
+    fn drop(&mut self) {
+        self.record("exit", 0, None);
+        MAINTENANCE_PHASE_SCOPE.with(|current| current.set(self.parent));
+    }
+}

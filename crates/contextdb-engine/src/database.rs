@@ -15262,6 +15262,45 @@ impl DatabaseTransactionHost {
 
     #[expect(
         clippy::result_large_err,
+        reason = "Preserve the existing public diagnostic through postcommit publication."
+    )]
+    fn with_deferred_metadata_write_after_commit<R>(
+        &self,
+        committed: &std::cell::Cell<bool>,
+        write: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        let publish = || {
+            let reservation = self.reserve_deferred_metadata_publication()?;
+            let result = write();
+            // A postcommit error cannot withdraw the already durable schema.
+            // Complete the existing prepaid publication on either outcome.
+            if committed.get() {
+                self.owe_metadata_publication(reservation);
+            }
+            result
+        };
+        match self {
+            Self::Legacy(_) => publish(),
+            Self::Owned(handle) => handle.with_host(|host| {
+                host.with_metadata_publication_scope(|| {
+                    if self.commit_boundary_held_by_current_thread() {
+                        publish()
+                    } else {
+                        // A native deferred Box must be completed by this
+                        // operation's commit boundary before its stack owner
+                        // ends. Inherit an existing guard; otherwise take the
+                        // same guard used by every other metadata publication.
+                        host.transactions.with_transactions(|transactions| {
+                            transactions.with_commit_lock(publish)
+                        })
+                    }
+                })
+            }),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn reserve_deferred_metadata_publication(
@@ -26420,6 +26459,31 @@ fn publish_direct_metadata<R>(
     })
 }
 
+// The narrow publisher knows exactly when its durable write and infallible
+// memory swap completed. Preserve that publication even if its later observer
+// reports an error; precommit failures still abandon their unused reservation.
+#[expect(
+    clippy::result_large_err,
+    reason = "Preserve the existing public diagnostic through postcommit publication."
+)]
+fn publish_direct_metadata_after_commit<R>(
+    tx_mgr: &DatabaseTransactionHost,
+    committed: &std::cell::Cell<bool>,
+    write: impl FnOnce() -> Result<R>,
+) -> Result<R> {
+    if tx_mgr.commit_boundary_held_by_current_thread() {
+        return tx_mgr.with_deferred_metadata_write_after_commit(committed, write);
+    }
+    tx_mgr.with_maintenance_publication(|publication| {
+        publication.reserve()?;
+        let result = write();
+        if committed.get() {
+            publication.complete();
+        }
+        result
+    })
+}
+
 struct MaintenanceCleanup {
     source: *mut MaintenanceContext,
     initialized: [bool; 27],
@@ -36528,6 +36592,8 @@ impl Database {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _maintenance_phase = crate::read_image_memory::MaintenancePhase::enter("execute");
         #[cfg(test)]
         let _purge_enclosing_producer = crate::persistence::content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::site(
             "Database::execute");
@@ -63115,6 +63181,8 @@ impl Database {
                 .get(table)
                 .map_or(0, Vec::len) as u64,
         );
+        #[cfg(test)]
+        consolidation_metadata_contract_tests::note_projection_rows(1);
         self.table_versions_for_projection(table)
     }
 
@@ -72895,6 +72963,9 @@ impl Database {
         params: &HashMap<String, Value>,
         snapshot: SnapshotId,
     ) -> Result<QueryResult> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _maintenance_phase =
+            crate::read_image_memory::MaintenancePhase::enter("execute_at_snapshot");
         let child = self.ordinary_read_child()?;
         crate::executor::bounded::with_native_read_memory(
             child,
@@ -77294,6 +77365,8 @@ impl Database {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn run_maintenance_cycle(&self) -> Result<MaintenanceReport> {
+        #[cfg(any(test, feature = "test-seams"))]
+        let _maintenance_phase = crate::read_image_memory::MaintenancePhase::enter("maintenance");
         crate::memory_accounting::observe_inherited_process_ceiling();
         let read_memory = self.finalization.accountant.read_budget()?;
         self.run_maintenance_cycle_with_read_memory(read_memory)
@@ -83285,7 +83358,7 @@ impl Database {
         .and_then(|swap| swap.prepare_schema_generation(self, std::iter::once(name)))
     }
 
-    pub(crate) fn allows_local_ef_search_metadata_publication(&self) -> bool {
+    pub(crate) fn allows_local_vector_policy_metadata_publication(&self) -> bool {
         self.finalization
             .local_policy_metadata_enabled
             .load(Ordering::SeqCst)
@@ -83293,13 +83366,13 @@ impl Database {
             && !self.private_received_rows_hold_delete_invoices()
     }
 
-    /// Publish an already validated, local-autocommit EF_SEARCH declaration.
+    /// Publish an already validated, local-autocommit search-breadth or consolidation declaration.
     /// No row, posting or historical body changes ownership on this path.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(crate) fn publish_local_ef_search_metadata(
+    pub(crate) fn publish_local_vector_policy_metadata(
         &self,
         name: &str,
         old_meta: &TableMeta,
@@ -83308,6 +83381,8 @@ impl Database {
         lsn: Lsn,
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+        consolidation_only: bool,
+        committed: &std::cell::Cell<bool>,
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
@@ -83323,7 +83398,11 @@ impl Database {
         let mut metadata_memory = self.reserve_original_preparation_for(
             retained_table_metadata_bytes(&self.relational_store, meta),
             "ddl",
-            "prepare_ef_search_metadata",
+            if consolidation_only {
+                "prepare_consolidation_metadata"
+            } else {
+                "prepare_ef_search_metadata"
+            },
             "Reduce schema metadata or raise MEMORY_LIMIT.",
         )?;
         let mut memory_swap = PreparedMemorySwap::from_original_preparation(
@@ -83340,7 +83419,11 @@ impl Database {
                 .saturating_add(meta.metadata_bytes().saturating_mul(32))
                 .saturating_add(name.len().saturating_mul(32)),
             "ddl",
-            "prepare_ef_search_history",
+            if consolidation_only {
+                "prepare_consolidation_history"
+            } else {
+                "prepare_ef_search_history"
+            },
             "Reduce schema metadata or raise MEMORY_LIMIT.",
         )?;
         vector_copy_owner.reserve(std::mem::size_of::<VectorIndexLayout>().saturating_add(
@@ -83379,6 +83462,7 @@ impl Database {
         // Every fallible preparation, including the captured writer schema,
         // precedes durability. Move the successor payloads into an infallible
         // callback that runs before the postcommit observation boundary.
+        let mut published_policy = None;
         let publish = || {
             let old = {
                 let mut metadata = self.relational_store.table_meta.write();
@@ -83391,19 +83475,19 @@ impl Database {
             self.publish_memory_schema_history(memory_history);
             memory_swap.commit_after_swap();
             if let Some(prepared) = prepared_policy {
-                // EF_SEARCH does not change maintenance_need. Do not perform
-                // a fallible storage recheck inside the committed write's
-                // sticky admission scope.
-                self.vector_store.publish_policy_layout_update(prepared);
+                // Apply the already admitted layout after durable success.
+                // A consolidation recheck belongs outside this committed
+                // write's sticky admission scope, never inside publication.
+                published_policy = self.vector_store.publish_policy_layout_update(prepared);
             }
         };
-        if let Some(persistence) = &self.persistence {
+        let result = if let Some(persistence) = &self.persistence {
             // The durable occurrence is an admitted temporary encoding input,
             // not a resident history entry. Persistence keeps the occurrence
             // and its summary/configuration in the same durable transaction.
             let durable_ddl = [self.alter_table_ddl_for_meta(name, meta, Vec::new())];
-            self.publish_direct_metadata(|| {
-                persistence.publish_ef_search_metadata_and_ddl(
+            publish_direct_metadata_after_commit(&self.tx_mgr, committed, || {
+                persistence.publish_vector_policy_metadata_and_ddl(
                     name,
                     meta,
                     values
@@ -83413,13 +83497,32 @@ impl Database {
                     lsn,
                     &durable_ddl,
                     &metadata_memory,
-                    publish,
+                    || {
+                        publish();
+                        committed.set(true);
+                    },
                 )
             })
         } else {
             publish();
+            committed.set(true);
             Ok(())
+        };
+        result?;
+        if consolidation_only {
+            if let Some(published) = published_policy {
+                // Match ordinary local/received policy publication: a refused
+                // inspection-only recheck keeps its failure mark until the
+                // next maintenance pass. Durable metadata remains authoritative.
+                if let Ok(read_memory) = self.declared_reader_memory() {
+                    let mut owner = crate::vector_read_memory::admission(read_memory);
+                    let _ = self
+                        .vector_store
+                        .recheck_policy_maintenance_failures(&published, &mut owner);
+                }
+            }
         }
+        Ok(())
     }
 
     /// Settle what a change to `table`'s INDEX SET costs -- or gives back --
@@ -119856,3 +119959,11 @@ pub(crate) mod ordinary_native_owner_tests;
 
 #[cfg(test)]
 pub(crate) mod ef_search_metadata_contract_tests;
+
+#[cfg(test)]
+#[path = "database/consolidation_metadata_contract_tests.rs"]
+pub(crate) mod consolidation_metadata_contract_tests;
+
+#[cfg(all(test, feature = "test-seams"))]
+#[path = "database/selected_membership_proof_tests.rs"]
+mod selected_membership_proof_tests;
