@@ -11,6 +11,7 @@ struct Fixture {
     point_reads: Arc<AtomicUsize>,
     bridge: bool,
     wrong_identity: bool,
+    wrong_body: bool,
 }
 struct OriginReader {
     fixture: Fixture,
@@ -41,7 +42,7 @@ impl paged_builder::PagedVectorReader for OriginReader {
                 Ok(Value::Point(crate::ScopedVectorCopy::from_admitted(
                     paged_builder::PagedVectorPoint::F32(paged_builder::PagedPoint {
                         id,
-                        origin_id: 7 + rank,
+                        origin_id: 7 + rank + usize::from(rank == 1 && self.fixture.wrong_body),
                         values,
                         neighbours: vec![next],
                     }),
@@ -170,11 +171,20 @@ impl paged_builder::PagedVectorGraphSource for UnusedSource {
 
 #[test]
 fn durable_expansion_reads_one_point_body_per_distance_plus_required_adjacency() {
-    for (bridge, allow_bridges, admitted, wrong_identity) in [
-        (false, false, true, false),
-        (true, false, true, false),
-        (false, true, false, false),
-        (false, false, true, true),
+    for (bridge, allow_bridges, admitted, wrong_identity, wrong_body, cached_fault) in [
+        (false, false, true, false, false, 0),
+        (true, false, true, false, false, 0),
+        (false, true, false, false, false, 0),
+        (false, false, true, true, false, 0),
+        // Fresh body checks: distance, then excluded bridge adjacency.
+        (false, false, true, false, true, 0),
+        (true, false, true, false, true, 0),
+        // Existing identity-cache binding checks, then cached distance and
+        // bridge adjacency body-origin checks. These retain normal funding.
+        (false, false, true, false, false, 1),
+        (false, false, true, false, false, 2),
+        (false, false, true, false, false, 3),
+        (true, false, true, false, false, 3),
     ] {
         let payer = budget();
         let reads = Arc::new(AtomicUsize::new(0));
@@ -182,6 +192,7 @@ fn durable_expansion_reads_one_point_body_per_distance_plus_required_adjacency()
             point_reads: reads.clone(),
             bridge,
             wrong_identity,
+            wrong_body,
         };
         let mut progress =
             paged_builder::PagedVectorProgress::new(1, 1, contextdb_core::TxId(1), Lsn(1), 3);
@@ -221,6 +232,48 @@ fn durable_expansion_reads_one_point_body_per_distance_plus_required_adjacency()
             .limit
             .store(standing + WINDOW + 4096, Ordering::SeqCst);
         let navigation = NavigationSession::new(Some(payer.clone().into()));
+        if cached_fault != 0 {
+            // Cache-hit negatives need room for both an optional body and the
+            // independent mandatory window. Primary exact-fit cases above
+            // keep their original limit and body-miss assertion unchanged.
+            payer.limit.store(standing + 4 * WINDOW, Ordering::SeqCst);
+            if cached_fault <= 2 {
+                navigation.lock().remember_identity(
+                    0,
+                    8,
+                    &paged_builder::PagedVectorIdentity {
+                        point: PointId(0, if cached_fault == 1 { 0 } else { 1 }),
+                        data_id: 8,
+                        graph_origin: if cached_fault == 2 { 9 } else { 8 },
+                        row_id: RowId(8),
+                        lsn: Lsn(1),
+                        created_tx: contextdb_core::TxId(1),
+                        deleted_tx: None,
+                        exact_key: Vec::new(),
+                    },
+                );
+            } else {
+                navigation.lock().remember_point(
+                    0,
+                    PointId(0, 1),
+                    &paged_builder::PagedVectorPoint::F32(paged_builder::PagedPoint {
+                        id: PointId(0, 1),
+                        origin_id: 9,
+                        values: vec![0.0; DIMENSION],
+                        neighbours: vec![Vec::new()],
+                    }),
+                );
+                assert!(
+                    navigation
+                        .lock()
+                        .point(0, PointId(0, 1))
+                        .unwrap()
+                        .values
+                        .is_some()
+                );
+            }
+        }
+
         let rows = parking_lot::RwLock::new(HashMap::new());
         let members = parking_lot::RwLock::new(super::super::GraphMembers::default());
         let versions = parking_lot::RwLock::new(HashMap::new());
@@ -301,10 +354,10 @@ fn durable_expansion_reads_one_point_body_per_distance_plus_required_adjacency()
             &mut |_| Ok::<_, Error>(()),
             &mut |_| {},
         );
-        if wrong_identity {
+        if wrong_identity || wrong_body || cached_fault != 0 {
             assert!(
                 result.is_err(),
-                "an edge must not relabel a different authenticated point's row"
+                "an edge must keep its authenticated identity and body origin on fresh and cached reads: bridge={bridge} wrong_identity={wrong_identity} wrong_body={wrong_body} cached_fault={cached_fault}"
             );
         } else {
             result.unwrap();
