@@ -9,7 +9,7 @@ import re
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_MODULE_SHA256 = "797bbab6c2f5fb0ad39cb44887813322e36c714aff3a40e407f2d324072c6348"
+BASELINE_MODULE_SHA256 = "45c95eed5fdbcaa3f45afa18f646bb83c4780cd2ebc61bf68b13cec449eb51a5"
 BASELINE_HELPERS_SHA256 = "9905e54b79db77270853f14542c5d525b5da1b33a37ca9889d0a28e3941eafbf"
 BASELINE_HELPER_TESTS_SHA256 = "9883a4313ce70e8a444b3a7237e587d618fbdc163d2eac86d9acafe40a84d269"
 ACCEPTANCE_TARGETS = {
@@ -42,6 +42,8 @@ def reject(call):
 
 roots = {name: ROOT / path.removeprefix("../../") for name, path in ACCEPTANCE_TARGETS.items()}
 partitioned = {name: modules(path) for name, path in roots.items()}
+for target, entries in partitioned.items():
+    assert len(entries) == len(set(entries)), f"duplicate acceptance module in {target}"
 assert ("acceptance/long_running.rs", "long_running") not in partitioned["acceptance"]
 assert ("acceptance/sync.rs", "sync") not in partitioned["acceptance"]
 assert partitioned["acceptance_long_running"] == [

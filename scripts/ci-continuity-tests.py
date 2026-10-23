@@ -45,7 +45,7 @@ class Controls(unittest.TestCase):
 
     def test_baseline(self):
         inv = CI.check(self.root)
-        self.assertEqual(39, sum(t['crate'] == 'contextdb-engine' and t['kind'] == 'test' for t in inv['targets']))
+        self.assertEqual(109, sum(t['crate'] == 'contextdb-engine' and t['kind'] == 'test' for t in inv['targets']))
         self.assertEqual(17, len(inv['shards']))
 
     def test_each_shard_omission(self):
@@ -57,7 +57,7 @@ class Controls(unittest.TestCase):
     def test_feature_omissions(self):
         for feature in ('test-seams,iroh', 'contextdb-internal,test-seams'):
             self.mutate('.github/workflows/rc2-tests.yml', lambda s: s.replace('features: "' + feature + '"', 'features: ""'))
-        self.mutate('.github/workflows/nightly.yml', lambda s: s.replace('test-seams,iroh,nightly-tests', 'test-seams,iroh'))
+        self.mutate('.github/workflows/nightly.yml', lambda s: s.replace('gate_mode: full', 'gate_mode: normal'))
 
     def test_inventory_target_omission(self):
         data = json.loads((self.root / 'scripts/ci-continuity-inventory.json').read_text())
@@ -70,18 +70,18 @@ class Controls(unittest.TestCase):
         self.mutate('crates/contextdb-engine/Cargo.toml', lambda s: s.replace('required-features = ["test-seams", "iroh"]', 'required-features = ["test-seams", "mdns"]'))
 
     def test_removed_default_or_smoke_job(self):
-        for key in ('test', 'installed-smoke', 'cross-compile'):
+        for key in ('test-bundles', 'installed-smoke', 'cross-compile'):
             self.mutate('.github/workflows/ci.yml', lambda s: s.replace('\n  ' + key + ':', '\n  omitted-' + key + ':'))
 
     def test_false_success_and_skips(self):
         for relative, old, new in [
-            ('.github/workflows/ci.yml', 'cargo test --workspace', 'cargo test --workspace || true'),
+            ('.github/workflows/ci.yml', 'bash scripts/verify pr shard', 'bash scripts/verify pr shard || true'),
             ('.github/workflows/rc2-tests.yml', 'exit "$status"', 'exit 0'),
             ('.github/workflows/rc2-tests.yml', 'needs: [lint, test]', 'needs: [test]'),
             ('.github/workflows/ci.yml', 'if: always()', "if: success()"),
-            ('.github/workflows/ci.yml', '  test:\n', '  test:\n    continue-on-error: true\n'),
+            ('.github/workflows/ci.yml', '  test-bundles:\n', '  test-bundles:\n    continue-on-error: true\n'),
             ('.github/workflows/ci.yml', '  lint:\n', '  lint:\n    if: false\n'),
-            ('.github/workflows/ci.yml', 'aggregate lint test installed-smoke cross-compile', 'aggregate lint test')]:
+            ('.github/workflows/ci.yml', 'python3 scripts/ci-required.py', 'python3 scripts/ci-required.py aggregate lint test')]:
             with self.subTest(mutation=new):
                 self.mutate(relative, lambda s: s.replace(old, new))
 

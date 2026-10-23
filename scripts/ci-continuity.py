@@ -9,7 +9,8 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / 'scripts/ci-continuity-inventory.json'
 BRANCH = 'linux-bounded-storage-candidate-20261019'
-REQUIRED = {'ci': ('required', ['lint', 'test', 'installed-smoke', 'cross-compile']),
+REQUIRED = {'ci': ('required', ['lint', 'test-bundles', 'build', 'features',
+                                'installed-smoke', 'cross-compile', 'impact', 'integration']),
             'rc2-tests': ('summary', ['lint', 'test'])}
 
 
@@ -26,9 +27,19 @@ def aggregate(expected, results):
 
 def workflows(root):
     import yaml
-    return {name: yaml.load((root / f'.github/workflows/{name}.yml').read_text(),
-                            Loader=yaml.BaseLoader)
-            for name in ('ci', 'rc2-tests', 'nightly')}
+    pending = ['ci', 'rc2-tests', 'nightly']
+    result = {}
+    while pending:
+        name = pending.pop(0)
+        if name in result:
+            continue
+        flow = yaml.load((root / f'.github/workflows/{name}.yml').read_text(), Loader=yaml.BaseLoader)
+        result[name] = flow
+        for job in flow['jobs'].values():
+            reference = job.get('uses', '')
+            if reference.startswith('./.github/workflows/'):
+                pending.append(Path(reference).stem)
+    return result
 
 
 def runs(job):
@@ -36,55 +47,39 @@ def runs(job):
 
 
 def validate_workflows(w):
+    # The complete reviewed topology is pinned, including all commands, filters,
+    # feature tuples, limits, conditional routes, and fork/mirror controls.
+    expected = json.loads(DATA.read_text())['workflow_structure']
+    demand(w == expected, 'workflow topology inventory mismatch')
+    demand(set(w) == {'ci', 'rc2-tests', 'nightly', 'integration', 'build'}, 'workflow shape')
     for name, (gate, dependencies) in REQUIRED.items():
         flow = w[name]
-        demand({'main', 'dev', BRANCH} <= set(flow['on']['push']['branches']), name + ' push coverage')
+        demand({'main', 'dev'} <= set(flow['on']['push']['branches']), name + ' push coverage')
+        if name == 'rc2-tests':
+            demand(BRANCH in flow['on']['push']['branches'], 'rc2-tests candidate push coverage')
         demand({'main', 'dev'} <= set(flow['on']['pull_request']['branches']), name + ' PR coverage')
         demand('workflow_dispatch' in flow['on'], name + ' dispatch missing')
         demand(flow['permissions'] == {'contents': 'read'}, name + ' permissions')
         jobs = flow['jobs']
-        demand(set(jobs) == set(dependencies + [gate]), name + ' correctness job set changed')
+        extra = ['development-binaries'] if name == 'ci' else []
+        demand(set(jobs) == set(dependencies + [gate] + extra), name + ' correctness job set changed')
         g = jobs[gate]
         demand(g['needs'] == dependencies and g['if'] == 'always()', name + ' aggregate dependencies')
-        expected = 'python3 scripts/ci-continuity.py aggregate ' + ' '.join(dependencies)
-        demand(expected in runs(g), name + ' aggregate command absent')
-        step = next(s for s in g['steps'] if s.get('run') == expected)
-        demand(step.get('env') == {'NEEDS_JSON': '${{ toJSON(needs) }}'}, name + ' aggregate input')
-        demand(not any(k in step for k in ('if', 'continue-on-error')), name + ' aggregate bypass')
-        for key, job in jobs.items():
-            demand('continue-on-error' not in job, name + '/' + key + ' allows failure')
-            if key != gate:
-                demand('if' not in job, name + '/' + key + ' conditional correctness job')
-            for s in job.get('steps', []):
-                demand('continue-on-error' not in s, name + '/' + key + ' step allows failure')
-                if 'run' in s:
-                    demand('if' not in s or (key == 'cross-compile' and s.get('if') == "matrix.target == 'aarch64-unknown-linux-gnu'" and s.get('name') == 'Install cross-compilation tools'), name + '/' + key + ' conditional command')
-        demand('python3 scripts/ci-continuity.py check' in runs(jobs['lint']), name + ' inventory not enforced')
-        demand('python3 scripts/ci-continuity-tests.py' in runs(jobs['lint']), name + ' controls not enforced')
-    cross = w['ci']['jobs']['cross-compile']
-    demand(cross['strategy']['matrix']['include'] == [
+        command = ('python3 scripts/ci-required.py' if name == 'ci' else
+                   'python3 scripts/ci-continuity.py aggregate ' + ' '.join(dependencies))
+        demand(command in runs(g), name + ' aggregate command absent')
+    ci = w['ci']['jobs']
+    demand(ci['test-bundles']['strategy']['matrix'] ==
+           '${{ fromJSON(needs.impact.outputs.bundle_matrix) }}', 'bundle matrix shape')
+    demand(ci['test-bundles']['strategy']['fail-fast'] == 'false', 'bundle fail-fast')
+    demand(ci['cross-compile']['strategy']['matrix']['include'] == [
         {'target': 'aarch64-unknown-linux-gnu', 'os': 'ubuntu-latest'}], 'Linux cross matrix')
-    for name, flow in w.items():
-        for key, j in flow['jobs'].items():
-            demand(j['runs-on'] in ('ubuntu-latest', '${{ matrix.os }}'), name + '/' + key + ' Linux runner')
-    test = w['ci']['jobs']['test']
-    for command in ('cargo test --workspace', 'cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked', 'cargo build --release', 'bash scripts/verify-packaged-engine.sh'):
-        demand(command in runs(test), 'default command missing: ' + command)
-    smoke = '\n'.join(runs(w['ci']['jobs']['installed-smoke']))
-    for command in ('cargo install --locked --path crates/contextdb-cli', 'cargo install --locked --path crates/contextdb-server', '--features production-smoke-driver --bins', 'scripts/installed-release-durable-sync-smoke.sh'):
-        demand(command in smoke, 'installed smoke command missing: ' + command)
-    for name in ('ci', 'rc2-tests'):
-        for command in ('cargo fmt --all --check', 'cargo clippy --workspace --all-targets -- -D warnings', 'cargo fmt --manifest-path crates/contextdb-redb/Cargo.toml --check', 'cargo clippy --manifest-path crates/contextdb-redb/Cargo.toml --all-targets -- -D warnings'):
-            demand(command in runs(w[name]['jobs']['lint']), 'lint command missing: ' + command)
-    demand(w['nightly']['on'] == {'schedule': [{'cron': '0 3 * * *'}], 'workflow_dispatch': ''}, 'nightly admission changed')
-    demand(runs(w['nightly']['jobs']['full-test']) == [
-        'cargo test --workspace', 'cargo test --manifest-path crates/contextdb-redb/Cargo.toml --locked',
-        'cargo test -p contextdb-engine --features test-seams,iroh,nightly-tests',
-        'cargo test -p contextdb-engine --features test-seams,nightly-tests --release --test acceptance'], 'nightly commands changed')
+    nightly = w['nightly']['jobs']['full-test']
+    demand(nightly['uses'] == './.github/workflows/integration.yml' and nightly['with'] ==
+           {'enabled': 'true', 'run_default': 'true', 'gate_mode': 'full'}, 'nightly full selection')
     shard = w['rc2-tests']['jobs']['test']
     demand(shard['timeout-minutes'] == '330' and shard['strategy']['fail-fast'] == 'false', 'shard execution limits')
     command = next(s['run'] for s in shard['steps'] if s.get('id') == 'run')
-    # Exact runner body is pinned in the inventory as well: shell-status propagation is part of selection.
     demand('--include-ignored' not in command, 'ignored tests must stay ignored')
     return shard, command
 
@@ -197,7 +192,7 @@ def inventory(root=ROOT):
                 ignores.append({'path': str(p.relative_to(root)), 'line': line, 'declaration': text.strip(), 'execution': 'not selected (--include-ignored absent)'})
             if 'feature = "nightly-tests"' in text:
                 nightly_cfg.append({'path': str(p.relative_to(root)), 'line': line, 'declaration': text.strip(), 'job': 'nightly/full-test', 'execution': 'not executed by this audit'})
-    return {'base': '65a2ccf8066de7a4b6ec5381d5bf0e75775152d6', 'branch': BRANCH,
+    return {'base': 'bc0f1b0fa98424e54e54bb1b3778c245abf6f8fd', 'branch': BRANCH,
             'workflow_structure': w, 'shards': rows, 'shard_runner': command, 'targets': targets, 'features': features,
             'nightly_cfg': nightly_cfg, 'ignore_declarations': ignores}
 
