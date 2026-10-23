@@ -1316,6 +1316,34 @@ fn authenticate_owning_row_with_evidence(
     body_deleted: Option<Option<TxId>>,
     before: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<AuthenticatedOwningRow>> {
+    authenticate_owning_row_for_use(
+        owner,
+        read,
+        index,
+        identity,
+        body_deleted,
+        before,
+        OwningRowUse::Decoded,
+    )
+}
+#[derive(Clone, Copy)]
+enum OwningRowUse {
+    Decoded,
+    CountHeader,
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Native refusal diagnostics stay inline under exhausted budgets."
+)]
+fn authenticate_owning_row_for_use(
+    owner: &MembershipOwner,
+    read: &redb::ReadTransaction,
+    index: &VectorIndexRef,
+    identity: &RawVectorDirectoryEntry,
+    body_deleted: Option<Option<TxId>>,
+    before: &mut dyn FnMut() -> Result<()>,
+    use_row: OwningRowUse,
+) -> Result<Option<AuthenticatedOwningRow>> {
     let Some(context) = operation_for(owner).filter(|context| context.historical) else {
         return Ok(None);
     };
@@ -1352,28 +1380,51 @@ fn authenticate_owning_row_with_evidence(
                     before,
                 )?);
             }
-            root.visit_historical_rows_with_proof(
-                &index.table,
-                Some(identity.row_id),
-                SnapshotId(stamp.visible_from.0),
-                context.snapshot,
-                context.memory.clone(),
-                fixed.as_ref().expect("created same-capture fixed proof"),
-                before,
-                &mut |window| {
-                    if window.value.created_tx != stamp.owning_row_tx
-                        || window.value.lsn != stamp.row_lsn
-                    {
-                        return Err(damage("vector membership names another owning row version"));
-                    }
-                    if found {
-                        return Err(damage("vector placement has duplicate owning row versions"));
-                    }
-                    row_deleted = window.value.deleted_tx;
-                    found = true;
-                    Ok(())
-                },
-            )?;
+            let mut accept = |created: TxId, lsn: Lsn, deleted: Option<TxId>| {
+                if created != stamp.owning_row_tx || lsn != stamp.row_lsn {
+                    return Err(damage("vector membership names another owning row version"));
+                }
+                if found {
+                    return Err(damage("vector placement has duplicate owning row versions"));
+                }
+                row_deleted = deleted;
+                found = true;
+                Ok(())
+            };
+            match use_row {
+                OwningRowUse::Decoded => root.visit_historical_rows_with_proof(
+                    &index.table,
+                    Some(identity.row_id),
+                    SnapshotId(stamp.visible_from.0),
+                    context.snapshot,
+                    context.memory.clone(),
+                    fixed.as_ref().expect("created same-capture fixed proof"),
+                    before,
+                    &mut |window| {
+                        accept(
+                            window.value.created_tx,
+                            window.value.lsn,
+                            window.value.deleted_tx,
+                        )
+                    },
+                )?,
+                OwningRowUse::CountHeader => root.visit_historical_row_headers_with_proof(
+                    &index.table,
+                    Some(identity.row_id),
+                    SnapshotId(stamp.visible_from.0),
+                    context.snapshot,
+                    context.memory.clone(),
+                    fixed.as_ref().expect("created same-capture fixed proof"),
+                    before,
+                    &mut |window| {
+                        accept(
+                            window.value.created_tx,
+                            window.value.lsn,
+                            window.value.deleted_tx,
+                        )
+                    },
+                )?,
+            }
         }
         None => {
             let MembershipOwner::Retained(source) = owner else {
@@ -2551,6 +2602,26 @@ impl DurableMembershipSource {
         &self,
         row: Option<RowId>,
         before: &mut dyn FnMut() -> bool,
+        select: impl FnMut(&VectorPartitionMembershipRecord) -> Option<T>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+        admit: &mut dyn FnMut(
+            &mut contextdb_vector::VectorCopyAdmission,
+            usize,
+            &str,
+            &str,
+            &str,
+        ) -> Result<()>,
+    ) -> Result<Option<T>> {
+        self.find_for_row_use(row, before, select, owner, admit, OwningRowUse::Decoded)
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics stay inline under exhausted budgets."
+    )]
+    fn find_for_row_use<T>(
+        &self,
+        row: Option<RowId>,
+        before: &mut dyn FnMut() -> bool,
         mut select: impl FnMut(&VectorPartitionMembershipRecord) -> Option<T>,
         owner: &mut contextdb_vector::VectorCopyAdmission,
         admit: &mut dyn FnMut(
@@ -2560,6 +2631,7 @@ impl DurableMembershipSource {
             &str,
             &str,
         ) -> Result<()>,
+        use_row: OwningRowUse,
     ) -> Result<Option<T>> {
         let mut scratch = owner.scratch();
         admit(
@@ -2579,22 +2651,23 @@ impl DurableMembershipSource {
                 .row_owner()?
                 .enter();
             let mut interrupted = None;
-            let next = cursor.next_authenticated_record(&mut |request| match request {
-                DormantVectorLoadRequest::Reserve(bytes) => match admit(
-                    &mut scratch,
-                    bytes,
-                    "vector_copy",
-                    "materialize",
-                    "Reduce the selected copy or raise the executing statement's memory limit.",
-                ) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        interrupted = Some(error);
-                        false
-                    }
-                },
-                _ => before(),
-            });
+            let next =
+                cursor.next_authenticated_record_for_use(use_row, &mut |request| match request {
+                    DormantVectorLoadRequest::Reserve(bytes) => match admit(
+                        &mut scratch,
+                        bytes,
+                        "vector_copy",
+                        "materialize",
+                        "Reduce the selected copy or raise the executing statement's memory limit.",
+                    ) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            interrupted = Some(error);
+                            false
+                        }
+                    },
+                    _ => before(),
+                });
             if let Some(error) = interrupted {
                 return Err(error);
             }
@@ -2760,12 +2833,25 @@ impl MembershipCursor {
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<Option<AuthenticatedMembership>> {
+        self.next_authenticated_record_for_use(OwningRowUse::Decoded, request)
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics stay inline under exhausted budgets."
+    )]
+    fn next_authenticated_record_for_use(
+        &mut self,
+        use_row: OwningRowUse,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<Option<AuthenticatedMembership>> {
         operation_checkpoint()?;
         self.selected_identity = None;
         let memory = historical_operation_memory(&self.owner, &self.root.read)?;
         let result = match memory {
-            Some(memory) => graph_read::with_pages(memory, || self.next_record_attempt(request)),
-            None => self.next_record_attempt(request),
+            Some(memory) => {
+                graph_read::with_pages(memory, || self.next_record_attempt(request, use_row))
+            }
+            None => self.next_record_attempt(request, use_row),
         };
         if let Ok(Some(record)) = &result {
             self.selected_identity = Some(body_identity(&record.record));
@@ -2785,6 +2871,7 @@ impl MembershipCursor {
     fn next_record_attempt(
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+        use_row: OwningRowUse,
     ) -> Result<Option<AuthenticatedMembership>> {
         operation_checkpoint()?;
         if self.done {
@@ -2868,7 +2955,7 @@ impl MembershipCursor {
             value.value(),
             &record,
         )?;
-        let row_evidence = authenticate_owning_row_with_evidence(
+        let row_evidence = authenticate_owning_row_for_use(
             &self.owner,
             &self.root.read,
             &self.partition.index,
@@ -2881,6 +2968,7 @@ impl MembershipCursor {
                     Err(Error::ReadCancelled)
                 }
             },
+            use_row,
         )?;
         // The admitted metadata window includes this retained retry key.
         self.last_success = Some(key.value().to_vec());
@@ -3194,7 +3282,7 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         drop(root);
         drop(metadata);
         let mut count = 0;
-        self.find(
+        self.find_for_row_use(
             None,
             before,
             |record| {
@@ -3202,6 +3290,10 @@ impl RawVectorMembershipSource for DurableMembershipSource {
                 None::<()>
             },
             owner,
+            &mut |token, bytes, component, operation, hint| {
+                token.reserve_for(bytes, component, operation, hint)
+            },
+            OwningRowUse::CountHeader,
         )?;
         Ok(count)
     }
@@ -4526,3 +4618,18 @@ pub(crate) fn stream_partition_journal_tail(
 }
 
 use crate::persistence::writer_source::WriterSnapshotHandle;
+
+/// The exact count-header producer must authenticate but not decode a later
+/// row version beyond the placement's visible_from cut. The outer membership
+/// count authenticates every placement at its OWN cut, so an invisible newer
+/// malformed placement still correctly rejects there; that is a different cut.
+#[cfg(all(test, feature = "test-seams"))]
+pub(crate) fn count_header_before_future_version_for_test(owner: &MembershipOwner, table: &str, snapshot: SnapshotId) -> Result<usize> {
+    let context = operation_for(owner).expect("actual captured vector operation");
+    let root = context.root.writer.as_ref().expect("actual writer historical producer");
+    let proof = root.open_historical_row_proof(table, context.snapshot, context.memory.clone(), &mut || Ok(()))?;
+    let mut count = 0;
+    root.visit_historical_row_headers_with_proof(table, None, snapshot, context.snapshot,
+        context.memory.clone(), &proof, &mut || Ok(()), &mut |_row| { count += 1; Ok(()) })?;
+    Ok(count)
+}

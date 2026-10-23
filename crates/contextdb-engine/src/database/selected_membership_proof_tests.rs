@@ -59,6 +59,14 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
         )
         .unwrap();
         let snapshot = db.snapshot();
+        // A real later publication makes visible_count use its historical
+        // cursor, while preserving exactly one version for every vector row.
+        db.execute(
+            "CREATE TABLE after_snapshot_marker (id INTEGER PRIMARY KEY)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute("INSERT INTO after_snapshot_marker VALUES (1)", &HashMap::new()).unwrap();
         let child = db.ordinary_read_child().unwrap();
         crate::executor::bounded::with_native_read_memory(child, |memory, _trace_refund| {
             let image = crate::read_image_memory::ImageMemory::new_direct_reader(None, memory.clone())?;
@@ -76,6 +84,16 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
                 MembershipOwner::Writable(persistence.clone()), None, &partition, summary,
                 db.accountant.clone(), &mut workspace, retained,
             ).unwrap();
+            let count_work = crate::read_work_probe::ReadWorkObservationScope::enter(crate::read_work_probe::ReadWorkPhase::Query);
+            let visible = source.visible_count(snapshot, &mut || true, &mut copies).unwrap();
+            assert_eq!(visible, rows as usize, "the actual historical count consumes the declared population");
+            let counted = count_work.counters();
+            let counted_history = count_work.historical_counters();
+            assert_eq!(counted_history.owning_row_controls_admitted, rows as u64,
+                "each counted record still reconciles its original owning row");
+            assert_eq!(counted.decoded_rows, 0,
+                "a membership count authenticates body and schema without constructing owned row vectors: {counted:?}, {counted_history:?}");
+            drop(count_work);
             // Discover the genuine physical row id through its existing
             // admitted cursor, outside the measured select/load segment.
             let mut first_window = copies.scratch();
@@ -231,4 +249,81 @@ fn historical_receipt_preserves_old_and_current_indexed_answers_across_overwrite
         drop(pin);
         db.close().unwrap();
     }
+}
+
+/// The real count cursor must reject malformed JSON even though its complete
+/// borrowed structural parser accepts the UTF-8 bytes. The fixture rewrites the
+/// real persisted body AND manifest; a digest mismatch cannot satisfy this.
+#[test]
+#[serial_test::serial]
+fn historical_count_rejects_authenticated_malformed_json() {
+    authenticated_json_count_fixture(true, false);
+}
+#[test]
+#[serial_test::serial]
+fn historical_count_valid_json_uses_existing_decoder() {
+    authenticated_json_count_fixture(false, false);
+}
+#[test]
+#[serial_test::serial]
+fn count_header_producer_skips_future_authenticated_malformed_json() {
+    authenticated_json_count_fixture(true, true);
+}
+fn authenticated_json_count_fixture(malformed: bool, future: bool) {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_options(dir.path().join("json-count.redb"), DatabaseOpenOptions {
+        maintenance_policy: MaintenancePolicy::CallerDriven, ..Default::default()
+    }).unwrap();
+    db.execute("CREATE TABLE count_json (id INTEGER PRIMARY KEY, doc JSON, v VECTOR(4)) HISTORY ALL", &HashMap::new()).unwrap();
+    db.execute("INSERT INTO count_json VALUES (1,$doc,$v)", &HashMap::from([
+        ("doc".into(), Value::Json(serde_json::json!({}))),
+        ("v".into(), Value::Vector(vec![1.0,0.0,0.0,0.0])),
+    ])).unwrap();
+    let snapshot = db.snapshot();
+    if future {
+        db.execute("UPDATE count_json SET doc = $doc WHERE id = 1", &HashMap::from([
+            ("doc".into(), Value::Json(serde_json::json!({}))),
+        ])).unwrap();
+    }
+    if malformed {
+        db.persistence.as_ref().unwrap().malformed_count_json_for_test(db.accountant.clone(), "count_json", future).unwrap();
+    }
+    db.execute("CREATE TABLE count_json_marker (id INTEGER PRIMARY KEY)", &HashMap::new()).unwrap();
+    db.execute("INSERT INTO count_json_marker VALUES (1)", &HashMap::new()).unwrap();
+    crate::executor::bounded::with_native_read_memory(db.ordinary_read_child().unwrap(), |memory, _trace_refund| {
+        let image = crate::read_image_memory::ImageMemory::new_direct_reader(None, memory.clone())?;
+        image.scope(|| {
+            let _intent = db.vector_historical_read_intent(snapshot, memory.clone());
+            let mut copies = crate::vector_read_memory::admission(memory.clone());
+            let _scope = db.vector_read_scope(snapshot, memory.clone(), &mut copies).unwrap();
+            let persistence = db.persistence.as_ref().unwrap().clone();
+            let mut partitions = persistence.durable_membership_partitions(&mut copies).unwrap();
+            let (partition, summary) = partitions.pop().unwrap();
+            let mut workspace = copies.scratch();
+            let owner = MembershipOwner::Writable(persistence);
+            let source = DurableMembershipSource::from_owner_admitted(
+                owner.clone(), None, &partition, summary,
+                db.accountant.clone(), &mut workspace, copies.scratch()).unwrap();
+            let work = crate::read_work_probe::ReadWorkObservationScope::enter(crate::read_work_probe::ReadWorkPhase::Query);
+            let result = if future {
+                crate::persistence::vector_membership_source::count_header_before_future_version_for_test(&owner, "count_json", snapshot)
+            } else {
+                source.visible_count(snapshot, &mut || true, &mut copies)
+            };
+            if future {
+                assert_eq!(result.unwrap(), 1, "the same count producer selects the older valid row and skips decoding its authenticated future version");
+                assert_eq!(work.counters().decoded_rows, 1, "only the older valid JSON row requires full decoding");
+            } else if malformed {
+                assert!(matches!(result, Err(Error::StoreCorrupted { .. })),
+                    "the actual historical count must preserve the original JSON decode rejection: {result:?}");
+                assert_eq!(work.counters().decoded_rows, 1, "malformed JSON goes through the existing full decoder");
+            } else {
+                assert_eq!(result.unwrap(), 1);
+                assert_eq!(work.counters().decoded_rows, 1, "valid JSON uses the same original full decoder");
+            }
+            Ok(())
+        })
+    }).unwrap();
+    db.close().unwrap();
 }

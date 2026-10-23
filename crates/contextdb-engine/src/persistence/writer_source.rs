@@ -4868,6 +4868,89 @@ impl WriterSnapshotHandle {
         before: &mut dyn FnMut() -> Result<()>,
         visit: &mut dyn FnMut(WriterWindow<VersionedRow>) -> Result<()>,
     ) -> Result<()> {
+        self.visit_historical_rows_projected(
+            table,
+            row_id,
+            snapshot,
+            operation_snapshot,
+            read_memory,
+            proof,
+            false,
+            before,
+            &mut |meta, bytes, _header| {
+                RedbPersistence::decode_relational_source_row(table, meta, bytes)
+            },
+            &mut |row: &VersionedRow, snapshot| row.visible_at(snapshot),
+            visit,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics stay inline under exhausted budgets."
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn visit_historical_row_headers_with_proof(
+        &self,
+        table: &str,
+        row_id: Option<RowId>,
+        snapshot: SnapshotId,
+        operation_snapshot: SnapshotId,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        proof: &HistoricalRowProof,
+        before: &mut dyn FnMut() -> Result<()>,
+        visit: &mut dyn FnMut(
+            WriterWindow<content_identity::version_manifest::BorrowedRowHeader>,
+        ) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_historical_rows_projected(
+            table,
+            row_id,
+            snapshot,
+            operation_snapshot,
+            read_memory,
+            proof,
+            true,
+            before,
+            &mut |meta, bytes, header| {
+                let header = header.ok_or_else(|| Error::Other("authenticated row header is absent".into()))?;
+                if header.requires_owned_validation {
+                    // This is the same decoder, schema validation and genuine
+                    // selected-row image owner as the original full-row path.
+                    drop(RedbPersistence::decode_relational_source_row(table, meta, bytes)?);
+                }
+                Ok(header)
+            },
+            &mut |row: &content_identity::version_manifest::BorrowedRowHeader, snapshot| {
+                row.visible_at(snapshot)
+            },
+            visit,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics stay inline under exhausted budgets."
+    )]
+    #[allow(clippy::too_many_arguments)]
+    fn visit_historical_rows_projected<T>(
+        &self,
+        table: &str,
+        row_id: Option<RowId>,
+        snapshot: SnapshotId,
+        operation_snapshot: SnapshotId,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        proof: &HistoricalRowProof,
+        count_header: bool,
+        before: &mut dyn FnMut() -> Result<()>,
+        decode: &mut dyn FnMut(
+            &TableMeta,
+            &[u8],
+            Option<content_identity::version_manifest::BorrowedRowHeader>,
+        ) -> Result<T>,
+        visible_at: &mut dyn FnMut(&T, SnapshotId) -> bool,
+        visit: &mut dyn FnMut(WriterWindow<T>) -> Result<()>,
+    ) -> Result<()> {
         if !proof.matches(self, table, operation_snapshot, &read_memory)
             || proof.read.storage_snapshot_identity()
                 != self.owner_read()?.storage_snapshot_identity()
@@ -4951,7 +5034,7 @@ impl WriterSnapshotHandle {
                 };
                 let mut previous = None::<[u8; 24]>;
                 let mut group = None::<RowId>;
-                let mut selected = None::<WriterWindow<VersionedRow>>;
+                let mut selected = None::<WriterWindow<T>>;
                 let complete = verifier.visit_history_from::<Error>(
                     content_identity::HistoryKind::RelationalVersion,
                     Bound::Included(prefix.clone()),
@@ -4977,8 +5060,9 @@ impl WriterSnapshotHandle {
                             witness.identity[..8].try_into().expect("row identity"),
                         ));
                         if group.is_some_and(|prior| prior != id)
-                            && let Some(row) =
-                                selected.take().filter(|row| row.value.visible_at(snapshot))
+                            && let Some(row) = selected
+                                .take()
+                                .filter(|row| visible_at(&row.value, snapshot))
                         {
                             (touch.borrow_mut())()?;
                             visit(row)?;
@@ -4999,17 +5083,52 @@ impl WriterSnapshotHandle {
                         }
                         let mut admission =
                             content_identity::ProofAdmission::for_reader(read_memory.clone());
-                        let actual = manifest::manifest_for_body_with_checkpoint(
-                            table,
-                            key.value(),
-                            body.value(),
-                            &mut admission,
-                            &mut || (touch.borrow_mut())(),
-                        );
+                        let actual = if count_header {
+                            manifest::manifested_row_header(
+                                table,
+                                key.value(),
+                                body.value(),
+                                &mut admission,
+                                &mut || (touch.borrow_mut())(),
+                                meta,
+                                coordinate,
+                                &mut |header| {
+                                    validate_read_version_bounds(
+                                        &read,
+                                        table,
+                                        header.lsn,
+                                        header.created_tx,
+                                        header.deleted_tx,
+                                        TxId(self.snapshot.0),
+                                        self.lsn,
+                                    )
+                                    .map_err(|error| {
+                                        match error {
+                                            LoadReadImageError::Memory(error) => {
+                                                typed_body_error(error)
+                                            }
+                                            other => verifier.corrupt(other),
+                                        }
+                                    })
+                                },
+                                snapshot,
+                            )
+                            .map(|(coordinate, header)| (coordinate, Some(header)))
+                        } else {
+                            manifest::manifest_for_body_with_checkpoint(
+                                table,
+                                key.value(),
+                                body.value(),
+                                &mut admission,
+                                &mut || (touch.borrow_mut())(),
+                            )
+                            .map(|coordinate| (coordinate, None))
+                        };
                         if let Some(error) = admission.take_reader_refusal() {
                             return Err(error);
                         }
-                        if actual.map_err(&typed_body_error)?.as_slice() != coordinate {
+                        let (actual, header) = actual.map_err(&typed_body_error)?;
+                        if actual.as_slice() != coordinate {
                             return Err(verifier
                                 .corrupt("persisted row body or closure does not authenticate"));
                         }
@@ -5021,29 +5140,25 @@ impl WriterSnapshotHandle {
                         let lsn = Lsn(u64::from_be_bytes(
                             witness.identity[16..].try_into().expect("log identity"),
                         ));
-                        validate_read_version_bounds(
-                            &read,
-                            table,
-                            lsn,
-                            created,
-                            witness.deleted_tx,
-                            TxId(self.snapshot.0),
-                            self.lsn,
-                        )
-                        .map_err(|error| match error {
-                            LoadReadImageError::Memory(error) => typed_body_error(error),
-                            other => verifier.corrupt(other),
-                        })?;
+                        if !count_header {
+                            validate_read_version_bounds(
+                                &read,
+                                table,
+                                lsn,
+                                created,
+                                witness.deleted_tx,
+                                TxId(self.snapshot.0),
+                                self.lsn,
+                            )
+                            .map_err(|error| match error {
+                                LoadReadImageError::Memory(error) => typed_body_error(error),
+                                other => verifier.corrupt(other),
+                            })?;
+                        }
                         if created.0 <= snapshot.0 {
                             let memory = owner.image(self, "historical_selected_row");
                             let row = memory
-                                .scope(|| {
-                                    RedbPersistence::decode_relational_source_row(
-                                        table,
-                                        meta,
-                                        body.value(),
-                                    )
-                                })
+                                .scope(|| decode(meta, body.value(), header))
                                 .map_err(&typed_body_error)?;
                             memory.reserve(witness.identity.len())?;
                             selected = Some(WriterWindow {
@@ -5071,7 +5186,7 @@ impl WriterSnapshotHandle {
                 {
                     return Err(verifier.corrupt("unwitnessed physical relational suffix"));
                 }
-                if let Some(row) = selected.filter(|row| row.value.visible_at(snapshot)) {
+                if let Some(row) = selected.filter(|row| visible_at(&row.value, snapshot)) {
                     (touch.borrow_mut())()?;
                     visit(row)?;
                 }
