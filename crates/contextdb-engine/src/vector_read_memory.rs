@@ -610,6 +610,20 @@ impl DeclaredReadRoot {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn native_child_unqualified(&self) -> Result<NativeReadChildReceipt> {
+        self.native_child_unqualified_observed(|_, _| {})
+    }
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn child_with_physical_counter_for_test(&self) -> Result<(ReadMemoryOwner, (usize, usize))> {
+        let mut observed = (0, 0);
+        let receipt = self.native_child_unqualified_observed(|child, owner| {
+            observed = (owner.accounting_identity(), &child.retained as *const _ as usize);
+        })?;
+        Ok((receipt.into_owner(), observed))
+    }
+    fn native_child_unqualified_observed(
+        &self,
+        observe: impl FnOnce(&NativeDeclaredChild, &ReadMemoryOwner),
+    ) -> Result<NativeReadChildReceipt> {
         let control_bytes =
             ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>().size();
         self.try_reserve(
@@ -644,6 +658,7 @@ impl DeclaredReadRoot {
             );
             #[cfg(any(test, feature = "test-seams"))]
             register_native_child_observer(self, &owner, &child, request_before, initial_held);
+            observe(&child, &owner);
             NativeReadChildReceipt { owner }
         })
     }
