@@ -53,7 +53,8 @@ struct NavigationPoint {
 }
 struct NavigationIdentity {
     row: RowId,
-    _point: PointId,
+    point: PointId,
+    origin: usize,
     _lsn: contextdb_core::Lsn,
     _created_tx: contextdb_core::TxId,
     _deleted_tx: Option<contextdb_core::TxId>,
@@ -234,6 +235,25 @@ impl NavigationCache {
             _ => None,
         }
     }
+    fn row_at_point(
+        &mut self,
+        layer: usize,
+        origin: usize,
+        point: PointId,
+    ) -> Result<Option<RowId>> {
+        match self.touch(NavigationKey::Identity(layer, origin)) {
+            Some(NavigationValue::Identity(identity)) => {
+                check_point_origin(Some(origin), identity.origin)?;
+                if identity.point != point {
+                    return Err(Error::Other(
+                        "paged graph edge disagrees with its point identity".into(),
+                    ));
+                }
+                Ok(Some(identity.row))
+            }
+            _ => Ok(None),
+        }
+    }
     fn row_version(&mut self, layer: usize, origin: usize) -> Option<Lsn> {
         match self.touch(NavigationKey::Identity(layer, origin)) {
             Some(NavigationValue::Identity(identity)) => Some(identity._lsn),
@@ -255,7 +275,8 @@ impl NavigationCache {
                 key,
                 NavigationValue::Identity(NavigationIdentity {
                     row: identity.row_id,
-                    _point: identity.point,
+                    point: identity.point,
+                    origin: identity.graph_origin,
                     _lsn: identity.lsn,
                     _created_tx: identity.created_tx,
                     _deleted_tx: identity.deleted_tx,
@@ -840,6 +861,14 @@ struct OpenLayer<'a, 's> {
     supplied: Option<UnionSeedRows<'s>>,
 }
 
+fn check_point_origin(expected: Option<usize>, actual: usize) -> Result<()> {
+    if expected.is_some_and(|expected| expected != actual) {
+        return Err(Error::Other(
+            "paged graph edge disagrees with its point origin".into(),
+        ));
+    }
+    Ok(())
+}
 impl<'a, 's> OpenLayer<'a, 's> {
     fn bit(&self, point: PointId) -> Option<usize> {
         let index = point.0 as usize;
@@ -1095,6 +1124,56 @@ impl<'a, 's> OpenLayer<'a, 's> {
         }
     }
 
+    /// Resolve an edge's existing origin using the small authenticated identity
+    /// record. The edge must name this exact point before its row is consulted.
+    fn row_at_point<E: From<Error>, S: FnMut() -> std::result::Result<(), E>>(
+        &self,
+        origin: usize,
+        point: PointId,
+        before_source: &mut S,
+    ) -> std::result::Result<Option<RowId>, E> {
+        match &self.graph {
+            LayerGraph::Durable { reader, .. } => {
+                before_source()?;
+                if let Some(row) = self
+                    .navigation
+                    .lock()
+                    .row_at_point(self.source_layer, origin, point)
+                    .map_err(E::from)?
+                {
+                    return Ok(Some(row));
+                }
+                let identity = paged_builder::AdmittedPagedReader::with_reclamation(
+                    reader.borrow_mut().as_mut(),
+                    self.navigation.owner(),
+                    &|| self.navigation.reclaim(),
+                )
+                .identity(origin)
+                .map_err(E::from)?;
+                check_point_origin(Some(origin), identity.graph_origin).map_err(E::from)?;
+                if identity.point != point {
+                    return Err(E::from(Error::Other(
+                        "paged graph edge disagrees with its point identity".into(),
+                    )));
+                }
+                let row = identity.row_id;
+                self.navigation
+                    .lock()
+                    .remember_identity(self.source_layer, origin, &identity);
+                Ok(Some(row))
+            }
+            _ => {
+                let actual = self.origin(point, before_source)?;
+                if actual != Some(origin) {
+                    return Err(E::from(Error::Other(
+                        "graph edge disagrees with its point origin".into(),
+                    )));
+                }
+                self.row(origin, before_source)
+            }
+        }
+    }
+
     /// The version `origin`'s own row stores at this point, where the layer
     /// records it; `None` for a decoded sealed point, which is the version
     /// visible at the layer's covered frontier.
@@ -1137,6 +1216,7 @@ impl<'a, 's> OpenLayer<'a, 's> {
     fn neighbours<'h, E, A, S>(
         &self,
         point: PointId,
+        expected_origin: Option<usize>,
         level: usize,
         scratch: &'h mut HopScratch,
         acquire: &mut A,
@@ -1177,6 +1257,7 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     {
                         let mut navigation = self.navigation.lock();
                         if let Some(cached) = navigation.point(self.source_layer, point) {
+                            check_point_origin(expected_origin, cached.origin).map_err(E::from)?;
                             let Some(edges) = cached.neighbours.get(level) else {
                                 return Ok(None);
                             };
@@ -1200,10 +1281,13 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     self.navigation
                         .lock()
                         .remember_point(self.source_layer, point, &value);
-                    let neighbours = match &*value {
-                        paged_builder::PagedVectorPoint::F32(p) => &p.neighbours,
-                        paged_builder::PagedVectorPoint::Quantized(p) => &p.neighbours,
+                    let (actual_origin, neighbours) = match &*value {
+                        paged_builder::PagedVectorPoint::F32(p) => (p.origin_id, &p.neighbours),
+                        paged_builder::PagedVectorPoint::Quantized(p) => {
+                            (p.origin_id, &p.neighbours)
+                        }
                     };
+                    check_point_origin(expected_origin, actual_origin).map_err(E::from)?;
                     let Some(edges) = neighbours.get(level) else {
                         return Ok(None);
                     };
@@ -1250,6 +1334,7 @@ impl<'a, 's> OpenLayer<'a, 's> {
     fn distance<E, S, D, A, R>(
         &mut self,
         point: PointId,
+        expected_origin: Option<usize>,
         query: &UnionQuery<'_>,
         before_source_entry: &mut S,
         before_distance: &mut D,
@@ -1280,10 +1365,12 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     }?;
                     let cached = {
                         let mut navigation = self.navigation.lock();
-                        navigation
-                            .point(self.source_layer, point)
-                            .and_then(|point| point.values.as_ref())
-                            .is_some()
+                        if let Some(point) = navigation.point(self.source_layer, point) {
+                            check_point_origin(expected_origin, point.origin).map_err(E::from)?;
+                            point.values.is_some()
+                        } else {
+                            false
+                        }
                     };
                     if cached {
                         {
@@ -1320,6 +1407,11 @@ impl<'a, 's> OpenLayer<'a, 's> {
                             before_distance()
                         }?;
                     }
+                    let actual_origin = match &*value {
+                        paged_builder::PagedVectorPoint::F32(point) => point.origin_id,
+                        paged_builder::PagedVectorPoint::Quantized(point) => point.origin_id,
+                    };
+                    check_point_origin(expected_origin, actual_origin).map_err(E::from)?;
                     let distance = match &*value {
                         paged_builder::PagedVectorPoint::F32(point) => {
                             hnsw_f32_distance().eval(query.values, &point.values)
@@ -3754,6 +3846,7 @@ where
     }
     let Some(distance) = layer.distance(
         point,
+        None,
         query,
         before_source_entry,
         before_distance,
@@ -3919,6 +4012,7 @@ where
             layer,
             position,
             entry_id,
+            None,
             walk,
             query,
             allow_bridges,
@@ -3942,6 +4036,7 @@ where
                 let neighbours = layer
                     .neighbours(
                         pivot_id,
+                        None,
                         level as usize,
                         &mut *hops,
                         acquire,
@@ -3986,6 +4081,7 @@ where
                         layer,
                         position,
                         neighbour_id,
+                        Some(neighbour_origin),
                         walk,
                         query,
                         allow_bridges,
@@ -4430,18 +4526,26 @@ where
             }
             let layer = &mut open[candidate.layer as usize];
             let neighbours = layer
-                .neighbours(candidate.point, 0, &mut hops, acquire, before_source_entry)?
+                .neighbours(
+                    candidate.point,
+                    Some(candidate.origin),
+                    0,
+                    &mut hops,
+                    acquire,
+                    before_source_entry,
+                )?
                 .ok_or_else(|| {
                     E::from(Error::Other(
                         ("graph layer-zero neighbours".to_string()).into(),
                     ))
                 })?;
             for hop in 0..neighbours.len() {
-                let (neighbour_id, _) = neighbours.get(hop);
+                let (neighbour_id, neighbour_origin) = neighbours.get(hop);
                 match consider(
                     layer,
                     candidate.layer as usize,
                     neighbour_id,
+                    Some(neighbour_origin),
                     walk,
                     query,
                     allow_bridges,
@@ -4467,6 +4571,7 @@ where
                 // already read; a point reached before is never read again.
                 let Some(bridge_hops) = layer.neighbours(
                     neighbour_id,
+                    Some(neighbour_origin),
                     0,
                     &mut bridges,
                     acquire,
@@ -4476,11 +4581,12 @@ where
                     continue;
                 };
                 for bridge in 0..bridge_hops.len() {
-                    let (bridge_id, _) = bridge_hops.get(bridge);
+                    let (bridge_id, bridge_origin) = bridge_hops.get(bridge);
                     if let Some(stop) = consider(
                         layer,
                         candidate.layer as usize,
                         bridge_id,
+                        Some(bridge_origin),
                         walk,
                         query,
                         allow_bridges,
@@ -4750,6 +4856,7 @@ fn consider<E, S, D, A, R, F, V>(
     layer: &mut OpenLayer<'_, '_>,
     position: usize,
     point_id: PointId,
+    edge_origin: Option<usize>,
     walk: &mut Walk<'_>,
     query: &UnionQuery<'_>,
     allow_bridges: bool,
@@ -4775,10 +4882,16 @@ where
     if walk.reached.get(&bit).is_some_and(|entry| entry.marked) {
         return Ok(Considered::Passed);
     }
-    let Some(origin) = layer.origin(point_id, before_source_entry)? else {
-        return Ok(Considered::Passed);
+    let origin = match edge_origin {
+        Some(origin) => origin,
+        None => {
+            let Some(origin) = layer.origin(point_id, before_source_entry)? else {
+                return Ok(Considered::Passed);
+            };
+            origin
+        }
     };
-    let row_id = layer.row(origin, before_source_entry)?;
+    let row_id = layer.row_at_point(origin, point_id, before_source_entry)?;
     #[cfg(feature = "test-seams")]
     if row_id.is_some_and(super::hnsw_row_unlinked_for_test) {
         return Ok(Considered::Passed);
@@ -4799,6 +4912,7 @@ where
         }
         let Some(distance) = layer.distance(
             point_id,
+            Some(origin),
             query,
             before_source_entry,
             before_distance,
@@ -5374,13 +5488,19 @@ where
             break;
         };
         let layer = &mut open[candidate.layer as usize];
-        let listed: Vec<(PointId, usize)> =
-            match layer.neighbours(candidate.point, 0, &mut *hops, acquire, before_source_entry)? {
-                Some(neighbours) => (0..neighbours.len())
-                    .map(|hop| neighbours.get(hop))
-                    .collect(),
-                None => continue,
-            };
+        let listed: Vec<(PointId, usize)> = match layer.neighbours(
+            candidate.point,
+            Some(candidate.origin),
+            0,
+            &mut *hops,
+            acquire,
+            before_source_entry,
+        )? {
+            Some(neighbours) => (0..neighbours.len())
+                .map(|hop| neighbours.get(hop))
+                .collect(),
+            None => continue,
+        };
         for (point, origin) in listed {
             let Some(bit) = layer.bit(point) else {
                 continue;
@@ -5403,6 +5523,7 @@ where
                 Some(distance) => distance,
                 None => match layer.distance(
                     point,
+                    Some(origin),
                     query,
                     before_source_entry,
                     before_distance,
