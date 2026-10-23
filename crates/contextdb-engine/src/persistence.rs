@@ -7235,6 +7235,32 @@ impl WritableRawVectorBodyScan {
         membership_authenticated: bool,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<VectorEntry> {
+        self.read_partition_body_with_owning_row_before(
+            index,
+            partition_key,
+            identity,
+            expected_dimension,
+            quantization,
+            membership_authenticated,
+            None,
+            before,
+        )
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
+    )]
+    pub(crate) fn read_partition_body_with_owning_row_before(
+        &mut self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        identity: &RawVectorDirectoryEntry,
+        expected_dimension: usize,
+        quantization: VectorQuantization,
+        membership_authenticated: bool,
+        row_evidence: Option<&vector_membership_source::AuthenticatedOwningRow>,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<VectorEntry> {
         let owner = vector_membership_source::MembershipOwner::Writable(self.source.clone());
         let historical_memory =
             vector_membership_source::historical_operation_memory(&owner, &self._transaction)?;
@@ -7258,6 +7284,7 @@ impl WritableRawVectorBodyScan {
                 expected_dimension,
                 quantization,
                 membership_authenticated,
+                row_evidence,
                 before,
             )
         };
@@ -7278,6 +7305,7 @@ impl WritableRawVectorBodyScan {
         expected_dimension: usize,
         quantization: VectorQuantization,
         membership_authenticated: bool,
+        row_evidence: Option<&vector_membership_source::AuthenticatedOwningRow>,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<VectorEntry> {
         before()?;
@@ -7469,14 +7497,25 @@ impl WritableRawVectorBodyScan {
                 memory,
                 before,
             )?;
-            vector_membership_source::authenticate_owning_row(
-                &owner,
-                &self._transaction,
-                index,
-                identity,
-                Some(entry.deleted_tx),
-                before,
-            )?;
+            if let Some(evidence) = row_evidence {
+                evidence.verify(
+                    &owner,
+                    &self._transaction,
+                    index,
+                    identity,
+                    Some(entry.deleted_tx),
+                    before,
+                )?;
+            } else {
+                vector_membership_source::authenticate_owning_row(
+                    &owner,
+                    &self._transaction,
+                    index,
+                    identity,
+                    Some(entry.deleted_tx),
+                    before,
+                )?;
+            }
         } else if !self.producer_body_root {
             // The authenticated producer-root path never uses a content
             // verifier. Keep this fallback verifier on the stack for the call,
@@ -7568,6 +7607,32 @@ impl RetainedRawVectorBodyScan {
         membership_authenticated: bool,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<VectorEntry> {
+        self.read_partition_body_with_owning_row_before(
+            index,
+            partition_key,
+            identity,
+            expected_dimension,
+            quantization,
+            membership_authenticated,
+            None,
+            before,
+        )
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics remain inline when the original budget is exhausted."
+    )]
+    pub(crate) fn read_partition_body_with_owning_row_before(
+        &mut self,
+        index: &VectorIndexRef,
+        partition_key: &VectorPartitionKey,
+        identity: &RawVectorDirectoryEntry,
+        expected_dimension: usize,
+        quantization: VectorQuantization,
+        membership_authenticated: bool,
+        row_evidence: Option<&vector_membership_source::AuthenticatedOwningRow>,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<VectorEntry> {
         let owner = vector_membership_source::MembershipOwner::Retained(self.source.clone());
         let historical_memory =
             vector_membership_source::historical_operation_memory(&owner, &self._transaction)?;
@@ -7591,6 +7656,7 @@ impl RetainedRawVectorBodyScan {
                 expected_dimension,
                 quantization,
                 membership_authenticated,
+                row_evidence,
                 before,
             )
         };
@@ -7611,6 +7677,7 @@ impl RetainedRawVectorBodyScan {
         expected_dimension: usize,
         quantization: VectorQuantization,
         membership_authenticated: bool,
+        row_evidence: Option<&vector_membership_source::AuthenticatedOwningRow>,
         before: &mut dyn FnMut() -> Result<()>,
     ) -> Result<VectorEntry> {
         before()?;
@@ -7662,14 +7729,25 @@ impl RetainedRawVectorBodyScan {
                 memory,
                 before,
             )?;
-            vector_membership_source::authenticate_owning_row(
-                &owner,
-                &self._transaction,
-                index,
-                identity,
-                Some(entry.deleted_tx),
-                before,
-            )?;
+            if let Some(evidence) = row_evidence {
+                evidence.verify(
+                    &owner,
+                    &self._transaction,
+                    index,
+                    identity,
+                    Some(entry.deleted_tx),
+                    before,
+                )?;
+            } else {
+                vector_membership_source::authenticate_owning_row(
+                    &owner,
+                    &self._transaction,
+                    index,
+                    identity,
+                    Some(entry.deleted_tx),
+                    before,
+                )?;
+            }
         } else if !self.producer_body_root {
             let mut proof = source
                 .content_proof

@@ -1204,8 +1204,104 @@ pub(super) fn authenticate_owning_row(
     body_deleted: Option<Option<TxId>>,
     before: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
+    authenticate_owning_row_with_evidence(owner, read, index, identity, body_deleted, before)
+        .map(|_| ())
+}
+
+/// Produced only after the owning row's manifest/body reconciliation at this
+/// captured operation. Every field is scalar; the retained selection's existing
+/// original invoice pays its enlarged fixed layout until physical free.
+pub(super) struct AuthenticatedOwningRow {
+    physical: redb::StorageSnapshotIdentity,
+    source: usize,
+    reader: usize,
+    snapshot: SnapshotId,
+    index: [u8; 32],
+    identity: RawVectorDirectoryEntry,
+    row_deleted: Option<TxId>,
+}
+fn evidence_source(owner: &MembershipOwner) -> usize {
+    match owner {
+        MembershipOwner::Writable(p) => Arc::as_ptr(p) as usize,
+        MembershipOwner::Retained(p) => p.identity(),
+    }
+}
+fn evidence_index(index: &VectorIndexRef) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"contextdb-private-owning-row-evidence-v1");
+    for name in [&index.table, &index.column] {
+        hash.update(&(name.len() as u64).to_be_bytes());
+        hash.update(name.as_bytes());
+    }
+    *hash.finalize().as_bytes()
+}
+impl AuthenticatedOwningRow {
+    pub(super) fn verify(
+        &self,
+        owner: &MembershipOwner,
+        read: &redb::ReadTransaction,
+        index: &VectorIndexRef,
+        identity: &RawVectorDirectoryEntry,
+        body_deleted: Option<Option<TxId>>,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        operation_checkpoint()?;
+        let context = operation_for(owner)
+            .filter(|c| c.historical)
+            .ok_or_else(|| damage("owning row evidence has no executing historical capture"))?;
+        if self.source != evidence_source(owner)
+            || self.physical != read.storage_snapshot_identity()
+            || self.physical != context.root.read.storage_snapshot_identity()
+            || self.reader != context.memory.accounting_identity()
+            || self.snapshot != context.snapshot
+            || self.index != evidence_index(index)
+            || self.identity != *identity
+        {
+            return Err(damage(
+                "owning row evidence belongs to another source, root, reader, snapshot or identity",
+            ));
+        }
+        context.root.check_scope(&index.table)?;
+        before()?;
+        verify_row_lifecycle(identity, self.row_deleted, body_deleted)?;
+        before()
+    }
+}
+struct AuthenticatedMembership {
+    record: VectorPartitionMembershipRecord,
+    row_evidence: Option<AuthenticatedOwningRow>,
+}
+fn verify_row_lifecycle(
+    identity: &RawVectorDirectoryEntry,
+    row_deleted: Option<TxId>,
+    body_deleted: Option<Option<TxId>>,
+) -> Result<()> {
+    let stamp = identity.membership;
+    if let Some(body_deleted) = body_deleted {
+        let effective = match (row_deleted, body_deleted) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if stamp.deleted_tx != effective {
+            return Err(damage(
+                "vector placement closure differs from owning row and canonical body",
+            ));
+        }
+    } else if row_deleted.is_some_and(|closed| stamp.deleted_tx.is_none_or(|end| end > closed)) {
+        return Err(damage("vector placement outlives its owning row version"));
+    }
+    Ok(())
+}
+fn authenticate_owning_row_with_evidence(
+    owner: &MembershipOwner,
+    read: &redb::ReadTransaction,
+    index: &VectorIndexRef,
+    identity: &RawVectorDirectoryEntry,
+    body_deleted: Option<Option<TxId>>,
+    before: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<AuthenticatedOwningRow>> {
     let Some(context) = operation_for(owner).filter(|context| context.historical) else {
-        return Ok(());
+        return Ok(None);
     };
     operation_checkpoint()?;
     if context.root.read.storage_snapshot_identity() != read.storage_snapshot_identity() {
@@ -1300,21 +1396,17 @@ pub(super) fn authenticate_owning_row(
     if !found {
         return Err(damage("vector membership has no authenticated owning row"));
     }
-    if let Some(body_deleted) = body_deleted {
-        let effective = match (row_deleted, body_deleted) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        if stamp.deleted_tx != effective {
-            return Err(damage(
-                "vector placement closure differs from owning row and canonical body",
-            ));
-        }
-    } else if row_deleted.is_some_and(|closed| stamp.deleted_tx.is_none_or(|end| end > closed)) {
-        return Err(damage("vector placement outlives its owning row version"));
-    }
+    verify_row_lifecycle(identity, row_deleted, body_deleted)?;
     before()?;
-    Ok(())
+    Ok(Some(AuthenticatedOwningRow {
+        physical: read.storage_snapshot_identity(),
+        source: evidence_source(owner),
+        reader: context.memory.accounting_identity(),
+        snapshot: context.snapshot,
+        index: evidence_index(index),
+        identity: identity.clone(),
+        row_deleted,
+    }))
 }
 
 #[expect(
@@ -1384,7 +1476,7 @@ pub(crate) fn select_live_fallback(
             value.value(),
             &record,
         )?;
-        authenticate_owning_row(
+        let row_evidence = authenticate_owning_row_with_evidence(
             &owner,
             &root.read,
             &record.index,
@@ -1404,6 +1496,7 @@ pub(crate) fn select_live_fallback(
                 root: root.clone(),
                 owner: owner.clone(),
                 record,
+                row_evidence,
                 _copy_owner: window,
             });
         }
@@ -1415,6 +1508,7 @@ pub(crate) struct SelectedVectorMembership {
     root: MembershipRoot,
     owner: MembershipOwner,
     record: VectorPartitionMembershipRecord,
+    row_evidence: Option<AuthenticatedOwningRow>,
     _copy_owner: contextdb_vector::VectorCopyAdmission,
 }
 
@@ -1486,25 +1580,27 @@ impl SelectedVectorMembership {
                     .map(|writer| writer.clone().into_capture());
                 source
                     .open_raw_vector_body_scan_at(&partition.index, self.root.read.clone(), pin)?
-                    .read_partition_body_before(
+                    .read_partition_body_with_owning_row_before(
                         &partition.index,
                         &partition.partition_key,
                         &identity,
                         dimension,
                         quantization,
                         true,
+                        self.row_evidence.as_ref(),
                         before,
                     )
             }
             MembershipOwner::Retained(source) => source
                 .open_raw_vector_body_scan_at(self.root.read.clone())?
-                .read_partition_body_before(
+                .read_partition_body_with_owning_row_before(
                     &partition.index,
                     &partition.partition_key,
                     &identity,
                     dimension,
                     quantization,
                     true,
+                    self.row_evidence.as_ref(),
                     before,
                 ),
         };
@@ -2212,7 +2308,7 @@ impl DurableMembershipSource {
         let mut cursor = self.cursor(Some(row))?;
         loop {
             let mut interrupted = None;
-            let next = cursor.next_record(&mut |request| match request {
+            let next = cursor.next_authenticated_record(&mut |request| match request {
                 DormantVectorLoadRequest::Reserve(bytes) => match scratch.reserve(bytes) {
                     Ok(()) => true,
                     Err(error) => {
@@ -2225,24 +2321,34 @@ impl DurableMembershipSource {
             if let Some(error) = interrupted {
                 return Err(error);
             }
-            let Some(record) = next? else {
+            let Some(AuthenticatedMembership {
+                record,
+                row_evidence,
+            }) = next?
+            else {
                 return Ok(None);
             };
             if select(&record) {
-                authenticate_owning_row(
-                    &self.owner,
-                    &cursor.root.read,
-                    &self.partition.index,
-                    &body_identity(&record),
-                    None,
-                    &mut || {
-                        if before() {
-                            Ok(())
-                        } else {
-                            Err(Error::ReadCancelled)
-                        }
-                    },
-                )?;
+                if !before() {
+                    return Err(Error::ReadCancelled);
+                }
+                if let Some(evidence) = &row_evidence {
+                    evidence.verify(
+                        &self.owner,
+                        &cursor.root.read,
+                        &self.partition.index,
+                        &body_identity(&record),
+                        None,
+                        &mut || {
+                            if before() {
+                                Ok(())
+                            } else {
+                                Err(Error::ReadCancelled)
+                            }
+                        },
+                    )?;
+                }
+
                 let mut retained = owner.scratch();
                 retained.reserve(
                     std::mem::size_of::<SelectedVectorMembership>()
@@ -2260,6 +2366,7 @@ impl DurableMembershipSource {
                     root: cursor.root,
                     owner: self.owner.clone(),
                     record,
+                    row_evidence,
                     _copy_owner: retained,
                 })));
             }
@@ -2324,7 +2431,7 @@ impl DurableMembershipSource {
                 .row_owner()?
                 .enter();
             let mut interrupted = None;
-            let next = cursor.next_record(&mut |request| match request {
+            let next = cursor.next_authenticated_record(&mut |request| match request {
                 DormantVectorLoadRequest::Reserve(bytes) => match admit(
                     &mut scratch,
                     bytes,
@@ -2343,24 +2450,34 @@ impl DurableMembershipSource {
             if let Some(error) = interrupted {
                 return Err(error);
             }
-            let Some(record) = next? else {
+            let Some(AuthenticatedMembership {
+                record,
+                row_evidence,
+            }) = next?
+            else {
                 break;
             };
             if let Some(value) = select(&record) {
-                authenticate_owning_row(
-                    &self.owner,
-                    &cursor.root.read,
-                    &self.partition.index,
-                    &body_identity(&record),
-                    None,
-                    &mut || {
-                        if before() {
-                            Ok(())
-                        } else {
-                            Err(Error::ReadCancelled)
-                        }
-                    },
-                )?;
+                if !before() {
+                    return Err(Error::ReadCancelled);
+                }
+                if let Some(evidence) = &row_evidence {
+                    evidence.verify(
+                        &self.owner,
+                        &cursor.root.read,
+                        &self.partition.index,
+                        &body_identity(&record),
+                        None,
+                        &mut || {
+                            if before() {
+                                Ok(())
+                            } else {
+                                Err(Error::ReadCancelled)
+                            }
+                        },
+                    )?;
+                }
+
                 return Ok(Some(value));
             }
         }
@@ -2483,6 +2600,14 @@ impl MembershipCursor {
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
     ) -> Result<Option<VectorPartitionMembershipRecord>> {
+        self.next_authenticated_record(request)
+            .map(|next| next.map(|next| next.record))
+    }
+
+    fn next_authenticated_record(
+        &mut self,
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<Option<AuthenticatedMembership>> {
         operation_checkpoint()?;
         self.selected_identity = None;
         let memory = historical_operation_memory(&self.owner, &self.root.read)?;
@@ -2491,7 +2616,7 @@ impl MembershipCursor {
             None => self.next_record_attempt(request),
         };
         if let Ok(Some(record)) = &result {
-            self.selected_identity = Some(body_identity(record));
+            self.selected_identity = Some(body_identity(&record.record));
         }
         if result.is_err() {
             // The failed iterator step may already have moved its leaf cursor.
@@ -2508,7 +2633,7 @@ impl MembershipCursor {
     fn next_record_attempt(
         &mut self,
         request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
-    ) -> Result<Option<VectorPartitionMembershipRecord>> {
+    ) -> Result<Option<AuthenticatedMembership>> {
         operation_checkpoint()?;
         if self.done {
             return Ok(None);
@@ -2591,7 +2716,7 @@ impl MembershipCursor {
             value.value(),
             &record,
         )?;
-        authenticate_owning_row(
+        let row_evidence = authenticate_owning_row_with_evidence(
             &self.owner,
             &self.root.read,
             &self.partition.index,
@@ -2608,7 +2733,10 @@ impl MembershipCursor {
         // The admitted metadata window includes this retained retry key.
         self.last_success = Some(key.value().to_vec());
         self.seen += 1;
-        Ok(Some(record))
+        Ok(Some(AuthenticatedMembership {
+            record,
+            row_evidence,
+        }))
     }
 }
 
