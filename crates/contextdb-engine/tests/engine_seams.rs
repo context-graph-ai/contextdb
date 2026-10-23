@@ -176,6 +176,8 @@ mod retired_custody_keys_stay_funded_until_the_write_set_drops;
 mod the_closure_memo_frees_its_entries_before_refunding_them;
 #[path = "engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs"]
 mod unpartitioned_vector_membership_pages_reload_at_constant_residency;
+#[path = "engine_seams/native_membership_parent_peak_guard.rs"]
+mod native_membership_parent_peak_guard;
 #[path = "engine_seams/version_pruning_and_compaction_resume_finite_safe_batches.rs"]
 mod version_pruning_and_compaction_resume_finite_safe_batches;
 #[cfg(target_os = "linux")]

@@ -757,10 +757,14 @@ struct NativeChildInvoice {
 }
 impl Drop for NativeChildInvoice {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-seams"))]
+        let before = self.parent.standing_control_bytes();
         self.parent
             .live_child_control_bytes
             .fetch_sub(self.bytes as u64, std::sync::atomic::Ordering::SeqCst);
         self.parent.release(self.bytes);
+        #[cfg(any(test, feature = "test-seams"))]
+        statement_child_proof::native_control_refunded(&self.parent, self.bytes, before);
     }
 }
 #[derive(Debug)]
@@ -2707,6 +2711,12 @@ pub mod statement_child_proof {
         pub children: usize,
         pub control_bytes: usize,
         pub peak: u64,
+        /// Original parent counter sampled at the same completed child peak.
+        pub peak_completed: Option<Event>,
+        /// First actual pre-existing child release during this observation.
+        pub first_sibling_release: Option<Event>,
+        /// First actual native control refund during this observation.
+        pub first_control_refund: Option<Event>,
         pub final_bytes: u64,
         pub drops: usize,
         pub refusals: usize,
@@ -2794,6 +2804,7 @@ pub mod statement_child_proof {
         pub acl_before: u64,
         pub acl_after: u64,
         pub target_parent_net: i128,
+        pub target_control_parent_net: i128,
         pub sibling_parent_net: i128,
         pub direct_parent_net: i128,
     }
@@ -2905,6 +2916,7 @@ pub mod statement_child_proof {
                     let completed_peak = held + self.context.control_bytes as u64;
                     if completed_peak > sample.peak {
                         PEAK_COMPLETED.with(|slot| slot.set(Some(record)));
+                        sample.peak_completed = Some(record);
                         sample.peak = completed_peak;
                     }
                     sample.final_bytes = held;
@@ -3089,6 +3101,9 @@ pub mod statement_child_proof {
                 record.site = self.site;
                 record.subsystem = self.subsystem;
                 record.operation = self.operation;
+                if delta < 0 && child != 0 && child != sample.identity.target_identity {
+                    sample.first_sibling_release.get_or_insert(record);
+                }
                 record.bytes = self.bytes;
                 record.child_before = self.forward.map_or(0, |forward| forward.held);
                 record.child_after = record.child_before;
@@ -3148,6 +3163,7 @@ pub mod statement_child_proof {
             ),
             acl_after: parent.live_acl_cache_bytes.load(Ordering::SeqCst),
             target_parent_net: sample.identity.target_parent_net,
+            target_control_parent_net: sample.identity.target_control_parent_net,
             sibling_parent_net: sample.identity.sibling_parent_net,
             direct_parent_net: sample.identity.direct_parent_net,
         }
@@ -3406,6 +3422,23 @@ pub mod statement_child_proof {
                 }
                 slot.set(Some(sample));
             }
+        });
+    }
+    pub(super) fn native_control_refunded(
+        parent: &DeclaredReadMemory,
+        bytes: usize,
+        (controls_before, parent_before): (u64, u64),
+    ) {
+        update(parent, |sample| {
+            let mut record = event(parent, sample, None, 0, "ControlRefund", "physical-free");
+            record.site = "NativeChildInvoice::drop";
+            record.subsystem = "reader";
+            record.operation = "native_control_refund";
+            record.bytes = bytes;
+            record.child_control_bytes = bytes;
+            record.live_controls_before = controls_before;
+            record.parent_before = parent_before;
+            sample.first_control_refund.get_or_insert(record);
         });
     }
     pub(super) fn native_dropped(child: &NativeDeclaredChild, identity: usize) {
