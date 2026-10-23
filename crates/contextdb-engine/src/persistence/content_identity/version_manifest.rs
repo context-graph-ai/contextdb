@@ -996,6 +996,7 @@ pub(in super::super) struct BorrowedRowHeader {
     pub(in super::super) created_tx: TxId,
     pub(in super::super) deleted_tx: Option<TxId>,
     pub(in super::super) lsn: Lsn,
+    pub(in super::super) requires_owned_validation: bool,
 }
 impl BorrowedRowHeader {
     pub(in super::super) fn visible_at(&self, snapshot: SnapshotId) -> bool {
@@ -1015,6 +1016,7 @@ pub(in super::super) fn manifested_row_header(
     meta: &TableMeta,
     expected: &[u8],
     before_schema: &mut dyn FnMut(BorrowedRowHeader) -> Result<()>,
+    visible_from: SnapshotId,
 ) -> Result<(Vec<u8>, BorrowedRowHeader)> {
     manifested_row_body(
         table,
@@ -1022,7 +1024,7 @@ pub(in super::super) fn manifested_row_header(
         body,
         admission,
         checkpoint,
-        Some((meta, expected, before_schema)),
+        Some((meta, expected, before_schema, visible_from)),
     )
 }
 #[expect(
@@ -1039,6 +1041,7 @@ fn manifested_row_body(
         &TableMeta,
         &[u8],
         &mut dyn FnMut(BorrowedRowHeader) -> Result<()>,
+        SnapshotId,
     )>,
 ) -> Result<(Vec<u8>, BorrowedRowHeader)> {
     checkpoint()?;
@@ -1213,21 +1216,41 @@ fn manifested_row_body(
         coordinate.push(u8::from(deleted.is_some()));
         coordinate.extend_from_slice(&deleted.unwrap_or(0).to_be_bytes());
         coordinate.extend_from_slice(&digest);
-        let header = BorrowedRowHeader {
+        let mut header = BorrowedRowHeader {
             row_id: RowId(row_id),
             created_tx: TxId(created),
             deleted_tx: deleted.map(TxId),
             lsn: Lsn(lsn),
+            requires_owned_validation: false,
         };
-        if let Some((meta, expected, before_schema)) = schema {
+        if let Some((meta, expected, before_schema, visible_from)) = schema {
             // Root/body equality precedes schema validation, as in the owned
             // reader. The caller retains its independent equality check too.
             if coordinate.as_slice() != expected {
-                return Err(corrupt_body(
-                    "persisted row body or closure does not authenticate",
-                ));
+                // Preserve the caller's original verifier-owned corruption.
+                return Ok((coordinate, header));
             }
             before_schema(header)?;
+            // The owned path authenticated and checked version bounds for all
+            // versions, but decoded/shape-validated only this visible prefix.
+            if header.created_tx.0 > visible_from.0 {
+                return Ok((coordinate, header));
+            }
+            for span in &spans {
+                let mut no_extra_source_event = || Ok(());
+                let mut value = Encoded {
+                    bytes: body,
+                    position: span.value,
+                    checkpoint: &mut no_extra_source_event,
+                };
+                if value.integer()? == 0 && value.integer()? == 7 {
+                    // Encoded checks JSON UTF-8; the existing owned decoder
+                    // additionally checks JSON syntax. Use that decoder for
+                    // this row, under its original selected-row image scope.
+                    header.requires_owned_validation = true;
+                    return Ok((coordinate, header));
+                }
+            }
             crate::persistence::validate_read_row_id(table, header.row_id)
                 .map_err(|error| crate::persistence::read_row_shape_error(table, error))?;
             for span in &spans {

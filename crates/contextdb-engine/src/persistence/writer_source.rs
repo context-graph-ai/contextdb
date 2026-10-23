@@ -4912,8 +4912,14 @@ impl WriterSnapshotHandle {
             proof,
             true,
             before,
-            &mut |_meta, _bytes, header| {
-                header.ok_or_else(|| Error::Other("authenticated row header is absent".into()))
+            &mut |meta, bytes, header| {
+                let header = header.ok_or_else(|| Error::Other("authenticated row header is absent".into()))?;
+                if header.requires_owned_validation {
+                    // This is the same decoder, schema validation and genuine
+                    // selected-row image owner as the original full-row path.
+                    drop(RedbPersistence::decode_relational_source_row(table, meta, bytes)?);
+                }
+                Ok(header)
             },
             &mut |row: &content_identity::version_manifest::BorrowedRowHeader, snapshot| {
                 row.visible_at(snapshot)
@@ -5105,6 +5111,7 @@ impl WriterSnapshotHandle {
                                         }
                                     })
                                 },
+                                snapshot,
                             )
                             .map(|(coordinate, header)| (coordinate, Some(header)))
                         } else {
