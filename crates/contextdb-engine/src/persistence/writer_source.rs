@@ -41,6 +41,31 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 pub(crate) struct WriterSnapshotHandle(contextdb_tx::native_capture::CaptureHandle);
 #[derive(Clone, Default)]
 pub(crate) struct WriterSnapshotWeak(contextdb_tx::native_capture::CaptureWeak);
+pub(crate) struct HistoricalRowProof {
+    verifier: content_identity::ContentIdentityReadVerifier,
+    read: Arc<redb::ReadTransaction>,
+    root: WriterSnapshotHandle,
+    table: Box<str>,
+    operation_snapshot: SnapshotId,
+    reader: usize,
+    _image: ImageMemory,
+    _controls: SourceWindowCredit,
+}
+impl HistoricalRowProof {
+    pub(crate) fn matches(
+        &self,
+        root: &WriterSnapshotHandle,
+        table: &str,
+        operation_snapshot: SnapshotId,
+        memory: &contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> bool {
+        self.root.ptr_eq(root)
+            && self.table.as_ref() == table
+            && self.operation_snapshot == operation_snapshot
+            && self.reader == memory.accounting_identity()
+    }
+}
+
 impl WriterSnapshotHandle {
     #[expect(
         clippy::result_large_err,
@@ -4686,22 +4711,40 @@ impl WriterSnapshotHandle {
         visit: &mut dyn FnMut(WriterWindow<VersionedRow>) -> Result<()>,
     ) -> Result<()> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let proof = self.open_historical_row_proof(table, snapshot, read_memory.clone(), before)?;
+        self.visit_historical_rows_with_proof(
+            table,
+            row_id,
+            snapshot,
+            snapshot,
+            read_memory,
+            &proof,
+            before,
+            visit,
+        )
+    }
 
-        use super::content_identity::version_manifest as manifest;
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics remain inline under exhausted budgets."
+    )]
+    pub(crate) fn open_historical_row_proof(
+        &self,
+        table: &str,
+        operation_snapshot: SnapshotId,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        before: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<HistoricalRowProof> {
         self.check_table_scope(table)?;
         let owner = SourceWindowOwner::Read(read_memory.clone());
         let image = owner.image(self, "historical_row_range");
-        let _controls = owner.reserve(
+        let controls = owner.reserve(
             std::mem::size_of::<content_identity::ContentIdentityReadVerifier>()
-                .checked_add(std::mem::size_of::<Option<WriterWindow<VersionedRow>>>())
-                .and_then(|n| n.checked_add(std::mem::size_of::<ReadHistoryProofOwner>()))
-                .and_then(|n| n.checked_add(2 * table.len() + 144))
+                .checked_add(2 * table.len() + 144)
                 .ok_or_else(|| Error::Other("historical row controls overflow".into()))?,
             "historical_row_controls",
         )?;
-        #[cfg(any(test, feature = "test-seams"))]
-        crate::read_work_probe::note_owning_row_controls_admitted();
-        graph_read::with_pages(read_memory.clone(), || {
+        let (read, verifier, name) = graph_read::with_pages(read_memory.clone(), || {
             image.scope(|| {
                 before()?;
                 let read = self.owner_read()?;
@@ -4715,8 +4758,69 @@ impl WriterSnapshotHandle {
                     Path::new(table),
                     None,
                 )?;
+                let name = Box::<str>::from(table);
                 #[cfg(any(test, feature = "test-seams"))]
                 crate::read_work_probe::note_owning_row_proof_setup();
+                Ok((read, verifier, name))
+            })
+        })?;
+        Ok(HistoricalRowProof {
+            verifier,
+            read,
+            root: self.clone(),
+            table: name,
+            operation_snapshot,
+            reader: read_memory.accounting_identity(),
+            _image: image,
+            _controls: controls,
+        })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Native refusal diagnostics remain inline under exhausted budgets."
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn visit_historical_rows_with_proof(
+        &self,
+        table: &str,
+        row_id: Option<RowId>,
+        snapshot: SnapshotId,
+        operation_snapshot: SnapshotId,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+        proof: &HistoricalRowProof,
+        before: &mut dyn FnMut() -> Result<()>,
+        visit: &mut dyn FnMut(WriterWindow<VersionedRow>) -> Result<()>,
+    ) -> Result<()> {
+        if !proof.matches(self, table, operation_snapshot, &read_memory)
+            || proof.read.storage_snapshot_identity()
+                != self.owner_read()?.storage_snapshot_identity()
+        {
+            return Err(Error::StoreCorrupted {
+                path: table.into(),
+                reason: "historical row proof escaped its captured root, table, reader or snapshot"
+                    .into(),
+            });
+        }
+
+        use super::content_identity::version_manifest as manifest;
+        self.check_table_scope(table)?;
+        let owner = SourceWindowOwner::Read(read_memory.clone());
+        let image = owner.image(self, "historical_row_range");
+        let _controls = owner.reserve(
+            std::mem::size_of::<Option<WriterWindow<VersionedRow>>>()
+                .checked_add(std::mem::size_of::<ReadHistoryProofOwner>())
+                .ok_or_else(|| Error::Other("historical row controls overflow".into()))?,
+            "historical_row_controls",
+        )?;
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::read_work_probe::note_owning_row_controls_admitted();
+        graph_read::with_pages(read_memory.clone(), || {
+            image.scope(|| {
+                before()?;
+                let read = &proof.read;
+                let verifier = &proof.verifier;
+                before()?;
                 let meta = self
                     .borrow_captured_table_meta(table)
                     .ok_or_else(|| Error::TableNotFound(table.into()))?;

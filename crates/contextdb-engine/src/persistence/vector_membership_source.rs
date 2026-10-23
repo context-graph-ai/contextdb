@@ -292,6 +292,9 @@ pub(crate) struct VectorReadOperation {
     historical: bool,
     checkpoint: Option<crate::executor::bounded::VectorReadCheckpoint>,
     memory: contextdb_core::read_memory::ReadMemoryOwner,
+    // One fixed setup slot belongs only to this captured root/source/reader.
+    // Switching tables drops the old slot; no population-sized memo is kept.
+    historical_rows: parking_lot::Mutex<Option<writer_source::HistoricalRowProof>>,
     // Preflight and resumed loaders draw on the same existing scan allowance.
     scan_allowance: redb::ScanAllowance,
 }
@@ -515,6 +518,7 @@ pub(crate) fn enter_read_operation(
     // free, including unwind. The request already owns its inline capture slot.
     let context = VectorReadCapture::try_from_prepaid(
         VectorReadOperation {
+            historical_rows: parking_lot::Mutex::new(None),
             owner,
             root,
             snapshot,
@@ -1334,26 +1338,43 @@ fn authenticate_owning_row_with_evidence(
     let mut row_deleted = None;
     let mut found = false;
     match &context.root.writer {
-        Some(root) => root.visit_historical_rows(
-            &index.table,
-            Some(identity.row_id),
-            SnapshotId(stamp.visible_from.0),
-            context.memory.clone(),
-            before,
-            &mut |window| {
-                if window.value.created_tx != stamp.owning_row_tx
-                    || window.value.lsn != stamp.row_lsn
-                {
-                    return Err(damage("vector membership names another owning row version"));
-                }
-                if found {
-                    return Err(damage("vector placement has duplicate owning row versions"));
-                }
-                row_deleted = window.value.deleted_tx;
-                found = true;
-                Ok(())
-            },
-        )?,
+        Some(root) => {
+            let mut fixed = context.historical_rows.lock();
+            if !fixed.as_ref().is_some_and(|proof| {
+                proof.matches(root, &index.table, context.snapshot, &context.memory)
+            }) {
+                // Release all old fixed storage before admitting its successor.
+                *fixed = None;
+                *fixed = Some(root.open_historical_row_proof(
+                    &index.table,
+                    context.snapshot,
+                    context.memory.clone(),
+                    before,
+                )?);
+            }
+            root.visit_historical_rows_with_proof(
+                &index.table,
+                Some(identity.row_id),
+                SnapshotId(stamp.visible_from.0),
+                context.snapshot,
+                context.memory.clone(),
+                fixed.as_ref().expect("created same-capture fixed proof"),
+                before,
+                &mut |window| {
+                    if window.value.created_tx != stamp.owning_row_tx
+                        || window.value.lsn != stamp.row_lsn
+                    {
+                        return Err(damage("vector membership names another owning row version"));
+                    }
+                    if found {
+                        return Err(damage("vector placement has duplicate owning row versions"));
+                    }
+                    row_deleted = window.value.deleted_tx;
+                    found = true;
+                    Ok(())
+                },
+            )?;
+        }
         None => {
             let MembershipOwner::Retained(source) = owner else {
                 return Err(damage("historical vector proof has no captured owner"));
