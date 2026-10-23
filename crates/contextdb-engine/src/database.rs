@@ -46315,6 +46315,8 @@ impl Database {
             working_graph,
             working_vectors.clone(),
         )?;
+        // An unpublished schema image never owns a maintenance schedule.
+        working.maintenance_caller_driven.store(true, Ordering::SeqCst);
         if paged_rows {
             working
                 .relational_store
@@ -79321,6 +79323,8 @@ impl Database {
 
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_maintenance_worker_start();
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::read_probe::note_thread_maintenance_worker_start();
         #[cfg(any(test, feature = "test-seams"))]
         crate::read_probe::note_background_worker_start();
         let handle = thread::spawn(move || {

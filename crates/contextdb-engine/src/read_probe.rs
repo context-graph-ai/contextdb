@@ -224,3 +224,18 @@ pub(crate) fn owner_route_source_counter(
         .as_ref()
         .and_then(|published| published.get(&address).cloned())
 }
+
+thread_local! {
+    static THREAD_MAINTENANCE_STARTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+pub(crate) fn note_thread_maintenance_worker_start() {
+    let _ = THREAD_MAINTENANCE_STARTS.try_with(|count| count.set(count.get() + 1));
+}
+#[cfg(test)]
+pub(crate) fn reset_thread_maintenance_worker_starts() {
+    THREAD_MAINTENANCE_STARTS.with(|count| count.set(0));
+}
+#[cfg(test)]
+pub(crate) fn thread_maintenance_worker_starts() -> u64 {
+    THREAD_MAINTENANCE_STARTS.with(std::cell::Cell::get)
+}

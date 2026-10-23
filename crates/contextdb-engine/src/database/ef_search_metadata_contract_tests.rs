@@ -660,7 +660,7 @@ fn topology_radius_structural_and_transactional_alters_keep_general_semantics() 
             "group DEFAULT clearing topology is not EF-only"
         );
         let before = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
-        crate::read_probe::reset();
+        crate::read_probe::reset_thread_maintenance_worker_starts();
         let tx = db.begin().unwrap();
         db.execute_in_tx(
             tx,
@@ -676,13 +676,13 @@ fn topology_radius_structural_and_transactional_alters_keep_general_semantics() 
         assert_eq!(authored_rows(&db), authored);
         assert_eq!(visible(&db), rows);
         assert_eq!(
-            crate::read_probe::observed().maintenance_worker_starts,
+            crate::read_probe::thread_maintenance_worker_starts(),
             0,
             "private staging starts no maintenance worker"
         );
         db.rollback(tx).unwrap();
         assert_eq!(
-            crate::read_probe::observed().maintenance_worker_starts,
+            crate::read_probe::thread_maintenance_worker_starts(),
             0,
             "rollback starts no maintenance worker"
         );
@@ -698,13 +698,13 @@ fn topology_radius_structural_and_transactional_alters_keep_general_semantics() 
         )
         .unwrap();
         assert_eq!(
-            crate::read_probe::observed().maintenance_worker_starts,
+            crate::read_probe::thread_maintenance_worker_starts(),
             0,
             "private staging starts no maintenance worker"
         );
         db.commit(tx).unwrap();
         assert_eq!(
-            crate::read_probe::observed().maintenance_worker_starts,
+            crate::read_probe::thread_maintenance_worker_starts(),
             0,
             "commit starts no maintenance worker"
         );
@@ -933,6 +933,222 @@ async fn authenticated_pull_preserves_the_same_authored_history_through_ef_searc
         );
         assert_eq!(reopened.execute("SELECT id, bucket, embedding, compressed, marker FROM breadth_rows ORDER BY id", &empty()).unwrap().rows(), expected_rows);
         reopened.close().unwrap();
+        source.close().unwrap();
+    }
+}
+
+#[test]
+fn received_private_vector_and_history_images_start_no_worker_on_prepare_rollback_or_commit() {
+    for file in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Database::open_memory();
+        source.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        run(
+            &source,
+            "CREATE TABLE received_rows (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED) SYNC TWO WAY SYNC CONFLICT KEEP LATEST HISTORY CURRENT ONLY",
+        );
+        run(
+            &source,
+            "INSERT INTO received_rows VALUES (1, [1.0, 2.0, 3.0])",
+        );
+        // Real authored extraction, handed to the same prepare/registration/
+        // commit path as apply_changes. No fabricated received image.
+        let changes = source.changes_since(Lsn(0)).unwrap();
+        assert!(!changes.ddl.is_empty() && !changes.rows.is_empty());
+        let db = if file {
+            Database::open(dir.path().join("received.db")).unwrap()
+        } else {
+            Database::open_memory()
+        };
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        crate::read_probe::reset_thread_maintenance_worker_starts();
+        let before = db.current_lsn();
+        for rollback in [true, false] {
+            let reached_prepare = Cell::new(false);
+            let reader = db.declared_reader_memory().unwrap();
+            let mut vector_copy = contextdb_engine::vector_read_memory::admission(reader.clone());
+            let result = db.commit_received_schema_stage(
+                &changes,
+                None,
+                &[],
+                &HashMap::new(),
+                SyncAdoption::Continuing,
+                SyncApplyRole::PullLeg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                Some(&ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
+                |_| Ok(None),
+                || {
+                    reached_prepare.set(true);
+                    assert_eq!(
+                        crate::read_probe::thread_maintenance_worker_starts(),
+                        0,
+                        "received private preparation starts no maintenance worker"
+                    );
+                    assert!(
+                        db.table_meta("received_rows").is_none(),
+                        "prepare stays private"
+                    );
+                    if rollback {
+                        Err(Error::Other(
+                            "exercise received rollback after preparation".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut vector_copy,
+                reader,
+            );
+            assert!(
+                reached_prepare.get(),
+                "actual received stage was registered"
+            );
+            assert_eq!(crate::read_probe::thread_maintenance_worker_starts(), 0);
+            if rollback {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("exercise received rollback after preparation")
+                );
+                assert!(db.table_meta("received_rows").is_none());
+                assert_eq!(db.current_lsn(), before);
+                assert!(db.ddl_log_since(Lsn(0)).unwrap().is_empty());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    canonical(&db.table_meta("received_rows").unwrap()),
+                    canonical(&source.table_meta("received_rows").unwrap())
+                );
+                assert_eq!(
+                    db.execute("SELECT id, embedding FROM received_rows", &empty())
+                        .unwrap()
+                        .rows(),
+                    vec![vec![Value::Int64(1), Value::Vector(vec![1.0, 2.0, 3.0])]]
+                );
+                assert_eq!(db.ddl_log_since(Lsn(0)).unwrap().len(), changes.ddl.len());
+            }
+        }
+        db.close().unwrap();
+        source.close().unwrap();
+    }
+}
+
+#[test]
+fn maintenance_start_probe_counts_only_the_calling_thread() {
+    crate::read_probe::reset_thread_maintenance_worker_starts();
+    std::thread::spawn(|| {
+        let db = Database::open_memory();
+        // Real engine-owned registration starts a real worker on this thread.
+        run(&db, "CREATE TABLE probe_rows (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED)");
+        assert!(crate::read_probe::thread_maintenance_worker_starts() > 0);
+        db.close().unwrap();
+    }).join().unwrap();
+    assert_eq!(crate::read_probe::thread_maintenance_worker_starts(), 0);
+}
+
+#[test]
+fn received_history_policy_alter_starts_no_worker_and_preserves_rows_on_rollback() {
+    for file in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Database::open_memory();
+        source.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        run(
+            &source,
+            "CREATE TABLE policy_rows (id INTEGER PRIMARY KEY, body TEXT) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+        );
+        run(&source, "INSERT INTO policy_rows VALUES (1, 'authored')");
+        let db = if file {
+            Database::open(dir.path().join("policy.db")).unwrap()
+        } else {
+            Database::open_memory()
+        };
+        db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        db.apply_changes(
+            source.changes_since(Lsn(0)).unwrap(),
+            &ConflictPolicies::uniform(ConflictPolicy::LatestWins),
+        )
+        .unwrap();
+        let source_before = source.current_lsn();
+        run(&source, "ALTER TABLE policy_rows SET HISTORY CURRENT ONLY");
+        let changes = source.changes_since(source_before).unwrap();
+        assert_eq!(changes.ddl.len(), 1);
+        assert!(changes.rows.is_empty());
+        let before = canonical(&db.table_meta("policy_rows").unwrap());
+        let history = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
+        let rows = db
+            .execute("SELECT id, body FROM policy_rows", &empty())
+            .unwrap()
+            .rows()
+            .to_vec();
+        crate::read_probe::reset_thread_maintenance_worker_starts();
+        for rollback in [true, false] {
+            let prepared = Cell::new(false);
+            let reader = db.declared_reader_memory().unwrap();
+            let mut vector_copy = contextdb_engine::vector_read_memory::admission(reader.clone());
+            let result = db.commit_received_schema_stage(
+                &changes,
+                None,
+                &[],
+                &HashMap::new(),
+                SyncAdoption::Continuing,
+                SyncApplyRole::PullLeg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                Some(&ConflictPolicies::uniform(ConflictPolicy::LatestWins)),
+                |_| Ok(None),
+                || {
+                    prepared.set(true);
+                    assert_eq!(crate::read_probe::thread_maintenance_worker_starts(), 0);
+                    assert_eq!(canonical(&db.table_meta("policy_rows").unwrap()), before);
+                    if rollback {
+                        Err(Error::Other("exercise received history rollback".into()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut vector_copy,
+                reader,
+            );
+            assert!(prepared.get());
+            assert_eq!(crate::read_probe::thread_maintenance_worker_starts(), 0);
+            assert_eq!(
+                db.execute("SELECT id, body FROM policy_rows", &empty())
+                    .unwrap()
+                    .rows(),
+                rows
+            );
+            if rollback {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exercise received history rollback")
+                );
+                assert_eq!(canonical(&db.table_meta("policy_rows").unwrap()), before);
+                assert_eq!(canonical(&db.ddl_log_since(Lsn(0)).unwrap()), history);
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    canonical(&db.table_meta("policy_rows").unwrap()),
+                    canonical(&source.table_meta("policy_rows").unwrap())
+                );
+                assert_eq!(
+                    db.ddl_log_since(Lsn(0)).unwrap().len(),
+                    history.as_array().unwrap().len() + 1
+                );
+            }
+        }
+        db.close().unwrap();
         source.close().unwrap();
     }
 }
