@@ -257,18 +257,34 @@ fn historical_receipt_preserves_old_and_current_indexed_answers_across_overwrite
 #[test]
 #[serial_test::serial]
 fn historical_count_rejects_authenticated_malformed_json() {
+    authenticated_json_count_fixture(true, false);
+}
+#[test]
+#[serial_test::serial]
+fn historical_count_valid_json_uses_existing_decoder() {
+    authenticated_json_count_fixture(false, false);
+}
+#[test]
+#[serial_test::serial]
+fn historical_count_skips_future_authenticated_malformed_json() {
+    authenticated_json_count_fixture(true, true);
+}
+fn authenticated_json_count_fixture(malformed: bool, future: bool) {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_with_options(dir.path().join("json-count.redb"), DatabaseOpenOptions {
         maintenance_policy: MaintenancePolicy::CallerDriven, ..Default::default()
     }).unwrap();
     db.execute("CREATE TABLE count_json (id INTEGER PRIMARY KEY, doc JSON, v VECTOR(4)) HISTORY ALL", &HashMap::new()).unwrap();
+    let before_insert = db.snapshot();
     db.execute("INSERT INTO count_json VALUES (1,$doc,$v)", &HashMap::from([
         ("doc".into(), Value::Json(serde_json::json!({}))),
         ("v".into(), Value::Vector(vec![1.0,0.0,0.0,0.0])),
     ])).unwrap();
-    let snapshot = db.snapshot();
-    db.persistence.as_ref().unwrap().malformed_count_json_for_test(db.accountant.clone(), "count_json").unwrap();
+    let snapshot = if future { before_insert } else { db.snapshot() };
+    if malformed {
+        db.persistence.as_ref().unwrap().malformed_count_json_for_test(db.accountant.clone(), "count_json").unwrap();
+    }
     db.execute("CREATE TABLE count_json_marker (id INTEGER PRIMARY KEY)", &HashMap::new()).unwrap();
     db.execute("INSERT INTO count_json_marker VALUES (1)", &HashMap::new()).unwrap();
     crate::executor::bounded::with_native_read_memory(db.ordinary_read_child().unwrap(), |memory| {
@@ -286,9 +302,17 @@ fn historical_count_rejects_authenticated_malformed_json() {
                 db.accountant.clone(), &mut workspace, copies.scratch()).unwrap();
             let work = crate::read_work_probe::ReadWorkObservationScope::enter(crate::read_work_probe::ReadWorkPhase::Query);
             let result = source.visible_count(snapshot, &mut || true, &mut copies);
-            assert!(matches!(result, Err(Error::StoreCorrupted { .. })),
-                "the actual historical count must preserve the original JSON decode rejection: {result:?}");
-            assert_eq!(work.counters().decoded_rows, 1, "malformed JSON goes through the existing full decoder");
+            if future {
+                assert_eq!(result.unwrap(), 0, "an authenticated future version is not decoded or shape-validated");
+                assert_eq!(work.counters().decoded_rows, 0);
+            } else if malformed {
+                assert!(matches!(result, Err(Error::StoreCorrupted { .. })),
+                    "the actual historical count must preserve the original JSON decode rejection: {result:?}");
+                assert_eq!(work.counters().decoded_rows, 1, "malformed JSON goes through the existing full decoder");
+            } else {
+                assert_eq!(result.unwrap(), 1);
+                assert_eq!(work.counters().decoded_rows, 1, "valid JSON uses the same original full decoder");
+            }
             Ok(())
         })
     }).unwrap();
