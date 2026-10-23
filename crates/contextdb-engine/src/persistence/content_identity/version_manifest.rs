@@ -4,7 +4,7 @@ use super::*;
 #[cfg(test)]
 #[path = "version_manifest_seek_tests.rs"]
 mod seek_tests;
-use contextdb_core::IndexDecl;
+use contextdb_core::{IndexDecl, SnapshotId};
 
 const FORMAT: u8 = 1;
 const FIXED_KEY_BYTES: usize = 72;
