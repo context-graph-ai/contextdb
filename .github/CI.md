@@ -21,10 +21,11 @@ exact inner payloads, and successful bundle matrix result. Each constituent
 disables automatic job-ID suffixing and carries the historical `-test` suffix in
 its per-row cache key, preserving each old cache namespace; feature sets and
 target directories stay unchanged. The cache action uses its baseline behavior for failed jobs.
-The compile roots form `lint` → `build` → `cross-compile`; `features` also needs only `lint`
+The compile roots form `lint` → `build`; `features` also needs only `lint`
 and runs as a sibling of `build`. Each successor runs after predecessor failure unless the
-workflow is cancelled, so the aggregate records every root error. `installed-smoke` and
-`lint-macos` remain independent roots.
+workflow is cancelled, so the aggregate records every root error. `installed-smoke`,
+`lint-macos` and `cross-compile` (which consumes none of `build`'s outputs and has its own
+cache) remain independent roots, so the aarch64 build is never queued behind `build`.
 Setup savings are a forecast; hosted whole-gate timing remains unproven.
 
 > Normal correctness blocks merge; original scale/corpus qualification
@@ -399,7 +400,8 @@ rule.
 - The installed smoke needs Bash and GNU `timeout` (`gtimeout` via
   `brew install coreutils` on macOS).
 - Cross builds need the target via `rustup target add` and, for aarch64 Linux,
-  `gcc-aarch64-linux-gnu`.
+  `gcc-aarch64-linux-gnu` locally; hosted CI uses no apt: `scripts/ci-install-zig-aarch64.sh`
+  downloads a version-pinned zig, verifies its SHA-256, and uses it as the aarch64 `cc`/`ar`/linker.
 - Disk: the full suite builds the workspace and the redb fork into separate
   target directories (`target/` and `target/redb/`); hosted Linux jobs free
   preinstalled tooling first with [`ci-free-disk.sh`](../scripts/ci-free-disk.sh).

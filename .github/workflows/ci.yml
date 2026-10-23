@@ -430,8 +430,6 @@ jobs:
         run: bash scripts/verify pr installed
 
   cross-compile:
-    needs: build
-    if: always() && !cancelled()
     strategy:
       matrix:
         include:
@@ -454,10 +452,7 @@ jobs:
           key: cross-${{ matrix.target }}-debug0-jobs2
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+        run: bash scripts/ci-install-zig-aarch64.sh "$RUNNER_TEMP/zig-aarch64"
       - run: bash scripts/verify pr cross
         env:
           CI_TARGET: ${{ matrix.target }}

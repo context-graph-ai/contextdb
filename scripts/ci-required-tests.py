@@ -162,8 +162,9 @@ class RequiredControls(unittest.TestCase):
         self.assertNotIn('needs', doc['lint-macos'])
         self.assertEqual(doc['lint-macos']['runs-on'], 'macos-latest')
         self.assertEqual(doc['lint-macos']['steps'][-1]['run'], 'bash scripts/verify pr lint')
-        for name, predecessor in [('features', 'lint'), ('build', 'lint'),
-                                  ('cross-compile', 'build')]:
+        self.assertNotIn('needs', doc['cross-compile'])
+        self.assertNotIn('if', doc['cross-compile'])
+        for name, predecessor in [('features', 'lint'), ('build', 'lint')]:
             self.assertEqual(doc[name]['needs'], predecessor)
             self.assertEqual(doc[name]['if'], 'always() && !cancelled()')
         for name, result in [('features', 'failure'), ('build', 'cancelled'),
