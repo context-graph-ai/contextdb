@@ -1801,7 +1801,10 @@ fn actual_direct_file_public_readers_keep_original_invoices_through_physical_fre
                 "must be the actual committed direct-file route"
             );
             session
-                .with_direct_file_physical_context_for_test(|db, parent| {
+                .with_direct_file_physical_context_for_test(|db, parent, image_payer| {
+                    eprintln!(
+                        "actual_direct_image_original_payer route={route} payer={image_payer:?}"
+                    );
                     db.clear_last_vector_search_trace();
                     let capture = Observation::begin_parent(parent);
                     update(|c| c.allow_constructor_prefix = true);
@@ -1833,6 +1836,10 @@ fn actual_direct_file_public_readers_keep_original_invoices_through_physical_fre
             let target = reader.execution_target();
             let db = target.resident_history_database_for_test().unwrap();
             let parent = reader.original_parent_for_physical_test();
+            eprintln!(
+                "actual_direct_image_original_payer route={route} payer={:?}",
+                reader.original_image_payer_for_physical_test()
+            );
             db.clear_last_vector_search_trace();
             let capture = Observation::begin_parent(parent);
             update(|c| c.allow_constructor_prefix = true);

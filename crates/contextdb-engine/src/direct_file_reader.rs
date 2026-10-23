@@ -1391,6 +1391,14 @@ impl DirectFileReader {
     }
 
     #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn original_image_payer_for_physical_test(&self) -> Option<usize> {
+        self.image_memory
+            .accountant
+            .original_reader_for_observation()
+            .map(|owner| owner.accounting_identity())
+    }
+
+    #[cfg(all(test, feature = "test-seams"))]
     pub(crate) fn original_parent_for_physical_test(
         &self,
     ) -> &crate::vector_read_memory::DeclaredReadRoot {

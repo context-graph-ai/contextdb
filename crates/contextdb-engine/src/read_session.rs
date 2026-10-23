@@ -6570,7 +6570,11 @@ impl ReadSession {
     #[cfg(all(test, feature = "test-seams"))]
     pub(crate) fn with_direct_file_physical_context_for_test<T>(
         &self,
-        action: impl FnOnce(&Database, &crate::vector_read_memory::DeclaredReadRoot) -> Result<T>,
+        action: impl FnOnce(
+            &Database,
+            &crate::vector_read_memory::DeclaredReadRoot,
+            Option<usize>,
+        ) -> Result<T>,
     ) -> Result<T> {
         let ReadSessionState::DirectFile(reader) = self.state.as_ref() else {
             return Err(Error::PlanError(
@@ -6581,6 +6585,7 @@ impl ReadSession {
         action(
             target.resident_history_database_for_test()?,
             reader.original_parent_for_physical_test(),
+            reader.original_image_payer_for_physical_test(),
         )
     }
 
