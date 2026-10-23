@@ -141,11 +141,14 @@ pub fn isolated_test(module: &str, name: &str, flag: &str) -> bool {
     if std::env::var_os(flag).is_some() {
         return false;
     }
+    // Keep libtest's timeout reporter outside the allocator observation window.
+    // The selected test still runs with the same external timeout and all hooks.
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             &crate::child_test_filter(module, name),
             "--nocapture",
+            "--test-threads=1",
         ])
         .env(flag, "1")
         .output()
