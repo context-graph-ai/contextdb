@@ -13696,53 +13696,86 @@ fn decode_read_relational_table_with_bounds(
     Ok(rows)
 }
 
+#[derive(Clone, Copy)]
+enum ReadCellShape {
+    Null,
+    Vector(usize),
+    Other,
+}
 #[expect(
     clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    reason = "Read-image corruption diagnostics retain their original inline form."
+)]
+fn validate_read_row_id(table: &str, row: RowId) -> std::result::Result<(), LoadReadImageError> {
+    if i64::try_from(row.0).is_err() {
+        return Err(invalid_read_image_state(format!(
+            "row {} in table {table} is outside the relational identifier range",
+            row.0
+        )));
+    }
+    Ok(())
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Read-image corruption diagnostics retain their original inline form."
+)]
+fn validate_read_cell_shape(
+    table: &str,
+    row: RowId,
+    column: &str,
+    shape: ReadCellShape,
+    meta: &TableMeta,
+) -> std::result::Result<(), LoadReadImageError> {
+    let Some(definition) = meta
+        .columns
+        .iter()
+        .find(|definition| definition.name == column)
+    else {
+        return Err(direct_read_requires_writer(format!(
+            "row {} in table {table} carries unknown column {column}",
+            row.0
+        )));
+    };
+    if let ColumnType::Vector(dimension) = definition.column_type {
+        let absent_embedding_is_legal =
+            definition.nullable || !matches!(definition.quantization, VectorQuantization::F32);
+        match shape {
+            ReadCellShape::Vector(length) if length == dimension => {}
+            ReadCellShape::Null if absent_embedding_is_legal => {}
+            _ => {
+                return Err(direct_read_requires_writer(format!(
+                    "row {} in table {table} carries an invalid vector value for {column}",
+                    row.0
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+fn read_row_shape_error(table: &str, error: LoadReadImageError) -> Error {
+    crate::funded_error::corruption_display(
+        crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),
+        table,
+        error,
+    )
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Read-image corruption diagnostics retain their original inline form."
 )]
 fn validate_read_row(
     table: &str,
     row: &VersionedRow,
     meta: &TableMeta,
 ) -> std::result::Result<(), LoadReadImageError> {
-    if i64::try_from(row.row_id.0).is_err() {
-        return Err(invalid_read_image_state(format!(
-            "row {} in table {table} is outside the relational identifier range",
-            row.row_id.0
-        )));
-    }
+    validate_read_row_id(table, row.row_id)?;
     for (column, value) in &row.values {
-        let Some(definition) = meta
-            .columns
-            .iter()
-            .find(|definition| definition.name == *column)
-        else {
-            return Err(direct_read_requires_writer(format!(
-                "row {} in table {table} carries unknown column {column}",
-                row.row_id.0
-            )));
+        let shape = match value {
+            Value::Null => ReadCellShape::Null,
+            Value::Vector(values) => ReadCellShape::Vector(values.len()),
+            _ => ReadCellShape::Other,
         };
-        if let ColumnType::Vector(dimension) = definition.column_type {
-            // An absent embedding is a value, not damage -- but only where the
-            // declaration allows one. A nullable vector column holds NULL
-            // wherever a row was written before its embedding existed, and on a
-            // quantized column the empty slot is the deliberate placeholder for
-            // the independently durable vector entry the row is hydrated from.
-            // A NULL anywhere else sits in a cell the schema says must hold an
-            // embedding, so `NOT NULL` keeps its meaning through a direct read.
-            let absent_embedding_is_legal =
-                definition.nullable || !matches!(definition.quantization, VectorQuantization::F32);
-            match value {
-                Value::Vector(vector) if vector.len() == dimension => {}
-                Value::Null if absent_embedding_is_legal => {}
-                _ => {
-                    return Err(direct_read_requires_writer(format!(
-                        "row {} in table {table} carries an invalid vector value for {column}",
-                        row.row_id.0
-                    )));
-                }
-            }
-        }
+        validate_read_cell_shape(table, row.row_id, column, shape, meta)?;
     }
     Ok(())
 }

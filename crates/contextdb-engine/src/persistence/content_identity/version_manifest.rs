@@ -984,6 +984,63 @@ pub(in super::super) fn manifest_for_body_with_checkpoint(
     admission: &mut ProofAdmission,
     checkpoint: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<u8>> {
+    manifested_row_body(table, physical, body, admission, checkpoint, None)
+        .map(|(coordinate, _header)| coordinate)
+}
+
+/// Scalar envelope from the SAME complete borrowed parser and authenticated
+/// body. No map, vector values or schema mirror is retained.
+#[derive(Clone, Copy, Debug)]
+pub(in super::super) struct BorrowedRowHeader {
+    pub(in super::super) row_id: RowId,
+    pub(in super::super) created_tx: TxId,
+    pub(in super::super) deleted_tx: Option<TxId>,
+    pub(in super::super) lsn: Lsn,
+}
+impl BorrowedRowHeader {
+    pub(in super::super) fn visible_at(&self, snapshot: SnapshotId) -> bool {
+        self.created_tx.0 <= snapshot.0 && self.deleted_tx.is_none_or(|tx| tx.0 > snapshot.0)
+    }
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Native refusal diagnostics stay inline under exhausted budgets."
+)]
+pub(in super::super) fn manifested_row_header(
+    table: &str,
+    physical: &[u8],
+    body: &[u8],
+    admission: &mut ProofAdmission,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+    meta: &TableMeta,
+    expected: &[u8],
+    before_schema: &mut dyn FnMut(BorrowedRowHeader) -> Result<()>,
+) -> Result<(Vec<u8>, BorrowedRowHeader)> {
+    manifested_row_body(
+        table,
+        physical,
+        body,
+        admission,
+        checkpoint,
+        Some((meta, expected, before_schema)),
+    )
+}
+#[expect(
+    clippy::result_large_err,
+    reason = "Native refusal diagnostics stay inline under exhausted budgets."
+)]
+fn manifested_row_body(
+    table: &str,
+    physical: &[u8],
+    body: &[u8],
+    admission: &mut ProofAdmission,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+    schema: Option<(
+        &TableMeta,
+        &[u8],
+        &mut dyn FnMut(BorrowedRowHeader) -> Result<()>,
+    )>,
+) -> Result<(Vec<u8>, BorrowedRowHeader)> {
     checkpoint()?;
     if physical.len() != 24 {
         return Err(bad("physical key width"));
@@ -1156,7 +1213,67 @@ pub(in super::super) fn manifest_for_body_with_checkpoint(
         coordinate.push(u8::from(deleted.is_some()));
         coordinate.extend_from_slice(&deleted.unwrap_or(0).to_be_bytes());
         coordinate.extend_from_slice(&digest);
-        Ok(coordinate)
+        let header = BorrowedRowHeader {
+            row_id: RowId(row_id),
+            created_tx: TxId(created),
+            deleted_tx: deleted.map(TxId),
+            lsn: Lsn(lsn),
+        };
+        if let Some((meta, expected, before_schema)) = schema {
+            // Root/body equality precedes schema validation, as in the owned
+            // reader. The caller retains its independent equality check too.
+            if coordinate.as_slice() != expected {
+                return Err(corrupt_body(
+                    "persisted row body or closure does not authenticate",
+                ));
+            }
+            before_schema(header)?;
+            crate::persistence::validate_read_row_id(table, header.row_id)
+                .map_err(|error| crate::persistence::read_row_shape_error(table, error))?;
+            for span in &spans {
+                // The full parser above already validated this entire value,
+                // its canonical integer encodings, payload bounds and UTF-8.
+                // Reuse its integer/length routines for a bounded header peek;
+                // no payload is rescanned or copied and no source/work event
+                // is fabricated by this already authenticated scalar check.
+                let mut no_extra_source_event = || Ok(());
+                let mut value = Encoded {
+                    bytes: body,
+                    position: span.value,
+                    checkpoint: &mut no_extra_source_event,
+                };
+                let shape = match value.integer()? {
+                    0 => match value.integer()? {
+                        0 => crate::persistence::ReadCellShape::Null,
+                        8 => crate::persistence::ReadCellShape::Vector(value.length()?),
+                        _ => crate::persistence::ReadCellShape::Other,
+                    },
+                    1 => {
+                        let kind = value.integer()?;
+                        let dimension = if kind == 0 {
+                            value.length()?
+                        } else {
+                            value.take(8)?;
+                            usize::try_from(value.integer()?)
+                                .map_err(|_| torn("vector dimension overflow"))?
+                        };
+                        crate::persistence::ReadCellShape::Vector(dimension)
+                    }
+                    _ => return Err(corrupt_body("foreign persisted value")),
+                };
+                let name = std::str::from_utf8(&body[span.name..span.name_end])
+                    .map_err(|_| corrupt_body("column is not UTF-8"))?;
+                crate::persistence::validate_read_cell_shape(
+                    table,
+                    header.row_id,
+                    name,
+                    shape,
+                    meta,
+                )
+                .map_err(|error| crate::persistence::read_row_shape_error(table, error))?;
+            }
+        }
+        Ok((coordinate, header))
     })();
     admission.release(scratch);
     result
