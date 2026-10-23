@@ -108,6 +108,7 @@ pub(crate) enum Charge {
 #[cfg(test)]
 pub(crate) mod staging_witness {
     use super::Charge;
+    use crate::persistence::recorder_buffer::RecorderBuffer;
     use std::cell::{Cell, RefCell};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,9 +147,9 @@ pub(crate) mod staging_witness {
         static ARMED: Cell<bool> = const { Cell::new(false) };
         static WATCHED: Cell<usize> = const { Cell::new(0) };
         static LEN: Cell<usize> = const { Cell::new(0) };
-        static LOG: RefCell<[Option<Event>; CAPACITY]> = const { RefCell::new([None; CAPACITY]) };
-        static LIVE_TAGGED: RefCell<[Option<(usize, Charge, usize)>; LIVE]> =
-            const { RefCell::new([None; LIVE]) };
+        static LOG: RecorderBuffer<Option<Event>, CAPACITY> = const { RecorderBuffer::new() };
+        static LIVE_TAGGED: RecorderBuffer<Option<(usize, Charge, usize)>, LIVE> =
+            const { RecorderBuffer::new() };
         static EXPECTING: RefCell<[Option<(Charge, usize, usize)>; EXPECTED]> =
             const { RefCell::new([None; EXPECTED]) };
         static CHARGED: Cell<[usize; 6]> = const { Cell::new([0; 6]) };
@@ -161,36 +162,42 @@ pub(crate) mod staging_witness {
 
     fn armed() -> bool {
         ARMED.try_with(Cell::get).unwrap_or(false)
+            && LOG.try_with(|slot| slot.is_initialized()).unwrap_or(false)
+            && LIVE_TAGGED
+                .try_with(|slot| slot.is_initialized())
+                .unwrap_or(false)
     }
 
     fn push(event: Event) {
-        LEN.with(|len| {
+        let _ = LEN.try_with(|len| {
             let at = len.get();
             if at < CAPACITY {
-                LOG.with(|log| log.borrow_mut()[at] = Some(event));
+                let _ = LOG.try_with(|log| log.borrow_mut()[at] = Some(event));
             }
             len.set(at + 1);
         });
     }
 
     fn live_bytes(charge: Charge) -> usize {
-        LIVE_TAGGED.with(|live| {
-            live.borrow()
-                .iter()
-                .flatten()
-                .filter(|(_, tagged, _)| *tagged == charge)
-                .map(|(_, _, size)| *size)
-                .sum()
-        })
+        LIVE_TAGGED
+            .try_with(|live| {
+                live.borrow()
+                    .iter()
+                    .flatten()
+                    .filter(|(_, tagged, _)| *tagged == charge)
+                    .map(|(_, _, size)| *size)
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     fn check(charges: &[Charge]) {
         for &charge in charges {
             let live = live_bytes(charge);
-            let charged = CHARGED.with(Cell::get)[index(charge)];
-            if live > charged && OVERRUN.with(Cell::get).is_none() {
-                let at_event = LEN.with(Cell::get);
-                OVERRUN.with(|overrun| {
+            let charged = CHARGED.try_with(Cell::get).unwrap_or([0; 6])[index(charge)];
+            if live > charged && OVERRUN.try_with(Cell::get).ok().flatten().is_none() {
+                let at_event = LEN.try_with(Cell::get).unwrap_or(0);
+                let _ = OVERRUN.try_with(|overrun| {
                     overrun.set(Some(Overrun {
                         charge,
                         live,
@@ -204,8 +211,11 @@ pub(crate) mod staging_witness {
 
     /// Start recording, also logging untagged allocations of `watched` bytes.
     pub(crate) fn arm(watched: usize) {
+        ARMED.with(|armed| armed.set(false));
+        LOG.with(|log| log.initialize(|| None));
+        LIVE_TAGGED.with(|live| live.initialize(|| None));
         LEN.with(|len| len.set(0));
-        LIVE_TAGGED.with(|live| *live.borrow_mut() = [None; LIVE]);
+        LIVE_TAGGED.with(|live| live.borrow_mut().fill(None));
         EXPECTING.with(|expecting| *expecting.borrow_mut() = [None; EXPECTED]);
         CHARGED.with(|charged| charged.set([0; 6]));
         OVERRUN.with(|overrun| overrun.set(None));
@@ -248,13 +258,13 @@ pub(crate) mod staging_witness {
         if !armed() {
             return;
         }
-        CHARGED.with(|charged| {
+        let _ = CHARGED.try_with(|charged| {
             let mut all = charged.get();
             all[index(charge)] += bytes;
             charged.set(all);
         });
         if count > 0 {
-            EXPECTING.with(|expecting| {
+            let _ = EXPECTING.try_with(|expecting| {
                 let mut expecting = expecting.borrow_mut();
                 if let Some(slot) = expecting.iter_mut().find(|slot| slot.is_none()) {
                     *slot = Some((charge, size, count));
@@ -269,12 +279,12 @@ pub(crate) mod staging_witness {
         if !armed() {
             return;
         }
-        CHARGED.with(|charged| {
+        let _ = CHARGED.try_with(|charged| {
             let mut all = charged.get();
             all[index(charge)] = all[index(charge)].saturating_sub(bytes);
             charged.set(all);
         });
-        EXPECTING.with(|expecting| {
+        let _ = EXPECTING.try_with(|expecting| {
             for slot in expecting.borrow_mut().iter_mut() {
                 if slot.is_some_and(|(expected, _, _)| expected == charge) {
                     *slot = None;
@@ -285,7 +295,7 @@ pub(crate) mod staging_witness {
         if charge == Charge::Scratch {
             // The prepared array now holds the pass-start tables and stays
             // with the transaction: the declared baseline transfer.
-            LIVE_TAGGED.with(|live| {
+            let _ = LIVE_TAGGED.try_with(|live| {
                 for slot in live.borrow_mut().iter_mut() {
                     if slot.is_some_and(|(_, tagged, _)| tagged == Charge::Scratch) {
                         *slot = None;
@@ -309,23 +319,26 @@ pub(crate) mod staging_witness {
         if !armed() {
             return;
         }
-        let tag = EXPECTING.with(|expecting| {
-            let mut expecting = expecting.borrow_mut();
-            let slot = expecting
-                .iter_mut()
-                .find(|slot| slot.is_some_and(|(_, expected, _)| expected == size))?;
-            let (charge, expected, count) = slot.unwrap();
-            *slot = (count > 1).then_some((charge, expected, count - 1));
-            Some(charge)
-        });
+        let tag = EXPECTING
+            .try_with(|expecting| {
+                let mut expecting = expecting.borrow_mut();
+                let slot = expecting
+                    .iter_mut()
+                    .find(|slot| slot.is_some_and(|(_, expected, _)| expected == size))?;
+                let (charge, expected, count) = slot.unwrap();
+                *slot = (count > 1).then_some((charge, expected, count - 1));
+                Some(charge)
+            })
+            .ok()
+            .flatten();
         if let Some(charge) = tag {
-            LIVE_TAGGED.with(|live| {
+            let _ = LIVE_TAGGED.try_with(|live| {
                 if let Some(slot) = live.borrow_mut().iter_mut().find(|slot| slot.is_none()) {
                     *slot = Some((address, charge, size));
                 }
             });
             push(Event::Alloc(Some(charge), address));
-        } else if WATCHED.with(Cell::get) == size {
+        } else if WATCHED.try_with(Cell::get).unwrap_or(0) == size {
             push(Event::Alloc(None, address));
         }
     }
@@ -334,15 +347,18 @@ pub(crate) mod staging_witness {
         if !armed() {
             return;
         }
-        let tagged = LIVE_TAGGED.with(|live| {
-            let mut live = live.borrow_mut();
-            let slot = live
-                .iter_mut()
-                .find(|slot| slot.is_some_and(|(at, _, _)| at == address))?;
-            *slot = None;
-            Some(())
-        });
-        if tagged.is_some() || WATCHED.with(Cell::get) == size {
+        let tagged = LIVE_TAGGED
+            .try_with(|live| {
+                let mut live = live.borrow_mut();
+                let slot = live
+                    .iter_mut()
+                    .find(|slot| slot.is_some_and(|(at, _, _)| at == address))?;
+                *slot = None;
+                Some(())
+            })
+            .ok()
+            .flatten();
+        if tagged.is_some() || WATCHED.try_with(Cell::get).unwrap_or(0) == size {
             push(Event::Free(address));
         }
     }
@@ -351,6 +367,84 @@ pub(crate) mod staging_witness {
         if armed() {
             push(Event::Staged(staged));
         }
+    }
+
+    #[test]
+    fn staging_log_overflow_is_not_a_truncated_success() {
+        arm(0);
+        for _ in 0..CAPACITY {
+            staged(false);
+        }
+        assert_eq!(LEN.with(Cell::get), CAPACITY);
+        assert_eq!(take().0.len(), CAPACITY);
+        arm(0);
+        for _ in 0..=CAPACITY {
+            staged(false);
+        }
+        assert!(std::panic::catch_unwind(take).is_err());
+        assert!(!armed());
+        arm(0);
+        assert!(take().0.is_empty());
+    }
+
+    #[test]
+    fn staging_backing_reuses_initialized_slots_and_stays_thread_local() {
+        arm(73);
+        let pointer = LIVE_TAGGED.with(|live| live.borrow().as_ptr() as usize);
+        admitted(Charge::Names, 73, 1, 73);
+        let memory =
+            unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(73, 1).unwrap()) };
+        assert_eq!(live(), vec![(Charge::Names, 73)]);
+        std::thread::spawn(|| {
+            assert!(!armed());
+            arm(73);
+            assert!(live().is_empty());
+            assert_eq!(charged(), [0; 6]);
+            assert!(take().0.is_empty());
+        })
+        .join()
+        .unwrap();
+        unsafe {
+            std::alloc::dealloc(memory, std::alloc::Layout::from_size_align(73, 1).unwrap());
+        }
+        released(Charge::Names, 73);
+        assert!(live().is_empty());
+        let (events, overrun) = take();
+        assert!(overrun.is_none());
+        assert!(events.contains(&Event::Alloc(Some(Charge::Names), memory as usize)));
+        assert!(events.contains(&Event::Free(memory as usize)));
+        arm(0);
+        assert_eq!(
+            LIVE_TAGGED.with(|live| live.borrow().as_ptr() as usize),
+            pointer
+        );
+        assert!(live().is_empty());
+        assert!(take().0.is_empty());
+    }
+
+    #[test]
+    fn staging_backing_teardown_leaves_allocator_callbacks_inactive() {
+        struct AfterBacking;
+        impl Drop for AfterBacking {
+            fn drop(&mut self) {
+                assert!(!armed());
+                let layout = std::alloc::Layout::from_size_align(73, 1).unwrap();
+                unsafe {
+                    let pointer = std::alloc::alloc(layout);
+                    std::alloc::dealloc(pointer, layout);
+                }
+                assert!(!armed());
+            }
+        }
+        thread_local! { static AFTER: AfterBacking = const { AfterBacking }; }
+        std::thread::spawn(|| {
+            AFTER.with(|_| ());
+            arm(73);
+            // Deliberately leave this recorder armed at thread exit. It owns
+            // no borrowed accountant; destroyed owners must gate callbacks.
+        })
+        .join()
+        .unwrap();
     }
 }
 

@@ -1,9 +1,10 @@
 //! Independent rows for the selected native JSON producers. No digest-validation
 //! claim: malformed inner strings are injected into actual serialized roots.
 use super::*;
+use crate::persistence::recorder_buffer::RecorderBuffer;
 use crate::persistence::{PersistedValue, PersistedVersionedRow, original_event_decode};
 use contextdb_core::read_memory::NativeRefusal;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 // Proof-only call-site provenance. Raw physical accounting never consults this
 // phase and never subtracts an allocation. Ordinary rows remain EngineProduce.
@@ -114,8 +115,8 @@ struct Receipt {
     json_refusal: bool,
 }
 thread_local! {
-    // Large history stays in static TLS, never returned/copied on a test stack.
-    static REQUESTS: RefCell<[Request; 2048]> = const { RefCell::new([Request::EMPTY; 2048]) };
+    // Explicitly armed per-thread infrastructure; allocator callbacks never initialize it.
+    static REQUESTS: RecorderBuffer<Request, 2048> = const { RecorderBuffer::new() };
     static RECEIPT: Cell<Receipt> = const { Cell::new(Receipt {
         counter: 0, baseline: 0, count: 0, live: 0, peak: 0, gap: 0,
         invalid: false, prepared: false, native: 0, text: 0, prepared_at: 0,
@@ -138,7 +139,7 @@ struct GapEvent {
 thread_local! {
     static FIRST_GAP: Cell<Option<GapEvent>> = const { Cell::new(None) };
     static WORST_GAP: Cell<Option<GapEvent>> = const { Cell::new(None) };
-    static HISTORY: [Cell<AllocationEvent>; 2048] = const { [const { Cell::new(AllocationEvent::EMPTY) }; 2048] };
+    static HISTORY: RecorderBuffer<Cell<AllocationEvent>, 2048> = const { RecorderBuffer::new() };
     static HISTORY_COUNT: Cell<usize> = const { Cell::new(0) };
     // Root, exact test subrow, input ordinal (or replay budget).
     static SUBROW: Cell<(&'static str, &'static str, usize)> = const { Cell::new(("none", "none", 0)) };
@@ -157,12 +158,12 @@ fn sample(r: &mut Receipt, event: AllocationEvent, generation: usize) {
             live: r.live,
             gap,
         };
-        FIRST_GAP.with(|s| {
+        let _ = FIRST_GAP.try_with(|s| {
             if s.get().is_none() {
                 s.set(Some(witness));
             }
         });
-        WORST_GAP.with(|s| {
+        let _ = WORST_GAP.try_with(|s| {
             if s.get().is_none_or(|old| gap > old.gap) {
                 s.set(Some(witness));
             }
@@ -209,7 +210,7 @@ impl AllocationEvent {
     };
 }
 thread_local! {
-    static EVENTS: [Cell<AllocationEvent>; 2048] = const { [const { Cell::new(AllocationEvent::EMPTY) }; 2048] };
+    static EVENTS: RecorderBuffer<Cell<AllocationEvent>, 2048> = const { RecorderBuffer::new() };
     static EVENT_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 // Called only after BOTH producer and aggregate allocation windows close.
@@ -237,22 +238,38 @@ fn dump_event(label: &str, index: usize, e: AllocationEvent) {
         e.proof_phase
     );
 }
+fn recorders_ready() -> bool {
+    REQUESTS
+        .try_with(RecorderBuffer::is_initialized)
+        .unwrap_or(false)
+        && EVENTS
+            .try_with(RecorderBuffer::is_initialized)
+            .unwrap_or(false)
+        && HISTORY
+            .try_with(RecorderBuffer::is_initialized)
+            .unwrap_or(false)
+}
 fn drain_events() {
-    REQUESTS.with(|slot| {
+    if !recorders_ready() {
+        return;
+    }
+    let _ = REQUESTS.try_with(|slot| {
         let Ok(mut entries) = slot.try_borrow_mut() else {
             return;
         };
-        RECEIPT.with(|cell| {
+        let _ = RECEIPT.try_with(|cell| {
             let mut r = cell.get();
             if r.counter == 0 {
                 return;
             }
-            EVENTS.with(|events| {
-                EVENT_COUNT.with(|count| {
+            let _ = EVENTS.try_with(|events| {
+                let events = events.borrow();
+                let _ = EVENT_COUNT.try_with(|count| {
                     for slot in &events[..count.replace(0)] {
                         let event = slot.replace(AllocationEvent::EMPTY);
-                        HISTORY.with(|history| {
-                            HISTORY_COUNT.with(|count| {
+                        let _ = HISTORY.try_with(|history| {
+                            let history = history.borrow();
+                            let _ = HISTORY_COUNT.try_with(|count| {
                                 let n = count.get();
                                 if n == history.len() {
                                     r.invalid = true;
@@ -260,7 +277,7 @@ fn drain_events() {
                                     history[n].set(event);
                                     count.set(n + 1);
                                 }
-                            })
+                            });
                         });
                         if event.kind == 0 {
                             if r.count == entries.len()
@@ -323,15 +340,17 @@ fn drain_events() {
                             }
                         }
                     }
-                })
+                });
             });
             cell.set(r);
         });
     });
 }
 fn allocation_event(pointer: usize, layout: Layout, kind: u8) {
-    let r = RECEIPT.with(Cell::get);
-    if r.counter == 0 {
+    let Ok(r) = RECEIPT.try_with(Cell::get) else {
+        return;
+    };
+    if r.counter == 0 || !recorders_ready() {
         return;
     }
     // Capture before deferred processing: a later invoice cannot fund an old
@@ -347,16 +366,19 @@ fn allocation_event(pointer: usize, layout: Layout, kind: u8) {
         native: r.native,
         text: r.text,
         prepared_at: r.prepared_at,
-        proof_phase: UNWIND_PHASES.with(|s| s.get().phase),
+        proof_phase: UNWIND_PHASES
+            .try_with(|s| s.get().phase)
+            .unwrap_or_default(),
         denial: r.denial,
-        subrow: SUBROW.with(Cell::get),
+        subrow: SUBROW.try_with(Cell::get).unwrap_or(("none", "none", 0)),
     };
     drain_events();
-    EVENTS.with(|events| {
-        EVENT_COUNT.with(|count| {
+    let _ = EVENTS.try_with(|events| {
+        let events = events.borrow();
+        let _ = EVENT_COUNT.try_with(|count| {
             let n = count.get();
             if n == events.len() {
-                RECEIPT.with(|cell| {
+                let _ = RECEIPT.try_with(|cell| {
                     let mut r = cell.get();
                     r.invalid = true;
                     cell.set(r);
@@ -365,7 +387,7 @@ fn allocation_event(pointer: usize, layout: Layout, kind: u8) {
                 events[n].set(event);
                 count.set(n + 1);
             }
-        })
+        });
     });
     drain_events();
 }
@@ -376,7 +398,7 @@ pub(crate) fn freed(pointer: usize, layout: Layout, after: bool) {
     allocation_event(pointer, layout, if after { 2 } else { 1 });
 }
 pub(crate) fn prepared(native: usize, text: usize) {
-    RECEIPT.with(|cell| {
+    let _ = RECEIPT.try_with(|cell| {
         let mut r = cell.get();
         if r.counter == 0 {
             return;
@@ -389,7 +411,7 @@ pub(crate) fn prepared(native: usize, text: usize) {
     });
 }
 pub(crate) fn refused(error: NativeRefusal) {
-    RECEIPT.with(|cell| {
+    let _ = RECEIPT.try_with(|cell| {
         let mut r = cell.get();
         if r.counter == 0 {
             return;
@@ -401,7 +423,7 @@ pub(crate) fn refused(error: NativeRefusal) {
     });
 }
 pub(crate) fn json_refusal() {
-    RECEIPT.with(|cell| {
+    let _ = RECEIPT.try_with(|cell| {
         let mut r = cell.get();
         if r.counter != 0 {
             r.json_refusal = true;
@@ -410,7 +432,7 @@ pub(crate) fn json_refusal() {
     });
 }
 pub(crate) fn diagnosis(error: &serde_json::Error, finite: Option<&'static str>) {
-    RECEIPT.with(|cell| {
+    let _ = RECEIPT.try_with(|cell| {
         let mut r = cell.get();
         if r.counter == 0 {
             return;
@@ -424,7 +446,7 @@ pub(crate) fn diagnosis(error: &serde_json::Error, finite: Option<&'static str>)
     });
 }
 pub(crate) fn rendered(pointer: usize) {
-    RECEIPT.with(|cell| {
+    let _ = RECEIPT.try_with(|cell| {
         let mut r = cell.get();
         if r.counter == 0 {
             return;
@@ -436,7 +458,7 @@ pub(crate) fn rendered(pointer: usize) {
     });
 }
 pub(crate) fn native_destroyed() {
-    RECEIPT.with(|cell| {
+    let _ = RECEIPT.try_with(|cell| {
         let mut r = cell.get();
         if r.counter == 0 {
             return;
@@ -449,6 +471,9 @@ struct Observation<'a>(&'a MemoryAccountant, Option<Receipt>);
 impl<'a> Observation<'a> {
     fn begin(owner: &'a MemoryAccountant) -> Self {
         assert_eq!(RECEIPT.with(Cell::get).counter, 0);
+        REQUESTS.with(|slot| slot.initialize(|| Request::EMPTY));
+        EVENTS.with(|slot| slot.initialize(|| Cell::new(AllocationEvent::EMPTY)));
+        HISTORY.with(|slot| slot.initialize(|| Cell::new(AllocationEvent::EMPTY)));
         EVENT_COUNT.with(|count| count.set(0));
         UNWIND_PHASES.with(|s| s.set(UnwindPhases::default()));
         HISTORY_COUNT.with(|count| count.set(0));
@@ -513,6 +538,7 @@ impl<'a> Observation<'a> {
                 }
             });
             HISTORY.with(|history| {
+                let history = history.borrow();
                 HISTORY_COUNT.with(|count| {
                     for (i, event) in history[..count.get()].iter().enumerate() {
                         dump_event("event", i, event.get());
@@ -1225,6 +1251,9 @@ fn panic_identity(caught: &std::thread::Result<()>) -> (usize, Option<u8>) {
 fn report_unwind_ledger(observation: &Observation<'_>, identity: ApplicationUnwindIdentity) {
     let r = observation.receipt();
     assert_eq!(RECEIPT.with(Cell::get).counter, 0);
+    REQUESTS.with(|slot| slot.initialize(|| Request::EMPTY));
+    EVENTS.with(|slot| slot.initialize(|| Cell::new(AllocationEvent::EMPTY)));
+    HISTORY.with(|slot| slot.initialize(|| Cell::new(AllocationEvent::EMPTY)));
     assert_eq!(MEASURING_HERE.with(Cell::get), 0);
     eprintln!("application unwind identity {identity:?} receipt {r:?}");
     for (label, witness) in [
@@ -1245,6 +1274,7 @@ fn report_unwind_ledger(observation: &Observation<'_>, identity: ApplicationUnwi
         }
     });
     HISTORY.with(|history| {
+        let history = history.borrow();
         HISTORY_COUNT.with(|count| {
             for (i, event) in history[..count.get()].iter().enumerate() {
                 dump_event("event", i, event.get());
@@ -1298,6 +1328,7 @@ fn report_application_unwind(
     assert!(!r.json_refusal);
     assert_eq!(observation.0.usage().used, r.baseline);
     HISTORY.with(|history| {
+        let history = history.borrow();
         HISTORY_COUNT.with(|count| {
             assert_eq!(
                 count.get(),
@@ -1510,7 +1541,7 @@ fn unwind_proof(
     // First pass validates all phase boundaries, pointers, generations, Layouts,
     // exact one-free histories, and funding-before-physical-free ordering.
     for index in 0..count {
-        let event = HISTORY.with(|history| history[index].get());
+        let event = HISTORY.with(|history| history.borrow()[index].get());
         let phase = if index < phases.initiate_at {
             ProofPhase::EngineProduce
         } else if index < phases.drop_at {
@@ -1698,7 +1729,7 @@ fn unwind_proof(
     let mut driver_live = false;
     let mut engine_gap = 0usize;
     for index in 0..count {
-        let event = HISTORY.with(|history| history[index].get());
+        let event = HISTORY.with(|history| history.borrow()[index].get());
         if event.kind == 0 {
             live += event.bytes;
             // An address used by an earlier engine generation may have been
@@ -1727,4 +1758,165 @@ fn unwind_proof(
     };
     eprintln!("unwind provenance {proof:?}; raw requests/events remain unchanged");
     Ok(proof)
+}
+
+#[test]
+#[serial]
+fn recorder_callbacks_allocate_nothing_before_during_and_after_observation() {
+    // A new OS thread begins with genuinely null recorder backings.
+    std::thread::spawn(|| {
+        let layout = Layout::from_size_align(31, 8).unwrap();
+        assert!(!recorders_ready());
+        let ((), peak, live) = measured(|| {
+            allocated(1, layout);
+            freed(1, layout, false);
+            freed(1, layout, true);
+            crate::persistence::writer_row_heads::staging_witness::allocated(1, 31);
+            crate::persistence::writer_row_heads::staging_witness::freed(1, 31);
+        });
+        assert_eq!((peak, live), (0, 0));
+        assert!(!recorders_ready());
+        assert!(!REQUESTS.with(RecorderBuffer::is_initialized));
+        assert!(!EVENTS.with(RecorderBuffer::is_initialized));
+        assert!(!HISTORY.with(RecorderBuffer::is_initialized));
+        assert_eq!(EVENT_COUNT.with(Cell::get), 0);
+        assert_eq!(HISTORY_COUNT.with(Cell::get), 0);
+        let owner = MemoryAccountant::no_limit();
+        let mut backing = 0;
+        for _ in 0..2 {
+            let observation = Observation::begin(&owner);
+            let current = REQUESTS.with(|slot| slot.borrow().as_ptr() as usize);
+            if backing != 0 {
+                assert_eq!(current, backing);
+            }
+            backing = current;
+            let (pointer, peak, live) = measured(|| unsafe {
+                let pointer = ALLOCATOR.alloc(layout);
+                ALLOCATOR.dealloc(pointer, layout);
+                pointer as usize
+            });
+            assert_eq!((peak, live), (allocation_layout(layout).0.size(), 0));
+            let receipt = observation.receipt();
+            assert!(!receipt.invalid);
+            assert_eq!((receipt.count, receipt.live), (1, 0));
+            REQUESTS.with(|slot| {
+                let entries = slot.borrow();
+                assert_eq!(
+                    (
+                        entries[0].pointer,
+                        entries[0].bytes,
+                        entries[0].align,
+                        entries[0].frees
+                    ),
+                    (pointer, 31, 8, 1)
+                );
+                assert_eq!(entries[0].before_free, entries[0].after_free);
+            });
+            drop(observation);
+        }
+        let before = HISTORY_COUNT.with(Cell::get);
+        let ((), peak, live) = measured(|| unsafe {
+            let pointer = ALLOCATOR.alloc(layout);
+            ALLOCATOR.dealloc(pointer, layout);
+        });
+        assert_eq!((peak, live), (allocation_layout(layout).0.size(), 0));
+        assert_eq!(HISTORY_COUNT.with(Cell::get), before);
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+#[serial]
+fn recorder_deferred_events_and_history_invalidate_at_the_original_capacity() {
+    let owner = MemoryAccountant::no_limit();
+    let layout = Layout::from_size_align(1, 1).unwrap();
+    let observation = Observation::begin(&owner);
+    REQUESTS.with(|slot| {
+        let _reader = slot.borrow();
+        for n in 0..2048 {
+            allocated(n + 1, layout);
+        }
+        assert_eq!(EVENT_COUNT.with(Cell::get), 2048);
+        assert!(!RECEIPT.with(Cell::get).invalid);
+        allocated(2049, layout);
+        assert_eq!(EVENT_COUNT.with(Cell::get), 2048);
+        assert!(RECEIPT.with(Cell::get).invalid);
+    });
+    drop(observation);
+    let observation = Observation::begin(&owner);
+    // Preexisting physical frees still belong in history, without inventing
+    // request generations. Exactly capacity remains valid; capacity+1 fails.
+    for n in 0..2048 {
+        freed(n + 1, layout, false);
+    }
+    assert_eq!(HISTORY_COUNT.with(Cell::get), 2048);
+    assert!(!observation.receipt().invalid);
+    freed(2049, layout, false);
+    assert_eq!(HISTORY_COUNT.with(Cell::get), 2048);
+    assert!(observation.receipt().invalid);
+}
+
+#[test]
+#[serial]
+fn recorder_rejects_nested_begin_and_restores_after_error_and_panic() {
+    let owner = MemoryAccountant::no_limit();
+    let observation = Observation::begin(&owner);
+    let counter = RECEIPT.with(Cell::get).counter;
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _nested = Observation::begin(&owner);
+        }))
+        .is_err()
+    );
+    assert_eq!(RECEIPT.with(Cell::get).counter, counter);
+    drop(observation);
+    let result = (|| -> std::result::Result<(), ()> {
+        let _observation = Observation::begin(&owner);
+        Err(())
+    })();
+    assert!(result.is_err());
+    assert_eq!(RECEIPT.with(Cell::get).counter, 0);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _observation = Observation::begin(&owner);
+            panic!("exercise observer unwind");
+        }))
+        .is_err()
+    );
+    assert_eq!(RECEIPT.with(Cell::get).counter, 0);
+    drop(Observation::begin(&owner));
+}
+
+#[test]
+#[serial]
+fn recorder_thread_teardown_callbacks_do_not_reopen_destroyed_backing() {
+    struct AfterBacking(std::sync::Arc<AtomicUsize>);
+    impl Drop for AfterBacking {
+        fn drop(&mut self) {
+            assert!(!recorders_ready());
+            let layout = Layout::from_size_align(37, 8).unwrap();
+            let ((), peak, live) = measured(|| unsafe {
+                let pointer = ALLOCATOR.alloc(layout);
+                ALLOCATOR.dealloc(pointer, layout);
+            });
+            assert_eq!((peak, live), (allocation_layout(layout).0.size(), 0));
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+    thread_local! {
+        static AFTER: std::cell::RefCell<Option<AfterBacking>> = const { std::cell::RefCell::new(None) };
+    }
+    let completed = std::sync::Arc::new(AtomicUsize::new(0));
+    let child = completed.clone();
+    std::thread::spawn(move || {
+        // TLS destroys in reverse initialization order, so this actual
+        // global-allocator call runs after all three buffers are destroyed.
+        AFTER.with(|slot| *slot.borrow_mut() = Some(AfterBacking(child)));
+        let owner = MemoryAccountant::no_limit();
+        drop(Observation::begin(&owner));
+    })
+    .join()
+    .unwrap();
+    assert_eq!(completed.load(AtomicOrdering::SeqCst), 1);
 }

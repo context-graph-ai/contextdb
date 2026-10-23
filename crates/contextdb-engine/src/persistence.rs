@@ -58,6 +58,8 @@ macro_rules! observed_graph_key {
         $key
     };
 }
+#[cfg(test)]
+pub(crate) mod recorder_buffer;
 pub(crate) mod content_identity;
 pub(crate) mod content_size;
 mod erasure_frontiers;
