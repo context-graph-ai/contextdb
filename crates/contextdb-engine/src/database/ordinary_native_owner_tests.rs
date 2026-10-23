@@ -11,6 +11,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 type Request = (usize, usize, usize);
+#[derive(Clone, Copy, Default, Debug)]
+struct NamedImageCall {
+    subsystem: &'static str,
+    operation: &'static str,
+    site: &'static str,
+    bytes: usize,
+    before: u64,
+    after: u64,
+    refused: bool,
+}
 #[derive(Clone, Copy, Default)]
 struct Capture {
     active: bool,
@@ -19,6 +29,13 @@ struct Capture {
     actual_constructor_requests: [(usize, usize, usize, usize); 3],
     first_expected_child: [usize; 4],
     first_unexpected_child: [usize; 4],
+    named_image_child: usize,
+    named_image_counter: usize,
+    named_image_calls: usize,
+    named_image_start: u64,
+    named_image_events: [NamedImageCall; 32],
+    named_image_event_count: usize,
+
     parent: usize,
     parent_counter: usize,
     baseline: u64,
@@ -63,7 +80,9 @@ thread_local! { static ANSWER_TRACE: Cell<AnswerTraceCapture> = const { Cell::ne
 thread_local! {
     static HOOK_BUSY: Cell<bool> = const { Cell::new(false) };
     static CAPTURE: Cell<Capture> = const { Cell::new(Capture {
-        active: false, invalid: false, invalid_site: 0, actual_constructor_requests: [(0,0,0,0);3], first_expected_child:[0;4], first_unexpected_child:[0;4], parent: 0, parent_counter: 0,
+        active: false, invalid: false, invalid_site: 0, actual_constructor_requests: [(0,0,0,0);3], first_expected_child:[0;4], first_unexpected_child:[0;4], named_image_child:0, named_image_counter:0, named_image_calls:0, named_image_start:0,
+        named_image_events:[NamedImageCall { subsystem:"", operation:"", site:"", bytes:0, before:0, after:0, refused:false };32],
+        named_image_event_count:0, parent: 0, parent_counter: 0,
         baseline: 0, children: 0, stages: 0, allow_constructor_prefix: false, constructor_base: 0, requests: [(0, 0, 0); 3],
         trace_requests: [(0,0,0); 2], trace_ordinals: [0; 2], trace_invoices: [(0,0); 2], trace_stages: 0,
         trace_before: 0, trace_parent: [0; 2], trace_credits: [0; 2],
@@ -73,6 +92,37 @@ thread_local! {
         outer_invoice_payload: 0, inner_invoice_payload: 0,
         forwarding_payload: 0, payload_invoice_bytes: 0,
     }) };
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn named_image_child_call(
+    payload: usize, counter: usize, subsystem: &'static str, operation: &'static str,
+    site: &'static str, bytes: usize, before: u64, after: u64, refused: bool,
+) {
+    update(|capture| {
+        if payload != capture.named_image_child || capture.named_image_child == 0 { return; }
+        if counter != capture.named_image_counter {
+            capture.invalid = true; capture.invalid_site = line!(); return;
+        }
+        let index = capture.named_image_event_count;
+        if index < capture.named_image_events.len() {
+            capture.named_image_events[index] = NamedImageCall {
+                subsystem, operation, site, bytes, before, after, refused,
+            };
+        }
+        // Fixed diagnostic prefix; overflow is reported explicitly, never
+        // treated as a complete allocation census or expected invoice cost.
+        capture.named_image_event_count += 1;
+    });
+}
+fn named_image_sample(capture: &Capture, route: &str, cut: &str) {
+    if capture.named_image_child == 0 { return; }
+    // The direct reader/session still owns the exact original child at all
+    // these cuts. This borrowed scalar never extends its lifetime.
+    let held = unsafe { &*(capture.named_image_counter as *const AtomicU64) }
+        .load(std::sync::atomic::Ordering::SeqCst);
+    eprintln!("actual_named_image_lifetime route={route} cut={cut} child={} counter={} starting={} held={} diagnostic_only=true",
+        capture.named_image_child, capture.named_image_counter, capture.named_image_start, held);
 }
 
 // Reentry or a fourth selected constructor is a failed precondition, never
@@ -293,6 +343,26 @@ pub(crate) fn child_counter(
     limit: u64,
 ) {
     update(|c| {
+        // A direct-file image already owns this independently named native
+        // source child before the query starts. Record it separately; only
+        // the actual newly constructed query child owns the three watches.
+        // No unknown child, parent or limit is accepted by this qualification.
+        if c.named_image_child != 0 && payload == c.named_image_child {
+            if c.parent != parent as *const _ as usize
+                || (c.named_image_counter != 0
+                    && c.named_image_counter != counter as *const _ as usize)
+                || limit != c.declared_limit
+            {
+                c.invalid = true;
+                if c.invalid_site == 0 {
+                    c.invalid_site = line!();
+                }
+            }
+            c.named_image_counter = counter as *const _ as usize;
+            c.named_image_calls += 1;
+            return;
+        }
+
         if c.parent != parent as *const _ as usize
             || (c.child_counter != 0 && c.child_counter != counter as *const _ as usize)
         {
@@ -1685,6 +1755,19 @@ fn assert_route_original_physical_invoices(
         "the actual {route} vector trace must reach both native factories"
     );
     capture.assert_live();
+    if controls.named_image_child != 0 {
+        assert_ne!(controls.named_image_child, controls.child_payload);
+        assert_ne!(controls.named_image_counter, 0);
+        assert!(controls.named_image_calls > 0);
+        eprintln!(
+            "actual_named_preexisting_image_child route={route} child={} counter={} calls={}",
+            controls.named_image_child, controls.named_image_counter, controls.named_image_calls
+        );
+        named_image_sample(&controls, route, "post-statement");
+        eprintln!("actual_named_image_calls route={route} total={} retained_prefix={} records={:?} diagnostic_only=true",
+            controls.named_image_event_count, controls.named_image_event_count.min(32),
+            &controls.named_image_events[..controls.named_image_event_count.min(32)]);
+    }
     let retained = db.last_vector_search_trace.write().take().unwrap();
     let invoice = retained.complete_invoice_for_test(|_| {});
     assert_eq!(invoice.original_payer, controls.forwarding_payload);
@@ -1702,10 +1785,12 @@ fn assert_route_original_physical_invoices(
     count += 1;
     oracle::watch_exact_frees_for_test(&requests[..count], controls.parent_counter);
     let session = cleanup();
+    named_image_sample(&controls, route, "post-answer-cursor");
     // The escaped actual trace now keeps its own original invoices.
     assert_eq!(oracle::source_free_for_test(count)[3].2, 0);
     assert_eq!(oracle::source_free_for_test(count)[4].2, 0);
     drop(retained);
+    named_image_sample(&controls, route, "post-trace");
     let freed = oracle::source_free_for_test(count);
     let live = oracle::source_live_at_free_for_test(count);
     for slot in 0..count {
@@ -1801,10 +1886,19 @@ fn actual_direct_file_public_readers_keep_original_invoices_through_physical_fre
                 "must be the actual committed direct-file route"
             );
             session
-                .with_direct_file_physical_context_for_test(|db, parent| {
+                .with_direct_file_physical_context_for_test(|db, parent, image_payer| {
+                    eprintln!(
+                        "actual_direct_image_original_payer route={route} payer={image_payer:?}"
+                    );
                     db.clear_last_vector_search_trace();
                     let capture = Observation::begin_parent(parent);
-                    update(|c| c.allow_constructor_prefix = true);
+                    update(|c| {
+                        c.allow_constructor_prefix = true;
+                        let (child, counter, held) = image_payer.expect("actual image original");
+                        c.named_image_child = child;
+                        c.named_image_counter = counter;
+                        c.named_image_start = held;
+                    });
                     let (answer, _, _) =
                         observed_parent(parent, || session.execute(query, &params).unwrap());
                     assert_eq!(answer.rows(), vec![vec![Value::Int64(0)]]);
@@ -1833,9 +1927,19 @@ fn actual_direct_file_public_readers_keep_original_invoices_through_physical_fre
             let target = reader.execution_target();
             let db = target.resident_history_database_for_test().unwrap();
             let parent = reader.original_parent_for_physical_test();
+            eprintln!(
+                "actual_direct_image_original_payer route={route} payer={:?}",
+                reader.original_image_payer_for_physical_test()
+            );
             db.clear_last_vector_search_trace();
+            let (image_child, image_counter, image_start) = reader.original_image_payer_for_physical_test().expect("actual image original");
             let capture = Observation::begin_parent(parent);
-            update(|c| c.allow_constructor_prefix = true);
+            update(|c| {
+                c.allow_constructor_prefix = true;
+                c.named_image_child = image_child;
+                c.named_image_counter = image_counter;
+                c.named_image_start = image_start;
+            });
             if route == "direct-reader-execute" {
                 let (answer, _, _) =
                     observed_parent(parent, || reader.execute(query, &params).unwrap());

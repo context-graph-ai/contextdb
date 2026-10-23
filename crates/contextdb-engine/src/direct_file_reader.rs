@@ -1035,6 +1035,8 @@ impl std::error::Error for DirectFileReaderError {}
 /// Internal owner of one released committed image and the shared bounded
 /// execution target built from it.
 pub struct DirectFileReader {
+    #[cfg(all(test, feature = "test-seams"))]
+    original_image_counter: Option<(usize, usize)>,
     image: Arc<DirectOwnedImage>,
     target: Arc<dyn crate::executor::ReadExecutionTarget>,
     limits: ReadLimits,
@@ -1070,6 +1072,8 @@ impl BackendTargetConstructionReceipt {
             ));
         }
         Ok(DirectFileReader {
+            #[cfg(all(test, feature = "test-seams"))]
+            original_image_counter: None,
             image_memory: self.image_memory,
             image: self.image,
             target: self.target,
@@ -1391,6 +1395,25 @@ impl DirectFileReader {
     }
 
     #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn original_image_payer_for_physical_test(&self) -> Option<(usize, usize, u64)> {
+        self.image_memory
+            .accountant
+            .original_reader_for_observation()
+            .map(|owner| {
+                let identity = owner.accounting_identity();
+                let (constructed_identity, counter) = self.original_image_counter
+                    .expect("actual typed open-child constructor receipt");
+                assert_eq!(identity, constructed_identity, "image accountant retains the actual open child");
+                // The actual image accountant above pins this exact original
+                // owner; constructor captured its typed counter, no cast from
+                // arbitrary provider identity or observation-registry alias.
+                let held = unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                (identity, counter, held)
+            })
+    }
+
+    #[cfg(all(test, feature = "test-seams"))]
     pub(crate) fn original_parent_for_physical_test(
         &self,
     ) -> &crate::vector_read_memory::DeclaredReadRoot {
@@ -1509,10 +1532,15 @@ impl DirectFileReader {
         let declared_read_memory =
             crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(config.limits.memory)
                 .map_err(crate::read_image::history_answer_error)?;
+        #[cfg(all(test, feature = "test-seams"))]
+        let (open_child, original_image_counter) = declared_read_memory
+            .child_with_physical_counter_for_test()
+            .map_err(crate::read_image::history_answer_error)?;
+        #[cfg(not(all(test, feature = "test-seams")))]
+        let open_child = declared_read_memory.child()
+            .map_err(crate::read_image::history_answer_error)?;
         let open_context = crate::executor::bounded::ReadOpenContext::new(
-            declared_read_memory
-                .child()
-                .map_err(crate::read_image::history_answer_error)?,
+            open_child,
             config.limits,
             config.clock.clone(),
             cancellation.clone(),
@@ -1526,7 +1554,10 @@ impl DirectFileReader {
             open_context,
         )
         .map_err(|error| error.into_direct_reader_error())?;
-        consume_released_persistence_load(load, config, declared_read_memory, observation)
+        let reader = consume_released_persistence_load(load, config, declared_read_memory, observation)?;
+        #[cfg(all(test, feature = "test-seams"))]
+        let reader = { let mut reader = reader; reader.original_image_counter = Some(original_image_counter); reader };
+        Ok(reader)
     }
 
     #[allow(dead_code)]
