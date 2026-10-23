@@ -220,7 +220,7 @@ def redb_target_contract(root):
         for command in commands:
             if text.count(command) != 1:
                 raise ValueError(f"redb publication target mismatch: {workflow}: {command}")
-    for workflow, expected in [('ci.yml', 3), ('integration.yml', 1)]:
+    for workflow, expected in [('ci.yml', 4), ('integration.yml', 1)]:
         text = (root / '.github/workflows' / workflow).read_text()
         if text.count('crates/contextdb-redb -> ../../target/redb') != expected:
             raise ValueError(f"redb cache target mismatch: {workflow}")

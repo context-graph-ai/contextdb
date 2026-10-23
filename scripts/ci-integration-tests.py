@@ -35,12 +35,12 @@ class IntegrationControls(unittest.TestCase):
 
         def validate(source):
             upload_blocks = re.findall(
-                r'(?m)^      - name: Upload constituent [123] (?:shard|integration) receipt\n'
+                r'(?m)^      - name: Upload constituent [1234] (?:shard|integration) receipt\n'
                 r'(?P<block>.*?)(?=^      - name:|\Z)', source, re.S)
-            if len(upload_blocks) != 6:
-                raise ValueError('expected six constituent receipt uploads')
+            if len(upload_blocks) != 8:
+                raise ValueError('expected eight constituent receipt uploads')
             for block in upload_blocks:
-                if not re.search(r'(?m)^        if: always\(\) && !cancelled\(\) && matrix\.slot[123]\.kind == \'(?:pr|integration)\'$\n', block):
+                if not re.search(r'(?m)^        if: always\(\) && !cancelled\(\) && matrix\.slot[1234]\.kind == \'(?:pr|integration)\'$\n', block):
                     raise ValueError('receipt upload condition is not cancel-safe')
                 if not re.search(r'(?m)^          if-no-files-found: error$', block):
                     raise ValueError('receipt upload must fail when files are missing')
@@ -268,14 +268,14 @@ class IntegrationControls(unittest.TestCase):
         self.assertNotIn('max-parallel', bundle_job['strategy'])
         caches = [step for step in bundle_job['steps']
                   if step.get('uses', '').startswith('Swatinem/rust-cache@')]
-        self.assertEqual(len(caches), 3)
+        self.assertEqual(len(caches), 4)
         self.assertEqual([step['with']['key'] for step in caches],
                          ['${{ matrix.slot1.cache_key }}', '${{ matrix.slot2.cache_key }}',
-                          '${{ matrix.slot3.cache_key }}'])
-        self.assertEqual([step['with']['add-job-id-key'] for step in caches], [False] * 3)
+                          '${{ matrix.slot3.cache_key }}', '${{ matrix.slot4.cache_key }}'])
+        self.assertEqual([step['with']['add-job-id-key'] for step in caches], [False] * 4)
         self.assertTrue(all('cache-on-failure' not in step['with'] for step in caches))
         runs = {step.get('id'): step for step in bundle_job['steps'] if step.get('id')}
-        self.assertEqual(set(runs), {f'slot{slot}_{kind}' for slot in range(1, 4)
+        self.assertEqual(set(runs), {f'slot{slot}_{kind}' for slot in range(1, 5)
                                      for kind in ('pr', 'integration')})
         self.assertTrue(all(step['continue-on-error'] is True for step in runs.values()))
         self.assertTrue(all(step['if'].startswith('always() && !cancelled()')
@@ -294,7 +294,8 @@ class IntegrationControls(unittest.TestCase):
         outcomes = dict(os.environ, SLOT1_KIND='pr', SLOT1_PR='failure',
                         SLOT1_INTEGRATION='skipped', SLOT2_KIND='integration',
                         SLOT2_PR='skipped', SLOT2_INTEGRATION='success',
-                        SLOT3_KIND='', SLOT3_PR='skipped', SLOT3_INTEGRATION='skipped')
+                        SLOT3_KIND='', SLOT3_PR='skipped', SLOT3_INTEGRATION='skipped',
+                        SLOT4_KIND='', SLOT4_PR='skipped', SLOT4_INTEGRATION='skipped')
         self.assertNotEqual(subprocess.run(['bash', '-c', final], env=outcomes).returncode, 0)
         self.assertEqual(len(i.pr_inventory()), 26)
 
@@ -321,9 +322,9 @@ class IntegrationControls(unittest.TestCase):
                 self.assertEqual(len(logical_tuples), 29)
                 i.validate_combined(value, self.rows, True, decision)
                 bundles = i.bundle_matrix(value, self.rows, True, decision)
-                self.assertEqual(len(bundles['include']), 18)
+                self.assertEqual(len(bundles['include']), 16)
                 flattened = [bundle[f'slot{slot}'] for bundle in bundles['include']
-                             for slot in range(1, 4) if bundle[f'slot{slot}'] is not None]
+                             for slot in range(1, 5) if bundle[f'slot{slot}'] is not None]
                 self.assertEqual(len(flattened), len(value['include']))
                 self.assertEqual({row['id'] for row in flattened},
                                  {row['id'] for row in value['include']})
@@ -339,12 +340,12 @@ class IntegrationControls(unittest.TestCase):
                         changed_bundles['include'][0]['slot1']['cache_key'] += '-changed'
                     elif mutation == 'source':
                         slot = next(slot for bundle in changed_bundles['include']
-                                    for slot in (bundle['slot1'], bundle['slot2'], bundle['slot3'])
+                                    for slot in (bundle['slot1'], bundle['slot2'], bundle['slot3'], bundle['slot4'])
                                     if slot is not None and slot['kind'] == 'integration')
                         slot['integration']['source_sha'] = '0' * 40
                     else:
                         slot = next(slot for bundle in changed_bundles['include']
-                                    for slot in (bundle['slot1'], bundle['slot2'], bundle['slot3'])
+                                    for slot in (bundle['slot1'], bundle['slot2'], bundle['slot3'], bundle['slot4'])
                                     if slot is not None and slot['kind'] == 'pr')
                         slot['pr']['features'] = 'mixed-profile'
                     with self.subTest(bundle_payload=mutation), self.assertRaises(ValueError):
@@ -385,9 +386,9 @@ class IntegrationControls(unittest.TestCase):
                 self.assertEqual(len(disabled['include']), 26)
                 self.assertTrue(all(row['kind'] == 'pr' for row in disabled['include']))
                 disabled_bundles = i.bundle_matrix(disabled, self.rows, False, decision)
-                self.assertEqual(len(disabled_bundles['include']), 15)
+                self.assertEqual(len(disabled_bundles['include']), 11)
                 self.assertEqual(sum(bundle[f'slot{slot}'] is not None
-                                     for bundle in disabled_bundles['include'] for slot in range(1, 4)), 26)
+                                     for bundle in disabled_bundles['include'] for slot in range(1, 5)), 26)
                 # A disabled partition is empty, not an exemption from binding
                 # the published source and certificate decision.
                 for field, value in [('source_sha', '0' * 40),

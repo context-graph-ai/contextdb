@@ -673,7 +673,7 @@ def combined_matrix(rows, enabled, decision, root=ROOT):
     return {'include': envelopes}
 
 
-NORMAL_BUNDLES_SHA256 = '54cc4a9062ccb737819faaf7da923793005a8d0dcb55bf28b78e459d953e5c86'
+NORMAL_BUNDLES_SHA256 = '14e6e7c3e0958b6e0ab5c435879830fa09fac2eec1de48560304aeb3d5a7584e'
 SLOT_FIELDS = ENVELOPE_FIELDS | {'cache_key'}
 
 
@@ -691,19 +691,21 @@ def _bundle_slots(value, enabled, decision, root=ROOT):
         raise ValueError('normal bundle manifest differs from reviewed design')
     bundles = definition['bundles']
     additions = definition['fallback_additions']
-    if (not isinstance(bundles, list) or len(bundles) != 18
-            or any(not isinstance(bundle, list) or not 1 <= len(bundle) <= 3 for bundle in bundles)
+    if (not isinstance(bundles, list) or len(bundles) != 16
+            or any(not isinstance(bundle, list) or not 1 <= len(bundle) <= 4 for bundle in bundles)
             or any(not isinstance(row_id, str) for bundle in bundles for row_id in bundle)
             or not isinstance(additions, dict)
-            or additions != {'integration-engine-family-10': 8,
-                              'integration-engine-family-11': 10,
-                              'integration-engine-family-13': 14,
-                              'integration-engine-family-14': 15}):
+            or additions != {'integration-engine-family-10': 12,
+                              'integration-engine-family-11': 12,
+                              'integration-engine-family-13': 4,
+                              'integration-engine-family-14': 4}):
         raise ValueError('invalid reviewed normal bundle layout')
     planned = [list(bundle) for bundle in bundles]
     if enabled and not decision['dedup_sha']:
         for row_id, one_based_bundle in additions.items():
             planned[one_based_bundle - 1].append(row_id)
+    if any(len(bundle) > 4 for bundle in planned):
+        raise ValueError('normal bundle exceeds the four reviewed constituent slots')
     flattened = [row_id for bundle in planned for row_id in bundle]
     if len(flattened) != len(set(flattened)):
         raise ValueError('normal bundles contain duplicate canonical rows')
@@ -733,7 +735,8 @@ def bundle_matrix(value, rows, enabled, decision, root=ROOT):
             slot['name'].removeprefix('normal correctness / ') for slot in slots)
         result.append(dict(id=f'normal-bundle-{index:02d}', name=name,
                            slot1=slots[0], slot2=slots[1] if len(slots) > 1 else None,
-                           slot3=slots[2] if len(slots) > 2 else None))
+                           slot3=slots[2] if len(slots) > 2 else None,
+                           slot4=slots[3] if len(slots) > 3 else None))
     return {'include': result}
 
 

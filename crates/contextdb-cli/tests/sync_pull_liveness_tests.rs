@@ -1,17 +1,4 @@
-//! CLI pull liveness (owner-folded correction, 2026-08-06) — the ruled D1
-//! promise ("you can tell a long `.sync pull` is alive, not stuck") is
-//! structurally unmet as shipped: the interactive-only progress printer
-//! (`pull_with_interactive_progress`, `repl.rs`) checks
-//! `std::io::stdin().is_terminal()` before it ever prints a line, so a
-//! SCRIPTED session (stdin piped, exactly what these tests and every
-//! non-interactive caller look like) gets NO liveness signal at all during a
-//! long pull — only the cumulative `pull_pages_read` counter once the whole
-//! pull has already finished. The `repl.rs:1134`-area doc comment claiming an
-//! agent can poll `.sync status --json` twice mid-pull is false: `.sync pull`
-//! blocks the one CLI session for its whole duration, and no second process
-//! can open the same store while it runs.
-//!
-//! Folded contract:
+//! CLI pull liveness contracts:
 //! (a) a long-running `.sync pull` STREAMS machine-readable progress —
 //!     periodic JSON Lines notices on stderr, shape
 //!     `{"sync_pull_progress":{"pages_read":N}}` — emitted even when stdout
@@ -22,8 +9,8 @@
 //!     "this pull did nothing" from "this pull did a lot" without having to
 //!     diff two cumulative reads itself.
 //!
-//! Discipline: no sleeps, no elapsed-time assertions — every assertion here
-//! is on stderr/JSON content and counts, never on how long anything took.
+//! The scripted progress case drives the existing cadence from real pull-page
+//! events. Assertions cover stderr/JSON content and counts, not elapsed time.
 
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::Database;
@@ -166,7 +153,9 @@ async fn a_scripted_multi_page_pull_streams_progress_notices_on_stderr() {
     // This process's stdin/stdout/stderr are ALL piped (Stdio::piped()) —
     // exactly the "stdout is not a terminal" case the promise must still
     // cover.
-    let (code, stdout, stderr) = run(cli(&edge_path, &hub, "acme"), ".sync pull\n");
+    let mut command = cli(&edge_path, &hub, "acme");
+    command.env("CONTEXTDB_CLI_TEST_PULL_PROGRESS_CLOCK", "pages");
+    let (code, stdout, stderr) = run(command, ".sync pull\n");
     assert_eq!(code, Some(0), "stdout:\n{stdout}\nstderr:\n{stderr}");
 
     let progress_notices: Vec<u64> = stderr
@@ -185,6 +174,18 @@ async fn a_scripted_multi_page_pull_streams_progress_notices_on_stderr() {
     assert!(
         progress_notices.windows(2).all(|pair| pair[0] <= pair[1]),
         "streamed pages_read values must be non-decreasing: {progress_notices:?}"
+    );
+    let pull_pages = parse_lines(&stdout)
+        .into_iter()
+        .find_map(|doc| {
+            doc.get("sync_pull")?
+                .get("pull_pages_read_this_pull")?
+                .as_u64()
+        })
+        .expect("pull result must report this pull's real page count");
+    assert!(
+        pull_pages >= 3,
+        "the pull must fetch at least 3 real pages: {stdout}"
     );
 
     hub.stop().await;

@@ -15406,37 +15406,51 @@ pub mod read_persistence_test_scaffold {
         UntilDeadline { after_ms: u64 },
     }
 
-    fn reader_release_blocks() -> &'static Mutex<Vec<ReaderReleaseBlockForTest>> {
-        static BLOCKS: OnceLock<Mutex<Vec<ReaderReleaseBlockForTest>>> = OnceLock::new();
-        BLOCKS.get_or_init(|| Mutex::new(Vec::new()))
+    thread_local! {
+        static READER_RELEASE_BLOCKS: std::cell::RefCell<Vec<ReaderReleaseBlockForTest>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    /// Start recording what reader-release waits block in, discarding
-    /// anything recorded before. Recording is process-wide, so a proof
-    /// that uses it owns its test binary.
+    /// Start recording this thread's reader-release blocks, discarding its
+    /// previous observations. The wait blocks on its caller's thread.
     pub fn reset_reader_release_blocks_for_test() {
-        reader_release_blocks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        READER_RELEASE_BLOCKS.with(|blocks| blocks.borrow_mut().clear());
     }
 
-    /// Every block reader-release waits have performed since the reset, in
-    /// order.
+    /// Every block this thread's reader-release waits performed since reset,
+    /// in order. Other threads cannot reset or contribute to this recording.
     pub fn reader_release_blocks_for_test() -> Vec<ReaderReleaseBlockForTest> {
-        reader_release_blocks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        READER_RELEASE_BLOCKS.with(|blocks| blocks.borrow().clone())
     }
 
     /// Production reader-release waits call this once for every block they
     /// perform, whatever mechanism they block on.
     pub(super) fn note_reader_release_block_for_test(block: ReaderReleaseBlockForTest) {
-        reader_release_blocks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(block);
+        READER_RELEASE_BLOCKS.with(|blocks| blocks.borrow_mut().push(block));
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn reader_release_recording_cannot_be_reset_or_extended_by_another_thread() {
+        use std::sync::{Arc, Barrier};
+
+        let own = ReaderReleaseBlockForTest::UntilHolderReleased;
+        let sibling = ReaderReleaseBlockForTest::UntilDeadline { after_ms: 1 };
+        reset_reader_release_blocks_for_test();
+        note_reader_release_block_for_test(own);
+        let recorded = Arc::new(Barrier::new(2));
+        let other_recorded = Arc::clone(&recorded);
+        let other = std::thread::spawn(move || {
+            reset_reader_release_blocks_for_test();
+            note_reader_release_block_for_test(sibling);
+            other_recorded.wait();
+            reader_release_blocks_for_test()
+        });
+        recorded.wait();
+        let blocks = reader_release_blocks_for_test();
+        let other_blocks = other.join().expect("join the sibling recorder");
+        assert_eq!(blocks, vec![own]);
+        assert_eq!(other_blocks, vec![sibling]);
     }
 
     /// What answering reads has cost this thread in operating-system objects.
@@ -35152,9 +35166,7 @@ mod reader_breadcrumb_location_proofs {
                 }
             }
             for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
-                let error = macos_process_info(pid)
-                    .err()
-                    .expect("invalid PID must fail");
+                let error = macos_process_info(pid).expect_err("invalid PID must fail");
                 assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             }
         }
@@ -35353,10 +35365,9 @@ mod reader_breadcrumb_location_proofs {
             // Validate raw-record failures directly as well: otherwise a later
             // changed-tuple rejection could mask a broken arithmetic guard.
             if !label.starts_with("invalid-name/") {
-                with_observations(queue(good.pid, &[bad.clone()]), || {
-                    let error = macos_process_info(good.pid)
-                        .err()
-                        .expect("raw record must be rejected");
+                with_observations(queue(good.pid, std::slice::from_ref(&bad)), || {
+                    let error =
+                        macos_process_info(good.pid).expect_err("raw record must be rejected");
                     if let Some(errno) = errno {
                         assert_eq!(error.raw_os_error(), Some(errno), "{label}");
                     } else {
@@ -35381,7 +35392,7 @@ mod reader_breadcrumb_location_proofs {
                 root,
                 &format!("{label}/first"),
                 good.pid,
-                &[bad.clone()],
+                std::slice::from_ref(&bad),
                 errno,
                 false,
             );
@@ -35465,9 +35476,8 @@ mod reader_breadcrumb_location_proofs {
                 );
                 pending[0].pid = requested as libc::c_int;
                 with_observations(pending, || {
-                    let error = macos_process_info(requested)
-                        .err()
-                        .expect("caller PID must be rejected");
+                    let error =
+                        macos_process_info(requested).expect_err("caller PID must be rejected");
                     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
                     assert_eq!(counts(), (0, 0), "production must reject before the FFI");
                     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -35687,7 +35697,7 @@ mod reader_breadcrumb_location_proofs {
                 root,
                 "claimed-pid",
                 pid + 1,
-                &[good.clone()],
+                std::slice::from_ref(&good),
                 None,
                 false,
             );
@@ -35729,8 +35739,7 @@ mod reader_breadcrumb_location_proofs {
                 with_observations(queue(pid, &[bad]), || {
                     assert_eq!(
                         macos_process_info(pid)
-                            .err()
-                            .expect("raw failure")
+                            .expect_err("raw failure")
                             .raw_os_error(),
                         Some(libc::EACCES)
                     );
@@ -35739,7 +35748,7 @@ mod reader_breadcrumb_location_proofs {
                 assert_eq!(unsafe { *libc::__error() }, before);
                 assert_eq!(counts(), (1, 1));
                 let panic = catch_unwind(AssertUnwindSafe(|| {
-                    with_observations(queue(pid, &[good.clone()]), || {
+                    with_observations(queue(pid, std::slice::from_ref(good)), || {
                         unsafe { *libc::__error() = libc::ESRCH };
                         panic!("native scope original panic");
                     });
@@ -35753,7 +35762,7 @@ mod reader_breadcrumb_location_proofs {
             });
             assert_eq!(unsafe { *libc::__error() }, errno);
             for mode in ["unused", "ordinal", "pid", "exhausted"] {
-                let mut observations = queue(pid, &[good.clone()]);
+                let mut observations = queue(pid, std::slice::from_ref(good));
                 match mode {
                     "ordinal" => observations[0].ordinal = 2,
                     "pid" => observations[0].pid += 1,
@@ -35796,7 +35805,7 @@ mod reader_breadcrumb_location_proofs {
                     )
                     .is_none()
                 );
-                with_observations(queue(pid, &[good.clone()]), || {
+                with_observations(queue(pid, std::slice::from_ref(good)), || {
                     macos_process_info(pid).unwrap();
                     assert_eq!(counts(), (1, 1));
                 });

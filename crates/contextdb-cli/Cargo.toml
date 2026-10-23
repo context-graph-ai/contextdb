@@ -26,7 +26,7 @@ path = "src/main.rs"
 # self-dependency below turns it on for this crate's OWN test targets, which is
 # what lets the seam tests run in the default `cargo test -p contextdb-cli` gate
 # without the module existing for anyone else.
-test-seams = []
+test-seams = ["contextdb-engine/test-seams"]
 
 [dependencies]
 contextdb-engine = { path = "../contextdb-engine", version = "1.0" }
