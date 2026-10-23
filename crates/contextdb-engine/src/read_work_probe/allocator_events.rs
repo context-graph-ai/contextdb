@@ -24,6 +24,43 @@ static START_NS: AtomicU64 = AtomicU64::new(0);
 static FIRST_REASON: AtomicU64 = AtomicU64::new(0);
 static FIRST_THREAD: AtomicUsize = AtomicUsize::new(0);
 static FIRST_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
+static FIRST_OWNER_TOKEN: AtomicUsize = AtomicUsize::new(0);
+static FIRST_EMITTER_TOKEN: AtomicUsize = AtomicUsize::new(0);
+static FIRST_OPERATION: AtomicUsize = AtomicUsize::new(0);
+static FIRST_POINTER: AtomicUsize = AtomicUsize::new(0);
+static FIRST_BYTES: AtomicUsize = AtomicUsize::new(0);
+static FIRST_ALIGN: AtomicUsize = AtomicUsize::new(0);
+#[derive(Clone, Copy, Default)]
+struct HookEvent {
+    operation: usize,
+    pointer: usize,
+    bytes: usize,
+    align: usize,
+}
+thread_local! { static HOOK_EVENT: Cell<HookEvent> = const { Cell::new(HookEvent { operation: 0, pointer: 0, bytes: 0, align: 0 }) }; }
+struct HookScope(HookEvent);
+impl HookScope {
+    fn enter(operation: usize, pointer: usize, layout: Layout) -> Self {
+        Self(
+            HOOK_EVENT
+                .try_with(|slot| {
+                    slot.replace(HookEvent {
+                        operation,
+                        pointer,
+                        bytes: layout.size(),
+                        align: layout.align(),
+                    })
+                })
+                .unwrap_or_default(),
+        )
+    }
+}
+impl Drop for HookScope {
+    fn drop(&mut self) {
+        let _ = HOOK_EVENT.try_with(|slot| slot.set(self.0));
+    }
+}
+
 static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 fn monotonic_ns() -> u64 {
     // Initialized before ACTIVE; sampling never initializes, allocates or locks.
@@ -36,6 +73,13 @@ pub struct FirstFailure {
     pub reason: u64,
     pub caller_is_window_thread: bool,
     pub elapsed_ns: u64,
+    pub owner_token: usize,
+    pub emitter_token: usize,
+    /// Existing global allocator hook active at the first failure.
+    pub operation: &'static str,
+    pub pointer: usize,
+    pub bytes: usize,
+    pub align: usize,
 }
 /// Read only after the recording window has closed; this is diagnostic evidence.
 pub fn first_failure() -> Option<FirstFailure> {
@@ -44,6 +88,18 @@ pub fn first_failure() -> Option<FirstFailure> {
         reason,
         caller_is_window_thread: FIRST_THREAD.load(Ordering::SeqCst) == 1,
         elapsed_ns: FIRST_ELAPSED_NS.load(Ordering::SeqCst),
+        owner_token: FIRST_OWNER_TOKEN.load(Ordering::SeqCst),
+        emitter_token: FIRST_EMITTER_TOKEN.load(Ordering::SeqCst),
+        operation: match FIRST_OPERATION.load(Ordering::SeqCst) {
+            1 => "before_alloc_or_zeroed",
+            2 => "allocated_or_zeroed",
+            3 => "reallocated",
+            4 => "before_dealloc",
+            _ => "recorder_api",
+        },
+        pointer: FIRST_POINTER.load(Ordering::SeqCst),
+        bytes: FIRST_BYTES.load(Ordering::SeqCst),
+        align: FIRST_ALIGN.load(Ordering::SeqCst),
     })
 }
 thread_local! { static THREAD: Cell<u8> = const { Cell::new(0) }; }
@@ -56,6 +112,13 @@ pub(crate) fn fail(reason: u64) {
         .is_ok()
     {
         let caller = thread();
+        let event = HOOK_EVENT.try_with(Cell::get).unwrap_or_default();
+        FIRST_OWNER_TOKEN.store(WINDOW_THREAD.load(Ordering::SeqCst), Ordering::SeqCst);
+        FIRST_EMITTER_TOKEN.store(caller, Ordering::SeqCst);
+        FIRST_OPERATION.store(event.operation, Ordering::SeqCst);
+        FIRST_POINTER.store(event.pointer, Ordering::SeqCst);
+        FIRST_BYTES.store(event.bytes, Ordering::SeqCst);
+        FIRST_ALIGN.store(event.align, Ordering::SeqCst);
         FIRST_THREAD.store(
             usize::from(caller != 0 && caller == WINDOW_THREAD.load(Ordering::SeqCst)),
             Ordering::SeqCst,
@@ -278,6 +341,16 @@ impl Window {
         FIRST_REASON.store(0, Ordering::SeqCst);
         FIRST_THREAD.store(0, Ordering::SeqCst);
         FIRST_ELAPSED_NS.store(0, Ordering::SeqCst);
+        for scalar in [
+            &FIRST_OWNER_TOKEN,
+            &FIRST_EMITTER_TOKEN,
+            &FIRST_OPERATION,
+            &FIRST_POINTER,
+            &FIRST_BYTES,
+            &FIRST_ALIGN,
+        ] {
+            scalar.store(0, Ordering::SeqCst);
+        }
         EPOCH.get_or_init(std::time::Instant::now);
         START_NS.store(monotonic_ns(), Ordering::SeqCst);
         if layouts.len() > FILTER_CAPACITY {
@@ -670,7 +743,8 @@ pub(crate) fn funding_next(counter: usize) {
 }
 /// Called by the existing allocator before System.alloc/alloc_zeroed, not by
 /// the producer that supplies the expected inventory or reservation receipt.
-pub fn before_alloc(_layout: Layout) {
+pub fn before_alloc(layout: Layout) {
+    let _hook = HookScope::enter(1, 0, layout);
     crate::vector_read_memory::root_observations::install_physical_observer();
     access(|state| {
         if state.pending_sample.is_some() {
@@ -689,10 +763,12 @@ pub fn before_alloc(_layout: Layout) {
 
 /// Called after the real System request, including null results.
 pub fn allocated(pointer: *mut u8, layout: Layout) {
+    let _hook = HookScope::enter(2, pointer as usize, layout);
     crate::vector_read_memory::root_observations::install_physical_observer();
     record_request(pointer, layout, 0, 0);
 }
 pub fn reallocated(old: *mut u8, old_layout: Layout, pointer: *mut u8, layout: Layout) {
+    let _hook = HookScope::enter(3, pointer as usize, layout);
     crate::vector_read_memory::root_observations::install_physical_observer();
     record_request(pointer, layout, old as usize, old_layout.size());
 }
@@ -771,6 +847,7 @@ pub struct FreeToken {
     producer: u64,
 }
 pub fn before_dealloc(pointer: *mut u8, layout: Layout) -> FreeToken {
+    let _hook = HookScope::enter(4, pointer as usize, layout);
     crate::vector_read_memory::root_observations::install_physical_observer();
     let producer = crate::vector_read_memory::root_observations::before_physical_free(
         pointer as usize,
