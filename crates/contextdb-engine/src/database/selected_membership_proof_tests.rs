@@ -167,7 +167,12 @@ fn historical_receipt_preserves_old_and_current_indexed_answers_across_overwrite
         Some(VectorSearchRoute::Indexed)
     );
     assert_eq!(
-        old_answer.trace().vector_search.as_ref().unwrap().route_evidence,
+        old_answer
+            .trace()
+            .vector_search
+            .as_ref()
+            .unwrap()
+            .route_evidence,
         VectorSearchRouteEvidence::Executed
     );
     let history = observed.historical_counters();
@@ -179,6 +184,10 @@ fn historical_receipt_preserves_old_and_current_indexed_answers_across_overwrite
         "historical_receipt_whole_query counters={:?} historical={history:?}",
         observed.counters()
     );
+    assert_eq!(
+        history.owning_row_proof_setups, 1,
+        "one actual captured root/table/reader reuses fixed verifier setup while every consumed row is still authenticated: {history:?}"
+    );
     drop(old_answer);
     drop(observed);
     let current = db.execute(sql, &query).unwrap();
@@ -188,7 +197,12 @@ fn historical_receipt_preserves_old_and_current_indexed_answers_across_overwrite
         Some(VectorSearchRoute::Indexed)
     );
     assert_eq!(
-        current.trace().vector_search.as_ref().unwrap().route_evidence,
+        current
+            .trace()
+            .vector_search
+            .as_ref()
+            .unwrap()
+            .route_evidence,
         VectorSearchRouteEvidence::Executed
     );
     drop(current);

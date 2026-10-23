@@ -4715,6 +4715,8 @@ impl WriterSnapshotHandle {
                     Path::new(table),
                     None,
                 )?;
+                #[cfg(any(test, feature = "test-seams"))]
+                crate::read_work_probe::note_owning_row_proof_setup();
                 let meta = self
                     .borrow_captured_table_meta(table)
                     .ok_or_else(|| Error::TableNotFound(table.into()))?;
