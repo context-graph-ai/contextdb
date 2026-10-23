@@ -6325,9 +6325,9 @@ mod admitted_navigation_body_tests {
     use crate::memory_budget::{MemoryBudget, MemoryBudgetOwner};
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[derive(Debug)]
-    struct Budget {
-        used: AtomicUsize,
-        limit: AtomicUsize,
+    pub(super) struct Budget {
+        pub(super) used: AtomicUsize,
+        pub(super) limit: AtomicUsize,
     }
     impl MemoryBudget for Budget {
         fn try_allocate_for(
@@ -6356,7 +6356,7 @@ mod admitted_navigation_body_tests {
             assert!(self.used.fetch_sub(bytes, Ordering::SeqCst) >= bytes);
         }
     }
-    fn budget() -> Arc<Budget> {
+    pub(super) fn budget() -> Arc<Budget> {
         Arc::new(Budget {
             used: AtomicUsize::new(0),
             limit: AtomicUsize::new(1024 * 1024),
@@ -6617,3 +6617,7 @@ mod admitted_navigation_body_tests {
         assert_eq!(payer.used.load(Ordering::SeqCst), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "union/origin_work_tests.rs"]
+mod origin_work_tests;
