@@ -24762,6 +24762,9 @@ struct RetainedVectorGraphPageReader {
 
 impl ReadOnlyVectorGraphPageReader for RetainedVectorGraphPageReader {
     fn read_range(&mut self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::PageRead,
+        );
         let relative_end = offset
             .checked_add(len)
             .ok_or_else(|| Error::Other(("saved graph page range overflow".to_string()).into()))?;
@@ -24835,8 +24838,13 @@ impl ReadOnlyVectorGraphPageReader for RetainedVectorGraphPageReader {
                 );
                 let expected_checksum = &stored[4..VECTOR_PARTITION_GRAPH_PAGE_HEADER_BYTES];
                 let bytes = &stored[VECTOR_PARTITION_GRAPH_PAGE_HEADER_BYTES..];
-                if stored_page != page_number || blake3::hash(bytes).as_bytes() != expected_checksum
-                {
+                if stored_page != page_number || {
+                    let _inline_auth = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::PageAuth,
+                    );
+                    contextdb_core::find_attribution::inline_phases::authenticated(bytes.len());
+                    blake3::hash(bytes).as_bytes() != expected_checksum
+                } {
                     return Err(crate::funded_error::corruption_text(
                         Ok(self.read_memory.clone()),
                         self.database_path.display(),

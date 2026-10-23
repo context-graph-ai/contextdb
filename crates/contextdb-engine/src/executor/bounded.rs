@@ -7511,6 +7511,9 @@ impl ScanState {
         // is read; the entry after the cap is never read to learn whether
         // the range had ended.
         let capped = Cell::new(false);
+        let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::CandidateDrain,
+        );
         let _attribution = contextdb_core::find_attribution::stage("candidate_drain");
         loop {
             let visited = db.bounded_visit_verified_ordered_identities(
@@ -10138,6 +10141,9 @@ impl VectorState {
         context: &ControlArc<RequestContext>,
         row_id: RowId,
     ) -> std::result::Result<Option<PulledRow>, BoundedExecutionError> {
+        let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Materialize,
+        );
         let mut vector_copy_owner = crate::vector_read_memory::admission(
             context
                 .source_read_memory(BoundedWorkSource::TableScan)
@@ -10515,6 +10521,9 @@ impl VectorState {
         db: &dyn ReadExecutionTarget,
         context: &ControlArc<RequestContext>,
     ) -> std::result::Result<(), BoundedExecutionError> {
+        let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Rescore,
+        );
         if self.vector_overlay.is_none() {
             return Ok(());
         }
@@ -10691,18 +10700,20 @@ impl VectorState {
                     // A filter the search could check row by row is first
                     // probed for a small exact candidate set: at most half the
                     // statement's row checks, each counted before it is read.
-                    let probe_cap =
-                        if !matches!(self.preparation, VectorPreparation::Candidates(Some(_))) {
-                            None
-                        } else {
-                            match (&self.row_filter, self.row_check_allowance) {
-                                (Some(_), Some(allowance)) => Some(allowance / 2),
-                                (Some(_), None)
-                                    if self.search_mode
-                                        != contextdb_core::VectorSearchMode::Exact =>
-                                {
-                                    let allowance = {
-                                        let groups = self.with_partition_scope(context, || {
+                    let probe_cap = if !matches!(
+                        self.preparation,
+                        VectorPreparation::Candidates(Some(_))
+                    ) {
+                        None
+                    } else {
+                        match (&self.row_filter, self.row_check_allowance) {
+                            (Some(_), Some(allowance)) => Some(allowance / 2),
+                            (Some(_), None)
+                                if self.search_mode != contextdb_core::VectorSearchMode::Exact =>
+                            {
+                                let allowance = {
+                                    let groups = self.with_partition_scope(context, || {
+                        let _inline_phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::Grouping);
                                             context.with_vector_copies(|vector_copy_owner| {
                                                 db.bounded_vector_candidate_groups(
                                                     &self.index,
@@ -10726,23 +10737,23 @@ impl VectorState {
                                                 )
                                             })
                                         })?;
-                                        let groups =
-                                            RetainedVectorCandidateGroups::new(groups, context);
-                                        context.with_vector_copies(|vector_copy_owner| {
-                                            db.bounded_vector_row_check_allowance(
-                                                &self.index,
-                                                self.k,
-                                                groups.get(),
-                                                vector_copy_owner,
-                                            )
-                                        })?
-                                    };
-                                    self.row_check_allowance = allowance;
-                                    allowance.map(|allowance| allowance / 2)
-                                }
-                                _ => None,
+                                    let groups =
+                                        RetainedVectorCandidateGroups::new(groups, context);
+                                    context.with_vector_copies(|vector_copy_owner| {
+                                        db.bounded_vector_row_check_allowance(
+                                            &self.index,
+                                            self.k,
+                                            groups.get(),
+                                            vector_copy_owner,
+                                        )
+                                    })?
+                                };
+                                self.row_check_allowance = allowance;
+                                allowance.map(|allowance| allowance / 2)
                             }
-                        };
+                            _ => None,
+                        }
+                    };
                     let candidate = match &mut self.preparation {
                         VectorPreparation::Candidates(candidate) => candidate,
                         _ => {
@@ -10890,6 +10901,10 @@ impl VectorState {
                     let candidates = (self.candidate_filter && !self.row_checked)
                         .then_some(self.candidate_ids.as_slice());
                     let groups = self.with_partition_scope(context, || {
+                        let _inline_grouping =
+                            contextdb_core::find_attribution::inline_phases::enter(
+                                contextdb_core::find_attribution::inline_phases::Phase::Grouping,
+                            );
                         context.with_vector_copies(|vector_copy_owner| {
                             vector_copy_owner.with_raw_only_sources(
                                 self.search_mode == contextdb_core::VectorSearchMode::Exact
@@ -10974,6 +10989,10 @@ impl VectorState {
                             None => Ok(true),
                         };
                         let mut hnsw_search = || {
+                            let _inline_phase =
+                                contextdb_core::find_attribution::inline_phases::enter(
+                                    contextdb_core::find_attribution::inline_phases::Phase::Hnsw,
+                                );
                             context.with_vector_copies(|vector_copy_owner| {
                                 db.bounded_hnsw_vector_search(
                                     &self.index,
@@ -19518,6 +19537,7 @@ pub(super) fn execute_with_native_trace_refund(
 ) -> std::result::Result<BoundedExecutionResult, BoundedExecutionError> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+    let _inline_statement = contextdb_core::find_attribution::inline_phases::statement();
     let mut release_proofs = StatementProofReuse {
         db,
         cache: Some(redb::ReadCacheRequest::enter()),
@@ -19581,6 +19601,9 @@ pub(super) fn execute_with_native_trace_refund(
         // that shape, not after.
         let planned_prepared_bytes = checked_size_mul(statement_bytes, 2, "bounded read plan")?;
         context.reserve(BoundedWorkSource::TableScan, planned_prepared_bytes)?;
+        let inline_planning = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Planning,
+        );
         let (resolved, plan) = if matches!(&statement, Statement::Select(select)
             if select.ctes.is_empty() || select.body.where_clause.is_none())
         {
@@ -19609,6 +19632,7 @@ pub(super) fn execute_with_native_trace_refund(
                 )
             })
         }?;
+        drop(inline_planning);
         let resolved_bytes = statement_capacity_bytes(&resolved)?;
         ensure_supported_plan(&plan)?;
         let plan_bytes = physical_plan_capacity_bytes(&plan)?;

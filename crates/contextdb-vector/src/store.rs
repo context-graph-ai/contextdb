@@ -4269,6 +4269,14 @@ impl IndexState {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_membership_source_for_test(
+        &self,
+        source: Arc<dyn RawVectorMembershipSource>,
+    ) {
+        *self.durable_memberships.write() = Some(source.into());
+    }
+
     pub(crate) fn durable_membership_source(
         &self,
     ) -> Option<NativeSourceArc<dyn RawVectorMembershipSource>> {

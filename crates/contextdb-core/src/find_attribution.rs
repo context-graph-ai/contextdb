@@ -450,6 +450,7 @@ static PAGE_FILL_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub fn note_page_lookup(hit: bool) {
+    inline_phases::page_lookup(hit);
     if !enabled() {
         return;
     }
@@ -461,6 +462,7 @@ pub fn note_page_lookup(hit: bool) {
 
 #[inline]
 pub fn note_page_fill(bytes: usize) {
+    inline_phases::page_fill(bytes);
     if !enabled() {
         return;
     }
@@ -839,4 +841,268 @@ pub fn note_refused_saved_graph_load() {
 /// What this thread has loaded and hashed so far.
 pub fn load_meters() -> LoadMeters {
     LOAD_METERS.with(std::cell::Cell::get)
+}
+
+/// Fixed inline measurements for the private default-feature diagnostic.
+/// This path never enters the legacy allocating Record or its sink.
+#[doc(hidden)]
+pub mod inline_phases {
+    use std::cell::Cell;
+    use std::io::Write;
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
+    use std::time::Instant;
+    #[derive(Clone, Copy)]
+    #[repr(usize)]
+    pub enum Phase {
+        Planning,
+        CandidateDrain,
+        Grouping,
+        Hnsw,
+        Adapter,
+        Rescore,
+        Materialize,
+        IsAllowed,
+        ResolveScore,
+        BeforeSource,
+        BeforeDistance,
+        Acquire,
+        Release,
+        PageRead,
+        PageAuth,
+        Origin,
+        RowLookup,
+        RowVersion,
+        Neighbours,
+        Distance,
+        LoadPoint,
+        Identity,
+        NavigationLock,
+        DurableDistance,
+        PagedDistance,
+        ResidentF32Distance,
+        ResidentQuantizedDistance,
+    }
+    const N: usize = 27;
+    const NAMES: [&str; N] = [
+        "planning",
+        "candidate_drain",
+        "grouping",
+        "hnsw",
+        "adapter",
+        "rescore",
+        "materialize",
+        "is_allowed",
+        "resolve_score",
+        "before_source",
+        "before_distance",
+        "acquire",
+        "release",
+        "page_read",
+        "page_auth",
+        "origin",
+        "row_lookup",
+        "row_version",
+        "neighbours",
+        "distance",
+        "load_point",
+        "identity",
+        "navigation_lock",
+        "durable_distance",
+        "paged_distance",
+        "resident_f32_distance",
+        "resident_quantized_distance",
+    ];
+    struct State {
+        active: Cell<bool>,
+        request: Cell<u64>,
+        depth: Cell<u32>,
+        calls: [Cell<u64>; N],
+        ns: [Cell<u64>; N],
+        page_lookups: Cell<u64>,
+        page_hits: Cell<u64>,
+        page_fills: Cell<u64>,
+        page_bytes: Cell<u64>,
+        auth_bytes: Cell<u64>,
+    }
+    thread_local! { static STATE: State = const { State {
+        active: Cell::new(false), request: Cell::new(0), depth: Cell::new(0),
+        calls: [const { Cell::new(0) }; N], ns: [const { Cell::new(0) }; N],
+        page_lookups: Cell::new(0), page_hits: Cell::new(0), page_fills: Cell::new(0),
+        page_bytes: Cell::new(0), auth_bytes: Cell::new(0),
+    } }; }
+    pub struct Statement {
+        start: Option<Instant>,
+        enabled: bool,
+        root: bool,
+    }
+    pub fn statement() -> Statement {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        // One bounded transient OsString is resolved lazily in the first
+        // execute, which the unchanged producer performs before warm samples.
+        if !*ENABLED.get_or_init(|| std::env::var_os("CONTEXTDB_INLINE_PHASES").is_some()) {
+            return Statement {
+                start: None,
+                enabled: false,
+                root: false,
+            };
+        }
+        STATE.with(|state| {
+            let root = !state.active.get();
+            if root {
+                state.request.set(NEXT.fetch_add(1, Ordering::Relaxed));
+                state.depth.set(0);
+                for slot in &state.calls {
+                    slot.set(0);
+                }
+                for slot in &state.ns {
+                    slot.set(0);
+                }
+                state.page_lookups.set(0);
+                state.page_hits.set(0);
+                state.page_fills.set(0);
+                state.page_bytes.set(0);
+                state.auth_bytes.set(0);
+                state.active.set(true);
+            }
+            state.depth.set(state.depth.get() + 1);
+            Statement {
+                start: root.then(Instant::now),
+                enabled: true,
+                root,
+            }
+        })
+    }
+    impl Drop for Statement {
+        fn drop(&mut self) {
+            if !self.enabled {
+                return;
+            }
+            if !self.root {
+                STATE.with(|state| state.depth.set(state.depth.get() - 1));
+                return;
+            }
+            let elapsed = self
+                .start
+                .map_or(0, |start| start.elapsed().as_nanos() as u64);
+            let (request, calls, ns, pages) = STATE.with(|state| {
+                state.active.set(false);
+                state.depth.set(0);
+                (
+                    state.request.get(),
+                    std::array::from_fn::<_, N, _>(|i| state.calls[i].get()),
+                    std::array::from_fn::<_, N, _>(|i| state.ns[i].get()),
+                    [
+                        state.page_lookups.get(),
+                        state.page_hits.get(),
+                        state.page_fills.get(),
+                        state.page_bytes.get(),
+                        state.auth_bytes.get(),
+                    ],
+                )
+            });
+            // A record's finite field count and maximum decimal widths fit
+            // within 4KiB (native PIPE_BUF). Format on the stack and flush
+            // once after snapshotting; no per-piece stderr writes or heap.
+            let mut buffer = [0u8; 4096];
+            let mut output = std::io::Cursor::new(buffer.as_mut_slice());
+            let formatted = (|| -> std::io::Result<()> {
+                write!(
+                    output,
+                    "inline_phases pid={} request={} elapsed_ns={} nested_times=inclusive timer_clock_reads=2 page_lookups={} page_hits={} page_fills={} page_bytes={} auth_bytes={}",
+                    std::process::id(),
+                    request,
+                    elapsed,
+                    pages[0],
+                    pages[1],
+                    pages[2],
+                    pages[3],
+                    pages[4]
+                )?;
+                for (index, name) in NAMES.iter().enumerate() {
+                    write!(
+                        output,
+                        " {}_calls={} {}_ns={}",
+                        name, calls[index], name, ns[index]
+                    )?;
+                }
+                writeln!(output)
+            })();
+            let len = output.position() as usize;
+            drop(output);
+            if formatted.is_ok() {
+                let _ = std::io::stderr().write_all(&buffer[..len]);
+            }
+        }
+    }
+    pub struct Timer {
+        phase: Phase,
+        start: Option<Instant>,
+        request: u64,
+    }
+    #[inline]
+    pub fn enter(phase: Phase) -> Timer {
+        STATE.with(|state| {
+            // The off path checks one byte before touching any counter/array.
+            if !state.active.get() {
+                return Timer {
+                    phase,
+                    start: None,
+                    request: 0,
+                };
+            }
+            Timer {
+                phase,
+                start: Some(Instant::now()),
+                request: state.request.get(),
+            }
+        })
+    }
+    impl Drop for Timer {
+        #[inline]
+        fn drop(&mut self) {
+            let Some(start) = self.start else {
+                return;
+            };
+            // Enabled tiny-phase samples include two clock reads; use the
+            // same-ELF collection-off control to bound instrumentation cost.
+            let elapsed = start.elapsed().as_nanos() as u64;
+            STATE.with(|state| {
+                if state.active.get() && state.request.get() == self.request {
+                    let index = self.phase as usize;
+                    state.calls[index].set(state.calls[index].get().saturating_add(1));
+                    state.ns[index].set(state.ns[index].get().saturating_add(elapsed));
+                }
+            });
+        }
+    }
+    #[inline]
+    pub fn page_lookup(hit: bool) {
+        STATE.with(|state| {
+            if state.active.get() {
+                state.page_lookups.set(state.page_lookups.get() + 1);
+                state.page_hits.set(state.page_hits.get() + u64::from(hit));
+            }
+        });
+    }
+    #[inline]
+    pub fn page_fill(bytes: usize) {
+        STATE.with(|state| {
+            if state.active.get() {
+                state.page_fills.set(state.page_fills.get() + 1);
+                state.page_bytes.set(state.page_bytes.get() + bytes as u64);
+            }
+        });
+    }
+    #[inline]
+    pub fn authenticated(bytes: usize) {
+        STATE.with(|state| {
+            if state.active.get() {
+                state.auth_bytes.set(state.auth_bytes.get() + bytes as u64);
+            }
+        });
+    }
 }

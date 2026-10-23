@@ -53,7 +53,8 @@ struct NavigationPoint {
 }
 struct NavigationIdentity {
     row: RowId,
-    _point: PointId,
+    point: PointId,
+    origin: usize,
     _lsn: contextdb_core::Lsn,
     _created_tx: contextdb_core::TxId,
     _deleted_tx: Option<contextdb_core::TxId>,
@@ -234,6 +235,25 @@ impl NavigationCache {
             _ => None,
         }
     }
+    fn row_at_point(
+        &mut self,
+        layer: usize,
+        origin: usize,
+        point: PointId,
+    ) -> Result<Option<RowId>> {
+        match self.touch(NavigationKey::Identity(layer, origin)) {
+            Some(NavigationValue::Identity(identity)) => {
+                check_point_origin(Some(origin), identity.origin)?;
+                if identity.point != point {
+                    return Err(Error::Other(
+                        "paged graph edge disagrees with its point identity".into(),
+                    ));
+                }
+                Ok(Some(identity.row))
+            }
+            _ => Ok(None),
+        }
+    }
     fn row_version(&mut self, layer: usize, origin: usize) -> Option<Lsn> {
         match self.touch(NavigationKey::Identity(layer, origin)) {
             Some(NavigationValue::Identity(identity)) => Some(identity._lsn),
@@ -255,7 +275,8 @@ impl NavigationCache {
                 key,
                 NavigationValue::Identity(NavigationIdentity {
                     row: identity.row_id,
-                    _point: identity.point,
+                    point: identity.point,
+                    origin: identity.graph_origin,
                     _lsn: identity.lsn,
                     _created_tx: identity.created_tx,
                     _deleted_tx: identity.deleted_tx,
@@ -325,10 +346,11 @@ impl NavigationCache {
             neighbours: compact,
             values: None,
         };
-        // Upper-layer bodies remain optional. Do not evict the admitted new
-        // table while this entry is pending insertion; refusal is a body miss.
-        if id.0 != 0
-            && let paged_builder::PagedVectorPoint::F32(point) = value
+        // Every captured F32 point can serve its following distance request.
+        // Retain only after original-reader admission, while the native source
+        // window remains charged. Do not evict the pending table/entry here;
+        // refusal remains a body miss and mandatory source reads reclaim later.
+        if let paged_builder::PagedVectorPoint::F32(point) = value
             && let Some(body_bytes) = point.values.len().checked_mul(std::mem::size_of::<f32>())
             && self.payload_bytes.checked_add(body_bytes).is_some()
             && self.accountant.as_ref().is_some_and(|owner| {
@@ -388,7 +410,25 @@ impl NavigationSession {
         }
     }
     fn lock(&self) -> parking_lot::MutexGuard<'_, NavigationCache> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::NavigationLock,
+        );
         self.navigation.lock()
+    }
+    #[cfg(test)]
+    pub(crate) fn fill_base_body_for_test(&self, point: &paged_builder::PagedVectorPoint) {
+        self.lock().remember_point(0, PointId(0, 0), point);
+        assert!(
+            self.lock()
+                .point(0, PointId(0, 0))
+                .unwrap()
+                .values
+                .is_some()
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn has_base_body_for_test(&self) -> bool {
+        self.lock().point(0, PointId(0, 0)).is_some()
     }
     pub(crate) fn owner(&self) -> Option<crate::memory_budget::MemoryBudgetOwner> {
         self.lock().accountant.clone()
@@ -750,12 +790,17 @@ impl HopScratch {
     {
         let wanted = point.neighbour_count(level);
         if wanted > self.charged {
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::Result,
-                previous_capacity: self.charged,
-                requested_capacity: wanted,
-                element_bytes: Self::ELEMENT_BYTES,
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::Result,
+                    previous_capacity: self.charged,
+                    requested_capacity: wanted,
+                    element_bytes: Self::ELEMENT_BYTES,
+                })
+            }?;
             self.charged = wanted;
             self.ids.clear();
             self.ids.reserve_exact(wanted);
@@ -772,11 +817,16 @@ impl HopScratch {
         let charged = self.charged;
         drop(self.ids);
         if charged != 0 {
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::Result,
-                capacity: charged,
-                element_bytes: Self::ELEMENT_BYTES,
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::Result,
+                    capacity: charged,
+                    element_bytes: Self::ELEMENT_BYTES,
+                })
+            };
         }
     }
 }
@@ -811,6 +861,14 @@ struct OpenLayer<'a, 's> {
     supplied: Option<UnionSeedRows<'s>>,
 }
 
+fn check_point_origin(expected: Option<usize>, actual: usize) -> Result<()> {
+    if expected.is_some_and(|expected| expected != actual) {
+        return Err(Error::Other(
+            "paged graph edge disagrees with its point origin".into(),
+        ));
+    }
+    Ok(())
+}
 impl<'a, 's> OpenLayer<'a, 's> {
     fn bit(&self, point: PointId) -> Option<usize> {
         let index = point.0 as usize;
@@ -842,6 +900,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
         point: PointId,
         before_source: &mut S,
     ) -> std::result::Result<Option<usize>, E> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Origin,
+        );
         Ok(match &self.graph {
             LayerGraph::Durable { reader, .. } => (|| -> std::result::Result<Option<usize>, E> {
                 before_source()?;
@@ -1011,12 +1072,22 @@ impl<'a, 's> OpenLayer<'a, 's> {
         F: FnMut(usize, RowId) -> bool,
     {
         let partition = self.partition;
-        if row.is_some_and(|row| is_allowed(partition, row)) {
+        if row.is_some_and(|row| {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+            );
+            is_allowed(partition, row)
+        }) {
             return Ok(true);
         }
         let mut found = false;
         self.for_each_member(origin, before_source, &mut |member, _, _| {
-            found = is_allowed(partition, member);
+            found = {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(partition, member)
+            };
             Ok(!found)
         })?;
         Ok(found)
@@ -1027,6 +1098,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
         origin: usize,
         before_source: &mut S,
     ) -> std::result::Result<Option<RowId>, E> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::RowLookup,
+        );
         match &self.graph {
             LayerGraph::Durable { reader, .. } => (|| {
                 before_source()?;
@@ -1050,6 +1124,56 @@ impl<'a, 's> OpenLayer<'a, 's> {
         }
     }
 
+    /// Resolve an edge's existing origin using the small authenticated identity
+    /// record. The edge must name this exact point before its row is consulted.
+    fn row_at_point<E: From<Error>, S: FnMut() -> std::result::Result<(), E>>(
+        &self,
+        origin: usize,
+        point: PointId,
+        before_source: &mut S,
+    ) -> std::result::Result<Option<RowId>, E> {
+        match &self.graph {
+            LayerGraph::Durable { reader, .. } => {
+                before_source()?;
+                if let Some(row) = self
+                    .navigation
+                    .lock()
+                    .row_at_point(self.source_layer, origin, point)
+                    .map_err(E::from)?
+                {
+                    return Ok(Some(row));
+                }
+                let identity = paged_builder::AdmittedPagedReader::with_reclamation(
+                    reader.borrow_mut().as_mut(),
+                    self.navigation.owner(),
+                    &|| self.navigation.reclaim(),
+                )
+                .identity(origin)
+                .map_err(E::from)?;
+                check_point_origin(Some(origin), identity.graph_origin).map_err(E::from)?;
+                if identity.point != point {
+                    return Err(E::from(Error::Other(
+                        "paged graph edge disagrees with its point identity".into(),
+                    )));
+                }
+                let row = identity.row_id;
+                self.navigation
+                    .lock()
+                    .remember_identity(self.source_layer, origin, &identity);
+                Ok(Some(row))
+            }
+            _ => {
+                let actual = self.origin(point, before_source)?;
+                if actual != Some(origin) {
+                    return Err(E::from(Error::Other(
+                        "graph edge disagrees with its point origin".into(),
+                    )));
+                }
+                self.row(origin, before_source)
+            }
+        }
+    }
+
     /// The version `origin`'s own row stores at this point, where the layer
     /// records it; `None` for a decoded sealed point, which is the version
     /// visible at the layer's covered frontier.
@@ -1058,6 +1182,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
         origin: usize,
         before_source: &mut S,
     ) -> std::result::Result<Option<Lsn>, E> {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::RowVersion,
+        );
         match &self.graph {
             LayerGraph::Durable { reader, .. } => {
                 if let Some(lsn) = self
@@ -1089,6 +1216,7 @@ impl<'a, 's> OpenLayer<'a, 's> {
     fn neighbours<'h, E, A, S>(
         &self,
         point: PointId,
+        expected_origin: Option<usize>,
         level: usize,
         scratch: &'h mut HopScratch,
         acquire: &mut A,
@@ -1100,6 +1228,9 @@ impl<'a, 's> OpenLayer<'a, 's> {
         S: FnMut() -> std::result::Result<(), E>,
         A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
     {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Neighbours,
+        );
         match &self.graph {
             LayerGraph::Durable { tail, reader } => {
                 {
@@ -1107,12 +1238,17 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     // separate admission while their allocations coexist.
                     let wanted = super::layer0_serving_degree(tail.definition().2.hnsw_m);
                     if wanted > scratch.charged {
-                        acquire(HnswSearchScratchEvent::Reserve {
-                            container: HnswSearchScratchContainer::Result,
-                            previous_capacity: scratch.charged,
-                            requested_capacity: wanted,
-                            element_bytes: HopScratch::ELEMENT_BYTES,
-                        })?;
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                                contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                            );
+                            acquire(HnswSearchScratchEvent::Reserve {
+                                container: HnswSearchScratchContainer::Result,
+                                previous_capacity: scratch.charged,
+                                requested_capacity: wanted,
+                                element_bytes: HopScratch::ELEMENT_BYTES,
+                            })
+                        }?;
                         scratch.charged = wanted;
                         scratch.ids.clear();
                         scratch.ids.reserve_exact(wanted);
@@ -1121,6 +1257,7 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     {
                         let mut navigation = self.navigation.lock();
                         if let Some(cached) = navigation.point(self.source_layer, point) {
+                            check_point_origin(expected_origin, cached.origin).map_err(E::from)?;
                             let Some(edges) = cached.neighbours.get(level) else {
                                 return Ok(None);
                             };
@@ -1144,10 +1281,13 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     self.navigation
                         .lock()
                         .remember_point(self.source_layer, point, &value);
-                    let neighbours = match &*value {
-                        paged_builder::PagedVectorPoint::F32(p) => &p.neighbours,
-                        paged_builder::PagedVectorPoint::Quantized(p) => &p.neighbours,
+                    let (actual_origin, neighbours) = match &*value {
+                        paged_builder::PagedVectorPoint::F32(p) => (p.origin_id, &p.neighbours),
+                        paged_builder::PagedVectorPoint::Quantized(p) => {
+                            (p.origin_id, &p.neighbours)
+                        }
                     };
+                    check_point_origin(expected_origin, actual_origin).map_err(E::from)?;
                     let Some(edges) = neighbours.get(level) else {
                         return Ok(None);
                     };
@@ -1194,6 +1334,7 @@ impl<'a, 's> OpenLayer<'a, 's> {
     fn distance<E, S, D, A, R>(
         &mut self,
         point: PointId,
+        expected_origin: Option<usize>,
         query: &UnionQuery<'_>,
         before_source_entry: &mut S,
         before_distance: &mut D,
@@ -1207,67 +1348,96 @@ impl<'a, 's> OpenLayer<'a, 's> {
         A: FnMut(HnswSearchScratchEvent) -> std::result::Result<(), E>,
         R: FnMut(HnswSearchScratchEvent),
     {
+        let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Distance,
+        );
         match &mut self.graph {
-            LayerGraph::Durable { tail, reader } => (|| {
-                before_source_entry()?;
-                let cached = {
-                    let mut navigation = self.navigation.lock();
-                    navigation
-                        .point(self.source_layer, point)
-                        .and_then(|point| point.values.as_ref())
-                        .is_some()
-                };
-                if cached {
-                    before_distance()?;
-                    let mut navigation = self.navigation.lock();
-                    if let Some(values) = navigation
-                        .point(self.source_layer, point)
-                        .and_then(|point| point.values.as_ref())
+            LayerGraph::Durable { tail, reader } => {
+                let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::DurableDistance,
+                );
+                (|| {
                     {
-                        let distance = hnsw_f32_distance().eval(query.values, values);
-                        if !distance.is_finite() {
-                            return Err(E::from(Error::Other(
-                                "invalid paged graph distance".into(),
-                            )));
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                        );
+                        before_source_entry()
+                    }?;
+                    let cached = {
+                        let mut navigation = self.navigation.lock();
+                        if let Some(point) = navigation.point(self.source_layer, point) {
+                            check_point_origin(expected_origin, point.origin).map_err(E::from)?;
+                            point.values.is_some()
+                        } else {
+                            false
                         }
-                        return Ok(Some(distance));
+                    };
+                    if cached {
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeDistance);
+                            before_distance()
+                        }?;
+                        let mut navigation = self.navigation.lock();
+                        if let Some(values) = navigation
+                            .point(self.source_layer, point)
+                            .and_then(|point| point.values.as_ref())
+                        {
+                            let distance = hnsw_f32_distance().eval(query.values, values);
+                            if !distance.is_finite() {
+                                return Err(E::from(Error::Other(
+                                    "invalid paged graph distance".into(),
+                                )));
+                            }
+                            return Ok(Some(distance));
+                        }
                     }
-                }
-                let value = paged_builder::AdmittedPagedReader::with_reclamation(
-                    reader.borrow_mut().as_mut(),
-                    self.navigation.owner(),
-                    &|| self.navigation.reclaim(),
-                )
-                .load_point(point)
-                .map_err(E::from)?;
-                self.navigation
-                    .lock()
-                    .remember_point(self.source_layer, point, &value);
-                if !cached {
-                    before_distance()?;
-                }
-                let distance = match &*value {
-                    paged_builder::PagedVectorPoint::F32(point) => {
-                        hnsw_f32_distance().eval(query.values, &point.values)
+                    let value = paged_builder::AdmittedPagedReader::with_reclamation(
+                        reader.borrow_mut().as_mut(),
+                        self.navigation.owner(),
+                        &|| self.navigation.reclaim(),
+                    )
+                    .load_point(point)
+                    .map_err(E::from)?;
+                    self.navigation
+                        .lock()
+                        .remember_point(self.source_layer, point, &value);
+                    if !cached {
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeDistance);
+                            before_distance()
+                        }?;
                     }
-                    paged_builder::PagedVectorPoint::Quantized(point) => DistQuantizedCosine {
-                        quantization: tail.definition().1,
+                    let actual_origin = match &*value {
+                        paged_builder::PagedVectorPoint::F32(point) => point.origin_id,
+                        paged_builder::PagedVectorPoint::Quantized(point) => point.origin_id,
+                    };
+                    check_point_origin(expected_origin, actual_origin).map_err(E::from)?;
+                    let distance = match &*value {
+                        paged_builder::PagedVectorPoint::F32(point) => {
+                            hnsw_f32_distance().eval(query.values, &point.values)
+                        }
+                        paged_builder::PagedVectorPoint::Quantized(point) => DistQuantizedCosine {
+                            quantization: tail.definition().1,
+                        }
+                        .eval(
+                            query.encoded.ok_or_else(|| {
+                                E::from(Error::Other(
+                                    "paged quantized graph requires an encoded query".into(),
+                                ))
+                            })?,
+                            &point.values,
+                        ),
+                    };
+                    if !distance.is_finite() {
+                        return Err(E::from(Error::Other("invalid paged graph distance".into())));
                     }
-                    .eval(
-                        query.encoded.ok_or_else(|| {
-                            E::from(Error::Other(
-                                "paged quantized graph requires an encoded query".into(),
-                            ))
-                        })?,
-                        &point.values,
-                    ),
-                };
-                if !distance.is_finite() {
-                    return Err(E::from(Error::Other("invalid paged graph distance".into())));
-                }
-                Ok(Some(distance))
-            })(),
+                    Ok(Some(distance))
+                })()
+            }
             LayerGraph::Paged { paged, reader } => {
+                let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::PagedDistance,
+                );
                 let Some(stored) = paged.point(point) else {
                     return Ok(None);
                 };
@@ -1286,13 +1456,22 @@ impl<'a, 's> OpenLayer<'a, 's> {
                     .map_err(map_core_bounded_error)
             }
             LayerGraph::ResidentF32 { points, distance } => {
+                let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::ResidentF32Distance,
+                );
                 let Some(stored) = points.resident_point(&point) else {
                     return Ok(None);
                 };
-                before_distance()?;
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::BeforeDistance,
+                    );
+                    before_distance()
+                }?;
                 Ok(Some(distance.eval(query.values, stored.get_v())))
             }
             LayerGraph::ResidentQuantized { points, distance } => {
+                let _inline_inner = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResidentQuantizedDistance);
                 let Some(stored) = points.resident_point(&point) else {
                     return Ok(None);
                 };
@@ -1303,7 +1482,12 @@ impl<'a, 's> OpenLayer<'a, 's> {
                         .into(),
                     ))
                 })?;
-                before_distance()?;
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::BeforeDistance,
+                    );
+                    before_distance()
+                }?;
                 Ok(Some(distance.eval(encoded, stored.get_v())))
             }
         }
@@ -1390,7 +1574,12 @@ where
             if let Err(stop) = walk.charge_rescore() {
                 return Ok(Err(stop));
             }
-            let score = resolve_score(partition, row_id, before_source_entry, before_distance)?;
+            let score = {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::ResolveScore,
+                );
+                resolve_score(partition, row_id, before_source_entry, before_distance)
+            }?;
             Ok(Ok(score.map(|score| (1.0 - score, Some(score)))))
         }
     }
@@ -1505,32 +1694,47 @@ impl Walk<'_> {
                 .checked_mul(VISIT_ELEMENT_BYTES)
                 .and_then(|n| n.checked_add(16))
                 .ok_or_else(|| E::from(Error::Other("graph visit allocation overflow".into())))?;
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::VisitedPoints,
-                previous_capacity: 0,
-                requested_capacity: bytes,
-                element_bytes: 1,
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::VisitedPoints,
+                    previous_capacity: 0,
+                    requested_capacity: bytes,
+                    element_bytes: 1,
+                })
+            }?;
             if self
                 .reached
                 .try_reserve(wanted.saturating_sub(self.reached.len()))
                 .is_err()
             {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::VisitedPoints,
-                    capacity: bytes,
-                    element_bytes: 1,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::VisitedPoints,
+                        capacity: bytes,
+                        element_bytes: 1,
+                    })
+                };
                 return Err(E::from(Error::Other(
                     "cannot allocate admitted graph visit scratch".into(),
                 )));
             }
             if self.visit_bytes != 0 {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::VisitedPoints,
-                    capacity: self.visit_bytes,
-                    element_bytes: 1,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::VisitedPoints,
+                        capacity: self.visit_bytes,
+                        element_bytes: 1,
+                    })
+                };
             }
             self.visit_bytes = bytes;
         }
@@ -1708,19 +1912,29 @@ impl Walk<'_> {
                         "graph retained-row allocation overflow".into(),
                     ))
                 })?;
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::SeenRows,
-                previous_capacity: 0,
-                requested_capacity: bytes,
-                element_bytes: 1,
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::SeenRows,
+                    previous_capacity: 0,
+                    requested_capacity: bytes,
+                    element_bytes: 1,
+                })
+            }?;
             let mut replacement = HashMap::new();
             if replacement.try_reserve(wanted).is_err() {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::SeenRows,
-                    capacity: bytes,
-                    element_bytes: 1,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::SeenRows,
+                        capacity: bytes,
+                        element_bytes: 1,
+                    })
+                };
                 return Err(E::from(Error::Other(
                     "cannot allocate retained-row scratch".into(),
                 )));
@@ -1729,11 +1943,16 @@ impl Walk<'_> {
             self.kept_rows.extend(old);
             // Consuming the old map has physically freed its buckets.
             if self.kept_rows_bytes != 0 {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::SeenRows,
-                    capacity: self.kept_rows_bytes,
-                    element_bytes: 1,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::SeenRows,
+                        capacity: self.kept_rows_bytes,
+                        element_bytes: 1,
+                    })
+                };
             }
             self.kept_rows_bytes = bytes;
         }
@@ -1761,32 +1980,47 @@ impl Walk<'_> {
                 .saturating_mul(2)
                 .max(FRONTIER_FIRST_CHARGE)
                 .min(self.frontier_capacity);
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::CandidateHeap,
-                previous_capacity: 0,
-                requested_capacity: grown,
-                element_bytes: std::mem::size_of::<Nearest>(),
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::CandidateHeap,
+                    previous_capacity: 0,
+                    requested_capacity: grown,
+                    element_bytes: std::mem::size_of::<Nearest>(),
+                })
+            }?;
             if self
                 .frontier
                 .try_reserve_exact(grown.saturating_sub(self.frontier.len()))
                 .is_err()
             {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::CandidateHeap,
-                    capacity: grown,
-                    element_bytes: std::mem::size_of::<Nearest>(),
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::CandidateHeap,
+                        capacity: grown,
+                        element_bytes: std::mem::size_of::<Nearest>(),
+                    })
+                };
                 return Err(E::from(Error::Other(
                     "cannot allocate graph frontier".into(),
                 )));
             }
             if self.frontier_charged != 0 {
-                release(HnswSearchScratchEvent::Release {
-                    container: HnswSearchScratchContainer::CandidateHeap,
-                    capacity: self.frontier_charged,
-                    element_bytes: std::mem::size_of::<Nearest>(),
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: HnswSearchScratchContainer::CandidateHeap,
+                        capacity: self.frontier_charged,
+                        element_bytes: std::mem::size_of::<Nearest>(),
+                    })
+                };
             }
             self.frontier_charged = grown;
         }
@@ -2261,12 +2495,17 @@ where
             if paged.entry_point.is_none() {
                 return Ok(None);
             }
-            acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::ServingPageDirectory,
-                previous_capacity: 0,
-                requested_capacity: paged.page_slots,
-                element_bytes: SERVING_PAGE_DIRECTORY_ENTRY_BYTES,
-            })?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::ServingPageDirectory,
+                    previous_capacity: 0,
+                    requested_capacity: paged.page_slots,
+                    element_bytes: SERVING_PAGE_DIRECTORY_ENTRY_BYTES,
+                })
+            }?;
             *directory_entries = directory_entries.saturating_add(paged.page_slots);
             let reader =
                 ServingPages::new(paged.source.reader().map_err(E::from)?, paged.page_slots);
@@ -2463,12 +2702,17 @@ where
     // duplicate directory or uncharged replacement during layer opening.
     let open_element_bytes =
         std::mem::size_of::<OpenLayer<'_, '_>>() + 16 * std::mem::size_of::<usize>();
-    acquire(HnswSearchScratchEvent::Reserve {
-        container: HnswSearchScratchContainer::ServingPageDirectory,
-        previous_capacity: 0,
-        requested_capacity: layers.len(),
-        element_bytes: open_element_bytes,
-    })?;
+    {
+        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+        );
+        acquire(HnswSearchScratchEvent::Reserve {
+            container: HnswSearchScratchContainer::ServingPageDirectory,
+            previous_capacity: 0,
+            requested_capacity: layers.len(),
+            element_bytes: open_element_bytes,
+        })
+    }?;
     // Open every layer: how it is read, its identity map, its seed directory.
     let mut open = Vec::<OpenLayer<'_, '_>>::with_capacity(layers.len());
     let mut total_points = 0usize;
@@ -2482,12 +2726,22 @@ where
     let mut encoded_query = None::<Vec<u8>>;
     let opened = (|| -> std::result::Result<(), E> {
         for (source_layer, layer) in layers.iter().enumerate() {
-            before_source_entry()?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                );
+                before_source_entry()
+            }?;
             if layer.graph.is_empty() {
                 continue;
             }
             let partition = layer.partition;
-            let mut layer_allowed = |row: RowId| is_allowed(partition, row);
+            let mut layer_allowed = |row: RowId| {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(partition, row)
+            };
             let seed_all = layer.seed_rows.is_none();
             let seed_rows = || {
                 layer.seed_rows.map_or_else(
@@ -2595,20 +2849,30 @@ where
     })();
     let release_seeds = |release: &mut R, bytes: usize| {
         if bytes != 0 {
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::Result,
-                capacity: bytes / std::mem::size_of::<PointId>().max(1),
-                element_bytes: std::mem::size_of::<PointId>(),
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::Result,
+                    capacity: bytes / std::mem::size_of::<PointId>().max(1),
+                    element_bytes: std::mem::size_of::<PointId>(),
+                })
+            };
         }
     };
     let release_directories = |release: &mut R, entries: usize| {
         if entries != 0 {
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::ServingPageDirectory,
-                capacity: entries,
-                element_bytes: SERVING_PAGE_DIRECTORY_ENTRY_BYTES,
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::ServingPageDirectory,
+                    capacity: entries,
+                    element_bytes: SERVING_PAGE_DIRECTORY_ENTRY_BYTES,
+                })
+            };
         }
     };
     fn release_encoded<E, A, R>(acquire: &mut A, release: &mut R, encoded: Option<Vec<u8>>)
@@ -2624,11 +2888,16 @@ where
     }
     if let Err(error) = opened {
         drop(open);
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::ServingPageDirectory,
-            capacity: layers.len(),
-            element_bytes: open_element_bytes,
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::ServingPageDirectory,
+                capacity: layers.len(),
+                element_bytes: open_element_bytes,
+            })
+        };
         release_encoded(&mut acquire, &mut release, encoded_query);
         release_directories(&mut release, directory_entries);
         release_seeds(&mut release, seed_bytes);
@@ -2636,11 +2905,16 @@ where
     }
     if open.is_empty() {
         drop(open);
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::ServingPageDirectory,
-            capacity: layers.len(),
-            element_bytes: open_element_bytes,
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::ServingPageDirectory,
+                capacity: layers.len(),
+                element_bytes: open_element_bytes,
+            })
+        };
         release_encoded(&mut acquire, &mut release, encoded_query);
         release_directories(&mut release, directory_entries);
         release_seeds(&mut release, seed_bytes);
@@ -2685,25 +2959,40 @@ where
     for (reserved, (container, requested_capacity, element_bytes)) in
         reservations.into_iter().enumerate()
     {
-        if let Err(error) = acquire(HnswSearchScratchEvent::Reserve {
-            container,
-            previous_capacity: 0,
-            requested_capacity,
-            element_bytes,
-        }) {
+        if let Err(error) = {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+            );
+            acquire(HnswSearchScratchEvent::Reserve {
+                container,
+                previous_capacity: 0,
+                requested_capacity,
+                element_bytes,
+            })
+        } {
             for (container, capacity, element_bytes) in &reservations[..reserved] {
-                release(HnswSearchScratchEvent::Release {
-                    container: *container,
-                    capacity: *capacity,
-                    element_bytes: *element_bytes,
-                });
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::Release,
+                    );
+                    release(HnswSearchScratchEvent::Release {
+                        container: *container,
+                        capacity: *capacity,
+                        element_bytes: *element_bytes,
+                    })
+                };
             }
             drop(open);
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::ServingPageDirectory,
-                capacity: layers.len(),
-                element_bytes: open_element_bytes,
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::ServingPageDirectory,
+                    capacity: layers.len(),
+                    element_bytes: open_element_bytes,
+                })
+            };
             release_encoded(&mut acquire, &mut release, encoded_query);
             release_directories(&mut release, directory_entries);
             release_seeds(&mut release, seed_bytes);
@@ -2955,7 +3244,10 @@ where
             if let Some(key) = key {
                 for open_layer in &open {
                     if let LayerGraph::Durable { reader, .. } = &open_layer.graph {
-                        before_source_entry()?;
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                            before_source_entry()
+                        }?;
                         if paged_builder::AdmittedPagedReader::with_reclamation(
                             reader.borrow_mut().as_mut(),
                             navigation.owner(),
@@ -3053,13 +3345,21 @@ where
                 return Ok(());
             };
             for (position, layer) in layers.iter().enumerate() {
-                before_source_entry()?;
+                {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                    );
+                    before_source_entry()
+                }?;
                 if let Some(open_layer) = open.iter().find(|opened| opened.source_layer == position)
                     && let LayerGraph::Durable { reader, .. } = &open_layer.graph
                 {
                     let mut after = None;
                     loop {
-                        before_source_entry()?;
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                            before_source_entry()
+                        }?;
                         let Some(row_id) = paged_builder::AdmittedPagedReader::with_reclamation(
                             reader.borrow_mut().as_mut(),
                             navigation.owner(),
@@ -3077,7 +3377,10 @@ where
                         }
                         after = Some(row_id);
                         if layer.seed_rows.is_some_and(|rows| !rows.contains(row_id.0))
-                            || !is_allowed(layer.partition, row_id)
+                            || !{
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed);
+                                is_allowed(layer.partition, row_id)
+                            }
                         {
                             continue;
                         }
@@ -3119,9 +3422,9 @@ where
                             &mut acquire,
                             &mut release,
                             |row_id, before_source_entry, _, _| {
-                                before_source_entry()?;
+                                { let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource); before_source_entry() }?;
                                 if layer.seed_rows.is_some_and(|rows| !rows.contains(row_id.0))
-                                    || !is_allowed(layer.partition, row_id)
+                                    || !{ let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed); is_allowed(layer.partition, row_id) }
                                 {
                                     return Ok(false);
                                 }
@@ -3165,8 +3468,18 @@ where
                         break;
                     };
                     let row_id = &row_id;
-                    before_source_entry()?;
-                    if is_allowed(layer.partition, *row_id) {
+                    {
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                        );
+                        before_source_entry()
+                    }?;
+                    if {
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                        );
+                        is_allowed(layer.partition, *row_id)
+                    } {
                         if ties.len() < kept_capacity {
                             ties.push((position, *row_id, None));
                         } else if let Some((worst, worst_id)) = ties
@@ -3206,11 +3519,21 @@ where
             let mut index = 0usize;
             while index < ties.len() {
                 let (position, row_id, _) = ties[index];
-                if let Err(error) = before_source_entry() {
+                if let Err(error) = {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                    );
+                    before_source_entry()
+                } {
                     retained = Err(error);
                     break;
                 }
-                if !is_allowed(layers[position].partition, row_id) {
+                if !{
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                    );
+                    is_allowed(layers[position].partition, row_id)
+                } {
                     ties.remove(index);
                     continue;
                 }
@@ -3238,12 +3561,15 @@ where
                             ties.clear();
                             break;
                         }
-                        match resolve_score(
-                            partition,
-                            row_id,
-                            &mut before_source_entry,
-                            &mut before_distance,
-                        ) {
+                        match {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResolveScore);
+                            resolve_score(
+                                partition,
+                                row_id,
+                                &mut before_source_entry,
+                                &mut before_distance,
+                            )
+                        } {
                             Ok(score) => score,
                             Err(error) => {
                                 retained = Err(error);
@@ -3408,11 +3734,16 @@ where
     if disconnected.capacity() != 0 {
         let capacity = disconnected.capacity();
         drop(disconnected);
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::Result,
-            capacity,
-            element_bytes: std::mem::size_of::<usize>(),
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::Result,
+                capacity,
+                element_bytes: std::mem::size_of::<usize>(),
+            })
+        };
     }
 
     // Each charge goes back only once what it covers has been dropped.
@@ -3423,34 +3754,54 @@ where
     let bridges = std::mem::take(&mut walk.bridges);
     drop(walk);
     if visit_bytes != 0 {
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::VisitedPoints,
-            capacity: visit_bytes,
-            element_bytes: 1,
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::VisitedPoints,
+                capacity: visit_bytes,
+                element_bytes: 1,
+            })
+        };
     }
     hops.release(&mut release);
     bridges.release(&mut release);
     for (container, capacity, element_bytes) in reservations {
-        release(HnswSearchScratchEvent::Release {
-            container,
-            capacity,
-            element_bytes,
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container,
+                capacity,
+                element_bytes,
+            })
+        };
     }
     if frontier_charged != 0 {
-        release(HnswSearchScratchEvent::Release {
-            container: HnswSearchScratchContainer::CandidateHeap,
-            capacity: frontier_charged,
-            element_bytes: std::mem::size_of::<Nearest>(),
-        });
+        {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::Release,
+            );
+            release(HnswSearchScratchEvent::Release {
+                container: HnswSearchScratchContainer::CandidateHeap,
+                capacity: frontier_charged,
+                element_bytes: std::mem::size_of::<Nearest>(),
+            })
+        };
     }
     drop(open);
-    release(HnswSearchScratchEvent::Release {
-        container: HnswSearchScratchContainer::ServingPageDirectory,
-        capacity: layers.len(),
-        element_bytes: open_element_bytes,
-    });
+    {
+        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+            contextdb_core::find_attribution::inline_phases::Phase::Release,
+        );
+        release(HnswSearchScratchEvent::Release {
+            container: HnswSearchScratchContainer::ServingPageDirectory,
+            capacity: layers.len(),
+            element_bytes: open_element_bytes,
+        })
+    };
     release_encoded(&mut acquire, &mut release, encoded_query);
     release_directories(&mut release, directory_entries);
     release_seeds(&mut release, seed_bytes);
@@ -3495,6 +3846,7 @@ where
     }
     let Some(distance) = layer.distance(
         point,
+        None,
         query,
         before_source_entry,
         before_distance,
@@ -3593,10 +3945,12 @@ where
             let origin = layer
                 .origin(entry_id, before_source_entry)?
                 .ok_or_else(|| E::from(Error::Other("graph entry identity".into())))?;
-            if !layer
-                .row(origin, before_source_entry)?
-                .is_some_and(|row| is_allowed(partition, row))
-            {
+            if !layer.row(origin, before_source_entry)?.is_some_and(|row| {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(partition, row)
+            }) {
                 let mut oldest = None;
                 for (level, end) in layer.level_ends.iter().copied().enumerate() {
                     let start = if level == 0 {
@@ -3616,9 +3970,12 @@ where
                     }
                 }
                 if let Some((point, origin)) = oldest
-                    && layer
-                        .row(origin, before_source_entry)?
-                        .is_some_and(|row| is_allowed(partition, row))
+                    && layer.row(origin, before_source_entry)?.is_some_and(|row| {
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                        );
+                        is_allowed(partition, row)
+                    })
                 {
                     entry_id = point;
                 }
@@ -3655,6 +4012,7 @@ where
             layer,
             position,
             entry_id,
+            None,
             walk,
             query,
             allow_bridges,
@@ -3678,6 +4036,7 @@ where
                 let neighbours = layer
                     .neighbours(
                         pivot_id,
+                        None,
                         level as usize,
                         &mut *hops,
                         acquire,
@@ -3693,7 +4052,7 @@ where
                     if !allow_bridges
                         && !layer
                             .row(neighbour_origin, before_source_entry)?
-                            .is_some_and(|row| is_allowed(partition, row))
+                            .is_some_and(|row| { let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed); is_allowed(partition, row) })
                     {
                         continue;
                     }
@@ -3722,6 +4081,7 @@ where
                         layer,
                         position,
                         neighbour_id,
+                        Some(neighbour_origin),
                         walk,
                         query,
                         allow_bridges,
@@ -3876,18 +4236,28 @@ where
     ];
     if !settled.is_empty() {
         for (admitted, element_bytes) in settled_charges.iter().copied().enumerate() {
-            if let Err(error) = acquire(HnswSearchScratchEvent::Reserve {
-                container: HnswSearchScratchContainer::MergeResults,
-                previous_capacity: 0,
-                requested_capacity: settled.len(),
-                element_bytes,
-            }) {
+            if let Err(error) = {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Acquire,
+                );
+                acquire(HnswSearchScratchEvent::Reserve {
+                    container: HnswSearchScratchContainer::MergeResults,
+                    previous_capacity: 0,
+                    requested_capacity: settled.len(),
+                    element_bytes,
+                })
+            } {
                 for element_bytes in settled_charges[..admitted].iter().copied() {
-                    release(HnswSearchScratchEvent::Release {
-                        container: HnswSearchScratchContainer::MergeResults,
-                        capacity: settled.len(),
-                        element_bytes,
-                    });
+                    {
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::Release,
+                        );
+                        release(HnswSearchScratchEvent::Release {
+                            container: HnswSearchScratchContainer::MergeResults,
+                            capacity: settled.len(),
+                            element_bytes,
+                        })
+                    };
                 }
                 walk.hops = hops;
                 walk.bridges = bridges;
@@ -3949,8 +4319,16 @@ where
                             break;
                         }
                         let row = &settled[position];
-                        before_source_entry()?;
-                        if !is_allowed(row.partition, row.row_id) {
+                        {
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                            before_source_entry()
+                        }?;
+                        if !{
+                            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                                contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                            );
+                            is_allowed(row.partition, row.row_id)
+                        } {
                             continue;
                         }
                         let score = match settled_scores[position] {
@@ -3963,12 +4341,15 @@ where
                                         stop: Some(stop),
                                     });
                                 }
-                                let score = resolve_score(
-                                    row.partition,
-                                    row.row_id,
-                                    before_source_entry,
-                                    before_distance,
-                                )?;
+                                let score = {
+                                    let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResolveScore);
+                                    resolve_score(
+                                        row.partition,
+                                        row.row_id,
+                                        before_source_entry,
+                                        before_distance,
+                                    )
+                                }?;
                                 settled_scores[position] = Some(score);
                                 score
                             }
@@ -4014,8 +4395,14 @@ where
                             after =
                                 Some((kept.0.reached.distance, kept.0.partition, kept.0.row_id));
                             let key = (kept.0.partition, kept.0.row_id);
-                            before_source_entry()?;
-                            if !is_allowed(key.0, key.1) {
+                            {
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                                before_source_entry()
+                            }?;
+                            if !{
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed);
+                                is_allowed(key.0, key.1)
+                            } {
                                 continue;
                             }
                             let score = match walk
@@ -4033,12 +4420,15 @@ where
                                             stop: Some(stop),
                                         });
                                     }
-                                    resolve_score(
-                                        key.0,
-                                        key.1,
-                                        before_source_entry,
-                                        before_distance,
-                                    )?
+                                    {
+                                        let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResolveScore);
+                                        resolve_score(
+                                            key.0,
+                                            key.1,
+                                            before_source_entry,
+                                            before_distance,
+                                        )
+                                    }?
                                 }
                             };
                             if let Some(entry) = walk.kept_rows.get_mut(&key) {
@@ -4061,8 +4451,14 @@ where
                                 break;
                             }
                             let row = &settled[position];
-                            before_source_entry()?;
-                            if !is_allowed(row.partition, row.row_id) {
+                            {
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::BeforeSource);
+                                before_source_entry()
+                            }?;
+                            if !{
+                                let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::IsAllowed);
+                                is_allowed(row.partition, row.row_id)
+                            } {
                                 continue;
                             }
                             let score = match settled_scores[position] {
@@ -4075,12 +4471,15 @@ where
                                             stop: Some(stop),
                                         });
                                     }
-                                    let score = resolve_score(
-                                        row.partition,
-                                        row.row_id,
-                                        before_source_entry,
-                                        before_distance,
-                                    )?;
+                                    let score = {
+                                        let _phase = contextdb_core::find_attribution::inline_phases::enter(contextdb_core::find_attribution::inline_phases::Phase::ResolveScore);
+                                        resolve_score(
+                                            row.partition,
+                                            row.row_id,
+                                            before_source_entry,
+                                            before_distance,
+                                        )
+                                    }?;
                                     settled_scores[position] = Some(score);
                                     score
                                 }
@@ -4127,18 +4526,26 @@ where
             }
             let layer = &mut open[candidate.layer as usize];
             let neighbours = layer
-                .neighbours(candidate.point, 0, &mut hops, acquire, before_source_entry)?
+                .neighbours(
+                    candidate.point,
+                    Some(candidate.origin),
+                    0,
+                    &mut hops,
+                    acquire,
+                    before_source_entry,
+                )?
                 .ok_or_else(|| {
                     E::from(Error::Other(
                         ("graph layer-zero neighbours".to_string()).into(),
                     ))
                 })?;
             for hop in 0..neighbours.len() {
-                let (neighbour_id, _) = neighbours.get(hop);
+                let (neighbour_id, neighbour_origin) = neighbours.get(hop);
                 match consider(
                     layer,
                     candidate.layer as usize,
                     neighbour_id,
+                    Some(neighbour_origin),
                     walk,
                     query,
                     allow_bridges,
@@ -4164,6 +4571,7 @@ where
                 // already read; a point reached before is never read again.
                 let Some(bridge_hops) = layer.neighbours(
                     neighbour_id,
+                    Some(neighbour_origin),
                     0,
                     &mut bridges,
                     acquire,
@@ -4173,11 +4581,12 @@ where
                     continue;
                 };
                 for bridge in 0..bridge_hops.len() {
-                    let (bridge_id, _) = bridge_hops.get(bridge);
+                    let (bridge_id, bridge_origin) = bridge_hops.get(bridge);
                     if let Some(stop) = consider(
                         layer,
                         candidate.layer as usize,
                         bridge_id,
+                        Some(bridge_origin),
                         walk,
                         query,
                         allow_bridges,
@@ -4217,11 +4626,16 @@ where
     drop(settled_scores);
     if !settled.is_empty() {
         for element_bytes in settled_charges {
-            release(HnswSearchScratchEvent::Release {
-                container: HnswSearchScratchContainer::MergeResults,
-                capacity: settled.len(),
-                element_bytes,
-            });
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::Release,
+                );
+                release(HnswSearchScratchEvent::Release {
+                    container: HnswSearchScratchContainer::MergeResults,
+                    capacity: settled.len(),
+                    element_bytes,
+                })
+            };
         }
     }
     expanded
@@ -4269,7 +4683,12 @@ where
             if !visit.marked {
                 continue;
             }
-            before_source_entry()?;
+            {
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::BeforeSource,
+                );
+                before_source_entry()
+            }?;
             let Some(layer) = open.iter().rev().find(|layer| layer.first_bit <= *bit) else {
                 continue;
             };
@@ -4293,7 +4712,12 @@ where
             // only when the snapshot allows it.
             let partition = layer.partition;
             if let Some(row) = layer.row(origin, before_source_entry)?
-                && is_allowed(partition, row)
+                && {
+                    let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                        contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                    );
+                    is_allowed(partition, row)
+                }
             {
                 let needed = rows.len() + 1;
                 scratch.ensure_vec_capacity_compact(
@@ -4319,7 +4743,12 @@ where
             COUNTING_MEMBERS.with(|counting| counting.set(true));
             let counted =
                 layer.for_each_member(origin, &mut traversal_checkpoint, &mut |member, _, _| {
-                    if !is_allowed(partition, member) {
+                    if !{
+                        let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                            contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                        );
+                        is_allowed(partition, member)
+                    } {
                         return Ok(true);
                     }
                     let needed = rows.len() + 1;
@@ -4427,6 +4856,7 @@ fn consider<E, S, D, A, R, F, V>(
     layer: &mut OpenLayer<'_, '_>,
     position: usize,
     point_id: PointId,
+    edge_origin: Option<usize>,
     walk: &mut Walk<'_>,
     query: &UnionQuery<'_>,
     allow_bridges: bool,
@@ -4452,10 +4882,16 @@ where
     if walk.reached.get(&bit).is_some_and(|entry| entry.marked) {
         return Ok(Considered::Passed);
     }
-    let Some(origin) = layer.origin(point_id, before_source_entry)? else {
-        return Ok(Considered::Passed);
+    let origin = match edge_origin {
+        Some(origin) => origin,
+        None => {
+            let Some(origin) = layer.origin(point_id, before_source_entry)? else {
+                return Ok(Considered::Passed);
+            };
+            origin
+        }
     };
-    let row_id = layer.row(origin, before_source_entry)?;
+    let row_id = layer.row_at_point(origin, point_id, before_source_entry)?;
     #[cfg(feature = "test-seams")]
     if row_id.is_some_and(super::hnsw_row_unlinked_for_test) {
         return Ok(Considered::Passed);
@@ -4476,6 +4912,7 @@ where
         }
         let Some(distance) = layer.distance(
             point_id,
+            Some(origin),
             query,
             before_source_entry,
             before_distance,
@@ -4540,7 +4977,12 @@ where
 {
     let partition = layer.partition;
     if let Some(row_id) = layer.row(origin, before_source_entry)?
-        && is_allowed(partition, row_id)
+        && {
+            let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+            );
+            is_allowed(partition, row_id)
+        }
     {
         let stored = layer.row_version(origin, before_source_entry)?;
         let answered = match answer_distance(
@@ -4625,7 +5067,12 @@ where
         origin,
         before_source_entry,
         &mut |member, lsn, before_source| {
-            if !is_allowed(partition, member) {
+            if !{
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(partition, member)
+            } {
                 return Ok(true);
             }
             let answered = match answer_distance(
@@ -5041,13 +5488,19 @@ where
             break;
         };
         let layer = &mut open[candidate.layer as usize];
-        let listed: Vec<(PointId, usize)> =
-            match layer.neighbours(candidate.point, 0, &mut *hops, acquire, before_source_entry)? {
-                Some(neighbours) => (0..neighbours.len())
-                    .map(|hop| neighbours.get(hop))
-                    .collect(),
-                None => continue,
-            };
+        let listed: Vec<(PointId, usize)> = match layer.neighbours(
+            candidate.point,
+            Some(candidate.origin),
+            0,
+            &mut *hops,
+            acquire,
+            before_source_entry,
+        )? {
+            Some(neighbours) => (0..neighbours.len())
+                .map(|hop| neighbours.get(hop))
+                .collect(),
+            None => continue,
+        };
         for (point, origin) in listed {
             let Some(bit) = layer.bit(point) else {
                 continue;
@@ -5058,13 +5511,19 @@ where
             let Some(row_id) = layer.row(origin, before_source_entry)? else {
                 continue;
             };
-            if !is_allowed(layer.partition, row_id) {
+            if !{
+                let _phase = contextdb_core::find_attribution::inline_phases::enter(
+                    contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
+                );
+                is_allowed(layer.partition, row_id)
+            } {
                 continue;
             }
             let distance = match walk.reached.get(&bit).and_then(PointVisit::distance) {
                 Some(distance) => distance,
                 None => match layer.distance(
                     point,
+                    Some(origin),
                     query,
                     before_source_entry,
                     before_distance,
@@ -5980,3 +6439,306 @@ mod settled_scratch_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod admitted_navigation_body_tests {
+    use super::*;
+    use crate::memory_budget::{MemoryBudget, MemoryBudgetOwner};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug)]
+    pub(super) struct Budget {
+        pub(super) used: AtomicUsize,
+        pub(super) limit: AtomicUsize,
+    }
+    impl MemoryBudget for Budget {
+        fn try_allocate_for(
+            &self,
+            bytes: usize,
+            subsystem: &str,
+            operation: &str,
+            hint: &str,
+        ) -> Result<()> {
+            let limit = self.limit.load(Ordering::SeqCst);
+            self.used
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                    used.checked_add(bytes).filter(|next| *next <= limit)
+                })
+                .map_err(|used| Error::MemoryBudgetExceeded {
+                    subsystem: subsystem.to_owned().into(),
+                    operation: operation.to_owned().into(),
+                    requested_bytes: bytes,
+                    available_bytes: limit.saturating_sub(used),
+                    budget_limit_bytes: limit,
+                    hint: hint.to_owned().into(),
+                })?;
+            Ok(())
+        }
+        fn release(&self, bytes: usize) {
+            assert!(self.used.fetch_sub(bytes, Ordering::SeqCst) >= bytes);
+        }
+    }
+    pub(super) fn budget() -> Arc<Budget> {
+        Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: AtomicUsize::new(1024 * 1024),
+        })
+    }
+    fn point(id: PointId, value: f32) -> paged_builder::PagedVectorPoint {
+        paged_builder::PagedVectorPoint::F32(paged_builder::PagedPoint {
+            id,
+            origin_id: 7,
+            values: vec![value; 128],
+            neighbours: vec![Vec::new()],
+        })
+    }
+    #[test]
+    fn base_body_cache_separates_captured_layers_and_releases_the_original_funder() {
+        let payer = budget();
+        let mut cache = NavigationCache::new(Some(MemoryBudgetOwner::from(payer.clone())));
+        let id = PointId(0, 0);
+        cache.remember_point(0, id, &point(id, 1.0));
+        let held = payer.used.load(Ordering::SeqCst);
+        assert!(held >= 128 * std::mem::size_of::<f32>());
+        assert_eq!(
+            cache.point(0, id).unwrap().values.as_deref(),
+            Some(&[1.0; 128][..])
+        );
+        // A later captured layer with the same point identity must never read
+        // the earlier layer's values. Both generations can remain live.
+        cache.remember_point(1, id, &point(id, 2.0));
+        assert_eq!(
+            cache.point(1, id).unwrap().values.as_deref(),
+            Some(&[2.0; 128][..])
+        );
+        assert_eq!(
+            cache.point(0, id).unwrap().values.as_deref(),
+            Some(&[1.0; 128][..])
+        );
+        assert!(payer.used.load(Ordering::SeqCst) > held);
+        assert!(cache.evict_lru());
+        assert!(cache.point(1, id).is_none());
+        assert_eq!(
+            cache.point(0, id).unwrap().values.as_deref(),
+            Some(&[1.0; 128][..])
+        );
+        drop(cache);
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn optional_base_body_refusal_preserves_navigation_and_unwind_refunds_it() {
+        let payer = budget();
+        let id = PointId(0, 0);
+        let mut cache = NavigationCache::new(Some(MemoryBudgetOwner::from(payer.clone())));
+        // Admit table/adjacency first using an empty body. Reuse the measured
+        // actual charge as the next cache's ceiling; the real body cannot fit.
+        cache.remember_point(
+            0,
+            id,
+            &paged_builder::PagedVectorPoint::F32(paged_builder::PagedPoint {
+                id,
+                origin_id: 7,
+                values: Vec::new(),
+                neighbours: vec![Vec::new()],
+            }),
+        );
+        let navigation_only = payer.used.load(Ordering::SeqCst);
+        drop(cache);
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+        payer.limit.store(navigation_only, Ordering::SeqCst);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cache = NavigationCache::new(Some(MemoryBudgetOwner::from(payer.clone())));
+            cache.remember_point(0, id, &point(id, 3.0));
+            assert_eq!(cache.point(0, id).unwrap().origin, 7);
+            assert!(cache.point(0, id).unwrap().values.is_none());
+            assert_eq!(payer.used.load(Ordering::SeqCst), navigation_only);
+            panic!("caller unwinds with admitted optional navigation");
+        }));
+        assert!(result.is_err());
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+        let session = NavigationSession::new(Some(MemoryBudgetOwner::from(payer.clone())));
+        session.lock().remember_point(0, id, &point(id, 4.0));
+        session.release_navigation_before_body();
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn mandatory_navigation_admission_evicts_optional_base_bodies_at_the_same_limit() {
+        let payer = budget();
+        let id = PointId(0, 0);
+        let session = NavigationSession::new(Some(MemoryBudgetOwner::from(payer.clone())));
+        session.lock().remember_point(0, id, &point(id, 5.0));
+        let retained = payer.used.load(Ordering::SeqCst);
+        assert!(session.lock().point(0, id).unwrap().values.is_some());
+        payer.limit.store(retained, Ordering::SeqCst);
+        let mut mandatory = crate::memory_budget::VectorCopyAdmission::new(payer.clone());
+        session
+            .reserve_for(
+                &mut mandatory,
+                128 * std::mem::size_of::<f32>(),
+                "vector_index",
+                "mandatory_source_window",
+                "same original finite limit",
+            )
+            .unwrap();
+        assert!(
+            session.lock().point(0, id).is_none(),
+            "the original finite admission must evict the optional entry before succeeding"
+        );
+        assert_eq!(payer.limit.load(Ordering::SeqCst), retained);
+        assert_eq!(
+            payer.used.load(Ordering::SeqCst),
+            128 * std::mem::size_of::<f32>()
+        );
+        drop(mandatory);
+        drop(session);
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+    }
+
+    struct AdmittingPointReader {
+        bytes: usize,
+        copied: usize,
+    }
+    impl paged_builder::PagedVectorReader for AdmittingPointReader {
+        fn read_with_copy_admission(
+            &mut self,
+            request: paged_builder::PagedVectorReadRequest<'_>,
+            admit: &mut dyn FnMut(usize) -> Result<Option<crate::VectorCopyAdmission>>,
+        ) -> Result<paged_builder::PagedVectorReadValue> {
+            let paged_builder::PagedVectorReadRequest::Point { id } = request else {
+                panic!("this fixture accepts only the actual point request");
+            };
+            // Match the native reader's contract: reserve before constructing
+            // the owned body, and keep that exact token in the returned copy.
+            let token = admit(self.bytes)?;
+            self.copied += 1;
+            Ok(paged_builder::PagedVectorReadValue::Point(
+                crate::memory_budget::ScopedVectorCopy::from_admitted(point(id, 9.0), token),
+            ))
+        }
+        fn load_point(&mut self, _: PointId) -> Result<paged_builder::PagedVectorPoint> {
+            panic!("must use copy admission")
+        }
+        fn identity(&mut self, _: usize) -> Result<paged_builder::PagedVectorIdentity> {
+            unreachable!()
+        }
+        fn point_for_row(
+            &mut self,
+            _: contextdb_core::RowId,
+            _: contextdb_core::SnapshotId,
+        ) -> Result<Option<PointId>> {
+            unreachable!()
+        }
+        fn exact_rows(
+            &mut self,
+            _: &[u8],
+            _: contextdb_core::SnapshotId,
+            _: Option<contextdb_core::RowId>,
+            _: usize,
+        ) -> Result<Vec<contextdb_core::RowId>> {
+            unreachable!()
+        }
+        fn checkpoint(&mut self) -> Result<()> {
+            unreachable!()
+        }
+        fn before_distance(&mut self) -> Result<()> {
+            unreachable!()
+        }
+        fn before_visit(&mut self) -> Result<()> {
+            unreachable!()
+        }
+        fn visible_count(&mut self, _: contextdb_core::SnapshotId) -> Result<usize> {
+            unreachable!()
+        }
+        fn row_window(
+            &mut self,
+            _: contextdb_core::SnapshotId,
+            _: Option<contextdb_core::RowId>,
+            _: usize,
+        ) -> Result<Vec<contextdb_core::RowId>> {
+            unreachable!()
+        }
+        fn row_bounds(
+            &mut self,
+        ) -> Result<Option<(contextdb_core::RowId, contextdb_core::RowId, usize)>> {
+            unreachable!()
+        }
+        fn point_at_or_after(
+            &mut self,
+            _: contextdb_core::RowId,
+        ) -> Result<Option<(contextdb_core::RowId, PointId)>> {
+            unreachable!()
+        }
+        fn exact_graph_row_after(
+            &mut self,
+            _: &[u8],
+            _: Option<contextdb_core::RowId>,
+        ) -> Result<Option<contextdb_core::RowId>> {
+            unreachable!()
+        }
+        fn member_after(
+            &mut self,
+            _: usize,
+            _: Option<(contextdb_core::RowId, usize)>,
+        ) -> Result<Option<(contextdb_core::RowId, usize, contextdb_core::Lsn)>> {
+            unreachable!()
+        }
+        fn group_after(&mut self, _: u64, _: Option<usize>) -> Result<Option<usize>> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn actual_paged_point_admission_reclaims_full_base_cache_before_copying() {
+        let payer = budget();
+        let session = NavigationSession::new(Some(MemoryBudgetOwner::from(payer.clone())));
+        let cached = PointId(0, 0);
+        session
+            .lock()
+            .remember_point(0, cached, &point(cached, 5.0));
+        assert!(session.lock().point(0, cached).unwrap().values.is_some());
+        let fixed_limit = payer.used.load(Ordering::SeqCst);
+        payer.limit.store(fixed_limit, Ordering::SeqCst);
+        let bytes = 128 * std::mem::size_of::<f32>();
+        assert!(bytes <= fixed_limit);
+        let mut reader = AdmittingPointReader { bytes, copied: 0 };
+        let reclaim = || session.reclaim();
+        let loaded = paged_builder::AdmittedPagedReader::with_reclamation(
+            &mut reader,
+            session.owner(),
+            &reclaim,
+        )
+        .load_point(PointId(0, 1))
+        .unwrap();
+        assert_eq!(reader.copied, 1);
+        assert!(session.lock().point(0, cached).is_none());
+        let paged_builder::PagedVectorPoint::F32(body) = &*loaded else {
+            panic!("expected F32 body");
+        };
+        assert_eq!(body.id, PointId(0, 1));
+        assert_eq!(body.values, vec![9.0; 128]);
+        assert_eq!(payer.used.load(Ordering::SeqCst), bytes);
+        assert_eq!(payer.limit.load(Ordering::SeqCst), fixed_limit);
+        drop(loaded);
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+        // Reclamation cannot invent quota. A body larger than the same fixed
+        // limit must fail at the original native admission before any copy.
+        reader.bytes = fixed_limit + 1;
+        let error = paged_builder::AdmittedPagedReader::with_reclamation(
+            &mut reader,
+            session.owner(),
+            &reclaim,
+        )
+        .load_point(PointId(0, 2))
+        .err()
+        .expect("the unchanged finite limit must refuse before copying");
+        assert!(
+            matches!(error, Error::MemoryBudgetExceeded { operation, requested_bytes, budget_limit_bytes, .. }
+            if operation == "read_paged_vector_window" && requested_bytes == fixed_limit + 1 && budget_limit_bytes == fixed_limit)
+        );
+        assert_eq!(reader.copied, 1);
+        assert_eq!(payer.used.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+#[path = "union/origin_work_tests.rs"]
+mod origin_work_tests;
