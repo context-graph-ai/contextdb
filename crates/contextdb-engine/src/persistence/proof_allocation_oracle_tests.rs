@@ -48,6 +48,7 @@ thread_local! {
     static READER_STANDING_FUNDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SOURCE_COUNTER_IS_READER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SOURCE_REQUEST_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LAST_SOURCE_REQUEST_CREDIT: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0,0,0)) };
     static SOURCE_REQUEST_CREDIT: std::cell::Cell<[usize; 256]> = const { std::cell::Cell::new([0; 256]) };
     static NATIVE_REQUEST_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NATIVE_REQUEST_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -728,6 +729,11 @@ pub(crate) fn source_unfunded_peak_for_test() -> (usize, (usize, usize, usize, b
         measurement.source_unfunded_request,
     )
 }
+// Same original pre-System counter sample as the bounded prefix recorder,
+// retained for the actual latest constructor even beyond that prefix.
+pub(crate) fn last_source_request_credit_for_test() -> (usize, usize, usize) {
+    LAST_SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get)
+}
 pub(crate) fn source_request_credit_for_test() -> [usize; 256] {
     SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get)
 }
@@ -738,7 +744,7 @@ pub(crate) fn watch_source_free_for_test(requests: &[(usize, usize, usize)], cou
     }
     append_source_free_for_test(requests, counter);
 }
-fn append_source_free_for_test(requests: &[(usize, usize, usize)], counter: usize) {
+pub(crate) fn append_source_free_for_test(requests: &[(usize, usize, usize)], counter: usize) {
     for request in requests {
         let watch = NATIVE_FREE
             .iter()
@@ -1136,10 +1142,12 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             .unwrap_or(0);
         if source_counter != 0 {
             let index = NATIVE_REQUEST_COUNT.with(std::cell::Cell::get);
+            let funding = observed_source_funding(source_counter);
+            LAST_SOURCE_REQUEST_CREDIT.with(|slot| slot.set((source_counter, funding, index + 1)));
             if index < 256 {
                 SOURCE_REQUEST_CREDIT.with(|credits| {
                     let mut entries = credits.get();
-                    entries[index] = observed_source_funding(source_counter);
+                    entries[index] = funding;
                     credits.set(entries);
                 });
             }
@@ -1362,6 +1370,10 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 .sum();
             watch.live_at_free.store(live, AtomicOrdering::SeqCst);
             watch.before.store(before, AtomicOrdering::SeqCst);
+            #[cfg(feature = "test-seams")]
+            crate::database::ordinary_native_owner_tests::replacement_physical_cut(
+                (pointer as usize, layout.size(), layout.align()), counter, before, false,
+            );
             // capture969 begin
             #[cfg(feature = "test-seams")]
             crate::database::retained_trace_ownership_tests::ordered_cut(
@@ -1425,6 +1437,10 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                 unsafe { &*(counter as *const AtomicUsize) }.load(AtomicOrdering::SeqCst)
             };
             watch.after.store(after, AtomicOrdering::SeqCst);
+            #[cfg(feature = "test-seams")]
+            crate::database::ordinary_native_owner_tests::replacement_physical_cut(
+                (pointer as usize, layout.size(), layout.align()), counter, after, true,
+            );
             // capture969 begin
             #[cfg(feature = "test-seams")]
             crate::database::retained_trace_ownership_tests::ordered_cut(

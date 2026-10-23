@@ -547,6 +547,7 @@ impl DeclaredReadRoot {
                 &self.retained,
                 owner.accounting_identity(),
                 ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>(),
+                &child.retained,
             );
             #[cfg(any(test, feature = "test-seams"))]
             register_native_child_observer(self, &owner, &child, request_before, initial_held);
@@ -655,6 +656,7 @@ impl DeclaredReadRoot {
                 &self.retained,
                 owner.accounting_identity(),
                 ReadMemoryOwner::native_layout::<NativeDeclaredChild, NativeChildInvoice>(),
+                &child.retained,
             );
             #[cfg(any(test, feature = "test-seams"))]
             register_native_child_observer(self, &owner, &child, request_before, initial_held);

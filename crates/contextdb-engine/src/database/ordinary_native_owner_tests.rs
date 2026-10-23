@@ -40,6 +40,11 @@ struct Capture {
     parent_counter: usize,
     baseline: u64,
     children: usize,
+    transaction_replacement: bool,
+    replacement_request: Request,
+    replacement_counter: usize,
+    replacement_funding: [u64; 2],
+    replacement_physical_cuts: usize,
     stages: usize,
     allow_constructor_prefix: bool,
     constructor_base: usize,
@@ -83,7 +88,7 @@ thread_local! {
         active: false, invalid: false, invalid_site: 0, actual_constructor_requests: [(0,0,0,0);3], first_expected_child:[0;4], first_unexpected_child:[0;4], named_image_child:0, named_image_counter:0, named_image_calls:0, named_image_start:0,
         named_image_events:[NamedImageCall { subsystem:"", operation:"", site:"", bytes:0, before:0, after:0, refused:false };32],
         named_image_event_count:0, parent: 0, parent_counter: 0,
-        baseline: 0, children: 0, stages: 0, allow_constructor_prefix: false, constructor_base: 0, requests: [(0, 0, 0); 3],
+        baseline: 0, children: 0, transaction_replacement: false, replacement_request: (0,0,0), replacement_counter: 0, replacement_funding: [0;2], replacement_physical_cuts: 0, stages: 0, allow_constructor_prefix: false, constructor_base: 0, requests: [(0, 0, 0); 3],
         trace_requests: [(0,0,0); 2], trace_ordinals: [0; 2], trace_invoices: [(0,0); 2], trace_stages: 0,
         trace_before: 0, trace_parent: [0; 2], trace_credits: [0; 2],
         child_limit: 0, declared_limit: 0, parent_after_constructor: [0; 3], allocator_funding: [0; 3],
@@ -312,6 +317,7 @@ pub(crate) fn child_allocated(
     counter: &AtomicU64,
     pointer: usize,
     layout: Layout,
+    child_counter: &AtomicU64,
 ) {
     update(|c| {
         c.children += 1;
@@ -327,6 +333,36 @@ pub(crate) fn child_allocated(
                 c.invalid_site = line!();
             }
         }
+        // The UPDATE replacement separately owns a native reader for its
+        // retire/stage graph operation. It has no forwarding controls and
+        // keeps its own row-graph reservations in this scalar-row fixture. Keep its
+        // actual typed constructor and invoice, without resetting the window.
+        if c.transaction_replacement && c.children == 2 {
+            let (bytes, align, ordinal) = oracle::last_request_for_test(false);
+            let funding = oracle::last_source_request_credit_for_test();
+            let expected = ordinary_native_child_layout_for_test();
+            let counter = child_counter as *const _ as usize;
+            let after = unsafe { &*(c.parent_counter as *const AtomicU64) }
+                .load(Ordering::SeqCst);
+            if c.stages != 3 || c.trace_stages != 0
+                || layout != expected || (bytes, align) != (layout.size(), layout.align())
+                || pointer != oracle::last_request_pointer_for_test()
+                || pointer == c.requests[0].0 || ordinal <= c.constructor_base + 3
+                || counter <= pointer || counter >= pointer + bytes
+                || counter == c.child_counter || child_counter.load(Ordering::SeqCst) != 0
+                || funding.0 != c.parent_counter || funding.2 != ordinal
+                || funding.1 as u64 != after
+            {
+                c.invalid = true;
+                if c.invalid_site == 0 { c.invalid_site = line!(); }
+                return;
+            }
+            c.replacement_request = (pointer, bytes, align);
+            c.replacement_counter = counter;
+            c.replacement_funding = [funding.1 as u64, after];
+            oracle::append_source_free_for_test(&[c.replacement_request], c.parent_counter);
+            return;
+        }
         record(c, 0, pointer, layout);
         if c.requests[0].0 != pointer {
             c.invalid = true;
@@ -336,6 +372,39 @@ pub(crate) fn child_allocated(
         }
     });
 }
+// This scalar-row replacement has two native cells and only the public
+// request's inline data debit. Read that genuine, still-live typed counter at
+// each real System.dealloc cut; no aggregate slack substitutes for its invoice.
+pub(crate) fn replacement_physical_cut(
+    request: Request,
+    parent_counter: usize,
+    paid: usize,
+    after: bool,
+) {
+    update(|c| {
+        if !c.transaction_replacement || request.0 != c.replacement_request.0 {
+            return;
+        }
+        // The first owner must still be alive before borrowing its counter.
+        if request != c.replacement_request || parent_counter != c.parent_counter
+            || c.child_counter == 0 || oracle::source_free_for_test(1)[0].2 != 0
+            || c.replacement_physical_cuts != usize::from(after)
+        {
+            c.invalid = true;
+            if c.invalid_site == 0 { c.invalid_site = line!(); }
+            return;
+        }
+        let outer = unsafe { &*(c.child_counter as *const AtomicU64) }.load(Ordering::SeqCst);
+        let due = c.baseline + c.requests[0].1 as u64
+            + c.replacement_request.1 as u64 + outer;
+        if paid as u64 != due {
+            c.invalid = true;
+            if c.invalid_site == 0 { c.invalid_site = line!(); }
+        }
+        c.replacement_physical_cuts += 1;
+    });
+}
+
 pub(crate) fn child_counter(
     parent: &DeclaredReadMemory,
     payload: usize,
@@ -360,6 +429,21 @@ pub(crate) fn child_counter(
             }
             c.named_image_counter = counter as *const _ as usize;
             c.named_image_calls += 1;
+            return;
+        }
+
+        // Identified by the actual typed second constructor, not its Layout
+        // or a provider name. Every other counter still fails below.
+        if c.transaction_replacement && c.replacement_counter != 0
+            && counter as *const _ as usize == c.replacement_counter
+        {
+            if c.parent != parent as *const _ as usize || limit != c.declared_limit
+                || payload < c.replacement_request.0
+                || payload >= c.replacement_request.0 + c.replacement_request.1
+            {
+                c.invalid = true;
+                if c.invalid_site == 0 { c.invalid_site = line!(); }
+            }
             return;
         }
 
@@ -527,7 +611,15 @@ impl Observation {
     }
     fn assert_admitted(&self) -> Capture {
         let c = self.capture();
-        assert_eq!((c.children, c.stages), (1, 3));
+        assert_eq!((c.children, c.stages), (if c.transaction_replacement { 2 } else { 1 }, 3));
+        if c.transaction_replacement {
+            assert_ne!(c.replacement_request.0, 0);
+            assert_ne!(c.replacement_counter, 0);
+            assert_eq!(c.replacement_funding[0], c.replacement_funding[1]);
+            assert!(c.replacement_funding[0] >= c.baseline
+                + c.requests.iter().map(|r| r.1 as u64).sum::<u64>()
+                + c.replacement_request.1 as u64);
+        }
         assert_eq!(
             c.child_limit, c.declared_limit,
             "ordinary child must preserve the genuine parent limit"
@@ -627,6 +719,14 @@ impl Observation {
                     "actual allocation-time trace invoice must match its independent physical request"
                 );
             }
+        }
+        if c.transaction_replacement {
+            assert_eq!(c.trace_stages, 0);
+            let free = oracle::source_free_for_test(4)[3];
+            assert_eq!(free.2, 1, "the actual replacement child physically frees once");
+            assert_eq!(free.0, free.1, "its original parent invoice remains paid across System.dealloc");
+            assert_eq!(c.replacement_physical_cuts, 2,
+                "the second original invoice must qualify on both sides of physical free");
         }
         assert_eq!(db.declared_read_memory.charged_bytes(), c.baseline);
     }
@@ -865,6 +965,7 @@ fn ordinary_transactions_preserve_eager_updates_and_private_rows() {
         sql(&db, "BEGIN");
         let routes = Arc::new(Routes::default());
         let observation = Observation::begin(&db);
+        update(|c| c.transaction_replacement = true);
         let (updated, _, _) = observed(&db, || {
             db.with_read_execution_convergence_observer_for_test(routes.clone(), || {
                 db.execute(
