@@ -228,6 +228,9 @@ pub(crate) mod staging_witness {
         ARMED.with(|armed| armed.set(false));
         let len = LEN.with(Cell::get);
         assert!(len <= CAPACITY, "the staging witness held every event");
+        if len == 0 {
+            return (Vec::new(), OVERRUN.with(Cell::get));
+        }
         let events = LOG.with(|log| {
             log.borrow()[..len]
                 .iter()
@@ -244,6 +247,12 @@ pub(crate) mod staging_witness {
 
     /// Live tagged allocations: (category, bytes).
     pub(crate) fn live() -> Vec<(Charge, usize)> {
+        if !LIVE_TAGGED
+            .try_with(|live| live.is_initialized())
+            .unwrap_or(false)
+        {
+            return Vec::new();
+        }
         LIVE_TAGGED.with(|live| {
             live.borrow()
                 .iter()
@@ -367,6 +376,26 @@ pub(crate) mod staging_witness {
         if armed() {
             push(Event::Staged(staged));
         }
+    }
+
+    #[test]
+    fn staging_unarmed_callbacks_and_empty_reads_leave_backings_null() {
+        std::thread::spawn(|| {
+            assert!(!LOG.with(|log| log.is_initialized()));
+            assert!(!LIVE_TAGGED.with(|live| live.is_initialized()));
+            let layout = std::alloc::Layout::from_size_align(73, 1).unwrap();
+            unsafe {
+                let pointer = std::alloc::alloc(layout);
+                std::alloc::dealloc(pointer, layout);
+            }
+            assert!(take().0.is_empty());
+            assert!(live().is_empty());
+            assert!(!LOG.with(|log| log.is_initialized()));
+            assert!(!LIVE_TAGGED.with(|live| live.is_initialized()));
+            assert_eq!(LEN.with(Cell::get), 0);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
