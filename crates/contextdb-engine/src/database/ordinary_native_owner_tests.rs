@@ -22,6 +22,8 @@ struct Capture {
     baseline: u64,
     children: usize,
     stages: usize,
+    allow_constructor_prefix: bool,
+    constructor_base: usize,
     requests: [Request; 3], // native child, external keeper, forwarding Arc
     trace_requests: [Request; 2], // independently observed keeper, provider
     trace_ordinals: [usize; 2],
@@ -60,7 +62,7 @@ thread_local! {
     static HOOK_BUSY: Cell<bool> = const { Cell::new(false) };
     static CAPTURE: Cell<Capture> = const { Cell::new(Capture {
         active: false, invalid: false, invalid_site: 0, actual_constructor_requests: [(0,0,0,0);3], parent: 0, parent_counter: 0,
-        baseline: 0, children: 0, stages: 0, requests: [(0, 0, 0); 3],
+        baseline: 0, children: 0, stages: 0, allow_constructor_prefix: false, constructor_base: 0, requests: [(0, 0, 0); 3],
         trace_requests: [(0,0,0); 2], trace_ordinals: [0; 2], trace_invoices: [(0,0); 2], trace_stages: 0,
         trace_before: 0, trace_parent: [0; 2], trace_credits: [0; 2],
         child_limit: 0, declared_limit: 0, parent_after_constructor: [0; 3], allocator_funding: [0; 3],
@@ -115,9 +117,17 @@ fn record(c: &mut Capture, stage: usize, payload: usize, expected: Layout) {
     let (bytes, align, ordinal) = oracle::last_request_for_test(false);
     let pointer = oracle::last_request_pointer_for_test();
     c.actual_constructor_requests[stage] = (pointer, bytes, align, ordinal);
+    if c.allow_constructor_prefix && stage == 0 {
+        let Some(base) = ordinal.checked_sub(1).filter(|base| *base <= 256 - 3) else {
+            c.invalid = true;
+            c.invalid_site = line!();
+            return;
+        };
+        c.constructor_base = base;
+    }
     if c.stages != stage
         || pointer == 0
-        || ordinal != stage + 1
+        || ordinal != c.constructor_base + stage + 1
         || (bytes, align) != (expected.size(), expected.align())
         || payload < pointer
         || payload >= pointer.saturating_add(bytes)
@@ -213,7 +223,7 @@ pub(crate) fn trace_control_allocated(
             || (bytes, align) != (layout.size(), layout.align())
             || payload < pointer
             || payload >= pointer.saturating_add(bytes)
-            || ordinal <= 3
+            || ordinal <= c.constructor_base + 3
             || (stage == 1 && ordinal != c.trace_ordinals[0] + 1)
         {
             c.invalid = true;
@@ -405,6 +415,11 @@ impl Observation {
         oracle::disarm_source_free_watch();
         Self
     }
+    fn begin_at_actual_native_constructor(db: &Database) -> Self {
+        let observer = Self::begin(db);
+        update(|c| c.allow_constructor_prefix = true);
+        observer
+    }
     fn capture(&self) -> Capture {
         let c = CAPTURE.with(Cell::get);
         assert!(
@@ -556,7 +571,7 @@ fn observed<T>(db: &Database, action: impl FnOnce() -> T) -> (T, [Request; 3], u
     );
     let credits = oracle::source_request_credit_for_test();
     update(|c| {
-        if c.stages > 3 || count < c.stages {
+        if c.stages > 3 || count < c.constructor_base + c.stages {
             c.invalid = true;
             if c.invalid_site == 0 {
                 c.invalid_site = line!();
@@ -564,13 +579,14 @@ fn observed<T>(db: &Database, action: impl FnOnce() -> T) -> (T, [Request; 3], u
             return;
         }
         for stage in 0..c.stages {
-            if c.requests[stage] != requests[stage] {
+            let at = c.constructor_base + stage;
+            if at >= requests.len() || c.requests[stage] != requests[at] {
                 c.invalid = true;
                 if c.invalid_site == 0 {
                     c.invalid_site = line!();
                 }
             }
-            c.allocator_funding[stage] = credits[stage];
+            c.allocator_funding[stage] = credits[at];
         }
         for stage in 0..c.trace_stages {
             let ordinal = c.trace_ordinals[stage];
@@ -586,7 +602,15 @@ fn observed<T>(db: &Database, action: impl FnOnce() -> T) -> (T, [Request; 3], u
             // through the original first-256 funding recorder.
         }
     });
-    (value, requests[..3].try_into().unwrap(), count)
+    let captured = CAPTURE.with(Cell::get);
+    if captured.allow_constructor_prefix && captured.constructor_base != 0 {
+        eprintln!(
+            "native_constructor_prefix requests={:?} original_parent_funding={:?}",
+            &requests[..captured.constructor_base],
+            &credits[..captured.constructor_base]
+        );
+    }
+    (value, captured.requests, count)
 }
 
 fn fixture(file: bool) -> (tempfile::TempDir, Database) {
@@ -1537,7 +1561,7 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
             let session = db
                 .read_session(contextdb_core::read_contract::ReadLimits::default())
                 .unwrap();
-            let capture = Observation::begin(&db);
+            let capture = Observation::begin_at_actual_native_constructor(&db);
             let mut answer = None;
             let mut cursor = None;
             let mut page = None;
@@ -1630,10 +1654,18 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
                     let all_payload = requests[5..token].iter().map(|r| r.1).sum::<usize>();
                     assert_eq!(all_payload, invoice.prepaid_bytes);
                     let controls_live = requests[..5].iter().map(|r| r.1).sum::<usize>();
-                    controls_live + invoice.prepaid_bytes + invoice.prepaid_control_bytes
-                        + invoice.additional_bytes + invoice.score_credit_bytes
+                    controls_live
+                        + invoice.prepaid_bytes
+                        + invoice.prepaid_control_bytes
+                        + invoice.additional_bytes
+                        + invoice.score_credit_bytes
                 } else {
-                    live[slot] + if slot == token { invoice.additional_bytes } else { 0 }
+                    live[slot]
+                        + if slot == token {
+                            invoice.additional_bytes
+                        } else {
+                            0
+                        }
                 };
                 assert_eq!(
                     freed[slot].0,
