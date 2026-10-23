@@ -59,6 +59,14 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
         )
         .unwrap();
         let snapshot = db.snapshot();
+        // A real later publication makes visible_count use its historical
+        // cursor, while preserving exactly one version for every vector row.
+        db.execute(
+            "CREATE TABLE after_snapshot_marker (id INTEGER PRIMARY KEY)",
+            &HashMap::new(),
+        )
+        .unwrap();
+        db.execute("INSERT INTO after_snapshot_marker VALUES (1)", &HashMap::new()).unwrap();
         let child = db.ordinary_read_child().unwrap();
         crate::executor::bounded::with_native_read_memory(child, |memory| {
             let image = crate::read_image_memory::ImageMemory::new_direct_reader(None, memory.clone())?;
@@ -76,6 +84,16 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
                 MembershipOwner::Writable(persistence.clone()), None, &partition, summary,
                 db.accountant.clone(), &mut workspace, retained,
             ).unwrap();
+            let count_work = crate::read_work_probe::ReadWorkObservationScope::enter(crate::read_work_probe::ReadWorkPhase::Query);
+            let visible = source.visible_count(snapshot, &mut || true, &mut copies).unwrap();
+            assert_eq!(visible, rows as usize, "the actual historical count consumes the declared population");
+            let counted = count_work.counters();
+            let counted_history = count_work.historical_counters();
+            assert_eq!(counted_history.owning_row_controls_admitted, rows as u64,
+                "each counted record still reconciles its original owning row");
+            assert_eq!(counted.decoded_rows, 0,
+                "a membership count authenticates body and schema without constructing owned row vectors: {counted:?}, {counted_history:?}");
+            drop(count_work);
             // Discover the genuine physical row id through its existing
             // admitted cursor, outside the measured select/load segment.
             let mut first_window = copies.scratch();
