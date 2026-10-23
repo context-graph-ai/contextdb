@@ -46115,33 +46115,22 @@ impl Database {
         let metadata = self.relational_store.table_meta.read().clone();
         let read_memory = working.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
-        for (table, meta) in metadata {
-            working.relational_store.create_table(&table, meta.clone());
+        for (table, meta) in &metadata {
+            working.relational_store.create_table(table, meta.clone());
             for index in &meta.indexes {
                 if index.kind == IndexKind::Auto {
                     working.relational_store.create_exact_index_storage(
-                        &table,
+                        table,
                         &index.name,
                         index.columns.clone(),
                     );
                 } else {
                     working.relational_store.create_index_storage(
-                        &table,
+                        table,
                         &index.name,
                         index.columns.clone(),
                     );
                 }
-            }
-            // Schema staging needs declared layouts even when no vector query
-            // has materialized a graph. Register descriptors only: row/vector
-            // payloads remain with the live database until commit preparation.
-            for column in &meta.columns {
-                working.register_vector_index_for_column(
-                    &table,
-                    column,
-                    &mut vector_copy_owner,
-                    read_memory.clone(),
-                )?;
             }
         }
         // The working image's retained-state owner returns the metadata fold
@@ -46163,6 +46152,19 @@ impl Database {
             .finalization
             .accountant
             .charge_retained(metadata_bytes);
+        // Registration is fallible, so the working image must own its metadata
+        // charge before a refusal can drop it. Register declarations only;
+        // row/vector payloads stay live until bounded commit preparation.
+        for (table, meta) in metadata {
+            for column in &meta.columns {
+                working.register_vector_index_for_column(
+                    &table,
+                    column,
+                    &mut vector_copy_owner,
+                    read_memory.clone(),
+                )?;
+            }
+        }
         Ok(working)
     }
 
