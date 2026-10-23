@@ -177,7 +177,9 @@ fn recorder_static_tls_fits_the_default_test_thread() {
 fn recorder_partial_initialization_retires_elements_and_can_be_retried() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static DROPPED: AtomicUsize = AtomicUsize::new(0);
-    struct Element;
+    struct Element {
+        _byte: u8,
+    }
     impl Drop for Element {
         fn drop(&mut self) {
             DROPPED.fetch_add(1, Ordering::SeqCst);
@@ -193,14 +195,14 @@ fn recorder_partial_initialization_retires_elements_and_can_be_retried() {
                     panic!("initializer failure");
                 }
                 initialized.set(n + 1);
-                Element
+                Element { _byte: 0 }
             });
         }))
         .is_err()
     );
     assert!(!buffer.is_initialized());
     assert_eq!(DROPPED.load(Ordering::SeqCst), 3);
-    buffer.initialize(|| Element);
+    buffer.initialize(|| Element { _byte: 0 });
     assert!(buffer.is_initialized());
     assert_eq!(buffer.borrow().len(), 8);
     drop(buffer);
