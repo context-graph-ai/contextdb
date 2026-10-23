@@ -1626,84 +1626,201 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
             if let Some(page) = &page {
                 assert_eq!(page.rows(), vec![vec![Value::Int64(1)]]);
             }
-            let controls = capture.assert_admitted();
-            assert_eq!(
-                controls.trace_stages, 2,
-                "the actual {route} vector trace must reach both native factories"
-            );
-            capture.assert_live();
-            let retained = db.last_vector_search_trace.write().take().unwrap();
-            let invoice = retained.complete_invoice_for_test(|_| {});
-            assert_eq!(invoice.original_payer, controls.forwarding_payload);
-            let mut requests = [(0, 0, 0); 16];
-            requests[..3].copy_from_slice(&controls.requests);
-            requests[3..5].copy_from_slice(&controls.trace_requests);
-            let mut count = 5;
-            for request in invoice.allocations {
-                if request.1 != 0 {
-                    requests[count] = request;
-                    count += 1;
+            assert_route_original_physical_invoices(&db, capture, route, file, || {
+                drop(answer);
+                drop(page);
+                drop(initial_page);
+                if let Some(cursor) = cursor {
+                    cursor.close().unwrap();
                 }
-            }
-            requests[count] = invoice.prepaid_control;
+                (route == "cursor").then_some(session)
+            });
+        }
+    }
+}
+
+fn assert_route_original_physical_invoices(
+    db: &Database,
+    capture: Observation,
+    route: &str,
+    file: bool,
+    cleanup: impl FnOnce() -> Option<crate::ReadSession>,
+) {
+    let controls = capture.assert_admitted();
+    assert_eq!(
+        controls.trace_stages, 2,
+        "the actual {route} vector trace must reach both native factories"
+    );
+    capture.assert_live();
+    let retained = db.last_vector_search_trace.write().take().unwrap();
+    let invoice = retained.complete_invoice_for_test(|_| {});
+    assert_eq!(invoice.original_payer, controls.forwarding_payload);
+    let mut requests = [(0, 0, 0); 16];
+    requests[..3].copy_from_slice(&controls.requests);
+    requests[3..5].copy_from_slice(&controls.trace_requests);
+    let mut count = 5;
+    for request in invoice.allocations {
+        if request.1 != 0 {
+            requests[count] = request;
             count += 1;
-            oracle::watch_exact_frees_for_test(&requests[..count], controls.parent_counter);
-            drop(answer);
-            drop(page);
-            drop(initial_page);
-            if let Some(cursor) = cursor {
-                cursor.close().unwrap();
-            }
-            // Cursor setup owns an independent standing expiry budget. Keep
-            // that actual session alive through this cut; the other routes
-            // still release their session before the escaped trace.
-            let session = (route == "cursor").then_some(session);
-            // The escaped actual trace now keeps its own original invoices.
-            assert_eq!(oracle::source_free_for_test(count)[3].2, 0);
-            assert_eq!(oracle::source_free_for_test(count)[4].2, 0);
-            drop(retained);
-            let freed = oracle::source_free_for_test(count);
-            let live = oracle::source_live_at_free_for_test(count);
-            for slot in 0..count {
-                assert_eq!(
-                    freed[slot].2, 1,
-                    "{route} physical request {slot} frees once"
-                );
-                assert_eq!(freed[slot].0, freed[slot].1);
-                let token = count - 1;
-                let payload_group = slot >= 5 && slot < token;
-                let extra = if payload_group {
-                    // These buffers share one prepaid invoice. Already freed
-                    // buffers stay charged until the entire payload retires.
-                    let all_payload = requests[5..token].iter().map(|r| r.1).sum::<usize>();
-                    assert_eq!(all_payload, invoice.prepaid_bytes);
-                    let controls_live = requests[..5].iter().map(|r| r.1).sum::<usize>();
-                    controls_live
-                        + invoice.prepaid_bytes
-                        + invoice.prepaid_control_bytes
-                        + invoice.additional_bytes
-                        + invoice.score_credit_bytes
+        }
+    }
+    requests[count] = invoice.prepaid_control;
+    count += 1;
+    oracle::watch_exact_frees_for_test(&requests[..count], controls.parent_counter);
+    let session = cleanup();
+    // The escaped actual trace now keeps its own original invoices.
+    assert_eq!(oracle::source_free_for_test(count)[3].2, 0);
+    assert_eq!(oracle::source_free_for_test(count)[4].2, 0);
+    drop(retained);
+    let freed = oracle::source_free_for_test(count);
+    let live = oracle::source_live_at_free_for_test(count);
+    for slot in 0..count {
+        assert_eq!(
+            freed[slot].2, 1,
+            "{route} physical request {slot} frees once"
+        );
+        assert_eq!(freed[slot].0, freed[slot].1);
+        let token = count - 1;
+        let payload_group = slot >= 5 && slot < token;
+        let extra = if payload_group {
+            // These buffers share one prepaid invoice. Already freed
+            // buffers stay charged until the entire payload retires.
+            let all_payload = requests[5..token].iter().map(|r| r.1).sum::<usize>();
+            assert_eq!(all_payload, invoice.prepaid_bytes);
+            let controls_live = requests[..5].iter().map(|r| r.1).sum::<usize>();
+            controls_live
+                + invoice.prepaid_bytes
+                + invoice.prepaid_control_bytes
+                + invoice.additional_bytes
+                + invoice.score_credit_bytes
+        } else {
+            live[slot]
+                + if slot == token {
+                    invoice.additional_bytes
                 } else {
-                    live[slot]
-                        + if slot == token {
-                            invoice.additional_bytes
-                        } else {
-                            0
-                        }
-                };
-                assert_eq!(
-                    freed[slot].0,
-                    controls.baseline as usize + extra,
-                    "{route} keeps each actual original invoice through physical free, including the grouped payload and inline credits"
-                );
-            }
-            assert_eq!(db.declared_read_memory.charged_bytes(), controls.baseline);
-            eprintln!(
-                "actual_request_cursor_physical route={route} file={file} requests={:?} frees={:?}",
-                &requests[..count],
-                &freed[..count]
+                    0
+                }
+        };
+        assert_eq!(
+            freed[slot].0,
+            controls.baseline as usize + extra,
+            "{route} keeps each actual original invoice through physical free, including the grouped payload and inline credits"
+        );
+    }
+    assert_eq!(db.declared_read_memory.charged_bytes(), controls.baseline);
+    eprintln!(
+        "actual_request_cursor_physical route={route} file={file} requests={:?} frees={:?}",
+        &requests[..count],
+        &freed[..count]
+    );
+    drop(session);
+}
+
+struct DirectPhysicalClock;
+impl contextdb_core::read_contract::DeadlineClock for DirectPhysicalClock {
+    fn now_ms(&self) -> u64 {
+        0
+    }
+    fn wait_until(&self, _: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn actual_direct_file_public_readers_keep_original_invoices_through_physical_free() {
+    use crate::direct_file_reader::{DirectFileReader, DirectReaderConfig};
+    use std::num::NonZeroUsize;
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    for route in [
+        "direct-reader-execute",
+        "direct-reader-cursor",
+        "direct-session-execute",
+    ] {
+        let (dir, writer) = fixture(true);
+        sql(
+            &writer,
+            "CREATE TABLE route_points (id INT PRIMARY KEY, v VECTOR(4)) HISTORY ALL",
+        );
+        for id in 0..4 {
+            writer
+                .execute(
+                    "INSERT INTO route_points VALUES ($id,$v)",
+                    &HashMap::from([
+                        ("id".into(), Value::Int64(id)),
+                        ("v".into(), Value::Vector(vec![1.0, id as f32, 0.0, 0.0])),
+                    ]),
+                )
+                .unwrap();
+        }
+        writer.close().unwrap();
+        drop(writer);
+        let path = dir.path().join("ordinary.db");
+        let params = HashMap::from([("v".into(), Value::Vector(vec![1.0, 0.0, 0.0, 0.0]))]);
+        let query = "SELECT id FROM route_points ORDER BY v <=> $v USE VECTOR EXACT LIMIT 1";
+        if route == "direct-session-execute" {
+            let session =
+                crate::ReadSession::open_with_options(&path, crate::ReadSessionOptions::default())
+                    .unwrap();
+            assert!(
+                session.file_snapshot_for_test().is_some(),
+                "must be the actual committed direct-file route"
             );
-            drop(session);
+            session
+                .__with_resident_history_for_test(|db| {
+                    db.clear_last_vector_search_trace();
+                    let capture = Observation::begin_at_actual_native_constructor(db);
+                    let (answer, _, _) = observed(db, || session.execute(query, &params).unwrap());
+                    assert_eq!(answer.rows(), vec![vec![Value::Int64(0)]]);
+                    // The live session owns only its standing root, not this
+                    // per-operation native child or the escaped actual trace.
+                    assert_route_original_physical_invoices(db, capture, route, true, || {
+                        drop(answer);
+                        None
+                    });
+                    Ok(())
+                })
+                .unwrap();
+        } else {
+            let config = DirectReaderConfig::new(
+                contextdb_core::read_contract::ReadLimits::default(),
+                Arc::new(DirectPhysicalClock),
+            );
+            let reader = DirectFileReader::open(&path, config).unwrap();
+            let target = reader.execution_target();
+            let db = target.resident_history_database_for_test().unwrap();
+            db.clear_last_vector_search_trace();
+            let capture = Observation::begin_at_actual_native_constructor(db);
+            if route == "direct-reader-execute" {
+                let (answer, _, _) = observed(db, || reader.execute(query, &params).unwrap());
+                assert_eq!(answer.result.rows(), vec![vec![Value::Int64(0)]]);
+                assert_route_original_physical_invoices(db, capture, route, true, || {
+                    drop(answer);
+                    None
+                });
+            } else {
+                let (mut opened, _, _) = observed(db, || {
+                    reader.open_cursor(
+                    "SELECT id FROM route_points ORDER BY v <=> $v USE VECTOR EXACT LIMIT 2",
+                    &params, NonZeroUsize::MIN).unwrap()
+                });
+                assert_eq!(
+                    opened.first_page.page_for_test().rows,
+                    &[vec![Value::Int64(0)]]
+                );
+                assert!(opened.first_page.page_for_test().has_more);
+                let next = opened.cursor.fetch(Some(NonZeroUsize::MIN)).unwrap();
+                assert_eq!(next.page_for_test().rows, &[vec![Value::Int64(1)]]);
+                assert!(!next.page_for_test().has_more);
+                assert_route_original_physical_invoices(db, capture, route, true, || {
+                    drop(next);
+                    drop(opened.first_page);
+                    opened.cursor.close().unwrap();
+                    drop(opened.cursor);
+                    None
+                });
+            }
         }
     }
 }
