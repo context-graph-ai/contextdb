@@ -1372,7 +1372,10 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             watch.before.store(before, AtomicOrdering::SeqCst);
             #[cfg(feature = "test-seams")]
             crate::database::ordinary_native_owner_tests::replacement_physical_cut(
-                (pointer as usize, layout.size(), layout.align()), counter, before, false,
+                (pointer as usize, layout.size(), layout.align()),
+                counter,
+                before,
+                false,
             );
             // capture969 begin
             #[cfg(feature = "test-seams")]
@@ -1439,7 +1442,10 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             watch.after.store(after, AtomicOrdering::SeqCst);
             #[cfg(feature = "test-seams")]
             crate::database::ordinary_native_owner_tests::replacement_physical_cut(
-                (pointer as usize, layout.size(), layout.align()), counter, after, true,
+                (pointer as usize, layout.size(), layout.align()),
+                counter,
+                after,
+                true,
             );
             // capture969 begin
             #[cfg(feature = "test-seams")]
@@ -2165,9 +2171,23 @@ impl GraphAllocationState {
     };
 }
 thread_local! {
+    static GRAPH_ALLOCATIONS_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GRAPH_FREE_RECORD_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_ALLOCATIONS: std::cell::Cell<Option<GraphAllocationState>> = const { std::cell::Cell::new(None) };
 }
 fn graph_buffer_deallocated(pointer: usize) {
+    if GRAPH_ALLOCATIONS_ACTIVE
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+    {
+        graph_buffer_deallocated_active(pointer);
+    }
+}
+// Keep the large active record out of the allocator's inactive stack frame.
+#[cold]
+#[inline(never)]
+fn graph_buffer_deallocated_active(pointer: usize) {
+    let _ = GRAPH_FREE_RECORD_COPIES.try_with(|copies| copies.set(copies.get() + 1));
     let _ = GRAPH_ALLOCATIONS.try_with(|slot| {
         if let Some(mut state) = slot.get() {
             let mut watched = false;
@@ -2184,15 +2204,17 @@ fn graph_buffer_deallocated(pointer: usize) {
         }
     });
 }
-pub(crate) struct GraphAllocationGuard(Option<GraphAllocationState>);
+pub(crate) struct GraphAllocationGuard(Option<GraphAllocationState>, bool);
 impl Drop for GraphAllocationGuard {
     fn drop(&mut self) {
         GRAPH_ALLOCATIONS.with(|slot| slot.set(self.0.take()));
+        GRAPH_ALLOCATIONS_ACTIVE.with(|active| active.set(self.1));
     }
 }
 pub(crate) fn watch_graph_allocations() -> GraphAllocationGuard {
     GraphAllocationGuard(
         GRAPH_ALLOCATIONS.with(|slot| slot.replace(Some(GraphAllocationState::EMPTY))),
+        GRAPH_ALLOCATIONS_ACTIVE.with(|active| active.replace(true)),
     )
 }
 pub(crate) fn graph_workspace_event(
@@ -3112,61 +3134,64 @@ fn maintenance_payload_allocated(pointer: usize, bytes: usize) {
     }
     let spy = unsafe { &*(ticket.1 as *const MaintenanceReaderSpy) };
     MAINTENANCE_PAYLOADS.with(|slots| {
-        let mut entries = slots.get();
-        if let Some(slot) = entries.iter_mut().find(|slot| slot.pointer == 0) {
-            *slot = MaintenancePayloadSlot {
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
+        if let Some(slot) = entries
+            .as_slice_of_cells()
+            .iter()
+            .find(|slot| slot.get().pointer == 0)
+        {
+            slot.set(MaintenancePayloadSlot {
                 pointer,
                 bytes,
                 owner: ticket.0,
                 funder: ticket.1,
-            };
+            });
             spy.payload_allocations.fetch_add(1, AtomicOrdering::SeqCst);
         } else {
             spy.allocation_watch_overflow
                 .fetch_add(1, AtomicOrdering::SeqCst);
         }
-        slots.set(entries);
     });
 }
 fn maintenance_owner_control(owner: usize, spy: &MaintenanceReaderSpy) {
     MAINTENANCE_PAYLOADS.with(|slots| {
-        let mut entries = slots.get();
-        // Identify an image-control block by the initialized owner's actual
-        // address lying inside its observed allocation, with no header offset.
-        if let Some(slot) = entries.iter_mut().find(|slot| {
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
+        if let Some(slot) = entries.as_slice_of_cells().iter().find(|slot| {
+            let slot = slot.get();
             slot.pointer != 0
                 && slot.funder == spy as *const _ as usize
                 && slot.pointer <= owner
                 && owner < slot.pointer.saturating_add(slot.bytes)
         }) {
-            *slot = MaintenancePayloadSlot::EMPTY;
+            slot.set(MaintenancePayloadSlot::EMPTY);
             spy.payload_allocations.fetch_sub(1, AtomicOrdering::SeqCst);
         }
-        slots.set(entries);
     });
 }
 fn maintenance_payload_freed(pointer: usize) {
     let _ = MAINTENANCE_PAYLOADS.try_with(|slots| {
-        let mut entries = slots.get();
+        // This callback runs on deep engine stacks even with no observer.
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
         if let Some(slot) = entries
-            .iter_mut()
-            .find(|slot| slot.pointer == pointer && pointer != 0)
+            .as_slice_of_cells()
+            .iter()
+            .find(|slot| slot.get().pointer == pointer && pointer != 0)
         {
-            // The reader scope retains this capability while its payload
-            // drops. System.dealloc has already returned at this observation.
-            let spy = unsafe { &*(slot.funder as *const MaintenanceReaderSpy) };
+            // System.dealloc has returned; the reader scope still retains the spy.
+            let spy = unsafe { &*(slot.get().funder as *const MaintenanceReaderSpy) };
             spy.payload_frees.fetch_add(1, AtomicOrdering::SeqCst);
-            *slot = MaintenancePayloadSlot::EMPTY;
+            slot.set(MaintenancePayloadSlot::EMPTY);
         }
-        slots.set(entries);
     });
 }
 fn maintenance_owner_refund(owner: usize, spy: &MaintenanceReaderSpy) {
     MAINTENANCE_PAYLOADS.with(|slots| {
-        let live = slots
-            .get()
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
+        let live = entries
+            .as_slice_of_cells()
             .iter()
             .filter(|slot| {
+                let slot = slot.get();
                 slot.pointer != 0 && slot.owner == owner && slot.funder == spy as *const _ as usize
             })
             .count();
@@ -5185,4 +5210,106 @@ impl Drop for SourceRequestsWindow {
             MEASUREMENT.lock().unwrap().active_window = 0;
         }
     }
+}
+
+// These lib tests run in the existing engine test-seams lib CI tier.
+#[test]
+fn inactive_graph_allocator_observation_copies_no_record() {
+    assert!(!GRAPH_ALLOCATIONS_ACTIVE.with(std::cell::Cell::get));
+    let before = GRAPH_FREE_RECORD_COPIES.with(std::cell::Cell::get);
+    let block = vec![42u8; std::hint::black_box(73)];
+    std::hint::black_box(&block);
+    drop(block);
+    assert_eq!(
+        GRAPH_FREE_RECORD_COPIES.with(std::cell::Cell::get),
+        before,
+        "inactive real allocator callbacks must never load the graph observation record"
+    );
+}
+
+#[test]
+fn graph_allocator_observation_restores_nested_error_and_panic_scopes() {
+    use crate::vector_observations::{
+        VectorGraphBufferKindForTest as Kind, VectorGraphWorkspaceEventForTest as Event,
+    };
+    assert!(!GRAPH_ALLOCATIONS_ACTIVE.with(std::cell::Cell::get));
+    {
+        let _outer = watch_graph_allocations();
+        let original = vec![1u8; std::hint::black_box(81)];
+        graph_workspace_event(&Event::GraphBuffers {
+            kind: Kind::OriginalEnvelope,
+            pointer: original.as_ptr() as usize,
+            capacity: original.capacity(),
+        });
+        let error = (|| -> std::result::Result<(), ()> {
+            let _inner = watch_graph_allocations();
+            Err(())
+        })();
+        assert!(error.is_err());
+        let panic = std::panic::catch_unwind(|| {
+            let _inner = watch_graph_allocations();
+            panic!("scope unwind");
+        });
+        assert!(panic.is_err());
+        assert!(GRAPH_ALLOCATIONS_ACTIVE.with(std::cell::Cell::get));
+        let selected = vec![2u8; std::hint::black_box(97)];
+        graph_workspace_event(&Event::GraphBuffers {
+            kind: Kind::SelectedBase,
+            pointer: selected.as_ptr() as usize,
+            capacity: selected.capacity(),
+        });
+        drop(original);
+        drop(selected);
+        graph_workspace_event(&Event::WorkspaceResize {
+            previous: 178,
+            next: 0,
+            operation: "normal_cleanup",
+        });
+        assert_graph_freed_before_workspace_refund(false);
+    }
+    assert!(!GRAPH_ALLOCATIONS_ACTIVE.with(std::cell::Cell::get));
+    inactive_graph_allocator_observation_copies_no_record();
+}
+
+#[test]
+fn maintenance_allocator_observation_tracks_real_payload_before_refund() {
+    use contextdb_core::read_memory::ReadMemoryBudget;
+    let db = crate::Database::open_memory();
+    let spy = MaintenanceReaderSpy::new(
+        db.declared_reader_memory().unwrap(),
+        db.writer_accountant_for_test().clone(),
+    );
+    // A real prepaid child invoice and the real allocator request share this
+    // exact identity. No inferred native header or adapter layout is used.
+    let bytes = 83;
+    spy.source
+        .try_reserve(bytes, "reader", "materialize_answer", "bounded observer guard")
+        .unwrap();
+    let owner = &spy as *const _ as usize;
+    MAINTENANCE_INVOICES.with(|tickets| {
+        let mut entries = [(0, 0, 0); 16];
+        entries[0] = (owner, spy.as_ref() as *const _ as usize, bytes);
+        tickets.set(entries);
+    });
+    let layout = Layout::from_size_align(bytes, 8).unwrap();
+    let pointer = unsafe { std::alloc::alloc(layout) };
+    assert!(!pointer.is_null());
+    assert_eq!(spy.payload_allocations.load(AtomicOrdering::SeqCst), 1);
+    MAINTENANCE_PAYLOADS.with(|slots| {
+        let entries: &std::cell::Cell<[MaintenancePayloadSlot]> = slots;
+        assert!(entries.as_slice_of_cells().iter().any(|slot| {
+            let slot = slot.get();
+            slot.pointer == pointer as usize
+                && slot.bytes == layout.size()
+                && slot.owner == owner
+                && slot.funder == spy.as_ref() as *const _ as usize
+        }));
+    });
+    unsafe {
+        std::alloc::dealloc(pointer, layout);
+    }
+    assert_eq!(spy.payload_frees.load(AtomicOrdering::SeqCst), 1);
+    maintenance_owner_refund(owner, &spy);
+    spy.source.release(bytes);
+    spy.assert_payload_lifetime();
 }
