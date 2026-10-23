@@ -256,4 +256,5 @@ mod a_reads_erasure_check_does_fixed_work_however_much_history_there_is;
 #[path = "engine_seams/many_catalog_maintenance.rs"]
 mod many_catalog_maintenance;
 
+#[path = "engine_seams/allocator_foreign_events.rs"]
 mod allocator_foreign_events;
