@@ -48,7 +48,7 @@ pub(crate) struct HistoricalRowProof {
     table: Box<str>,
     operation_snapshot: SnapshotId,
     reader: usize,
-    _image: ImageMemory,
+    _image: crate::read_image_memory::ImageMemoryHandle,
     _controls: SourceWindowCredit,
 }
 impl HistoricalRowProof {
@@ -4797,7 +4797,7 @@ impl WriterSnapshotHandle {
                 != self.owner_read()?.storage_snapshot_identity()
         {
             return Err(Error::StoreCorrupted {
-                path: table.into(),
+                path: "historical row proof".into(),
                 reason: "historical row proof escaped its captured root, table, reader or snapshot"
                     .into(),
             });
