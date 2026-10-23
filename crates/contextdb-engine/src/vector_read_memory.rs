@@ -358,7 +358,14 @@ impl DeclaredReadMemory {
                 held.checked_add(bytes as u64)
                     .filter(|after| *after <= self.effective_limit())
             })
-            .map(|_| ())
+            .map(|before| {
+                // This is the only increasing write to the original parent's
+                // retained counter. Failed CAS attempts never reach this hook.
+                #[cfg(any(test, feature = "test-seams"))]
+                statement_child_proof::parent_admitted(self, before + bytes as u64);
+                #[cfg(not(any(test, feature = "test-seams")))]
+                let _ = before;
+            })
     }
     /// Admit every original root, including a standing parent, against its
     /// declared TOTAL limit before requesting the exact native allocation.
@@ -614,10 +621,15 @@ impl DeclaredReadRoot {
         self.native_child_unqualified_observed(|_, _| {})
     }
     #[cfg(all(test, feature = "test-seams"))]
-    pub(crate) fn child_with_physical_counter_for_test(&self) -> Result<(ReadMemoryOwner, (usize, usize))> {
+    pub(crate) fn child_with_physical_counter_for_test(
+        &self,
+    ) -> Result<(ReadMemoryOwner, (usize, usize))> {
         let mut observed = (0, 0);
         let receipt = self.native_child_unqualified_observed(|child, owner| {
-            observed = (owner.accounting_identity(), &child.retained as *const _ as usize);
+            observed = (
+                owner.accounting_identity(),
+                &child.retained as *const _ as usize,
+            );
         })?;
         Ok((receipt.into_owner(), observed))
     }
@@ -2708,6 +2720,10 @@ pub mod statement_child_proof {
         pub limit: u64,
         pub parent_before: u64,
         pub parent_after: u64,
+        /// Maximum actual original-parent charge over successful admissions,
+        /// including target, sibling, direct and native-control reservations.
+        pub parent_high_water: u64,
+        pub parent_successful_admissions: usize,
         pub children: usize,
         pub control_bytes: usize,
         pub peak: u64,
@@ -2891,9 +2907,14 @@ pub mod statement_child_proof {
         fn drop(&mut self) {
             #[cfg(all(test, feature = "test-seams"))]
             crate::database::ordinary_native_owner_tests::named_image_child_call(
-                self.context.child, self.counter as *const _ as usize,
-                self.context.subsystem, self.context.operation, self.context.site,
-                self.context.bytes, self.context.held, self.counter.load(Ordering::SeqCst),
+                self.context.child,
+                self.counter as *const _ as usize,
+                self.context.subsystem,
+                self.context.operation,
+                self.context.site,
+                self.context.bytes,
+                self.context.held,
+                self.counter.load(Ordering::SeqCst),
                 self.refused.get(),
             );
             update(self.parent, |sample| {
@@ -3172,11 +3193,63 @@ pub mod statement_child_proof {
         static PEAK_COMPLETED: Cell<Option<Event>> = const { Cell::new(None) };
         static CALL: Cell<Option<CallContext>> = const { Cell::new(None) };
         static FORWARD: Cell<Option<ForwardContext>> = const { Cell::new(None) };
+        static ACTIVE_PARENT: Cell<usize> = const { Cell::new(0) };
         static ACTIVE: Cell<Option<Observation>> = const { Cell::new(None) };
     }
+    thread_local! {
+        static COPY_COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    // Count at the actual full Cell<Option<Observation>> read, independently
+    // of ACTIVE. Measuring an inactive statement must not enable observation.
+    #[inline(never)]
+    fn copy_observation(slot: &Cell<Option<Observation>>) -> Option<Observation> {
+        COPY_COUNT.with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
+        slot.get()
+    }
+    #[doc(hidden)]
+    pub fn count_observation_copies<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                COPY_COUNT.with(|slot| slot.set(self.0));
+            }
+        }
+        let restore = Restore(COPY_COUNT.with(|slot| slot.replace(Some(0))));
+        let result = operation();
+        let copies = COPY_COUNT.with(|slot| slot.get().unwrap());
+        drop(restore);
+        (result, copies)
+    }
+    #[inline(always)]
+    fn observing(parent: &DeclaredReadMemory) -> bool {
+        ACTIVE_PARENT.with(|key| key.get() == parent as *const _ as usize)
+    }
+    #[inline(always)]
+    fn observing_any() -> bool {
+        ACTIVE_PARENT.with(|key| key.get() != 0)
+    }
+    pub(super) fn parent_admitted(parent: &DeclaredReadMemory, charged: u64) {
+        update(parent, |sample| {
+            sample.parent_high_water = sample.parent_high_water.max(charged);
+            sample.parent_successful_admissions += 1;
+        });
+    }
+    #[inline(always)]
     fn update(parent: &DeclaredReadMemory, f: impl FnOnce(&mut Observation)) {
+        if !observing(parent) {
+            return;
+        }
+        update_cold(parent, f)
+    }
+    #[cold]
+    #[inline(never)]
+    fn update_cold(parent: &DeclaredReadMemory, f: impl FnOnce(&mut Observation)) {
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get()
+            if let Some(mut sample) = copy_observation(slot)
                 && sample.parent_identity == parent as *const DeclaredReadMemory as usize
             {
                 f(&mut sample);
@@ -3184,9 +3257,18 @@ pub mod statement_child_proof {
             }
         });
     }
+    #[inline(always)]
     pub(super) fn expects_native_address(parent: &DeclaredReadMemory, address: usize) -> bool {
+        if !observing(parent) {
+            return false;
+        }
+        expects_native_address_cold(parent, address)
+    }
+    #[cold]
+    #[inline(never)]
+    fn expects_native_address_cold(parent: &DeclaredReadMemory, address: usize) -> bool {
         ACTIVE.with(|slot| {
-            slot.get().is_some_and(|s| {
+            copy_observation(slot).is_some_and(|s| {
                 s.parent_identity == parent as *const _ as usize
                     && s.native_controls.is_some_and(|n| {
                         address >= n.block.payload
@@ -3198,15 +3280,33 @@ pub mod statement_child_proof {
             })
         })
     }
+    #[inline(always)]
     pub(super) fn selected_native(identity: usize) -> bool {
+        if !observing_any() {
+            return false;
+        }
+        selected_native_cold(identity)
+    }
+    #[cold]
+    #[inline(never)]
+    fn selected_native_cold(identity: usize) -> bool {
         ACTIVE.with(|slot| {
-            slot.get()
+            copy_observation(slot)
                 .is_some_and(|s| s.owner_identity == identity && s.native_controls.is_some())
         })
     }
+    #[inline(always)]
     pub(super) fn limit(parent: &DeclaredReadMemory) -> Option<u64> {
+        if !observing(parent) {
+            return None;
+        }
+        limit_cold(parent)
+    }
+    #[cold]
+    #[inline(never)]
+    fn limit_cold(parent: &DeclaredReadMemory) -> Option<u64> {
         ACTIVE.with(|slot| {
-            slot.get()
+            copy_observation(slot)
                 .filter(|sample| {
                     sample.parent_identity == parent as *const DeclaredReadMemory as usize
                 })
@@ -3221,10 +3321,11 @@ pub mod statement_child_proof {
         limit: u64,
         operation: impl FnOnce() -> T,
     ) -> (T, Observation) {
-        struct Restore(Option<Observation>);
+        struct Restore(Option<Observation>, usize);
         impl Drop for Restore {
             fn drop(&mut self) {
                 ACTIVE.with(|slot| slot.set(self.0));
+                ACTIVE_PARENT.with(|key| key.set(self.1));
             }
         }
         // The allocator observes this door too. getenv only borrows its static
@@ -3239,16 +3340,22 @@ pub mod statement_child_proof {
         FORWARD.with(|_| ());
         let before = parent.retained.load(Ordering::SeqCst);
         assert!(limit <= parent.effective_limit());
-        let restore = Restore(ACTIVE.with(|slot| {
-            slot.replace(Some(Observation {
-                parent_identity: parent as *const DeclaredReadMemory as usize,
-                parent_before: before,
-                limit,
-                ..Observation::default()
-            }))
-        }));
+        let previous_parent = ACTIVE_PARENT.with(Cell::get);
+        let restore = Restore(
+            ACTIVE.with(|slot| {
+                slot.replace(Some(Observation {
+                    parent_identity: parent as *const DeclaredReadMemory as usize,
+                    parent_before: before,
+                    parent_high_water: before,
+                    limit,
+                    ..Observation::default()
+                }))
+            }),
+            previous_parent,
+        );
+        ACTIVE_PARENT.with(|key| key.set(parent as *const _ as usize));
         let result = operation();
-        let mut sample = ACTIVE.with(|slot| slot.get().unwrap());
+        let mut sample = ACTIVE.with(|slot| copy_observation(slot).unwrap());
         sample.parent_after = parent.retained.load(Ordering::SeqCst);
         if sample.owner_identity != 0 {
             let after = sample.parent_after;
@@ -3345,9 +3452,18 @@ pub mod statement_child_proof {
             }
         });
     }
+    #[inline(always)]
     pub(super) fn native_forwarder_retired(identity: usize) {
+        if !observing_any() {
+            return;
+        }
+        native_forwarder_retired_cold(identity)
+    }
+    #[cold]
+    #[inline(never)]
+    fn native_forwarder_retired_cold(identity: usize) {
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get()
+            if let Some(mut sample) = copy_observation(slot)
                 && sample.owner_identity == identity
             {
                 sample.native_forwarder_identity = 0;
@@ -3355,6 +3471,7 @@ pub mod statement_child_proof {
             }
         });
     }
+    #[inline(always)]
     pub(crate) fn native_control_credits(
         identity: usize,
         keeper_bytes: usize,
@@ -3363,8 +3480,30 @@ pub mod statement_child_proof {
         adapter_payer: Option<usize>,
         adapter_payload_layout: std::alloc::Layout,
     ) {
+        if !observing_any() {
+            return;
+        }
+        native_control_credits_cold(
+            identity,
+            keeper_bytes,
+            adapter_bytes,
+            keeper_payer,
+            adapter_payer,
+            adapter_payload_layout,
+        )
+    }
+    #[cold]
+    #[inline(never)]
+    fn native_control_credits_cold(
+        identity: usize,
+        keeper_bytes: usize,
+        adapter_bytes: usize,
+        keeper_payer: Option<usize>,
+        adapter_payer: Option<usize>,
+        adapter_payload_layout: std::alloc::Layout,
+    ) {
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get()
+            if let Some(mut sample) = copy_observation(slot)
                 && sample.owner_identity == identity
             {
                 let controls = sample
@@ -3383,6 +3522,7 @@ pub mod statement_child_proof {
             }
         });
     }
+    #[inline(always)]
     pub(crate) fn native_control_allocated(
         identity: usize,
         keeper: bool,
@@ -3392,8 +3532,32 @@ pub mod statement_child_proof {
         outer_keeper: usize,
         inner_keeper: usize,
     ) {
+        if !observing_any() {
+            return;
+        }
+        native_control_allocated_cold(
+            identity,
+            keeper,
+            allocation,
+            payer,
+            invoice_bytes,
+            outer_keeper,
+            inner_keeper,
+        )
+    }
+    #[cold]
+    #[inline(never)]
+    fn native_control_allocated_cold(
+        identity: usize,
+        keeper: bool,
+        allocation: ControlAllocation,
+        payer: usize,
+        invoice_bytes: usize,
+        outer_keeper: usize,
+        inner_keeper: usize,
+    ) {
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get()
+            if let Some(mut sample) = copy_observation(slot)
                 && sample.owner_identity == identity
             {
                 let controls = sample
@@ -3470,29 +3634,71 @@ pub mod statement_child_proof {
     /// open. This neither ends/resets observation nor retains a forwarding Arc.
     /// parent_after is the operation-exit sample and is final only on return.
     #[doc(hidden)]
+    #[inline(always)]
     pub fn current() -> Option<Observation> {
-        ACTIVE.with(Cell::get)
+        if !observing_any() {
+            return None;
+        }
+        current_cold()
+    }
+    #[cold]
+    #[inline(never)]
+    fn current_cold() -> Option<Observation> {
+        ACTIVE.with(copy_observation)
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[inline(always)]
     pub(crate) fn native_controls(identity: usize) -> Option<NativeOwnerControls> {
+        if !observing_any() {
+            return None;
+        }
+        native_controls_cold(identity)
+    }
+    #[cold]
+    #[inline(never)]
+    fn native_controls_cold(identity: usize) -> Option<NativeOwnerControls> {
         ACTIVE.with(|slot| {
-            slot.get()
+            copy_observation(slot)
                 .filter(|s| s.owner_identity == identity)
                 .and_then(|s| s.native_controls)
         })
     }
     #[cfg(any(test, feature = "test-seams"))]
+    #[inline(always)]
     pub(crate) fn trace_owner_controls(controls: TraceOwnerControls) {
+        if !observing_any() {
+            return;
+        }
+        trace_owner_controls_cold(controls)
+    }
+    #[cold]
+    #[inline(never)]
+    fn trace_owner_controls_cold(controls: TraceOwnerControls) {
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get() {
+            if let Some(mut sample) = copy_observation(slot) {
                 sample.trace_owner_controls = Some(controls);
                 slot.set(Some(sample));
             }
         });
     }
     #[cfg(feature = "test-seams")]
+    #[inline(always)]
     pub(crate) fn trace_produced(
+        receipt: contextdb_vector::mem::TraceInvoiceForTest,
+        payer: usize,
+        owner: usize,
+        prepaid: std::alloc::Layout,
+    ) {
+        if !observing_any() {
+            return;
+        }
+        trace_produced_cold(receipt, payer, owner, prepaid)
+    }
+    #[cfg(feature = "test-seams")]
+    #[cold]
+    #[inline(never)]
+    fn trace_produced_cold(
         mut receipt: contextdb_vector::mem::TraceInvoiceForTest,
         payer: usize,
         owner: usize,
@@ -3502,16 +3708,26 @@ pub mod statement_child_proof {
         receipt.owner_payload_pointer = owner;
         receipt.prepaid_control = (0, prepaid.size(), prepaid.align());
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get() {
+            if let Some(mut sample) = copy_observation(slot) {
                 sample.trace_produced = Some(receipt);
                 slot.set(Some(sample));
             }
         });
     }
     #[cfg(feature = "test-seams")]
+    #[inline(always)]
     pub(crate) fn trace_cleared(old: Option<&contextdb_vector::OwnedVectorSearchTrace>) {
+        if !observing_any() {
+            return;
+        }
+        trace_cleared_cold(old)
+    }
+    #[cfg(feature = "test-seams")]
+    #[cold]
+    #[inline(never)]
+    fn trace_cleared_cold(old: Option<&contextdb_vector::OwnedVectorSearchTrace>) {
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get() {
+            if let Some(mut sample) = copy_observation(slot) {
                 if let Some(old) = old {
                     sample.trace_cleared = Some(old.complete_invoice_for_test(|_| {}));
                 }
@@ -3520,12 +3736,25 @@ pub mod statement_child_proof {
         });
     }
     #[cfg(feature = "test-seams")]
+    #[inline(always)]
     pub(crate) fn trace_published(
         new: &contextdb_vector::OwnedVectorSearchTrace,
         old: Option<&contextdb_vector::OwnedVectorSearchTrace>,
     ) {
+        if !observing_any() {
+            return;
+        }
+        trace_published_cold(new, old)
+    }
+    #[cfg(feature = "test-seams")]
+    #[cold]
+    #[inline(never)]
+    fn trace_published_cold(
+        new: &contextdb_vector::OwnedVectorSearchTrace,
+        old: Option<&contextdb_vector::OwnedVectorSearchTrace>,
+    ) {
         ACTIVE.with(|slot| {
-            if let Some(mut sample) = slot.get() {
+            if let Some(mut sample) = copy_observation(slot) {
                 sample.trace_new = Some(new.complete_invoice_for_test(|_| {}));
                 sample.trace_old = old.map(|trace| trace.complete_invoice_for_test(|_| {}));
                 slot.set(Some(sample));
@@ -3534,10 +3763,19 @@ pub mod statement_child_proof {
     }
 
     /// Sample the real owner while its physical membership capture is live.
+    #[inline(always)]
     pub(crate) fn live_workspace(memory: impl Into<ReadMemoryOwner>, bytes: usize) {
+        if !observing_any() {
+            return;
+        }
+        live_workspace_cold(memory, bytes)
+    }
+    #[cold]
+    #[inline(never)]
+    fn live_workspace_cold(memory: impl Into<ReadMemoryOwner>, bytes: usize) {
         let memory: ReadMemoryOwner = memory.into();
         ACTIVE.with(|slot| {
-            let Some(mut sample) = slot.get() else {
+            let Some(mut sample) = copy_observation(slot) else {
                 return;
             };
             let identity = observed_reader_identity(&memory);
@@ -3551,6 +3789,70 @@ pub mod statement_child_proof {
             }));
             slot.set(Some(sample));
         });
+    }
+
+    #[cfg(test)]
+    mod recovery_tests {
+        use super::*;
+        #[test]
+        fn parent_high_water_records_successful_direct_admissions_but_not_refusals() {
+            let parent = DeclaredReadMemory::from_reader_limit(8192).unwrap();
+            let before = parent.retained.load(Ordering::SeqCst);
+            let (_, sample) = observe(&parent, 4096, || {
+                parent
+                    .try_reserve_native(3000, "reader", "direct-peak", "test")
+                    .unwrap();
+                parent.release(3000);
+                assert!(
+                    parent
+                        .try_reserve_native(4096, "reader", "refused", "test")
+                        .is_err()
+                );
+                parent
+                    .try_reserve(100, "reader", "fallible-door", "test")
+                    .unwrap();
+                parent.release(100);
+            });
+            assert_eq!(sample.parent_high_water, before + 3000);
+            assert_eq!(sample.parent_successful_admissions, 2);
+            assert_eq!(sample.parent_before, before);
+            assert_eq!(sample.parent_after, before);
+            assert_eq!(
+                sample.peak, 0,
+                "parent maximum is independent of child peak"
+            );
+        }
+        #[test]
+        fn observation_parent_key_restores_normal_error_panic_and_nested_scopes() {
+            let parent = DeclaredReadMemory::from_reader_limit(8192).unwrap();
+            let foreign = DeclaredReadMemory::from_reader_limit(8192).unwrap();
+            assert_eq!(limit(&parent), None);
+            let (_, outer) = observe(&parent, 4096, || {
+                assert_eq!(limit(&parent), Some(4096));
+                assert_eq!(limit(&foreign), None);
+                let (_, inner) = observe(&foreign, 2048, || {
+                    assert_eq!(limit(&parent), None);
+                    assert_eq!(limit(&foreign), Some(2048));
+                });
+                assert_eq!(inner.parent_identity, &*foreign as *const _ as usize);
+                assert_eq!(limit(&parent), Some(4096));
+                let (error, _) = observe(&parent, 2048, || Err::<(), _>("expected"));
+                assert!(error.is_err());
+                assert_eq!(limit(&parent), Some(4096));
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    observe(&parent, 2048, || panic!("scope unwind"));
+                }));
+                assert!(panic.is_err());
+                assert_eq!(limit(&parent), Some(4096));
+            });
+            assert_eq!(outer.parent_identity, &*parent as *const _ as usize);
+            assert_eq!(limit(&parent), None);
+            let (_, copies) = count_observation_copies(|| {
+                assert_eq!(limit(&parent), None);
+                update(&foreign, |_| panic!("inactive update must not execute"));
+            });
+            assert_eq!(copies, 0);
+        }
     }
 }
 

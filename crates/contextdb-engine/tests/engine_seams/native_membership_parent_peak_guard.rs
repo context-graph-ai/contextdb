@@ -1,3 +1,5 @@
+// Permanent fast CI: contextdb-engine-test-seams-7 runs this engine_seams
+// module in the normal PR tier, with the existing test-seams feature tuple.
 //! Cheap public SQL guard for simultaneous reader-parent and child accounting.
 use crate::resident_history_support::{insert_vector, open, vector};
 use contextdb_core::{Value, Wallclock};
@@ -77,6 +79,14 @@ fn public_membership_pages_keep_the_original_parent_within_its_live_limit() {
                 peak.parent_after <= LIMIT,
                 "simultaneous original parent ceiling: {peak:?}"
             );
+            assert!(live.parent_high_water <= LIMIT);
+            assert!(live.parent_high_water >= live.parent_before);
+            assert!(live.parent_high_water >= peak.parent_after);
+            assert!(live.parent_high_water >= live.parent_after);
+            assert!(live.parent_successful_admissions > 0);
+            assert!(finished.parent_high_water <= LIMIT);
+            assert!(finished.parent_high_water >= live.parent_high_water);
+            assert!(finished.parent_high_water >= finished.parent_after);
             assert!(finished.parent_after <= LIMIT);
             assert_eq!(finished.parent_funding_mismatches, 0);
             assert_eq!(
@@ -113,5 +123,46 @@ fn public_membership_pages_keep_the_original_parent_within_its_live_limit() {
     assert!(
         saw_control_refund,
         "prior native child control must physically refund"
+    );
+}
+
+#[test]
+fn inactive_observation_copies_no_full_receipts_for_public_sql_n_and_2n() {
+    let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let mut counts = Vec::new();
+    for n in [32, 64] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("inactive.db"), Some(64 * 1024 * 1024));
+        db.execute(
+            "CREATE TABLE inactive_copy (id INT PRIMARY KEY, v VECTOR(256)) HISTORY ALL",
+            &HashMap::new(),
+        )
+        .unwrap();
+        for id in 0..n {
+            insert_vector(&db, "inactive_copy", id, None, 256);
+        }
+        let snapshot = db.snapshot();
+        let params = HashMap::from([("v".into(), Value::Vector(vector(0, 256)))]);
+        let ((answer, work), copies) = statement::count_observation_copies(|| {
+            observe(|| {
+                db.execute_at_snapshot(
+                    "SELECT id FROM inactive_copy ORDER BY v <=> $v USE VECTOR EXACT LIMIT 1",
+                    &params,
+                    snapshot,
+                )
+            })
+        });
+        assert_eq!(answer.unwrap().rows()[0][0], Value::Int64(0));
+        assert!(
+            work.membership_keys_examined >= n,
+            "actual native membership budget path"
+        );
+        counts.push(copies);
+    }
+    eprintln!("inactive full Observation copies N/2N: {counts:?}");
+    assert_eq!(
+        counts,
+        [0, 0],
+        "inactive SQL must not copy a full Observation"
     );
 }
