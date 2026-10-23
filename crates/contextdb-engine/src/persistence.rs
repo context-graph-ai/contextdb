@@ -35140,7 +35140,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
         table: &str,
     ) -> Result<()> {
         let original = crate::memory_accounting::OwnedMemoryReservation::new(accountant);
-        let storage = native_storage_admission::StorageAdmissionScope::writer_original_native(&original)?;
+        let storage = native_storage_admission::StorageAdmissionScope::writer_original_native(&original)
+            .map_err(Error::NativeEngineOther)?;
         storage.run_native(|| self.with_db(|db| {
             let write = Self::begin_history_write(db)?;
             let table_name = Self::rel_table_name(table);
@@ -35162,7 +35163,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
             }
             write.commit().map_err(Self::storage_error)?;
             Ok(())
-        }))
+        })).map_err(native_storage_admission::original_storage_error)
     }
 
     #[expect(
