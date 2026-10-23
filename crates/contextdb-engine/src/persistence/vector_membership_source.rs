@@ -4618,3 +4618,18 @@ pub(crate) fn stream_partition_journal_tail(
 }
 
 use crate::persistence::writer_source::WriterSnapshotHandle;
+
+/// The exact count-header producer must authenticate but not decode a later
+/// row version beyond the placement's visible_from cut. The outer membership
+/// count authenticates every placement at its OWN cut, so an invisible newer
+/// malformed placement still correctly rejects there; that is a different cut.
+#[cfg(all(test, feature = "test-seams"))]
+pub(crate) fn count_header_before_future_version_for_test(owner: &MembershipOwner, table: &str, snapshot: SnapshotId) -> Result<usize> {
+    let context = operation_for(owner).expect("actual captured vector operation");
+    let root = context.root.writer.as_ref().expect("actual writer historical producer");
+    let proof = root.open_historical_row_proof(table, context.snapshot, context.memory.clone(), &mut || Ok(()))?;
+    let mut count = 0;
+    root.visit_historical_row_headers_with_proof(table, None, snapshot, context.snapshot,
+        context.memory.clone(), &proof, &mut || Ok(()), &mut |_row| { count += 1; Ok(()) })?;
+    Ok(count)
+}

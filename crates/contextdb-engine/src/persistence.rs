@@ -35138,6 +35138,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         &self,
         accountant: crate::memory_accounting::AccountantHandle,
         table: &str,
+        last: bool,
     ) -> Result<()> {
         let original = crate::memory_accounting::OwnedMemoryReservation::new(accountant);
         let storage = native_storage_admission::StorageAdmissionScope::writer_original_native(&original)
@@ -35149,8 +35150,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
             {
                 let mut relation = write.open_table(definition).map_err(Self::storage_error)?;
                 let (key, old) = {
-                    let (key, body) = relation.iter().map_err(Self::storage_error)?
-                        .next().transpose().map_err(Self::storage_error)?.expect("fixture row");
+                    let mut rows = relation.iter().map_err(Self::storage_error)?;
+                    let (key, body) = if last { rows.next_back() } else { rows.next() }
+                        .transpose().map_err(Self::storage_error)?.expect("fixture row");
                     (key.value().to_vec(), body.value().to_vec())
                 };
                 let mut new = old.clone();

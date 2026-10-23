@@ -266,7 +266,7 @@ fn historical_count_valid_json_uses_existing_decoder() {
 }
 #[test]
 #[serial_test::serial]
-fn historical_count_skips_future_authenticated_malformed_json() {
+fn count_header_producer_skips_future_authenticated_malformed_json() {
     authenticated_json_count_fixture(true, true);
 }
 fn authenticated_json_count_fixture(malformed: bool, future: bool) {
@@ -276,14 +276,18 @@ fn authenticated_json_count_fixture(malformed: bool, future: bool) {
         maintenance_policy: MaintenancePolicy::CallerDriven, ..Default::default()
     }).unwrap();
     db.execute("CREATE TABLE count_json (id INTEGER PRIMARY KEY, doc JSON, v VECTOR(4)) HISTORY ALL", &HashMap::new()).unwrap();
-    let before_insert = db.snapshot();
     db.execute("INSERT INTO count_json VALUES (1,$doc,$v)", &HashMap::from([
         ("doc".into(), Value::Json(serde_json::json!({}))),
         ("v".into(), Value::Vector(vec![1.0,0.0,0.0,0.0])),
     ])).unwrap();
-    let snapshot = if future { before_insert } else { db.snapshot() };
+    let snapshot = db.snapshot();
+    if future {
+        db.execute("UPDATE count_json SET doc = $doc WHERE id = 1", &HashMap::from([
+            ("doc".into(), Value::Json(serde_json::json!({}))),
+        ])).unwrap();
+    }
     if malformed {
-        db.persistence.as_ref().unwrap().malformed_count_json_for_test(db.accountant.clone(), "count_json").unwrap();
+        db.persistence.as_ref().unwrap().malformed_count_json_for_test(db.accountant.clone(), "count_json", future).unwrap();
     }
     db.execute("CREATE TABLE count_json_marker (id INTEGER PRIMARY KEY)", &HashMap::new()).unwrap();
     db.execute("INSERT INTO count_json_marker VALUES (1)", &HashMap::new()).unwrap();
@@ -297,14 +301,19 @@ fn authenticated_json_count_fixture(malformed: bool, future: bool) {
             let mut partitions = persistence.durable_membership_partitions(&mut copies).unwrap();
             let (partition, summary) = partitions.pop().unwrap();
             let mut workspace = copies.scratch();
+            let owner = MembershipOwner::Writable(persistence);
             let source = DurableMembershipSource::from_owner_admitted(
-                MembershipOwner::Writable(persistence), None, &partition, summary,
+                owner.clone(), None, &partition, summary,
                 db.accountant.clone(), &mut workspace, copies.scratch()).unwrap();
             let work = crate::read_work_probe::ReadWorkObservationScope::enter(crate::read_work_probe::ReadWorkPhase::Query);
-            let result = source.visible_count(snapshot, &mut || true, &mut copies);
+            let result = if future {
+                crate::persistence::vector_membership_source::count_header_before_future_version_for_test(&owner, "count_json", snapshot)
+            } else {
+                source.visible_count(snapshot, &mut || true, &mut copies)
+            };
             if future {
-                assert_eq!(result.unwrap(), 0, "an authenticated future version is not decoded or shape-validated");
-                assert_eq!(work.counters().decoded_rows, 0);
+                assert_eq!(result.unwrap(), 1, "the same count producer selects the older valid row and skips decoding its authenticated future version");
+                assert_eq!(work.counters().decoded_rows, 1, "only the older valid JSON row requires full decoding");
             } else if malformed {
                 assert!(matches!(result, Err(Error::StoreCorrupted { .. })),
                     "the actual historical count must preserve the original JSON decode rejection: {result:?}");
