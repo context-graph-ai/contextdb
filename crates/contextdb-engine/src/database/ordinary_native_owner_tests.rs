@@ -17,6 +17,8 @@ struct Capture {
     invalid: bool,
     invalid_site: u32,
     actual_constructor_requests: [(usize, usize, usize, usize); 3],
+    first_expected_child: [usize; 4],
+    first_unexpected_child: [usize; 4],
     parent: usize,
     parent_counter: usize,
     baseline: u64,
@@ -61,7 +63,7 @@ thread_local! { static ANSWER_TRACE: Cell<AnswerTraceCapture> = const { Cell::ne
 thread_local! {
     static HOOK_BUSY: Cell<bool> = const { Cell::new(false) };
     static CAPTURE: Cell<Capture> = const { Cell::new(Capture {
-        active: false, invalid: false, invalid_site: 0, actual_constructor_requests: [(0,0,0,0);3], parent: 0, parent_counter: 0,
+        active: false, invalid: false, invalid_site: 0, actual_constructor_requests: [(0,0,0,0);3], first_expected_child:[0;4], first_unexpected_child:[0;4], parent: 0, parent_counter: 0,
         baseline: 0, children: 0, stages: 0, allow_constructor_prefix: false, constructor_base: 0, requests: [(0, 0, 0); 3],
         trace_requests: [(0,0,0); 2], trace_ordinals: [0; 2], trace_invoices: [(0,0); 2], trace_stages: 0,
         trace_before: 0, trace_parent: [0; 2], trace_credits: [0; 2],
@@ -294,6 +296,20 @@ pub(crate) fn child_counter(
         if c.parent != parent as *const _ as usize
             || (c.child_counter != 0 && c.child_counter != counter as *const _ as usize)
         {
+            if c.first_unexpected_child == [0; 4] {
+                c.first_expected_child = [
+                    c.parent,
+                    c.child_payload,
+                    c.child_counter,
+                    c.child_limit as usize,
+                ];
+                c.first_unexpected_child = [
+                    parent as *const _ as usize,
+                    payload,
+                    counter as *const _ as usize,
+                    limit as usize,
+                ];
+            }
             c.invalid = true;
             if c.invalid_site == 0 {
                 c.invalid_site = line!();
@@ -427,13 +443,15 @@ impl Observation {
         let c = CAPTURE.with(Cell::get);
         assert!(
             !c.invalid,
-            "constructor receipt invalid at line {}; children={} stages={} trace_stages={} actual={:?} expected={:?}",
+            "constructor receipt invalid at line {}; children={} stages={} trace_stages={} actual={:?} expected={:?} first_expected_child(parent,payload,counter,limit)={:?} first_unexpected_child={:?}",
             c.invalid_site,
             c.children,
             c.stages,
             c.trace_stages,
             c.actual_constructor_requests,
-            c.requests
+            c.requests,
+            c.first_expected_child,
+            c.first_unexpected_child
         );
         c
     }
@@ -1792,10 +1810,17 @@ fn actual_direct_file_public_readers_keep_original_invoices_through_physical_fre
                     assert_eq!(answer.rows(), vec![vec![Value::Int64(0)]]);
                     // The live session owns only its standing root, not this
                     // per-operation native child or the escaped actual trace.
-                    assert_route_original_physical_invoices(db, parent, capture, route, true, || {
-                        drop(answer);
-                        None
-                    });
+                    assert_route_original_physical_invoices(
+                        db,
+                        parent,
+                        capture,
+                        route,
+                        true,
+                        || {
+                            drop(answer);
+                            None
+                        },
+                    );
                     Ok(())
                 })
                 .unwrap();
