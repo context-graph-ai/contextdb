@@ -464,6 +464,7 @@ fn consolidation_transaction_rollback_does_not_publish_local_autocommit_metadata
         let before = canonical(&db.table_meta("breadth_rows").unwrap());
         let history = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
         let rows = visible(&db);
+        crate::read_probe::reset();
         let tx = db.begin().unwrap();
         db.execute_in_tx(
             tx,
@@ -472,7 +473,17 @@ fn consolidation_transaction_rollback_does_not_publish_local_autocommit_metadata
         )
         .unwrap();
         assert_eq!(canonical(&db.table_meta("breadth_rows").unwrap()), before);
+        assert_eq!(
+            crate::read_probe::observed().maintenance_worker_starts,
+            0,
+            "private staging starts no maintenance worker"
+        );
         db.rollback(tx).unwrap();
+        assert_eq!(
+            crate::read_probe::observed().maintenance_worker_starts,
+            0,
+            "rollback starts no maintenance worker"
+        );
         assert_eq!(canonical(&db.table_meta("breadth_rows").unwrap()), before);
         assert_eq!(canonical(&db.ddl_log_since(Lsn(0)).unwrap()), history);
         assert_eq!(visible(&db), rows);
@@ -484,7 +495,17 @@ fn consolidation_transaction_rollback_does_not_publish_local_autocommit_metadata
             &empty(),
         )
         .unwrap();
+        assert_eq!(
+            crate::read_probe::observed().maintenance_worker_starts,
+            0,
+            "private staging starts no maintenance worker"
+        );
         db.commit(tx).unwrap();
+        assert_eq!(
+            crate::read_probe::observed().maintenance_worker_starts,
+            0,
+            "commit starts no maintenance worker"
+        );
         assert!(column(&db).consolidation_disabled);
         assert_eq!(visible(&db), rows);
         assert_eq!(authored_rows(&db), authored);

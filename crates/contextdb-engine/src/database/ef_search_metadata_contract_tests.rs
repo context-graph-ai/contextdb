@@ -660,6 +660,7 @@ fn topology_radius_structural_and_transactional_alters_keep_general_semantics() 
             "group DEFAULT clearing topology is not EF-only"
         );
         let before = canonical(&db.ddl_log_since(Lsn(0)).unwrap());
+        crate::read_probe::reset();
         let tx = db.begin().unwrap();
         db.execute_in_tx(
             tx,
@@ -674,7 +675,17 @@ fn topology_radius_structural_and_transactional_alters_keep_general_semantics() 
         );
         assert_eq!(authored_rows(&db), authored);
         assert_eq!(visible(&db), rows);
+        assert_eq!(
+            crate::read_probe::observed().maintenance_worker_starts,
+            0,
+            "private staging starts no maintenance worker"
+        );
         db.rollback(tx).unwrap();
+        assert_eq!(
+            crate::read_probe::observed().maintenance_worker_starts,
+            0,
+            "rollback starts no maintenance worker"
+        );
         assert_eq!(column(&db).hnsw_ef_search, None);
         assert_eq!(authored_rows(&db), authored);
         assert_eq!(visible(&db), rows);
@@ -686,7 +697,17 @@ fn topology_radius_structural_and_transactional_alters_keep_general_semantics() 
             &empty(),
         )
         .unwrap();
+        assert_eq!(
+            crate::read_probe::observed().maintenance_worker_starts,
+            0,
+            "private staging starts no maintenance worker"
+        );
         db.commit(tx).unwrap();
+        assert_eq!(
+            crate::read_probe::observed().maintenance_worker_starts,
+            0,
+            "commit starts no maintenance worker"
+        );
         assert_eq!(column(&db).hnsw_ef_search, Some(19));
         assert_eq!(
             db.ddl_log_since(Lsn(0)).unwrap().len(),

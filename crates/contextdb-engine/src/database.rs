@@ -46114,6 +46114,8 @@ impl Database {
             .finalization
             .local_policy_metadata_enabled
             .store(false, Ordering::SeqCst);
+        // A private schema image never owns a maintenance schedule.
+        working.maintenance_caller_driven.store(true, Ordering::SeqCst);
         let metadata = self.relational_store.table_meta.read().clone();
         let read_memory = working.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
