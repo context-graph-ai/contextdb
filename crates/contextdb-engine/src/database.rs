@@ -6312,6 +6312,8 @@ mod received_schema_stage_tests {
         );
         assert!(db.pending_local_schema_stages.lock().is_empty());
         assert!(db.local_schema_stages.lock().is_empty());
+        // Durable verification needs its ordinary funding after the staging refusal.
+        db.set_memory_limit(None).unwrap();
         assert_local_schema_transaction_absent(
             &db,
             "local_memory_refusal",
