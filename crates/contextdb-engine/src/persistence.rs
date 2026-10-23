@@ -35130,6 +35130,41 @@ graph_commit_result }.map_err(Self::storage_error)?;
         })
     }
 
+    /// Fixture-only corruption with a matching REAL rooted manifest. The
+    /// caller changes only the existing JSON text bytes, so physical identity,
+    /// encoded length, row versions and all lifecycle metadata remain intact.
+    #[cfg(all(test, feature = "test-seams"))]
+    pub(crate) fn malformed_count_json_for_test(
+        &self,
+        accountant: crate::memory_accounting::AccountantHandle,
+        table: &str,
+    ) -> Result<()> {
+        let original = crate::memory_accounting::OwnedMemoryReservation::new(accountant);
+        let storage = native_storage_admission::StorageAdmissionScope::writer_original_native(&original)?;
+        storage.run_native(|| self.with_db(|db| {
+            let write = Self::begin_history_write(db)?;
+            let table_name = Self::rel_table_name(table);
+            let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(&table_name);
+            {
+                let mut relation = write.open_table(definition).map_err(Self::storage_error)?;
+                let (key, old) = {
+                    let (key, body) = relation.iter().map_err(Self::storage_error)?
+                        .next().transpose().map_err(Self::storage_error)?.expect("fixture row");
+                    (key.value().to_vec(), body.value().to_vec())
+                };
+                let mut new = old.clone();
+                let offset = new.windows(5).position(|window| window == [0, 7, 2, b'{', b'}'])
+                    .expect("fixture has plain JSON text {}");
+                new[offset + 4] = b'x';
+                self.replace_relational_manifest_in_write_original(
+                    &original, &write, table, &key, Some(&old), Some(&new))?;
+                relation.insert(key.as_slice(), new.as_slice()).map_err(Self::storage_error)?;
+            }
+            write.commit().map_err(Self::storage_error)?;
+            Ok(())
+        }))
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

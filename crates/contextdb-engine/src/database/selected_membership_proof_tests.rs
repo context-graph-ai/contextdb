@@ -250,3 +250,47 @@ fn historical_receipt_preserves_old_and_current_indexed_answers_across_overwrite
         db.close().unwrap();
     }
 }
+
+/// The real count cursor must reject malformed JSON even though its complete
+/// borrowed structural parser accepts the UTF-8 bytes. The fixture rewrites the
+/// real persisted body AND manifest; a digest mismatch cannot satisfy this.
+#[test]
+#[serial_test::serial]
+fn historical_count_rejects_authenticated_malformed_json() {
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_options(dir.path().join("json-count.redb"), DatabaseOpenOptions {
+        maintenance_policy: MaintenancePolicy::CallerDriven, ..Default::default()
+    }).unwrap();
+    db.execute("CREATE TABLE count_json (id INTEGER PRIMARY KEY, doc JSON, v VECTOR(4)) HISTORY ALL", &HashMap::new()).unwrap();
+    db.execute("INSERT INTO count_json VALUES (1,$doc,$v)", &HashMap::from([
+        ("doc".into(), Value::Json(serde_json::json!({}))),
+        ("v".into(), Value::Vector(vec![1.0,0.0,0.0,0.0])),
+    ])).unwrap();
+    let snapshot = db.snapshot();
+    db.persistence.as_ref().unwrap().malformed_count_json_for_test(db.accountant.clone(), "count_json").unwrap();
+    db.execute("CREATE TABLE count_json_marker (id INTEGER PRIMARY KEY)", &HashMap::new()).unwrap();
+    db.execute("INSERT INTO count_json_marker VALUES (1)", &HashMap::new()).unwrap();
+    crate::executor::bounded::with_native_read_memory(db.ordinary_read_child().unwrap(), |memory| {
+        let image = crate::read_image_memory::ImageMemory::new_direct_reader(None, memory.clone())?;
+        image.scope(|| {
+            let _intent = db.vector_historical_read_intent(snapshot, memory.clone());
+            let mut copies = crate::vector_read_memory::admission(memory.clone());
+            let _scope = db.vector_read_scope(snapshot, memory.clone(), &mut copies).unwrap();
+            let persistence = db.persistence.as_ref().unwrap().clone();
+            let mut partitions = persistence.durable_membership_partitions(&mut copies).unwrap();
+            let (partition, summary) = partitions.pop().unwrap();
+            let mut workspace = copies.scratch();
+            let source = DurableMembershipSource::from_owner_admitted(
+                MembershipOwner::Writable(persistence), None, &partition, summary,
+                db.accountant.clone(), &mut workspace, copies.scratch()).unwrap();
+            let work = crate::read_work_probe::ReadWorkObservationScope::enter(crate::read_work_probe::ReadWorkPhase::Query);
+            let result = source.visible_count(snapshot, &mut || true, &mut copies);
+            assert!(matches!(result, Err(Error::StoreCorrupted { .. })),
+                "the actual historical count must preserve the original JSON decode rejection: {result:?}");
+            assert_eq!(work.counters().decoded_rows, 1, "malformed JSON goes through the existing full decoder");
+            Ok(())
+        })
+    }).unwrap();
+    db.close().unwrap();
+}
