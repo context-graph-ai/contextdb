@@ -1558,13 +1558,25 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
             db.clear_last_vector_search_trace();
             let query = "SELECT id FROM route_points ORDER BY v <=> $v USE VECTOR EXACT LIMIT 1";
             let params = HashMap::from([("v".into(), Value::Vector(vec![1.0, 0.0, 0.0, 0.0]))]);
-            let session = db
-                .read_session(contextdb_core::read_contract::ReadLimits::default())
-                .unwrap();
+            let mut limits = contextdb_core::read_contract::ReadLimits::default();
+            if route == "cursor" {
+                limits.cursor_page_rows = 1;
+            }
+            let session = db.read_session(limits).unwrap();
+            if route == "cursor" {
+                // Initialize the real standing expiry owner as fixture setup.
+                // It belongs to this live session, not to the vector operation.
+                let ready = session
+                    .open_cursor("SELECT id FROM route_points WHERE id < 0", &HashMap::new())
+                    .unwrap();
+                assert!(ready.first_page().rows().is_empty());
+                ready.close().unwrap();
+            }
             let capture = Observation::begin_at_actual_native_constructor(&db);
             let mut answer = None;
             let mut cursor = None;
             let mut page = None;
+            let mut initial_page = None;
             let _ = observed(&db, || {
                 match route {
                     "request" => {
@@ -1593,8 +1605,16 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
                     }
                     "session" => answer = Some(session.execute(query, &params).unwrap()),
                     "cursor" => {
-                        let mut opened = session.open_cursor(query, &params).unwrap();
-                        page = Some(opened.fetch(None).unwrap());
+                        let mut opened = session.open_cursor(
+                            "SELECT id FROM route_points ORDER BY v <=> $v USE VECTOR EXACT LIMIT 2", &params).unwrap();
+                        let first = opened.first_page().clone();
+                        assert_eq!(first.rows(), vec![vec![Value::Int64(0)]]);
+                        assert!(first.has_more());
+                        let next = opened.fetch(Some(std::num::NonZeroUsize::MIN)).unwrap();
+                        assert_eq!(next.rows(), vec![vec![Value::Int64(1)]]);
+                        assert!(!next.has_more());
+                        initial_page = Some(first);
+                        page = Some(next);
                         cursor = Some(opened);
                     }
                     _ => unreachable!(),
@@ -1604,7 +1624,7 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
                 assert_eq!(answer.rows(), vec![vec![Value::Int64(0)]]);
             }
             if let Some(page) = &page {
-                assert_eq!(page.rows(), vec![vec![Value::Int64(0)]]);
+                assert_eq!(page.rows(), vec![vec![Value::Int64(1)]]);
             }
             let controls = capture.assert_admitted();
             assert_eq!(
@@ -1630,10 +1650,14 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
             oracle::watch_exact_frees_for_test(&requests[..count], controls.parent_counter);
             drop(answer);
             drop(page);
+            drop(initial_page);
             if let Some(cursor) = cursor {
                 cursor.close().unwrap();
             }
-            drop(session);
+            // Cursor setup owns an independent standing expiry budget. Keep
+            // that actual session alive through this cut; the other routes
+            // still release their session before the escaped trace.
+            let session = (route == "cursor").then_some(session);
             // The escaped actual trace now keeps its own original invoices.
             assert_eq!(oracle::source_free_for_test(count)[3].2, 0);
             assert_eq!(oracle::source_free_for_test(count)[4].2, 0);
@@ -1679,6 +1703,7 @@ fn actual_request_and_cursor_traces_keep_the_same_original_physical_invoices() {
                 &requests[..count],
                 &freed[..count]
             );
+            drop(session);
         }
     }
 }
