@@ -1391,11 +1391,16 @@ impl DirectFileReader {
     }
 
     #[cfg(all(test, feature = "test-seams"))]
-    pub(crate) fn original_image_payer_for_physical_test(&self) -> Option<usize> {
+    pub(crate) fn original_image_payer_for_physical_test(&self) -> Option<(usize, usize, u64)> {
         self.image_memory
             .accountant
             .original_reader_for_observation()
-            .map(|owner| owner.accounting_identity())
+            .map(|owner| {
+                let identity = owner.accounting_identity();
+                let observer = crate::vector_read_memory::original_child_observer_for_test(identity)
+                    .expect("persistent image original is a real native child");
+                (identity, observer.physical_funding_counter_for_test(), observer.sample().charged_bytes)
+            })
     }
 
     #[cfg(all(test, feature = "test-seams"))]

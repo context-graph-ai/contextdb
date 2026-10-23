@@ -2861,6 +2861,13 @@ pub mod statement_child_proof {
     }
     impl Drop for ChildCall<'_> {
         fn drop(&mut self) {
+            #[cfg(all(test, feature = "test-seams"))]
+            crate::database::ordinary_native_owner_tests::named_image_child_call(
+                self.context.child, self.counter as *const _ as usize,
+                self.context.subsystem, self.context.operation, self.context.site,
+                self.context.bytes, self.context.held, self.counter.load(Ordering::SeqCst),
+                self.refused.get(),
+            );
             update(self.parent, |sample| {
                 let held = self.counter.load(Ordering::SeqCst);
                 let record = event(

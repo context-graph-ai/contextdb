@@ -6573,7 +6573,7 @@ impl ReadSession {
         action: impl FnOnce(
             &Database,
             &crate::vector_read_memory::DeclaredReadRoot,
-            Option<usize>,
+            Option<(usize, usize, u64)>,
         ) -> Result<T>,
     ) -> Result<T> {
         let ReadSessionState::DirectFile(reader) = self.state.as_ref() else {
