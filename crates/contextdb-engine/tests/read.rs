@@ -31,6 +31,9 @@ mod a_local_drop_leaves_the_remaining_history_readable;
 #[path = "read/a_read_only_consumer_opens_a_read_only_store.rs"]
 mod a_read_only_consumer_opens_a_read_only_store;
 #[cfg(unix)]
+#[path = "read/a_reader_arriving_while_a_writer_opens_is_served.rs"]
+mod a_reader_arriving_while_a_writer_opens_is_served;
+#[cfg(unix)]
 #[path = "read/a_received_table_replacement_retires_every_content_identity.rs"]
 mod a_received_table_replacement_retires_every_content_identity;
 #[path = "read/a_reopened_store_never_reuses_a_committed_transaction.rs"]
