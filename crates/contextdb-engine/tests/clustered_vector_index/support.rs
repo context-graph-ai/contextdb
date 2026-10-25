@@ -965,3 +965,42 @@ pub fn nearest_lists(
 ) -> Vec<u64> {
     unimplemented!("{UNBOUND}: the lists a search probes")
 }
+
+/// Declares the indexed column's TRAINING_SEED through its engineering
+/// policy: the seed of the deterministic reservoir sample and k-means
+/// initialisation. Zero is a valid seed.
+pub fn declare_training_seed(_db: &Database, _table: &str, _column: &str, _seed: u64) {
+    unimplemented!("{UNBOUND}: declaring a training seed")
+}
+
+/// The work the build of one Context's serving generation did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuildWork {
+    /// Training iterations the build ran (its resolved TRAINING_ITERATIONS).
+    pub training_iterations: u64,
+    /// Vectors in the training reservoir (its resolved TRAINING_SAMPLES).
+    pub training_samples: u64,
+    /// Lists the trained codebook has.
+    pub lists: u64,
+    /// Rows the build assigned to lists.
+    pub assigned_rows: u64,
+    /// Distance evaluations spent training the codebook.
+    pub training_distance_evaluations: u64,
+    /// Distance evaluations spent assigning rows to lists.
+    pub assignment_distance_evaluations: u64,
+}
+
+pub fn build_work(_db: &Database, _table: &str, _column: &str, _context: &[Value]) -> BuildWork {
+    unimplemented!("{UNBOUND}: build work")
+}
+
+/// The pages the serving generation's list holds, base and sealed runs.
+pub fn list_pages(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _list: u64,
+) -> u64 {
+    unimplemented!("{UNBOUND}: a list's page count")
+}
