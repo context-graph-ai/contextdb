@@ -31,6 +31,13 @@ impl<'a, S> Tracked<'a, S> {
     }
 }
 impl<S: ReadPages> ReadPages for Tracked<'_, S> {
+    fn inspection_verdict(&self, p: u64, g: u64) -> Option<Verdict> {
+        self.source.inspection_verdict(p, g)
+    }
+    fn record_inspection_verdict(&self, p: u64, g: u64, v: Verdict) {
+        self.source.record_inspection_verdict(p, g, v);
+    }
+
     fn snapshot_lsn(&self) -> Result<u64> {
         self.source.snapshot_lsn()
     }

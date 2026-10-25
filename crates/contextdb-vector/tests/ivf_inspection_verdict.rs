@@ -32,27 +32,18 @@ fn maintenance_inspection_persists_damage_and_later_readers_use_only_the_verdict
     tx.put_page(key, &raw).unwrap();
     tx.commit().unwrap();
     let mut index = ClusteredIndex::new(store, p, t, budget.into()).unwrap();
-    // Read-only inspection reports known state; maintenance verifies and persists.
-    assert_eq!(
-        inspect_catalog(index.storage(), 0, 2)
-            .unwrap()
-            .unwrap()
-            .recovery_action,
-        None
-    );
+    // Live inspection verifies once; maintenance persists the cached verdict.
+    let live = inspect_catalog(index.storage(), 0, 2).unwrap().unwrap();
+    assert_eq!(live.recovery_action, Some("rebuild"));
+    assert!(!live.verdict_recorded);
     index.storage().reads.borrow_mut().clear();
-    assert_eq!(
-        index.inspect_catalog(0).unwrap().unwrap().recovery_action,
-        Some("rebuild")
-    );
-    assert!(
-        index
-            .storage()
-            .reads
-            .borrow()
-            .keys()
-            .any(|k| *k == PageKind::Codebook)
-    );
+    let recorded = index.inspect_catalog(0).unwrap().unwrap();
+    assert_eq!(recorded.recovery_action, Some("rebuild"));
+    assert!(recorded.verdict_recorded);
+    assert!(index.storage().reads.borrow().keys().all(|k| !matches!(
+        k,
+        PageKind::Codebook | PageKind::Directory | PageKind::DirectoryPresence
+    )));
     for writer_path in [false, true] {
         index.storage().reads.borrow_mut().clear();
         let state = if writer_path {

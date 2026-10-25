@@ -45,6 +45,7 @@ impl MemoryBudget for Budget {
 pub struct Pages {
     identity: VectorIndexRef,
     committed_lsn: u64,
+    pub inspection: RefCell<BTreeMap<(u64, u64, u64), Verdict>>,
     pages: BTreeMap<PageKey, Box<[u8; PAGE_BYTES]>>,
     manifests: BTreeMap<u64, Manifest>,
     builds: BTreeMap<u64, BuildState>,
@@ -61,6 +62,7 @@ impl Default for Pages {
         Self {
             identity: VectorIndexRef::new("fixture", "embedding"),
             committed_lsn: 0,
+            inspection: RefCell::new(BTreeMap::new()),
             pages: BTreeMap::new(),
             manifests: BTreeMap::new(),
             builds: BTreeMap::new(),
@@ -75,6 +77,18 @@ impl Default for Pages {
     }
 }
 impl ReadPages for Pages {
+    fn inspection_verdict(&self, p: u64, g: u64) -> Option<Verdict> {
+        self.inspection
+            .borrow()
+            .get(&(self.committed_lsn, p, g))
+            .copied()
+    }
+    fn record_inspection_verdict(&self, p: u64, g: u64, v: Verdict) {
+        self.inspection
+            .borrow_mut()
+            .insert((self.committed_lsn, p, g), v);
+    }
+
     fn snapshot_lsn(&self) -> Result<u64> {
         Ok(self.committed_lsn)
     }
@@ -129,11 +143,19 @@ impl ReadPages for Pages {
 pub struct Transaction<'a> {
     parent: &'a mut Pages,
     lsn: u64,
+    pub inspection: RefCell<BTreeMap<(u64, u64, u64), Verdict>>,
     pages: BTreeMap<PageKey, Box<[u8; PAGE_BYTES]>>,
     manifests: BTreeMap<u64, Manifest>,
     builds: BTreeMap<u64, BuildState>,
 }
 impl ReadPages for Transaction<'_> {
+    fn inspection_verdict(&self, p: u64, g: u64) -> Option<Verdict> {
+        self.inspection.borrow().get(&(self.lsn, p, g)).copied()
+    }
+    fn record_inspection_verdict(&self, p: u64, g: u64, v: Verdict) {
+        self.inspection.borrow_mut().insert((self.lsn, p, g), v);
+    }
+
     fn snapshot_lsn(&self) -> Result<u64> {
         Ok(self.parent.committed_lsn)
     }
@@ -184,19 +206,23 @@ impl WritePages for Transaction<'_> {
         if self.parent.fail_next_write.replace(false) {
             return Err(Error::ReadCancelled);
         }
+        self.inspection.borrow_mut().clear();
         self.pages.insert(key, Box::new(*payload));
         Ok(())
     }
     fn stage_build(&mut self, state: BuildState) -> Result<()> {
+        self.inspection.borrow_mut().clear();
         self.builds.insert(state.manifest.partition, state);
         Ok(())
     }
     fn publish_manifest(&mut self, m: Manifest) -> Result<()> {
+        self.inspection.borrow_mut().clear();
         self.manifests.insert(m.partition, m);
         Ok(())
     }
     fn commit(self) -> Result<()> {
         self.parent.check_cancel()?;
+        self.parent.inspection.borrow_mut().clear();
         self.parent.committed_lsn = self.lsn;
         self.parent.pages.extend(self.pages);
         self.parent.manifests.extend(self.manifests);
@@ -214,6 +240,7 @@ impl PageStore for Pages {
             .expect("fixture transaction clock exhausted");
         Ok(Transaction {
             lsn,
+            inspection: RefCell::new(BTreeMap::new()),
             parent: self,
             pages: BTreeMap::new(),
             manifests: BTreeMap::new(),

@@ -37,6 +37,21 @@ pub struct PageKey {
     pub run: u64,
 }
 
+/// A verified inspection result scoped to one admitted manifest window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Healthy,
+    Corrupt(PageKey),
+}
+impl Verdict {
+    pub(crate) fn damage(self) -> Option<PageKey> {
+        match self {
+            Self::Healthy => None,
+            Self::Corrupt(key) => Some(key),
+        }
+    }
+}
+
 /// Fixed metadata; directories and vectors remain pages, never vectors in this object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Manifest {
@@ -107,6 +122,11 @@ pub enum DistanceKind {
 }
 
 pub trait ReadPages {
+    /// Snapshot identity is implicit in the supplying pinned view. The verdict
+    /// lives inline in its already admitted manifest/control holder; eviction is
+    /// permitted and re-admission then requires verification again.
+    fn inspection_verdict(&self, partition: u64, generation: u64) -> Option<Verdict>;
+    fn record_inspection_verdict(&self, partition: u64, generation: u64, verdict: Verdict);
     /// Captured native source frontier, never a slot-derived substitute.
     fn snapshot_lsn(&self) -> Result<u64>;
     /// The captured native index identity; copied into a typed caller diagnostic only on failure.

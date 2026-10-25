@@ -9,6 +9,8 @@ use super::{
 };
 use crate::MemoryBudgetOwner;
 use contextdb_core::Result;
+// Two fixed coalesce inputs plus a distinct append/join target.
+pub(crate) const MIN_LIVE_RUN_DESCRIPTORS: u64 = 2 + 1;
 pub(crate) const CONTROL_PAGES: usize = 15;
 pub(crate) const DIRECTORY_PAGES: usize = 10;
 pub(crate) fn coalesce_control_pages(m: Manifest) -> Result<usize> {
@@ -934,19 +936,22 @@ impl<S: PageStore> ClusteredIndex<S> {
     /// Subsequent inspections read that flag; read-only SHOW never re-verifies.
     pub fn inspect_catalog(&mut self, partition: u64) -> Result<Option<catalog::CatalogState>> {
         self.store.check_cancel()?;
-        let Some(m) = self.store.manifest(partition)? else {
+        let Some(state) = catalog::inspect(&self.store, partition, self.policy.max_delta_runs)?
+        else {
             return Ok(None);
         };
-        let mut c = Catalog::load(&self.store, m)?;
-        if c.unserviceable.is_none() {
-            c.unserviceable = super::recovery::inspect_damage(&self.store, m, c)?;
-            if c.unserviceable.is_some() {
-                let mut tx = self.store.begin()?;
-                c.store(&mut tx, m)?;
-                tx.commit()?;
-            }
+        if let Some(key) = state.unserviceable
+            && !state.verdict_recorded
+        {
+            let m = self.store.manifest(partition)?.ok_or_else(corrupt)?;
+            let mut c = Catalog::load(&self.store, m)?;
+            c.unserviceable.get_or_insert(key);
+            let mut tx = self.store.begin()?;
+            c.store(&mut tx, m)?;
+            tx.commit()?;
+            return catalog::inspect(&self.store, partition, self.policy.max_delta_runs);
         }
-        catalog::inspect(&self.store, partition, self.policy.max_delta_runs)
+        Ok(Some(state))
     }
 
     /// At most entry_limit source entries, with a durable entry cursor. Prepared
@@ -969,9 +974,11 @@ impl<S: PageStore> ClusteredIndex<S> {
             });
         };
         let source_run = Run::load(&self.store, old, c.legacy_first)?;
-        if c.remap_examined > source_run.entries {
+        if c.remap_examined > source_run.entries
+            || (c.remap_join_target != 0 && c.remap_examined != source_run.entries)
+        {
             let key = m.key(PageKind::Catalog, 0, 0);
-            c.unserviceable = Some(key);
+            c.unserviceable.get_or_insert(key);
             if c.remap_join_target != 0 {
                 // Joining proves the source pass completed; retain its list cursor.
                 c.remap_examined = source_run.entries;
@@ -1086,7 +1093,7 @@ impl<S: PageStore> ClusteredIndex<S> {
                 .max_delta_runs
                 .checked_add(1)
                 .ok_or_else(corrupt)?
-                .max(3);
+                .max(MIN_LIVE_RUN_DESCRIPTORS);
             if prepared.entries != 0 && (c.runs >= bound || c.remap_join_target != 0) {
                 if c.remap_join_target == 0 {
                     if c.last == 0 || c.last == c.coalesce_left || c.last == c.coalesce_right {
@@ -1259,13 +1266,14 @@ fn load_seal_book(
     let book = match Codebook::load_values(owner, source, m) {
         Ok(book) => book,
         Err(error) if super::recovery::damaged_page(&error) => {
-            c.unserviceable = Some(m.key(PageKind::Codebook, 0, 0));
+            c.unserviceable
+                .get_or_insert(m.key(PageKind::Codebook, 0, 0));
             return Ok(None);
         }
         Err(error) => return Err(error),
     };
     if let Some(key) = super::recovery::directory_damage(source, m, *c)? {
-        c.unserviceable = Some(key);
+        c.unserviceable.get_or_insert(key);
         return Ok(None);
     }
     Ok(Some(book))

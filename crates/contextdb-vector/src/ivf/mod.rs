@@ -17,5 +17,6 @@ mod versions;
 mod writer;
 pub use catalog::{CatalogState, inspect as inspect_catalog};
 pub use search::{search, search_with_work};
+pub use storage::Verdict;
 pub use types::{BufferState, Hit, Mode, Policy, RowIdentity, TrainingPolicy, Vector, Work};
 pub use writer::{ClusteredIndex, RemapProgress};

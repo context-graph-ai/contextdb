@@ -15,14 +15,13 @@ use contextdb_vector::ivf::{
 };
 use std::sync::Arc;
 
-const UNBOUND: &str = "the fixture does not expose this inspection-verdict observation";
 const CAP: u64 = 2;
 
 /// Evicts the fixture's admitted manifest/control window, and the
 /// inspection verdicts it holds with it, as the native holder's bounded
 /// window would.
-fn evict_manifest_window(_store: &ivf_pages::Pages) {
-    unimplemented!("{UNBOUND}: evicting the admitted manifest window")
+fn evict_manifest_window(store: &ivf_pages::Pages) {
+    store.inspection.borrow_mut().clear();
 }
 
 fn training() -> TrainingPolicy {

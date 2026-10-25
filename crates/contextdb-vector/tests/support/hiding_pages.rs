@@ -19,7 +19,7 @@ use super::ivf_pages;
 use contextdb_core::{Result, VectorIndexRef};
 use contextdb_vector::ivf::storage::{
     BuildState, DistanceKind, Manifest, PAGE_BYTES, PageKey, PageKind, PageStore, ReadPages,
-    WritePages,
+    Verdict, WritePages,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -35,6 +35,12 @@ pub struct Hiding {
     pub reads: RefCell<BTreeMap<PageKind, u64>>,
 }
 impl ReadPages for Hiding {
+    fn inspection_verdict(&self, p: u64, g: u64) -> Option<Verdict> {
+        self.inner.inspection_verdict(p, g)
+    }
+    fn record_inspection_verdict(&self, p: u64, g: u64, v: Verdict) {
+        self.inner.record_inspection_verdict(p, g, v);
+    }
     fn index_identity(&self) -> &VectorIndexRef {
         self.inner.index_identity()
     }
@@ -100,6 +106,12 @@ pub struct HidingTransaction<'a> {
     reads: &'a RefCell<BTreeMap<PageKind, u64>>,
 }
 impl ReadPages for HidingTransaction<'_> {
+    fn inspection_verdict(&self, p: u64, g: u64) -> Option<Verdict> {
+        self.inner.inspection_verdict(p, g)
+    }
+    fn record_inspection_verdict(&self, p: u64, g: u64, v: Verdict) {
+        self.inner.record_inspection_verdict(p, g, v);
+    }
     fn index_identity(&self) -> &VectorIndexRef {
         self.inner.index_identity()
     }

@@ -369,6 +369,8 @@ pub struct CatalogState {
     pub coalescing: bool,
     pub pending_coalesce_pages: u64,
     pub recovery_action: Option<&'static str>,
+    /// False means a live verified result not yet recorded by maintenance.
+    pub verdict_recorded: bool,
 }
 pub fn inspect(
     source: &impl ReadPages,
@@ -379,8 +381,21 @@ pub fn inspect(
         return Ok(None);
     };
     let c = Catalog::load(source, m)?;
-    // Read-only inspection never repeats derived-page verification or writes.
-    let damage = c.unserviceable;
+    // A recorded verdict takes precedence over the session's live verification.
+    let verdict_recorded = c.unserviceable.is_some();
+    let damage = if verdict_recorded {
+        c.unserviceable
+    } else if let Some(verdict) = source.inspection_verdict(partition, m.generation) {
+        verdict.damage()
+    } else {
+        let damage = super::recovery::inspect_damage(source, m, c)?;
+        let verdict = damage.map_or(
+            super::storage::Verdict::Healthy,
+            super::storage::Verdict::Corrupt,
+        );
+        source.record_inspection_verdict(partition, m.generation, verdict);
+        damage
+    };
     Ok(Some(CatalogState {
         delta_runs: c.runs,
         runs_over_cap: c.runs.saturating_sub(max_delta_runs),
@@ -393,6 +408,7 @@ pub fn inspect(
         legacy_unserviceable: c.legacy_unserviceable,
         coalescing: c.coalesce_output != 0,
         recovery_action: damage.map(|_| "rebuild"),
+        verdict_recorded,
         pending_coalesce_pages: if c.coalesce_output == 0 {
             0
         } else {
