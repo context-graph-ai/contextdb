@@ -22,6 +22,8 @@ mod a_historical_read_costs_the_same_per_returned_row_as_rows_and_history_grow;
 mod a_large_journal_cleanup_is_charged_to_the_writer;
 #[path = "engine_seams/a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics.rs"]
 mod a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics;
+#[path = "engine_seams/a_scoped_sink_receives_and_counts_only_its_own_events.rs"]
+mod a_scoped_sink_receives_and_counts_only_its_own_events;
 #[path = "engine_seams/aggregate_reads_complete_across_bounded_pages.rs"]
 mod aggregate_reads_complete_across_bounded_pages;
 #[path = "engine_seams/an_arriving_count_declaration_meets_the_same_door_a_local_one_does.rs"]
