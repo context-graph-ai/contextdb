@@ -853,6 +853,7 @@ def workflow_contract(root=ROOT):
             raise ValueError('unsupported integration job execution metadata: ' + name)
     runs = re.findall(r'^        run: (.*)$', text, re.M)
     if runs != ['python3 -B scripts/ci-integration.py plan', 'bash scripts/ci-free-disk.sh',
+                'sudo apt-get update && sudo apt-get install -y ripgrep',
                 'bash scripts/verify integration "${CI_INTEGRATION_SLICE}"',
                 'python3 -B scripts/ci-integration.py required']:
         raise ValueError('integration command execution changed')
