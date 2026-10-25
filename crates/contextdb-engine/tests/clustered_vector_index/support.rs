@@ -193,6 +193,15 @@ pub struct SearchWork {
     pub served_generation: Option<u64>,
     /// The approximation-quality status the route record reports.
     pub objective_status: Option<ObjectiveStatus>,
+    /// The route the search's route record says it took.
+    pub route: Option<SearchRoute>,
+}
+
+/// The route a vector search took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchRoute {
+    Exact,
+    Indexed,
 }
 
 /// The terminal outcome of an indexed search.
@@ -381,6 +390,9 @@ pub enum PublicationCut {
     /// The manifest naming the new generation is durable; nothing after it
     /// (reclamation of the old generation) has run.
     AfterGenerationPublication,
+    /// Inside one remap batch of the legacy runs, after its work is written
+    /// and before it commits.
+    DuringRemapBatch,
 }
 
 /// Calls `observer` at each publication boundary that `operation` reaches on
@@ -654,4 +666,79 @@ pub fn remap_progress(
     _context: &[Value],
 ) -> RemapProgress {
     unimplemented!("{UNBOUND}: remap progress")
+}
+
+/// One depth of a serving generation's persisted coverage summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DepthSummary {
+    pub depth: u32,
+    /// The fewest exact top-`depth` identities any sample query's answer
+    /// prefix of length `depth` contained.
+    pub minimum_hits: u32,
+    /// Sample queries whose prefix recall at this depth is below the
+    /// declared RECALL.
+    pub queries_below: u32,
+}
+
+/// The per-depth coverage summary persisted with one Context's serving
+/// generation, for depths 1 through its maximum k, in depth order.
+pub fn coverage_summary(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> Vec<DepthSummary> {
+    unimplemented!("{UNBOUND}: the per-depth coverage summary")
+}
+
+/// While it lives, the next calibration of the named Context computes each
+/// sample query's exact ranking as usual, then scores, in place of the chosen
+/// setting's own ranked answer for sample query `i`, the identities that
+/// `answer(i, exact)` returns. `exact` holds the sample query's exact ranking
+/// to the calibration's maximum depth, as canonical row identities.
+pub struct CalibrationAnswersRewritten {
+    _private: (),
+}
+
+pub fn rewrite_next_calibration_answers(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _answer: Box<dyn Fn(usize, &[u64]) -> Vec<u64> + Send + Sync>,
+) -> CalibrationAnswersRewritten {
+    unimplemented!("{UNBOUND}: rewriting calibration answers")
+}
+
+/// The durable replacement-switch state of one Context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchPhase {
+    /// One generation serves; any replacement is unpublished.
+    Serving,
+    /// A replacement has published; legacy runs sealed under the old codebook
+    /// are being remapped.
+    Remapping,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchState {
+    pub phase: SwitchPhase,
+    /// Legacy runs recorded at the publication commit (R); fixed for the
+    /// whole remap.
+    pub legacy_runs: u64,
+    /// Legacy runs already remapped to the serving codebook.
+    pub legacy_runs_remapped: u64,
+    /// The retained old codebook while the remap runs.
+    pub retained_codebook: Option<u64>,
+    /// The whole-object charge held for the retained old codebook.
+    pub retained_codebook_charge_bytes: u64,
+}
+
+pub fn switch_state(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> SwitchState {
+    unimplemented!("{UNBOUND}: the replacement switch state")
 }
