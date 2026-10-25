@@ -1,20 +1,30 @@
 //! Coverage is decided per calibrated depth. Calibration qualifies a fixed
-//! set of depths, each by its own production search with its own shortlist,
-//! and a LIMIT k query is covered only when k is one of those depths and that
-//! depth's own run met the target on every sample query. Here the depth-10
-//! run of one sample query misses two exact neighbours while every other run
-//! is exact: LIMIT 10 is uncovered even though the depth-20 and depth-50 runs,
-//! whose first ten answers are exact, qualify; so is any LIMIT outside the
-//! calibrated set. An implementation that infers a shallow depth from a
-//! deeper run's prefix, instead of running it, fails. On a partition whose
-//! receipt qualifies a depth below EXACT's work, AUTO takes the index there.
-//! Each calibrated depth carries its own qualified (PROBES, REFINE_FACTOR)
-//! pair, listed by inspection, and its shortlist follows its own factor.
+//! set of depths, each by its own production search with its own shortlist.
+//! A LIMIT k query is served by the smallest calibrated depth d >= k, with
+//! d's own (PROBES, REFINE_FACTOR) pair and shortlist, and the route record
+//! reports that served depth. It is covered only when the executed d-route's
+//! own prefix summary at k met the target on every sample query; a LIMIT
+//! above the largest calibrated depth is never covered.
+//!
+//! Here the depth-10 run of one sample query misses two exact neighbours, and
+//! the depth-50 run of the same sample misses its two nearest neighbours,
+//! while every other run is exact. LIMIT 9 and 10 are uncovered even though
+//! the depth-20 and depth-50 runs, whose first ten answers are exact,
+//! qualify. Depth 50 meets the target at 50, yet LIMIT 21 and 30, which it
+//! serves, are uncovered, because its own answer misses the top of their
+//! rankings; LIMIT 45 is covered by the same route. An implementation that
+//! infers a shallow depth from a deeper run's prefix, or covers every k below
+//! a qualified depth, fails. On a partition whose receipt qualifies a depth
+//! below EXACT's work, AUTO takes the index there and for the LIMITs that
+//! depth serves. Each calibrated depth carries its own qualified (PROBES,
+//! REFINE_FACTOR) pair, listed by inspection, and its shortlist follows its
+//! own factor.
 
 use super::support::{
     MAX_MAINTENANCE_CYCLES, ObjectiveStatus, SearchOutcome, SearchRoute, SearchWork,
     calibration_receipt, drive_until_serving, empty, int_ids, observe_search, open_caller_driven,
-    params, plant_qualification, rewrite_next_calibration_answers, serving, unit_vector,
+    params, plant_qualification, prefix_coverage, rewrite_next_calibration_answers, serving,
+    unit_vector,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -110,10 +120,10 @@ fn only_calibrated_depths_are_covered_each_by_its_own_run() {
             &[],
             Box::new(move |query, depth, exact| {
                 seen.lock().unwrap().insert((query, depth), exact.len());
-                if query == 0 && depth == 10 {
-                    exact[..8].to_vec()
-                } else {
-                    exact.to_vec()
+                match (query, depth) {
+                    (0, 10) => exact[..8].to_vec(),
+                    (0, 50) => exact[2..].to_vec(),
+                    _ => exact.to_vec(),
                 }
             }),
         );
@@ -194,31 +204,103 @@ fn only_calibrated_depths_are_covered_each_by_its_own_run() {
         (1, false),
         "the depth-10 run of one sample missed two exact neighbours: {receipt:?}"
     );
-    for depth in [20, 50] {
+    for depth in [5, 20, 50] {
         assert_eq!(
             (at(depth).queries_below, at(depth).qualified),
             (0, true),
-            "every depth-{depth} run is exact and the depth qualifies: {receipt:?}"
+            "every depth-{depth} run meets the target at {depth} and the depth qualifies: {receipt:?}"
         );
     }
 
-    assert_uncovered(
-        &db,
-        10,
-        "because its own depth-10 run missed, though deeper runs are exact",
+    // The summary each executed depth-d route recorded at every k in
+    // (previous depth, d]: one sample's depth-10 answer holds only its exact
+    // top 8, and its depth-50 answer lacks its exact top 2, so that sample
+    // finds k - 2 of its top k at depth 50, below 95% for every k under 40.
+    let prefixes = prefix_coverage(&db, "covered_items", "embedding", &[]);
+    assert_eq!(
+        prefixes.iter().map(|row| row.k).collect::<Vec<_>>(),
+        (1..=100).collect::<Vec<u32>>(),
+        "every k up to the largest calibrated depth has one recorded summary: {prefixes:?}"
     );
-    for limit in [11, 30] {
-        assert_uncovered(&db, limit, "because it is not a calibrated depth");
+    for row in &prefixes {
+        let serving_depth = DEFAULT_DEPTHS
+            .into_iter()
+            .find(|depth| *depth >= row.k)
+            .unwrap();
+        assert_eq!(
+            row.depth, serving_depth,
+            "LIMIT {} is summarised from the depth-{serving_depth} route that serves it",
+            row.k
+        );
+        let expected_below = match (row.depth, row.k) {
+            (10, 9..=10) | (50, 21..=39) => Some(1),
+            (50, 40) => None,
+            _ => Some(0),
+        };
+        if let Some(below) = expected_below {
+            assert_eq!(
+                (row.queries_below, row.covered),
+                (below, below == 0),
+                "the depth-{} route's own summary at k = {}: {row:?}",
+                row.depth,
+                row.k
+            );
+        }
     }
-    for limit in [20, 50] {
+
+    for limit in [9, 10] {
+        assert_uncovered(
+            &db,
+            limit,
+            "because the depth-10 route that serves it missed, though deeper runs are exact",
+        );
+    }
+    for limit in [21, 30] {
+        assert_uncovered(
+            &db,
+            limit,
+            "because the depth-50 route that serves it misses one sample's nearest neighbours, \
+             though it meets the target at depth 50",
+        );
+    }
+    for limit in [101, 150] {
+        assert_uncovered(
+            &db,
+            limit,
+            "because it is above the largest calibrated depth",
+        );
+    }
+    for (limit, depth) in [(3, 5), (15, 20), (20, 20), (45, 50), (50, 50)] {
         let (ids, indexed) = search(&db, "INDEXED", limit);
         assert_eq!(ids.len(), limit);
         assert_eq!(indexed.outcome, Some(SearchOutcome::Complete));
         assert_eq!(
             indexed.objective_status,
             Some(ObjectiveStatus::Met),
-            "a qualified depth meets its objective: {indexed:?}"
+            "LIMIT {limit}, covered by the depth-{depth} route, meets its objective: {indexed:?}"
         );
+        assert_eq!(
+            indexed.served_depth,
+            Some(depth),
+            "LIMIT {limit} is served by depth {depth}: {indexed:?}"
+        );
+        assert_eq!(
+            indexed.lists_probed,
+            at(depth).probes,
+            "LIMIT {limit} probes depth {depth}'s own lists: {indexed:?}"
+        );
+        assert_eq!(
+            indexed.full_precision_evaluations,
+            at(depth).shortlist.min(indexed.quantized_evaluations),
+            "LIMIT {limit} rescores depth {depth}'s own shortlist, not one sized for {limit}: {indexed:?}"
+        );
+        let (auto_ids, auto) = search(&db, "AUTO", limit);
+        assert_eq!(
+            (auto.route, auto.served_depth),
+            (Some(SearchRoute::Indexed), Some(depth)),
+            "AUTO takes the depth-{depth} route for covered LIMIT {limit}: {auto:?}"
+        );
+        assert_eq!(auto_ids, ids, "AUTO answers LIMIT {limit} as INDEXED does");
     }
 }
 
@@ -264,11 +346,22 @@ fn auto_takes_the_index_on_a_qualified_partition() {
         assert_eq!(auto.served_generation, Some(generation));
         db.run_maintenance_cycle().expect("one maintenance cycle");
     }
-    let (_, auto) = search(&db, "AUTO", 11);
+    let (ids, auto) = search(&db, "AUTO", 7);
+    assert_eq!(ids.len(), 7);
+    assert_eq!(
+        (auto.route, auto.objective_status, auto.served_depth),
+        (
+            Some(SearchRoute::Indexed),
+            Some(ObjectiveStatus::Met),
+            Some(10)
+        ),
+        "AUTO serves a LIMIT between calibrated depths from the next qualified depth: {auto:?}"
+    );
+    let (_, auto) = search(&db, "AUTO", 101);
     assert_eq!(
         auto.route,
         Some(SearchRoute::Exact),
-        "a LIMIT outside the qualified depths still takes EXACT: {auto:?}"
+        "a LIMIT above the largest calibrated depth still takes EXACT: {auto:?}"
     );
 }
 

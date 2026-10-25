@@ -195,6 +195,11 @@ pub struct SearchWork {
     pub objective_status: Option<ObjectiveStatus>,
     /// The route the search's route record says it took.
     pub route: Option<SearchRoute>,
+    /// The calibrated depth whose (PROBES, REFINE_FACTOR) pair and shortlist
+    /// served the search, as the route record reports it: the smallest
+    /// calibrated depth at least LIMIT. None when the search took EXACT or no
+    /// calibrated depth is at least LIMIT.
+    pub served_depth: Option<u32>,
 }
 
 /// The route a vector search took.
@@ -707,6 +712,35 @@ pub struct DepthQualification {
     pub qualified: bool,
 }
 
+/// The prefix hit summary one executed calibrated-depth route recorded at one
+/// LIMIT it serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixCoverage {
+    /// The calibrated depth d whose route was run: the smallest calibrated
+    /// depth at least `k`.
+    pub depth: u32,
+    /// A LIMIT in (the previous calibrated depth, d].
+    pub k: u32,
+    /// Sample queries, over both halves, whose exact top `k` the depth-d
+    /// route's answer held below the target.
+    pub queries_below: u32,
+    /// No sample query was below the target at `k`: a LIMIT `k` query is
+    /// covered.
+    pub covered: bool,
+}
+
+/// Every prefix summary of the Context's serving generation, ordered by `k`:
+/// for each calibrated depth d, the summary its own executed d-route recorded
+/// at every k in (the previous calibrated depth, d].
+pub fn prefix_coverage(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> Vec<PrefixCoverage> {
+    unimplemented!("{UNBOUND}: per-k prefix coverage")
+}
+
 /// Where a generation's calibration samples came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalibrationBasis {
@@ -776,9 +810,10 @@ pub fn rewrite_next_calibration_answers(
 }
 
 /// Installs on the Context's serving generation a qualification receipt
-/// stating that every listed depth qualified, with the given mean complete
-/// work for the indexed route and for EXACT, as if calibration had measured
-/// them. The receipt keeps the generation's calibration basis; nothing else
+/// stating that every listed depth qualified, with every prefix summary from
+/// the previous calibrated depth up to it covered, and with the given mean
+/// complete work for the indexed route and for EXACT, as if calibration had
+/// measured them. The receipt keeps the generation's calibration basis; nothing else
 /// about the generation changes.
 pub fn plant_qualification(
     _db: &Database,
