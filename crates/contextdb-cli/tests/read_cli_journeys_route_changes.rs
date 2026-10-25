@@ -5,8 +5,10 @@
 //! the session: when its writer exits and it reads the committed file, when a
 //! writer returns, and when it reads a newer file image after that writer
 //! exits. A statement that reads the same way as the one before it adds no
-//! notice. A file image read after a writer committed is never reported with
-//! an earlier snapshot moment than the image read before that commit.
+//! notice. A file notice names its snapshot by the committed LSN, its
+//! identity, and by its moment, for people: a file image read after a writer
+//! committed has a strictly greater LSN than the image read before that
+//! commit, and a moment that is never earlier.
 //!
 //! Every writer is a separate process. Each phase ends with an unknown
 //! command, refused on standard error after any notice for that phase and
@@ -33,19 +35,76 @@ fn route_notices(session: &Background) -> Vec<Value> {
         .collect()
 }
 
-fn route_of(notice: &Value) -> (String, Option<String>) {
+/// What a route notice says: the route, the snapshot's committed LSN (its
+/// identity) and the snapshot moment (for people).
+#[derive(Debug, Clone, PartialEq)]
+struct RouteNotice {
+    route: String,
+    snapshot_lsn: Option<u64>,
+    snapshot_at: Option<String>,
+}
+
+fn route_of(notice: &Value) -> RouteNotice {
     let detail = notice.get("detail").expect("route notice detail");
-    (
-        detail
+    RouteNotice {
+        route: detail
             .get("route")
             .and_then(Value::as_str)
             .expect("route word")
             .to_owned(),
-        detail
+        snapshot_lsn: detail.get("snapshot_lsn").and_then(Value::as_u64),
+        snapshot_at: detail
             .get("snapshot_at")
             .and_then(Value::as_str)
             .map(str::to_owned),
+    }
+}
+
+/// A file notice names its snapshot by committed LSN and moment.
+fn file_image(notice: &RouteNotice, when: &str) -> (u64, String) {
+    assert_eq!(
+        notice.route, "file",
+        "{when}, the shell reads the committed file"
+    );
+    (
+        notice.snapshot_lsn.unwrap_or_else(|| {
+            panic!("{when}, a file image reports its committed LSN: {notice:?}")
+        }),
+        notice
+            .snapshot_at
+            .clone()
+            .unwrap_or_else(|| panic!("{when}, a file image reports its moment: {notice:?}")),
     )
+}
+
+/// The owner route reads live state: no snapshot identity or moment.
+fn assert_owner(notice: &RouteNotice, when: &str) {
+    assert_eq!(
+        (
+            notice.route.as_str(),
+            notice.snapshot_lsn,
+            notice.snapshot_at.as_deref()
+        ),
+        ("owner", None, None),
+        "{when}, the shell reads through the live owner, with no snapshot"
+    );
+}
+
+/// A later file image has a strictly greater committed LSN and a moment that
+/// is never earlier.
+fn assert_newer_image(earlier: &(u64, String), later: &(u64, String), when: &str) {
+    assert!(
+        later.0 > earlier.0,
+        "{when}, the newer file image's committed LSN strictly increases: {} after {}",
+        later.0,
+        earlier.0
+    );
+    assert!(
+        later.1 >= earlier.1,
+        "{when}, the newer file image is never reported earlier: {} after {}",
+        later.1,
+        earlier.1
+    );
 }
 
 /// Read the table, then end the phase with a refusal on standard error that
@@ -97,7 +156,7 @@ fn a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_return
         "the first read reports how the shell reads. transcript:\n{}",
         session.transcript()
     );
-    assert_eq!(route_of(&notices[0]), ("owner".to_owned(), None));
+    assert_owner(&route_of(&notices[0]), "beside the first writer");
     read_phase(&mut session, "p1again");
     assert_eq!(
         route_notices(&session).len(),
@@ -120,12 +179,11 @@ fn a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_return
         "when its writer exits, the shell says it now reads the committed file. transcript:\n{}",
         session.transcript()
     );
-    let (route, first_image) = route_of(&notices[1]);
-    assert_eq!(route, "file");
-    let first_image = first_image.expect("a file image reports its snapshot moment");
+    let first_image = file_image(&route_of(&notices[1]), "after the first writer exits");
     assert_eq!(phase_ids(&session, "p2"), vec![1, 2]);
 
-    let second_writer = live_owner(
+    // A second writer opens and commits row 3.
+    let mut second_writer = live_owner(
         &store.path,
         "INSERT INTO shared (id, label) VALUES (3, 'row-000003');\n",
     );
@@ -137,17 +195,23 @@ fn a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_return
         "when a writer returns, the shell says how it reads now. transcript:\n{}",
         session.transcript()
     );
-    match route_of(&notices[2]) {
-        (route, None) if route == "owner" => {}
-        (route, Some(image)) if route == "file" => assert!(
-            image >= first_image,
-            "a newer file image is never reported earlier than the one before it: {image} < \
-             {first_image}"
-        ),
-        other => panic!("an unexpected route notice: {other:?}"),
-    }
+    let third = route_of(&notices[2]);
+    let latest_image = if third.route == "owner" {
+        assert_owner(&third, "with the second writer serving");
+        first_image.clone()
+    } else {
+        let image = file_image(&third, "with the second writer serving");
+        assert_newer_image(
+            &first_image,
+            &image,
+            "after the second writer committed row 3",
+        );
+        image
+    };
     assert_eq!(phase_ids(&session, "p3"), vec![1, 2, 3]);
 
+    // The second writer commits row 4, then exits.
+    second_writer.send_line("INSERT INTO shared (id, label) VALUES (4, 'row-000004');");
     let (code, transcript) = second_writer.finish();
     assert_eq!(
         code,
@@ -163,13 +227,11 @@ fn a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_return
          transcript:\n{}",
         session.transcript()
     );
-    let (route, last_image) = route_of(&notices[3]);
-    assert_eq!(route, "file");
-    let last_image = last_image.expect("a file image reports its snapshot moment");
-    assert!(
-        last_image >= first_image,
-        "the file image read after a commit is never reported earlier than the one before it: \
-         {last_image} < {first_image}"
+    let last_image = file_image(&route_of(&notices[3]), "after the second writer exits");
+    assert_newer_image(
+        &latest_image,
+        &last_image,
+        "after the second writer committed row 4",
     );
-    assert_eq!(phase_ids(&session, "p4"), vec![1, 2, 3]);
+    assert_eq!(phase_ids(&session, "p4"), vec![1, 2, 3, 4]);
 }
