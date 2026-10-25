@@ -1850,7 +1850,12 @@ pub(crate) fn decode_exact_with_memory<T: DeserializeOwned>(
     .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     let before = memory.held();
     let (value, consumed) = memory
-        .scope(|| crate::read_image_memory::decode(bytes))
+        .scope(|| {
+            crate::read_image_memory::decode(
+                &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+                bytes,
+            )
+        })
         .map_err(|error| encoding_error_from_core(error, memory_ceiling))?;
     if consumed != bytes.len() {
         drop(value);

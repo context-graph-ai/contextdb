@@ -25855,6 +25855,18 @@ impl VectorStore {
                 .saturating_add(directory.typed_partition_keys);
             let partitions = column.partitions.read();
             for state in partitions.values() {
+                // Pending builders/reclaimers own their partition-name copy and
+                // progress Arc independently of published graph generations.
+                // The slots progress is an alias of the pending builders
+                // progress, so count the physical invoice only once.
+                for slot in [&state.paged_builder, &state.paged_reclaimer] {
+                    let slot = slot.lock();
+                    if let Some((builder, _)) = slot.pending.as_ref() {
+                        receipt.vector_partition_controls = receipt
+                            .vector_partition_controls
+                            .saturating_add(builder.retained_control_bytes());
+                    }
+                }
                 receipt.mutable_tail = receipt
                     .mutable_tail
                     .saturating_add(state.hnsw_bytes.load(Ordering::SeqCst));

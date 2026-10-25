@@ -2195,6 +2195,11 @@ impl Drop for WriterWaitInvoice {
 #[derive(Debug)]
 struct WriterWaitMemory(StoreAccountantHandle);
 impl contextdb_core::read_memory::ReadMemoryBudget for WriterWaitMemory {
+    #[cfg(feature = "test-seams")]
+    fn funding_accountant_identity_for_test(&self) -> Option<usize> {
+        Some(self.0.as_handle().as_ptr() as usize)
+    }
+
     fn native_reserve_supported(&self) -> bool {
         self.0.as_handle().adapter_native_supported()
     }
@@ -6102,6 +6107,11 @@ impl WriterVectorBudget {
     }
 }
 impl contextdb_core::read_memory::ReadMemoryBudget for WriterVectorBudget {
+    #[cfg(feature = "test-seams")]
+    fn funding_accountant_identity_for_test(&self) -> Option<usize> {
+        Some(self.accountant().as_ptr() as usize)
+    }
+
     fn native_reserve_supported(&self) -> bool {
         self.accountant().adapter_native_supported()
     }
@@ -6901,6 +6911,11 @@ impl contextdb_vector::MemoryBudget for MemoryAccountant {
 }
 
 impl contextdb_core::read_memory::ReadMemoryBudget for MemoryAccountant {
+    #[cfg(feature = "test-seams")]
+    fn funding_accountant_identity_for_test(&self) -> Option<usize> {
+        Some(self as *const Self as usize)
+    }
+
     fn try_reserve_native(
         &self,
         bytes: usize,

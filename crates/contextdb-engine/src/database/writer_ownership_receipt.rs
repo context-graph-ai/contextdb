@@ -16,20 +16,52 @@ impl Database {
     }
 
     pub(super) fn emit_writer_memory_ownership_receipt_for_test(&self, checkpoint: &str) {
-        let Some(path) = std::env::var_os("CONTEXTDB_TEST_SEAMS_RECEIPT_PATH") else {
-            return;
-        };
-        // No caller holds the commit boundary here. Serialize samples before
-        // capturing their roots so concurrent commits cannot reorder the lines.
-        let _emission = EMISSION.lock();
-        let (receipt, lsn, schema_history_charge) = self
-            .with_writer_memory_ownership_receipt_for_test(|receipt| {
-                (
-                    receipt,
-                    self.tx_mgr.capture_published_read().lsn,
-                    self.schema_history_retained_bytes(),
-                )
+        if let Some(emission) = self.prepare_writer_memory_ownership_receipt_for_test(checkpoint) {
+            emission.emit();
+        }
+    }
+
+    pub(super) fn prepare_writer_memory_ownership_receipt_for_test<'a>(
+        &self,
+        checkpoint: &'a str,
+    ) -> Option<WriterReceiptEmission<'a>> {
+        let path = std::env::var_os("CONTEXTDB_TEST_SEAMS_RECEIPT_PATH")?;
+        // Ordering is acquired after maintenance and commit exclusions. Return
+        // the captured values and EMISSION guard; the maintenance caller drops
+        // its own outer guard before serialization or append.
+        let (receipt, emission) =
+            self.with_atomic_writer_memory_ownership_receipt_for_test(|receipt| {
+                (receipt, EMISSION.lock())
             });
+        Some(WriterReceiptEmission {
+            path,
+            checkpoint,
+            database_id: self.id,
+            receipt,
+            _emission: emission,
+        })
+    }
+}
+
+pub(super) struct WriterReceiptEmission<'a> {
+    path: std::ffi::OsString,
+    checkpoint: &'a str,
+    database_id: DatabaseId,
+    receipt: WriterMemoryOwnershipReceiptForTest,
+    _emission: parking_lot::MutexGuard<'static, ()>,
+}
+
+impl WriterReceiptEmission<'_> {
+    pub(super) fn emit(self) {
+        let Self {
+            path,
+            checkpoint,
+            database_id,
+            receipt,
+            _emission,
+        } = self;
+        let lsn = receipt.published_lsn;
+        let schema_history_charge = receipt.schema_history_retained_bytes;
         let rss_bytes = current_process_rss_bytes();
         let serde_json::Value::Object(mut owners) = serde_json::to_value(&receipt)
             .expect("writer ownership observations serialize as primitive fields")
@@ -45,7 +77,7 @@ impl Database {
             "checkpoint": checkpoint,
             "lsn": lsn.0,
             "pid": std::process::id(),
-            "database_id": self.id.0,
+            "database_id": database_id.0,
             "wallclock_ms": Wallclock::now().0,
             "rss_bytes": rss_bytes,
             "receipt": owners,

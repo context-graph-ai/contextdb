@@ -55,7 +55,7 @@ impl Database {
         let read_memory = self.declared_reader_memory()?;
         let mut operation = self.assert_open_operation();
         operation.release_schema_publication_for_online_maintenance();
-        let _guard = self.pruning_guard.lock();
+        let _guard = MaintenanceReceiptGuard::lock(&self.pruning_guard);
         self.maintenance_context()
             .persist_import_vector_tails(read_memory)
     }

@@ -13,7 +13,10 @@ fn decode_window_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     let owner = crate::read_image_memory::active_owner()?;
     let before = owner.held();
-    let (value, consumed) = crate::read_image_memory::decode(bytes)?;
+    let (value, consumed) = crate::read_image_memory::decode(
+        &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+        bytes,
+    )?;
     if consumed != bytes.len() {
         drop(value);
         owner.release(owner.held() - before);

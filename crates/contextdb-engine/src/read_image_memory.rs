@@ -182,6 +182,11 @@ impl AsRef<ImageMemory> for ImageMemoryHandle {
     }
 }
 impl contextdb_core::read_memory::ReadMemoryBudget for ImageMemoryHandle {
+    #[cfg(feature = "test-seams")]
+    fn funding_accountant_identity_for_test(&self) -> Option<usize> {
+        contextdb_core::read_memory::ReadMemoryBudget::funding_accountant_identity_for_test(&**self)
+    }
+
     fn try_reserve(
         &self,
         bytes: usize,
@@ -1033,7 +1038,8 @@ impl ImageMemory {
         crate::memory_accounting::AccountantHandle::standalone(limit, true)
     }
 
-    /// Reuse an operation's owner; otherwise admit a fresh call-local owner.
+    /// Re-enter the owner installed by the operation. Decoding never selects
+    /// a budget or manufactures a payer for an unscoped caller.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -1044,7 +1050,7 @@ impl ImageMemory {
         }
         #[cfg(any(test, feature = "test-seams"))]
         crate::vector_read_memory::note_unowned_decode_for_test();
-        Self::enter_writer_operation(Self::default_decode_accountant()?)
+        active_owner()?.enter_call()
     }
 
     #[expect(
@@ -1146,7 +1152,15 @@ impl ImageMemory {
         let bytes = self.held.load(Ordering::SeqCst);
         if bytes != 0 {
             if self.reader_budget.is_some() {
-                visit(self as *const Self as usize, bytes, false);
+                // A read capability may forward to the writer's original
+                // accountant. Attribute the actual payer, not the trait door.
+                #[cfg(feature = "test-seams")]
+                let writer_funded = self.reader_budget.as_ref()
+                    .and_then(|reader| reader.funding_accountant_identity_for_test())
+                    == Some(writer as *const MemoryAccountant as usize);
+                #[cfg(not(feature = "test-seams"))]
+                let writer_funded = false;
+                visit(self as *const Self as usize, bytes, writer_funded);
             } else if std::ptr::eq(self.accountant.as_ref(), writer) {
                 visit(self as *const Self as usize, bytes, true);
             }
@@ -1335,6 +1349,15 @@ impl ImageMemory {
 // The already captured image/session charge is itself the required read
 // capability; callers do not reconstruct one from a vector-copy adapter.
 impl contextdb_core::read_memory::ReadMemoryBudget for ImageMemory {
+    #[cfg(feature = "test-seams")]
+    fn funding_accountant_identity_for_test(&self) -> Option<usize> {
+        self.reader_budget
+            .as_ref()
+            .map_or(Some(self.accountant.as_ptr() as usize), |reader| {
+                reader.funding_accountant_identity_for_test()
+            })
+    }
+
     fn try_reserve(
         &self,
         bytes: usize,
@@ -1513,6 +1536,11 @@ impl Drop for ImageMemory {
 #[derive(Debug)]
 struct ImageVectorBudget(crate::read_image_memory::ImageMemoryHandle);
 impl ReadMemoryBudget for ImageVectorBudget {
+    #[cfg(feature = "test-seams")]
+    fn funding_accountant_identity_for_test(&self) -> Option<usize> {
+        self.0.funding_accountant_identity_for_test()
+    }
+
     fn try_reserve(
         &self,
         bytes: usize,
@@ -1946,6 +1974,13 @@ pub(crate) struct ImageMemoryScope {
     _owner: ImageMemoryHandle,
     _same_thread: PhantomData<std::rc::Rc<()>>,
 }
+impl ImageMemoryScope {
+    /// Re-enter only this already installed, retained operation owner.
+    pub(crate) fn reenter(&self) -> Self {
+        self._owner.enter()
+    }
+}
+
 impl Drop for ImageMemoryScope {
     fn drop(&mut self) {
         ACTIVE.with(|active| {
@@ -2347,8 +2382,12 @@ fn admit<E: de::Error>(bytes: usize) -> std::result::Result<(), E> {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(crate) fn decode<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize)> {
+pub(crate) fn decode<T: de::DeserializeOwned>(
+    scope: &ImageMemoryScope,
+    bytes: &[u8],
+) -> Result<(T, usize)> {
     decode_with_control(
+        scope,
         bytes,
         std::mem::size_of::<T>()
             .checked_mul(4)
@@ -2364,14 +2403,18 @@ pub(crate) fn decode<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize)
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(crate) fn decode_exact_buffers<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<(T, usize)> {
-    decode_with_control(bytes, 0)
+pub(crate) fn decode_exact_buffers<T: de::DeserializeOwned>(
+    scope: &ImageMemoryScope,
+    bytes: &[u8],
+) -> Result<(T, usize)> {
+    decode_with_control(scope, bytes, 0)
 }
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 fn decode_with_control<T: de::DeserializeOwned>(
+    scope: &ImageMemoryScope,
     bytes: &[u8],
     control: usize,
 ) -> Result<(T, usize)> {
@@ -2382,8 +2425,8 @@ fn decode_with_control<T: de::DeserializeOwned>(
         std::any::type_name::<T>(),
         None,
     );
-    let _decode_scope = ImageMemory::enter_decode_call()?;
-    let owner = active_owner()?;
+    let _decode_scope = scope._owner.enter();
+    let owner = &scope._owner;
     owner.reserve(control)?;
     struct Control<'a>(&'a ImageMemory, usize);
     impl Drop for Control<'_> {
@@ -2391,7 +2434,7 @@ fn decode_with_control<T: de::DeserializeOwned>(
             self.0.release(self.1);
         }
     }
-    let _control = Control(&owner, control);
+    let _control = Control(owner, control);
     let before = owner.held();
     let result = bincode::serde::seed_decode_from_slice(
         Seed(PhantomData::<T>),
@@ -2421,9 +2464,12 @@ fn decode_with_control<T: de::DeserializeOwned>(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(crate) fn decode_json<T: de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    let _decode_scope = ImageMemory::enter_decode_call()?;
-    let owner = active_owner()?;
+pub(crate) fn decode_json<T: de::DeserializeOwned>(
+    scope: &ImageMemoryScope,
+    bytes: &[u8],
+) -> Result<T> {
+    let _decode_scope = scope._owner.enter();
+    let owner = &scope._owner;
     let bound = bytes
         .len()
         .checked_mul(4)
@@ -3402,6 +3448,17 @@ impl ImageMemoryHandle {
         let _scope = self.enter();
         operation()
     }
+
+    /// Install the retained operation owner only while its future is polled.
+    /// A suspended request leaves no owner behind on an executor thread.
+    pub(crate) async fn scope_future<F: std::future::Future>(&self, future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|context| {
+            let _scope = self.enter();
+            future.as_mut().poll(context)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -3435,7 +3492,11 @@ mod exact_sequence_tests {
         let values: Vec<f32> = (0..1536).map(|lane| lane as f32 * 0.5).collect();
         let owner = ImageMemory::operation_writer(accountant(1 << 20)).unwrap();
         let _scope = owner.enter();
-        let (decoded, _) = decode::<Exact>(&encoded(&values)).unwrap();
+        let (decoded, _) = decode::<Exact>(
+            &ImageMemory::enter_decode_call().unwrap(),
+            &encoded(&values),
+        )
+        .unwrap();
         assert_eq!(decoded.0, values, "the stored format is unchanged");
         assert_eq!(decoded.0.capacity(), 1536, "no growth past its length");
         assert_eq!(owner.held(), 1536 * 4, "charged exactly its decoded bytes");
@@ -3446,7 +3507,11 @@ mod exact_sequence_tests {
         let values: Vec<f32> = (0..1536).map(|lane| lane as f32).collect();
         let owner = ImageMemory::operation_writer(accountant(1 << 20)).unwrap();
         let _scope = owner.enter();
-        let (decoded, _) = decode::<Generic>(&encoded(&values)).unwrap();
+        let (decoded, _) = decode::<Generic>(
+            &ImageMemory::enter_decode_call().unwrap(),
+            &encoded(&values),
+        )
+        .unwrap();
         assert_eq!(decoded.0, values);
         assert_eq!(owner.held(), 48 + 16 * 1535, "unchanged allowance");
     }
@@ -3458,14 +3523,22 @@ mod exact_sequence_tests {
         let owner = ImageMemory::operation_writer_per_call(writer.clone(), 1536 * 4).unwrap();
         let _scope = owner.enter();
         let before = writer.usage().used;
-        let (decoded, _) = decode::<Kept>(&encoded(&values)).unwrap();
+        let (decoded, _) = decode::<Kept>(
+            &ImageMemory::enter_decode_call().unwrap(),
+            &encoded(&values),
+        )
+        .unwrap();
         assert_eq!(decoded.0.capacity(), 1536);
         assert_eq!(owner.adopted_output(), 1536 * 4);
         // The call's own owner holds no payload: the kept vector was prepaid.
         assert_eq!(owner.held_with_call(), 0);
         assert_eq!(writer.usage().used, before);
         // A second kept vector finds no prepaid credit left and is charged.
-        let (_second, _) = decode::<Kept>(&encoded(&values)).unwrap();
+        let (_second, _) = decode::<Kept>(
+            &ImageMemory::enter_decode_call().unwrap(),
+            &encoded(&values),
+        )
+        .unwrap();
         assert_eq!(owner.adopted_output(), 1536 * 4);
         assert_eq!(writer.usage().used, before + 1536 * 4);
     }
@@ -3482,7 +3555,11 @@ mod exact_sequence_tests {
             let _scope = owner.enter();
             // A streamed scan: each body is decoded, scored and dropped.
             for _ in 0..64 {
-                let (decoded, _) = decode::<Exact>(&encoded(&values)).unwrap();
+                let (decoded, _) = decode::<Exact>(
+                    &ImageMemory::enter_decode_call().unwrap(),
+                    &encoded(&values),
+                )
+                .unwrap();
                 drop(decoded);
             }
             assert_eq!(owner.held(), 0, "the request owner itself holds nothing");
@@ -3504,7 +3581,11 @@ mod exact_sequence_tests {
             "the last call's charge returns when the request owner drops"
         );
         drop(reader);
-        assert_eq!(declared.retained_bytes_for_test(), 0);
+        assert_eq!(
+            declared.retained_bytes_for_test(),
+            declared.root_control_bytes() as u64
+        );
+        declared.assert_final_root_free_for_test();
     }
 
     fn length_prefix_u32(length: u32) -> Vec<u8> {
@@ -3519,9 +3600,12 @@ mod exact_sequence_tests {
         let _scope = owner.enter();
         // One billion f32 values claimed, none present: the 4 GB admission
         // is refused as the typed budget refusal, and nothing stays charged.
-        let refused = decode::<Exact>(&length_prefix_u32(1_000_000_000))
-            .err()
-            .expect("refused");
+        let refused = decode::<Exact>(
+            &ImageMemory::enter_decode_call().unwrap(),
+            &length_prefix_u32(1_000_000_000),
+        )
+        .err()
+        .expect("refused");
         assert!(
             matches!(refused, Error::MemoryBudgetExceeded { requested_bytes, .. } if requested_bytes == 4_000_000_000),
             "{refused:?}"
@@ -3535,7 +3619,9 @@ mod exact_sequence_tests {
         let _scope = owner.enter();
         let mut bytes = vec![253];
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
-        let refused = decode::<Exact>(&bytes).err().expect("refused");
+        let refused = decode::<Exact>(&ImageMemory::enter_decode_call().unwrap(), &bytes)
+            .err()
+            .expect("refused");
         assert!(
             matches!(&refused, Error::Other(reason) if reason.contains("exact sequence length overflows")),
             "{refused:?}"
@@ -3549,7 +3635,7 @@ mod exact_sequence_tests {
         let _scope = owner.enter();
         let mut bytes = encoded(&[1.0, 2.0, 3.0, 4.0, 5.0]);
         bytes.truncate(bytes.len() - 8);
-        assert!(decode::<Exact>(&bytes).is_err());
+        assert!(decode::<Exact>(&ImageMemory::enter_decode_call().unwrap(), &bytes).is_err());
         assert_eq!(owner.held(), 0, "a failed decode returns its admission");
     }
 }
@@ -3888,5 +3974,171 @@ impl Drop for MaintenancePhase {
     fn drop(&mut self) {
         self.record("exit", 0, None);
         MAINTENANCE_PHASE_SCOPE.with(|current| current.set(self.parent));
+    }
+}
+
+#[cfg(test)]
+mod operation_scope_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn an_unscoped_decoder_cannot_choose_its_own_budget() {
+        assert!(active_owner().is_err());
+        let error = ImageMemory::enter_decode_call()
+            .err()
+            .expect("no operation owner");
+        assert!(is_missing_decode_owner(&error));
+        assert!(active_owner().is_err());
+    }
+
+    struct TwoPolls {
+        accountant: usize,
+        pending: bool,
+        panic_on_ready: bool,
+        input: Vec<u8>,
+        decoded: Option<Vec<f32>>,
+    }
+
+    impl TwoPolls {
+        fn new(accountant: usize, panic_on_ready: bool) -> Self {
+            Self {
+                accountant,
+                pending: true,
+                panic_on_ready,
+                input: bincode::serde::encode_to_vec(
+                    vec![1.0_f32, 2.0, 3.0, 4.0],
+                    bincode::config::standard(),
+                )
+                .unwrap(),
+                decoded: None,
+            }
+        }
+    }
+
+    impl Future for TwoPolls {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            let owner = active_owner().expect("the operation owns this poll");
+            assert_eq!(owner.accountant.as_ptr() as usize, self.accountant);
+            if self.pending {
+                let scope = owner.enter();
+                let (decoded, consumed) = decode::<Vec<f32>>(&scope, &self.input).unwrap();
+                assert_eq!(consumed, self.input.len());
+                assert!(
+                    owner.held() >= decoded.capacity() * std::mem::size_of::<f32>(),
+                    "actual retained vector capacity is covered by the original invoice"
+                );
+                self.decoded = Some(decoded);
+                self.pending = false;
+                Poll::Pending
+            } else {
+                let decoded = self.decoded.as_ref().unwrap();
+                assert_eq!(decoded.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+                assert!(
+                    owner.held() >= decoded.capacity() * std::mem::size_of::<f32>(),
+                    "the moved physical buffer retains its original funding"
+                );
+                assert!(!self.panic_on_ready, "injected poll unwind");
+                drop(self.decoded.take());
+                Poll::Ready(())
+            }
+        }
+    }
+
+    #[test]
+    fn a_suspended_operation_reinstalls_its_owner_on_another_thread() {
+        let writer =
+            crate::memory_accounting::MemoryAccountant::writer_budget(1_610_612_736).unwrap();
+        let accountant = writer.accountant();
+        let before = accountant.usage().used;
+        let probe = TwoPolls::new(accountant.as_ptr() as usize, false);
+        let memory = ImageMemory::operation_writer(accountant).unwrap();
+        let future = Box::pin(async move { memory.scope_future(probe).await });
+        let mut future = std::thread::spawn(move || {
+            let mut future = future;
+            assert!(active_owner().is_err());
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert!(
+                active_owner().is_err(),
+                "a suspended poll restores the executor thread"
+            );
+            future
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(move || {
+            assert!(active_owner().is_err());
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+            );
+            assert!(
+                active_owner().is_err(),
+                "a completed poll restores the executor thread"
+            );
+            drop(future);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            writer.accountant().usage().used,
+            before,
+            "the last physical vector and native owner have freed before refund"
+        );
+    }
+
+    #[test]
+    fn nested_poll_unwind_restores_the_outer_original_owner() {
+        let writer =
+            crate::memory_accounting::MemoryAccountant::writer_budget(1_610_612_736).unwrap();
+        let accountant = writer.accountant();
+        let before = accountant.usage().used;
+        let outer = ImageMemory::operation_writer(accountant.clone()).unwrap();
+        let inner = ImageMemory::operation_writer(accountant.clone()).unwrap();
+        let outer_identity = &*outer as *const ImageMemory as usize;
+        let scope = outer.enter();
+        let mut future =
+            Box::pin(inner.scope_future(TwoPolls::new(accountant.as_ptr() as usize, true)));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(
+            &*active_owner().unwrap() as *const ImageMemory as usize,
+            outer_identity
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            &*active_owner().unwrap() as *const ImageMemory as usize,
+            outer_identity
+        );
+        drop(future);
+        drop(scope);
+        assert!(active_owner().is_err());
+        drop(inner);
+        drop(outer);
+        assert_eq!(
+            accountant.usage().used,
+            before,
+            "unwind preserves funding until all physical holders are gone"
+        );
     }
 }

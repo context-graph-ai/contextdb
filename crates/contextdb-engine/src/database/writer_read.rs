@@ -1373,7 +1373,15 @@ impl Database {
                         owner.downcast_ref::<contextdb_core::read_memory::ReadCredit>()
                         && credit.bytes() != 0
                     {
-                        visit(credit as *const _ as usize, credit.bytes(), false);
+                        #[cfg(feature = "test-seams")]
+                        let writer_funded = {
+                            use contextdb_core::read_memory::ReadMemoryBudget;
+                            credit.owner().funding_accountant_identity_for_test()
+                                == Some(self.accountant.as_ref() as *const MemoryAccountant as usize)
+                        };
+                        #[cfg(not(feature = "test-seams"))]
+                        let writer_funded = false;
+                        visit(credit as *const _ as usize, credit.bytes(), writer_funded);
                     }
                 }
             }

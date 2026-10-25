@@ -68,6 +68,26 @@ pub(crate) enum StorageAllocation {
     Read(ReadCredit),
     Store(ControlCredit),
 }
+#[cfg(feature = "test-seams")]
+unsafe fn inspect_scope_allocation_funding(raw: NonNull<()>) -> Option<(usize, usize)> {
+    // Paired only with this module's StorageScopeBlock admission constructor.
+    let scope = &unsafe { raw.cast::<StorageScopeBlock>().as_ref() }.payload;
+    let owner = match &scope.funding {
+        StorageFunding::Original(original) => Some(original.accountant().as_ptr() as usize),
+        StorageFunding::Writer {
+            original_handle, ..
+        }
+        | StorageFunding::PreparedWriter {
+            original_handle, ..
+        } => Some(original_handle.as_handle().as_ptr() as usize),
+        StorageFunding::Read(reader) | StorageFunding::ReadUnqualified(reader) => {
+            use contextdb_core::read_memory::ReadMemoryBudget;
+            reader.funding_accountant_identity_for_test()
+        }
+    }?;
+    Some((owner, Layout::new::<StorageReceipt>().size()))
+}
+
 enum StorageFunding {
     Original(OwnedMemoryReservation),
     Writer {
@@ -723,13 +743,15 @@ impl StorageAdmissionScope {
     ) -> (std::result::Result<R, E>, Option<NativeStorageFailure>) {
         unsafe { retain_scope(self.pointer.cast()) };
         let admission = unsafe {
-            NativeStorageAdmission::from_owned_receipt(
-                self.pointer.cast(),
-                retain_scope,
-                finish_scope,
-                admit_scope,
+            observe_allocation_funding(
+                NativeStorageAdmission::from_owned_receipt(
+                    self.pointer.cast(),
+                    retain_scope,
+                    finish_scope,
+                    admit_scope,
+                )
+                .with_failure_inspector(inspect_scope_failure),
             )
-            .with_failure_inspector(inspect_scope_failure)
         };
         let result = redb::with_native_storage_admission(admission, operation);
         let scope = &unsafe { self.pointer.as_ref() }.payload;
@@ -1098,13 +1120,15 @@ impl StorageAdmissionScope {
     pub(crate) fn retain_admission(&self) -> NativeStorageAdmission {
         unsafe { retain_scope(self.pointer.cast()) };
         unsafe {
-            NativeStorageAdmission::from_owned_receipt(
-                self.pointer.cast(),
-                retain_scope,
-                finish_scope,
-                admit_scope,
+            observe_allocation_funding(
+                NativeStorageAdmission::from_owned_receipt(
+                    self.pointer.cast(),
+                    retain_scope,
+                    finish_scope,
+                    admit_scope,
+                )
+                .with_failure_inspector(inspect_scope_failure),
             )
-            .with_failure_inspector(inspect_scope_failure)
         }
     }
 
@@ -1156,13 +1180,15 @@ impl StorageAdmissionScope {
     ) -> std::result::Result<T, PreparedReadFailure> {
         unsafe { retain_scope(self.pointer.cast()) };
         let admission = unsafe {
-            NativeStorageAdmission::from_owned_receipt(
-                self.pointer.cast(),
-                retain_scope,
-                finish_scope,
-                admit_scope,
+            observe_allocation_funding(
+                NativeStorageAdmission::from_owned_receipt(
+                    self.pointer.cast(),
+                    retain_scope,
+                    finish_scope,
+                    admit_scope,
+                )
+                .with_failure_inspector(inspect_scope_failure),
             )
-            .with_failure_inspector(inspect_scope_failure)
         };
         // The lower API installs this owned scope before verified-root reads.
         // No formatting, boxing or losing conversion occurs on either exit.
@@ -1287,4 +1313,27 @@ impl StorageAdmissionScope {
             Layout::new::<StorageScopeBlock>(),
         )
     }
+}
+
+/// Borrow the actual original invoice of this module's native storage credit.
+///
+/// # Safety
+/// The supplied credit must have been created by `paid_receipt` and remain live.
+#[cfg(test)]
+pub(crate) unsafe fn original_invoice_for_test(credit: &NativeStorageCredit) -> (usize, usize) {
+    let receipt = unsafe { &*(credit.identity_for_test() as *const StorageReceipt) };
+    match &*receipt.allocation {
+        StorageAllocation::Writer(original) => {
+            (original.accountant().as_ptr() as usize, original.bytes())
+        }
+        _ => panic!("the pending name uses its original writer invoice"),
+    }
+}
+
+// All native admission constructors pass through this same observation seam.
+unsafe fn observe_allocation_funding(admission: NativeStorageAdmission) -> NativeStorageAdmission {
+    #[cfg(feature = "test-seams")]
+    let admission =
+        unsafe { admission.with_allocation_funding_inspector(inspect_scope_allocation_funding) };
+    admission
 }

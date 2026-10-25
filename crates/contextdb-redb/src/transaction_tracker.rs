@@ -253,6 +253,17 @@ impl Drop for SnapshotRefreshReadPin<'_> {
 }
 
 impl TransactionTracker {
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    pub(crate) fn reader_registry_charge_for_test(&self, accountant: usize) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .live_read_transactions
+            .map
+            .allocator()
+            .charge_for(accountant)
+    }
+
     pub(crate) fn new(next_transaction_id: TransactionId) -> Self {
         Self::new_with_external_snapshots(
             next_transaction_id,

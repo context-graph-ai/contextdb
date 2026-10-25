@@ -164,7 +164,10 @@ impl WriterSnapshotHandle {
                 .unwrap_or(key)
                 .parse::<u64>()
                 .map_err(|_| Error::Other("invalid DDL occurrence LSN".into()))?;
-            let (change, consumed) = crate::read_image_memory::decode::<DdlChange>(bytes)?;
+            let (change, consumed) = crate::read_image_memory::decode::<DdlChange>(
+                &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+                bytes,
+            )?;
             if consumed != bytes.len() {
                 return Err(Error::Other("DDL occurrence has trailing bytes".into()));
             }

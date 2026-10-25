@@ -322,6 +322,30 @@ impl RequestReadOwner {
         self.0
     }
 }
+/// Actual parent charge over a scoped observation; not an admission count.
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderMemoryHighWaterForTest {
+    pub before: u64,
+    pub peak: u64,
+    pub after: u64,
+}
+#[cfg(any(test, feature = "test-seams"))]
+struct ReaderPeakObservation {
+    registration: u64,
+    parent: usize,
+    peak: u64,
+}
+#[cfg(any(test, feature = "test-seams"))]
+static READER_PEAK_OBSERVATIONS: parking_lot::Mutex<Vec<ReaderPeakObservation>> =
+    parking_lot::Mutex::new(Vec::new());
+#[cfg(any(test, feature = "test-seams"))]
+static READER_PEAK_REGISTRATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(test, feature = "test-seams"))]
+static READER_PEAK_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Debug)]
 pub struct DeclaredReadMemory {
     limit: u64,
@@ -343,6 +367,53 @@ pub fn native_control_layouts_for_test() -> (std::alloc::Layout, std::alloc::Lay
     )
 }
 impl DeclaredReadMemory {
+    #[cfg(any(test, feature = "test-seams"))]
+    pub(crate) fn observe_high_water_for_test<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> (R, ReaderMemoryHighWaterForTest) {
+        use std::sync::atomic::Ordering;
+        struct Remove(u64);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                READER_PEAK_OBSERVATIONS
+                    .lock()
+                    .retain(|entry| entry.registration != self.0);
+                READER_PEAK_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let registration = READER_PEAK_REGISTRATION
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .expect("reader observation identity overflow");
+        let mut observations = READER_PEAK_OBSERVATIONS.lock();
+        let before = self.retained.load(Ordering::SeqCst);
+        observations.push(ReaderPeakObservation {
+            registration,
+            parent: self as *const Self as usize,
+            peak: before,
+        });
+        READER_PEAK_ACTIVE.fetch_add(1, Ordering::SeqCst);
+        drop(observations);
+        let _remove = Remove(registration);
+        let answer = operation();
+        let observations = READER_PEAK_OBSERVATIONS.lock();
+        let peak = observations
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .expect("live reader observation")
+            .peak;
+        let after = self.retained.load(Ordering::SeqCst);
+        drop(observations);
+        (
+            answer,
+            ReaderMemoryHighWaterForTest {
+                before,
+                peak,
+                after,
+            },
+        )
+    }
+
     fn effective_limit(&self) -> u64 {
         #[cfg(any(test, feature = "test-seams"))]
         if let Some(limit) = statement_child_proof::limit(self) {
@@ -363,6 +434,14 @@ impl DeclaredReadMemory {
                 // retained counter. Failed CAS attempts never reach this hook.
                 #[cfg(any(test, feature = "test-seams"))]
                 statement_child_proof::parent_admitted(self, before + bytes as u64);
+                #[cfg(any(test, feature = "test-seams"))]
+                if READER_PEAK_ACTIVE.load(Ordering::SeqCst) != 0 {
+                    for observation in READER_PEAK_OBSERVATIONS.lock().iter_mut() {
+                        if observation.parent == self as *const Self as usize {
+                            observation.peak = observation.peak.max(before + bytes as u64);
+                        }
+                    }
+                }
                 #[cfg(not(any(test, feature = "test-seams")))]
                 let _ = before;
             })

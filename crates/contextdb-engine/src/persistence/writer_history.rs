@@ -383,7 +383,10 @@ impl super::writer_source::WriterReadCursor {
             let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
             let owner = crate::read_image_memory::active_owner()?;
             let before = owner.held();
-            let (change, consumed) = crate::read_image_memory::decode(value)?;
+            let (change, consumed) = crate::read_image_memory::decode(
+                &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+                value,
+            )?;
             if consumed != value.len() {
                 drop(change);
                 owner.release(owner.held() - before);

@@ -1625,8 +1625,11 @@ impl RetainedReadSource {
         memory.scope(|| {
             before()?;
             let (encoded, consumed): (EncodedRelationalIndexPosition, usize) =
-                crate::read_image_memory::decode(key)
-                    .map_err(|error| self.content_identity_error(error))?;
+                crate::read_image_memory::decode(
+                    &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+                    key,
+                )
+                .map_err(|error| self.content_identity_error(error))?;
             if consumed != key.len() {
                 return Err(
                     self.content_identity_corruption("historical posting has trailing bytes")

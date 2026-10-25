@@ -1317,6 +1317,14 @@ impl ReadableDatabase for Database {
 }
 
 impl Database {
+    /// Exact live reader-registry backing plus its receipt, for one payer.
+    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+    #[doc(hidden)]
+    pub fn reader_registry_charge_for_test(&self, accountant: usize) -> usize {
+        self.transaction_tracker
+            .reader_registry_charge_for_test(accountant)
+    }
+
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn cache_controls_for_test(&self) -> [(usize, usize); 2] { self.mem.controls_for_test() }

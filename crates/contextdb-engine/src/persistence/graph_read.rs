@@ -659,7 +659,10 @@ impl RetainedGraphCursor {
                         RedbPersistence::verify_history_root(read, "row_graph_rev")?;
                         let _decode = crate::read_image_memory::ImageMemory::enter_decode_call()?;
                         let (owned, used): (contextdb_tx::OwnedAdjEntry, usize) =
-                            crate::read_image_memory::decode(value.value())?;
+                            crate::read_image_memory::decode(
+                                &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+                                value.value(),
+                            )?;
                         super::row_graph::validate(&owned)?;
                         if used != value.value().len()
                             || RedbPersistence::row_graph_key(&owned, self.reverse)? != key.value()
@@ -885,14 +888,17 @@ fn decode_edge(
     let mut diagnostic = Some(source.prepare_corruption(owner)?);
     #[cfg(any(test, feature = "test-seams"))]
     crate::read_work_probe::note_graph("graph_payload", "payload_decode", key, None, None);
-    let (edge, consumed): (AdjEntry, usize) =
-        crate::read_image_memory::decode(bytes).map_err(|error| match error {
-            Error::Other(reason) => diagnostic
-                .take()
-                .expect("one graph decode diagnosis")
-                .corruption(reason),
-            other => other,
-        })?;
+    let (edge, consumed): (AdjEntry, usize) = crate::read_image_memory::decode(
+        &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+        bytes,
+    )
+    .map_err(|error| match error {
+        Error::Other(reason) => diagnostic
+            .take()
+            .expect("one graph decode diagnosis")
+            .corruption(reason),
+        other => other,
+    })?;
     if consumed != bytes.len() {
         return Err(Error::StoreCorrupted {
             path: "graph adjacency".into(),

@@ -208,11 +208,14 @@ impl RedbPersistence {
         Self::decode_stored_change_log_with(
             bytes,
             |public| {
-                let (entry, consumed): (ChangeLogEntry, usize) =
-                    crate::read_image_memory::decode(public).map_err(|error| match error {
-                        Error::Other(reason) => malformed(reason),
-                        other => other,
-                    })?;
+                let (entry, consumed): (ChangeLogEntry, usize) = crate::read_image_memory::decode(
+                    &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+                    public,
+                )
+                .map_err(|error| match error {
+                    Error::Other(reason) => malformed(reason),
+                    other => other,
+                })?;
                 if consumed != public.len() {
                     return Err(malformed("public history bytes have trailing data"));
                 }

@@ -371,16 +371,10 @@ fn the_holder_builds_the_storage_name_every_caller_uses() {
     }
 }
 
-/// A real commit writing one row into a long-named table. Each reconciliation
-/// pass opens that table's relation while it is not yet staged (the root hook
-/// flushes staged roots on every protected close), so closing it stages a new
-/// key. Allocations of exactly the storage name's length are recorded in
-/// order with the holder's charges. While a pass holds the relation's name
-/// charge (2 × the name), every name copy allocated (the handle's name, the
-/// registry key, and the key staging allocates on close) is freed before the
-/// charge is released, and no more than two copies are ever alive at once.
-/// Before that charge, the first use allocates exactly one name: the admitted
-/// temporary, and no unadmitted second copy.
+/// Reconciliation reuses the key staged by the row write. The holder admits
+/// its own two name copies, and the native pending key retains its separate
+/// original invoice until transaction teardown. A fresh native write below
+/// also exercises the first-stage case before any relation open or close.
 #[test]
 fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_until_after_it_is_freed()
  {
@@ -407,7 +401,11 @@ fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_unti
     )
     .expect("stage one row");
     staging_witness::arm(name_len);
-    db.commit(tx).expect("commit the row");
+    let writer = db.__accountant_handle_for_test();
+    staging_witness::arm_pending_names(name_len, writer.as_ptr() as usize);
+    redb::observe_pending_names_for_test(staging_witness::pending_name, || {
+        db.commit(tx).expect("commit the row");
+    });
     let (events, overrun) = staging_witness::take();
     assert_eq!(
         overrun, None,
@@ -453,8 +451,8 @@ fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_unti
                     Event::Staged(staged) => Some(*staged),
                     _ => None,
                 }),
-            Some(false),
-            "the relation was not staged when the pass first used it"
+            Some(true),
+            "the row write already staged the relation before reconciliation"
         );
         let mut live = std::collections::HashSet::new();
         let mut allocated = 0;
@@ -472,10 +470,10 @@ fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_unti
                 _ => {}
             }
         }
-        assert!(
-            allocated >= 3,
-            "the handle's name, the registry key and the staged key are all allocated \
-             while the charge is held: {:?}",
+        assert_eq!(
+            allocated,
+            2,
+            "the handle name and registry key are the holder's two copies: {:?}",
             &events[start..=end]
         );
         assert!(
@@ -496,6 +494,8 @@ fn a_relation_first_staged_by_a_commit_is_funded_from_before_its_key_exists_unti
         "both reconciliation passes held the relation: {events:?}"
     );
     db.close().expect("close");
+    staging_witness::assert_pending_names_freed();
+    fresh_native_holder_staging(false);
 }
 
 /// A store with `count` tables and one staged transaction writing one row to
@@ -698,4 +698,93 @@ fn a_commit_failing_at_any_holder_step_returns_everything_and_keeps_the_store_us
             }
         }
     }
+}
+
+/// A native write starts before this relation has been opened or staged.
+/// The pending key has its own original invoice after the holder releases
+/// its two shorter name copies, through the write transaction's teardown.
+fn fresh_native_holder_staging(inject_growth: bool) {
+    use super::staging_witness::{self, Event};
+    let count = if inject_growth { 5 } else { 1 };
+    let tables: Vec<_> = (0..count)
+        .map(|n| format!("n{n:02}_{}", "x".repeat(773)))
+        .collect();
+    let (_directory, db) = store(&tables);
+    let writer = MemoryAccountant::writer_budget(1_610_612_736).unwrap();
+    let accountant = writer.accountant();
+    let original = crate::memory_accounting::OwnedMemoryReservation::new(accountant.clone());
+    let native =
+        super::native_storage_admission::StorageAdmissionScope::writer_original(&original).unwrap();
+    let name_len = relation_name(&tables[0]).len();
+    staging_witness::arm(name_len);
+    staging_witness::arm_pending_names(name_len, accountant.as_ptr() as usize);
+    redb::observe_pending_names_for_test(staging_witness::pending_name, || {
+        native
+            .run_original_unqualified(|| {
+                let write = db.begin_write().unwrap();
+                assert!(!write.pending_table_update_contains(&relation_name(&tables[0])));
+                let mut admission = content_identity::ProofAdmission::new(Some(accountant.clone()));
+                let mut held = HeldRelations::new(&write, &mut admission).unwrap();
+                if inject_growth {
+                    inject_hold_fault(HoldStep::GrowNodes, HoldFault::Error, 1);
+                    for table in &tables[..4] {
+                        assert!(held.get(table)?.is_some());
+                    }
+                    let before = staging_witness::live_node_bytes();
+                    assert_eq!(
+                        before,
+                        4 * PositionTree::NODE_BYTES,
+                        "the actual first node buffer is live"
+                    );
+                    assert!(held.get(&tables[4]).is_err());
+                    assert!(!clear_hold_fault(), "the second growth fault fired");
+                    assert_eq!(
+                        staging_witness::live_node_bytes(),
+                        before,
+                        "cancellation preserves existing nodes"
+                    );
+                } else {
+                    assert!(held.get(&tables[0])?.is_some());
+                }
+                drop(held);
+                assert!(write.pending_table_update_contains(&relation_name(&tables[0])));
+                drop(admission);
+                drop(write);
+                Ok(())
+            })
+            .unwrap();
+    });
+    let (events, overrun) = staging_witness::take();
+    assert_eq!(overrun, None, "every real holder allocation remains funded");
+    assert!(
+        events.contains(&Event::Staged(false)),
+        "the native write exercised genuine first staging"
+    );
+    drop(native);
+    drop(original);
+    staging_witness::assert_pending_names_freed();
+}
+
+#[test]
+fn a_failed_node_growth_keeps_existing_nodes_and_pending_names_funded() {
+    fresh_native_holder_staging(true);
+}
+
+#[test]
+fn a_real_position_tree_buffer_stays_funded_until_clear_after_growth_cancellation() {
+    use super::{Charge, staging_witness};
+    let mut tree = PositionTree::new();
+    let bytes = 4 * PositionTree::NODE_BYTES;
+    staging_witness::arm(0);
+    staging_witness::admitted(Charge::Nodes, bytes, 1, bytes);
+    tree.grow(4);
+    staging_witness::cancel_unmade_node_growth();
+    assert_eq!(staging_witness::live_node_bytes(), bytes);
+    tree.clear();
+    staging_witness::released(Charge::Nodes, bytes);
+    let (_, overrun) = staging_witness::take();
+    assert_eq!(
+        overrun, None,
+        "the actual node buffer frees before its charge"
+    );
 }

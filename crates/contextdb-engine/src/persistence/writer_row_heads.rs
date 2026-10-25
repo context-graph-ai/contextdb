@@ -156,6 +156,132 @@ pub(crate) mod staging_witness {
         static OVERRUN: Cell<Option<Overrun>> = const { Cell::new(None) };
     }
 
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct PendingInvoice {
+        payload: usize,
+        receipt: usize,
+        bytes: usize,
+        payer: usize,
+        admitted: usize,
+        payload_free_started: bool,
+        payload_freed: bool,
+        receipt_free_started: bool,
+        receipt_freed: bool,
+        early: bool,
+    }
+    thread_local! {
+        static NATIVE_NAME: Cell<usize> = const { Cell::new(0) };
+        static NATIVE_PAYER: Cell<usize> = const { Cell::new(0) };
+        static PENDING_INVOICES: Cell<[Option<PendingInvoice>; 16]> = const { Cell::new([None; 16]) };
+        static PENDING_OVERFLOW: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn arm_pending_names(name_len: usize, payer: usize) {
+        PENDING_INVOICES.with(|slot| slot.set([None; 16]));
+        PENDING_OVERFLOW.with(|slot| slot.set(false));
+        NATIVE_PAYER.with(|slot| slot.set(payer));
+        NATIVE_NAME.with(|slot| slot.set(name_len));
+    }
+
+    pub(crate) fn pending_name(
+        name: &str,
+        pointer: usize,
+        layout: std::alloc::Layout,
+        credit: Option<&redb::NativeStorageCredit>,
+    ) {
+        if NATIVE_NAME.with(Cell::get) != name.len() {
+            return;
+        }
+        let (receipt, payer, admitted) = credit.map_or((0, 0, 0), |credit| {
+            // Only this fixture's engine storage scope supplies these callbacks.
+            let (payer, admitted) =
+                unsafe { super::native_storage_admission::original_invoice_for_test(credit) };
+            (credit.identity_for_test(), payer, admitted)
+        });
+        PENDING_INVOICES.with(|slot| {
+            let mut rows = slot.get();
+            if let Some(row) = rows.iter_mut().find(|row| row.is_none()) {
+                *row = Some(PendingInvoice {
+                    payload: pointer,
+                    receipt,
+                    bytes: layout.size(),
+                    payer,
+                    admitted,
+                    payload_free_started: false,
+                    payload_freed: false,
+                    receipt_free_started: false,
+                    receipt_freed: false,
+                    early: false,
+                });
+            } else {
+                PENDING_OVERFLOW.with(|slot| slot.set(true));
+            }
+            slot.set(rows);
+        });
+    }
+
+    fn pending_free(address: usize, after: bool) {
+        if NATIVE_NAME.try_with(Cell::get).unwrap_or(0) == 0 {
+            return;
+        }
+        PENDING_INVOICES.with(|slot| {
+            let mut rows = slot.get();
+            for row in rows.iter_mut().flatten() {
+                if row.payload == address && !row.payload_freed {
+                    row.early |= row.receipt_free_started;
+                    row.payload_free_started = true;
+                    row.payload_freed |= after;
+                }
+                if row.receipt == address && !row.receipt_freed {
+                    row.early |= !row.payload_freed;
+                    row.receipt_free_started = true;
+                    row.receipt_freed |= after;
+                }
+            }
+            slot.set(rows);
+        });
+    }
+
+    pub(crate) fn after_free(address: usize) {
+        pending_free(address, true);
+    }
+
+    pub(crate) fn assert_pending_names_freed() {
+        NATIVE_NAME.with(|slot| slot.set(0));
+        let payer = NATIVE_PAYER.with(Cell::get);
+        let rows = PENDING_INVOICES.with(Cell::get);
+        assert!(
+            !PENDING_OVERFLOW.with(Cell::get),
+            "every pending name is observed"
+        );
+        assert!(
+            rows.iter().any(Option::is_some),
+            "observe an actual pending directory name"
+        );
+        for row in rows.iter().flatten() {
+            assert_eq!(
+                row.payer, payer,
+                "the key retains the original writer: {row:?}"
+            );
+            assert_eq!(
+                row.admitted, row.bytes,
+                "the whole native key layout is prepaid: {row:?}"
+            );
+            assert!(
+                row.payload_free_started && row.payload_freed,
+                "the key physically freed: {row:?}"
+            );
+            assert!(
+                row.receipt_free_started && row.receipt_freed,
+                "the original invoice settled: {row:?}"
+            );
+            assert!(
+                !row.early,
+                "the original invoice survives the key's physical free: {row:?}"
+            );
+        }
+    }
+
     fn index(charge: Charge) -> usize {
         CHARGES.iter().position(|known| *known == charge).unwrap()
     }
@@ -207,6 +333,10 @@ pub(crate) mod staging_witness {
                 });
             }
         }
+    }
+
+    pub(crate) fn live_node_bytes() -> usize {
+        live_bytes(Charge::Nodes)
     }
 
     /// Start recording, also logging untagged allocations of `watched` bytes.
@@ -316,6 +446,23 @@ pub(crate) mod staging_witness {
         }
     }
 
+    /// Cancel only the outstanding allocation for a growth that never ran.
+    /// Existing live nodes, charges, other expectations and overruns are retained.
+    pub(crate) fn cancel_unmade_node_growth() {
+        if !armed() {
+            return;
+        }
+        EXPECTING.with(|expecting| {
+            if let Some(slot) = expecting
+                .borrow_mut()
+                .iter_mut()
+                .find(|slot| slot.is_some_and(|(charge, _, _)| charge == Charge::Nodes))
+            {
+                *slot = None;
+            }
+        });
+    }
+
     /// An injected fault fired: every category must fit what is charged.
     pub(crate) fn fault() {
         if armed() {
@@ -353,6 +500,7 @@ pub(crate) mod staging_witness {
     }
 
     pub(crate) fn freed(address: usize, size: usize) {
+        pending_free(address, false);
         if !armed() {
             return;
         }
@@ -644,7 +792,12 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
         #[cfg(any(test, feature = "test-seams"))]
         if let Some(fault) = take_hold_fault(step) {
             #[cfg(test)]
-            staging_witness::fault();
+            {
+                staging_witness::fault();
+                if matches!(step, HoldStep::GrowNodes) {
+                    staging_witness::cancel_unmade_node_growth();
+                }
+            }
             match fault {
                 HoldFault::Error => {
                     return Err(Error::Other(

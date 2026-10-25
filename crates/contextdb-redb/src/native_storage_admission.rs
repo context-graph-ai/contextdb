@@ -66,14 +66,32 @@ pub struct NativeStorageAdmission {
     owner: NativeStorageCredit,
     admit: unsafe fn(NonNull<()>, Layout) -> Result<NativeStorageCredit, NativeStorageRefused>,
     inspect_failure: Option<NativeFailureInspector>,
+    #[cfg(feature = "test-seams")]
+    allocation_funding: Option<unsafe fn(NonNull<()>) -> Option<(usize, usize)>>,
 }
-type NativeFailureInspector = unsafe fn(NonNull<()>, &mut dyn FnMut(Option<&(dyn std::error::Error + Send + Sync + 'static)>));
+type NativeFailureInspector = unsafe fn(
+    NonNull<()>,
+    &mut dyn FnMut(Option<&(dyn std::error::Error + Send + Sync + 'static)>),
+);
 impl std::fmt::Debug for NativeStorageAdmission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeStorageAdmission").finish_non_exhaustive()
     }
 }
 impl NativeStorageAdmission {
+    /// Observe the actual payer and receipt allocation overhead, without admission.
+    /// # Safety
+    /// The callback must borrow this same concrete scope and report only the
+    /// payer and receipt layout used by its successful allocation callback.
+    #[cfg(feature = "test-seams")]
+    pub unsafe fn with_allocation_funding_inspector(
+        mut self,
+        inspect: unsafe fn(NonNull<()>) -> Option<(usize, usize)>,
+    ) -> Self {
+        self.allocation_funding = Some(inspect);
+        self
+    }
+
     /// # Safety
     /// The credit contract above also applies to this paid scope cell. `admit`
     /// must be a static callback for the SAME concrete cell, preserving the
@@ -88,6 +106,8 @@ impl NativeStorageAdmission {
             owner: unsafe { NativeStorageCredit::from_owned_receipt(receipt, retain, finish) },
             admit,
             inspect_failure: None,
+            #[cfg(feature = "test-seams")]
+            allocation_funding: None,
         }
     }
 
@@ -131,6 +151,8 @@ impl Clone for NativeStorageAdmission {
             owner: self.owner.clone(),
             admit: self.admit,
             inspect_failure: self.inspect_failure,
+            #[cfg(feature = "test-seams")]
+            allocation_funding: self.allocation_funding,
         }
     }
 }
@@ -469,6 +491,8 @@ struct ReaderRegistryHeader {
 pub(crate) struct ReaderRegistryAllocator {
     pub(crate) qualified: bool,
     failure: RefCell<Option<NativeColdReadError>>,
+    #[cfg(feature = "test-seams")]
+    allocation: std::cell::Cell<Option<(usize, usize, usize)>>,
 }
 impl Clone for ReaderRegistryAllocator {
     fn clone(&self) -> Self { Self::new(self.qualified) }
@@ -478,7 +502,16 @@ impl ReaderRegistryAllocator {
         Self {
             qualified,
             failure: RefCell::new(None),
+            #[cfg(feature = "test-seams")]
+            allocation: std::cell::Cell::new(None),
         }
+    }
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn charge_for(&self, accountant: usize) -> usize {
+        self.allocation
+            .get()
+            .filter(|(_, owner, _)| *owner == accountant)
+            .map_or(0, |(_, _, bytes)| bytes)
     }
     pub(crate) fn error(&self) -> crate::StorageError {
         self.failure.borrow_mut().take().map_or_else(
@@ -513,6 +546,25 @@ unsafe impl allocator_api2::alloc::Allocator for ReaderRegistryAllocator {
             });
             AllocError
         })?;
+        #[cfg(feature = "test-seams")]
+        {
+            // The source that admitted this allocation also names its receipt.
+            // Unknown/legacy/process sources do not become writer capacity.
+            let funding = if invoice.is_some() {
+                NATIVE.with(|slot| {
+                    slot.borrow().as_ref().and_then(|scope| {
+                        scope
+                            .allocation_funding
+                            .and_then(|inspect| unsafe { inspect(scope.owner.receipt) })
+                    })
+                })
+            } else {
+                None
+            };
+            self.allocation.set(funding.map(|(owner, overhead)| {
+                (pointer.as_ptr() as usize, owner, whole.size() + overhead)
+            }));
+        }
         unsafe {
             pointer
                 .cast::<ReaderRegistryHeader>()
@@ -528,6 +580,14 @@ unsafe impl allocator_api2::alloc::Allocator for ReaderRegistryAllocator {
         let (whole, offset) = Self::combined(layout);
         let start = unsafe { pointer.as_ptr().sub(offset) };
         let header = unsafe { start.cast::<ReaderRegistryHeader>().read() };
+        #[cfg(feature = "test-seams")]
+        if self
+            .allocation
+            .get()
+            .is_some_and(|(pointer, _, _)| pointer == start as usize)
+        {
+            self.allocation.set(None);
+        }
         unsafe {
             dealloc(start, whole);
         }
@@ -622,6 +682,30 @@ unsafe impl allocator_api2::alloc::Allocator for PendingAlloc {
     }
 }
 
+#[cfg(feature = "test-seams")]
+type PendingNameObserver = fn(&str, usize, Layout, Option<&NativeStorageCredit>);
+#[cfg(feature = "test-seams")]
+thread_local! {
+    static PENDING_NAME_OBSERVER: std::cell::Cell<Option<PendingNameObserver>> = const { std::cell::Cell::new(None) };
+}
+
+/// Observe a real pending name and its borrowed native invoice after construction.
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub fn observe_pending_names_for_test<T>(
+    observer: PendingNameObserver,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<PendingNameObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PENDING_NAME_OBSERVER.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(PENDING_NAME_OBSERVER.with(|slot| slot.replace(Some(observer))));
+    action()
+}
+
 pub(crate) struct PendingName(allocator_api2::boxed::Box<[u8], PendingAlloc>);
 impl PendingName {
     pub(crate) fn try_new(name: &str, alloc: PendingAlloc) -> Result<Self, crate::StorageError> {
@@ -630,7 +714,19 @@ impl PendingName {
             .try_reserve_exact(name.len())
             .map_err(|_| pending_allocation_error())?;
         bytes.extend_from_slice(name.as_bytes());
-        Ok(Self(bytes.into_boxed_slice()))
+        let name = Self(bytes.into_boxed_slice());
+        #[cfg(feature = "test-seams")]
+        PENDING_NAME_OBSERVER.with(|slot| {
+            if let Some(observe) = slot.get() {
+                let (full, offset) =
+                    PendingAlloc::layout(Layout::array::<u8>(name.0.len()).unwrap());
+                // The name owns this initialized combined allocation throughout the callback.
+                let raw = unsafe { name.0.as_ptr().sub(offset) };
+                let invoice = unsafe { &*raw.cast::<Option<NativeStorageCredit>>() };
+                observe(name.as_str(), raw as usize, full, invoice.as_ref());
+            }
+        });
+        Ok(name)
     }
     pub(crate) fn as_str(&self) -> &str {
         std::str::from_utf8(&self.0).expect("table name UTF-8")

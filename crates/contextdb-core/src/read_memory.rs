@@ -185,6 +185,13 @@ impl std::fmt::Display for NativeRefusal {
 
 #[doc(hidden)]
 pub trait ReadMemoryBudget: Debug + Send + Sync {
+    /// Identity of the actual accountant charged by this provider, if known.
+    #[cfg(feature = "test-seams")]
+    #[doc(hidden)]
+    fn funding_accountant_identity_for_test(&self) -> Option<usize> {
+        None
+    }
+
     /// Original fixed-control invoice for a private forwarding allocation.
     /// Consumers pair this alias outside the Arc before retaining it.
     #[doc(hidden)]
@@ -333,6 +340,8 @@ type NativeReserve = unsafe fn(
 ) -> std::result::Result<(), NativeRefusal>;
 
 struct NativeVtable {
+    #[cfg(feature = "test-seams")]
+    funding_accountant: unsafe fn(NonNull<()>) -> Option<usize>,
     native_reserve_supported: unsafe fn(NonNull<()>) -> bool,
     constrain_operation_memory: unsafe fn(NonNull<()>, usize),
     reserve_native: NativeReserve,
@@ -392,6 +401,8 @@ impl<I> Drop for NativeFreeGuard<I> {
 
 impl<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static> NativeReadBlock<T, I> {
     const VTABLE: NativeVtable = NativeVtable {
+        #[cfg(feature = "test-seams")]
+        funding_accountant: Self::funding_accountant,
         native_reserve_supported: Self::native_reserve_supported,
         constrain_operation_memory: Self::constrain_operation_memory,
         reserve_native: Self::reserve_native,
@@ -402,6 +413,17 @@ impl<T: ReadMemoryBudget + 'static, I: Send + Sync + 'static> NativeReadBlock<T,
         clone_owner: Self::clone_owner,
         drop_owner: Self::drop_owner,
     };
+    #[cfg(feature = "test-seams")]
+    unsafe fn funding_accountant(block: NonNull<()>) -> Option<usize> {
+        // The same monomorphized strong owner pins this exact provider.
+        unsafe {
+            block
+                .cast::<Self>()
+                .as_ref()
+                .payload
+                .funding_accountant_identity_for_test()
+        }
+    }
     unsafe fn native_reserve_supported(block: NonNull<()>) -> bool {
         // SAFETY: the strong owner retains this exact monomorphized payload.
         unsafe {
@@ -810,6 +832,14 @@ impl AsRef<dyn ReadMemoryBudget> for ReadMemoryOwner {
     }
 }
 impl ReadMemoryBudget for ReadMemoryOwner {
+    #[cfg(feature = "test-seams")]
+    fn funding_accountant_identity_for_test(&self) -> Option<usize> {
+        match &self.0 {
+            OwnerKind::Legacy(reader, _) => reader.funding_accountant_identity_for_test(),
+            OwnerKind::Native(owner) => unsafe { (owner.vtable.funding_accountant)(owner.block) },
+        }
+    }
+
     #[cfg(feature = "test-seams")]
     fn funding_owner_for_test(&self) -> Option<&Arc<dyn ReadMemoryBudget>> {
         match &self.0 {

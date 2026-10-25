@@ -727,7 +727,23 @@ impl SyncClient {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<AuthenticatedTenantPolicyBinding> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let operation_owner = self.db.operation_read_owner(read_memory.clone())?;
+        operation_owner
+            .scope_future(
+                self.bind_application_table_policy_in_memory_scope(expectation, read_memory),
+            )
+            .await
+    }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    async fn bind_application_table_policy_in_memory_scope(
+        &self,
+        expectation: ApplicationTablePolicyExpectation,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> contextdb_core::Result<AuthenticatedTenantPolicyBinding> {
         let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
             self.db.bounded_read_accountant(),
             read_memory.clone(),
@@ -871,7 +887,21 @@ impl SyncClient {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> contextdb_core::Result<Vec<DeliveryOutcome>> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let operation_owner = self.db.operation_read_owner(read_memory.clone())?;
+        operation_owner
+            .scope_future(self.fetch_delivery_outcomes_in_memory_scope(since, read_memory))
+            .await
+    }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    async fn fetch_delivery_outcomes_in_memory_scope(
+        &self,
+        since: Option<DeliveryOutcomeCursor>,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> contextdb_core::Result<Vec<DeliveryOutcome>> {
         // A caller-supplied reader keeps every charge on that reader.
         let owner = read_memory.clone();
         self.fetch_delivery_outcomes_on(since, owner, read_memory)
@@ -1963,6 +1993,8 @@ impl SyncClient {
         inspect: impl FnOnce(&ChangeSet) -> T,
     ) -> Result<T, Error> {
         let unit_memory = self.db.engine_sync_read_memory()?;
+        let owner = self.db.operation_read_owner(unit_memory.clone())?;
+        let _operation = owner.enter();
         let mut selection_credit =
             contextdb_core::read_memory::ReadCredit::new(unit_memory.clone());
         let mut retained_vector_copy = crate::vector_read_memory::admission(unit_memory.clone());
@@ -3083,7 +3115,22 @@ impl SyncClient {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, Error> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let operation_owner = self
+            .db
+            .operation_read_owner(self.db.engine_sync_read_memory()?)?;
+        operation_owner
+            .scope_future(self.push_in_memory_scope(read_memory))
+            .await
+    }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    async fn push_in_memory_scope(
+        &self,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<ApplyResult, Error> {
         let unit_memory = self.db.engine_sync_read_memory()?;
         let _calling_session_read_memory = read_memory.clone();
         let mut selection_credit =
@@ -5075,7 +5122,20 @@ impl SyncClient {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<ApplyResult, Error> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let operation_owner = self.db.operation_read_owner(read_memory.clone())?;
+        operation_owner
+            .scope_future(self.pull_default_in_memory_scope(read_memory))
+            .await
+    }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    async fn pull_default_in_memory_scope(
+        &self,
+        read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<ApplyResult, Error> {
         // An offline local delete is owed to the hub.  Offer that durable
         // obligation before accepting a contradictory ordinary pull; otherwise
         // a close/open between delete and reconnect could resurrect the very

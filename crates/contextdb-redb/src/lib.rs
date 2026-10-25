@@ -212,3 +212,7 @@ pub use read_admission::{OwnedReadPageCharge, with_owned_read_page_charge_storag
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 #[doc(hidden)]
 pub use tree_store::CheckedWriterBackendForTest;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use native_storage_admission::observe_pending_names_for_test;

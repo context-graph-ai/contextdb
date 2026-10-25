@@ -332,12 +332,7 @@ pub async fn claim_job_with_read_memory(
                 .pull_default_with_read_memory(read_memory.clone())
                 .await
             {
-                if matches!(
-                    &err,
-                    Error::ReadFailure(_)
-                        | Error::ReadCancelled
-                        | Error::MemoryBudgetExceeded { .. }
-                ) {
+                if !is_offline_sync_error(&err) {
                     return Err(err);
                 }
                 // The refusal already established that some claim row holds
@@ -365,11 +360,7 @@ pub async fn claim_job_with_read_memory(
         }
         // An unreachable hub is the offline mode: the local primary key was
         // the arbiter, the claim rides the next successful push.
-        Err(
-            err @ (Error::ReadFailure(_)
-            | Error::ReadCancelled
-            | Error::MemoryBudgetExceeded { .. }),
-        ) => Err(err),
+        Err(err) if !is_offline_sync_error(&err) => Err(err),
         Err(_) => Ok(ClaimOutcome::Won { synced: false }),
     }
 }
@@ -654,10 +645,7 @@ pub async fn poll_and_execute_once_with_read_memory(
         if !config.writes_are_canonical
             && let Err(err) = client.push_with_read_memory(read_memory.clone()).await
         {
-            if matches!(
-                &err,
-                Error::ReadFailure(_) | Error::ReadCancelled | Error::MemoryBudgetExceeded { .. }
-            ) {
+            if !is_offline_sync_error(&err) {
                 return Err(err);
             }
             tracing::debug!(
@@ -822,7 +810,7 @@ pub async fn poll_and_execute_once_with_read_memory(
                 _ = &mut execution_pull => {
                     if let Err(err) = client.pull_default_with_read_memory(read_memory.clone()).await
                     {
-                        if matches!(&err, Error::ReadFailure(_) | Error::ReadCancelled | Error::MemoryBudgetExceeded { .. }) { return Err(err); }
+                        if !is_offline_sync_error(&err) { return Err(err); }
                         if !warned_in_execution_pull_failure {
                         warned_in_execution_pull_failure = true;
                         tracing::warn!(
@@ -906,15 +894,17 @@ pub async fn poll_and_execute_once_with_read_memory(
     })
 }
 
+// Sync transport failures preserve the existing disconnected-worker behavior.
+// Local engine failures retain their typed cause and must reach the caller.
+fn is_offline_sync_error(error: &Error) -> bool {
+    matches!(error, Error::SyncError(_))
+}
+
 fn tolerate_offline_sync(
     result: Result<contextdb_engine::sync_types::ApplyResult, Error>,
 ) -> Result<(), Error> {
     match result {
-        Err(
-            err @ (Error::ReadFailure(_)
-            | Error::ReadCancelled
-            | Error::MemoryBudgetExceeded { .. }),
-        ) => Err(err),
+        Err(err) if !is_offline_sync_error(&err) => Err(err),
         _ => Ok(()),
     }
 }
@@ -993,10 +983,7 @@ async fn run_worker_loop_with_provider(
     if !config.writes_are_canonical
         && let Err(err) = client.push_with_read_memory(read_memory.clone()).await
     {
-        if matches!(
-            &err,
-            Error::ReadFailure(_) | Error::ReadCancelled | Error::MemoryBudgetExceeded { .. }
-        ) {
+        if !is_offline_sync_error(&err) {
             return Err(err);
         }
         tracing::debug!(
@@ -1038,4 +1025,24 @@ async fn run_worker_loop_with_provider(
         tokio::time::sleep(poll_interval).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod worker_error_tests {
+    use super::*;
+
+    #[test]
+    fn an_internal_engine_error_cannot_be_reported_as_an_offline_hub() {
+        let result = tolerate_offline_sync(Err(Error::Other(
+            "engine decode requires an operation memory owner".into(),
+        )));
+        assert!(matches!(result, Err(Error::Other(_))));
+    }
+
+    #[test]
+    fn a_disconnected_transport_preserves_the_offline_worker_path() {
+        assert!(
+            tolerate_offline_sync(Err(Error::SyncError("no responder on channel".into(),))).is_ok()
+        );
+    }
 }

@@ -305,10 +305,9 @@ index 0000000..eb04085
 +    COMMIT_SPANS.with(|spans| spans.replace(CommitSpansForTest::ZERO))
 +}
 diff --git a/src/db.rs b/src/db.rs
-index 9854b21..2fa7396 100644
 --- a/src/db.rs
 +++ b/src/db.rs
-@@ -20,13 +20,32 @@ use crate::error::TransactionError;
+@@ -20,12 +20,31 @@
  use crate::sealed::Sealed;
  use crate::transactions::{
      ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTree, DATA_ALLOCATED_TABLE,
@@ -320,7 +319,7 @@ index 9854b21..2fa7396 100644
  use crate::tree_store::file_backend::FileBackend;
  #[cfg(feature = "logging")]
  use log::{debug, info, warn};
- 
++
 +#[cfg(feature = "test-seams")]
 +pub(crate) mod allocator_metadata_test_seams;
 +
@@ -339,27 +338,28 @@ index 9854b21..2fa7396 100644
 +    /// Fail the save after the free totals are encoded, before publication.
 +    FailAfterEncode,
 +}
-+
+
  #[allow(clippy::len_without_is_empty)]
  /// Implements persistent storage for a database.
- pub trait StorageBackend: 'static + Debug + Send + Sync {
-@@ -49,6 +68,12 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
+@@ -48,6 +67,12 @@
+
      /// Writes the specified array to the storage.
      fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
- 
++
 +    /// Create non-durable allocator scratch storage beside this backend's file.
 +    /// Backends without a file may retain the in-memory allocator instead.
 +    fn scratch_backend(&self) -> std::result::Result<Option<Box<dyn ScratchBackend>>, io::Error> {
 +        Ok(None)
 +    }
-+
+
      /// Release any resources held by the backend
      ///
-     /// Note: redb will not access the backend after calling this method and will call it exactly
-@@ -58,6 +83,165 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
+@@ -56,6 +81,165 @@
+     fn close(&self) -> std::result::Result<(), io::Error> {
+         Ok(())
      }
- }
- 
++}
++
 +
 +/// Original construction capability. Legacy or wrapped backends never acquire it implicitly.
 +#[cfg(feature = "contextdb-internal")]
@@ -517,12 +517,10 @@ index 9854b21..2fa7396 100644
 +    Ok(Box::new(TemporaryScratch(std::sync::Mutex::new(
 +        tempfile::tempfile_in(directory)?,
 +    ))))
-+}
-+
+ }
+
  pub trait TableHandle: Sealed {
-     // Returns the name of the table
-     fn name(&self) -> &str;
-@@ -275,6 +459,10 @@ pub(crate) struct TransactionGuard {
+@@ -275,6 +459,10 @@
      transaction_tracker: Option<Arc<TransactionTracker>>,
      transaction_id: Option<TransactionId>,
      write_transaction: bool,
@@ -533,10 +531,11 @@ index 9854b21..2fa7396 100644
  }
  
  impl TransactionGuard {
-@@ -286,9 +474,38 @@ impl TransactionGuard {
+@@ -286,7 +474,36 @@
              transaction_tracker: Some(tracker),
              transaction_id: Some(transaction_id),
              write_transaction: false,
+-        }
 +            #[cfg(feature = "contextdb-internal")]
 +            prepared: false,
 +            #[cfg(feature = "contextdb-internal")]
@@ -556,9 +555,9 @@ index 9854b21..2fa7396 100644
 +    pub(crate) fn activate_prepared(&self) {
 +        if let Some(active) = &self.prepared_active {
 +            active.store(true, std::sync::atomic::Ordering::Release);
-         }
-     }
- 
++        }
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn prepared_active(&self) -> bool {
 +        self.prepared_active.as_ref().is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
@@ -567,12 +566,10 @@ index 9854b21..2fa7396 100644
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn prepared_activation(&self) -> Arc<std::sync::atomic::AtomicBool> {
 +        self.prepared_active.as_ref().expect("prepared guard").clone()
-+    }
-+
+     }
+
      pub(crate) fn new_write(
-         transaction_id: TransactionId,
-         tracker: Arc<TransactionTracker>,
-@@ -297,6 +514,10 @@ impl TransactionGuard {
+@@ -297,6 +514,10 @@
              transaction_tracker: Some(tracker),
              transaction_id: Some(transaction_id),
              write_transaction: true,
@@ -583,7 +580,7 @@ index 9854b21..2fa7396 100644
          }
      }
  
-@@ -306,6 +527,22 @@ impl TransactionGuard {
+@@ -306,6 +527,22 @@
              transaction_tracker: None,
              transaction_id: None,
              write_transaction: false,
@@ -606,19 +603,19 @@ index 9854b21..2fa7396 100644
          }
      }
  
-@@ -323,6 +560,11 @@ impl Drop for TransactionGuard {
+@@ -321,6 +558,11 @@
+ impl Drop for TransactionGuard {
+     fn drop(&mut self) {
          if self.transaction_tracker.is_none() {
-             return;
-         }
++            return;
++        }
 +        #[cfg(feature = "contextdb-internal")]
 +        if self.prepared {
 +            self.transaction_tracker.as_ref().unwrap().remove_prepared_pin(self.id());
-+            return;
-+        }
+             return;
+         }
          if let Some(transaction_id) = self.transaction_id {
-             if self.write_transaction {
-                 self.transaction_tracker
-@@ -419,16 +661,268 @@ impl ReadableDatabase for ReadOnlyDatabase {
+@@ -419,9 +661,250 @@
  }
  
  impl ReadOnlyDatabase {
@@ -683,8 +680,8 @@ index 9854b21..2fa7396 100644
      /// Opens an existing redb database.
      pub fn open(path: impl AsRef<Path>) -> Result<ReadOnlyDatabase, DatabaseError> {
          Builder::new().open_read_only(path)
-     }
- 
++    }
++
 +    /// Whether this handle's header says a writer died mid-run. Such a store
 +    /// is read at its last verified commit through
 +    /// [`ReadOnlyDatabase::crashed_snapshot_for_registration`].
@@ -866,10 +863,10 @@ index 9854b21..2fa7396 100644
 +        snapshot: crate::StorageSnapshotIdentity,
 +    ) -> Result<ReadTransaction, TransactionError> {
 +        ReadTransaction::new_external(self.mem.clone(), snapshot)
-+    }
-+
+     }
+
      fn new(
-         file: Box<dyn StorageBackend>,
+@@ -429,6 +912,17 @@
          page_size: usize,
          region_size: Option<u64>,
          cache_size: usize,
@@ -887,7 +884,7 @@ index 9854b21..2fa7396 100644
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -441,21 +935,26 @@ impl ReadOnlyDatabase {
+@@ -441,21 +935,26 @@
              region_size,
              cache_size,
              true,
@@ -906,6 +903,8 @@ index 9854b21..2fa7396 100644
 -                &file_path
 -            );
 -            return Err(DatabaseError::RepairAborted);
+-        }
+-
 +        // External readers use a registered user root. Allocator state may
 +        // belong to a concurrently committing writer and is never consulted.
 +        // A reader never allocates, so an allocator-free handle loads none.
@@ -920,16 +919,17 @@ index 9854b21..2fa7396 100644
 +                );
 +                return Err(DatabaseError::RepairAborted);
 +            }
-         }
--
++        }
 +        // This handle owns only its local read-transaction tracking.
          let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
          let db = Self {
              mem,
-@@ -466,6 +965,303 @@ impl ReadOnlyDatabase {
-     }
- }
+@@ -464,6 +963,303 @@
  
+         Ok(db)
+     }
++}
++
 +/// The most base pages a registered reader's root capture may read, header
 +/// included: one header page, at most 4 system-tree pages (6 fixed system
 +/// tables), at most 33 allocator-state branches at 2 requests each (a prefix
@@ -1225,12 +1225,10 @@ index 9854b21..2fa7396 100644
 +            StorageError::Corrupted("allocator-state transaction value".to_owned())
 +        })?);
 +    Ok(recorded == mem.get_last_committed_transaction_id()?.raw_id())
-+}
-+
+ }
+
  /// Opened redb database file
- ///
- /// Use [`Self::begin_read`] to get a [`ReadTransaction`] object that can be used to read from the database
-@@ -502,6 +1298,9 @@ impl ReadOnlyDatabase {
+@@ -502,6 +1298,9 @@
  pub struct Database {
      mem: Arc<TransactionalMemory>,
      transaction_tracker: Arc<TransactionTracker>,
@@ -1240,10 +1238,18 @@ index 9854b21..2fa7396 100644
  }
  
  impl ReadableDatabase for Database {
-@@ -518,6 +1317,124 @@ impl ReadableDatabase for Database {
+@@ -518,6 +1317,132 @@
  }
  
  impl Database {
++    /// Exact live reader-registry backing plus its receipt, for one payer.
++    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++    #[doc(hidden)]
++    pub fn reader_registry_charge_for_test(&self, accountant: usize) -> usize {
++        self.transaction_tracker
++            .reader_registry_charge_for_test(accountant)
++    }
++
 +    #[cfg(feature = "test-seams")]
 +    #[doc(hidden)]
 +    pub fn cache_controls_for_test(&self) -> [(usize, usize); 2] { self.mem.controls_for_test() }
@@ -1365,7 +1371,7 @@ index 9854b21..2fa7396 100644
      /// Opens the specified file as a redb database.
      /// * if the file does not exist, or is an empty file, a new database will be initialized in it
      /// * if the file is a valid redb database, it will be opened
-@@ -571,9 +1488,17 @@ impl Database {
+@@ -571,9 +1496,17 @@
      /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
      /// alive when this method is called.
      pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
@@ -1384,7 +1390,7 @@ index 9854b21..2fa7396 100644
  
          let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
  
-@@ -619,6 +1544,7 @@ impl Database {
+@@ -619,6 +1552,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1392,7 +1398,7 @@ index 9854b21..2fa7396 100644
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +1555,7 @@ impl Database {
+@@ -629,6 +1563,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1400,7 +1406,7 @@ index 9854b21..2fa7396 100644
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +1570,7 @@ impl Database {
+@@ -643,6 +1578,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1408,7 +1414,7 @@ index 9854b21..2fa7396 100644
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +1580,7 @@ impl Database {
+@@ -652,6 +1588,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1416,7 +1422,7 @@ index 9854b21..2fa7396 100644
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +1589,7 @@ impl Database {
+@@ -660,6 +1597,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1424,10 +1430,12 @@ index 9854b21..2fa7396 100644
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -678,6 +1608,310 @@ impl Database {
-         Ok(compacted)
-     }
+@@ -676,6 +1614,310 @@
+         }
  
+         Ok(compacted)
++    }
++
 +    /// Relocate a bounded page selection using copy-on-write publication.
 +    /// Existing read snapshots keep their pages until their guards end.
 +    #[doc(hidden)]
@@ -1730,12 +1738,10 @@ index 9854b21..2fa7396 100644
 +    pub fn external_snapshot_page_allocated_for_test(&self, page: [u8; 8]) -> bool {
 +        self.mem
 +            .is_allocated(crate::tree_store::PageNumber::from_le_bytes(page))
-+    }
-+
+     }
+
      #[cfg_attr(not(debug_assertions), expect(dead_code))]
-     fn check_repaired_allocated_pages_table(
-         system_root: Option<BtreeHeader>,
-@@ -891,14 +2125,19 @@ impl Database {
+@@ -891,14 +2133,19 @@
          Ok([data_root, system_root])
      }
  
@@ -1756,7 +1762,7 @@ index 9854b21..2fa7396 100644
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
          #[cfg(feature = "logging")]
-@@ -910,6 +2149,8 @@ impl Database {
+@@ -910,6 +2157,8 @@
              region_size,
              cache_size,
              false,
@@ -1765,7 +1771,7 @@ index 9854b21..2fa7396 100644
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +2160,12 @@ impl Database {
+@@ -919,7 +2168,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -1779,7 +1785,7 @@ index 9854b21..2fa7396 100644
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,9 +2190,22 @@ impl Database {
+@@ -944,8 +2198,21 @@
  
          let db = Database {
              mem,
@@ -1794,16 +1800,15 @@ index 9854b21..2fa7396 100644
 +            #[cfg(feature = "test-seams")]
 +            deferred_free_commit_io_fault: std::sync::atomic::AtomicBool::new(false),
          };
- 
++
 +        // Repair reconstructs current and deferred allocation state without
 +        // reusing pages. Authenticate every external root before the first
 +        // housekeeping transaction can reclaim or allocate anything.
 +        db.transaction_tracker.refresh_external_snapshots(&db.mem)?;
-+
+
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-         if let Some(next_id) = txn.next_persistent_savepoint_id()? {
-@@ -1035,12 +2294,27 @@ impl Database {
+@@ -1035,12 +2302,27 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -1831,7 +1836,7 @@ index 9854b21..2fa7396 100644
          WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
              .map_err(|e| e.into())
      }
-@@ -1056,16 +2330,171 @@ impl Database {
+@@ -1056,16 +2338,171 @@
  
          Ok(())
      }
@@ -2005,7 +2010,7 @@ index 9854b21..2fa7396 100644
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +2535,8 @@ pub struct Builder {
+@@ -1106,6 +2543,8 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -2014,7 +2019,7 @@ index 9854b21..2fa7396 100644
  }
  
  impl Builder {
-@@ -1125,6 +2556,8 @@ impl Builder {
+@@ -1125,6 +2564,8 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -2023,7 +2028,7 @@ index 9854b21..2fa7396 100644
          }
      }
  
-@@ -1157,13 +2590,37 @@ impl Builder {
+@@ -1157,13 +2598,37 @@
          self
      }
  
@@ -2062,7 +2067,7 @@ index 9854b21..2fa7396 100644
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +2632,7 @@ impl Builder {
+@@ -1175,6 +2640,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -2070,7 +2075,7 @@ index 9854b21..2fa7396 100644
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +2641,75 @@ impl Builder {
+@@ -1183,26 +2649,75 @@
              .open(path)?;
  
          Database::new(
@@ -2148,10 +2153,13 @@ index 9854b21..2fa7396 100644
          )
      }
  
-@@ -1225,6 +2732,58 @@ impl Builder {
-         )
-     }
- 
+@@ -1222,6 +2737,58 @@
+             self.page_size,
+             None,
+             self.cache_size,
++        )
++    }
++
 +    /// Opens an existing read-only database through a caller-owned backend.
 +    ///
 +    /// The caller must provide any required coordination and keep the backend's
@@ -2201,20 +2209,17 @@ index 9854b21..2fa7396 100644
 +            self.cache_size,
 +            false,
 +            true,
-+        )
-+    }
-+
-     /// Open an existing or create a new database in the given `file`.
-     ///
-     /// The file must be empty or contain a valid database.
-@@ -1236,9 +2795,53 @@ impl Builder {
+         )
+     }
+
+@@ -1236,7 +2803,51 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
 +            None,
 +            self.deferred_free_budget,
 +            self.keep_pace_reclaim,
-+        )
+         )
 +    }
 +
 +    /// Create storage with an authenticated external snapshot provider, so
@@ -2236,9 +2241,9 @@ index 9854b21..2fa7396 100644
 +            Some(provider),
 +            self.deferred_free_budget,
 +            self.keep_pace_reclaim,
-         )
-     }
- 
++        )
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    #[doc(hidden)]
 +    pub fn create_with_native_backend_and_external_snapshots(
@@ -2256,12 +2261,10 @@ index 9854b21..2fa7396 100644
 +        Database::new(Backend::Native(Box::new(backend)), false, self.page_size,
 +            None, self.cache_size, &self.repair_callback, Some(provider),
 +            self.deferred_free_budget, self.keep_pace_reclaim)
-+    }
-+
+     }
+
      /// Open an existing or create a new database with the given backend.
-     pub fn create_with_backend(
-         &self,
-@@ -1251,6 +2854,9 @@ impl Builder {
+@@ -1251,6 +2862,9 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2271,14 +2274,15 @@ index 9854b21..2fa7396 100644
          )
      }
  }
-@@ -1261,18 +2867,215 @@ impl std::fmt::Debug for Database {
+@@ -1260,18 +2874,215 @@
+         f.debug_struct("Database").finish()
      }
  }
- 
++
 +#[cfg(test)]
 +#[path = "open_with_backend_region_override_tests.rs"]
 +mod open_with_backend_region_override_tests;
-+
+
  #[cfg(test)]
  mod test {
      use crate::backends::FileBackend;
@@ -2292,7 +2296,7 @@ index 9854b21..2fa7396 100644
      use std::io::{ErrorKind, Read, Seek, SeekFrom};
      use std::sync::Arc;
      use std::sync::atomic::{AtomicU64, Ordering};
- 
++
 +    #[cfg(feature = "contextdb-internal")]
 +    #[test]
 +    fn nonblocking_external_read_refuses_before_refresh_release() {
@@ -2485,10 +2489,9 @@ index 9854b21..2fa7396 100644
 +        assert_eq!(table.get(1).unwrap().unwrap().value(), b"original");
 +        assert!(table.get(2).unwrap().is_none());
 +    }
-+
+
      #[derive(Debug)]
      struct FailingBackend {
-         inner: FileBackend,
 diff --git a/src/db/allocator_metadata_test_seams.rs b/src/db/allocator_metadata_test_seams.rs
 new file mode 100644
 index 0000000..63e7366
@@ -2670,7 +2673,6 @@ index 1a6b2da..49d53ef 100644
 +    }
 +}
 diff --git a/src/lib.rs b/src/lib.rs
-index 4923b92..6b4d444 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -62,10 +62,23 @@
@@ -2699,7 +2701,7 @@ index 4923b92..6b4d444 100644
  };
  pub use error::{
      CommitError, CompactionError, DatabaseError, Error, SavepointError, SetDurabilityError,
-@@ -79,19 +92,58 @@ pub use table::{
+@@ -79,19 +92,58 @@
      ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
      Table, TableStats,
  };
@@ -2758,7 +2760,7 @@ index 4923b92..6b4d444 100644
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +158,57 @@ fn create_tempfile() -> tempfile::NamedTempFile {
+@@ -106,3 +158,61 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -2816,6 +2818,10 @@ index 4923b92..6b4d444 100644
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +#[doc(hidden)]
 +pub use tree_store::CheckedWriterBackendForTest;
++
++#[cfg(feature = "test-seams")]
++#[doc(hidden)]
++pub use native_storage_admission::observe_pending_names_for_test;
 diff --git a/src/multimap_table.rs b/src/multimap_table.rs
 index 275f8a2..498a2ba 100644
 --- a/src/multimap_table.rs
@@ -2854,10 +2860,9 @@ index 275f8a2..498a2ba 100644
          }
 diff --git a/src/native_storage_admission.rs b/src/native_storage_admission.rs
 new file mode 100644
-index 0000000..f3f3524
 --- /dev/null
 +++ b/src/native_storage_admission.rs
-@@ -0,0 +1,822 @@
+@@ -0,0 +1,918 @@
 +//! Internal owned admission for exact byte reads; no host or engine dependency.
 +#![cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
 +use std::alloc::{Layout, alloc, dealloc};
@@ -2926,14 +2931,32 @@ index 0000000..f3f3524
 +    owner: NativeStorageCredit,
 +    admit: unsafe fn(NonNull<()>, Layout) -> Result<NativeStorageCredit, NativeStorageRefused>,
 +    inspect_failure: Option<NativeFailureInspector>,
++    #[cfg(feature = "test-seams")]
++    allocation_funding: Option<unsafe fn(NonNull<()>) -> Option<(usize, usize)>>,
 +}
-+type NativeFailureInspector = unsafe fn(NonNull<()>, &mut dyn FnMut(Option<&(dyn std::error::Error + Send + Sync + 'static)>));
++type NativeFailureInspector = unsafe fn(
++    NonNull<()>,
++    &mut dyn FnMut(Option<&(dyn std::error::Error + Send + Sync + 'static)>),
++);
 +impl std::fmt::Debug for NativeStorageAdmission {
 +    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 +        f.debug_struct("NativeStorageAdmission").finish_non_exhaustive()
 +    }
 +}
 +impl NativeStorageAdmission {
++    /// Observe the actual payer and receipt allocation overhead, without admission.
++    /// # Safety
++    /// The callback must borrow this same concrete scope and report only the
++    /// payer and receipt layout used by its successful allocation callback.
++    #[cfg(feature = "test-seams")]
++    pub unsafe fn with_allocation_funding_inspector(
++        mut self,
++        inspect: unsafe fn(NonNull<()>) -> Option<(usize, usize)>,
++    ) -> Self {
++        self.allocation_funding = Some(inspect);
++        self
++    }
++
 +    /// # Safety
 +    /// The credit contract above also applies to this paid scope cell. `admit`
 +    /// must be a static callback for the SAME concrete cell, preserving the
@@ -2948,6 +2971,8 @@ index 0000000..f3f3524
 +            owner: unsafe { NativeStorageCredit::from_owned_receipt(receipt, retain, finish) },
 +            admit,
 +            inspect_failure: None,
++            #[cfg(feature = "test-seams")]
++            allocation_funding: None,
 +        }
 +    }
 +
@@ -2991,6 +3016,8 @@ index 0000000..f3f3524
 +            owner: self.owner.clone(),
 +            admit: self.admit,
 +            inspect_failure: self.inspect_failure,
++            #[cfg(feature = "test-seams")]
++            allocation_funding: self.allocation_funding,
 +        }
 +    }
 +}
@@ -3329,6 +3356,8 @@ index 0000000..f3f3524
 +pub(crate) struct ReaderRegistryAllocator {
 +    pub(crate) qualified: bool,
 +    failure: RefCell<Option<NativeColdReadError>>,
++    #[cfg(feature = "test-seams")]
++    allocation: std::cell::Cell<Option<(usize, usize, usize)>>,
 +}
 +impl Clone for ReaderRegistryAllocator {
 +    fn clone(&self) -> Self { Self::new(self.qualified) }
@@ -3338,7 +3367,16 @@ index 0000000..f3f3524
 +        Self {
 +            qualified,
 +            failure: RefCell::new(None),
++            #[cfg(feature = "test-seams")]
++            allocation: std::cell::Cell::new(None),
 +        }
++    }
++    #[cfg(feature = "test-seams")]
++    pub(crate) fn charge_for(&self, accountant: usize) -> usize {
++        self.allocation
++            .get()
++            .filter(|(_, owner, _)| *owner == accountant)
++            .map_or(0, |(_, _, bytes)| bytes)
 +    }
 +    pub(crate) fn error(&self) -> crate::StorageError {
 +        self.failure.borrow_mut().take().map_or_else(
@@ -3373,6 +3411,25 @@ index 0000000..f3f3524
 +            });
 +            AllocError
 +        })?;
++        #[cfg(feature = "test-seams")]
++        {
++            // The source that admitted this allocation also names its receipt.
++            // Unknown/legacy/process sources do not become writer capacity.
++            let funding = if invoice.is_some() {
++                NATIVE.with(|slot| {
++                    slot.borrow().as_ref().and_then(|scope| {
++                        scope
++                            .allocation_funding
++                            .and_then(|inspect| unsafe { inspect(scope.owner.receipt) })
++                    })
++                })
++            } else {
++                None
++            };
++            self.allocation.set(funding.map(|(owner, overhead)| {
++                (pointer.as_ptr() as usize, owner, whole.size() + overhead)
++            }));
++        }
 +        unsafe {
 +            pointer
 +                .cast::<ReaderRegistryHeader>()
@@ -3388,6 +3445,14 @@ index 0000000..f3f3524
 +        let (whole, offset) = Self::combined(layout);
 +        let start = unsafe { pointer.as_ptr().sub(offset) };
 +        let header = unsafe { start.cast::<ReaderRegistryHeader>().read() };
++        #[cfg(feature = "test-seams")]
++        if self
++            .allocation
++            .get()
++            .is_some_and(|(pointer, _, _)| pointer == start as usize)
++        {
++            self.allocation.set(None);
++        }
 +        unsafe {
 +            dealloc(start, whole);
 +        }
@@ -3482,6 +3547,30 @@ index 0000000..f3f3524
 +    }
 +}
 +
++#[cfg(feature = "test-seams")]
++type PendingNameObserver = fn(&str, usize, Layout, Option<&NativeStorageCredit>);
++#[cfg(feature = "test-seams")]
++thread_local! {
++    static PENDING_NAME_OBSERVER: std::cell::Cell<Option<PendingNameObserver>> = const { std::cell::Cell::new(None) };
++}
++
++/// Observe a real pending name and its borrowed native invoice after construction.
++#[cfg(feature = "test-seams")]
++#[doc(hidden)]
++pub fn observe_pending_names_for_test<T>(
++    observer: PendingNameObserver,
++    action: impl FnOnce() -> T,
++) -> T {
++    struct Restore(Option<PendingNameObserver>);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            PENDING_NAME_OBSERVER.with(|slot| slot.set(self.0));
++        }
++    }
++    let _restore = Restore(PENDING_NAME_OBSERVER.with(|slot| slot.replace(Some(observer))));
++    action()
++}
++
 +pub(crate) struct PendingName(allocator_api2::boxed::Box<[u8], PendingAlloc>);
 +impl PendingName {
 +    pub(crate) fn try_new(name: &str, alloc: PendingAlloc) -> Result<Self, crate::StorageError> {
@@ -3490,7 +3579,19 @@ index 0000000..f3f3524
 +            .try_reserve_exact(name.len())
 +            .map_err(|_| pending_allocation_error())?;
 +        bytes.extend_from_slice(name.as_bytes());
-+        Ok(Self(bytes.into_boxed_slice()))
++        let name = Self(bytes.into_boxed_slice());
++        #[cfg(feature = "test-seams")]
++        PENDING_NAME_OBSERVER.with(|slot| {
++            if let Some(observe) = slot.get() {
++                let (full, offset) =
++                    PendingAlloc::layout(Layout::array::<u8>(name.0.len()).unwrap());
++                // The name owns this initialized combined allocation throughout the callback.
++                let raw = unsafe { name.0.as_ptr().sub(offset) };
++                let invoice = unsafe { &*raw.cast::<Option<NativeStorageCredit>>() };
++                observe(name.as_str(), raw as usize, full, invoice.as_ref());
++            }
++        });
++        Ok(name)
 +    }
 +    pub(crate) fn as_str(&self) -> &str {
 +        std::str::from_utf8(&self.0).expect("table name UTF-8")
@@ -5220,7 +5321,7 @@ diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
      valid_savepoints: BTreeMap<SavepointId, TransactionId>,
      // Non-durable commits that are still in-memory, and waiting for a durable commit to get flushed
      // We need to make sure that the freed-table does not get processed for these, since they are not durable yet
-@@ -89,33 +217,342 @@
+@@ -89,33 +217,353 @@
      pending_non_durable_commits: HashMap<TransactionId, TransactionId>,
      // Non-durable commits which have NOT been processed in the freed table
      unprocessed_freed_non_durable_commits: BTreeSet<TransactionId>,
@@ -5260,6 +5361,17 @@ diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
  }
  
  impl TransactionTracker {
++    #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
++    pub(crate) fn reader_registry_charge_for_test(&self, accountant: usize) -> usize {
++        self.state
++            .lock()
++            .unwrap()
++            .live_read_transactions
++            .map
++            .allocator()
++            .charge_for(accountant)
++    }
++
      pub(crate) fn new(next_transaction_id: TransactionId) -> Self {
 +        Self::new_with_external_snapshots(
 +            next_transaction_id,
@@ -5564,7 +5676,7 @@ diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
          }
          assert!(state.live_write_transaction.is_none());
          let transaction_id = state.next_transaction_id.increment();
-@@ -124,6 +561,10 @@
+@@ -124,6 +572,10 @@
          state.live_write_transaction = Some(transaction_id);
  
          transaction_id
@@ -5575,7 +5687,7 @@ diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
      }
  
      pub(crate) fn end_write_transaction(&self, id: TransactionId) {
-@@ -146,6 +587,9 @@
+@@ -146,6 +598,9 @@
                  state.live_read_transactions.remove(&durable_ancestor);
              }
          }
@@ -5585,7 +5697,7 @@ diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
      }
  
      pub(crate) fn is_unprocessed_non_durable_commit(&self, id: TransactionId) -> bool {
-@@ -175,9 +619,8 @@
+@@ -175,9 +630,8 @@
          let mut state = self.state.lock().unwrap();
          state
              .live_read_transactions
@@ -5597,7 +5709,7 @@ diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
          state
              .pending_non_durable_commits
              .insert(id, durable_ancestor);
-@@ -194,12 +637,41 @@
+@@ -194,12 +648,41 @@
          let mut state = self.state.lock().unwrap();
          state
              .live_read_transactions
@@ -5642,7 +5754,7 @@ diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
      }
  
      pub(crate) fn register_read_transaction(
-@@ -208,13 +680,46 @@
+@@ -208,13 +691,46 @@
      ) -> Result<TransactionId> {
          let mut state = self.state.lock()?;
          let id = mem.get_last_committed_transaction_id()?;
@@ -5694,7 +5806,7 @@ diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
      }
  
      pub(crate) fn deallocate_read_transaction(&self, id: TransactionId) {
-@@ -224,6 +729,9 @@
+@@ -224,6 +740,9 @@
          if *ref_count == 0 {
              state.live_read_transactions.remove(&id);
          }
@@ -5704,7 +5816,7 @@ diff --git a/src/transaction_tracker.rs b/src/transaction_tracker.rs
      }
  
      pub(crate) fn any_savepoint_exists(&self) -> bool {
-@@ -293,24 +801,61 @@
+@@ -293,24 +812,61 @@
      }
  
      pub(crate) fn oldest_live_read_transaction(&self) -> Option<TransactionId> {

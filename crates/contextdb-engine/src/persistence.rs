@@ -8366,8 +8366,26 @@ impl CheckpointReadSource {
         let memory =
             crate::read_image_memory::active_owner().unwrap_or_else(|_| self.decode_memory.clone());
         let admission = ExportBodyAdmission::empty(memory.row_owner()?);
+        let operation = admission.memory.enter();
+        let filled = self.load_export_row_values_in_scope(&operation, name, meta, rows, &admission)?;
+        Ok((filled, admission))
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn load_export_row_values_in_scope(
+        &self,
+        operation: &crate::read_image_memory::ImageMemoryScope,
+        name: &str,
+        meta: &TableMeta,
+        rows: &mut [VersionedRow],
+        admission: &ExportBodyAdmission,
+    ) -> Result<usize> {
+        let _operation = operation.reenter();
         if rows.is_empty() {
-            return Ok((0, admission));
+            return Ok(0);
         }
         let table_name = RedbPersistence::rel_table_name(name);
         let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(&table_name);
@@ -8436,7 +8454,7 @@ impl CheckpointReadSource {
             }
             return Err(error);
         }
-        Ok((filled, admission))
+        Ok(filled)
     }
 
     /// Resolve the canonical body through this exact row version's membership.
@@ -8447,9 +8465,11 @@ impl CheckpointReadSource {
     )]
     fn export_row_vector_identity(
         &self,
+        operation: &crate::read_image_memory::ImageMemoryScope,
         index: &VectorIndexRef,
         row: &VersionedRow,
     ) -> Result<(TxId, Lsn)> {
+        let _operation = operation.reenter();
         let prefix_bytes = index
             .table
             .len()
@@ -8602,6 +8622,7 @@ impl CheckpointReadSource {
         let memory =
             crate::read_image_memory::active_owner().unwrap_or_else(|_| self.decode_memory.clone());
         let admission = ExportBodyAdmission::empty(memory.row_owner()?);
+        let _operation_scope = admission.memory.enter();
         if let Err(error) = self
             .overlay_export_row_f32_projections_with_admission(name, meta, rows, &admission, false)
         {
@@ -8625,6 +8646,7 @@ impl CheckpointReadSource {
         admission: &ExportBodyAdmission,
         replace_prepaid: bool,
     ) -> Result<()> {
+        let _operation_scope = admission.memory.enter();
         if rows.is_empty() {
             return Ok(());
         }
@@ -8684,7 +8706,8 @@ impl CheckpointReadSource {
                         ),
                     )
                 })?;
-            let row_memory = self.decode_memory.row_owner()?;
+            let row_memory = admission.memory.row_owner()?;
+            let _row_scope = row_memory.enter();
             let durable = row_memory.scope(|| {
                 RedbPersistence::decode_relational_source_row(name, meta, stored.value())
             })?;
@@ -8705,7 +8728,7 @@ impl CheckpointReadSource {
                         }
                         let index = VectorIndexRef::new(name, *column);
                         let (vector_created_tx, vector_lsn) =
-                            self.export_row_vector_identity(&index, &durable)?;
+                            self.export_row_vector_identity(&_row_scope, &index, &durable)?;
                         self.content_identity
                             .verify(&content_identity::decoded_vector_version_value_mutation(
                                 &index,
@@ -8938,6 +8961,19 @@ impl RetainedReadSource {
         })
     }
 
+    // Snapshot metadata authentication may run outside a kernel page call.
+    // Re-enter this capture's admitted owner when no request scope is active.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Keep the original typed memory refusal."
+    )]
+    fn decode_scope(&self) -> Result<crate::read_image_memory::ImageMemoryScope> {
+        match crate::read_image_memory::active_owner() {
+            Ok(owner) => owner.enter_call(),
+            Err(_) => self._source_memory.memory.enter_call(),
+        }
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -8946,7 +8982,7 @@ impl RetainedReadSource {
         &self,
         read: impl FnOnce(&redb::ReadTransaction) -> Result<T>,
     ) -> Result<T> {
-        let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        let _decode_scope = self.decode_scope()?;
         let transaction = self.begin_read()?;
         read(&transaction)
     }
@@ -8961,6 +8997,7 @@ impl RetainedReadSource {
         &self,
         key: &str,
     ) -> Result<Option<T>> {
+        let _decode_scope = self.decode_scope()?;
         let mut cache = self
             .image_config_cache
             .lock()
@@ -12320,6 +12357,12 @@ impl RetainedReadSource {
     {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
+        let operation = crate::read_image_memory::ImageMemory::operation_reader(
+            self.verified_ordered_runs.memory.accountant.clone(),
+            read_memory.clone(),
+        )
+        .map_err(E::from)?;
+        let _scope = operation.enter();
         check_boundary()?;
         self.verify_relational_source_roots(
             table,
@@ -12336,12 +12379,6 @@ impl RetainedReadSource {
             read_memory.clone(),
             before_touch,
         )?;
-        let operation = crate::read_image_memory::ImageMemory::operation_reader(
-            self.verified_ordered_runs.memory.accountant.clone(),
-            read_memory.clone(),
-        )
-        .map_err(E::from)?;
-        let _scope = operation.enter();
         if cursor.source_prefix_quota() == Some(0) {
             cursor.source_stop_prefix();
             return Ok(None);
@@ -27439,6 +27476,24 @@ impl RedbPersistence {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn recreate(path: &Path) -> Result<Self> {
+        let writer = match crate::read_session::DatabaseOpenOptions::default().memory_limit {
+            Some(bytes) => crate::memory_accounting::MemoryAccountant::writer_budget(bytes)?,
+            None => crate::memory_accounting::MemoryAccountant::writer_no_limit()?,
+        };
+        Self::recreate_with_owner(path, writer.accountant())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn recreate_with_owner(
+        path: &Path,
+        accountant: crate::memory_accounting::AccountantHandle,
+    ) -> Result<Self> {
+        let _operation = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            accountant.clone(),
+        )?;
         let companion_preexists = companion_exists(path)?;
         let (lock_file, old_db) = if companion_preexists {
             let lock_file = CompanionGuard::acquire(path, CompanionAdmission::Existing)?;
@@ -27459,6 +27514,9 @@ impl RedbPersistence {
             };
             (lock_file, old_db)
         };
+        if old_db.1.is_none() {
+            return Self::create_with_lock(path, lock_file, Some(accountant), REDB_CACHE_BYTES, None);
+        }
         lock_file.publish_writer_run(path, false, None)?;
         #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::store_replacement_checkpoint_for_test(
@@ -27499,7 +27557,7 @@ impl RedbPersistence {
         };
         if let Err(error) = Self::write_format_marker(
             &replacement_db,
-            &mut content_identity::ProofAdmission::unaccounted()
+            &mut content_identity::ProofAdmission::new(Some(accountant.clone()))
                 .with_scratch_owner(Some(Arc::downgrade(&replacement_owner))),
         ) {
             drop(replacement_db);
@@ -27588,8 +27646,10 @@ impl RedbPersistence {
                 }
 
                 {
+                    let proof_accountant = std::sync::OnceLock::new();
+                    let _ = proof_accountant.set(ProofAccountantSlot::attached(accountant.clone()));
                     std::ptr::addr_of_mut!((*construction.source).proof_accountant)
-                        .write(std::sync::OnceLock::new());
+                        .write(proof_accountant);
                     construction.initialized[15] = true;
                 }
 
@@ -28026,6 +28086,11 @@ impl RedbPersistence {
         )
     }
 
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn reader_registry_charge_for_test(&self, accountant: usize) -> usize {
+        self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |db| db.reader_registry_charge_for_test(accountant))
+    }
+
     /// Writer cache charge metadata; physical owners alone release its invoice.
     pub(crate) fn cache_charge(&self) -> usize {
         self.cache_charge_bytes.get().copied().unwrap_or(0)
@@ -28432,6 +28497,13 @@ impl RedbPersistence {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn is_legacy_format_store(path: &Path) -> Result<bool> {
+        let writer = match crate::read_session::DatabaseOpenOptions::default().memory_limit {
+            Some(bytes) => crate::memory_accounting::MemoryAccountant::writer_budget(bytes)?,
+            None => crate::memory_accounting::MemoryAccountant::writer_no_limit()?,
+        };
+        let _operation = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            writer.accountant(),
+        )?;
         Self::legacy_format_verdict(path, AbsentStoreAnswer::Taxonomy, REDB_CACHE_BYTES, None)
     }
 
@@ -46608,7 +46680,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
             lsn: Lsn,
             created_at: Option<contextdb_core::Wallclock>,
         }
-        let (row, _): (RowWire, usize) = crate::read_image_memory::decode_exact_buffers(bytes)?;
+        let scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
+        let (row, _): (RowWire, usize) =
+            crate::read_image_memory::decode_exact_buffers(&scope, bytes)?;
         Ok(VersionedRow {
             row_id: row.row_id,
             values: row.values.0,
@@ -51407,7 +51481,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 "RedbPersistence::decode",
             );
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
-        let (value, _) = crate::read_image_memory::decode(bytes)?;
+        let (value, _) = crate::read_image_memory::decode(&_decode_scope, bytes)?;
         Ok(value)
     }
 
@@ -51419,7 +51493,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
         let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
         let owner = crate::read_image_memory::active_owner()?;
         let before = owner.held();
-        let (value, consumed) = crate::read_image_memory::decode(bytes)?;
+        let (value, consumed) = crate::read_image_memory::decode(&_decode_scope, bytes)?;
         if consumed != bytes.len() {
             drop(value);
             owner.release(owner.held() - before);
@@ -58070,7 +58144,7 @@ mod empty_declared_index_readiness_tests {
                     "Raise the declared reader memory limit to read graph pages.",
                 );
                 let (decoded, consumed): (AdjEntry, usize) = decoder
-                    .scope(|| crate::read_image_memory::decode(&raw))
+                    .scope(|| crate::read_image_memory::decode(&decoder.enter(), &raw))
                     .unwrap();
                 assert_eq!(
                     (&decoded, consumed),
@@ -58094,7 +58168,7 @@ mod empty_declared_index_readiness_tests {
                     "Raise the declared reader memory limit to read graph pages.",
                 );
                 let decoded: Result<(AdjEntry, usize)> =
-                    decoder.scope(|| crate::read_image_memory::decode(&raw));
+                    decoder.scope(|| crate::read_image_memory::decode(&decoder.enter(), &raw));
                 let error = decoded.unwrap_err();
                 assert!(
                     matches!(error, Error::MemoryBudgetExceeded { ref subsystem, ref operation, budget_limit_bytes, .. }

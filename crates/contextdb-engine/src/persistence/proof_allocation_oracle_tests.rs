@@ -1423,6 +1423,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             System.dealloc(pointer.sub(offset), allocation);
         }
         crate::vector_read_memory::root_observations::after_physical_free(producer_free);
+        super::super::writer_row_heads::staging_witness::after_free(pointer as usize);
         selected_json_producer_rows::freed(pointer as usize, layout, true);
         answer_copy_free(pointer as usize, true);
         if declaration_free {

@@ -44,10 +44,17 @@ type Model = BTreeMap<u64, (u64, Option<u64>)>;
 struct Harness {
     dir: tempfile::TempDir,
     db: Option<ProofFixtureDatabase>,
+    memory: crate::read_image_memory::ImageMemoryHandle,
+    _writer: crate::memory_accounting::WriterBudget,
 }
 
 impl Harness {
     fn new() -> Self {
+        let writer =
+            crate::memory_accounting::MemoryAccountant::writer_budget(1_610_612_736).unwrap();
+        let memory =
+            crate::read_image_memory::ImageMemory::operation_writer(writer.accountant()).unwrap();
+        let _scope = memory.enter();
         let dir = tempfile::tempdir().unwrap();
         let db = ProofFixtureDatabase::create(dir.path().join("occupancy.db")).unwrap();
         let write = db.begin_write().unwrap();
@@ -55,7 +62,12 @@ impl Harness {
         crate::persistence::content_size::initialize(&write).unwrap();
         crate::persistence::content_size::ensure_table(&write, "items").unwrap();
         write.commit().unwrap();
-        Self { dir, db: Some(db) }
+        Self {
+            dir,
+            db: Some(db),
+            memory,
+            _writer: writer,
+        }
     }
 
     fn db(&self) -> &ProofFixtureDatabase {
@@ -84,6 +96,10 @@ impl Harness {
         &self,
         ops: &[(u64, Option<VectorPartitionMembershipRecord>)],
     ) -> redb::WriteTransaction {
+        let _scope = match crate::read_image_memory::active_owner() {
+            Ok(owner) => owner.enter(),
+            Err(_) => self.memory.enter(),
+        };
         let write = self.db().begin_write().unwrap();
         for (row, next) in ops {
             let identity = record(*row, 1, None);
@@ -101,6 +117,7 @@ impl Harness {
     }
 
     fn commit(&self, ops: &[(u64, Option<VectorPartitionMembershipRecord>)], settle: bool) {
+        let _scope = self.memory.enter();
         let write = self.stage(ops);
         if settle {
             pages::settle_dirty_occupancy(&write, None).unwrap();
@@ -134,6 +151,7 @@ impl Harness {
 
     /// The directory scan: every committed source record of the route.
     fn directory(&self) -> Vec<(u64, u64)> {
+        let _scope = self.memory.enter();
         let read = self.db().begin_read().unwrap();
         let Ok(table) = read.open_table(pages::SOURCE) else {
             return Vec::new();
@@ -153,6 +171,7 @@ impl Harness {
 
     /// The interval table's answer for one hold.
     fn answer(&self, hold: u64) -> Option<bool> {
+        let _scope = self.memory.enter();
         let read = self.db().begin_read().unwrap();
         pages::occupancy_visible_at_any_in_read(&read, &route(), &[SnapshotId(hold)]).unwrap()
     }
@@ -336,15 +355,19 @@ fn a_replacement_swaps_one_lifetime_for_another() {
     let child_control = parent.retained_bytes_for_test();
     let spy = MaintenanceReaderSpy::new(child.clone(), writer.clone().into());
     let owner = ImageMemory::operation_reader(writer.into(), spy.clone()).unwrap();
+    let baseline_funding = spy.used.load(Ordering::SeqCst);
     let row_owner = owner.row_owner().unwrap();
     let baseline = owner.held();
     let input = record(1, 10, Some(20));
     let payload = bincode::serde::encode_to_vec(&input, bincode::config::standard()).unwrap();
     let (decoded, requests, count) = row_owner.scope(|| {
         native_requests_for_test(|| {
-            crate::read_image_memory::decode::<VectorPartitionMembershipRecord>(&payload)
-                .unwrap()
-                .0
+            crate::read_image_memory::decode::<VectorPartitionMembershipRecord>(
+                &crate::read_image_memory::ImageMemory::enter_decode_call().unwrap(),
+                &payload,
+            )
+            .unwrap()
+            .0
         })
     });
     assert!(count >= 3);
@@ -377,7 +400,7 @@ fn a_replacement_swaps_one_lifetime_for_another() {
         "payload drop alone cannot refund another live row owner"
     );
     drop(row_owner);
-    assert_eq!(spy.used.load(Ordering::SeqCst), baseline);
+    assert_eq!(spy.used.load(Ordering::SeqCst), baseline_funding);
     let h = Harness::new();
     let write =
         owner.scope(|| h.stage(&[put(1, 10, Some(20)), put(1, 30, Some(40)), put(2, 15, None)]));
@@ -386,7 +409,7 @@ fn a_replacement_swaps_one_lifetime_for_another() {
         baseline,
         "actual membership publication returns previous/next decode invoices within this still-live operation"
     );
-    assert_eq!(spy.used.load(Ordering::SeqCst), baseline);
+    assert_eq!(spy.used.load(Ordering::SeqCst), baseline_funding);
     write.commit().unwrap();
     check(
         &h,
@@ -399,7 +422,11 @@ fn a_replacement_swaps_one_lifetime_for_another() {
     assert_eq!(parent.retained_bytes_for_test(), child_control);
     drop(spy);
     drop(child);
-    assert_eq!(parent.retained_bytes_for_test(), 0);
+    assert_eq!(
+        parent.retained_bytes_for_test(),
+        parent.root_control_bytes() as u64
+    );
+    parent.assert_final_root_free_for_test();
 }
 
 #[test]
@@ -440,13 +467,10 @@ fn removing_the_only_membership_of_a_route_clears_its_rows() {
         VectorPartitionTombstoneRecord,
     };
     use crate::read_image_memory::ImageMemory;
-    use std::sync::{Arc, atomic::Ordering};
+    use std::sync::atomic::Ordering;
     let directory = tempfile::tempdir().unwrap();
-    let writer = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
-        1_610_612_736,
-    ));
-    let root = crate::memory_accounting::WriterBudget::from_accountant(writer.clone()).unwrap();
-    let handle: crate::memory_accounting::AccountantHandle = writer.clone().into();
+    let root = crate::memory_accounting::MemoryAccountant::writer_budget(1_610_612_736).unwrap();
+    let handle = root.accountant();
     let persistence = RedbPersistence::create_with_accountant(
         &directory.path().join("selected-row.db"),
         Some(handle.clone()),
@@ -585,6 +609,7 @@ fn removing_the_only_membership_of_a_route_clears_its_rows() {
         "both selected records retain their own payload invoices through the next fallible operation"
     );
     assert!(spy.retained_at_failure.load(Ordering::SeqCst) > owner.held());
+    drop(error);
     drop(owner);
     assert!(
         workspace.bytes() > 0,
@@ -655,7 +680,11 @@ fn removing_the_only_membership_of_a_route_clears_its_rows() {
     assert!(after[5].is_empty());
     drop(spy);
     drop(child);
-    assert_eq!(parent.retained_bytes_for_test(), 0);
+    assert_eq!(
+        parent.retained_bytes_for_test(),
+        parent.root_control_bytes() as u64
+    );
+    parent.assert_final_root_free_for_test();
     drop(persistence);
     drop(root);
 }
@@ -815,6 +844,7 @@ fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() 
     use super::proof_allocation_oracle_tests::MaintenanceReaderSpy;
     use crate::read_image_memory::ImageMemory;
     use std::sync::{Arc, atomic::Ordering};
+    crate::vector_read_memory::watch_reader_budget_ledger_for_test();
     for disjoint in [false, true] {
         let mut receipts = Vec::new();
         for history in [32_u64, 64, 128] {
@@ -834,12 +864,10 @@ fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() 
             h.commit(&[(0, None)], false);
             assert!(h.dirty());
             let before = h.rows();
-            let writer = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
-                1_610_612_736,
-            ));
             let root =
-                crate::memory_accounting::WriterBudget::from_accountant(writer.clone()).unwrap();
-            let handle: crate::memory_accounting::AccountantHandle = writer.clone().into();
+                crate::memory_accounting::MemoryAccountant::writer_budget(1_610_612_736).unwrap();
+            let writer = root.accountant();
+            let handle = writer.clone();
             let writer_baseline = writer.usage().used;
             let parent =
                 crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(1_073_741_824)
@@ -851,6 +879,7 @@ fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() 
             let spy = MaintenanceReaderSpy::new(child.clone(), handle.clone());
             let owner = ImageMemory::operation_reader(handle.clone(), spy.clone()).unwrap();
             let owner_control = owner.held();
+            let owner_funding = spy.used.load(Ordering::SeqCst);
             // Abort an actual completed rebuild: neither old rows nor its
             // committed dirty marker may be partially published.
             let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -877,14 +906,14 @@ fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() 
                 owner_control,
                 "temporary decoded memberships refund before the next operation"
             );
-            assert_eq!(spy.used.load(Ordering::SeqCst), owner_control);
+            assert_eq!(spy.used.load(Ordering::SeqCst), owner_funding);
             assert_eq!(
                 child_observer.sample().charged_bytes as usize,
-                owner_control
+                owner_funding
             );
             assert_eq!(
                 parent.retained_bytes_for_test(),
-                child_control + owner_control as u64
+                child_control + owner_funding as u64
             );
             let first_requests = spy.decode_requests.load(Ordering::SeqCst);
             let reader_peak = spy.peak.load(Ordering::SeqCst);
@@ -915,12 +944,17 @@ fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() 
                 matches!(error, contextdb_core::Error::MemoryBudgetExceeded { ref subsystem, .. } if subsystem == "reader"),
                 "{error:?}"
             );
+            drop(error);
             drop(write);
             drop(small_owner);
             assert_eq!(small_spy.used.load(Ordering::SeqCst), 0);
             drop(small_spy);
             drop(small_child);
-            assert_eq!(small_parent.retained_bytes_for_test(), 0);
+            assert_eq!(
+                small_parent.retained_bytes_for_test(),
+                small_parent.root_control_bytes() as u64
+            );
+            small_parent.assert_final_root_free_for_test();
             assert_eq!(h.rows(), before);
             assert!(h.dirty());
             assert_eq!(writer.usage().used, writer_baseline);
@@ -945,7 +979,11 @@ fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() 
             ));
             drop(spy);
             drop(child);
-            assert_eq!(parent.retained_bytes_for_test(), 0);
+            assert_eq!(
+                parent.retained_bytes_for_test(),
+                parent.root_control_bytes() as u64
+            );
+            parent.assert_final_root_free_for_test();
             drop(root);
         }
         for receipt in &receipts[1..] {
@@ -970,6 +1008,7 @@ fn random_membership_writes_keep_the_interval_set_equal_to_the_directory_scan() 
             "actual durable occupancy mutations have linear growth for overlapping and arbitrary-order disjoint inputs"
         );
     }
+    drop(crate::vector_read_memory::take_reader_budget_ledger_for_test());
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,6 +1161,10 @@ fn cdb120_crash_window_child() {
 
 /// Every route's interval rows against the union of its durable memberships.
 fn assert_durable_intervals_match_memberships(store: &std::path::Path) {
+    let writer = crate::memory_accounting::MemoryAccountant::writer_budget(1_610_612_736).unwrap();
+    let memory =
+        crate::read_image_memory::ImageMemory::operation_writer(writer.accountant()).unwrap();
+    let _scope = memory.enter();
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

@@ -211,7 +211,12 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(
         before: owner.held(),
         armed: true,
     };
-    let (value, consumed) = owner.scope(|| crate::read_image_memory::decode(bytes))?;
+    let (value, consumed) = owner.scope(|| {
+        crate::read_image_memory::decode(
+            &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+            bytes,
+        )
+    })?;
     if consumed != bytes.len() {
         drop(value);
         return Err(contextdb_core::Error::Other(

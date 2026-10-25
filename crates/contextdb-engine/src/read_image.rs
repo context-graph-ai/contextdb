@@ -1997,8 +1997,8 @@ pub(crate) fn read_metadata_body(
         6 => {
             let has_more = bytes.flag()?;
             let counts: Option<crate::DeliveryStatusCounts> =
-                crate::read_image_memory::decode_json(bytes.text()?.as_bytes()).map_err(
-                    |error| {
+                crate::read_image_memory::decode_json(&_decode_scope, bytes.text()?.as_bytes())
+                    .map_err(|error| {
                         crate::read_contract::encoding_error_from_core(
                             error,
                             contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
@@ -2150,7 +2150,7 @@ fn read_rendered<T: serde::de::DeserializeOwned>(
     for _ in 0..count {
         let rendered = bytes.raw()?;
         values.push(
-            crate::read_image_memory::decode_json(rendered).map_err(|error| {
+            crate::read_image_memory::decode_json(&_decode_scope, rendered).map_err(|error| {
                 crate::read_contract::encoding_error_from_core(
                     error,
                     contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,

@@ -474,8 +474,10 @@ pub(crate) fn decode_outcome_projection(
         #[serde(deserialize_with = "required_nullable")]
         conflicts: Option<Vec<Conflict>>,
     }
-    let Some(p): Option<OutcomeProjection> =
-        crate::read_image_memory::decode_json(text.as_bytes())?
+    let Some(p): Option<OutcomeProjection> = crate::read_image_memory::decode_json(
+        &crate::read_image_memory::ImageMemory::enter_decode_call()?,
+        text.as_bytes(),
+    )?
     else {
         return Ok(None);
     };

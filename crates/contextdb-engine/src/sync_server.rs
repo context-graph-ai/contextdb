@@ -1974,7 +1974,33 @@ async fn handle_pull(
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
 ) -> contextdb_core::Result<()> {
     let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+    let owner = db.operation_read_owner(read_memory.clone())?;
+    owner
+        .scope_future(handle_pull_in_memory_scope(
+            db,
+            lineage_signer,
+            receipts,
+            tenant_id,
+            local_node_id,
+            schema_sync_holdbacks,
+            peer_schema_capabilities,
+            req,
+            read_memory,
+        ))
+        .await
+}
 
+async fn handle_pull_in_memory_scope(
+    db: Arc<Database>,
+    lineage_signer: Option<LineageSigner>,
+    receipts: Arc<TransferLedger>,
+    tenant_id: TenantId,
+    local_node_id: Option<String>,
+    schema_sync_holdbacks: SchemaSyncHoldbackStates,
+    peer_schema_capabilities: PeerSchemaCapabilities,
+    req: IncomingRequest,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+) -> contextdb_core::Result<()> {
     let decoded_memory = crate::read_image_memory::ImageMemory::charging_reader_for(
         db.bounded_read_accountant(),
         read_memory.clone(),
