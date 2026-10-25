@@ -1,10 +1,12 @@
 //! While a published replacement remaps the legacy entries sealed under the
 //! old codebook, every committed vector is answered exactly once. The legacy
 //! set is fixed at the publication commit F1 as the delta entries with commit
-//! LSN in (F0, F1], with an immutable membership identity; each maintenance
-//! call remaps at most one bounded batch of entries; and at every call
-//! boundary a full-depth search returns each committed row once, with no
-//! duplicate and no omission. Writers keep sealing under the new codebook, so
+//! LSN in (F0, F1], whose membership is exactly the rows committed in that
+//! window; every maintenance call, including the publication call and the
+//! call that completes the remap, prepares at most one bounded batch of
+//! legacy entries, and the switch prepares each legacy entry exactly once;
+//! and at every call boundary a full-depth search returns each committed row
+//! once, with no duplicate and no omission. Writers keep sealing under the new codebook, so
 //! the legacy set never changes. The old codebook stays retained, with a
 //! positive charge, until the remap exhausts the legacy set, and is released
 //! then. A crash inside a remap batch recovers the same state and finishes
@@ -13,8 +15,8 @@
 use super::support::{
     IndexTestOptions, LegacyEntries, MAX_MAINTENANCE_CYCLES, PublicationCut, SwitchPhase,
     SwitchState, build_progress, delta_entries, drive_until_serving, empty, int_ids, ivf,
-    observe_publication_cuts, open_with_index_test_options, params, serving, switch_state,
-    unit_vector, write_buffer,
+    legacy_entries_prepared_total, observe_publication_cuts, open_with_index_test_options, params,
+    serving, switch_state, unit_vector, write_buffer,
 };
 use contextdb_core::{Value, Wallclock};
 use contextdb_engine::Database;
@@ -113,11 +115,51 @@ fn state(db: &Database) -> SwitchState {
     switch_state(db, "switch_items", "embedding", &[])
 }
 
+fn prepared(db: &Database) -> u64 {
+    legacy_entries_prepared_total(db, "switch_items", "embedding", &[])
+}
+
+/// Runs one maintenance call and checks it prepared at most one bounded
+/// batch of legacy entries, whatever phase it started or ended in.
+fn bounded_cycle(db: &Database, stage: &str) {
+    let before = prepared(db);
+    db.run_maintenance_cycle().expect("one maintenance cycle");
+    let after = prepared(db);
+    assert!(
+        after >= before && after - before <= BATCH,
+        "{stage}: one maintenance call prepares at most one batch of {BATCH} legacy entries: \
+         {before} then {after}"
+    );
+}
+
+/// The legacy members recomputed from the actual delta entries: the
+/// (primary key, commit LSN) of every entry with commit LSN in (F0, F1].
+fn legacy_members(db: &Database, legacy: &LegacyEntries) -> BTreeSet<(i64, u64)> {
+    delta_entries(db, "switch_items", "embedding", &[])
+        .into_iter()
+        .filter(|entry| {
+            entry.commit_lsn > legacy.after_lsn && entry.commit_lsn <= legacy.through_lsn
+        })
+        .map(|entry| match entry.primary_key {
+            Value::Int64(id) => (id, entry.commit_lsn),
+            other => panic!("the primary key is an integer, got {other:?}"),
+        })
+        .collect()
+}
+
+struct SwitchFixture {
+    committed: BTreeSet<i64>,
+    old_codebook: u64,
+    legacy: LegacyEntries,
+    /// The legacy membership captured at the publication commit.
+    members: BTreeSet<(i64, u64)>,
+    /// The cumulative preparation count before the publication call.
+    prepared_before_publication: u64,
+}
+
 /// Serves the first generation, starts its replacement, seals the legacy
-/// entries under the old codebook, and publishes the replacement. Returns the
-/// committed rows, the old codebook and the legacy set recorded at
-/// publication.
-fn reach_state_b(db: &Database) -> (BTreeSet<i64>, u64, LegacyEntries) {
+/// entries under the old codebook, and publishes the replacement.
+fn reach_state_b(db: &Database) -> SwitchFixture {
     create(db);
     insert_all(db, BUILT);
     drive_until_serving(db);
@@ -125,7 +167,7 @@ fn reach_state_b(db: &Database) -> (BTreeSet<i64>, u64, LegacyEntries) {
     insert_all(db, GROWTH);
     let mut training = false;
     for _ in 0..MAX_MAINTENANCE_CYCLES {
-        db.run_maintenance_cycle().expect("one maintenance cycle");
+        bounded_cycle(db, "while the replacement starts");
         if build_progress(db, "switch_items", "embedding", &[]).in_flight {
             training = true;
             break;
@@ -136,9 +178,10 @@ fn reach_state_b(db: &Database) -> (BTreeSet<i64>, u64, LegacyEntries) {
         insert_one(db, id);
     }
     let committed = BUILT.chain(GROWTH).chain(LEGACY).collect::<BTreeSet<_>>();
+    let prepared_before_publication = prepared(db);
     let mut published = false;
     for _ in 0..MAX_MAINTENANCE_CYCLES {
-        db.run_maintenance_cycle().expect("one maintenance cycle");
+        bounded_cycle(db, "up to and including the publication call");
         if matches!(serving(db, "switch_items", "embedding", &[]), Some(now) if now.generation != old.generation)
         {
             published = true;
@@ -156,8 +199,19 @@ fn reach_state_b(db: &Database) -> (BTreeSet<i64>, u64, LegacyEntries) {
         .legacy
         .unwrap_or_else(|| panic!("the publication commit records the legacy set: {at_switch:?}"));
     assert!(
-        legacy.after_lsn < legacy.through_lsn && legacy.entries >= 1,
-        "the legacy set holds the entries sealed under the old codebook: {legacy:?}"
+        legacy.after_lsn < legacy.through_lsn,
+        "the legacy frontier is a non-empty LSN window: {legacy:?}"
+    );
+    let members = legacy_members(db, &legacy);
+    assert_eq!(
+        members.iter().map(|(id, _)| *id).collect::<BTreeSet<_>>(),
+        LEGACY.collect::<BTreeSet<_>>(),
+        "the legacy membership is exactly the rows committed while the replacement trained"
+    );
+    assert_eq!(
+        members.len() as u64,
+        legacy.entries,
+        "the recorded size matches the membership"
     );
     assert!(
         at_switch.legacy_entries_remapped < legacy.entries,
@@ -172,34 +226,28 @@ fn reach_state_b(db: &Database) -> (BTreeSet<i64>, u64, LegacyEntries) {
         at_switch.retained_codebook_charge_bytes > 0,
         "the retained codebook holds a positive charge"
     );
-    assert_legacy_coverage(db, &legacy, "at the switch");
-    (committed, old.codebook, legacy)
+    SwitchFixture {
+        committed,
+        old_codebook: old.codebook,
+        legacy,
+        members,
+        prepared_before_publication,
+    }
 }
 
-/// The delta entries with commit LSN in (F0, F1] are exactly as many as the
-/// legacy set recorded.
-fn assert_legacy_coverage(db: &Database, legacy: &LegacyEntries, stage: &str) {
-    let covered = delta_entries(db, "switch_items", "embedding", &[])
-        .into_iter()
-        .filter(|entry| {
-            entry.commit_lsn > legacy.after_lsn && entry.commit_lsn <= legacy.through_lsn
-        })
-        .count() as u64;
+/// The legacy membership recomputed from the actual delta entries equals the
+/// membership captured at the publication commit.
+fn assert_legacy_membership(db: &Database, fixture: &SwitchFixture, stage: &str) {
     assert_eq!(
-        covered, legacy.entries,
-        "{stage}: the entries in (F0, F1] are exactly the legacy set: {legacy:?}"
+        legacy_members(db, &fixture.legacy),
+        fixture.members,
+        "{stage}: the entries in (F0, F1] are exactly the legacy members captured at F1"
     );
 }
 
 /// Drives remap cycles to completion, sealing new commits under the new
 /// codebook between them, and checks every call boundary.
-fn remap_to_completion(
-    db: &Database,
-    committed: &mut BTreeSet<i64>,
-    old_codebook: u64,
-    legacy: LegacyEntries,
-    stage: &str,
-) {
+fn remap_to_completion(db: &Database, fixture: &mut SwitchFixture, stage: &str) {
     let new_codebook = serving(db, "switch_items", "embedding", &[])
         .expect("the replacement serves")
         .codebook;
@@ -212,13 +260,12 @@ fn remap_to_completion(
         }
         assert_eq!(
             now.legacy,
-            Some(legacy),
-            "{stage}: the legacy frontier, size and membership stay fixed at F1"
+            Some(fixture.legacy),
+            "{stage}: the recorded legacy frontier, size and digest stay as at F1"
         );
         assert!(
-            now.legacy_entries_remapped >= remapped
-                && now.legacy_entries_remapped - remapped <= BATCH,
-            "{stage}: one call remaps at most one bounded batch of entries: {remapped} then {now:?}"
+            now.legacy_entries_remapped >= remapped,
+            "{stage}: remap progress never goes back: {remapped} then {now:?}"
         );
         remapped = now.legacy_entries_remapped;
         assert_eq!(
@@ -226,17 +273,21 @@ fn remap_to_completion(
                 now.retained_codebook,
                 now.retained_codebook_charge_bytes > 0
             ),
-            (Some(old_codebook), true),
+            (Some(fixture.old_codebook), true),
             "{stage}: the old codebook stays retained and charged until the legacy set is \
              exhausted: {now:?}"
         );
-        assert_legacy_coverage(db, &legacy, stage);
-        assert_each_row_exactly_once(db, committed, &format!("{stage}, remap boundary {now:?}"));
+        assert_legacy_membership(db, fixture, stage);
+        assert_each_row_exactly_once(
+            db,
+            &fixture.committed,
+            &format!("{stage}, remap boundary {now:?}"),
+        );
 
         let seals_before = write_buffer(db, "switch_items", "embedding").sealed_runs;
         for _ in 0..AFTER_SWITCH_PER_BOUNDARY {
             insert_one(db, next_id);
-            committed.insert(next_id);
+            fixture.committed.insert(next_id);
             next_id += 1;
         }
         assert!(
@@ -244,7 +295,7 @@ fn remap_to_completion(
             "{stage}: the commits after the switch sealed"
         );
         for entry in delta_entries(db, "switch_items", "embedding", &[]) {
-            if entry.commit_lsn > legacy.through_lsn && entry.sealed {
+            if entry.commit_lsn > fixture.legacy.through_lsn && entry.sealed {
                 assert_eq!(
                     entry.codebook,
                     Some(new_codebook),
@@ -252,13 +303,9 @@ fn remap_to_completion(
                 );
             }
         }
-        assert_eq!(
-            state(db).legacy,
-            Some(legacy),
-            "{stage}: new seals leave the legacy set unchanged"
-        );
-        assert_each_row_exactly_once(db, committed, &format!("{stage}, after new seals"));
-        db.run_maintenance_cycle().expect("one remap cycle");
+        assert_legacy_membership(db, fixture, &format!("{stage}, after new seals"));
+        assert_each_row_exactly_once(db, &fixture.committed, &format!("{stage}, after new seals"));
+        bounded_cycle(db, &format!("{stage}, remap call"));
     }
     let done = state(db);
     assert_eq!(
@@ -271,6 +318,12 @@ fn remap_to_completion(
         (None, 0),
         "{stage}: the old codebook and its charge are released once the legacy set is exhausted"
     );
+    assert_eq!(
+        prepared(db) - fixture.prepared_before_publication,
+        fixture.legacy.entries,
+        "{stage}: the switch prepared each legacy entry exactly once"
+    );
+    assert_legacy_membership(db, fixture, &format!("{stage}, after the remap"));
     for entry in delta_entries(db, "switch_items", "embedding", &[]) {
         if entry.sealed {
             assert_eq!(
@@ -280,7 +333,7 @@ fn remap_to_completion(
             );
         }
     }
-    assert_each_row_exactly_once(db, committed, &format!("{stage}, after the remap"));
+    assert_each_row_exactly_once(db, &fixture.committed, &format!("{stage}, after the remap"));
 }
 
 #[test]
@@ -288,8 +341,8 @@ fn every_committed_vector_is_answered_exactly_once_while_legacy_entries_are_rema
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_with_index_test_options(&root.path().join("switch.db"), OPTIONS);
-    let (mut committed, old_codebook, legacy) = reach_state_b(&db);
-    remap_to_completion(&db, &mut committed, old_codebook, legacy, "remap");
+    let mut fixture = reach_state_b(&db);
+    remap_to_completion(&db, &mut fixture, "remap");
     db.close().expect("close the store");
 }
 
@@ -336,12 +389,13 @@ fn a_crash_inside_a_remap_batch_recovers_and_finishes_with_each_row_exactly_once
     }
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("remap-crash.db");
-    let (mut committed, old_codebook, legacy, before) = {
+    let (mut fixture, before, prepared_at_close) = {
         let db = open_with_index_test_options(&path, OPTIONS);
-        let (committed, old_codebook, legacy) = reach_state_b(&db);
+        let fixture = reach_state_b(&db);
         let before = state(&db);
+        let prepared_at_close = prepared(&db);
         db.close().expect("close in the remap state");
-        (committed, old_codebook, legacy, before)
+        (fixture, before, prepared_at_close)
     };
 
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -384,7 +438,17 @@ fn a_crash_inside_a_remap_batch_recovers_and_finishes_with_each_row_exactly_once
         before,
         "the uncommitted remap batch left the remap state exactly as it was"
     );
-    assert_each_row_exactly_once(&db, &committed, "after the crash inside a remap batch");
-    remap_to_completion(&db, &mut committed, old_codebook, legacy, "after recovery");
+    assert_eq!(
+        prepared(&db),
+        prepared_at_close,
+        "the uncommitted remap batch counts no preparation"
+    );
+    assert_legacy_membership(&db, &fixture, "after the crash inside a remap batch");
+    assert_each_row_exactly_once(
+        &db,
+        &fixture.committed,
+        "after the crash inside a remap batch",
+    );
+    remap_to_completion(&db, &mut fixture, "after recovery");
     db.close().unwrap();
 }

@@ -751,8 +751,10 @@ pub struct SwitchState {
 }
 
 /// One delta entry of one Context.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeltaEntry {
+    /// The primary key of the row whose version the entry holds.
+    pub primary_key: Value,
     /// The commit LSN of the row version the entry holds.
     pub commit_lsn: u64,
     /// The codebook the entry is searched through; `None` while unsealed in
@@ -779,4 +781,18 @@ pub fn switch_state(
     _context: &[Value],
 ) -> SwitchState {
     unimplemented!("{UNBOUND}: the replacement switch state")
+}
+
+/// Legacy entries one Context has prepared for remap into its serving
+/// codebook's pages since the Context was created, counted once per entry as
+/// each bounded preparation step commits. Persisted, and carried across every
+/// switch phase transition; it counts preparation work, not the moment a
+/// prepared run's searchable root switches.
+pub fn legacy_entries_prepared_total(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> u64 {
+    unimplemented!("{UNBOUND}: cumulative legacy remap preparation")
 }
