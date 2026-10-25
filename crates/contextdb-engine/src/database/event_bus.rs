@@ -8078,8 +8078,9 @@ impl OwnedEventBusHandle {
                 if !current {
                     return Err(OriginalError::queue(queue_output, entry_id, false));
                 }
-                // Acquire every settlement lock before entering storage. The
-                // source claim fixes this generation while the physical write runs.
+                // Capture the publication frontier before entering storage.
+                // The source claim and commit boundary fix this generation;
+                // readers keep capturing the prior descriptor during the write.
                 let mut published = publication
                     .prepare_exact_root()
                     .map_err(|error| diagnostic.error(error))?;

@@ -119,51 +119,54 @@ pub struct PublishedRead {
 #[doc(hidden)]
 pub struct MaintenancePublication<'guard, S: WriteSetApplicator> {
     manager: &'guard TransactionManager<S>,
-    snapshot: SnapshotId,
-    lsn: Lsn,
+    frontier: (SnapshotId, Lsn),
     reservation: Option<Option<Box<dyn Any + Send>>>,
     completed: bool,
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-/// A prepaid maintenance descriptor swap. Its mutex is acquired before any
-/// storage mutation; completion only moves the successor and prior descriptor.
-/// The caller keeps this owner until its queue and counters have also settled.
+/// A prepaid maintenance descriptor swap borrowing its immutable frontier.
+/// Readers can capture the prior descriptor throughout storage work; completion
+/// takes the publication mutex only for the atomic swap. The caller keeps
+/// retirement ownership until its queue and counters have also settled.
 #[doc(hidden)]
 pub struct PreparedMaintenanceRead<'a> {
-    published: Option<MutexGuard<'a, EnginePublishedRead>>,
+    published: &'a Mutex<EnginePublishedRead>,
+    frontier: &'a (SnapshotId, Lsn),
     retired: Option<EnginePublishedRead>,
     preserve_failure: bool,
 }
 impl PreparedMaintenanceRead<'_> {
     pub fn snapshot(&self) -> SnapshotId {
-        self.published.as_ref().unwrap().snapshot
+        self.frontier.0
     }
     pub fn lsn(&self) -> Lsn {
-        self.published.as_ref().unwrap().lsn
+        self.frontier.1
     }
     pub fn preserve_failure(&mut self) {
         self.preserve_failure = true;
     }
     /// Hidden Native consumer: move the displaced handle to its operation's
-    /// external retirement phase. The existing frontier and lock stay here.
+    /// external retirement phase. Its immutable frontier stays here.
     #[doc(hidden)]
     pub fn take_retired_handle(&mut self) -> Option<CaptureHandle> {
         self.retired.take().and_then(|retired| retired.handle)
     }
     pub fn settle(&mut self, handle: CaptureHandle) {
-        let published = self.published.as_mut().unwrap();
         let next = EnginePublishedRead {
-            snapshot: published.snapshot,
-            lsn: published.lsn,
+            snapshot: self.frontier.0,
+            lsn: self.frontier.1,
             handle: Some(handle),
         };
-        self.retired = Some(std::mem::replace(&mut **published, next));
+        let retired = {
+            let mut published = self.published.lock();
+            std::mem::replace(&mut *published, next)
+        };
+        self.retired = Some(retired);
     }
 }
 impl Drop for PreparedMaintenanceRead<'_> {
     fn drop(&mut self) {
-        drop(self.published.take());
         let retired = self.retired.take();
         let already_failing = self.preserve_failure || std::thread::panicking();
         if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(retired)))
@@ -193,7 +196,8 @@ impl<S: WriteSetApplicator> MaintenancePublication<'_, S> {
             ));
         }
         Ok(PreparedMaintenanceRead {
-            published: Some(self.manager.published_read.lock()),
+            published: &self.manager.published_read,
+            frontier: &self.frontier,
             retired: None,
             preserve_failure: false,
         })
@@ -232,10 +236,12 @@ impl<S: WriteSetApplicator> MaintenancePublication<'_, S> {
             .reservation
             .take()
             .expect("maintenance publication requires its admitted reservation");
-        self.manager
-            .store
-            .complete_metadata_publication(reservation, self.snapshot, self.lsn);
-        self.manager.publish_read_snapshot(self.lsn, None);
+        self.manager.store.complete_metadata_publication(
+            reservation,
+            self.frontier.0,
+            self.frontier.1,
+        );
+        self.manager.publish_read_snapshot(self.frontier.1, None);
         self.completed = true;
     }
 }
@@ -1653,8 +1659,7 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         let (snapshot, lsn) = self.published_read_snapshot();
         let mut publication = MaintenancePublication {
             manager: self,
-            snapshot,
-            lsn,
+            frontier: (snapshot, lsn),
             reservation: None,
             completed: false,
             _same_thread: std::marker::PhantomData,

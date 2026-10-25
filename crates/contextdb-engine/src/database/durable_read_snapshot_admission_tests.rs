@@ -576,3 +576,63 @@ fn historical_vector_queries_refuse_damaged_companions_in_the_selected_root() {
         }
     }
 }
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn prepared_metadata_publication_keeps_bounded_vector_reads_and_cursors_available() {
+    use crate::executor::bounded_read_test_support as bounded;
+    use contextdb_core::read_contract::ReadLimits;
+
+    #[derive(Default)]
+    struct Registrations(std::sync::Mutex<Vec<SnapshotId>>);
+    impl bounded::ExecutionProbe for Registrations {
+        fn registered_snapshot_for_test(&self, snapshot: SnapshotId) {
+            self.0.lock().expect("registrations").push(snapshot);
+        }
+        fn before_work(&self, _: bounded::TestWorkSource, _: u64) {}
+        fn cancellation_observed(&self, _: u64) {}
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        Database::open_owned_for_test(
+            &directory.path().join("metadata.db"),
+            DatabaseOpenOptions {
+                maintenance_policy: MaintenancePolicy::CallerDriven,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    db.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding VECTOR(2) SEARCH_MODE EXACT) SYNC OFF", &HashMap::new()).unwrap();
+    db.execute("INSERT INTO vectors VALUES (1, '[1,0]')", &HashMap::new())
+        .unwrap();
+    let published = db.tx_mgr.published_read_snapshot();
+    let registrations = Arc::new(Registrations::default());
+    db.tx_mgr.with_maintenance_publication(|publication| {
+        // This is the actual guard acquired by native sink attempt/ack writes
+        // before they enter storage, held until their joint settlement ends.
+        let prepared = publication.prepare_exact_root()?;
+        assert_eq!((prepared.snapshot(), prepared.lsn()), published);
+        let reader = Arc::clone(&db);
+        let probe = Arc::clone(&registrations);
+        std::thread::spawn(move || {
+            let mut request = bounded::BoundedReadRequest::new(
+                "SELECT id FROM vectors ORDER BY embedding <=> $probe LIMIT 1",
+                HashMap::from([("probe".to_owned(), Value::Vector(vec![1.0, 0.0]))]),
+                ReadLimits::default(), Arc::new(ManualDeadlineClock::at(0)),
+            );
+            request.probe = Some(probe as Arc<dyn bounded::ExecutionProbe>);
+            let result = bounded::execute(&reader, &request).expect("bounded read during metadata preparation");
+            assert_eq!(result.result.rows(), vec![vec![Value::Int64(1)]]);
+            let cursor = bounded::open_cursor(reader, &request).expect("bounded cursor during metadata preparation");
+            assert_eq!(cursor.first_page.rows(), vec![vec![Value::Int64(1)]]);
+            assert!(!cursor.first_page.has_more());
+        }).join().expect("both reads finish while the metadata guard is still live");
+        assert_eq!((prepared.snapshot(), prepared.lsn()), published);
+        assert_eq!(*registrations.0.lock().unwrap(), vec![published.0, published.0]);
+        eprintln!("prepared metadata read receipt: snapshot {:?}, LSN {:?}; both bounded forms returned the committed row while the guard was live", published.0, published.1);
+        Ok(())
+    }).unwrap();
+    db.close()
+        .expect("close the native writer after both reads finish");
+}
