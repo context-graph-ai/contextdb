@@ -12,7 +12,8 @@
 //! the depth-20 and depth-50 runs, whose first ten answers are exact,
 //! qualify. Depth 50 meets the target at 50, yet LIMIT 21 and 30, which it
 //! serves, are uncovered, because its own answer misses the top of their
-//! rankings; LIMIT 45 is covered by the same route. An implementation that
+//! rankings; LIMIT 40, where that sample finds exactly 95%, and LIMIT 45
+//! are covered by the same route. An implementation that
 //! infers a shallow depth from a deeper run's prefix, or covers every k below
 //! a qualified depth, fails. On a partition whose receipt qualifies a depth
 //! below EXACT's work, AUTO takes the index there and for the LIMITs that
@@ -215,7 +216,10 @@ fn only_calibrated_depths_are_covered_each_by_its_own_run() {
     // The summary each executed depth-d route recorded at every k in
     // (previous depth, d]: one sample's depth-10 answer holds only its exact
     // top 8, and its depth-50 answer lacks its exact top 2, so that sample
-    // finds k - 2 of its top k at depth 50, below 95% for every k under 40.
+    // finds k - 2 of its top k at depth 50: below 95% for every k under 40,
+    // and exactly 95% at k = 40, which meets the target. Coverage is per k
+    // even where depth d itself misses: k = 6 to 8 are covered by the same
+    // depth-10 route that misses at 9 and 10.
     let prefixes = prefix_coverage(&db, "covered_items", "embedding", &[]);
     assert_eq!(
         prefixes.iter().map(|row| row.k).collect::<Vec<_>>(),
@@ -232,20 +236,17 @@ fn only_calibrated_depths_are_covered_each_by_its_own_run() {
             "LIMIT {} is summarised from the depth-{serving_depth} route that serves it",
             row.k
         );
-        let expected_below = match (row.depth, row.k) {
-            (10, 9..=10) | (50, 21..=39) => Some(1),
-            (50, 40) => None,
-            _ => Some(0),
+        let below = match (row.depth, row.k) {
+            (10, 9..=10) | (50, 21..=39) => 1,
+            _ => 0,
         };
-        if let Some(below) = expected_below {
-            assert_eq!(
-                (row.queries_below, row.covered),
-                (below, below == 0),
-                "the depth-{} route's own summary at k = {}: {row:?}",
-                row.depth,
-                row.k
-            );
-        }
+        assert_eq!(
+            (row.queries_below, row.covered),
+            (below, below == 0),
+            "the depth-{} route's own summary at k = {}: {row:?}",
+            row.depth,
+            row.k
+        );
     }
 
     for limit in [9, 10] {
@@ -270,7 +271,7 @@ fn only_calibrated_depths_are_covered_each_by_its_own_run() {
             "because it is above the largest calibrated depth",
         );
     }
-    for (limit, depth) in [(3, 5), (15, 20), (20, 20), (45, 50), (50, 50)] {
+    for (limit, depth) in [(3, 5), (15, 20), (20, 20), (40, 50), (45, 50), (50, 50)] {
         let (ids, indexed) = search(&db, "INDEXED", limit);
         assert_eq!(ids.len(), limit);
         assert_eq!(indexed.outcome, Some(SearchOutcome::Complete));

@@ -2,8 +2,10 @@
 //! `WITH (member = value, ...)`, on CREATE and ADD COLUMN, and changed with
 //! `ALTER TABLE t ALTER COLUMN c SET WITH (member = value, ...)` and
 //! `... RESET WITH (member, ...)`. Every value kind (integer, decimal,
-//! DEFAULT, a bracketed integer/decimal list, a table.column reference)
-//! renders canonically, members render in their fixed canonical order, the
+//! DEFAULT, a bracketed integer/decimal list, a table.column reference, and
+//! the quoted storage representation of the carrier's existing first member,
+//! `quantization`) renders canonically, members render in their fixed
+//! canonical order, a quantization-only column renders as it does today, the
 //! rendering is a fixpoint of parsing, DEFAULT declares nothing, an unknown
 //! member is a typed refusal naming it, and the declarations travel with
 //! synced DDL unchanged.
@@ -32,14 +34,14 @@ fn every_value_kind_renders_canonically_in_member_order_and_round_trips() {
     db.execute(QUESTIONS, &empty())
         .expect("declare the calibration questions");
     db.execute(
-        "CREATE TABLE carrier_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (training_seed = 0, refine_factors = [1, 4.50, 10, 20], write_buffer_bytes = DEFAULT, refine_growth = 2.50, calibration_queries = carrier_questions.embedding, calibration_max_k = 100))",
+        "CREATE TABLE carrier_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (training_seed = 0, refine_factors = [1, 4.50, 10, 20], write_buffer_bytes = DEFAULT, quantization = 'SQ8', refine_growth = 2.50, calibration_queries = carrier_questions.embedding, calibration_max_k = 100))",
         &empty(),
     )
     .expect("every value kind is accepted, in any member order");
     let declared = schema(&db, "carrier_items");
     assert!(
         declared.contains(
-            "WITH (calibration_max_k = 100, refine_factors = [1, 4.5, 10, 20], refine_growth = 2.5, calibration_queries = carrier_questions.embedding, training_seed = 0)"
+            "WITH (quantization = 'SQ8', calibration_max_k = 100, refine_factors = [1, 4.5, 10, 20], refine_growth = 2.5, calibration_queries = carrier_questions.embedding, training_seed = 0)"
         ),
         "members render in canonical order; decimals render without trailing zeros; the list \
          and the reference render as declared; zero is a valid seed; a DEFAULT member declares \
@@ -94,16 +96,32 @@ fn every_value_kind_renders_canonically_in_member_order_and_round_trips() {
         "ADD COLUMN renders its carrier: {}",
         schema(&db, "added_items")
     );
+
+    db.execute(
+        "CREATE TABLE quantized_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (quantization = 'SQ8'))",
+        &empty(),
+    )
+    .expect("a quantization-only carrier parses as it does today");
+    let quantized = schema(&db, "quantized_items");
+    assert!(
+        quantized.contains("embedding VECTOR(3) WITH (quantization = 'SQ8')"),
+        "a quantization-only column renders exactly as today: {quantized}"
+    );
+    assert_eq!(
+        quantized.matches("WITH (").count(),
+        1,
+        "a quantization-only column renders one carrier with one member: {quantized}"
+    );
 }
 
 #[test]
 fn set_with_and_reset_with_change_only_the_members_they_name() {
     let db = Database::open_memory();
     db.execute(
-        "CREATE TABLE policy_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (training_seed = 7, max_delta_runs = 3))",
+        "CREATE TABLE policy_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (training_seed = 7, quantization = 'SQ8', max_delta_runs = 3))",
         &empty(),
     )
-    .expect("declare two members");
+    .expect("declare three members");
     let alter = |sql: &str| {
         db.execute(sql, &empty())
             .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
@@ -112,31 +130,42 @@ fn set_with_and_reset_with_change_only_the_members_they_name() {
     let rendered =
         alter("ALTER TABLE policy_items ALTER COLUMN embedding SET WITH (training_seed = 0)");
     assert!(
-        rendered.contains("WITH (training_seed = 0, max_delta_runs = 3)"),
+        rendered.contains("WITH (quantization = 'SQ8', training_seed = 0, max_delta_runs = 3)"),
         "SET WITH changes the named member and keeps the other: {rendered}"
     );
     let rendered =
         alter("ALTER TABLE policy_items ALTER COLUMN embedding SET WITH (ingest_batch_keys = 32)");
     assert!(
-        rendered.contains("WITH (training_seed = 0, max_delta_runs = 3, ingest_batch_keys = 32)"),
+        rendered.contains(
+            "WITH (quantization = 'SQ8', training_seed = 0, max_delta_runs = 3, ingest_batch_keys = 32)",
+        ),
         "SET WITH adds a member in its canonical place: {rendered}"
     );
     let rendered = alter(
         "ALTER TABLE policy_items ALTER COLUMN embedding SET WITH (max_delta_runs = DEFAULT)",
     );
     assert!(
-        rendered.contains("WITH (training_seed = 0, ingest_batch_keys = 32)")
+        rendered.contains("WITH (quantization = 'SQ8', training_seed = 0, ingest_batch_keys = 32)")
             && !rendered.contains("max_delta_runs"),
         "SET WITH (member = DEFAULT) clears only that member: {rendered}"
     );
     let rendered =
         alter("ALTER TABLE policy_items ALTER COLUMN embedding RESET WITH (training_seed)");
     assert!(
-        rendered.contains("WITH (ingest_batch_keys = 32)") && !rendered.contains("training_seed"),
+        rendered.contains("WITH (quantization = 'SQ8', ingest_batch_keys = 32)")
+            && !rendered.contains("training_seed"),
         "RESET WITH clears the named member: {rendered}"
     );
     let rendered =
         alter("ALTER TABLE policy_items ALTER COLUMN embedding RESET WITH (ingest_batch_keys)");
+    assert!(
+        rendered.contains("embedding VECTOR(3) WITH (quantization = 'SQ8')")
+            && rendered.matches("WITH (").count() == 1
+            && !rendered.contains("ingest_batch_keys"),
+        "resetting the engineering members leaves exactly today's quantization carrier: {rendered}"
+    );
+    let rendered =
+        alter("ALTER TABLE policy_items ALTER COLUMN embedding RESET WITH (quantization)");
     assert!(
         !rendered.contains("WITH ("),
         "resetting the last member leaves no carrier: {rendered}"
@@ -211,7 +240,7 @@ async fn with_declarations_travel_with_synced_ddl() {
         .expect("declare the source questions");
     source
         .execute(
-            "CREATE TABLE carrier_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (calibration_depths = [1, 10, 50], centroid_memory_fraction = 0.06, calibration_queries = carrier_questions.embedding, training_seed = 0, max_delta_runs = 3)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+            "CREATE TABLE carrier_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (calibration_depths = [1, 10, 50], centroid_memory_fraction = 0.06, calibration_queries = carrier_questions.embedding, training_seed = 0, quantization = 'SQ4', max_delta_runs = 3)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
             &empty(),
         )
         .expect("declare the source column with its carrier");
@@ -251,7 +280,7 @@ async fn with_declarations_travel_with_synced_ddl() {
     );
     assert!(
         schema(&edge, "carrier_items").contains(
-            "WITH (calibration_depths = [1, 10, 50], calibration_queries = carrier_questions.embedding, centroid_memory_fraction = 0.06, training_seed = 0, max_delta_runs = 3)"
+            "WITH (quantization = 'SQ4', calibration_depths = [1, 10, 50], calibration_queries = carrier_questions.embedding, centroid_memory_fraction = 0.06, training_seed = 0, max_delta_runs = 3)"
         ),
         "the transported carrier renders canonically: {}",
         schema(&edge, "carrier_items")
