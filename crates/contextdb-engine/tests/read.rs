@@ -46,6 +46,9 @@ mod a_received_table_replacement_retires_every_content_identity;
 #[path = "read/a_reopened_store_never_reuses_a_committed_transaction.rs"]
 mod a_reopened_store_never_reuses_a_committed_transaction;
 #[cfg(unix)]
+#[path = "read/a_session_reselecting_after_a_reopen_is_served_when_the_new_writer_wins.rs"]
+mod a_session_reselecting_after_a_reopen_is_served_when_the_new_writer_wins;
+#[cfg(unix)]
 #[path = "read/a_statement_on_the_file_route_costs_what_the_statement_costs.rs"]
 mod a_statement_on_the_file_route_costs_what_the_statement_costs;
 #[path = "read/an_erasure_invalidates_exactly_the_snapshots_older_than_it.rs"]
