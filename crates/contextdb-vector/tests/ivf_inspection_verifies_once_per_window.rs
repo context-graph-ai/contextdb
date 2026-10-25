@@ -4,8 +4,8 @@
 //! codebook and directories once and reports the live verdict, labelled
 //! unrecorded until a maintenance call persists it; a second inspection
 //! within the same admitted manifest window reads no codebook or directory
-//! page; after that window is evicted one re-verification is allowed and no
-//! more; once maintenance has recorded the verdict, inspection reports it as
+//! page; after that window is evicted the next inspection re-verifies exactly
+//! once and reports the live verdict; once maintenance has recorded the verdict, inspection reports it as
 //! recorded.
 #[path = "support/ivf_pages.rs"]
 mod ivf_pages;
@@ -82,7 +82,8 @@ fn inspect(store: &ivf_pages::Pages) -> (CatalogState, bool) {
 #[test]
 fn a_healthy_partition_is_verified_at_most_once_per_admitted_window() {
     let store = built();
-    let (first, _) = inspect(&store);
+    let (first, verified) = inspect(&store);
+    assert!(verified, "a cache miss verifies the derived pages");
     assert_eq!(
         first.recovery_action, None,
         "a healthy partition shows no recovery action"
@@ -94,7 +95,8 @@ fn a_healthy_partition_is_verified_at_most_once_per_admitted_window() {
         "a second inspection in the same window reads no codebook or directory page"
     );
     evict_manifest_window(&store);
-    let (after_eviction, _) = inspect(&store);
+    let (after_eviction, verified) = inspect(&store);
+    assert!(verified, "the first inspection after eviction re-verifies");
     assert_eq!(
         after_eviction, first,
         "re-verification after eviction agrees"
@@ -138,7 +140,8 @@ fn unrecorded_damage_is_reported_live_and_once_recorded_is_reported_recorded() {
     );
 
     evict_manifest_window(&store);
-    let (after_eviction, _) = inspect(&store);
+    let (after_eviction, verified) = inspect(&store);
+    assert!(verified, "the first inspection after eviction re-verifies");
     assert_eq!(
         (
             after_eviction.recovery_action,

@@ -215,11 +215,13 @@ fn plant_examined(store: &mut impl PageStore, examined: u64) {
     write_page(store, key, &page);
 }
 
+/// The persisted verdict: `None` unless a writer path has recorded it.
 fn recorded(store: &impl ReadPages, cap: u64) -> Option<PageKey> {
     inspect_catalog(store, 0, cap)
         .unwrap()
         .unwrap()
         .unserviceable
+        .filter(|_| persisted(store, cap))
 }
 
 /// Drives remap and coalescing calls, which may report the damage or
@@ -269,6 +271,13 @@ fn recover_to_state_c_and_rebuild(
             "{when}: {mode:?} serves every committed row after the rebuild"
         );
     }
+}
+
+fn persisted(store: &impl ReadPages, cap: u64) -> bool {
+    inspect_catalog(store, 0, cap)
+        .unwrap()
+        .unwrap()
+        .verdict_recorded
 }
 
 #[test]
@@ -333,10 +342,11 @@ fn a_damaged_used_count_on_the_prepared_runs_tail_is_reported_and_recovered() {
     assert_eq!(
         (
             state.recovery_action,
-            state.unserviceable.map(|key| key.kind)
+            state.unserviceable.map(|key| key.kind),
+            state.verdict_recorded
         ),
-        (Some("rebuild"), Some(PageKind::ListUsed)),
-        "the damage is recorded, naming the used-count page: {state:?}"
+        (Some("rebuild"), Some(PageKind::ListUsed), true),
+        "the damage is persisted, naming the used-count page: {state:?}"
     );
     recover_to_state_c_and_rebuild(&mut index, &budget, cap, LATE.end, "prepared-run damage");
 }
@@ -358,7 +368,7 @@ fn the_first_recorded_verdict_is_never_replaced_by_a_later_one() {
     assert_eq!(
         first.map(|key| key.kind),
         Some(PageKind::Codebook),
-        "fixture: the seal recorded the codebook verdict"
+        "fixture: the seal persisted the codebook verdict"
     );
     let mut store = index.into_storage();
     plant_examined(&mut store, 1_000_000);
@@ -370,7 +380,7 @@ fn the_first_recorded_verdict_is_never_replaced_by_a_later_one() {
     assert_eq!(
         recorded(index.storage(), cap),
         first,
-        "the first verdict is kept, not replaced by the cursor's"
+        "the first persisted verdict is kept, not replaced by the cursor's"
     );
     assert_eq!(
         inspect_catalog(index.storage(), 0, cap)
@@ -424,7 +434,11 @@ fn a_mismatched_cursor_while_joining_is_corruption_never_a_legacy_slot() {
             .unwrap()
             .recovery_action,
         Some("rebuild"),
-        "the damaged join cursor is recorded"
+        "the damaged join cursor shows the rebuild action"
+    );
+    assert!(
+        persisted(index.storage(), cap),
+        "the damaged join cursor's verdict is persisted"
     );
     recover_to_state_c_and_rebuild(&mut index, &budget, cap, next, "join-cursor damage");
 }
