@@ -134,8 +134,12 @@ fn bounded_cycle(db: &Database, stage: &str) {
 
 /// The legacy members recomputed from the actual delta entries: the
 /// (primary key, commit LSN) of every entry with commit LSN in (F0, F1].
-fn legacy_members(db: &Database, legacy: &LegacyEntries) -> BTreeSet<(i64, u64)> {
-    delta_entries(db, "switch_items", "embedding", &[])
+/// Before deduplicating, it checks that the raw selected entries, and their
+/// distinct (key, version) pairs, are each exactly one per row the test
+/// committed while the replacement trained, and that their keys are exactly
+/// those rows.
+fn legacy_members(db: &Database, legacy: &LegacyEntries, stage: &str) -> BTreeSet<(i64, u64)> {
+    let selected = delta_entries(db, "switch_items", "embedding", &[])
         .into_iter()
         .filter(|entry| {
             entry.commit_lsn > legacy.after_lsn && entry.commit_lsn <= legacy.through_lsn
@@ -144,7 +148,26 @@ fn legacy_members(db: &Database, legacy: &LegacyEntries) -> BTreeSet<(i64, u64)>
             Value::Int64(id) => (id, entry.commit_lsn),
             other => panic!("the primary key is an integer, got {other:?}"),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let members = selected.iter().copied().collect::<BTreeSet<_>>();
+    let rows = LEGACY.count();
+    assert_eq!(
+        selected.len(),
+        rows,
+        "{stage}: the raw entries in (F0, F1] are exactly one per legacy row version: {selected:?}"
+    );
+    assert_eq!(
+        members.len(),
+        rows,
+        "{stage}: the entries in (F0, F1] are distinct (key, version) pairs, one per legacy row: \
+         {selected:?}"
+    );
+    assert_eq!(
+        members.iter().map(|(id, _)| *id).collect::<BTreeSet<_>>(),
+        LEGACY.collect::<BTreeSet<_>>(),
+        "{stage}: the entries in (F0, F1] hold exactly the rows committed while the replacement trained"
+    );
+    members
 }
 
 struct SwitchFixture {
@@ -202,12 +225,7 @@ fn reach_state_b(db: &Database) -> SwitchFixture {
         legacy.after_lsn < legacy.through_lsn,
         "the legacy frontier is a non-empty LSN window: {legacy:?}"
     );
-    let members = legacy_members(db, &legacy);
-    assert_eq!(
-        members.iter().map(|(id, _)| *id).collect::<BTreeSet<_>>(),
-        LEGACY.collect::<BTreeSet<_>>(),
-        "the legacy membership is exactly the rows committed while the replacement trained"
-    );
+    let members = legacy_members(db, &legacy, "at the publication commit");
     assert_eq!(
         members.len() as u64,
         legacy.entries,
@@ -239,7 +257,7 @@ fn reach_state_b(db: &Database) -> SwitchFixture {
 /// membership captured at the publication commit.
 fn assert_legacy_membership(db: &Database, fixture: &SwitchFixture, stage: &str) {
     assert_eq!(
-        legacy_members(db, &fixture.legacy),
+        legacy_members(db, &fixture.legacy, stage),
         fixture.members,
         "{stage}: the entries in (F0, F1] are exactly the legacy members captured at F1"
     );
