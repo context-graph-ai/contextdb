@@ -2344,7 +2344,7 @@ impl ReadSession {
         };
         let selected = select_route_with_ownership_retry(
             &owner.path,
-            &self.options,
+            &self.options(),
             Some(&owner.runtime_dir),
             self.requirement,
             &self.resources,
