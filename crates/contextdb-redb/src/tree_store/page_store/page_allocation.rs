@@ -54,6 +54,9 @@ impl CacheCounter {
         (self.block.as_ptr() as usize, self.load(Ordering::SeqCst))
     }
 
+    pub(super) fn has_fixed_reserve(&self) -> bool {
+        unsafe { self.block.as_ref() }.reserve.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
     pub(super) fn layout() -> Layout {
         Layout::new::<CounterBlock>()
     }
@@ -163,11 +166,7 @@ impl CachePayment {
         self.counter.block == counter.block
     }
     fn has_fixed_reserve(&self) -> bool {
-        unsafe { self.counter.block.as_ref() }
-            .reserve
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        self.counter.has_fixed_reserve()
     }
 }
 impl Drop for CachePayment {
@@ -198,9 +197,15 @@ struct PageBlock {
     owners: AtomicUsize,
     #[cfg(feature = "contextdb-internal")]
     request: u64,
-    len: usize,
+    // A valid allocation Layout cannot reach isize::MAX bytes. Its unused
+    // high length bit records native construction without growing the header.
+    len_and_origin: usize,
     checksum: Mutex<Option<u128>>,
     payer: Mutex<Option<PagePayer>>,
+}
+
+impl PageBlock {
+    fn len(&self) -> usize { self.len_and_origin & (isize::MAX as usize) }
 }
 
 /// Exactly one allocation: reference control, checksum, payer and inline bytes.
@@ -234,6 +239,24 @@ impl PageAllocation {
             charge.map_or(PagePayer::Unscoped, PagePayer::Source),
         )
     }
+    #[cfg(feature = "contextdb-internal")]
+    pub(super) fn zeroed_native(len: usize) -> std::result::Result<Self, crate::NativeColdReadError> {
+        use crate::native_storage_admission::{NativeColdFault, NativeColdReadError, admit_native_storage};
+        let (layout, _) = Self::layout(len).map_err(|_| NativeColdReadError::Corrupt(
+            NativeColdFault::new("native page layout overflow")))?;
+        let credit = admit_native_storage(layout)?;
+        let mut page = Self::zeroed(len, Some(ReadMemoryCharge::Native(credit.into_page_charge())))
+            .map_err(|error| match error {
+                StorageError::Native(error) => error,
+                _ => unreachable!("checked native page layout"),
+            })?;
+        // The unique, unpublished allocation was paid by the native producer.
+        unsafe { page.block.as_mut() }.len_and_origin |= !(isize::MAX as usize);
+        Ok(page)
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub(super) fn is_native(&self) -> bool { (unsafe { self.block.as_ref() }.len_and_origin & !(isize::MAX as usize)) != 0 }
+
     fn allocate(len: usize, layout: Layout, offset: usize, payer: PagePayer) -> Result<Self> {
         let Some(block) = NonNull::new(unsafe { alloc(layout) }.cast::<PageBlock>()) else {
             return Err(allocation_failed("cache page allocation", layout));
@@ -244,7 +267,7 @@ impl PageAllocation {
                 owners: AtomicUsize::new(1),
                 #[cfg(feature = "contextdb-internal")]
                 request: crate::read_admission::cache_request(),
-                len,
+                len_and_origin: len,
                 checksum: Mutex::new(None),
                 payer: Mutex::new(Some(payer)),
             });
@@ -361,16 +384,16 @@ impl PageAllocation {
         }
         let block = unsafe { this.block.as_mut() };
         *block.checksum.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
-        let (_, offset) = Self::layout(block.len).expect("live page has a valid Layout");
+        let (_, offset) = Self::layout(block.len()).expect("live page has a valid Layout");
         Some(unsafe {
-            std::slice::from_raw_parts_mut(this.block.as_ptr().cast::<u8>().add(offset), block.len)
+            std::slice::from_raw_parts_mut(this.block.as_ptr().cast::<u8>().add(offset), block.len())
         })
     }
 }
 impl Deref for PageAllocation {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        let len = unsafe { self.block.as_ref() }.len;
+        let len = unsafe { self.block.as_ref() }.len();
         let (_, offset) = Self::layout(len).expect("live page has a valid Layout");
         unsafe { std::slice::from_raw_parts(self.block.as_ptr().cast::<u8>().add(offset), len) }
     }
@@ -404,7 +427,7 @@ impl Drop for PageAllocation {
         }
         fence(Ordering::Acquire);
         let block = unsafe { self.block.as_mut() };
-        let (layout, _) = Self::layout(block.len).expect("live page has a valid Layout");
+        let (layout, _) = Self::layout(block.len()).expect("live page has a valid Layout");
         let payer = block
             .payer
             .get_mut()

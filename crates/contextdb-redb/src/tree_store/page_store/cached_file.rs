@@ -4,7 +4,6 @@ use crate::tree_store::page_store::lru_cache::{EntryArena, LRUCache, WriteCache}
 use crate::{CacheStats, DatabaseError, Result, StorageError};
 use std::ops::{Index, IndexMut};
 use std::slice::SliceIndex;
-#[cfg(feature = "cache_metrics")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
@@ -21,11 +20,7 @@ pub(crate) enum PageMemory {
     // unqualified; the variant itself is never proof of external funding.
     Plain(PageAllocation),
     #[cfg(feature = "contextdb-internal")]
-    Native(
-        crate::native_storage_admission::NativeStorageShared<
-            crate::native_storage_admission::NativePagePayload,
-        >,
-    ),
+    Native(PageAllocation),
 }
 
 // Private representation names retained for source-adoption diagnostics.
@@ -51,6 +46,16 @@ thread_local! {
 }
 
 impl PageMemory {
+    fn allocation(&self) -> &PageAllocation {
+        match self {
+            Self::Cached(page) | Self::Charged(page) | Self::Plain(page) => page,
+            #[cfg(feature = "contextdb-internal")]
+            Self::Native(page) => page,
+        }
+    }
+    pub(crate) fn same_backing(&self, other: &Self) -> bool {
+        PageAllocation::ptr_eq(self.allocation(), other.allocation())
+    }
     #[cfg(all(test, feature = "contextdb-internal"))]
     pub(crate) fn admitted_bytes_for_test(len: usize) -> usize {
         admitted_page_bytes(len)
@@ -73,7 +78,7 @@ impl PageMemory {
             Self::Cached(page) => page.checksum(),
             Self::Charged(page) => page.checksum(),
             #[cfg(feature = "contextdb-internal")]
-            Self::Native(page) => &page.get().checksum,
+            Self::Native(page) => page.checksum(),
             Self::Plain(_) => {
                 #[cfg(test)]
                 BYTE_CHECKSUM_COUNTS.with(|counts| {
@@ -119,7 +124,7 @@ impl std::fmt::Debug for PageMemory {
             PageMemory::Charged(page) => ("charged", page.len()),
             PageMemory::Plain(bytes) => ("plain", bytes.len()),
             #[cfg(feature = "contextdb-internal")]
-            PageMemory::Native(page) => ("native", page.get().bytes.as_slice().len()),
+            PageMemory::Native(page) => ("native", page.len()),
         };
         write!(f, "PageMemory({kind}, {len} bytes)")
     }
@@ -134,7 +139,7 @@ impl std::ops::Deref for PageMemory {
             PageMemory::Charged(page) => page,
             PageMemory::Plain(bytes) => bytes,
             #[cfg(feature = "contextdb-internal")]
-            PageMemory::Native(page) => page.get().bytes.as_slice(),
+            PageMemory::Native(page) => page,
         }
     }
 }
@@ -329,7 +334,11 @@ impl CheckedBackend {
     }
 }
 
+static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(super) struct PagedCachedFile {
+    file_id: u64,
+    cache_epoch: AtomicU64,
     file: CheckedBackend,
     page_size: u64,
     // Dynamic cache partitioning.  Three invariants:
@@ -483,6 +492,8 @@ impl PagedCachedFile {
 
         Ok(Self {
             file: CheckedBackend::new(file),
+            file_id: NEXT_FILE_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1)).expect("cache file identity exhausted"),
+            cache_epoch: AtomicU64::new(0),
             page_size,
             read_cache_bytes,
             write_buffer_bytes,
@@ -707,13 +718,14 @@ impl PagedCachedFile {
         _write_lock: &MutexGuard<'_, LRUWriteCache>,
     ) {
         let num_stripes = self.read_cache.len();
-        let start = self.next_eviction_stripe.fetch_add(1, Ordering::Relaxed) % num_stripes;
+        let start = self.next_eviction_stripe.load(Ordering::Relaxed) % num_stripes;
         let mut freed = 0;
         for i in 0..num_stripes {
             if freed >= bytes_needed {
                 break;
             }
             let stripe = (start + i) % num_stripes;
+            self.next_eviction_stripe.store((stripe + 1) % num_stripes, Ordering::Relaxed);
             let mut lock = self.read_cache[stripe].write().unwrap();
             while freed < bytes_needed {
                 if let Some((_, v)) =
@@ -804,6 +816,7 @@ impl PagedCachedFile {
     }
 
     fn invalidate_cache_beyond(&self, len: u64) {
+        self.advance_cache_epoch();
         for stripe in &self.read_cache {
             let mut lock = stripe.write().unwrap();
             loop {
@@ -863,6 +876,28 @@ impl PagedCachedFile {
         Ok(page)
     }
 
+    fn shared_page_bytes(&self, page: &PageMemory) -> usize {
+        if page.allocation().counted_by(&self.read_cache_bytes) { cached_page_bytes(page.len()) } else { 0 }
+    }
+    fn scan_has_pinned_shared_cache(&self, scan: &crate::read_admission::ScanAllowance, key: crate::scan_cache::ScanKey, len: usize) -> bool {
+        let read = self.read_cache_bytes.load(Ordering::Acquire);
+        let write = self.write_buffer_bytes.load(Ordering::Acquire);
+        // Every byte counted here has a real page holder in this operation.
+        // Such holders cannot become evictable before this scope releases.
+        // This avoids a full unsuccessful victim walk on every later miss.
+        scan.pinned_shared_bytes(key) >= read && read.saturating_add(write)
+            .saturating_add(cached_page_bytes(len)) > self.max_cache_size.load(Ordering::Acquire)
+    }
+    fn scan_key(&self, offset: u64, len: usize, native: bool) -> crate::scan_cache::ScanKey {
+        let epoch = self.cache_epoch.load(Ordering::Acquire);
+        crate::scan_cache::ScanKey([self.file_id, epoch * 2 + u64::from(native), offset, len as u64])
+    }
+    fn advance_cache_epoch(&self) {
+        self.cache_epoch.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |epoch| epoch.checked_add(1).filter(|next| *next <= u64::MAX / 2))
+            .expect("cache mutation identity exhausted");
+    }
+
     // Read with caching. Caller must not read overlapping ranges without first calling invalidate_cache().
     // Doing so will not cause UB, but is a logic error.
     pub(super) fn read(&self, offset: u64, len: usize, hint: PageHint) -> Result<PageMemory> {
@@ -880,21 +915,47 @@ impl PagedCachedFile {
             }
         }
 
+        let working_set = crate::read_admission::scan_working_set();
+        let key = self.scan_key(offset, len, false);
+        if let Some(scan) = &working_set {
+            if let Some(page) = scan.cached_page(key) { return Ok(page); }
+            scan.reserve_page()?;
+        }
         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
-        {
+        let cached = {
             let read_lock = self.read_cache[cache_slot].read().unwrap();
-            if let Some(cached) = read_lock.get(offset) {
-                #[cfg(feature = "cache_metrics")]
-                self.reads_hits.fetch_add(1, Ordering::Release);
-                debug_assert_eq!(cached.len(), len);
-                return Ok(PageMemory::Cached(cached.clone()));
+            let cached = read_lock.get(offset).map(|page| page.clone());
+            cached
+        };
+        if let Some(cached) = cached {
+            #[cfg(feature = "cache_metrics")]
+            self.reads_hits.fetch_add(1, Ordering::Release);
+            debug_assert_eq!(cached.len(), len);
+            let page = PageMemory::Cached(cached);
+            if let Some(scan) = &working_set {
+                scan.cache_page(key, page.clone(), self.shared_page_bytes(&page))?;
             }
+            return Ok(page);
         }
 
         let buffer = self.read_direct_into_page(offset, len)?;
-        let page_bytes = cached_page_bytes(len);
+        if let Some(scan) = &working_set {
+            // The cache retains the same original source invoice until a genuine
+            // fixed reserve takes it over or the final physical page is freed.
+            let page = if !self.scan_has_pinned_shared_cache(scan, key, len) {
+                self.cache_loaded_page(offset, len, buffer, false)?
+            } else { Self::uncached(buffer) };
+            scan.cache_page(key, page.clone(), self.shared_page_bytes(&page))?;
+            return Ok(page);
+        }
         let scan_replace = crate::read_admission::scan_reads_active()
-            && !crate::read_admission::take_scan_growth(page_bytes);
+            && !crate::read_admission::take_scan_growth(cached_page_bytes(len));
+        self.cache_loaded_page(offset, len, buffer, scan_replace)
+    }
+
+    fn cache_loaded_page(&self, offset: u64, len: usize, buffer: PageAllocation, scan_replace: bool) -> Result<PageMemory> {
+        let page_bytes = cached_page_bytes(len);
+        let cache_slot = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
         if scan_replace {
             let before = self.read_cache_bytes.load(Ordering::Acquire);
             {
@@ -1016,6 +1077,7 @@ impl PagedCachedFile {
     //
     // NOTE: Invalidating a cached region in subsections is permitted, as long as all subsections are invalidated
     pub(super) fn invalidate_cache(&self, offset: u64, len: usize) {
+        self.advance_cache_epoch();
         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
         let mut lock = self.read_cache[cache_slot].write().unwrap();
         if let Some(removed) = lock.remove(offset) {
@@ -1047,6 +1109,7 @@ impl PagedCachedFile {
     }
 
     pub(super) fn invalidate_cache_all(&self) {
+        self.advance_cache_epoch();
         for cache_slot in 0..self.read_cache.len() {
             let mut lock = self.read_cache[cache_slot].write().unwrap();
             while lock.pop_lowest_priority().is_some() {}
@@ -1098,6 +1161,7 @@ impl PagedCachedFile {
 
     // If overwrite is true, the page is initialized to zero.
     pub(super) fn write(&self, offset: u64, len: usize, overwrite: bool) -> Result<WritablePage> {
+        self.advance_cache_epoch();
         assert_eq!(0, offset % self.page_size);
         // Reject an impossible complete Layout before reserving or unlinking.
         PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
@@ -1188,66 +1252,63 @@ impl PagedCachedFile {
 
 #[cfg(feature = "contextdb-internal")]
 impl PagedCachedFile {
-    /// A paid native page copies an original clean warm-cache hit; it never
-    /// borrows or adopts a legacy cell and never probes the write buffer.
+    /// Native clean reads share only natively constructed immutable pages.
+    /// A legacy hit is copied under the original native admission before it
+    /// enters that cache; no opaque legacy receipt is certified as native.
     pub(super) fn read_native_clean_miss(
-        &self,
-        offset: u64,
-        len: usize,
+        &self, offset: u64, len: usize,
     ) -> std::result::Result<PageMemory, crate::NativeColdReadError> {
-        use crate::native_storage_admission::{
-            NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer,
-            NativeStorageShared,
-        };
+        use crate::native_storage_admission::{NativeColdFault, NativeColdReadError};
         if !crate::native_storage_admission::native_storage_active() {
             return Err(NativeColdReadError::AdmissionRefused);
         }
         if self.file.io_failed.load(Ordering::Acquire) {
             return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
-                "native read requires an available backend",
-            )));
+                "native read requires an available backend")));
         }
-        // Admit both owners on the original scope before taking a cache lock.
-        let bytes = NativeStorageBuffer::zeroed(len)?;
-        let mut page = NativeStorageShared::new(NativePagePayload {
-            bytes,
-            checksum: Mutex::new(None),
-        })?;
-        let stripe =
-            usize::try_from(offset % Self::lock_stripes()).expect("stripe index fits usize");
-        {
-            let cache = self.read_cache[stripe].read().unwrap();
-            if let Some(cell) = cache.get(offset) {
-                if cell.len() != len {
-                    let mut fault = NativeColdFault::new(
-                        "native cache page length does not match the requested extent",
-                    );
-                    fault.expected = len as u128;
-                    fault.actual = cell.len() as u128;
-                    return Err(NativeColdReadError::Corrupt(fault));
-                }
-                page.get_mut()
-                    .expect("unpublished native page is unique")
-                    .bytes
-                    .as_mut_slice()
-                    .copy_from_slice(&cell);
-                return Ok(PageMemory::Native(page));
+        let working_set = crate::read_admission::native_scan_working_set();
+        let key = self.scan_key(offset, len, true);
+        if let Some(scan) = &working_set {
+            if let Some(page) = scan.cached_page(key) { return Ok(page); }
+            scan.reserve_native_page()?;
+        }
+        let stripe = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
+        let cached = self.read_cache[stripe].read().unwrap().get(offset).map(|page| page.clone());
+        if let Some(cached) = &cached {
+            if cached.len() != len {
+                let mut fault = NativeColdFault::new("native cache page length does not match the requested extent");
+                fault.expected = len as u128; fault.actual = cached.len() as u128;
+                return Err(NativeColdReadError::Corrupt(fault));
+            }
+            if cached.is_native() {
+                let page = PageMemory::Native(cached.clone());
+                if let Some(scan) = &working_set { scan.cache_native_page(key, page.clone(), self.shared_page_bytes(&page))?; }
+                return Ok(page);
             }
         }
-        // Every page allocation and its receipt is admitted before backend I/O.
-        let result = self.file.file.read_cause(
-            offset,
-            page.get_mut()
-                .expect("unpublished native page is unique")
-                .bytes
-                .as_mut_slice(),
-        );
-        if let Err(error) = result {
-            self.file.io_failed.store(true, Ordering::Release);
-            return Err(error.into_native());
+        let mut page = PageAllocation::zeroed_native(len)?;
+        let output = PageAllocation::get_mut(&mut page).expect("unpublished native page is unique");
+        if let Some(cached) = cached { output.copy_from_slice(&cached); }
+        else {
+            if let Err(error) = self.file.file.read_cause(offset, output) {
+                self.file.io_failed.store(true, Ordering::Release);
+                return Err(error.into_native());
+            }
+            crate::read_admission::record_backend_read(len);
         }
-        crate::read_admission::record_backend_read(len);
-        Ok(PageMemory::Native(page))
+        // The shared cache takes custody under its actual fixed reserve; if
+        // it cannot, the page keeps its genuine original source invoice.
+        let page = if working_set.as_ref().is_some_and(|scan| self.scan_has_pinned_shared_cache(scan, key, len)) {
+            Self::uncached(page)
+        } else {
+            self.cache_loaded_page(offset, len, page, false)
+                .map_err(crate::read_admission::ScanAllowance::native_index_error)?
+        };
+        let page = match page {
+            PageMemory::Cached(page) | PageMemory::Charged(page) | PageMemory::Plain(page) | PageMemory::Native(page) => PageMemory::Native(page),
+        };
+        if let Some(scan) = &working_set { scan.cache_native_page(key, page.clone(), self.shared_page_bytes(&page))?; }
+        Ok(page)
     }
 
     /// Copy the sealed write's unflushed bytes before consulting clean storage.
@@ -1258,15 +1319,8 @@ impl PagedCachedFile {
         offset: u64,
         len: usize,
     ) -> std::result::Result<PageMemory, crate::PreparedReadError> {
-        use crate::native_storage_admission::{
-            NativeColdFault, NativeColdReadError, NativePagePayload, NativeStorageBuffer,
-            NativeStorageShared,
-        };
-        let bytes = NativeStorageBuffer::zeroed(len)?;
-        let mut page = NativeStorageShared::new(NativePagePayload {
-            bytes,
-            checksum: Mutex::new(None),
-        })?;
+        use crate::native_storage_admission::{NativeColdFault, NativeColdReadError};
+        let mut page = PageAllocation::zeroed_native(len)?;
         {
             let write = self.write_buffer.lock().unwrap();
             if let Some(bytes) = write.get(offset) {
@@ -1278,10 +1332,8 @@ impl PagedCachedFile {
                     fault.actual = bytes.len() as u128;
                     return Err(NativeColdReadError::Corrupt(fault).into());
                 }
-                page.get_mut()
+                PageAllocation::get_mut(&mut page)
                     .expect("unpublished native page is unique")
-                    .bytes
-                    .as_mut_slice()
                     .copy_from_slice(bytes);
                 return Ok(PageMemory::Native(page));
             }
@@ -1298,10 +1350,8 @@ impl PagedCachedFile {
                     fault.actual = cell.len() as u128;
                     return Err(NativeColdReadError::Corrupt(fault).into());
                 }
-                page.get_mut()
+                PageAllocation::get_mut(&mut page)
                     .expect("unpublished native page is unique")
-                    .bytes
-                    .as_mut_slice()
                     .copy_from_slice(&cell);
                 return Ok(PageMemory::Native(page));
             }
@@ -1310,10 +1360,8 @@ impl PagedCachedFile {
         // read observer; a prepared read must not invent a corruption instead.
         self.file.read(
             offset,
-            page.get_mut()
-                .expect("unpublished native page is unique")
-                .bytes
-                .as_mut_slice(),
+            PageAllocation::get_mut(&mut page)
+                .expect("unpublished native page is unique"),
         )?;
         Ok(PageMemory::Native(page))
     }
@@ -1377,7 +1425,7 @@ mod test {
     }
 
     #[test]
-    fn scan_reads_grow_the_cache_only_within_their_allowance() {
+    fn unscoped_scan_reads_use_only_their_shared_cache_allowance() {
         let backend = InMemoryBackend::new();
         backend.set_len(1024).unwrap();
         let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();

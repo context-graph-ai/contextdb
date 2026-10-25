@@ -21,7 +21,28 @@ pub struct NativeStorageCredit {
 }
 unsafe impl Send for NativeStorageCredit {}
 unsafe impl Sync for NativeStorageCredit {}
+// A page has a single original invoice owner; its own strong page handles
+// provide sharing. Retain is therefore unnecessary in this moved receipt.
+#[cfg(feature = "contextdb-internal")]
+pub(crate) struct NativePageCharge {
+    receipt: NonNull<()>,
+    finish: unsafe fn(NonNull<()>),
+}
+#[cfg(feature = "contextdb-internal")]
+unsafe impl Send for NativePageCharge {}
+#[cfg(feature = "contextdb-internal")]
+unsafe impl Sync for NativePageCharge {}
+#[cfg(feature = "contextdb-internal")]
+impl Drop for NativePageCharge {
+    fn drop(&mut self) { unsafe { (self.finish)(self.receipt) }; }
+}
 impl NativeStorageCredit {
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn into_page_charge(self) -> NativePageCharge {
+        let credit = ManuallyDrop::new(self);
+        NativePageCharge { receipt: credit.receipt, finish: credit.finish }
+    }
+
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn identity_for_test(&self) -> usize { self.receipt.as_ptr() as usize }
@@ -477,10 +498,6 @@ impl<T> Drop for NativeStorageShared<T> {
         };
         unsafe { ManuallyDrop::drop(&mut block.payload) };
     }
-}
-pub(crate) struct NativePagePayload {
-    pub(crate) bytes: NativeStorageBuffer<u8>,
-    pub(crate) checksum: Mutex<Option<u128>>,
 }
 
 // One physical hash-table allocation, including its original invoice header.

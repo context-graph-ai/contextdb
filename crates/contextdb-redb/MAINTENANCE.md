@@ -114,8 +114,8 @@ the same active node without allocation. Last-guard release unlinks the exact
 node, including an interior node, before physical free. Fallible native creation
 and entry preserve actual admission and allocator-null causes. Public legacy
 `new`/`default`/`enter` signatures remain infallible and explicitly unqualified;
-native engine operations use the internal fallible methods. The 16 KiB allowance
-and cache admission/eviction behavior are unchanged. These source mechanisms
+native engine operations use the internal fallible methods. Declared scans now retain revisited pages under their original reader admission.
+Unscoped legacy scans keep the 16 KiB fallback allowance. These source mechanisms
 still require independent allocation, concurrent continuation, out-of-order guard,
 null and unwind verification; no compiler or runtime clearance is implied.
 
@@ -130,7 +130,7 @@ private cache tests still require the independently owned real-handle adoption.
 | Changed source | Reason |
 |---|---|
 | `src/native_storage_admission.rs`, `src/lib.rs` | The test-seams-only pending-name observer borrows the real combined allocation Layout and native invoice after name construction. It admits or retains nothing and lets the engine allocator witness bind the exact original invoice to physical key teardown. |
-| `src/read_admission.rs` | Feature-internal prepaid native scan counter and thread-bound per-entry linked scope nodes, using the existing original native credit ownership protocol. Same-node nested helper guards allocate nothing; exact last-owner unlink/free precedes refund. Preserve the public legacy signatures and the original 16 KiB scan-growth contract. Upstream proposal remains unsubmitted under the existing thread-scoped read-admission proposal. |
+| `src/read_admission.rs` | Feature-internal prepaid native scan counter and thread-bound per-entry linked scope nodes, using the existing original native credit ownership protocol. Same-node nested helper guards allocate nothing; exact last-owner unlink/free precedes refund. Preserve the public legacy signatures and the unscoped fallback allowance; declared scans retain their working set under the original reader admission. Upstream proposal remains unsubmitted under the existing thread-scoped read-admission proposal. |
 | `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/tree_store/bounded_bytes.rs` | Feature-internal concrete movable source-credit owner and a distinct internal legacy/owned carrier. Preserve authentic credit through actual control deallocation, source-page/counter teardown and cache handoff. Keep legacy Box wrappers and the public backend trait unchanged; exact actual Layout prepayment remains with the engine factory. Upstream proposal remains unsubmitted. |
 | `src/tree_store/page_store/cache_owner_contract_rows.rs` (added), `src/tree_store/page_store/lru_cache.rs`, `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/base.rs`, `src/tree_store/btree_base.rs`, `src/tree_store/page_store/page_manager.rs`, `src/db.rs` | Independent rows extend the existing immutable-page lifetime test with exact cached-identity displacement, a no-invalidation pinned negative, multiple clones, source-paid windows/unwind, retained dirty and COW aliases, flush/cancellation, refusal and real backend error/unwind. The existing test allocator observes one actual backing pointer and its real counter immediately before and after System deallocation. A test-seams-only borrowed guard adapter finds its actual Cached identity and file coordinate, calls existing exact invalidation and requires that identity absent. Ordinary holds, eviction policy and all byte caps stay unchanged. Private Arc-specific tests adopt actual PageAllocation handles and Layout-derived prices/full capacity; there is no Arc compatibility shim. These source tests remain uncompiled and unrun; fixed writer-reserve close/recycle custody is not certified. |
 | `src/lib.rs`, `src/db.rs`, `src/read_admission.rs`, `src/native_storage_admission.rs`, `src/tree_store/mod.rs`, `src/tree_store/page_store/{mod,page_allocation,page_manager,cached_file,lru_cache,allocator_pager,region}.rs` | Feature-internal original cache-reserve custody and shared real occupancy across handle recycling; exact preallocation quotes for index/window/control reconstruction, separate from source-page admission. Physical cache/allocator destruction precedes final parent refund. Private allocator-window settlement propagates existing typed storage errors rather than boxing an admission refusal as I/O. No cache capacity, pinned-victim rule, public backend API, default or storage format changes. Upstream proposal remains unsubmitted. |
@@ -997,3 +997,38 @@ The source patch is regenerated from every current src file against the pinned,
 checksum-verified archive; no prior source hunks are removed by reconstruction.
 
 The test-seams reader-registry census records the successfully allocated combined registry Layout and the producing scope’s actual receipt Layout, filtered by its original accountant identity. It does not reserve storage, change native-credit ownership, infer payment from occupancy, or count an unallocated capacity. TransactionTracker lends the live allocator observation under its state lock; Database forwards that observation without opening another read transaction.
+
+## Reader working sets and warm native pages
+
+Declared scans retain original immutable page handles in one shared operation
+state. A fallible open-addressed page index admits each complete replacement
+Layout before allocating, including old/new overlap. Its original receipt is
+held outside array destruction and physical free. Page handles keep their same
+source invoice until physical free or transfer to a genuine fixed cache reserve.
+Ending the operation releases its index and page holds; the shared read cache
+may retain pages and their original invoices for subsequent queries. Unscoped
+legacy scans retain the existing finite allowance rather than growing an
+unfunded operation index. No declared memory limit or cache share changes.
+
+The operation records bytes it itself pins in the shared cache. When those holds
+cover all occupied read-cache bytes, no victim can be reclaimed before scope
+release, so subsequent misses avoid another unsuccessful stripe walk. A victim
+search resumes after the actual last stripe visited. Ordinary eligible pages
+remain reclaimable; held pages retain their original physical occupancy.
+
+Native clean reads install natively admitted immutable pages in that same shared
+cache and reuse them across operations. An existing legacy page is copied under
+native admission before publication, preserving separate provenance. The native
+page uses the complete weakless page allocation and its original native receipt;
+moving the receipt into single-owner custody needs no new allocation or retain.
+The allocation Layout bounds its length to isize::MAX, leaving the high length
+bit available to record native construction without increasing the header.
+Every byte slice and final-free Layout uses the masked actual length. Prepared
+reads retain their separate dirty-source copying route and never install pages.
+File identities and mutation generations prevent stale operation hits after a
+write, invalidation or file-handle replacement. No persisted format changes.
+
+| Changed source | Reason |
+|---|---|
+| `src/scan_cache.rs` (added), `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/mod.rs` | Operation-owned, fallibly admitted page index; retain exact page handles and original invoices across scan continuations, with bounded shared-cache pin accounting. Upstream proposal: operation-scoped working-set retention under caller admission. |
+| `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/native_storage_admission.rs` | Shared warm-page retention for declared scans and native clean reads; concrete native page construction and same-original single-owner receipt custody, with physical-free-before-refund ordering. Continue eviction from the last visited stripe and skip futile walks only when this operation holds all occupied read-cache bytes. |
