@@ -50,6 +50,10 @@ impl ReadRequestBudgetProvider for HostProvider {
     }
 }
 
+pub fn host_budget() -> Arc<dyn ReadMemoryBudget> {
+    Arc::new(HostBudget::default())
+}
+
 pub fn host_provider() -> Arc<dyn ReadRequestBudgetProvider> {
     Arc::new(HostProvider::default())
 }

@@ -2,7 +2,7 @@
 //! executing ledger work through a sync client connected to a hub.
 
 use super::fixture::Store;
-use super::network_routes::host_provider;
+use super::network_routes::host_budget;
 use super::sync_routes::Pair;
 use super::{EventLog, Row, call, call_async_expecting};
 use contextdb_core::Wallclock;
@@ -11,7 +11,7 @@ use contextdb_engine::work_ledger::{
 };
 use contextdb_server::work_ledger::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const JOB: &str = "work-1";
@@ -140,8 +140,8 @@ pub fn rows() -> Vec<Row> {
             },
         },
         Row {
-            // A reachable hub must record the claim: `Won { synced: false }`
-            // is the answer for a hub that could not be reached.
+            // The claim outcome must be a synced win; `Won { synced: false }`
+            // is what the route answers when it judged the hub unreachable.
             route: "contextdb_server::work_ledger::claim_job",
             drive: || {
                 let pair = edge_with_own_work();
@@ -235,7 +235,7 @@ pub fn rows() -> Vec<Row> {
                             Duration::ZERO,
                             worker.stop.clone(),
                         );
-                        Ok::<_, contextdb_core::Error>(worker.drive(looping).await)
+                        Ok::<_, contextdb_core::Error>(worker.run(looping).await)
                     },
                     loop_executed_the_hub_job,
                 )
@@ -252,13 +252,13 @@ pub fn rows() -> Vec<Row> {
                         let config = config();
                         let looping = run_worker_loop_with_read_budget_provider(
                             &client,
-                            host_provider(),
+                            worker.provider_stopping_after_one_poll(),
                             &config,
                             worker.executor(),
                             Duration::ZERO,
                             worker.stop.clone(),
                         );
-                        Ok::<_, contextdb_core::Error>(worker.drive(looping).await)
+                        Ok::<_, contextdb_core::Error>(worker.run(looping).await)
                     },
                     loop_executed_the_hub_job,
                 )
@@ -270,7 +270,9 @@ pub fn rows() -> Vec<Row> {
 fn synced_claim(outcome: ClaimOutcome) -> Result<(), String> {
     match outcome {
         ClaimOutcome::Won { synced: true } => Ok(()),
-        other => Err(format!("a reachable hub did not record the claim: {other:?}")),
+        other => Err(format!(
+            "the claim outcome against a reachable hub is not a synced win: {other:?}"
+        )),
     }
 }
 
@@ -289,18 +291,27 @@ fn loop_executed_the_hub_job(
     match ended {
         Ok(()) if executed => Ok(()),
         Ok(()) => Err(format!(
-            "the loop reported the hub unreachable instead of executing its job; events: {events}"
+            "the loop completed a poll without executing the hub's job; events: {events}"
         )),
         Err(error) => Err(format!("the loop ended with {error:?}; events: {events}")),
     }
 }
 
-/// A worker loop driven to one of its two ends: the executor completed the
-/// hub's job and raised the stop flag, or the loop logged that it treats
-/// the hub as unreachable (it then idles forever, so the flag is raised
-/// here). With the hub's job claimable by this worker, a loop that can
-/// pull and push executes it on its first poll, and one that cannot logs
-/// the unreachable-hub event; a bounded step count stops anything else.
+/// A worker loop and the signals that end it after its first poll. The
+/// loop checks its stop flag only between polls, so each signal is raised
+/// at or before the end of the poll it belongs to, and the loop returns at
+/// its next check:
+/// - the executor raises it when it completes the hub's job;
+/// - the event log raises it at the event the loop emits when a poll found
+///   no work and could not re-push to the hub, which ends that poll;
+/// - for the provider variant, the provider raises it on its second call,
+///   which the loop makes at the start of its first poll, so exactly one
+///   poll runs.
+///
+/// A returned error ends the loop by itself. The plain variant emits no
+/// signal after a poll that answers anything else; that loop keeps polling
+/// until the test runner's timeout ends it, which the runner reports as a
+/// timeout, separately from a failed assertion.
 struct Worker {
     stop: Arc<AtomicBool>,
     executed: Arc<AtomicBool>,
@@ -309,10 +320,11 @@ struct Worker {
 
 impl Worker {
     fn new() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
         Self {
-            stop: Arc::new(AtomicBool::new(false)),
+            log: EventLog::at(tracing::Level::DEBUG).raising("re-push deferred", stop.clone()),
+            stop,
             executed: Arc::new(AtomicBool::new(false)),
-            log: EventLog::at(tracing::Level::DEBUG),
         }
     }
 
@@ -323,33 +335,43 @@ impl Worker {
         })
     }
 
-    async fn drive(
+    fn provider_stopping_after_one_poll(
+        &self,
+    ) -> Arc<dyn contextdb_engine::vector_read_memory::ReadRequestBudgetProvider> {
+        Arc::new(StopAfterOnePoll {
+            calls: AtomicUsize::new(0),
+            stop: self.stop.clone(),
+            budget: host_budget(),
+        })
+    }
+
+    async fn run(
         &self,
         looping: impl std::future::Future<Output = Result<(), contextdb_core::Error>>,
     ) -> (Result<(), contextdb_core::Error>, bool, String) {
         let _events = self.log.install();
-        let mut looping = std::pin::pin!(looping);
-        // A loop that neither executes the job nor logs an unreachable hub
-        // within this many scheduler steps is stopped and reported, so the
-        // row can never wait without end.
-        let mut steps_left: u32 = 2_000_000;
-        loop {
-            tokio::select! {
-                biased;
-                ended = &mut looping => {
-                    return (ended, self.executed.load(Ordering::SeqCst), self.log.text());
-                }
-                _ = tokio::task::yield_now() => {
-                    steps_left = steps_left.saturating_sub(1);
-                    if steps_left == 0 {
-                        self.log.note("the loop neither executed the hub's job nor reported the hub unreachable");
-                        self.stop.store(true, Ordering::SeqCst);
-                    }
-                    if self.log.find("unreachable").is_some() || self.log.find("push missed").is_some() {
-                        self.stop.store(true, Ordering::SeqCst);
-                    }
-                }
-            }
+        let ended = looping.await;
+        (ended, self.executed.load(Ordering::SeqCst), self.log.text())
+    }
+}
+
+/// A host read-budget provider that raises the loop's stop flag on its
+/// second request: the loop asks once at startup and once at the start of
+/// each poll.
+#[derive(Debug)]
+struct StopAfterOnePoll {
+    calls: AtomicUsize,
+    stop: Arc<AtomicBool>,
+    budget: Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>,
+}
+
+impl contextdb_engine::vector_read_memory::ReadRequestBudgetProvider for StopAfterOnePoll {
+    fn request_budget(
+        &self,
+    ) -> contextdb_core::Result<Arc<dyn contextdb_core::read_memory::ReadMemoryBudget>> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+            self.stop.store(true, Ordering::SeqCst);
         }
+        Ok(self.budget.clone())
     }
 }

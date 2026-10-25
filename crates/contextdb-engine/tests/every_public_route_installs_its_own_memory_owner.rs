@@ -70,6 +70,9 @@ pub enum Outcome {
     /// A failure whose only signal is a code, so it cannot be told apart
     /// from the missing-owner refusal; it fails the row.
     Unexplained(String),
+    /// A route with a positive expectation answered with anything other
+    /// than the expected value, a refusal of any kind included.
+    Wrong(String),
     Panicked(String),
 }
 
@@ -120,8 +123,9 @@ where
 }
 
 /// Call an async route on a fresh thread and check the value it answered
-/// with: a route that answers with the wrong thing (a claim it did not
-/// sync, a poll that found none of the hub's work) fails the row.
+/// with. Unlike the general table, every refusal fails here, as does a
+/// wrong answer (a claim outcome that is not a synced win, a poll that
+/// executed none of the hub's work).
 pub fn call_async_expecting<T, E: Debug, F>(
     route: impl FnOnce() -> F + Send,
     expect: impl FnOnce(T) -> Result<(), String> + Send,
@@ -138,10 +142,10 @@ where
                     .expect("a runtime for the calling thread")
                     .block_on(route());
                 match answered {
-                    Err(error) => Outcome::Refused(format!("{error:?}")),
+                    Err(error) => Outcome::Wrong(format!("the route refused: {error:?}")),
                     Ok(value) => match expect(value) {
                         Ok(()) => Outcome::Answered,
-                        Err(why) => Outcome::Unexplained(why),
+                        Err(why) => Outcome::Wrong(why),
                     },
                 }
             })
@@ -159,6 +163,7 @@ where
 pub struct EventLog {
     floor: tracing::Level,
     events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    raise_on: Option<(&'static str, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 impl EventLog {
@@ -166,7 +171,18 @@ impl EventLog {
         Self {
             floor,
             events: Default::default(),
+            raise_on: None,
         }
+    }
+
+    /// Also raise `flag` the moment an event containing `needle` is emitted.
+    pub fn raising(
+        mut self,
+        needle: &'static str,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.raise_on = Some((needle, flag));
+        self
     }
 
     /// Install for the calling thread until the guard drops.
@@ -188,11 +204,6 @@ impl EventLog {
             .cloned()
     }
 
-    /// Record a note of the test's own beside the captured events.
-    pub fn note(&self, text: &str) {
-        self.events.lock().expect("event log").push(text.to_string());
-    }
-
     pub fn text(&self) -> String {
         self.events.lock().expect("event log").join(" | ")
     }
@@ -211,6 +222,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLog {
         if *event.metadata().level() <= self.floor {
             let mut text = EventText(String::new());
             event.record(&mut text);
+            if let Some((needle, flag)) = &self.raise_on
+                && text.0.contains(needle)
+            {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             self.events.lock().expect("event log").push(text.0);
         }
     }
@@ -222,7 +238,7 @@ fn fails(outcome: &Outcome) -> bool {
         Outcome::Refused(reason) => MISSING_OWNER_REFUSALS
             .iter()
             .any(|refusal| reason.contains(refusal)),
-        Outcome::Unexplained(_) | Outcome::Panicked(_) => true,
+        Outcome::Unexplained(_) | Outcome::Wrong(_) | Outcome::Panicked(_) => true,
     }
 }
 
@@ -563,6 +579,35 @@ fn the_route_table_names_every_refusal_reachable_route_once() {
     assert!(
         missing.is_empty() && extra.is_empty(),
         "every listed route is driven or named unreachable with a reason, and nothing else is: missing {missing:?}, not listed {extra:?}"
+    );
+}
+
+#[test]
+fn a_positive_expectation_fails_every_refusal_and_every_wrong_answer() {
+    let answered = |value: u32| {
+        call_async_expecting(
+            move || async move { Ok::<_, contextdb_core::Error>(value) },
+            |value| match value {
+                7 => Ok(()),
+                other => Err(format!("expected 7, answered {other}")),
+            },
+        )
+    };
+    assert!(!fails(&answered(7)), "the expected answer passes");
+    assert!(fails(&answered(8)), "a wrong successful answer fails");
+    for refusal in [
+        contextdb_core::Error::ReadCancelled,
+        contextdb_core::Error::Other("an unrelated refusal".into()),
+    ] {
+        let outcome = call_async_expecting(
+            move || async move { Err::<u32, _>(refusal) },
+            |_| Ok(()),
+        );
+        assert!(fails(&outcome), "a refusal without the owner text fails: {outcome:?}");
+    }
+    assert!(
+        !fails(&Outcome::Refused(format!("{:?}", contextdb_core::Error::ReadCancelled))),
+        "the general table still accepts a typed refusal that is not the owner refusal"
     );
 }
 
