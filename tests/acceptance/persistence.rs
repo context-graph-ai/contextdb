@@ -896,14 +896,18 @@ fn f112b_fresh_one_dot_zero_store_opens_cleanly_and_show_reflects_state() {
             Value::Int64(0),
             "{label}: dormant bodies own no resident vector payload"
         );
+        // An empty shared partition key retains its slice handle and the
+        // two-word Arc control. Dormant bodies own no resident payload.
+        let key_bytes = (std::mem::size_of::<contextdb_core::VectorPartitionKey>()
+            + 2 * std::mem::size_of::<usize>()) as i64;
         assert_eq!(
             row[charged_index_idx],
-            Value::Int64(24),
+            Value::Int64(key_bytes),
             "{label}: exact index ownership"
         );
         assert_eq!(
             row[bytes_idx],
-            Value::Int64(24),
+            Value::Int64(key_bytes),
             "{label}: charged vector plus charged index bytes"
         );
         assert_eq!(
