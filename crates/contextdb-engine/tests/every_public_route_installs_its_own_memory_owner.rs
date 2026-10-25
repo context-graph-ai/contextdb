@@ -1,0 +1,533 @@
+//! Every public route answers or refuses on its own: a caller never needs a
+//! memory owner left on its thread by an earlier call.
+//!
+//! The memory a public operation decodes is charged to an owner that the
+//! operation installs for itself. A consumer calls a route from whatever
+//! thread it has; that thread carries no owner. So each route below is
+//! called on a freshly spawned thread against a small populated store, and
+//! its result must be an answer or a typed refusal the caller can act on,
+//! never the internal "no owner installed" or "no pinned writer" refusal and
+//! never a panic.
+//!
+//! The table covers every exported route whose call chain reaches either
+//! internal refusal (`LISTED_ROUTES`). A route a consumer cannot reach
+//! through the public crate API is named in `UNREACHABLE_BY_CONSUMERS` with
+//! the reason; none is skipped silently, and
+//! `the_route_table_names_every_refusal_reachable_route_once` keeps the two
+//! lists and the driven rows equal to `LISTED_ROUTES`.
+
+#[path = "every_public_route_installs_its_own_memory_owner/blob_routes.rs"]
+mod blob_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/cli_routes.rs"]
+mod cli_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/database_routes.rs"]
+mod database_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/fixture.rs"]
+mod fixture;
+#[path = "every_public_route_installs_its_own_memory_owner/listed_routes.rs"]
+mod listed_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/persistence_routes.rs"]
+mod persistence_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/read_session_routes.rs"]
+mod read_session_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/server_routes.rs"]
+mod server_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/sync_routes.rs"]
+mod sync_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/work_ledger_routes.rs"]
+mod work_ledger_routes;
+
+use std::collections::BTreeSet;
+use std::fmt::Debug;
+use std::panic::AssertUnwindSafe;
+
+/// The internal refusals a public caller must never see. The first two are
+/// the decode-owner and preparation-writer refusals; the others are the
+/// same missing-owner class under the names the engine itself groups with
+/// them.
+const MISSING_OWNER_REFUSALS: &[&str] = &[
+    "requires an operation memory owner",
+    "requires its pinned native original writer",
+    "writer decode requires its declared memory accountant",
+    "checkpoint source requires its installed accountant identity",
+    "preparation original writer registration mismatch",
+];
+
+/// One public route and how to drive it once.
+pub struct Row {
+    pub route: &'static str,
+    pub drive: fn() -> Outcome,
+}
+
+#[derive(Debug)]
+pub enum Outcome {
+    Answered,
+    Refused(String),
+    /// A failure whose only signal is a code, so it cannot be told apart
+    /// from the missing-owner refusal; it fails the row.
+    Unexplained(String),
+    Panicked(String),
+}
+
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_string()))
+        .unwrap_or_else(|| "a panic without a message".to_string())
+}
+
+fn answer<T, E: Debug>(result: Result<T, E>) -> Outcome {
+    match result {
+        Ok(_) => Outcome::Answered,
+        Err(error) => Outcome::Refused(format!("{error:?}")),
+    }
+}
+
+/// Call `route` on a newly spawned thread, which holds no memory owner.
+pub fn call<T, E: Debug>(route: impl FnOnce() -> Result<T, E> + Send) -> Outcome {
+    std::thread::scope(|scope| match scope.spawn(move || answer(route())).join() {
+        Ok(outcome) => outcome,
+        Err(payload) => Outcome::Panicked(panic_text(payload)),
+    })
+}
+
+/// Call a route that returns nothing; its only failure is a panic.
+pub fn call_unit(route: impl FnOnce() + Send) -> Outcome {
+    call(move || {
+        route();
+        Ok::<(), ()>(())
+    })
+}
+
+/// Call an async route on a newly spawned thread, driving it on that
+/// thread's own single-threaded runtime.
+pub fn call_async<T, E: Debug, F>(route: impl FnOnce() -> F + Send) -> Outcome
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    call(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the calling thread")
+            .block_on(route())
+    })
+}
+
+fn fails(outcome: &Outcome) -> bool {
+    match outcome {
+        Outcome::Answered => false,
+        Outcome::Refused(reason) => MISSING_OWNER_REFUSALS
+            .iter()
+            .any(|refusal| reason.contains(refusal)),
+        Outcome::Unexplained(_) | Outcome::Panicked(_) => true,
+    }
+}
+
+/// Drive every row, print each outcome, and fail with every route whose
+/// outcome was a missing-owner refusal or a panic.
+pub fn assert_routes_answer(rows: &[Row]) {
+    let mut failures = Vec::new();
+    for row in rows {
+        let outcome = match std::panic::catch_unwind(AssertUnwindSafe(row.drive)) {
+            Ok(outcome) => outcome,
+            Err(payload) => Outcome::Panicked(format!(
+                "the route's fixture could not be built: {}",
+                panic_text(payload)
+            )),
+        };
+        println!("{} => {outcome:?}", row.route);
+        if fails(&outcome) {
+            failures.push(format!("{}: {outcome:?}", row.route));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} public routes failed for want of an owner they should install themselves:\n{}",
+        failures.len(),
+        rows.len(),
+        failures.join("\n")
+    );
+}
+
+/// Routes a consumer cannot call through the public API of the crate that
+/// defines them, with the reason.
+const UNREACHABLE_BY_CONSUMERS: &[(&str, &str)] = &[
+    (
+        "contextdb_engine::Database::production_smoke_sync_incarnation",
+        "compiled only with the `production-smoke-driver` feature, the installed-release smoke facility; no consumer build enables it",
+    ),
+    (
+        "contextdb_engine::persistence::read_persistence_test_scaffold::load_read_image_for_test_adapter",
+        "its module exists only with the `test-seams` feature",
+    ),
+    (
+        "contextdb_engine::executor::bounded_read_test_support::execute",
+        "test support for the engine's bounded-read suites, not a consumer route",
+    ),
+    (
+        "contextdb_engine::executor::bounded_read_test_support::open_cursor",
+        "test support for the engine's bounded-read suites, not a consumer route",
+    ),
+    (
+        "contextdb_engine::SyncClient::with_authenticated_transport_for_test_with_read_memory",
+        "compiled only with the `test-seams` feature",
+    ),
+    (
+        "contextdb_engine::SyncClient::with_authenticated_transport_and_identity_for_test_with_read_memory",
+        "compiled only with the `test-seams` feature",
+    ),
+    (
+        "contextdb_engine::SyncServer::with_authenticated_transport_for_test_with_read_budget_provider",
+        "compiled only with the `test-seams` feature",
+    ),
+    (
+        "contextdb_engine::SyncServer::with_authenticated_transport_and_identity_for_test_with_read_budget_provider",
+        "compiled only with the `test-seams` feature",
+    ),
+    (
+        "contextdb_engine::read_contract::decode_cursor_page",
+        "`read_contract` is a private module without the `test-seams` feature; consumers read pages through `ReadSession`",
+    ),
+    (
+        "contextdb_engine::read_contract::decode_cursor_page_under_memory_ceiling",
+        "`read_contract` is a private module without the `test-seams` feature; consumers read pages through `ReadSession`",
+    ),
+    (
+        "contextdb_engine::read_contract::decode_metadata_body",
+        "`read_contract` is a private module without the `test-seams` feature; consumers read metadata through `ReadSession`",
+    ),
+    (
+        "contextdb_engine::read_contract::decode_metadata_page",
+        "`read_contract` is a private module without the `test-seams` feature; consumers read metadata through `ReadSession`",
+    ),
+    (
+        "contextdb_engine::read_contract::decode_metadata_page_under_memory_ceiling",
+        "`read_contract` is a private module without the `test-seams` feature; consumers read metadata through `ReadSession`",
+    ),
+    (
+        "contextdb_engine::read_contract::decode_query_result",
+        "`read_contract` is a private module without the `test-seams` feature; consumers read answers through `ReadSession`",
+    ),
+    (
+        "contextdb_engine::read_contract::decode_query_result_under_memory_ceiling",
+        "`read_contract` is a private module without the `test-seams` feature; consumers read answers through `ReadSession`",
+    ),
+    (
+        "contextdb_engine::direct_file_reader::DirectFileReader::open",
+        "`direct_file_reader` is a private module without the `test-seams` feature and `DirectFileReader` is not re-exported; `ReadSession`'s file route drives it",
+    ),
+    (
+        "contextdb_engine::direct_file_reader::DirectFileReader::execute",
+        "`direct_file_reader` is a private module without the `test-seams` feature and `DirectFileReader` is not re-exported; `ReadSession::execute` drives it",
+    ),
+    (
+        "contextdb_engine::direct_file_reader::DirectFileReader::execute_with_cancellation",
+        "`direct_file_reader` is a private module without the `test-seams` feature and `DirectFileReader` is not re-exported; `ReadSession::execute_with_cancellation` drives it",
+    ),
+    (
+        "contextdb_engine::direct_file_reader::DirectFileReader::open_cursor",
+        "`direct_file_reader` is a private module without the `test-seams` feature and `DirectFileReader` is not re-exported; `ReadSession::open_cursor` drives it",
+    ),
+    (
+        "contextdb_engine::direct_file_reader::DirectFileReader::open_cursor_with_cancellation",
+        "`direct_file_reader` is a private module without the `test-seams` feature and `DirectFileReader` is not re-exported; `ReadSession::open_cursor_with_cancellation` drives it",
+    ),
+    (
+        "contextdb_engine::direct_file_reader::DirectCursor::fetch",
+        "`direct_file_reader` is a private module without the `test-seams` feature; `ReadCursor` paging drives it",
+    ),
+    (
+        "contextdb_engine::direct_file_reader::DirectCursor::fetch_with_cancellation",
+        "`direct_file_reader` is a private module without the `test-seams` feature; `ReadCursor` paging drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::authentication::authenticate_framed_stream_handshake",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::carrier::UnixLocalCarrier::probe_stale",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::carrier::UnixLocalCarrier::receive_message",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::carrier::UnixLocalCarrier::receive_response",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::carrier::UnixLocalCarrier::send_message",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::carrier::UnixLocalCarrier::write_request",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::framing::decode_handshake_exact",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::framing::decode_message_exact",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::framing::receive_framed_ordinary_result",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::framing::LocalEngineFailure::into_error",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::framing::LocalProtocolBoundary::encode_frame",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::framing::LocalProtocolBoundary::receive_frame",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::framing::LocalProtocolBoundary::receive_ordinary_result_frame",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::framing::OrdinaryResultReceiver::receive",
+        "`local_transport` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::local_transport::stale::reconcile_stale_channel",
+        "`local_transport` is a private module without the `test-seams` feature; a writer open drives it",
+    ),
+    (
+        "contextdb_engine::owner_read::client::OwnerClient::connect",
+        "`owner_read` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::owner_read::client::OwnerClient::encode_envelope",
+        "`owner_read` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::owner_read::client::OwnerClient::read_envelope",
+        "`owner_read` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::owner_read::client::OwnerClient::receive_ordinary",
+        "`owner_read` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::owner_read::client::OwnerClient::request",
+        "`owner_read` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_engine::owner_read::client::OwnerClient::request_watching",
+        "`owner_read` is a private module without the `test-seams` feature; `ReadSession`'s owner route drives it",
+    ),
+    (
+        "contextdb_cli::repl::feed_line",
+        "`repl` is a private module of the CLI and `feed_line` is not re-exported; `contextdb_cli::run` drives it for every input line",
+    ),
+    (
+        "contextdb_engine::owner_read::service::OwnerReadService::start",
+        "`owner_read` is a private module without the `test-seams` feature; a writer open with owner reads enabled starts it",
+    ),
+];
+
+/// Vector-crate routes. `contextdb-vector` does not depend on the engine, so
+/// these reach either refusal only through engine trait objects (durable
+/// membership sources, paged persistence, memory budgets) that the engine
+/// installs in its own vector store. No public engine route hands that store
+/// out; the only accessors are `Database::vector_store_for_test` and its
+/// reader twins under the `test-seams` feature. A store a consumer builds
+/// from `contextdb-vector` itself carries no engine source, so neither
+/// refusal is on its path. The engine routes that drive these
+/// (`Database::execute`, `Database::query_vector`,
+/// `Database::run_maintenance_cycle`, the sync apply routes) are driven above.
+const VECTOR_STORE_ROUTES: &[&str] = &[
+    "contextdb_vector::MemVectorExecutor::bounded_brute_force_step",
+    "contextdb_vector::MemVectorExecutor::bounded_brute_force_step_charged",
+    "contextdb_vector::MemVectorExecutor::bounded_brute_force_step_with_query",
+    "contextdb_vector::MemVectorExecutor::bounded_hnsw_search",
+    "contextdb_vector::MemVectorExecutor::bounded_hnsw_search_grouped",
+    "contextdb_vector::MemVectorExecutor::bounded_hnsw_search_grouped_with_reader_memory_refusal",
+    "contextdb_vector::MemVectorExecutor::search_with_mode",
+    "contextdb_vector::MemVectorExecutor::search_with_mode_admission",
+    "contextdb_vector::MemVectorExecutor::search_with_mode_owned",
+    "contextdb_vector::MemVectorExecutor::search_with_strategy",
+    "contextdb_vector::VectorStore::apply_changes_with_accountant",
+    "contextdb_vector::VectorStore::apply_changes_with_accountant_ref",
+    "contextdb_vector::VectorStore::apply_deletes",
+    "contextdb_vector::VectorStore::apply_deletes_with_accountant",
+    "contextdb_vector::VectorStore::apply_inserts",
+    "contextdb_vector::VectorStore::apply_inserts_with_accountant",
+    "contextdb_vector::VectorStore::apply_moves",
+    "contextdb_vector::VectorStore::apply_moves_with_accountant",
+    "contextdb_vector::VectorStore::apply_partitioned_changes_with_accountant",
+    "contextdb_vector::VectorStore::apply_partitioned_deletes",
+    "contextdb_vector::VectorStore::apply_partitioned_inserts",
+    "contextdb_vector::VectorStore::apply_partitioned_inserts_with_accountant",
+    "contextdb_vector::VectorStore::apply_partitioned_moves",
+    "contextdb_vector::VectorStore::apply_partitioned_moves_with_accountant",
+    "contextdb_vector::VectorStore::durable_entries_of_partitions_containing_rows",
+    "contextdb_vector::VectorStore::ensure_all_raw_vectors_loaded",
+    "contextdb_vector::VectorStore::ensure_raw_partition_loaded",
+    "contextdb_vector::VectorStore::ensure_raw_partitions_containing_rows",
+    "contextdb_vector::VectorStore::entries_for_index",
+    "contextdb_vector::VectorStore::entries_for_partition",
+    "contextdb_vector::VectorStore::entries_for_partition_at_snapshot",
+    "contextdb_vector::VectorStore::entries_for_partition_generation_at_snapshot",
+    "contextdb_vector::VectorStore::load_entries_for_rows",
+    "contextdb_vector::VectorStore::load_live_entries_for_row",
+    "contextdb_vector::VectorStore::load_live_entry_for_row",
+    "contextdb_vector::VectorStore::partition_info",
+    "contextdb_vector::VectorStore::partition_infos",
+    "contextdb_vector::VectorStore::preload_dormant_partition_generation",
+    "contextdb_vector::VectorStore::prepare_partitioned_batch",
+    "contextdb_vector::VectorStore::prepare_partitioned_batch_with_registered_snapshots",
+    "contextdb_vector::VectorStore::recheck_policy_maintenance_failures",
+    "contextdb_vector::VectorStore::register_index_with_layout",
+    "contextdb_vector::VectorStore::run_hnsw_maintenance_cycle",
+    "contextdb_vector::VectorStore::run_hnsw_maintenance_cycle_with",
+    "contextdb_vector::VectorStore::step_partition_paged_build",
+    "contextdb_vector::VectorStore::step_partition_paged_build_with_plan",
+    "contextdb_vector::VectorStore::storage_bytes_per_entry",
+    "contextdb_vector::VectorStore::storage_bytes_per_entry_in_partition",
+    "contextdb_vector::VectorStore::try_all_entries",
+    "contextdb_vector::VectorStore::try_all_partitioned_entries",
+    "contextdb_vector::VectorStore::try_live_entry_for_row_in_partition",
+    "contextdb_vector::VectorStore::try_partition_info",
+    "contextdb_vector::VectorStore::try_partitioned_entries_matching",
+    "contextdb_vector::hnsw::paged_builder::PagedGenerationBuilder::abandon",
+    "contextdb_vector::hnsw::paged_builder::PagedGenerationBuilder::publish",
+    "contextdb_vector::hnsw::paged_builder::PagedGenerationBuilder::reclaim",
+    "contextdb_vector::hnsw::paged_builder::PagedGenerationBuilder::step",
+    "contextdb_vector::mem::BoundedVectorCandidateGroups::has_pending_tail_without_load",
+    "contextdb_vector::store::IndexState::preload_dormant_sealed_generation",
+    "contextdb_vector::store::IndexState::raw_hnsw_search",
+];
+
+/// Routes in a crate with no path to either refusal. `contextdb-hnsw`
+/// depends on no other workspace crate; its traced call chain is a name
+/// match of `std::fs::metadata` against the engine's custody `metadata`.
+const CANNOT_REACH_EITHER_REFUSAL: &[(&str, &str)] = &[
+    ("hnsw_rs::datamap::DataMap::from_hnswdump", "contextdb-hnsw depends on no workspace crate"),
+    ("hnsw_rs::hnswio::DumpInit::new", "contextdb-hnsw depends on no workspace crate"),
+    ("hnsw_rs::hnswio::HnswIo::load_hnsw", "contextdb-hnsw depends on no workspace crate"),
+    ("hnsw_rs::hnswio::HnswIo::load_hnsw_owned", "contextdb-hnsw depends on no workspace crate"),
+    ("hnsw_rs::hnswio::HnswIo::load_hnsw_owned_with_dist", "contextdb-hnsw depends on no workspace crate"),
+];
+
+/// Consumer routes this table does not drive yet, with the precondition the
+/// fixtures above do not provide. Each is a reachable route; none counts as
+/// proven.
+const NOT_YET_DRIVEN: &[(&str, &str)] = &[
+    ("contextdb_engine::SyncClient::new", "needs a bound Iroh hub endpoint and dial ticket; the sync rows use the in-process authenticated transport"),
+    ("contextdb_engine::SyncClient::new_with_read_memory", "needs a bound Iroh hub endpoint and dial ticket"),
+    ("contextdb_engine::SyncClient::change_destination", "needs a client built from an Iroh dial specification"),
+    ("contextdb_engine::SyncServer::new", "needs a bound Iroh endpoint"),
+    ("contextdb_engine::SyncServer::new_with_read_budget_provider", "needs a bound Iroh endpoint"),
+    ("contextdb_engine::SyncServer::run", "serves until the process ends; `SyncServer::run_until` is driven through a served pull"),
+    ("contextdb_engine::SyncServer::run_until_stopped", "needs the native stop handle of an Iroh-bound server"),
+    ("contextdb_engine::SyncServer::native_stop", "needs an Iroh-bound server"),
+    ("contextdb_engine::BlobStore::serve_on", "needs a bound Iroh endpoint"),
+    ("contextdb_engine::BlobStore::serve_on_with_read_budget_provider", "needs a bound Iroh endpoint"),
+    ("contextdb_engine::BlobStore::resolve_blob_ref", "needs a second node serving the blob over Iroh"),
+    ("contextdb_engine::BlobStore::resolve_blob_ref_with_read_memory", "needs a second node serving the blob over Iroh"),
+    ("contextdb_engine::BlobStore::spawn_reclaim_driver", "a background loop whose sweep failures are only logged; `BlobStore::reclaim_unreferenced` is the sweep and is driven"),
+    ("contextdb_engine::BlobStore::spawn_reclaim_driver_with_read_budget_provider", "a background loop whose sweep failures are only logged; `BlobStore::reclaim_unreferenced_with_read_memory` is the sweep and is driven"),
+    ("contextdb_server::work_ledger::claim_job", "needs a sync client connected to a hub holding a ledger"),
+    ("contextdb_server::work_ledger::claim_job_with_read_memory", "needs a sync client connected to a hub holding a ledger"),
+    ("contextdb_server::work_ledger::poll_and_execute_once", "needs a sync client connected to a hub holding a ledger and a work executor"),
+    ("contextdb_server::work_ledger::poll_and_execute_once_with_read_memory", "needs a sync client connected to a hub holding a ledger and a work executor"),
+    ("contextdb_server::work_ledger::run_worker_loop", "needs a sync client connected to a hub holding a ledger and a work executor"),
+    ("contextdb_server::work_ledger::run_worker_loop_with_read_budget_provider", "needs a sync client connected to a hub holding a ledger and a work executor"),
+    ("contextdb_cli::run", "reads its statements from the process's standard input"),
+];
+
+fn driven_rows() -> Vec<Row> {
+    let mut rows = Vec::new();
+    rows.extend(database_routes::rows());
+    rows.extend(work_ledger_routes::rows());
+    rows.extend(persistence_routes::rows());
+    rows.extend(read_session_routes::rows());
+    rows.extend(sync_routes::rows());
+    rows.extend(blob_routes::rows());
+    rows.extend(server_routes::rows());
+    rows.extend(cli_routes::rows());
+    rows
+}
+
+#[test]
+fn the_route_table_names_every_refusal_reachable_route_once() {
+    let listed: BTreeSet<&str> = listed_routes::LISTED_ROUTES.iter().copied().collect();
+    assert_eq!(
+        listed.len(),
+        listed_routes::LISTED_ROUTES.len(),
+        "each listed route is named once"
+    );
+    let mut accounted = Vec::new();
+    accounted.extend(driven_rows().iter().map(|row| row.route));
+    accounted.extend(UNREACHABLE_BY_CONSUMERS.iter().map(|(route, _)| *route));
+    accounted.extend(VECTOR_STORE_ROUTES.iter().copied());
+    accounted.extend(CANNOT_REACH_EITHER_REFUSAL.iter().map(|(route, _)| *route));
+    accounted.extend(NOT_YET_DRIVEN.iter().map(|(route, _)| *route));
+    let unique: BTreeSet<&str> = accounted.iter().copied().collect();
+    let repeated: Vec<&str> = {
+        let mut seen = BTreeSet::new();
+        accounted
+            .iter()
+            .copied()
+            .filter(|route| !seen.insert(*route))
+            .collect()
+    };
+    assert!(repeated.is_empty(), "routes accounted for twice: {repeated:?}");
+    let missing: Vec<&&str> = listed.difference(&unique).collect();
+    let extra: Vec<&&str> = unique.difference(&listed).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "every listed route is driven or named unreachable with a reason, and nothing else is: missing {missing:?}, not listed {extra:?}"
+    );
+}
+
+#[test]
+fn database_routes_answer_without_an_ambient_owner() {
+    assert_routes_answer(&database_routes::rows());
+}
+
+#[test]
+fn work_ledger_routes_answer_without_an_ambient_owner() {
+    assert_routes_answer(&work_ledger_routes::rows());
+}
+
+#[test]
+fn storage_layer_routes_answer_without_an_ambient_owner() {
+    assert_routes_answer(&persistence_routes::rows());
+}
+
+#[test]
+fn read_session_routes_answer_without_an_ambient_owner() {
+    assert_routes_answer(&read_session_routes::rows());
+}
+
+#[test]
+fn sync_routes_answer_without_an_ambient_owner() {
+    assert_routes_answer(&sync_routes::rows());
+}
+
+#[test]
+fn blob_routes_answer_without_an_ambient_owner() {
+    assert_routes_answer(&blob_routes::rows());
+}
+
+#[test]
+fn server_work_routes_answer_without_an_ambient_owner() {
+    assert_routes_answer(&server_routes::rows());
+}
+
+#[test]
+fn cli_routes_answer_without_an_ambient_owner() {
+    assert_routes_answer(&cli_routes::rows());
+}

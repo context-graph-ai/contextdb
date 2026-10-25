@@ -96,6 +96,8 @@ contextdb-core = { path = "../contextdb-core", version = "1.0", features = ["tes
 contextdb-tx = { path = "../contextdb-tx", version = "1.0", features = ["test-seams"] }
 contextdb-relational = { path = "../contextdb-relational", version = "1.0", features = ["test-seams"] }
 contextdb-server = { path = "../contextdb-server", features = ["in-process-test-seams"] }
+# The every-public-route test drives the CLI's operational commands too.
+contextdb-cli = { path = "../contextdb-cli" }
 contextdb-vector = { path = "../contextdb-vector", version = "1.0", features = ["test-seams"] }
 redb = { package = "contextdb-redb", version = "4.1.0", path = "../contextdb-redb", features = ["test-seams", "cache_metrics"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
@@ -804,6 +806,11 @@ required-features = ["test-seams", "iroh"]
 name = "vector"
 path = "tests/vector.rs"
 required-features = ["test-seams"]
+
+[[test]]
+name = "every_public_route_installs_its_own_memory_owner"
+path = "tests/every_public_route_installs_its_own_memory_owner.rs"
+required-features = ["test-seams", "iroh"]
 
 [[bin]]
 name = "memory-census"

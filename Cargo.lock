@@ -775,6 +775,7 @@ dependencies = [
  "bincode 2.0.1",
  "blake3",
  "bytes",
+ "contextdb-cli",
  "contextdb-core",
  "contextdb-graph",
  "contextdb-parser",
