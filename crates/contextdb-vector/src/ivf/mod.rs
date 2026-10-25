@@ -5,12 +5,15 @@
     reason = "The shared engine Error retains inline allocation-free refusal diagnostics."
 )]
 mod book;
+mod catalog;
 mod codec;
 mod memory;
 mod search;
 pub mod storage;
 mod types;
+mod versions;
 mod writer;
+pub use catalog::{CatalogState, inspect as inspect_catalog};
 pub use search::search;
 pub use types::{BufferState, Hit, Mode, Policy, TrainingPolicy, Vector, Work};
-pub use writer::ClusteredIndex;
+pub use writer::{ClusteredIndex, RemapProgress};

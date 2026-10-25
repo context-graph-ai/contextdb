@@ -3,14 +3,55 @@ use super::storage::PAGE_BYTES;
 /// Already resolved engine policy. SQL validation/default resolution lives above this layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
-    pub dimensions: usize,
-    pub lists: u32,
-    pub probes: u32,
-    pub rerank: usize,
-    pub buffer_cap_bytes: usize,
-    pub extend_to_k: bool,
+    pub(super) dimensions: usize,
+    pub(super) lists: u32,
+    pub(super) probes: u32,
+    pub(super) rerank: usize,
+    pub(super) buffer_cap_bytes: usize,
+    pub(super) extend_to_k: bool,
+    pub(super) max_delta_runs: u64,
+    pub(super) coalesce_pages_per_step: Option<usize>,
 }
 impl Policy {
+    pub fn dimensions(self) -> usize {
+        self.dimensions
+    }
+    pub fn lists(self) -> u32 {
+        self.lists
+    }
+    pub fn probes(self) -> u32 {
+        self.probes
+    }
+    pub fn rerank(self) -> usize {
+        self.rerank
+    }
+    pub fn buffer_cap_bytes(self) -> usize {
+        self.buffer_cap_bytes
+    }
+    pub fn extend_to_k(self) -> bool {
+        self.extend_to_k
+    }
+
+    /// Resolved declared MAX_DELTA_RUNS (engine default two).
+    pub fn with_max_delta_runs(mut self, runs: u64) -> Option<Self> {
+        if runs == 0 || runs.checked_add(1).is_none() {
+            return None;
+        }
+        self.max_delta_runs = runs;
+        Some(self)
+    }
+    pub fn max_delta_runs(self) -> u64 {
+        self.max_delta_runs
+    }
+    /// The engine passes the resolved declared maintenance page allowance.
+    pub fn with_coalesce_pages_per_step(mut self, pages: usize) -> Option<Self> {
+        if pages == 0 {
+            return None;
+        }
+        self.coalesce_pages_per_step = Some(pages);
+        Some(self)
+    }
+
     /// Reject a policy before any allocation; the declaring layer supplies its typed diagnostic.
     pub fn checked(
         dimensions: usize,
@@ -20,7 +61,7 @@ impl Policy {
         buffer_cap_bytes: usize,
         extend_to_k: bool,
     ) -> Option<Self> {
-        let record = dimensions.checked_mul(4)?.checked_add(24)?;
+        let record = dimensions.checked_mul(4)?.checked_add(40)?;
         if dimensions == 0
             || lists == 0
             || probes == 0
@@ -31,6 +72,7 @@ impl Policy {
             return None;
         }
         dimensions.checked_add(16).filter(|n| *n <= PAGE_BYTES)?;
+        dimensions.checked_mul(5)?;
         dimensions.checked_mul(lists as usize)?.checked_mul(4)?;
         Some(Self {
             dimensions,
@@ -39,6 +81,8 @@ impl Policy {
             rerank,
             buffer_cap_bytes,
             extend_to_k,
+            max_delta_runs: 2,
+            coalesce_pages_per_step: None,
         })
     }
 }
@@ -66,9 +110,16 @@ pub struct Work {
     pub full_precision_evaluations: u64,
     pub buffer_evaluations: u64,
     pub list_pages_read: u64,
+    pub codebook_pages_read: u64,
+    pub accumulator_pages_read: u64,
+    pub directory_pages_read: u64,
     pub canonical_pages_read: u64,
     pub visibility_pages_read: u64,
     pub lists_probed: u64,
+    pub catalog_pages_read: u64,
+    pub slot_metadata_pages_read: u64,
+    pub tail_pages_read: u64,
+    pub list_link_pages_read: u64,
     /// Actual scores on selected EXACT routes, never inferred from an oracle.
     pub exact_score_count: u64,
 }

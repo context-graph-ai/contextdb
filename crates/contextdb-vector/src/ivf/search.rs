@@ -1,15 +1,16 @@
 use super::{
-    book::Codebook,
+    book::{Codebook, list_page_used},
+    catalog::{Catalog, Entry, Run, tail_slot},
     codec,
-    memory::{Invoice, bytes, corrupt, overflow},
+    memory::{Invoice, bytes, corrupt, dimension, overflow},
     storage::{DistanceKind, Manifest, PAGE_BYTES, PageKind, ReadPages},
     types::{Candidate, Hit, Mode, Policy, Work, cosine, retain_best},
 };
 use crate::MemoryBudgetOwner;
 use contextdb_core::Result;
 
-/// Search into caller-admitted output. Internal scratch never escapes with an answer.
-/// The returned ledger is production-readable without the test-seams feature.
+/// Search into caller-admitted output. Catalogs, codebooks and work are from the
+/// captured native transaction; no test observer participates in this path.
 pub fn search(
     source: &impl ReadPages,
     policy: Policy,
@@ -20,7 +21,7 @@ pub fn search(
     output: &mut [Hit],
 ) -> Result<(usize, Work)> {
     if query.len() != policy.dimensions {
-        return Err(corrupt());
+        return Err(dimension(source, policy.dimensions, query.len()));
     }
     source.check_cancel()?;
     let k = output.len();
@@ -37,14 +38,20 @@ pub fn search(
         .checked_add(bytes::<Candidate>(k)?)
         .and_then(|x| x.checked_add(bytes::<(f64, u32)>(policy.lists as usize).ok()?))
         .and_then(|x| x.checked_add(raw_bytes))
-        .and_then(|x| x.checked_add(policy.dimensions * 5))
-        .and_then(|x| x.checked_add(PAGE_BYTES * 3 + std::mem::size_of::<blake3::Hasher>()))
+        .and_then(|x| x.checked_add(policy.dimensions.checked_mul(5)?))
+        .and_then(|x| {
+            x.checked_add(
+                PAGE_BYTES * 12
+                    + std::mem::size_of::<blake3::Hasher>()
+                    + std::mem::size_of::<Catalog>() * 2,
+            )
+        })
         .ok_or_else(overflow)?;
     let _scratch = Invoice::reserve(owner, charge, "clustered_query")?;
     let mut candidates = Vec::with_capacity(depth);
     let mut merged = Vec::with_capacity(k);
     let mut scores = Vec::with_capacity(policy.lists as usize);
-    let mut raw = vec![0u8; raw_bytes];
+    let mut raw = vec![0; raw_bytes];
     let mut values = vec![0.0; policy.dimensions];
     let mut query_code = vec![0i8; policy.dimensions];
     let norm = query
@@ -63,99 +70,245 @@ pub fn search(
     }
     let mut work = Work::default();
     let mut visit = |partition| -> Result<()> {
-        source.check_cancel()?;
-        let Some(manifest) = source.manifest(partition)? else {
+        let Some(m) = source.manifest(partition)? else {
             return Ok(());
         };
-        if manifest.dimensions != policy.dimensions
-            || manifest.lists > policy.lists
-            || manifest.active_lists > manifest.lists
-            || manifest.sealed_slots > manifest.slots
-        {
-            return Err(corrupt());
-        }
-        candidates.clear();
-        scores.clear();
-        let mut visibility = [0u8; PAGE_BYTES];
-        let mut vis_loaded = None;
-        let mut canonical = CanonicalWindow::new(source, manifest);
-        if mode == Mode::Exact || manifest.active_lists == 0 {
-            for slot in 0..manifest.slots {
-                source.check_cancel()?;
-                if !is_visible(
-                    source,
-                    manifest,
-                    slot,
-                    &mut visibility,
-                    &mut vis_loaded,
-                    &mut work,
-                )? {
-                    continue;
-                }
-                let row = canonical.vector(slot, &mut raw, &mut values)?;
-                let tail = slot >= manifest.sealed_slots;
-                source.before_distance(if tail {
-                    DistanceKind::Buffer
-                } else {
-                    DistanceKind::Canonical
-                })?;
-                let distance = cosine(query, &values);
-                if tail {
-                    work.buffer_evaluations += 1;
-                } else {
-                    work.full_precision_evaluations += 1;
-                }
-                if mode == Mode::Exact {
-                    work.exact_score_count += 1;
-                }
-                retain_best(
-                    &mut candidates,
-                    depth,
-                    Candidate {
-                        slot,
-                        row,
-                        distance,
-                    },
-                );
-            }
-        } else {
-            let book = Codebook::load(owner, source, manifest)?;
-            for list in 0..manifest.active_lists {
-                source.check_cancel()?;
-                source.before_distance(DistanceKind::Centroid)?;
-                let distance = cosine(query, book.row(list as usize));
-                work.centroid_evaluations += 1;
-                scores.push((distance, list));
-            }
-            scores.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            let stride = 16 + policy.dimensions;
-            let per_page = PAGE_BYTES / stride;
-            for (rank, (_, list)) in scores.iter().enumerate() {
-                if rank >= policy.probes as usize && (!policy.extend_to_k || candidates.len() >= k)
-                {
-                    break;
-                }
-                work.lists_probed += 1;
-                let count = codec::count(source, manifest, *list)?;
-                for ordinal in 0..count.div_ceil(per_page as u64) {
-                    source.check_cancel()?;
-                    let mut page = [0u8; PAGE_BYTES];
-                    if !source.read_admitted_page(
-                        manifest.key(PageKind::Lists, *list, ordinal),
-                        &mut page,
-                    )? {
+        validate(source, m, policy)?;
+        let c = Catalog::load(source, m)?;
+        work.catalog_pages_read += 1;
+        // At most two codebooks in state B, visited sequentially under whole-object funding.
+        for old in [false, true] {
+            let manifest = if old {
+                let Some(x) = c.legacy else { continue };
+                x
+            } else {
+                m
+            };
+            validate(source, manifest, policy)?;
+            let current_catalog = if old { Catalog::new(0) } else { c };
+            candidates.clear();
+            scores.clear();
+            let mut visibility = [0; PAGE_BYTES];
+            let mut vis_loaded = None;
+            let mut metadata = MetadataWindow::new(source, manifest);
+            let mut canonical = CanonicalWindow::new(source, manifest);
+            if mode == Mode::Exact || manifest.active_lists == 0 {
+                if old {
+                    let mut id = c.legacy_first;
+                    for _ in 0..c.legacy_runs {
+                        let run = Run::load(source, manifest, id)?;
+                        work.catalog_pages_read += 1;
+                        let mut slot = run.first;
+                        for _ in 0..run.entries {
+                            source.check_cancel()?;
+                            let e = metadata.entry(slot)?;
+                            if e.lsn > c.frontier
+                                && e.lsn <= c.switch_lsn
+                                && is_visible(
+                                    source,
+                                    manifest,
+                                    slot,
+                                    &mut visibility,
+                                    &mut vis_loaded,
+                                    &mut work,
+                                )?
+                            {
+                                score_exact(
+                                    source,
+                                    query,
+                                    slot,
+                                    false,
+                                    mode,
+                                    &mut canonical,
+                                    &mut raw,
+                                    &mut values,
+                                    &mut candidates,
+                                    depth,
+                                    &mut work,
+                                )?;
+                            }
+                            slot = e.next;
+                        }
+                        id = run.next;
+                    }
+                    if id != 0 {
                         return Err(corrupt());
                     }
-                    work.list_pages_read += 1;
-                    let entries = per_page.min((count - ordinal * per_page as u64) as usize);
-                    for record in page.chunks_exact(stride).take(entries) {
-                        let slot =
-                            u64::from_le_bytes(record[..8].try_into().map_err(|_| corrupt())?);
-                        let row =
-                            u64::from_le_bytes(record[8..16].try_into().map_err(|_| corrupt())?);
-                        if slot >= manifest.sealed_slots {
-                            return Err(corrupt());
+                } else {
+                    for slot in 0..manifest.slots {
+                        source.check_cancel()?;
+                        let e = metadata.entry(slot)?;
+                        if (e.prepared && e.run == c.remap_output)
+                            || !is_visible(
+                                source,
+                                manifest,
+                                slot,
+                                &mut visibility,
+                                &mut vis_loaded,
+                                &mut work,
+                            )?
+                        {
+                            continue;
                         }
+                        let tail = e.tail >= c.tail_head && e.tail < c.tail_end;
+                        score_exact(
+                            source,
+                            query,
+                            slot,
+                            tail,
+                            mode,
+                            &mut canonical,
+                            &mut raw,
+                            &mut values,
+                            &mut candidates,
+                            depth,
+                            &mut work,
+                        )?;
+                    }
+                }
+            } else {
+                let book = Codebook::load_values(owner, source, manifest)?;
+                work.codebook_pages_read += book.pages_read();
+                for list in 0..manifest.active_lists {
+                    source.check_cancel()?;
+                    source.before_distance(DistanceKind::Centroid)?;
+                    let distance = cosine(query, book.row(list as usize));
+                    work.centroid_evaluations += 1;
+                    scores.push((distance, list));
+                }
+                scores.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                for (rank, (_, list)) in scores.iter().enumerate() {
+                    if rank >= policy.probes as usize
+                        && (!policy.extend_to_k || candidates.len() >= k)
+                    {
+                        break;
+                    }
+                    work.lists_probed += 1;
+                    // One centroid pass per codebook, not per sealed run.
+                    let mut id = if old { c.legacy_first } else { 0 };
+                    let roots = if old {
+                        c.legacy_runs
+                    } else {
+                        current_catalog.runs + 1
+                    };
+                    for root in 0..roots {
+                        let mut view = manifest;
+                        view.run = id;
+                        let run = if id != 0 {
+                            let r = Run::load(source, manifest, id)?;
+                            work.catalog_pages_read += 1;
+                            Some(r)
+                        } else {
+                            None
+                        };
+                        let d = codec::directory(source, view, *list)?;
+                        work.directory_pages_read += 1;
+                        let mut remaining = d.count;
+                        let mut page_id = d.head;
+                        while remaining > 0 {
+                            source.check_cancel()?;
+                            let mut page = [0; PAGE_BYTES];
+                            if page_id == 0
+                                || !super::storage::read_page(
+                                    source,
+                                    manifest.key(PageKind::Lists, *list, page_id - 1),
+                                    &mut page,
+                                )?
+                            {
+                                return Err(corrupt());
+                            }
+                            work.list_pages_read += 1;
+                            let used = list_page_used(source, manifest, *list, page_id)?;
+                            work.list_link_pages_read += 1;
+                            let stride = 16 + policy.dimensions;
+                            if used == 0 || used > PAGE_BYTES / stride || used as u64 > remaining {
+                                return Err(corrupt());
+                            }
+                            for record in page.chunks_exact(stride).take(used) {
+                                let slot = u64::from_le_bytes(
+                                    record[..8].try_into().map_err(|_| corrupt())?,
+                                );
+                                let row = u64::from_le_bytes(
+                                    record[8..16].try_into().map_err(|_| corrupt())?,
+                                );
+                                if slot >= manifest.slots {
+                                    return Err(corrupt());
+                                }
+                                if old {
+                                    let e = metadata.entry(slot)?;
+                                    if e.lsn <= c.frontier || e.lsn > c.switch_lsn {
+                                        continue;
+                                    }
+                                }
+                                if !is_visible(
+                                    source,
+                                    manifest,
+                                    slot,
+                                    &mut visibility,
+                                    &mut vis_loaded,
+                                    &mut work,
+                                )? {
+                                    continue;
+                                }
+                                source.before_distance(DistanceKind::Quantized)?;
+                                let (mut dot, mut aa, mut bb) = (0i64, 0i64, 0i64);
+                                for (&a, &b) in query_code.iter().zip(&record[16..]) {
+                                    let a = i64::from(a);
+                                    let b = i64::from(b as i8);
+                                    dot += a * b;
+                                    aa += a * a;
+                                    bb += b * b;
+                                }
+                                let distance = if aa == 0 || bb == 0 {
+                                    1.0
+                                } else {
+                                    1.0 - dot as f64 / ((aa as f64).sqrt() * (bb as f64).sqrt())
+                                };
+                                work.quantized_evaluations += 1;
+                                retain_best(
+                                    &mut candidates,
+                                    depth,
+                                    Candidate {
+                                        slot,
+                                        row,
+                                        distance,
+                                    },
+                                );
+                            }
+                            remaining -= used as u64;
+                            if remaining > 0 {
+                                page_id = codec::next_list_page(source, manifest, *list, page_id)?;
+                                work.list_link_pages_read += 1;
+                            }
+                        }
+                        id = if old {
+                            run.ok_or_else(corrupt)?.next
+                        } else if root == 0 {
+                            current_catalog.first
+                        } else {
+                            run.ok_or_else(corrupt)?.next
+                        };
+                    }
+                    if id != 0 {
+                        return Err(corrupt());
+                    }
+                }
+                candidates.sort_unstable_by_key(|x| x.slot);
+                for candidate in &mut candidates {
+                    source.check_cancel()?;
+                    let row = canonical.vector(candidate.slot, &mut raw, &mut values)?;
+                    if row != candidate.row {
+                        return Err(corrupt());
+                    }
+                    source.before_distance(DistanceKind::Canonical)?;
+                    candidate.distance = cosine(query, &values);
+                    work.full_precision_evaluations += 1;
+                }
+                candidates.sort_unstable_by(super::types::order);
+                if !old {
+                    for seq in c.tail_head..c.tail_end {
+                        let slot = tail_slot(source, manifest, seq)?;
+                        work.tail_pages_read += 1;
                         if !is_visible(
                             source,
                             manifest,
@@ -166,92 +319,41 @@ pub fn search(
                         )? {
                             continue;
                         }
-                        source.before_distance(DistanceKind::Quantized)?;
-                        let mut dot = 0i64;
-                        let mut aa = 0i64;
-                        let mut bb = 0i64;
-                        for (&a, &b) in query_code.iter().zip(&record[16..]) {
-                            let a = i64::from(a);
-                            let b = i64::from(b as i8);
-                            dot += a * b;
-                            aa += a * a;
-                            bb += b * b;
-                        }
-                        let distance = if aa == 0 || bb == 0 {
-                            1.0
-                        } else {
-                            1.0 - dot as f64 / ((aa as f64).sqrt() * (bb as f64).sqrt())
-                        };
-                        work.quantized_evaluations += 1;
-                        retain_best(
+                        score_exact(
+                            source,
+                            query,
+                            slot,
+                            true,
+                            mode,
+                            &mut canonical,
+                            &mut raw,
+                            &mut values,
                             &mut candidates,
                             depth,
-                            Candidate {
-                                slot,
-                                row,
-                                distance,
-                            },
-                        );
+                            &mut work,
+                        )?;
                     }
                 }
             }
-            // Slot order coalesces canonical pages; distance order is restored only after re-score.
-            candidates.sort_unstable_by_key(|c| c.slot);
-            for candidate in &mut candidates {
-                source.check_cancel()?;
-                let row = canonical.vector(candidate.slot, &mut raw, &mut values)?;
-                if row != candidate.row {
-                    return Err(corrupt());
-                }
-                source.before_distance(DistanceKind::Canonical)?;
-                candidate.distance = cosine(query, &values);
-                work.full_precision_evaluations += 1;
+            work.canonical_pages_read += canonical.pages;
+            work.slot_metadata_pages_read += metadata.pages;
+            for candidate in &candidates {
+                retain_best(&mut merged, k, *candidate);
             }
-            candidates.sort_unstable_by(super::types::order);
-            for slot in manifest.sealed_slots..manifest.slots {
-                source.check_cancel()?;
-                if !is_visible(
-                    source,
-                    manifest,
-                    slot,
-                    &mut visibility,
-                    &mut vis_loaded,
-                    &mut work,
-                )? {
-                    continue;
-                }
-                let row = canonical.vector(slot, &mut raw, &mut values)?;
-                source.before_distance(DistanceKind::Buffer)?;
-                let distance = cosine(query, &values);
-                work.buffer_evaluations += 1;
-                retain_best(
-                    &mut candidates,
-                    depth,
-                    Candidate {
-                        slot,
-                        row,
-                        distance,
-                    },
-                );
-            }
-        }
-        work.canonical_pages_read += canonical.pages;
-        for candidate in &candidates {
-            retain_best(&mut merged, k, *candidate);
         }
         Ok(())
     };
     if let Some(partitions) = contexts {
-        for (i, partition) in partitions.iter().enumerate() {
-            if !partitions[..i].contains(partition) {
-                visit(*partition)?;
+        for (i, p) in partitions.iter().enumerate() {
+            if !partitions[..i].contains(p) {
+                visit(*p)?;
             }
         }
     } else {
         let mut after = None;
-        while let Some(partition) = source.next_partition(after)? {
-            visit(partition)?;
-            after = Some(partition);
+        while let Some(p) = source.next_partition(after)? {
+            visit(p)?;
+            after = Some(p);
         }
     }
     for (dst, src) in output.iter_mut().zip(&merged) {
@@ -262,20 +364,132 @@ pub fn search(
     }
     Ok((merged.len(), work))
 }
+fn validate(source: &impl ReadPages, m: Manifest, p: Policy) -> Result<()> {
+    if m.dimensions != p.dimensions {
+        return Err(dimension(source, m.dimensions, p.dimensions));
+    }
+    if m.lists > p.lists {
+        return Err(super::memory::phase(
+            "clustered query centroid capacity does not cover the captured generation",
+        ));
+    }
+    if m.active_lists > m.lists || m.sealed_slots > m.slots {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+fn score_exact<S: ReadPages>(
+    s: &S,
+    q: &[f32],
+    slot: u64,
+    tail: bool,
+    mode: Mode,
+    canonical: &mut CanonicalWindow<'_, S>,
+    raw: &mut [u8],
+    values: &mut [f32],
+    out: &mut Vec<Candidate>,
+    capacity: usize,
+    work: &mut Work,
+) -> Result<()> {
+    let row = canonical.vector(slot, raw, values)?;
+    s.before_distance(if tail {
+        DistanceKind::Buffer
+    } else {
+        DistanceKind::Canonical
+    })?;
+    let distance = cosine(q, values);
+    if tail {
+        work.buffer_evaluations += 1
+    } else {
+        work.full_precision_evaluations += 1
+    }
+    if mode == Mode::Exact {
+        work.exact_score_count += 1;
+    }
+    retain_best(
+        out,
+        capacity,
+        Candidate {
+            slot,
+            row,
+            distance,
+        },
+    );
+    Ok(())
+}
 fn is_visible(
-    source: &impl ReadPages,
-    manifest: Manifest,
+    s: &impl ReadPages,
+    m: Manifest,
     slot: u64,
     page: &mut [u8; PAGE_BYTES],
     loaded: &mut Option<u64>,
     work: &mut Work,
 ) -> Result<bool> {
-    let previous = *loaded;
-    let result = codec::visible(source, manifest, slot, page, loaded)?;
-    if previous != *loaded {
+    let before = *loaded;
+    let result = codec::visible(s, m, slot, page, loaded)?;
+    if before != *loaded {
         work.visibility_pages_read += 1;
     }
     Ok(result)
+}
+struct MetadataWindow<'a, S> {
+    source: &'a S,
+    manifest: Manifest,
+    page: [u8; PAGE_BYTES],
+    loaded: Option<u64>,
+    pages: u64,
+}
+impl<'a, S: ReadPages> MetadataWindow<'a, S> {
+    fn new(source: &'a S, manifest: Manifest) -> Self {
+        Self {
+            source,
+            manifest,
+            page: [0; PAGE_BYTES],
+            loaded: None,
+            pages: 0,
+        }
+    }
+    fn entry(&mut self, slot: u64) -> Result<Entry> {
+        let mut raw = [0; 40];
+        let mut offset = slot.checked_mul(40).ok_or_else(overflow)?;
+        let mut out = &mut raw[..];
+        while !out.is_empty() {
+            let ordinal = offset / PAGE_BYTES as u64;
+            if self.loaded != Some(ordinal) {
+                self.source.check_cancel()?;
+                if !super::storage::read_page(
+                    self.source,
+                    self.manifest.key(PageKind::SlotMetadata, 0, ordinal),
+                    &mut self.page,
+                )? {
+                    return Err(corrupt());
+                }
+                self.loaded = Some(ordinal);
+                self.pages += 1;
+            }
+            let at = (offset % PAGE_BYTES as u64) as usize;
+            let n = out.len().min(PAGE_BYTES - at);
+            out[..n].copy_from_slice(&self.page[at..at + n]);
+            out = &mut out[n..];
+            offset += n as u64;
+        }
+        let w = |i: usize| -> Result<u64> {
+            Ok(u64::from_le_bytes(
+                raw[i * 8..i * 8 + 8].try_into().map_err(|_| corrupt())?,
+            ))
+        };
+        if w(4)? > 1 {
+            return Err(corrupt());
+        }
+        Ok(Entry {
+            lsn: w(0)?,
+            next: w(1)?,
+            run: w(2)?,
+            tail: w(3)?,
+            prepared: w(4)? == 1,
+        })
+    }
 }
 struct CanonicalWindow<'a, S> {
     source: &'a S,
@@ -301,7 +515,8 @@ impl<'a, S: ReadPages> CanonicalWindow<'a, S> {
             let ordinal = offset / PAGE_BYTES as u64;
             if self.loaded != Some(ordinal) {
                 self.source.check_cancel()?;
-                if !self.source.read_admitted_page(
+                if !super::storage::read_page(
+                    self.source,
                     self.manifest.key(PageKind::Canonical, 0, ordinal),
                     &mut self.page,
                 )? {
@@ -318,8 +533,8 @@ impl<'a, S: ReadPages> CanonicalWindow<'a, S> {
             offset += n as u64;
         }
         let row = u64::from_le_bytes(raw[..8].try_into().map_err(|_| corrupt())?);
-        for (i, value) in values.iter_mut().enumerate() {
-            *value = f32::from_le_bytes(
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = f32::from_le_bytes(
                 raw[8 + i * 4..12 + i * 4]
                     .try_into()
                     .map_err(|_| corrupt())?,

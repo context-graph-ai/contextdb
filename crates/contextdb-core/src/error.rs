@@ -861,6 +861,8 @@ pub enum VectorPartitionDeclarationIssue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum VectorPolicyDeclarationIssue {
+    #[error("{member} has invalid training value {value}")]
+    InvalidTrainingValue { member: &'static str, value: u64 },
     #[error("vector policy clauses require a VECTOR column")]
     RequiresVectorColumn,
     #[error("AUTO_INDEX_AT must be a positive integer")]

@@ -52,3 +52,18 @@ pub(crate) fn bytes<T>(count: usize) -> Result<usize> {
         .checked_mul(std::mem::size_of::<T>())
         .ok_or_else(overflow)
 }
+
+pub(crate) fn dimension(
+    source: &impl super::storage::ReadPages,
+    expected: usize,
+    actual: usize,
+) -> Error {
+    Error::VectorIndexDimensionMismatch {
+        index: source.index_identity().clone(),
+        expected,
+        actual,
+    }
+}
+pub(crate) fn phase(name: impl Into<String>) -> Error {
+    Error::InvalidStateTransition(name.into())
+}

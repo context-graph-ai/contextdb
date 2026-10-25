@@ -14,7 +14,7 @@ use super::ivf_pages;
 use contextdb_core::{Result, VectorIndexRef};
 use contextdb_vector::ivf::storage::{
     BuildState, DistanceKind, Manifest, PAGE_BYTES, PageKey, PageKind, PageStore, ReadPages,
-    TailRef, WritePages,
+    WritePages,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -26,6 +26,9 @@ pub struct Hiding {
     pub reads: RefCell<BTreeMap<PageKind, u64>>,
 }
 impl ReadPages for Hiding {
+    fn index_identity(&self) -> &VectorIndexRef {
+        self.inner.index_identity()
+    }
     fn snapshot_lsn(&self) -> Result<u64> {
         self.inner.snapshot_lsn()
     }
@@ -43,9 +46,6 @@ impl ReadPages for Hiding {
     }
     fn next_partition(&self, after: Option<u64>) -> Result<Option<u64>> {
         self.inner.next_partition(after)
-    }
-    fn next_unsealed(&self, after: Option<(u64, u64)>) -> Result<Option<TailRef>> {
-        self.inner.next_unsealed(after)
     }
     fn read_admitted_page(&self, key: PageKey, output: &mut [u8; PAGE_BYTES]) -> Result<bool> {
         *self.reads.borrow_mut().entry(key.kind).or_default() += 1;
@@ -78,6 +78,9 @@ pub struct HidingTransaction<'a> {
     reads: &'a RefCell<BTreeMap<PageKind, u64>>,
 }
 impl ReadPages for HidingTransaction<'_> {
+    fn index_identity(&self) -> &VectorIndexRef {
+        self.inner.index_identity()
+    }
     fn snapshot_lsn(&self) -> Result<u64> {
         self.inner.snapshot_lsn()
     }
@@ -95,9 +98,6 @@ impl ReadPages for HidingTransaction<'_> {
     }
     fn next_partition(&self, after: Option<u64>) -> Result<Option<u64>> {
         self.inner.next_partition(after)
-    }
-    fn next_unsealed(&self, after: Option<(u64, u64)>) -> Result<Option<TailRef>> {
-        self.inner.next_unsealed(after)
     }
     fn read_admitted_page(&self, key: PageKey, output: &mut [u8; PAGE_BYTES]) -> Result<bool> {
         *self.reads.borrow_mut().entry(key.kind).or_default() += 1;
@@ -127,6 +127,6 @@ impl WritePages for HidingTransaction<'_> {
 
 /// The index identity the page port supplies to the kernel, which the
 /// kernel's typed errors name.
-pub fn port_identity(_port: &impl ReadPages) -> VectorIndexRef {
-    unimplemented!("the page port does not yet supply its index identity")
+pub fn port_identity(port: &impl ReadPages) -> VectorIndexRef {
+    port.index_identity().clone()
 }
