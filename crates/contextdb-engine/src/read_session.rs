@@ -6944,7 +6944,8 @@ impl ReadSession {
             Option<(usize, usize, u64)>,
         ) -> Result<T>,
     ) -> Result<T> {
-        let ReadSessionState::DirectFile(reader) = self.selected_state().as_ref() else {
+        let state = self.selected_state();
+        let ReadSessionState::DirectFile(reader) = state.as_ref() else {
             return Err(Error::PlanError(
                 "physical fixture requires the direct-file route".into(),
             ));
