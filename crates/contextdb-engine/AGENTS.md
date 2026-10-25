@@ -119,6 +119,14 @@ and `src/database/write_publication_drive/tests.rs`.
 
 ## Clock and memory seams
 
+The allocation recorder in `src/persistence/proof_allocation_oracle_tests.rs` keeps a bounded
+256-slot prefix and an explicit overflow flag; its separate scalar ordinal is never an array bound.
+`source_requests_for_test` requires a complete census and rejects overflow after recording stops.
+`source_request_prefix_for_test` serves selected-constructor proofs, which check every consumed slot;
+later allocations do not qualify as a complete census. Cleanup dumps clamp their slices and report
+overflow without replacing an existing unwind. Guards: `native_request_overflow_invalidates_the_receipt_after_recording_stops`
+and `an_overflowing_allocation_dump_preserves_the_original_unwind`.
+
 Persist timestamps through `contextdb_core::Wallclock::now()`, never raw epoch math. Tests use
 `Wallclock::test_clock_guard`; its override is thread-local, so drive background maintenance
 synchronously. Core `tests/test_estate_audit.rs::test_estate_audit_no_new_sleeps_or_raw_clock_reads`

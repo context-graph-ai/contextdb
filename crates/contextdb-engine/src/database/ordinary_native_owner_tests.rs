@@ -763,7 +763,7 @@ fn observed_parent<T>(
     action: impl FnOnce() -> T,
 ) -> (T, [Request; 3], usize) {
     let (value, requests, count) =
-        oracle::source_requests_for_test(parent.ordinary_parent_counter_for_test(), action);
+        oracle::source_request_prefix_for_test(parent.ordinary_parent_counter_for_test(), action);
     let credits = oracle::source_request_credit_for_test();
     update(|c| {
         if c.stages > 3 || count < c.constructor_base + c.stages {
@@ -801,8 +801,8 @@ fn observed_parent<T>(
     if captured.allow_constructor_prefix && captured.constructor_base != 0 {
         eprintln!(
             "native_constructor_prefix requests={:?} original_parent_funding={:?}",
-            &requests[..captured.constructor_base],
-            &credits[..captured.constructor_base]
+            &requests[..captured.constructor_base.min(requests.len())],
+            &credits[..captured.constructor_base.min(credits.len())]
         );
     }
     (value, captured.requests, count)
@@ -1500,7 +1500,7 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
         });
         let ((answer, allocations, count), sample) =
             crate::vector_read_memory::statement_child_proof::observe(&parent, limit, || {
-                oracle::source_requests_for_test(counter, || {
+                oracle::source_request_prefix_for_test(counter, || {
                     db.execute_at_snapshot(query, &params, db.snapshot())
                 })
             });
@@ -1665,7 +1665,7 @@ fn retained_trace_and_live_answer_have_independent_actual_invoice_cuts() {
             &parent,
             refusal_limit,
             || {
-                oracle::source_requests_for_test(counter, || {
+                oracle::source_request_prefix_for_test(counter, || {
                     db.execute_at_snapshot(query, &params, db.snapshot())
                 })
             },

@@ -745,9 +745,13 @@ fn funded_output_rolls_back_on_second_pass_serializer_failure_and_unwind() {
                 Ok(Err(ReadEncodingError::InvalidPayload))
             ));
         }
-        assert!(count <= requests.len());
+        assert!(
+            !physical::source_request_overflow_for_test() && count <= requests.len(),
+            "allocation recorder overflow: encoded-output receipt is incomplete"
+        );
+        let recorded = &requests[..count.min(requests.len())];
         assert_eq!(
-            requests[..count].iter().filter(|r| r.1 == length).count(),
+            recorded.iter().filter(|r| r.1 == length).count(),
             1,
             "the actual output allocation happened before failure"
         );

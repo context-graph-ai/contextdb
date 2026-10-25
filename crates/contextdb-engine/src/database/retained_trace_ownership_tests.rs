@@ -207,16 +207,22 @@ fn dump_ordered_cuts(label: &str) {
     let handoff = HANDOFF.with(Cell::get);
     eprintln!("capture969 pending={pending:?}");
     for (name, request) in [("factory", factory), ("handoff", handoff)] {
+        let count = request
+            .count
+            .min(request.allocations.len())
+            .min(request.credits.len());
+        let overflowed = request.overflowed || request.count > count;
         eprintln!(
-            "capture969 {} payer={} counter={} before={} after={} count={} allocations={:?} credits={:?}",
+            "capture969 {} payer={} counter={} before={} after={} count={} overflowed={} allocations={:?} credits={:?}",
             name,
             request.payer,
             request.counter,
             request.before,
             request.after,
             request.count,
-            &request.allocations[..request.count],
-            &request.credits[..request.count]
+            overflowed,
+            &request.allocations[..count],
+            &request.credits[..count]
         );
     }
     if let Some(pending) = pending {
@@ -240,6 +246,7 @@ struct OwnerRequest {
     allocations: [Allocation; 256],
     credits: [usize; 256],
     count: usize,
+    overflowed: bool,
     counter: usize,
     before: usize,
     after: usize,
@@ -249,6 +256,7 @@ const EMPTY_OWNER: OwnerRequest = OwnerRequest {
     allocations: [(0, 0, 0); 256],
     credits: [0; 256],
     count: 0,
+    overflowed: false,
     counter: 0,
     before: 0,
     after: 0,
@@ -430,6 +438,7 @@ impl Drop for OwnerWindow {
             allocations,
             credits,
             count,
+            overflowed: oracle::source_request_overflow_for_test(),
             counter: self.counter,
             before: self.before,
             after: counter_value(self.counter),
@@ -495,6 +504,13 @@ impl Drop for Capture {
         ROLLBACK_PIN.with(|slot| drop(slot.borrow_mut().take()));
         ROLLBACK_TRACE.with(|slot| slot.set(None));
         ROLLBACK_NATIVE_FREE.with(|slot| slot.set(None));
+        if !std::thread::panicking() {
+            assert!(
+                !OWNER.with(|slot| slot.get().overflowed)
+                    && !HANDOFF.with(|slot| slot.get().overflowed),
+                "allocation recorder overflow: retained trace receipt is incomplete"
+            );
+        }
     }
 }
 fn invoice(db: &Database) -> TraceInvoiceForTest {
@@ -535,6 +551,10 @@ fn assert_owner_request(
     receipt: TraceInvoiceForTest,
     observed: &statement::Observation,
 ) -> Controls {
+    assert!(
+        !owner.overflowed && owner.count <= owner.allocations.len(),
+        "allocation recorder overflow: retained trace receipt is incomplete"
+    );
     assert_rollback_native_frees();
     let proof = observed
         .trace_owner_controls
@@ -1936,4 +1956,33 @@ fn retained_trace_provider_callback_unwind_keeps_pending_payload_paid_through_na
     assert_eq!(db.accountant().usage().used, writer_before);
     // std panic and test-harness runtime allocations are outside this narrow
     // original-native-free proof; no process allocator/OOM qualification follows.
+}
+
+// An already-failing proof must retain its original panic even if its
+// diagnostic census overflowed. The diagnostic dump is also called by cleanup.
+#[test]
+#[serial_test::serial]
+fn an_overflowing_allocation_dump_preserves_the_original_unwind() {
+    struct Dump;
+    impl Drop for Dump {
+        fn drop(&mut self) {
+            dump_ordered_cuts("overflow-during-unwind");
+        }
+    }
+    let outcome = std::panic::catch_unwind(|| {
+        OWNER.with(|slot| {
+            slot.set(OwnerRequest {
+                count: usize::MAX,
+                ..EMPTY_OWNER
+            })
+        });
+        let _dump = Dump;
+        panic!("original allocation proof failure");
+    });
+    OWNER.with(|slot| slot.set(EMPTY_OWNER));
+    let panic = outcome.expect_err("the original proof still fails");
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"original allocation proof failure")
+    );
 }

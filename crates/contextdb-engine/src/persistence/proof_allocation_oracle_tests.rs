@@ -51,6 +51,9 @@ thread_local! {
     static LAST_SOURCE_REQUEST_CREDIT: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0,0,0)) };
     static SOURCE_REQUEST_CREDIT: std::cell::Cell<[usize; 256]> = const { std::cell::Cell::new([0; 256]) };
     static NATIVE_REQUEST_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Scalar allocation ordinal only; never an index into the bounded arrays.
+    static NATIVE_REQUEST_TOTAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NATIVE_REQUEST_OVERFLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static NATIVE_REQUEST_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -677,6 +680,16 @@ pub(crate) fn source_requests_for_test<T>(
     counter: usize,
     operation: impl FnOnce() -> T,
 ) -> (T, [(usize, usize, usize); 256], usize) {
+    let receipt = source_request_prefix_for_test(counter, operation);
+    assert_native_request_receipt_complete();
+    receipt
+}
+// Selected-constructor proofs check each consumed slot themselves. Later
+// query allocations do not belong to that prefix and are not a complete census.
+pub(crate) fn source_request_prefix_for_test<T>(
+    counter: usize,
+    operation: impl FnOnce() -> T,
+) -> (T, [(usize, usize, usize); 256], usize) {
     struct Guard;
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -707,7 +720,9 @@ pub(crate) fn reader_requests_for_test<T>(counter: usize, action: impl FnOnce() 
     });
     SOURCE_COUNTER_IS_READER.with(|slot| slot.set(true));
     let guard = Guard;
-    let (value, _, _) = source_requests_for_test(counter, action);
+    // Funding is sampled for every actual allocation; this path consumes no
+    // request census and does not qualify the bounded request prefix.
+    let (value, _, _) = source_request_prefix_for_test(counter, action);
     drop(guard);
     value
 }
@@ -733,6 +748,15 @@ pub(crate) fn source_unfunded_peak_for_test() -> (usize, (usize, usize, usize, b
 // retained for the actual latest constructor even beyond that prefix.
 pub(crate) fn last_source_request_credit_for_test() -> (usize, usize, usize) {
     LAST_SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get)
+}
+pub(crate) fn source_request_overflow_for_test() -> bool {
+    NATIVE_REQUEST_OVERFLOW.with(std::cell::Cell::get)
+}
+fn assert_native_request_receipt_complete() {
+    assert!(
+        !source_request_overflow_for_test(),
+        "allocation recorder overflow: the fixed request receipt is incomplete"
+    );
 }
 pub(crate) fn source_request_credit_for_test() -> [usize; 256] {
     SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get)
@@ -791,6 +815,8 @@ pub(crate) fn source_live_at_free_for_test(count: usize) -> [usize; 128] {
     std::array::from_fn(|index| NATIVE_FREE[index].live_at_free.load(AtomicOrdering::SeqCst))
 }
 
+// This three-request prefix qualifies selected constructors, not every later
+// allocation in the action. Whole-window proofs use source_requests_for_test.
 pub(crate) fn native_requests_for_test<T>(
     operation: impl FnOnce() -> T,
 ) -> (T, [(usize, usize, usize); 3], usize) {
@@ -802,6 +828,8 @@ pub(crate) fn native_requests_for_test<T>(
     }
     NATIVE_REQUESTS.with(|requests| requests.set([(0, 0, 0); 256]));
     NATIVE_REQUEST_COUNT.with(|count| count.set(0));
+    NATIVE_REQUEST_TOTAL.with(|total| total.set(0));
+    NATIVE_REQUEST_OVERFLOW.with(|overflow| overflow.set(false));
     NATIVE_REQUEST_ACTIVE.with(|active| active.set(true));
     let guard = Guard;
     let (value, _, _) = measured(operation);
@@ -809,7 +837,7 @@ pub(crate) fn native_requests_for_test<T>(
     (
         value,
         NATIVE_REQUESTS.with(|requests| requests.get()[..3].try_into().unwrap()),
-        NATIVE_REQUEST_COUNT.with(std::cell::Cell::get),
+        NATIVE_REQUEST_TOTAL.with(std::cell::Cell::get),
     )
 }
 
@@ -1143,7 +1171,10 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         if source_counter != 0 {
             let index = NATIVE_REQUEST_COUNT.with(std::cell::Cell::get);
             let funding = observed_source_funding(source_counter);
-            LAST_SOURCE_REQUEST_CREDIT.with(|slot| slot.set((source_counter, funding, index + 1)));
+            let ordinal = NATIVE_REQUEST_TOTAL
+                .with(std::cell::Cell::get)
+                .saturating_add(1);
+            LAST_SOURCE_REQUEST_CREDIT.with(|slot| slot.set((source_counter, funding, ordinal)));
             if index < 256 {
                 SOURCE_REQUEST_CREDIT.with(|credits| {
                     let mut entries = credits.get();
@@ -1202,7 +1233,11 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
                         requests.set(entries);
                     });
                 }
-                count.set(index + 1);
+                if index >= 256 {
+                    NATIVE_REQUEST_OVERFLOW.with(|overflow| overflow.set(true));
+                }
+                count.set(index.saturating_add(1).min(256));
+                NATIVE_REQUEST_TOTAL.with(|total| total.set(total.get().saturating_add(1)));
             });
         }
         unsafe {
@@ -3218,6 +3253,8 @@ pub(crate) fn disarm_source_free_watch() {
 
 pub(crate) fn arm_inverse_window() {
     NATIVE_REQUEST_COUNT.with(|count| count.set(0));
+    NATIVE_REQUEST_TOTAL.with(|total| total.set(0));
+    NATIVE_REQUEST_OVERFLOW.with(|overflow| overflow.set(false));
     NATIVE_REQUEST_ACTIVE.with(|active| {
         assert!(!active.get());
         active.set(true);
@@ -3225,6 +3262,7 @@ pub(crate) fn arm_inverse_window() {
 }
 pub(crate) fn disarm_inverse_window() -> usize {
     NATIVE_REQUEST_ACTIVE.with(|active| active.set(false));
+    assert_native_request_receipt_complete();
     NATIVE_REQUEST_COUNT.with(std::cell::Cell::get)
 }
 #[cfg(feature = "test-seams")]
@@ -3504,6 +3542,7 @@ mod row_check_cache_ownership_contract {
                     // The intentional null has no cache pointer. Do not let
                     // later error construction enter the cache allocation census.
                     super::NATIVE_REQUEST_COUNT.set(PHASE_REQUEST_START.get());
+                    super::NATIVE_REQUEST_TOTAL.set(PHASE_REQUEST_START.get());
                     return;
                 }
                 let n = super::NATIVE_REQUEST_COUNT.get();
@@ -3646,6 +3685,8 @@ mod row_check_cache_ownership_contract {
         PHASE_LAYOUTS.set([(0, 0); 32]);
         MIGRATED.set(0);
         super::NATIVE_REQUEST_COUNT.set(0);
+        super::NATIVE_REQUEST_TOTAL.set(0);
+        super::NATIVE_REQUEST_OVERFLOW.set(false);
         super::NATIVE_REQUESTS.set([(0, 0, 0); 256]);
         super::SOURCE_REQUEST_CREDIT.set([0; 256]);
         super::disarm_source_free_watch();
@@ -5193,6 +5234,8 @@ impl SourceRequestsWindow {
         SOURCE_REQUEST_CREDIT.with(|slot| slot.set([0; 256]));
         NATIVE_REQUESTS.with(|slot| slot.set([(0, 0, 0); 256]));
         NATIVE_REQUEST_COUNT.with(|slot| slot.set(0));
+        NATIVE_REQUEST_TOTAL.with(|total| total.set(0));
+        NATIVE_REQUEST_OVERFLOW.with(|overflow| overflow.set(false));
         SOURCE_REQUEST_COUNTER.with(|slot| slot.set(counter));
         MEASURING_HERE.with(|slot| slot.set(window.0));
         NATIVE_REQUEST_ACTIVE.with(|slot| slot.set(true));
@@ -5204,7 +5247,7 @@ impl SourceRequestsWindow {
         (
             NATIVE_REQUESTS.with(std::cell::Cell::get),
             SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get),
-            NATIVE_REQUEST_COUNT.with(std::cell::Cell::get),
+            NATIVE_REQUEST_COUNT.with(|count| count.get().min(256)),
         )
     }
 }
@@ -5319,4 +5362,51 @@ fn maintenance_allocator_observation_tracks_real_payload_before_refund() {
     maintenance_owner_refund(owner, &spy);
     spy.source.release(bytes);
     spy.assert_payload_lifetime();
+}
+
+// A fixed recorder must reject incomplete evidence after it stops observing,
+// so formatting the failure cannot recursively enter its allocator hook.
+#[test]
+#[serial]
+fn native_request_overflow_invalidates_the_receipt_after_recording_stops() {
+    let outcome = std::panic::catch_unwind(|| {
+        source_requests_for_test(0, || {
+            for _ in 0..257 {
+                let layout = Layout::new::<[u8; 17]>();
+                let pointer = unsafe { std::alloc::alloc(layout) };
+                assert!(!pointer.is_null());
+                std::hint::black_box(pointer);
+                unsafe { std::alloc::dealloc(pointer, layout) };
+            }
+        })
+    });
+    let panic = outcome.expect_err("overflow must invalidate the allocation receipt");
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic");
+    assert!(
+        message.contains("allocation recorder overflow"),
+        "{message}"
+    );
+    let (block, _, count) = native_requests_for_test(|| Box::new(17_u64));
+    assert_eq!(count, 1, "a new window starts with a complete recorder");
+    drop(block);
+    let window = SourceRequestsWindow::begin(0);
+    for _ in 0..257 {
+        let layout = Layout::new::<[u8; 17]>();
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        assert!(!pointer.is_null());
+        std::hint::black_box(pointer);
+        unsafe { std::alloc::dealloc(pointer, layout) };
+    }
+    let (_, _, recorded) = window.receipt();
+    let overflowed = source_request_overflow_for_test();
+    drop(window);
+    assert_eq!(recorded, 256, "borrowed receipts clamp to their storage");
+    assert!(
+        overflowed,
+        "the bounded prefix cannot qualify as a complete census"
+    );
 }
