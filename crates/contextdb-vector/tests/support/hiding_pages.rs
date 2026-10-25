@@ -6,7 +6,9 @@
 //! trait gains a member (the index identity, `fn index_identity(&self) ->
 //! &VectorIndexRef`), `Hiding` and `HidingTransaction` delegate it to what
 //! they wrap, and `port_identity` returns `port.index_identity().clone()`;
-//! those are the only edits this file is meant to receive.
+//! those are the only edits this file is meant to receive. The page port's
+//! LSN accessors, `snapshot_lsn` (the pinned frontier) and `commit_lsn` (the
+//! committing transaction's LSN), are forwarded the same way, unchanged.
 #![allow(dead_code)]
 use super::ivf_pages;
 use contextdb_core::{Result, VectorIndexRef};
@@ -24,6 +26,9 @@ pub struct Hiding {
     pub reads: RefCell<BTreeMap<PageKind, u64>>,
 }
 impl ReadPages for Hiding {
+    fn snapshot_lsn(&self) -> Result<u64> {
+        self.inner.snapshot_lsn()
+    }
     fn check_cancel(&self) -> Result<()> {
         self.inner.check_cancel()
     }
@@ -73,6 +78,9 @@ pub struct HidingTransaction<'a> {
     reads: &'a RefCell<BTreeMap<PageKind, u64>>,
 }
 impl ReadPages for HidingTransaction<'_> {
+    fn snapshot_lsn(&self) -> Result<u64> {
+        self.inner.snapshot_lsn()
+    }
     fn check_cancel(&self) -> Result<()> {
         self.inner.check_cancel()
     }
@@ -100,6 +108,9 @@ impl ReadPages for HidingTransaction<'_> {
     }
 }
 impl WritePages for HidingTransaction<'_> {
+    fn commit_lsn(&self) -> Result<u64> {
+        self.inner.commit_lsn()
+    }
     fn put_page(&mut self, key: PageKey, payload: &[u8; PAGE_BYTES]) -> Result<()> {
         self.inner.put_page(key, payload)
     }
