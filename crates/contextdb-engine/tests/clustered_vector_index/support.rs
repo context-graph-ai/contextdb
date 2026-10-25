@@ -400,6 +400,47 @@ pub fn build_progress(
     unimplemented!("{UNBOUND}: build progress")
 }
 
+/// Damage planted in a Context's serving generation's derived index pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexDamage {
+    /// A serving codebook page no longer matches the digest its generation's
+    /// codebook identity binds.
+    CodebookDigest,
+    /// The directory page of one of the Context's sealed delta runs is
+    /// missing.
+    MissingRunDirectory,
+}
+
+/// Plants `damage` in the serving generation of the Context, below the
+/// engine, as a lost or corrupted native page would leave it.
+pub fn damage_serving_index(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _damage: IndexDamage,
+) {
+    unimplemented!("{UNBOUND}: damaging a serving index page")
+}
+
+/// The recovery action inspection shows for a Context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// The serving generation is unserviceable; maintenance rebuilds it from
+    /// the committed rows.
+    Rebuild,
+}
+
+/// The recovery action inspection shows for the Context, if any.
+pub fn recovery_action(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> Option<RecoveryAction> {
+    unimplemented!("{UNBOUND}: the recovery action")
+}
+
 /// Durability boundaries of publishing a newly built generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicationCut {
