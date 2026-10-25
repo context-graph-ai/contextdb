@@ -6,7 +6,10 @@
 //! applied whatever the reader declared. Under the reader budget a
 //! context-graph search declares by default (1 GiB), a working set far
 //! smaller than that budget is read from the file once: repeating the same
-//! queries on the same reader reads nothing more from the file.
+//! queries on the same reader reads nothing more from the file. The working
+//! set is what the first round of queries reads from the file: about 49 MB of
+//! file pages for 24 MiB of row payload, because each 4 KiB-plus row spans two
+//! pages.
 //!
 //! Both tests are exact. One reads the cache share the production read open
 //! uses for a declared budget; the other counts the bytes the storage backend
@@ -76,8 +79,9 @@ fn reader_options(budget: usize) -> ReadSessionOptions {
 }
 
 /// The page cache a reader opens with is a share of its declared budget:
-/// a larger declared budget gives a larger cache, and the cache never takes
-/// the whole budget.
+/// a larger declared budget gives a larger cache, and the cache together with
+/// the reader's fixed source reservations stays below the budget, leaving the
+/// rest for results and working memory.
 #[test]
 fn a_readers_page_cache_share_grows_with_its_declared_memory_budget() {
     let budgets = [
@@ -86,12 +90,14 @@ fn a_readers_page_cache_share_grows_with_its_declared_memory_budget() {
         DEFAULT_SEARCH_READER_BUDGET,
         4096 * MIB,
     ];
-    let shares =
-        budgets.map(|budget| read_source_cache_reservation_for_limit_for_test(Some(budget)).0);
-    for (budget, share) in budgets.iter().zip(shares) {
+    let reservations =
+        budgets.map(|budget| read_source_cache_reservation_for_limit_for_test(Some(budget)));
+    let shares = reservations.map(|(share, _)| share);
+    for (budget, (share, fixed)) in budgets.iter().zip(reservations) {
         assert!(
-            share < *budget,
-            "a {budget}-byte reader's page cache ({share} bytes) must leave room for the rest of its work"
+            share + fixed < *budget,
+            "a {budget}-byte reader's page cache ({share} bytes) plus its fixed source \
+             reservations ({fixed} bytes) must leave room for the rest of its work"
         );
     }
     assert!(
@@ -101,9 +107,10 @@ fn a_readers_page_cache_share_grows_with_its_declared_memory_budget() {
     );
 }
 
-/// Under the default search reader budget, a 24 MiB working set (well under
-/// that budget) is read from the file by the first round of queries and not
-/// again by an identical second round on the same reader.
+/// Under the default search reader budget, the working set the first round
+/// of queries reads from the file (about 49 MB of file pages for 24 MiB of row
+/// payload, well under that budget) fits the reader's derived page cache and
+/// is not read again by an identical second round on the same reader.
 #[test]
 fn a_working_set_inside_the_default_search_budget_is_read_from_the_file_once() {
     let root = tempfile::tempdir().unwrap();
@@ -149,8 +156,13 @@ fn a_working_set_inside_the_default_search_budget_is_read_from_the_file_once() {
         read_source_cache_reservation_for_limit_for_test(Some(DEFAULT_SEARCH_READER_BUDGET)).0;
     assert!(
         first as usize >= ROWS * PAYLOAD_BYTES,
-        "the first round must read the whole {}-byte working set from the file (read {first})",
+        "the first round must read at least the {}-byte row payload from the file (read {first})",
         ROWS * PAYLOAD_BYTES
+    );
+    assert!(
+        first as usize <= share,
+        "the working set the first round read ({first} bytes of file pages) must fit the page \
+         cache derived from a {DEFAULT_SEARCH_READER_BUDGET}-byte reader budget ({share} bytes)"
     );
     assert_eq!(
         second, 0,
