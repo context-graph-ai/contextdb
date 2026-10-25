@@ -1,17 +1,20 @@
-//! While a published replacement remaps the legacy runs sealed under the old
-//! codebook, every committed vector is answered exactly once: the set R of
-//! legacy runs is fixed at the publication commit, each remap batch moves
-//! whole runs, and at every batch boundary a full-depth search returns each
-//! committed row once, with no duplicate and no omission. Writers keep
-//! sealing under the new codebook, so R never grows. The old codebook stays
-//! retained, with its whole-object charge, until the cursor exhausts R, and
-//! is released then. A crash inside a remap batch recovers the same state and
-//! finishes with the same property.
+//! While a published replacement remaps the legacy entries sealed under the
+//! old codebook, every committed vector is answered exactly once. The legacy
+//! set is fixed at the publication commit F1 as the delta entries with commit
+//! LSN in (F0, F1], with an immutable membership identity; each maintenance
+//! call remaps at most one bounded batch of entries; and at every call
+//! boundary a full-depth search returns each committed row once, with no
+//! duplicate and no omission. Writers keep sealing under the new codebook, so
+//! the legacy set never changes. The old codebook stays retained, with a
+//! positive charge, until the remap exhausts the legacy set, and is released
+//! then. A crash inside a remap batch recovers the same state and finishes
+//! with the same property.
 
 use super::support::{
-    IndexTestOptions, MAX_MAINTENANCE_CYCLES, PublicationCut, SwitchPhase, SwitchState,
-    build_progress, delta_runs, drive_until_serving, empty, int_ids, ivf, observe_publication_cuts,
-    open_with_index_test_options, params, serving, switch_state, unit_vector,
+    IndexTestOptions, LegacyEntries, MAX_MAINTENANCE_CYCLES, PublicationCut, SwitchPhase,
+    SwitchState, build_progress, delta_entries, drive_until_serving, empty, int_ids, ivf,
+    observe_publication_cuts, open_with_index_test_options, params, serving, switch_state,
+    unit_vector, write_buffer,
 };
 use contextdb_core::{Value, Wallclock};
 use contextdb_engine::Database;
@@ -29,10 +32,14 @@ const OPTIONS: IndexTestOptions = IndexTestOptions {
 const BUILT: std::ops::Range<i64> = 0..120;
 const GROWTH: std::ops::Range<i64> = 1_000..1_240;
 /// Single-row commits sealed under the old codebook while the replacement
-/// trains: the legacy runs.
+/// trains: the legacy entries.
 const LEGACY: std::ops::Range<i64> = 2_000..2_096;
-/// Single-row commits made after the switch, sealed under the new codebook.
-const AFTER_SWITCH: std::ops::Range<i64> = 3_000..3_064;
+/// Ids of single-row commits made after the switch start here.
+const AFTER_SWITCH_FIRST: i64 = 3_000;
+/// Commits per remap boundary after the switch: two write-buffer caps of
+/// vectors, so every boundary seals.
+const AFTER_SWITCH_PER_BOUNDARY: i64 = 32;
+const BATCH: u64 = 16;
 
 fn vector(id: i64) -> Vec<f32> {
     unit_vector(id as u64, DIMENSIONS)
@@ -107,9 +114,10 @@ fn state(db: &Database) -> SwitchState {
 }
 
 /// Serves the first generation, starts its replacement, seals the legacy
-/// runs under the old codebook, and publishes the replacement. Returns the
-/// committed rows, the old codebook and R as recorded at publication.
-fn reach_state_b(db: &Database) -> (BTreeSet<i64>, u64, u64) {
+/// entries under the old codebook, and publishes the replacement. Returns the
+/// committed rows, the old codebook and the legacy set recorded at
+/// publication.
+fn reach_state_b(db: &Database) -> (BTreeSet<i64>, u64, LegacyEntries) {
     create(db);
     insert_all(db, BUILT);
     drive_until_serving(db);
@@ -144,13 +152,16 @@ fn reach_state_b(db: &Database) -> (BTreeSet<i64>, u64, u64) {
         SwitchPhase::Remapping,
         "the switch enters the remap state"
     );
+    let legacy = at_switch
+        .legacy
+        .unwrap_or_else(|| panic!("the publication commit records the legacy set: {at_switch:?}"));
     assert!(
-        at_switch.legacy_runs >= 1,
-        "R holds the runs sealed under the old codebook: {at_switch:?}"
+        legacy.after_lsn < legacy.through_lsn && legacy.entries >= 1,
+        "the legacy set holds the entries sealed under the old codebook: {legacy:?}"
     );
     assert!(
-        at_switch.legacy_runs_remapped < at_switch.legacy_runs,
-        "the publication commit records R before any of it is remapped: {at_switch:?}"
+        at_switch.legacy_entries_remapped < legacy.entries,
+        "legacy remap work is pending after the publication commit: {at_switch:?}"
     );
     assert_eq!(
         at_switch.retained_codebook,
@@ -159,82 +170,126 @@ fn reach_state_b(db: &Database) -> (BTreeSet<i64>, u64, u64) {
     );
     assert!(
         at_switch.retained_codebook_charge_bytes > 0,
-        "the retained codebook is charged whole"
+        "the retained codebook holds a positive charge"
     );
-    (committed, old.codebook, at_switch.legacy_runs)
+    assert_legacy_coverage(db, &legacy, "at the switch");
+    (committed, old.codebook, legacy)
 }
 
-/// Drives remap cycles to completion, committing rows under the new codebook
-/// between them, and checks every batch boundary.
+/// The delta entries with commit LSN in (F0, F1] are exactly as many as the
+/// legacy set recorded.
+fn assert_legacy_coverage(db: &Database, legacy: &LegacyEntries, stage: &str) {
+    let covered = delta_entries(db, "switch_items", "embedding", &[])
+        .into_iter()
+        .filter(|entry| {
+            entry.commit_lsn > legacy.after_lsn && entry.commit_lsn <= legacy.through_lsn
+        })
+        .count() as u64;
+    assert_eq!(
+        covered, legacy.entries,
+        "{stage}: the entries in (F0, F1] are exactly the legacy set: {legacy:?}"
+    );
+}
+
+/// Drives remap cycles to completion, sealing new commits under the new
+/// codebook between them, and checks every call boundary.
 fn remap_to_completion(
     db: &Database,
     committed: &mut BTreeSet<i64>,
     old_codebook: u64,
-    legacy_runs: u64,
+    legacy: LegacyEntries,
     stage: &str,
 ) {
-    let mut after_switch = AFTER_SWITCH;
+    let new_codebook = serving(db, "switch_items", "embedding", &[])
+        .expect("the replacement serves")
+        .codebook;
+    let mut next_id = AFTER_SWITCH_FIRST;
+    let mut remapped = state(db).legacy_entries_remapped;
     for _ in 0..MAX_MAINTENANCE_CYCLES {
         let now = state(db);
         if now.phase == SwitchPhase::Serving {
             break;
         }
         assert_eq!(
-            now.legacy_runs, legacy_runs,
-            "{stage}: R stays fixed at the publication commit"
+            now.legacy,
+            Some(legacy),
+            "{stage}: the legacy frontier, size and membership stay fixed at F1"
         );
+        assert!(
+            now.legacy_entries_remapped >= remapped
+                && now.legacy_entries_remapped - remapped <= BATCH,
+            "{stage}: one call remaps at most one bounded batch of entries: {remapped} then {now:?}"
+        );
+        remapped = now.legacy_entries_remapped;
         assert_eq!(
             (
                 now.retained_codebook,
                 now.retained_codebook_charge_bytes > 0
             ),
             (Some(old_codebook), true),
-            "{stage}: the old codebook stays retained and charged until R is exhausted: {now:?}"
+            "{stage}: the old codebook stays retained and charged until the legacy set is \
+             exhausted: {now:?}"
         );
+        assert_legacy_coverage(db, &legacy, stage);
         assert_each_row_exactly_once(db, committed, &format!("{stage}, remap boundary {now:?}"));
-        for id in after_switch.by_ref().take(16) {
-            insert_one(db, id);
-            committed.insert(id);
+
+        let seals_before = write_buffer(db, "switch_items", "embedding").sealed_runs;
+        for _ in 0..AFTER_SWITCH_PER_BOUNDARY {
+            insert_one(db, next_id);
+            committed.insert(next_id);
+            next_id += 1;
         }
-        let new_codebook = serving(db, "switch_items", "embedding", &[])
-            .unwrap()
-            .codebook;
-        let tagged_old = delta_runs(db, "switch_items", "embedding", &[])
-            .into_iter()
-            .filter(|run| run.codebook == Some(old_codebook))
-            .count() as u64;
         assert!(
-            tagged_old <= legacy_runs - now.legacy_runs_remapped,
-            "{stage}: new writes seal under the new codebook {new_codebook}, never into R"
+            write_buffer(db, "switch_items", "embedding").sealed_runs > seals_before,
+            "{stage}: the commits after the switch sealed"
         );
+        for entry in delta_entries(db, "switch_items", "embedding", &[]) {
+            if entry.commit_lsn > legacy.through_lsn && entry.sealed {
+                assert_eq!(
+                    entry.codebook,
+                    Some(new_codebook),
+                    "{stage}: an entry sealed after F1 carries the new codebook: {entry:?}"
+                );
+            }
+        }
         assert_eq!(
-            state(db).legacy_runs,
-            legacy_runs,
-            "{stage}: writes do not grow R"
+            state(db).legacy,
+            Some(legacy),
+            "{stage}: new seals leave the legacy set unchanged"
         );
+        assert_each_row_exactly_once(db, committed, &format!("{stage}, after new seals"));
         db.run_maintenance_cycle().expect("one remap cycle");
     }
     let done = state(db);
     assert_eq!(
         done.phase,
         SwitchPhase::Serving,
-        "{stage}: the cursor exhausts R"
+        "{stage}: the remap exhausts the legacy set"
     );
     assert_eq!(
         (done.retained_codebook, done.retained_codebook_charge_bytes),
         (None, 0),
-        "{stage}: the old codebook and its charge are released once R is exhausted"
+        "{stage}: the old codebook and its charge are released once the legacy set is exhausted"
     );
+    for entry in delta_entries(db, "switch_items", "embedding", &[]) {
+        if entry.sealed {
+            assert_eq!(
+                entry.codebook,
+                Some(new_codebook),
+                "{stage}: after the remap every sealed entry is on the new codebook: {entry:?}"
+            );
+        }
+    }
     assert_each_row_exactly_once(db, committed, &format!("{stage}, after the remap"));
 }
 
 #[test]
-fn every_committed_vector_is_answered_exactly_once_while_legacy_runs_are_remapped() {
+fn every_committed_vector_is_answered_exactly_once_while_legacy_entries_are_remapped() {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().expect("temporary store directory");
     let db = open_with_index_test_options(&root.path().join("switch.db"), OPTIONS);
-    let (mut committed, old_codebook, legacy_runs) = reach_state_b(&db);
-    remap_to_completion(&db, &mut committed, old_codebook, legacy_runs, "remap");
+    let (mut committed, old_codebook, legacy) = reach_state_b(&db);
+    remap_to_completion(&db, &mut committed, old_codebook, legacy, "remap");
     db.close().expect("close the store");
 }
 
@@ -281,12 +336,12 @@ fn a_crash_inside_a_remap_batch_recovers_and_finishes_with_each_row_exactly_once
     }
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("remap-crash.db");
-    let (mut committed, old_codebook, legacy_runs, before) = {
+    let (mut committed, old_codebook, legacy, before) = {
         let db = open_with_index_test_options(&path, OPTIONS);
-        let (committed, old_codebook, legacy_runs) = reach_state_b(&db);
+        let (committed, old_codebook, legacy) = reach_state_b(&db);
         let before = state(&db);
         db.close().expect("close in the remap state");
-        (committed, old_codebook, legacy_runs, before)
+        (committed, old_codebook, legacy, before)
     };
 
     let mut child = Command::new(std::env::current_exe().unwrap())
@@ -330,12 +385,6 @@ fn a_crash_inside_a_remap_batch_recovers_and_finishes_with_each_row_exactly_once
         "the uncommitted remap batch left the remap state exactly as it was"
     );
     assert_each_row_exactly_once(&db, &committed, "after the crash inside a remap batch");
-    remap_to_completion(
-        &db,
-        &mut committed,
-        old_codebook,
-        legacy_runs,
-        "after recovery",
-    );
+    remap_to_completion(&db, &mut committed, old_codebook, legacy, "after recovery");
     db.close().unwrap();
 }

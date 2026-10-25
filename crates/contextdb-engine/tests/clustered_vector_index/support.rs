@@ -390,7 +390,7 @@ pub enum PublicationCut {
     /// The manifest naming the new generation is durable; nothing after it
     /// (reclamation of the old generation) has run.
     AfterGenerationPublication,
-    /// Inside one remap batch of the legacy runs, after its work is written
+    /// Inside one remap batch of the legacy entries, after its work is written
     /// and before it commits.
     DuringRemapBatch,
 }
@@ -715,23 +715,61 @@ pub fn rewrite_next_calibration_answers(
 pub enum SwitchPhase {
     /// One generation serves; any replacement is unpublished.
     Serving,
-    /// A replacement has published; legacy runs sealed under the old codebook
-    /// are being remapped.
+    /// A replacement has published; legacy entries sealed under the old
+    /// codebook are being remapped.
     Remapping,
+}
+
+/// The legacy entries fixed at a replacement's publication commit: every
+/// delta entry with commit LSN in (`after_lsn`, `through_lsn`], that is
+/// (F0, F1].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyEntries {
+    /// F0: the replacement base covers source versions at or below it.
+    pub after_lsn: u64,
+    /// F1: the publication commit.
+    pub through_lsn: u64,
+    /// How many entries the legacy set holds.
+    pub entries: u64,
+    /// An immutable digest of the legacy set's (row identity, version)
+    /// membership, fixed at the publication commit.
+    pub identity: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwitchState {
     pub phase: SwitchPhase,
-    /// Legacy runs recorded at the publication commit (R); fixed for the
-    /// whole remap.
-    pub legacy_runs: u64,
-    /// Legacy runs already remapped to the serving codebook.
-    pub legacy_runs_remapped: u64,
+    /// The legacy set recorded at the publication commit; `None` outside the
+    /// remap phase.
+    pub legacy: Option<LegacyEntries>,
+    /// Legacy entries remapped so far, counted per entry.
+    pub legacy_entries_remapped: u64,
     /// The retained old codebook while the remap runs.
     pub retained_codebook: Option<u64>,
-    /// The whole-object charge held for the retained old codebook.
+    /// Bytes charged for the retained old codebook.
     pub retained_codebook_charge_bytes: u64,
+}
+
+/// One delta entry of one Context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeltaEntry {
+    /// The commit LSN of the row version the entry holds.
+    pub commit_lsn: u64,
+    /// The codebook the entry is searched through; `None` while unsealed in
+    /// the write buffer or in an unclustered run.
+    pub codebook: Option<u64>,
+    /// The entry has been sealed out of the write buffer.
+    pub sealed: bool,
+}
+
+/// Every delta entry of one Context, in commit order.
+pub fn delta_entries(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> Vec<DeltaEntry> {
+    unimplemented!("{UNBOUND}: delta entries")
 }
 
 pub fn switch_state(

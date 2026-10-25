@@ -6,7 +6,9 @@
 //! within its first 50 but misses two of the exact top 11 within its first
 //! 11: LIMIT 11 is uncovered (AUTO takes EXACT; explicit INDEXED serves
 //! unqualified), while LIMIT 5 and LIMIT 50, which pass on every sample
-//! query, are covered.
+//! query, are covered (explicit INDEXED meets its objective). Whether AUTO
+//! picks the index for a covered depth also depends on its threshold and
+//! cost rules, which this fixture does not set up, so it is not asserted.
 
 use super::support::{
     ObjectiveStatus, SearchOutcome, SearchRoute, SearchWork, coverage_summary, drive_until_serving,
@@ -116,12 +118,6 @@ fn a_limit_is_covered_only_by_the_summary_at_its_own_depth() {
     );
 
     for limit in [5_usize, 50] {
-        let (_, auto) = search(&db, "AUTO", limit);
-        assert_eq!(
-            auto.route,
-            Some(SearchRoute::Indexed),
-            "AUTO serves covered LIMIT {limit} from the index: {auto:?}"
-        );
         let (_, indexed) = search(&db, "INDEXED", limit);
         assert_eq!(indexed.outcome, Some(SearchOutcome::Complete));
         assert_eq!(
