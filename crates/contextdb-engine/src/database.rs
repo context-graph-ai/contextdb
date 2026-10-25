@@ -15298,43 +15298,6 @@ impl DatabaseTransactionHost {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn try_with_commit_lock_cancellable_for<F, R, D>(
-        &self,
-        duration: Duration,
-        cancelled: &OwnerReadCancellation,
-        deadline_expired: D,
-        f: F,
-    ) -> Result<Option<R>>
-    where
-        F: FnOnce() -> R,
-        D: Fn() -> bool,
-    {
-        match self {
-            Self::Legacy(manager) => manager.try_with_commit_lock_cancellable_funded_for(
-                duration,
-                cancelled,
-                deadline_expired,
-                f,
-            ),
-            Self::Owned(handle) => handle.with_host(|host| {
-                host.with_metadata_publication_scope(|| {
-                    host.transactions.with_transactions(|transactions| {
-                        transactions.try_with_commit_lock_cancellable_funded_for(
-                            duration,
-                            cancelled,
-                            deadline_expired,
-                            f,
-                        )
-                    })
-                })
-            }),
-        }
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     fn with_maintenance_publication<F, R>(&self, f: F) -> Result<R>
     where
         F: for<'guard> FnOnce(

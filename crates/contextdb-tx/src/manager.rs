@@ -1809,34 +1809,6 @@ impl<S: WriteSetApplicator> TransactionManager<S> {
         self.wait_with_commit_listener(duration, cancelled, deadline_expired, f, _cancel_listener)
     }
 
-    /// Internal funded companion; admission refuses before callback/node allocation.
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn try_with_commit_lock_cancellable_funded_for<F, R, D>(
-        &self,
-        duration: Duration,
-        cancelled: &OwnerReadCancellation,
-        deadline_expired: D,
-        f: F,
-    ) -> Result<Option<R>>
-    where
-        F: FnOnce() -> R,
-        D: Fn() -> bool,
-    {
-        let wake_on_cancel = self.commit_release.clone();
-        let listener = cancelled.try_tell_on_cancel(move || {
-            wake_on_cancel.with_release(|release| {
-                let mut epoch = release.epoch.lock();
-                *epoch = epoch.wrapping_add(1);
-                release.changed.notify_all();
-            });
-        })?;
-        Ok(self.wait_with_commit_listener(duration, cancelled, deadline_expired, f, listener))
-    }
-
     fn wait_with_commit_listener<F, R, D>(
         &self,
         duration: Duration,
@@ -4756,29 +4728,6 @@ impl<S: WriteSetApplicator> EngineTransactions<S> {
     {
         self.manager
             .try_with_commit_lock_cancellable_for(duration, cancelled, deadline_expired, f)
-    }
-    #[doc(hidden)]
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub fn try_with_commit_lock_cancellable_funded_for<F, R, D>(
-        &self,
-        duration: Duration,
-        cancelled: &OwnerReadCancellation,
-        deadline_expired: D,
-        f: F,
-    ) -> Result<Option<R>>
-    where
-        F: FnOnce() -> R,
-        D: Fn() -> bool,
-    {
-        self.manager.try_with_commit_lock_cancellable_funded_for(
-            duration,
-            cancelled,
-            deadline_expired,
-            f,
-        )
     }
     #[doc(hidden)]
     #[expect(
