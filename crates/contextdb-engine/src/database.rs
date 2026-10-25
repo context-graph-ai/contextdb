@@ -29973,7 +29973,6 @@ impl MaintenanceContext {
             crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
         )?;
 
-
         // Every maintenance cycle -- the background worker's and an explicit
         // one -- is a boundary: it observes the process ceiling once, before
         // its first admission.
