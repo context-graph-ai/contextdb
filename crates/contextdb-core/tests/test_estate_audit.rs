@@ -727,7 +727,7 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // Committed sink drive, publication drive and final release add ten guards;
     // ordinary transactions and persisted vector answers add two public-layout guards.
     // Overflowing allocation diagnostics preserve the first unwind and reject incomplete evidence.
-    ("contextdb-engine", 4976, RSN_TEST_COUNT),
+    ("contextdb-engine", 4979, RSN_TEST_COUNT),
     //  - Inventory (+6): an oversized pending unit pushes from a reopened source whose read
     //    limit is smaller than the unit, the hub refuses a unit its writer can never fit before
     //    it transfers, a transiently refused unit stays pending and lands on retry, and a second

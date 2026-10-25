@@ -1472,6 +1472,12 @@ impl DirectFileReader {
             .publish_bounded_result(scope, value)
     }
 
+    pub(crate) fn database_identity(
+        &self,
+    ) -> Option<contextdb_core::read_contract::DatabaseIdentity> {
+        self.retained_source.registration().database_identity()
+    }
+
     pub fn open(
         path: impl AsRef<Path>,
         config: DirectReaderConfig,

@@ -1144,6 +1144,13 @@ fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderE
     }
 }
 
+struct RouteHandover<'a> {
+    clock: Arc<dyn DeadlineClock>,
+    deadline_ms: u64,
+    cancellation: &'a OwnerReadCancellation,
+    owner: contextdb_core::read_memory::ReadMemoryOwner,
+}
+
 /// Which routes an open is willing to take.
 ///
 /// The ordinary answer is both: ask the owner, and read the committed file
@@ -1338,9 +1345,11 @@ fn attempt_route(
     attempt: u64,
     resources: &Arc<RouteResources>,
     mismatch: Option<OwnerHandshakeMismatchForTest>,
+    handover: Option<&RouteHandover<'_>>,
     observe: &dyn Fn(ReadSessionEvent),
 ) -> std::result::Result<SelectedRoute, RouteOpenRefusal> {
-    let mut claim_wait: Option<(Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64)> = None;
+    let mut claim_wait =
+        handover.map(|handover| (Arc::clone(&handover.clock), handover.deadline_ms));
     loop {
         let refusal = match attempt_route_once(
             path,
@@ -1350,6 +1359,7 @@ fn attempt_route(
             attempt,
             resources,
             mismatch,
+            handover,
             observe,
         ) {
             Ok(selected) => return Ok(selected),
@@ -1382,9 +1392,20 @@ fn attempt_route(
         let settlement = if remaining_ms == 0 {
             crate::persistence::ClaimSettlement::StillHeld
         } else {
-            crate::persistence::wait_for_claim_settlement(claim, remaining_ms, clock.as_ref())
+            crate::persistence::wait_for_claim_settlement(
+                claim,
+                remaining_ms,
+                clock.as_ref(),
+                handover.map(|value| value.cancellation),
+            )
         };
         match settlement {
+            crate::persistence::ClaimSettlement::Cancelled => {
+                return Err(RouteOpenRefusal {
+                    failure: ReadRouteOpenFailure::OwnerHeldWithoutDecision,
+                    error: Error::ReadCancelled,
+                });
+            }
             crate::persistence::ClaimSettlement::Settled => continue,
             crate::persistence::ClaimSettlement::StillHeld => {
                 return Err(RouteOpenRefusal {
@@ -1409,6 +1430,7 @@ fn attempt_route_once(
     attempt: u64,
     resources: &Arc<RouteResources>,
     mismatch: Option<OwnerHandshakeMismatchForTest>,
+    handover: Option<&RouteHandover<'_>>,
     observe: &dyn Fn(ReadSessionEvent),
 ) -> std::result::Result<SelectedRoute, RouteOpenRefusal> {
     let published = published_owner_channel(path);
@@ -1484,18 +1506,23 @@ fn attempt_route_once(
             }
         };
         let channel_clock = resources.expiry.clock.clone();
-        let channel_owner = crate::local_transport::query_funding::QueryMemory::new(
-            options
-                .limits
-                .memory
-                .min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)),
-        )
-        .map_err(|error| RouteOpenRefusal {
-            failure: ReadRouteOpenFailure::OwnerAuthentication,
-            error,
-        })?
-        .image()
-        .owner();
+        let channel_owner = match handover {
+            Some(handover) => handover.owner.clone(),
+            None => {
+                crate::local_transport::query_funding::QueryMemory::new(
+                    options
+                        .limits
+                        .memory
+                        .min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)),
+                )
+                .map_err(|error| RouteOpenRefusal {
+                    failure: ReadRouteOpenFailure::OwnerAuthentication,
+                    error,
+                })?
+                .image()
+                .owner()
+            }
+        };
         match wait_for_local_answer(
             crate::owner_read::OwnerClient::connect(
                 &channel_path,
@@ -1995,9 +2022,12 @@ pub(crate) fn session_kernel_probe_for_test()
     SESSION_KERNEL_PROBE.with(|slot| slot.borrow().clone())
 }
 
-/// A route-stable bounded reading handle.
+/// A bounded reading handle for one store incarnation.
+/// New operations reselect their route after a writer run ends; existing
+/// cursors retain their selected snapshot and continuation.
 pub struct ReadSession {
     route: ReadRoute,
+    requirement: RouteRequirement,
     options: ReadSessionOptions,
     cache_policy_mutation: Mutex<()>,
     /// The runtime directory this session was opened against, when an operator
@@ -2189,7 +2219,148 @@ impl ReadSession {
         operation()
     }
 
-    /// Open a read-only session by selecting the owner or file route once.
+    /// A writer run belongs to one serving connection, not to the store.
+    /// Select once for a new operation after that run ends. Already-open
+    /// cursors keep their own state and exact-root registration unchanged.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn after_writer_turnover(&self, cancellation: &OwnerReadCancellation) -> Result<Option<Self>> {
+        let ReadSessionState::OwnerChannel(owner) = self.state.as_ref() else {
+            return Ok(None);
+        };
+        if cancellation.is_cancelled() {
+            return Err(Error::ReadCancelled);
+        }
+        let published = crate::persistence::published_writer_identity(&owner.path);
+        let mismatch = || {
+            Error::ReadFailure(
+                contextdb_core::read_contract::ReadFailure::new(
+                    contextdb_core::read_contract::ReadFailureKind::OwnerMismatch,
+                    contextdb_core::read_contract::ReadFailureDetail::None,
+                )
+                .expect("owner mismatch has no detail"),
+            )
+        };
+        if let Some((identity, run, _, _)) = published {
+            if identity != owner.identity {
+                return Err(mismatch());
+            }
+            if run == owner.writer_run
+                && crate::persistence::observed_writer_hold(&owner.path) == Some(true)
+                && !owner_is_quiescent(&owner.path)
+            {
+                return Ok(None);
+            }
+        }
+        let clock = self.session_clock();
+        let started_ms = clock.now_ms();
+        let handover = RouteHandover {
+            deadline_ms: started_ms.saturating_add(self.options.timeouts.routing_retry_ms),
+            clock: Arc::clone(&clock),
+            cancellation,
+            owner: owner
+                .client
+                .lock()
+                .expect("owner client")
+                .original_connection_owner(),
+        };
+        // Custody belongs to the public session before a temporary selected
+        // view or its first cursor can start using this shared clock. A view
+        // must never become the sole driver owner and stop the session clock
+        // when that operation or cursor finishes.
+        self.resources
+            .expiry
+            .ensure_driver(&self.expiry_driver, &clock, || Ok(handover.owner.clone()))?;
+        let observe = |event| {
+            #[cfg(any(test, feature = "test-seams"))]
+            if let Some(observer) = self.observer.as_ref() {
+                observer.observe_event(event);
+            }
+            #[cfg(not(any(test, feature = "test-seams")))]
+            let _ = event;
+        };
+        let selected = attempt_route(
+            &owner.path,
+            &self.options,
+            Some(&owner.runtime_dir),
+            self.requirement,
+            1,
+            &self.resources,
+            None,
+            Some(&handover),
+            &observe,
+        )
+        .map_err(|refusal| refusal.error)?;
+        if cancellation.is_cancelled() {
+            return Err(Error::ReadCancelled);
+        }
+        let (route, state, snapshot_at) = match selected {
+            SelectedRoute::Owner(selected) => {
+                if selected.identity != owner.identity {
+                    return Err(mismatch());
+                }
+                (
+                    ReadRoute::Owner,
+                    ReadSessionState::OwnerChannel(selected),
+                    None,
+                )
+            }
+            SelectedRoute::File(reader) => {
+                if reader.database_identity() != Some(owner.identity) {
+                    return Err(mismatch());
+                }
+                (
+                    ReadRoute::File,
+                    ReadSessionState::DirectFile(reader),
+                    Some(contextdb_core::Wallclock::now()),
+                )
+            }
+        };
+        let mut options = self.options.clone();
+        options.limits.active_ms = options
+            .limits
+            .active_ms
+            .saturating_sub(clock.now_ms().saturating_sub(started_ms));
+        if options.limits.active_ms == 0 {
+            return Err(Error::ReadFailure(
+                contextdb_core::read_contract::ReadFailure::owner_limit_exceeded(
+                    contextdb_core::read_contract::OwnerLimitExceededDetail {
+                        limit: contextdb_core::read_contract::ReadFailureLimit::ActiveMs,
+                        value: self.options.limits.active_ms,
+                        required: None,
+                        statement: None,
+                    },
+                ),
+            ));
+        }
+        observe(ReadSessionEvent::RouteSelected(route));
+        Ok(Some(Self {
+            route,
+            requirement: self.requirement,
+            options,
+            runtime_dir: self.runtime_dir.clone(),
+            state: Arc::new(state),
+            resources: Arc::clone(&self.resources),
+            expiry_driver: Mutex::new(
+                self.expiry_driver
+                    .lock()
+                    .expect("session expiry worker")
+                    .clone(),
+            ),
+            progress: self.progress.clone(),
+            snapshot_at,
+            #[cfg(any(test, feature = "test-seams"))]
+            observer: self.observer.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            kernel_observer: self.kernel_observer.clone(),
+            #[cfg(any(test, feature = "test-seams"))]
+            clock: Some(clock),
+        }))
+    }
+
+    /// Open a read-only session by selecting its initial owner or file route.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -2811,6 +2982,7 @@ impl ReadSession {
                     attempt,
                     &resources,
                     mismatch,
+                    None,
                     &observe,
                 ) {
                     Ok(selected) => break Ok(selected),
@@ -2850,6 +3022,7 @@ impl ReadSession {
         Ok(Self {
             route,
             cache_policy_mutation: Mutex::new(()),
+            requirement,
             options,
             runtime_dir,
             state: Arc::new(state),
@@ -2870,6 +3043,7 @@ impl ReadSession {
         Self {
             route: ReadRoute::Owner,
             cache_policy_mutation: Mutex::new(()),
+            requirement: RouteRequirement::OwnerOnly,
             options: ReadSessionOptions {
                 limits,
                 timeouts: ReadClientTimeouts::default(),
@@ -2914,6 +3088,7 @@ impl ReadSession {
         Self {
             route: ReadRoute::Owner,
             cache_policy_mutation: Mutex::new(()),
+            requirement: RouteRequirement::OwnerOnly,
             options: ReadSessionOptions {
                 limits,
                 timeouts: ReadClientTimeouts::default(),
@@ -2956,6 +3131,7 @@ impl ReadSession {
         Self {
             route: ReadRoute::Owner,
             cache_policy_mutation: Mutex::new(()),
+            requirement: RouteRequirement::OwnerOnly,
             options: ReadSessionOptions {
                 limits,
                 timeouts: ReadClientTimeouts::default(),
@@ -2974,6 +3150,7 @@ impl ReadSession {
         }
     }
 
+    /// The initial route selected when this session opened.
     pub const fn route(&self) -> ReadRoute {
         self.route
     }
@@ -3142,6 +3319,25 @@ impl ReadSession {
         cancellation: &OwnerReadCancellation,
         query_memory: Option<&crate::local_transport::query_funding::QueryMemory>,
     ) -> Result<OwnedQueryResult> {
+        match self.after_writer_turnover(cancellation)? {
+            Some(selected) => {
+                selected.execute_on_selected_route(sql, params, cancellation, query_memory)
+            }
+            None => self.execute_on_selected_route(sql, params, cancellation, query_memory),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn execute_on_selected_route(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        cancellation: &OwnerReadCancellation,
+        query_memory: Option<&crate::local_transport::query_funding::QueryMemory>,
+    ) -> Result<OwnedQueryResult> {
         match self.state.as_ref() {
             ReadSessionState::LiveDatabase(database) => {
                 let child = database.ordinary_read_child()?;
@@ -3283,6 +3479,24 @@ impl ReadSession {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn metadata_within_route(
+        &self,
+        request: MetadataRequest,
+        continuation: Option<&str>,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<MetadataAnswer> {
+        match self.after_writer_turnover(cancellation)? {
+            Some(selected) => {
+                selected.metadata_on_selected_route(request, continuation, cancellation)
+            }
+            None => self.metadata_on_selected_route(request, continuation, cancellation),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn metadata_on_selected_route(
         &self,
         request: MetadataRequest,
         continuation: Option<&str>,
@@ -3532,6 +3746,22 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<ReadCursor> {
+        match self.after_writer_turnover(cancellation)? {
+            Some(selected) => selected.open_cursor_on_selected_route(sql, params, cancellation),
+            None => self.open_cursor_on_selected_route(sql, params, cancellation),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn open_cursor_on_selected_route(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<ReadCursor> {
         match self.state.as_ref() {
             ReadSessionState::OwnerChannel(owner) => {
                 let clock = self.session_clock();
@@ -3553,7 +3783,6 @@ impl ReadSession {
                     crate::persistence::ReadSnapshotRegistrationGuard::owner_handoff_start_within(
                         &owner.path,
                         owner.identity,
-                        owner.writer_run,
                         Some(&owner.runtime_dir),
                         cancellation,
                         (Arc::clone(&clock), operation_deadline),
@@ -4246,7 +4475,9 @@ impl ReadSession {
                 claim,
                 claim_window_budget(options.timeouts),
                 claim_window_clock().as_ref(),
+                None,
             ) {
+                crate::persistence::ClaimSettlement::Cancelled => return Err(Error::ReadCancelled),
                 crate::persistence::ClaimSettlement::Settled => continue,
                 crate::persistence::ClaimSettlement::StillHeld => {
                     return Err(Error::ReadFailure(owner_holding_without_a_decision()));

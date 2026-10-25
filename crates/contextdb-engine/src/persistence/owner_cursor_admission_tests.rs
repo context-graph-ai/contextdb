@@ -866,7 +866,7 @@ fn maintenance_contention_row(contention: MaintenanceContention, retention: bool
             held_physical = Some(held);
         }
         MaintenanceContention::PendingHandoff => {
-            let (database_identity, run, _, _) = published_writer_identity(&path).unwrap();
+            let (database_identity, _, _, _) = published_writer_identity(&path).unwrap();
             let parked = pause_reader_registration_lock_for_test(
                 &path,
                 ReaderRegistrationLockPhase::DescriptorOpened,
@@ -878,7 +878,6 @@ fn maintenance_contention_row(contention: MaintenanceContention, retention: bool
                 ReadSnapshotRegistrationGuard::owner_handoff_start(
                     &reader_path,
                     database_identity,
-                    run,
                     Some(&reader_runtime),
                 )
             }));

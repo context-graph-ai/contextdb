@@ -196,3 +196,6 @@ mod content_size_independent_contract;
 
 #[path = "read/read_cache_share_inspection.rs"]
 mod read_cache_share_inspection;
+#[cfg(target_os = "linux")]
+#[path = "read/a_reselected_reader_keeps_its_deadline_driver.rs"]
+mod a_reselected_reader_keeps_its_deadline_driver;

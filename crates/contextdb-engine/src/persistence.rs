@@ -1981,6 +1981,7 @@ pub(crate) enum ClaimSettlement {
     /// holding this store, so the caller is owed a not-serving answer and
     /// never an absent one.
     StillHeld,
+    Cancelled,
 }
 
 /// A writer that holds this store and has not yet published what it decided
@@ -2035,10 +2036,11 @@ pub(crate) fn wait_for_claim_settlement(
     claim: UnsettledClaim,
     budget_ms: u64,
     clock: &dyn contextdb_core::read_contract::DeadlineClock,
+    cancellation: Option<&OwnerReadCancellation>,
 ) -> ClaimSettlement {
     #[cfg(not(unix))]
     {
-        let _ = (claim, budget_ms, clock);
+        let _ = (claim, budget_ms, clock, cancellation);
         return ClaimSettlement::StillHeld;
     }
     #[cfg(unix)]
@@ -2048,13 +2050,16 @@ pub(crate) fn wait_for_claim_settlement(
             pathname,
         } = claim;
         let deadline_ms = clock.now_ms().saturating_add(budget_ms);
-        let Ok(watch) = CoordinationWatch::arm(&pathname, None) else {
+        let Ok(watch) = CoordinationWatch::arm(&pathname, cancellation) else {
             return ClaimSettlement::StillHeld;
         };
         let waker = watch.waker();
         let mut context = std::task::Context::from_waker(&waker);
         let mut expiry = clock.wait_until(deadline_ms);
         loop {
+            if cancellation.is_some_and(OwnerReadCancellation::is_cancelled) {
+                return ClaimSettlement::Cancelled;
+            }
             match query_companion_range_lock(&companion, COMPANION_CLAIM_WINDOW_LOCK_OFFSET) {
                 Ok(RangeLockOutcome::Taken) => {
                     return ClaimSettlement::Settled;
@@ -4899,7 +4904,6 @@ impl ReadSnapshotRegistrationGuard {
     pub(crate) fn owner_handoff_start(
         path: &Path,
         identity: DatabaseIdentity,
-        writer_run: WriterRunNumber,
         runtime_dir: Option<&Path>,
     ) -> std::result::Result<Self, LoadReadImageError> {
         let clock: Arc<dyn contextdb_core::read_contract::DeadlineClock> =
@@ -4909,7 +4913,6 @@ impl ReadSnapshotRegistrationGuard {
         Self::owner_handoff_start_within(
             path,
             identity,
-            writer_run,
             runtime_dir,
             &OwnerReadCancellation::new(),
             (clock, deadline),
@@ -4928,7 +4931,6 @@ impl ReadSnapshotRegistrationGuard {
     pub(crate) fn owner_handoff_start_within(
         path: &Path,
         identity: DatabaseIdentity,
-        writer_run: WriterRunNumber,
         runtime_dir: Option<&Path>,
         cancellation: &OwnerReadCancellation,
         deadline: (Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64),
@@ -4939,9 +4941,7 @@ impl ReadSnapshotRegistrationGuard {
         let mut guard = Self::open_descriptor(path, false)?;
         #[cfg(not(unix))]
         let mut guard = Self::open(path)?;
-        if published_writer_identity(path).map(|value| (value.0, value.1))
-            != Some((identity, writer_run))
-        {
+        if published_writer_identity(path).map(|value| value.0) != Some(identity) {
             return Err(invalid_read_image_state(
                 "owner cursor file identity changed",
             ));
@@ -5787,6 +5787,10 @@ impl ReadSnapshotRegistrationGuard {
             self.reader_hold_held = false;
         }
         Ok(())
+    }
+
+    pub(crate) fn database_identity(&self) -> Option<DatabaseIdentity> {
+        self.snapshot.database_identity
     }
 
     #[cfg(any(test, feature = "test-seams"))]
