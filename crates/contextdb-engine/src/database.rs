@@ -298,6 +298,9 @@ mod snapshot_inspection_tests;
 mod durable_read_snapshot_admission_tests;
 
 #[cfg(test)]
+mod store_finalization_settles_writer_debits_tests;
+
+#[cfg(test)]
 mod policy_bounded_load_tests;
 
 #[cfg(test)]
