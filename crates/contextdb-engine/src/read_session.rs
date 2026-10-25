@@ -1379,7 +1379,12 @@ fn attempt_route(
             (clock, deadline_ms)
         });
         let remaining_ms = deadline_ms.saturating_sub(clock.now_ms());
-        match crate::persistence::wait_for_claim_settlement(claim, remaining_ms, clock.as_ref()) {
+        let settlement = if remaining_ms == 0 {
+            crate::persistence::ClaimSettlement::StillHeld
+        } else {
+            crate::persistence::wait_for_claim_settlement(claim, remaining_ms, clock.as_ref())
+        };
+        match settlement {
             crate::persistence::ClaimSettlement::Settled => continue,
             crate::persistence::ClaimSettlement::StillHeld => {
                 return Err(RouteOpenRefusal {
