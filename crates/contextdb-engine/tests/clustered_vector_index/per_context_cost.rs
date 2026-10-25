@@ -2,7 +2,9 @@
 //! search reads strictly fewer list pages than an all-Context search on the
 //! same store and never reads another Context's list-segment pages; a
 //! several-Context search reads exactly the Contexts it names. Each Context
-//! has its own published generation with the declared list count.
+//! has its own published generation with the declared list count, so an
+//! unrelated Context growing and publishing a replacement leaves an unchanged
+//! Context's codebook, list count and search work exactly as they were.
 
 use super::support::{
     SearchWork, drive_until_serving, empty, ivf, observe_search, open_caller_driven, params,
@@ -137,5 +139,125 @@ fn a_one_context_search_reads_only_its_own_segments_and_fewer_pages_than_all() {
     assert!(
         one.list_pages_read < all.list_pages_read,
         "one Context reads strictly fewer list pages than all Contexts: one {one:?}, all {all:?}"
+    );
+}
+
+const TARGET_ROWS: i64 = 150;
+/// Each unrelated Context starts with N rows and grows to 2N.
+const UNRELATED_N: i64 = 1_000;
+const TARGET_QUERIES: [u64; 4] = [3, 40, 77, 120];
+
+fn grown_context(ordinal: u128) -> Uuid {
+    Uuid::from_u128(0xC1_0000 + ordinal)
+}
+
+fn insert_rows(db: &Database, ordinal: u128, ids: std::ops::Range<i64>) {
+    let tx = db.begin_or_panic();
+    for id in ids {
+        db.execute_in_tx(
+            tx,
+            "INSERT INTO grown_items (id, context_id, embedding) VALUES ($id, $context, $embedding)",
+            &params([
+                ("id", Value::Int64(id)),
+                ("context", Value::Uuid(grown_context(ordinal))),
+                ("embedding", Value::Vector(row_vector(id))),
+            ]),
+        )
+        .expect("stage one row");
+    }
+    db.commit(tx).expect("commit the Context's rows");
+}
+
+/// The answer and complete work of each fixed query against the target
+/// Context alone.
+fn target_searches(db: &Database) -> Vec<(Vec<i64>, SearchWork)> {
+    TARGET_QUERIES
+        .iter()
+        .map(|seed| {
+            let bound = params([
+                ("target", Value::Uuid(grown_context(0))),
+                ("query", Value::Vector(row_vector(*seed as i64))),
+            ]);
+            let (result, work) = observe_search(db, || {
+                db.execute(
+                    "SELECT id FROM grown_items WHERE context_id = $target ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10",
+                    &bound,
+                )
+                .expect("target-Context search")
+            });
+            assert!(work.clustered_route, "the target search ran on the clustered index");
+            assert_eq!(
+                uuid_set(&work),
+                vec![grown_context(0)],
+                "the target search reads only the target Context: {work:?}"
+            );
+            (super::support::int_ids(&result), work)
+        })
+        .collect()
+}
+
+#[test]
+fn an_unrelated_context_growing_and_republishing_leaves_a_fixed_context_s_work_unchanged() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_caller_driven(&root.path().join("grown.db"));
+    // LISTS and PROBES are left to their population defaults, so a rule that
+    // resolved them over the whole column would move with unrelated growth.
+    db.execute(
+        &format!(
+            "CREATE TABLE grown_items (id INTEGER PRIMARY KEY, context_id UUID NOT NULL, embedding VECTOR({DIMENSIONS}) PARTITION_KEY (context_id) SEARCH_MODE INDEXED IVF (RERANK = 32) CONSOLIDATION (CHANGE_PERCENT = 10))"
+        ),
+        &empty(),
+    )
+    .expect("declare the per-Context clustered index");
+    insert_rows(&db, 0, 0..TARGET_ROWS);
+    insert_rows(&db, 1, 10_000..10_000 + UNRELATED_N);
+    insert_rows(&db, 2, 20_000..20_000 + UNRELATED_N);
+    drive_until_serving(&db);
+
+    let generation = |ordinal: u128| {
+        serving(
+            &db,
+            "grown_items",
+            "embedding",
+            &[Value::Uuid(grown_context(ordinal))],
+        )
+        .unwrap_or_else(|| panic!("Context {ordinal} has a serving generation"))
+    };
+    let target_before = generation(0);
+    let unrelated_before = [generation(1), generation(2)];
+    let work_before = target_searches(&db);
+
+    insert_rows(&db, 1, 10_000 + UNRELATED_N..10_000 + 2 * UNRELATED_N);
+    insert_rows(&db, 2, 20_000 + UNRELATED_N..20_000 + 2 * UNRELATED_N);
+    assert_eq!(
+        generation(0),
+        target_before,
+        "unrelated growth leaves the target's generation, codebook and list count alone"
+    );
+    assert_eq!(
+        target_searches(&db),
+        work_before,
+        "after unrelated N to 2N growth the target's answers and centroid, candidate, \
+         canonical, buffer, list, visibility, re-rank and directory work are exactly equal"
+    );
+
+    drive_until_serving(&db);
+    for (index, ordinal) in [1_u128, 2].into_iter().enumerate() {
+        assert_ne!(
+            generation(ordinal).generation,
+            unrelated_before[index].generation,
+            "unrelated Context {ordinal} published a replacement generation"
+        );
+    }
+    assert_eq!(
+        generation(0),
+        target_before,
+        "the unrelated replacements leave the target's generation, codebook and list count alone"
+    );
+    assert_eq!(
+        target_searches(&db),
+        work_before,
+        "after the unrelated replacements publish, the target's answers and every work count \
+         are exactly equal"
     );
 }

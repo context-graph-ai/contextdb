@@ -150,28 +150,55 @@ pub fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// The work one search did, observed at the index's own work boundaries.
-#[derive(Clone, Debug, Default)]
+///
+/// Every distance computation the search performs is counted in exactly one
+/// of the four evaluation counters, so their sum is its complete distance
+/// work.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SearchWork {
     /// The search ran on the clustered list layout (centroids, then list
     /// pages), not on another route.
     pub clustered_route: bool,
-    /// List pages (base lists and sealed runs) the search read, counting each
-    /// page read once per read.
+    /// Query-to-centroid distance evaluations, including codebook selection.
+    pub centroid_evaluations: u64,
+    /// Distance evaluations on quantized (int8) list records: the int8
+    /// candidates scored.
+    pub quantized_evaluations: u64,
+    /// Distance evaluations on the canonical stored representation read from
+    /// list-generation pages (re-rank, or EXACT's comparisons).
+    pub full_precision_evaluations: u64,
+    /// Exact comparisons against vectors in the capped, unsealed write buffer.
+    pub buffer_evaluations: u64,
+    /// List pages (base lists and sealed delta runs) the search read, each
+    /// read counted.
     pub list_pages_read: u64,
+    /// Visibility bitmap and tombstone-journal pages the search read.
+    pub visibility_pages_read: u64,
+    /// Canonical-vector pages the search read to re-rank or compare.
+    pub rerank_pages_read: u64,
+    /// Context directory objects (catalog entries, directory chunks and
+    /// manifests) the search loaded or consulted, each counted.
+    pub directory_objects_read: u64,
     /// The partition-key tuple of every Context whose list-segment pages the
     /// search read, each tuple once. An unpartitioned column reports one empty
     /// tuple.
     pub contexts_read: Vec<Vec<Value>>,
-    /// Distance evaluations on quantized (int8) list records.
-    pub quantized_evaluations: u64,
-    /// Distance evaluations on the canonical stored representation, each
-    /// stored vector compared once per comparison.
-    pub full_precision_evaluations: u64,
 }
 
 impl SearchWork {
+    /// The complete distance work: every centroid, int8, canonical and
+    /// buffer comparison.
     pub fn distance_evaluations(&self) -> u64 {
-        self.quantized_evaluations + self.full_precision_evaluations
+        self.centroid_evaluations
+            + self.quantized_evaluations
+            + self.full_precision_evaluations
+            + self.buffer_evaluations
+    }
+
+    /// Comparisons made at full precision, from list generations or from the
+    /// buffer.
+    pub fn full_precision_comparisons(&self) -> u64 {
+        self.full_precision_evaluations + self.buffer_evaluations
     }
 }
 
@@ -209,6 +236,8 @@ pub fn write_buffer(_db: &Database, _table: &str, _column: &str) -> WriteBuffer 
 pub struct Serving {
     pub generation: u64,
     pub lists: u64,
+    /// Identity of the generation's trained centroid codebook.
+    pub codebook: u64,
 }
 
 pub fn serving(_db: &Database, _table: &str, _column: &str, _context: &[Value]) -> Option<Serving> {
@@ -328,19 +357,41 @@ pub fn list_page_bytes(_db: &Database, _table: &str, _column: &str) -> u64 {
     unimplemented!("{UNBOUND}: the list page size")
 }
 
+/// A kind of index metadata object a search loads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataObjectKind {
+    /// One Context's centroid codebook (with its active bitmap and quantizer).
+    Codebook,
+    /// One bounded chunk of a Context directory.
+    DirectoryChunk,
+    /// One generation manifest.
+    Manifest,
+}
+
+/// One index metadata object an operation loaded, with every reader charge
+/// taken for it.
+#[derive(Clone, Debug)]
+pub struct MetadataObject {
+    pub kind: MetadataObjectKind,
+    /// The Context (partition-key tuple) the object belongs to.
+    pub context: Vec<Value>,
+    /// The object's complete decoded size.
+    pub object_bytes: u64,
+    /// Every reader charge taken for this object, in order.
+    pub charges: Vec<u64>,
+    /// Bytes still charged for this object once the operation returned.
+    pub outstanding_after: u64,
+}
+
 /// What one operation charged to the reader budget for index metadata.
 #[derive(Clone, Debug, Default)]
 pub struct ReaderCharges {
-    /// Size of the loaded centroid table object.
-    pub centroid_table_bytes: u64,
-    /// Every reader charge taken for the centroid table, in order.
-    pub centroid_table_charges: Vec<u64>,
-    /// Size of each selected Context directory object, in selection order.
-    pub directory_object_bytes: Vec<u64>,
-    /// Every reader charge taken for directory objects, in order.
-    pub directory_object_charges: Vec<u64>,
-    /// Reader bytes the operation still held after it returned.
-    pub outstanding_after: u64,
+    /// Every metadata object the operation loaded, in load order.
+    pub objects: Vec<MetadataObject>,
+    /// The directory window bound K the operation was admitted with.
+    pub directory_window: u64,
+    /// The most directory chunks the operation held resident at once.
+    pub peak_resident_directory_chunks: u64,
 }
 
 /// Observes the reader charges that `operation` takes on the calling thread.

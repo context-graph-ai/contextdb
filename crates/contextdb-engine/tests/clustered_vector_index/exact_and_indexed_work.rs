@@ -1,7 +1,8 @@
 //! EXACT compares every allowed stored vector at full precision, so it
 //! returns the full-precision order even where the int8 list records cannot
 //! tell neighbours apart; INDEXED re-ranks its candidates at full precision
-//! and does strictly less distance work than EXACT on the same scope.
+//! and does strictly less complete distance work than EXACT on the same
+//! scope: centroid, int8, canonical and write-buffer comparisons all count.
 
 use super::support::{
     cosine_distance, drive_until_serving, empty, int_ids, ivf, observe_search, open_caller_driven,
@@ -87,9 +88,9 @@ fn exact_returns_full_precision_order_where_int8_records_tie() {
         );
         if mode == "EXACT" {
             assert_eq!(
-                work.full_precision_evaluations,
+                work.full_precision_comparisons(),
                 rows.len() as u64,
-                "EXACT compares every stored vector once at full precision: {work:?}"
+                "EXACT compares every stored vector exactly once at full precision: {work:?}"
             );
         } else {
             assert!(work.clustered_route, "INDEXED ran on the clustered index");
@@ -186,9 +187,10 @@ fn exact_rescores_every_allowed_vector_and_indexed_does_strictly_less_work() {
         "EXACT is the full-precision answer"
     );
     assert_eq!(
-        exact_work.full_precision_evaluations,
+        exact_work.full_precision_comparisons(),
         allowed.len() as u64,
-        "EXACT compares every allowed vector, built and tail, once at full precision: {exact_work:?}"
+        "EXACT compares every allowed vector, built and tail, exactly once at full precision, \
+         whether it sits in a list generation or the write buffer: {exact_work:?}"
     );
 
     let (_, indexed_work) = search("INDEXED");
@@ -197,11 +199,23 @@ fn exact_rescores_every_allowed_vector_and_indexed_does_strictly_less_work() {
         "INDEXED ran on the clustered index"
     );
     assert!(
+        indexed_work.centroid_evaluations > 0,
+        "INDEXED's centroid comparisons are observed and counted as distance work: {indexed_work:?}"
+    );
+    assert!(
+        exact_work.buffer_evaluations <= TAIL_ROWS as u64,
+        "each buffered vector is compared at most once: {exact_work:?}"
+    );
+    assert_eq!(
+        indexed_work.buffer_evaluations, exact_work.buffer_evaluations,
+        "both routes compare the capped buffer exactly, once per buffered vector"
+    );
+    assert!(
         indexed_work.distance_evaluations() < exact_work.distance_evaluations(),
         "INDEXED does strictly fewer distance evaluations than EXACT: indexed {indexed_work:?}, exact {exact_work:?}"
     );
     assert!(
-        indexed_work.full_precision_evaluations < exact_work.full_precision_evaluations,
+        indexed_work.full_precision_comparisons() < exact_work.full_precision_comparisons(),
         "INDEXED re-ranks a bounded candidate set, not every vector: {indexed_work:?}"
     );
 

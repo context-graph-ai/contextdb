@@ -4,7 +4,8 @@
 //! reads only that Context's list segments and fewer pages than an
 //! all-Context search; EXACT compares every allowed vector at full precision
 //! and returns the full-precision order where int8 records tie, while INDEXED
-//! does strictly less distance work.
+//! does strictly less complete distance work (centroid, int8, canonical and
+//! write-buffer comparisons all count).
 //!
 //! The guards read the index through [`ClusteredLists`]. Each method states
 //! what it must do; the index binds each one to its own surface, and a method
@@ -48,8 +49,28 @@ struct Searched {
     list_pages_read: u64,
     /// Contexts whose list-segment pages were read.
     contexts_read: BTreeSet<u64>,
+    /// Every distance computation is counted in exactly one of these four.
+    /// Query-to-centroid comparisons, including codebook selection.
+    centroid_evaluations: u64,
+    /// Int8 list-record comparisons.
     quantized_evaluations: u64,
+    /// Canonical-precision comparisons against list-generation vectors.
     full_precision_evaluations: u64,
+    /// Exact comparisons against the capped, unsealed write buffer.
+    buffer_evaluations: u64,
+}
+
+impl Searched {
+    fn distance_evaluations(&self) -> u64 {
+        self.centroid_evaluations
+            + self.quantized_evaluations
+            + self.full_precision_evaluations
+            + self.buffer_evaluations
+    }
+
+    fn full_precision_comparisons(&self) -> u64 {
+        self.full_precision_evaluations + self.buffer_evaluations
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -286,9 +307,9 @@ fn exact_returns_full_precision_order_where_int8_records_tie() {
         "EXACT returns the full-precision order"
     );
     assert_eq!(
-        exact.full_precision_evaluations,
+        exact.full_precision_comparisons(),
         stored.len() as u64,
-        "EXACT compares every stored vector once at full precision: {exact:?}"
+        "EXACT compares every stored vector exactly once at full precision: {exact:?}"
     );
     assert_eq!(
         index.search(&query, 3, None, Mode::Indexed).rows,
@@ -332,15 +353,26 @@ fn exact_rescores_every_allowed_vector_and_indexed_does_strictly_less_work() {
         "EXACT is the full-precision answer"
     );
     assert_eq!(
-        exact.full_precision_evaluations,
+        exact.full_precision_comparisons(),
         allowed.len() as u64,
-        "EXACT compares every allowed vector, built and tail, once: {exact:?}"
+        "EXACT compares every allowed vector, built and tail, exactly once: {exact:?}"
     );
     let indexed = index.search(&query, 10, Some(&[0]), Mode::Indexed);
     assert!(
-        indexed.quantized_evaluations + indexed.full_precision_evaluations
-            < exact.quantized_evaluations + exact.full_precision_evaluations,
-        "INDEXED does strictly fewer distance evaluations: indexed {indexed:?}, exact {exact:?}"
+        indexed.centroid_evaluations > 0,
+        "INDEXED's centroid comparisons are observed and counted: {indexed:?}"
     );
-    assert!(indexed.full_precision_evaluations < exact.full_precision_evaluations);
+    assert!(
+        exact.buffer_evaluations <= 5,
+        "each buffered vector is compared at most once: {exact:?}"
+    );
+    assert_eq!(
+        indexed.buffer_evaluations, exact.buffer_evaluations,
+        "both routes compare the capped buffer exactly, once per buffered vector"
+    );
+    assert!(
+        indexed.distance_evaluations() < exact.distance_evaluations(),
+        "INDEXED does strictly less complete distance work: indexed {indexed:?}, exact {exact:?}"
+    );
+    assert!(indexed.full_precision_comparisons() < exact.full_precision_comparisons());
 }
