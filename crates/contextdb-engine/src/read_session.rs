@@ -4758,18 +4758,6 @@ fn promoted_metadata_answer(
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-fn decoded_metadata_page(
-    payload: &[u8],
-    limits: ReadLimits,
-) -> Result<contextdb_core::read_contract::MetadataPage> {
-    crate::read_contract::decode_metadata_page_under_memory_ceiling(payload, limits.memory)
-        .map_err(read_encoding_error)
-}
-
 /// Preserve a decoder's budget refusal across the owner channel and classify
 /// unreadable canonical bytes as a channel data failure.
 fn read_encoding_error(error: crate::read_contract::ReadEncodingError) -> Error {
