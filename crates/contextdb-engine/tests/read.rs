@@ -43,6 +43,9 @@ mod a_reader_session_spans_writer_reopens;
 #[cfg(unix)]
 #[path = "read/a_received_table_replacement_retires_every_content_identity.rs"]
 mod a_received_table_replacement_retires_every_content_identity;
+#[cfg(unix)]
+#[path = "read/a_reopened_session_keeps_its_selected_route_and_time.rs"]
+mod a_reopened_session_keeps_its_selected_route_and_time;
 #[path = "read/a_reopened_store_never_reuses_a_committed_transaction.rs"]
 mod a_reopened_store_never_reuses_a_committed_transaction;
 #[cfg(unix)]
