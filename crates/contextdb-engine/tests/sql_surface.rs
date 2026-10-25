@@ -18,3 +18,6 @@ mod purging_an_edge_row_erases_exactly_its_own_graph_witness;
 mod sql_surface_other;
 #[path = "sql_surface/sql_surface_tests.rs"]
 mod sql_surface_tests;
+#[cfg(not(feature = "test-seams"))]
+#[path = "sql_surface/production_layout_inventory.rs"]
+mod production_layout_inventory;

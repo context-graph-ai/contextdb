@@ -106,6 +106,9 @@ mod persistence;
 mod precommit_context_guard;
 #[path = "acceptance/principal_scoped_handle.rs"]
 mod principal_scoped_handle;
+#[cfg(not(feature = "test-seams"))]
+#[path = "acceptance/production_layout_inventory.rs"]
+mod production_layout_inventory;
 #[path = "acceptance/query_surface.rs"]
 mod query_surface;
 #[path = "acceptance/schema_evolution.rs"]
