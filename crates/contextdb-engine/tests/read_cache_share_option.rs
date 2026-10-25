@@ -7,6 +7,13 @@
 //! the reader does not quietly keep a larger cache than it declared. Leaving
 //! the share undeclared keeps the cache derived from the budget.
 //!
+//! An open session changes its share with `ReadSession::set_read_cache_share`
+//! (0 to 100, or `None` for the derived default) and reads it back through
+//! `options()` and `read_cache_share_status()`. Growth takes effect at the
+//! next statement; shrinking evicts what no statement holds, and a cursor
+//! already running keeps its rows and its snapshot. The session is never
+//! reopened.
+//!
 //! The oracle is the bytes the storage backend returns while a real file
 //! reader answers the same queries in repeated rounds.
 
@@ -18,6 +25,7 @@ mod reader_proof_support;
 
 use contextdb_core::Value;
 use contextdb_core::read_contract::ReadLimits;
+use contextdb_engine::persistence::read_source_cache_reservation_for_limit_for_test;
 use contextdb_engine::{Database, ReadSession, ReadSessionOptions};
 use reader_proof_support as fixture;
 use std::collections::HashMap;
@@ -171,5 +179,180 @@ fn a_small_declared_read_cache_share_is_honoured_not_enlarged() {
         large_repeat, 0,
         "the same store under a 40% share repeats the round without reading the file \
          (2% share repeated round read {small_repeat} bytes)"
+    );
+}
+
+fn derived_default() -> u64 {
+    read_source_cache_reservation_for_limit_for_test(Some(READER_BUDGET)).0 as u64
+}
+
+/// The cache a declared percent gives: that share of the budget left after
+/// the reader's fixed source reservations.
+fn declared_bytes(percent: usize) -> u64 {
+    let fixed = read_source_cache_reservation_for_limit_for_test(Some(READER_BUDGET)).1;
+    ((READER_BUDGET - fixed) * percent / 100) as u64
+}
+
+/// A session's share is declared through `set_read_cache_share`, seen in its
+/// options, and reported with its effective size in bytes and as a percent.
+/// `None` returns to the derived default, 0 turns the file cache off, and a
+/// share above 100 is refused with the previous declaration kept.
+#[test]
+fn a_read_cache_share_set_on_an_open_session_is_inspected_and_range_checked() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("api-inspect.db");
+    seed(&path);
+    let reader = fixture::open_file(&path, options(None), Arc::new(fixture::Routes::default()));
+    let status = reader.read_cache_share_status();
+    assert_eq!(reader.options().read_cache_share, None);
+    assert_eq!(
+        (status.declared, status.effective_bytes as u64),
+        (None, derived_default()),
+        "an undeclared session reports the derived default cache"
+    );
+    reader
+        .set_read_cache_share(Some(40))
+        .expect("an open session declares a 40% read cache share");
+    let status = reader.read_cache_share_status();
+    assert_eq!(reader.options().read_cache_share, Some(40));
+    assert_eq!(
+        (
+            status.declared,
+            status.effective_bytes as u64,
+            status.effective_percent as f64
+        ),
+        (Some(40), declared_bytes(40), 40.0),
+        "a declared share is reported with the cache size it gives under this budget"
+    );
+    assert!(
+        reader.set_read_cache_share(Some(101)).is_err(),
+        "a share above 100% is refused"
+    );
+    assert_eq!(
+        reader.options().read_cache_share,
+        Some(40),
+        "a refused declaration leaves the previous one in place"
+    );
+    reader
+        .set_read_cache_share(Some(0))
+        .expect("a streaming session turns its file cache off");
+    let status = reader.read_cache_share_status();
+    assert_eq!(
+        (status.declared, status.effective_bytes as u64),
+        (Some(0), 0)
+    );
+    reader
+        .set_read_cache_share(None)
+        .expect("a session returns to the derived default");
+    let status = reader.read_cache_share_status();
+    assert_eq!(
+        (status.declared, status.effective_bytes as u64),
+        (None, derived_default())
+    );
+}
+
+/// Growing the share on an open session takes effect at the next statement:
+/// a repeated round reads nothing from the file. Shrinking it takes effect the
+/// same way: a repeated round reads the rows again. The session is never
+/// reopened.
+#[test]
+fn growing_and_shrinking_the_share_on_an_open_session_is_honoured() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("api-honoured.db");
+    seed(&path);
+    let reader = fixture::open_file(
+        &path,
+        options(Some(2)),
+        Arc::new(fixture::Routes::default()),
+    );
+    round(&reader);
+    let small = round(&reader);
+    reader
+        .set_read_cache_share(Some(40))
+        .expect("an open session grows its read cache share");
+    let primed = round(&reader);
+    let grown = round(&reader);
+    reader
+        .set_read_cache_share(Some(2))
+        .expect("an open session shrinks its read cache share");
+    round(&reader);
+    let shrunk = round(&reader);
+    assert!(
+        small as usize >= ROWS * PAYLOAD_BYTES / 2,
+        "at a 2% share a repeated round reads much of the working set again (read {small})"
+    );
+    assert!(
+        primed <= declared_bytes(40),
+        "the working set one round reads ({primed} bytes of file pages) must fit the 40% share \
+         ({} bytes)",
+        declared_bytes(40)
+    );
+    assert_eq!(
+        grown, 0,
+        "after growing to 40% a repeated round reads nothing from the file (2% read {small})"
+    );
+    assert!(
+        shrunk as usize >= ROWS * PAYLOAD_BYTES / 2,
+        "after shrinking back to 2% a repeated round reads the rows again (read {shrunk})"
+    );
+}
+
+/// Shrinking the share while a cursor is open leaves the cursor intact: it
+/// returns every row at the snapshot it opened on although a writer changed a
+/// row it had not reached, and the session then reports the smaller cache.
+#[test]
+fn shrinking_the_share_under_an_open_cursor_keeps_its_rows_and_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("api-shrink-under-cursor.db");
+    seed(&path);
+    let mut opts = options(Some(40));
+    opts.limits.cursor_page_rows = 500;
+    opts.limits.cursor_page_bytes = 4 * MIB as u64;
+    let reader = fixture::open_file(&path, opts, Arc::new(fixture::Routes::default()));
+    round(&reader);
+    let mut cursor = reader
+        .open_cursor(
+            "SELECT id, payload FROM cache_share ORDER BY id",
+            &HashMap::new(),
+        )
+        .expect("a cursor opens over the warm working set");
+    let mut seen: Vec<Vec<Value>> = cursor.first_page().rows().to_vec();
+    assert!(
+        seen.len() < ROWS,
+        "the cursor is still open after its first page"
+    );
+    let writer = Database::open(&path).unwrap();
+    writer
+        .execute(
+            "UPDATE cache_share SET payload = 'changed after the cursor opened' WHERE id = $id",
+            &params([("id", Value::Int64((ROWS - 1) as i64))]),
+        )
+        .unwrap();
+    writer.close().unwrap();
+    reader
+        .set_read_cache_share(Some(2))
+        .expect("an open session shrinks its share under an open cursor");
+    loop {
+        let page = cursor
+            .fetch(None)
+            .expect("an open cursor keeps reading after its session's share shrinks");
+        seen.extend(page.rows().iter().cloned());
+        if !page.has_more() {
+            break;
+        }
+    }
+    drop(cursor);
+    let expected: Vec<Vec<Value>> = (0..ROWS)
+        .map(|row| vec![Value::Int64(row as i64), Value::Text(payload(row))])
+        .collect();
+    assert!(
+        seen == expected,
+        "the cursor returns every row once, at the snapshot it opened on ({} rows seen)",
+        seen.len()
+    );
+    assert_eq!(
+        reader.read_cache_share_status().effective_bytes as u64,
+        declared_bytes(2),
+        "once the cursor finishes, the session runs at the smaller cache"
     );
 }
