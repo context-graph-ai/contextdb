@@ -2,11 +2,16 @@
 //!
 //! Promise: a reader's working set for one operation stays in the read cache
 //! while that operation runs, within the reader's declared memory budget, and
-//! the reader's charge for it is released when the operation ends. A search
+//! what the reader is still charged once the operation ends is bounded by the
+//! distinct pages it read, never by how often it revisited them (a page the
+//! cache keeps may stay charged to the reader that loaded it until the cache
+//! drops it, when no fixed cache reserve takes it over). A search
 //! that probes the same B-tree pages over and over therefore reads each page
 //! from the file once, not once per visit. When the reader's declared limit is
 //! genuinely exhausted, the read is refused with the caller's own typed refusal
-//! and nothing is allocated past the limit.
+//! and nothing is allocated past the limit. The pages stay in the shared read
+//! cache after the operation, so a follow-on query over them is warm, and the
+//! native read entry point keeps the pages it reads cached the same way.
 //!
 //! The oracle is exact and counted at the storage backend: every read the
 //! database issues to the file is recorded by offset. Nothing here measures
@@ -35,6 +40,9 @@ const CACHE_BYTES: usize = 64 << 20;
 const READER_LIMIT: usize = 8 << 20;
 /// How many times one operation revisits every key.
 const PASSES: usize = 8;
+/// A generous ceiling on what one cached page may keep charged to the reader
+/// that loaded it: the page itself plus its allocation bookkeeping.
+const CHARGE_PER_KEPT_PAGE: usize = 2 * PAGE;
 
 /// A file backend that records how many times each offset was read.
 struct CountingBackend {
@@ -232,14 +240,25 @@ struct ScanRun {
 
 fn revisiting_scan(path: &Path, rows: u64) -> ScanRun {
     let (database, reads) = open_counting(path);
+    scan_operation(&database, &reads, rows, PASSES)
+}
+
+/// One read operation on an already open store: its own read transaction,
+/// scan scope and reader budget, probing every key `passes` times.
+fn scan_operation(
+    database: &redb::ReadOnlyDatabase,
+    reads: &Mutex<Observed>,
+    rows: u64,
+    passes: usize,
+) -> ScanRun {
     let read = database.begin_read().expect("begin the reader");
     let table = read.open_table(TABLE).expect("open the table to scan");
-    forget_reads(&reads);
+    forget_reads(reads);
     let held = Arc::new(HeldBytes::default());
     let after_each_pass =
         redb::with_read_page_charge_storage(reader_budget(READER_LIMIT, &held), || {
             redb::with_scan_reads(|| {
-                (0..PASSES)
+                (0..passes)
                     .map(|_| {
                         for key in probe_order(rows) {
                             let value = table
@@ -248,11 +267,13 @@ fn revisiting_scan(path: &Path, rows: u64) -> ScanRun {
                                 .expect("every fixture key is present");
                             assert_eq!(value.value().len(), VALUE_BYTES);
                         }
-                        file_reads(&reads)
+                        file_reads(reads)
                     })
                     .collect::<Vec<_>>()
             })
         });
+    drop(table);
+    drop(read);
     ScanRun {
         after_each_pass,
         held_after_end: *held.now.lock().unwrap(),
@@ -262,8 +283,8 @@ fn revisiting_scan(path: &Path, rows: u64) -> ScanRun {
 }
 
 /// A scan that revisits the same working set within its reader's budget
-/// reads each page from the file once, and its reader holds nothing once the
-/// operation ends.
+/// reads each page from the file once, and what its reader is still charged
+/// once the operation ends is bounded by the distinct pages it read.
 #[test]
 fn a_scan_reads_each_page_it_revisits_from_the_file_once() {
     let directory = tempfile::tempdir().expect("fixture directory");
@@ -292,10 +313,12 @@ fn a_scan_reads_each_page_it_revisits_from_the_file_once() {
          observed {} file reads, one page read {} times; reads after each pass: {:?}",
         last.distinct, last.total, last.most_for_one_page, run.after_each_pass
     );
-    assert_eq!(
-        run.held_after_end, 0,
-        "the reader's charge for its working set is released when the operation ends \
-         (peak held {} bytes)",
+    assert!(
+        run.held_after_end <= last.distinct as usize * CHARGE_PER_KEPT_PAGE,
+        "after the operation the reader is still charged {} bytes, more than its {} distinct \
+         pages can account for (peak held {} bytes)",
+        run.held_after_end,
+        last.distinct,
         run.peak_held
     );
 }
@@ -408,4 +431,269 @@ fn a_scan_past_its_declared_reader_limit_is_refused_and_allocates_nothing_past_i
         read_bytes <= admitted,
         "the file returned {read_bytes} bytes but only {admitted} were admitted ({seen:?})"
     );
+}
+
+/// The pages one scan read stay in the shared read cache after its scope
+/// ends, so the next query over the same pages, within its own reader
+/// budget, reads nothing from the file.
+#[test]
+fn a_scan_leaves_its_working_set_cached_for_the_next_query() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let path = directory.path().join("follow-on.redb");
+    let rows = 512;
+    write_store(&path, rows);
+    let (database, reads) = open_counting(&path);
+    let first = scan_operation(&database, &reads, rows, 1);
+    let populated = first.after_each_pass[0];
+    assert!(
+        populated.distinct >= 64,
+        "the fixture's working set ({} pages) must be far larger than the scan's 4-page free growth",
+        populated.distinct
+    );
+    assert_eq!(
+        first.refusals, 0,
+        "a working set inside the limit is never refused"
+    );
+    assert!(
+        first.held_after_end <= populated.distinct as usize * CHARGE_PER_KEPT_PAGE,
+        "after the first query its reader is still charged {} bytes, more than its {} distinct \
+         pages can account for",
+        first.held_after_end,
+        populated.distinct
+    );
+    let second = scan_operation(&database, &reads, rows, 1);
+    assert_eq!(
+        second.refusals, 0,
+        "a working set inside the limit is never refused"
+    );
+    assert_eq!(
+        second.after_each_pass[0],
+        FileReads {
+            distinct: 0,
+            total: 0,
+            most_for_one_page: 0
+        },
+        "a follow-on query over the {} pages the first query read must read none of them \
+         from the file (the first query read {} times)",
+        populated.distinct,
+        populated.total
+    );
+}
+
+/// The native read entry point, under a declared native reader budget,
+/// keeps the pages it reads cached the same way the ordinary read path must.
+#[cfg(feature = "contextdb-internal")]
+mod native_reads {
+    use super::{
+        CHARGE_PER_KEPT_PAGE, FileReads, Mutex, Observed, PASSES, Path, READER_LIMIT, VALUE_BYTES,
+        file_reads, forget_reads, open_counting, probe_order,
+    };
+    use redb::{NativeStorageAdmission, NativeStorageCredit, NativeStorageRefused, TableHandle};
+    use std::alloc::Layout;
+    use std::ptr::NonNull;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const NATIVE_TABLE: redb::TableDefinition<&[u8], &[u8]> =
+        redb::TableDefinition::new("native_scan_working_set");
+
+    fn write_native_store(path: &Path, rows: u64) {
+        let database = redb::Builder::new()
+            .create(path)
+            .expect("create the fixture store");
+        let write = database.begin_write().expect("begin the fixture write");
+        {
+            let mut table = write
+                .open_table(NATIVE_TABLE)
+                .expect("open the fixture table");
+            let value = vec![0x5a; VALUE_BYTES];
+            for key in 0..rows {
+                table
+                    .insert(key.to_be_bytes().as_slice(), value.as_slice())
+                    .expect("insert a fixture row");
+            }
+        }
+        write.commit().expect("commit the fixture rows");
+    }
+
+    /// What the declared native budget has seen: bytes held now, the peak,
+    /// and refusals.
+    #[derive(Default)]
+    struct BudgetStats {
+        held: Mutex<usize>,
+        peak: AtomicUsize,
+        refusals: AtomicUsize,
+    }
+
+    /// The reader's scope cell. Every credit drawn on it retains it, and the
+    /// last release frees it.
+    struct BudgetCell {
+        strong: AtomicUsize,
+        limit: usize,
+        stats: Arc<BudgetStats>,
+    }
+
+    /// One admitted allocation's receipt. Its own cell is counted in the
+    /// charge and freed before the charge is refunded.
+    struct ChargeCell {
+        strong: AtomicUsize,
+        bytes: usize,
+        budget: NonNull<BudgetCell>,
+    }
+
+    fn retain<T>(cell: NonNull<()>, strong: impl Fn(&T) -> &AtomicUsize) {
+        let count = strong(unsafe { cell.cast::<T>().as_ref() });
+        let before = count.fetch_add(1, Ordering::SeqCst);
+        assert!(before < usize::MAX / 2, "receipt strong count overflow");
+    }
+
+    unsafe fn retain_budget(cell: NonNull<()>) {
+        retain::<BudgetCell>(cell, |budget| &budget.strong);
+    }
+
+    unsafe fn finish_budget(cell: NonNull<()>) {
+        let cell = cell.cast::<BudgetCell>();
+        if unsafe { cell.as_ref() }
+            .strong
+            .fetch_sub(1, Ordering::SeqCst)
+            == 1
+        {
+            drop(unsafe { Box::from_raw(cell.as_ptr()) });
+        }
+    }
+
+    unsafe fn retain_charge(cell: NonNull<()>) {
+        retain::<ChargeCell>(cell, |charge| &charge.strong);
+    }
+
+    unsafe fn finish_charge(cell: NonNull<()>) {
+        let cell = cell.cast::<ChargeCell>();
+        if unsafe { cell.as_ref() }
+            .strong
+            .fetch_sub(1, Ordering::SeqCst)
+            == 1
+        {
+            let charge = *unsafe { Box::from_raw(cell.as_ptr()) };
+            let stats = Arc::clone(&unsafe { charge.budget.as_ref() }.stats);
+            *stats.held.lock().unwrap() -= charge.bytes;
+            unsafe { finish_budget(charge.budget.cast()) };
+        }
+    }
+
+    unsafe fn admit(
+        cell: NonNull<()>,
+        layout: Layout,
+    ) -> Result<NativeStorageCredit, NativeStorageRefused> {
+        let budget = cell.cast::<BudgetCell>();
+        let scope = unsafe { budget.as_ref() };
+        let bytes = layout.size() + Layout::new::<ChargeCell>().size();
+        {
+            let mut held = scope.stats.held.lock().unwrap();
+            let Some(after) = held
+                .checked_add(bytes)
+                .filter(|after| *after <= scope.limit)
+            else {
+                scope.stats.refusals.fetch_add(1, Ordering::SeqCst);
+                return Err(NativeStorageRefused);
+            };
+            *held = after;
+            scope.stats.peak.fetch_max(after, Ordering::SeqCst);
+        }
+        unsafe { retain_budget(cell) };
+        let charge = NonNull::from(Box::leak(Box::new(ChargeCell {
+            strong: AtomicUsize::new(1),
+            bytes,
+            budget,
+        })));
+        Ok(unsafe {
+            NativeStorageCredit::from_owned_receipt(charge.cast(), retain_charge, finish_charge)
+        })
+    }
+
+    /// A native reader that declares `limit` bytes and refuses past it.
+    fn native_budget(limit: usize, stats: &Arc<BudgetStats>) -> NativeStorageAdmission {
+        let cell = NonNull::from(Box::leak(Box::new(BudgetCell {
+            strong: AtomicUsize::new(1),
+            limit,
+            stats: Arc::clone(stats),
+        })));
+        unsafe {
+            NativeStorageAdmission::from_owned_receipt(
+                cell.cast(),
+                retain_budget,
+                finish_budget,
+                admit,
+            )
+        }
+    }
+
+    /// A native scan that revisits the same working set within its reader's
+    /// declared budget reads each page from the file once, like the ordinary
+    /// read path, and what its reader is still charged once the operation ends
+    /// is bounded by the distinct pages it read.
+    #[test]
+    fn a_native_scan_reads_each_page_it_revisits_from_the_file_once() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("native-revisit.redb");
+        let rows = 512;
+        write_native_store(&path, rows);
+        let (database, reads): (_, Arc<Mutex<Observed>>) = open_counting(&path);
+        let stats = Arc::new(BudgetStats::default());
+        let after_each_pass =
+            redb::with_native_storage_admission(native_budget(READER_LIMIT, &stats), || {
+                let view = database
+                    .begin_native_read()
+                    .expect("a native reader within its budget begins");
+                let allowance = redb::ScanAllowance::try_new_native()
+                    .expect("the scan allowance is admitted from the reader's budget");
+                let scan = allowance
+                    .try_enter_native()
+                    .expect("the scan scope is admitted from the reader's budget");
+                forget_reads(&reads);
+                let after_each_pass = (0..PASSES)
+                    .map(|_| {
+                        for key in probe_order(rows) {
+                            let value = view
+                                .get_native_byte_value(
+                                    NATIVE_TABLE.name(),
+                                    key.to_be_bytes().as_slice(),
+                                )
+                                .expect("a key within the reader's budget is readable")
+                                .expect("every fixture key is present");
+                            assert_eq!(value.value().len(), VALUE_BYTES);
+                        }
+                        file_reads(&reads)
+                    })
+                    .collect::<Vec<FileReads>>();
+                drop(scan);
+                drop(allowance);
+                drop(view);
+                after_each_pass
+            });
+        let last = *after_each_pass.last().unwrap();
+        assert!(
+            last.distinct >= 64,
+            "the fixture's working set ({} pages) must be far larger than the scan's 4-page free growth",
+            last.distinct
+        );
+        assert_eq!(
+            stats.refusals.load(Ordering::SeqCst),
+            0,
+            "a working set inside the limit is never refused"
+        );
+        assert_eq!(
+            last.total, last.distinct,
+            "each of the {} distinct pages must be read from the file once over {PASSES} native \
+             passes; observed {} file reads, one page read {} times; reads after each pass: {:?}",
+            last.distinct, last.total, last.most_for_one_page, after_each_pass
+        );
+        let held_after_end = *stats.held.lock().unwrap();
+        assert!(
+            held_after_end <= last.distinct as usize * CHARGE_PER_KEPT_PAGE,
+            "after the operation the native reader is still charged {held_after_end} bytes, more \
+             than its {} distinct pages can account for (peak held {} bytes)",
+            last.distinct,
+            stats.peak.load(Ordering::SeqCst)
+        );
+    }
 }
