@@ -22499,54 +22499,45 @@ impl SnapshotFloorRegistry {
         }
     }
 
-    /// Register `snapshot` for a caller that can withdraw the read it is
-    /// registering for -- a bounded read, whose holder may cancel while this
-    /// call is parked behind an in-flight pass. The blocking rule is exactly
-    /// [`Self::pass_holds`], but the park is answerable: pass completion and
-    /// cancellation wake the condition variable, and the active read limit
-    /// bounds the wait. A withdrawn caller gets `None` rather than a hold it
-    /// no longer wants. `idle_window` is the window a SUSPENDED cursor
-    /// publishes, so removal defers to it only while it is entitled to a page.
+    /// Capture a memory publication and register its floor under the same
+    /// removal-pass exclusion. A later publication cannot invalidate this
+    /// registered generation; no writer serialization lock is acquired.
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn register_withdrawable_with_budget(
+    fn register_published_with_budget(
         self: &Arc<Self>,
-        snapshot: SnapshotId,
+        capture: impl Fn() -> Result<(SnapshotId, Lsn)>,
         idle_window: Option<Arc<CursorIdleWindow>>,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
-    ) -> Result<Option<SnapshotRegistration>> {
+    ) -> Result<Option<(SnapshotId, Lsn, SnapshotRegistration)>> {
         let wake_on_cancel = Arc::clone(&self.pass_finished);
         let state_on_cancel = Arc::clone(&self.state);
         let _cancel_listener = withdrawn.try_tell_on_cancel(move || {
-            // Take the condition's mutex so cancellation cannot notify in
-            // the gap between the waiter's flag check and its atomic park.
             let _state = state_on_cancel.lock();
             wake_on_cancel.notify_all();
         })?;
         let mut state = self.state.lock();
-        while Self::pass_holds(&state, snapshot) {
+        loop {
             if withdrawn.is_cancelled() {
                 return Ok(None);
             }
             let remaining = budget.remaining()?;
-            // A test clock may advance without notifying the pass condition.
-            // Park between checks instead of busy-spinning on the registry.
+            let (snapshot, lsn) = capture()?;
+            if !Self::pass_holds(&state, snapshot) {
+                let registration = self.admit(
+                    state,
+                    snapshot,
+                    SnapshotRegistrationClass::ReaderHeld,
+                    idle_window,
+                );
+                return Ok(Some((snapshot, lsn, registration)));
+            }
             self.pass_finished
                 .wait_for(&mut state, remaining.min(Duration::from_millis(5)));
         }
-        if withdrawn.is_cancelled() {
-            return Ok(None);
-        }
-        budget.remaining()?;
-        Ok(Some(self.admit(
-            state,
-            snapshot,
-            SnapshotRegistrationClass::ReaderHeld,
-            idle_window,
-        )))
     }
 
     /// A durable root already protects the physical versions selected by this
@@ -22571,37 +22562,6 @@ impl SnapshotFloorRegistry {
         if withdrawn.is_cancelled() {
             return Ok(None);
         }
-        Ok(Some(self.admit(
-            state,
-            snapshot,
-            SnapshotRegistrationClass::ReaderHeld,
-            idle_window,
-        )))
-    }
-
-    /// Called only while holding the commit mutex that encloses every
-    /// removal pass. Admission cannot park for a pass while that mutex is
-    /// held. If this invariant is broken, refuse the read instead of waiting
-    /// with the writer blocked and claiming to protect an unsafe snapshot.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn register_withdrawable_at_commit_boundary(
-        self: &Arc<Self>,
-        snapshot: SnapshotId,
-        idle_window: Option<Arc<CursorIdleWindow>>,
-        budget: &ReadRegistrationBudget,
-        withdrawn: &OwnerReadCancellation,
-    ) -> Result<Option<SnapshotRegistration>> {
-        let state = self.state.lock();
-        if Self::pass_holds(&state, snapshot) {
-            return Err(bounded_snapshot_publication_timeout());
-        }
-        if withdrawn.is_cancelled() {
-            return Ok(None);
-        }
-        budget.remaining()?;
         Ok(Some(self.admit(
             state,
             snapshot,
@@ -74285,67 +74245,9 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn bounded_vector_graph_snapshot_registration(
-        &self,
-        idle_window: Option<Arc<CursorIdleWindow>>,
-        budget: &ReadRegistrationBudget,
-        withdrawn: &OwnerReadCancellation,
-        read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
-    ) -> Result<Option<crate::executor::BoundedReadSnapshotPin>> {
-        let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
-
-        let remaining = budget.remaining()?;
-        let Some(captured) = self.tx_mgr.try_with_commit_lock_cancellable_for(
-            remaining,
-            withdrawn,
-            || budget.remaining().is_err(),
-            || {
-                let (snapshot, root) = self.capture_writer_transaction_statement(
-                    self.active_read_transaction(),
-                    read_memory.clone(),
-                )?;
-                let lsn = root
-                    .as_ref()
-                    .map_or_else(|| self.current_lsn(), |root| root.lsn);
-                Ok(self
-                    .snapshot_registry
-                    .register_withdrawable_at_commit_boundary(
-                        snapshot,
-                        idle_window,
-                        budget,
-                        withdrawn,
-                    )?
-                    .map(|registration| (snapshot, lsn, registration, root)))
-            },
-        )?
-        else {
-            return if withdrawn.is_cancelled() {
-                Ok(None)
-            } else {
-                Err(budget.elapsed_timeout())
-            };
-        };
-        // The admitted stack guard already protects the selected graph. Box
-        // its carrier only after the publication/registry locks are released.
-        captured.map(|captured| {
-            captured.map(|(snapshot, lsn, registration, root)| {
-                (
-                    snapshot,
-                    lsn,
-                    Box::new(registration) as Box<dyn Send + Sync>,
-                    root,
-                )
-            })
-        })
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub(crate) fn bounded_read_snapshot_registration_with_root(
         &self,
-        needs_vector_graph: bool,
+        _needs_vector_graph: bool,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -74354,14 +74256,6 @@ impl Database {
 
         if withdrawn.is_cancelled() {
             return Ok(None);
-        }
-        if needs_vector_graph {
-            return self.bounded_vector_graph_snapshot_registration(
-                None,
-                budget,
-                withdrawn,
-                read_memory.clone(),
-            );
         }
         if self.persistence.is_some() {
             budget.remaining()?;
@@ -74390,93 +74284,23 @@ impl Database {
                 Some(root),
             )));
         }
-        let (snapshot, publication_lsn, registration) = if self.persistence.is_none() {
-            // A memory source can use the last complete publication while a
-            // writer installs newer row membership. The pair is independent
-            // of the commit lock and does not consult prunable commit history.
-            budget.remaining()?;
-            let (published_snapshot, publication_lsn) = self.tx_mgr.published_read_snapshot();
-            if self.try_snapshot_for_read().is_none() {
-                return Err(closed_database_error());
-            }
-            let snapshot =
-                SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published_snapshot));
-            let Some(registration) = self
-                .snapshot_registry
-                .register_withdrawable_with_budget(snapshot, None, budget, withdrawn)?
-            else {
-                return Ok(None);
-            };
-            if self.tx_mgr.published_read_snapshot() == (published_snapshot, publication_lsn) {
-                (snapshot, publication_lsn, registration)
-            } else {
-                // A complete publication overtook the lock-free capture.
-                // Retry once under the commit lock so continuous writers
-                // cannot make this path loop on a frozen request clock.
-                drop(registration);
-                let remaining = budget.remaining()?;
-                let Some(captured) = self.tx_mgr.try_with_commit_lock_cancellable_for(
-                    remaining,
-                    withdrawn,
-                    || budget.remaining().is_err(),
-                    || {
-                        if self.try_snapshot_for_read().is_none() {
-                            return Err(closed_database_error());
-                        }
-                        let (published_snapshot, publication_lsn) =
-                            self.tx_mgr.published_read_snapshot();
-                        let snapshot = SNAPSHOT_OVERRIDE
-                            .with(|cell| cell.borrow().unwrap_or(published_snapshot));
-                        Ok(self
-                            .snapshot_registry
-                            .register_withdrawable_with_budget(snapshot, None, budget, withdrawn)?
-                            .map(|registration| (snapshot, publication_lsn, registration)))
-                    },
-                )?
-                else {
-                    if withdrawn.is_cancelled() {
-                        return Ok(None);
-                    }
-                    return Err(budget.elapsed_timeout());
-                };
-                let Some(captured) = captured? else {
-                    return Ok(None);
-                };
-                captured
-            }
-        } else {
-            // A file-backed source needs the commit boundary for its storage
-            // root and its retention registration. No commit or removal pass
-            // can land between those steps. Wait only for the request's
-            // remaining active allowance; an owner deadline may withdraw it.
-            let remaining = budget.remaining()?;
-            let Some(captured) = self.tx_mgr.try_with_commit_lock_cancellable_for(
-                remaining,
-                withdrawn,
-                || budget.remaining().is_err(),
+        let Some((snapshot, publication_lsn, registration)) =
+            self.snapshot_registry.register_published_with_budget(
                 || {
-                    let Some(snapshot) = self.try_snapshot_for_read() else {
+                    if self.already_closed() {
                         return Err(closed_database_error());
-                    };
-                    let publication_lsn = self.current_lsn();
-                    Ok(self
-                        .snapshot_registry
-                        .register_withdrawable_at_commit_boundary(
-                            snapshot, None, budget, withdrawn,
-                        )?
-                        .map(|registration| (snapshot, publication_lsn, registration)))
+                    }
+                    let (published_snapshot, lsn) = self.tx_mgr.published_read_snapshot();
+                    let snapshot =
+                        SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published_snapshot));
+                    Ok((snapshot, lsn))
                 },
+                None,
+                budget,
+                withdrawn,
             )?
-            else {
-                if withdrawn.is_cancelled() {
-                    return Ok(None);
-                }
-                return Err(budget.elapsed_timeout());
-            };
-            let Some(captured) = captured? else {
-                return Ok(None);
-            };
-            captured
+        else {
+            return Ok(None);
         };
         #[cfg(feature = "in-process-test-seams")]
         crate::writer_query_test_seams::note_read_snapshot(snapshot);
@@ -74512,7 +74336,7 @@ impl Database {
     )]
     pub(crate) fn bounded_cursor_snapshot_registration_with_root(
         &self,
-        needs_vector_graph: bool,
+        _needs_vector_graph: bool,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
         budget: &ReadRegistrationBudget,
@@ -74524,44 +74348,6 @@ impl Database {
         if withdrawn.is_cancelled() {
             return Ok(None);
         }
-        if needs_vector_graph {
-            // Window allocation precedes the admission/publication locks. The
-            // admitted registration protects graph continuity while a storage
-            // pin is acquired afterward, without I/O under either lock.
-            let window = Arc::new(CursorIdleWindow::new(
-                Arc::clone(&clock),
-                idle_ms,
-                clock.now_ms(),
-            ));
-            let Some((snapshot, lsn, registration, root)) = self
-                .bounded_vector_graph_snapshot_registration(
-                    Some(window.clone()),
-                    budget,
-                    withdrawn,
-                    read_memory.clone(),
-                )?
-            else {
-                return Ok(None);
-            };
-            let (root, storage) = if let Some(root) = root {
-                let Some((selected, root, storage)) = self.writer_cursor_storage_pin(
-                    snapshot,
-                    root,
-                    false,
-                    budget,
-                    withdrawn,
-                    read_memory.clone(),
-                )?
-                else {
-                    return Ok(None);
-                };
-                debug_assert_eq!(selected, snapshot);
-                (Some(root), Some(storage))
-            } else {
-                (None, None)
-            };
-            return Ok(Some((snapshot, lsn, window, storage, registration, root)));
-        }
         if self.persistence.is_some() {
             budget.remaining()?;
             let (snapshot, root) = self.capture_writer_transaction_statement(
@@ -74572,7 +74358,6 @@ impl Database {
             let Some((snapshot, root, storage)) = self.writer_cursor_storage_pin(
                 snapshot,
                 root,
-                true,
                 budget,
                 withdrawn,
                 read_memory.clone(),
@@ -74608,187 +74393,37 @@ impl Database {
                 Some(root),
             )));
         }
-        if self.persistence.is_none() {
-            budget.remaining()?;
-            let (published_snapshot, publication_lsn) = self.tx_mgr.published_read_snapshot();
-            if self.try_snapshot_for_read().is_none() {
-                return Err(closed_database_error());
-            }
-            let snapshot =
-                SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published_snapshot));
-            let window = Arc::new(CursorIdleWindow::new(
-                Arc::clone(&clock),
-                idle_ms,
-                clock.now_ms(),
-            ));
-            let Some(registration) = self.snapshot_registry.register_withdrawable_with_budget(
-                snapshot,
+        let window = Arc::new(CursorIdleWindow::new(
+            Arc::clone(&clock),
+            idle_ms,
+            clock.now_ms(),
+        ));
+        let Some((snapshot, publication_lsn, registration)) =
+            self.snapshot_registry.register_published_with_budget(
+                || {
+                    if self.already_closed() {
+                        return Err(closed_database_error());
+                    }
+                    let (published_snapshot, lsn) = self.tx_mgr.published_read_snapshot();
+                    let snapshot =
+                        SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published_snapshot));
+                    Ok((snapshot, lsn))
+                },
                 Some(Arc::clone(&window)),
                 budget,
                 withdrawn,
             )?
-            else {
-                return Ok(None);
-            };
-            if self.tx_mgr.published_read_snapshot() == (published_snapshot, publication_lsn) {
-                return Ok(Some((
-                    snapshot,
-                    publication_lsn,
-                    window,
-                    None,
-                    Box::new(registration) as Box<dyn Send + Sync>,
-                    None,
-                )));
-            }
-            drop(registration);
-            // A commit overtook the root capture. One timed commit-lock
-            // acquisition chooses and registers its next complete root.
-            let remaining = budget.remaining()?;
-            let Some(captured) = self.tx_mgr.try_with_commit_lock_cancellable_for(
-                remaining,
-                withdrawn,
-                || budget.remaining().is_err(),
-                || {
-                    if self.try_snapshot_for_read().is_none() {
-                        return Err(closed_database_error());
-                    }
-                    let (published_snapshot, publication_lsn) =
-                        self.tx_mgr.published_read_snapshot();
-                    let snapshot =
-                        SNAPSHOT_OVERRIDE.with(|cell| cell.borrow().unwrap_or(published_snapshot));
-                    let window = Arc::new(CursorIdleWindow::new(
-                        Arc::clone(&clock),
-                        idle_ms,
-                        clock.now_ms(),
-                    ));
-                    let Some(registration) =
-                        self.snapshot_registry.register_withdrawable_with_budget(
-                            snapshot,
-                            Some(Arc::clone(&window)),
-                            budget,
-                            withdrawn,
-                        )?
-                    else {
-                        return Ok(None);
-                    };
-                    Ok(Some((
-                        snapshot,
-                        publication_lsn,
-                        window,
-                        None,
-                        Box::new(registration) as Box<dyn Send + Sync>,
-                        None,
-                    )))
-                },
-            )?
-            else {
-                if withdrawn.is_cancelled() {
-                    return Ok(None);
-                }
-                return Err(budget.elapsed_timeout());
-            };
-            return captured;
-        }
-        // Persistence can temporarily hold its handle or provider-refresh
-        // guards during recycle. Try admission atomically at the commit
-        // boundary, then release that boundary before waiting and recapture
-        // the complete root on the next attempt. A frozen test clock cannot
-        // renew the request's real waiting allowance on every retry.
-        let started = Instant::now();
-        let wait_allowance = budget.remaining()?;
-        let retry_wake = Arc::new((Mutex::new(()), Condvar::new()));
-        let wake_on_cancel = Arc::clone(&retry_wake);
-        let _cancel_listener = withdrawn.try_tell_on_cancel(move || {
-            let _state = wake_on_cancel.0.lock();
-            wake_on_cancel.1.notify_all();
-        })?;
-        loop {
-            if withdrawn.is_cancelled() {
-                return Ok(None);
-            }
-            let remaining = budget.remaining()?;
-            let Some(real_remaining) = wait_allowance.checked_sub(started.elapsed()) else {
-                return Err(budget.elapsed_timeout());
-            };
-            let Some(captured) = self.tx_mgr.try_with_commit_lock_cancellable_for(
-                remaining.min(real_remaining),
-                withdrawn,
-                || budget.remaining().is_err() || started.elapsed() >= wait_allowance,
-                || -> std::result::Result<
-                    Option<crate::executor::BoundedCursorSnapshotPin>,
-                    crate::persistence::OwnerCursorPinAdmissionError,
-                > {
-                    let Some(snapshot) = self.try_snapshot_for_read() else {
-                        return Err(closed_database_error().into());
-                    };
-                    let publication_lsn = self.current_lsn();
-                    let storage = self
-                        .persistence
-                        .as_ref()
-                        .map(|p| p.owner_cursor_pin_for_admission())
-                        .transpose()?;
-                    let opened_ms = clock.now_ms();
-                    let window = Arc::new(CursorIdleWindow::new(
-                        Arc::clone(&clock),
-                        idle_ms,
-                        opened_ms,
-                    ));
-                    Ok(self
-                        .snapshot_registry
-                        .register_withdrawable_at_commit_boundary(
-                            snapshot,
-                            Some(Arc::clone(&window)),
-                            budget,
-                            withdrawn,
-                        )?
-                        .map(|registration| {
-                            (
-                                snapshot,
-                                publication_lsn,
-                                window,
-                                storage,
-                                Box::new(registration) as Box<dyn Send + Sync>,
-                        None,
-                            )
-                        }))
-                },
-            )? else {
-                if withdrawn.is_cancelled() {
-                    return Ok(None);
-                }
-                return Err(budget.elapsed_timeout());
-            };
-            match captured {
-                Ok(pin) => return Ok(pin),
-                Err(crate::persistence::OwnerCursorPinAdmissionError::Refused(error)) => {
-                    return Err(error);
-                }
-                Err(crate::persistence::OwnerCursorPinAdmissionError::Busy(_)) => {
-                    #[cfg(test)]
-                    {
-                        owner_cursor_pin_retry_tests::after_busy_attempt_for_test();
-                        self.snapshot_registry
-                            .owner_cursor_busy_test_pause
-                            .maybe_pause();
-                    }
-                }
-            }
-            // No commit guard, native transaction, or failed registration
-            // survives here. Cancellation wakes this park immediately; the
-            // short interval also observes handle release and manual clocks.
-            let mut state = retry_wake.0.lock();
-            if withdrawn.is_cancelled() {
-                return Ok(None);
-            }
-            let remaining = budget.remaining()?;
-            let Some(real_remaining) = wait_allowance.checked_sub(started.elapsed()) else {
-                return Err(budget.elapsed_timeout());
-            };
-            retry_wake.1.wait_for(
-                &mut state,
-                remaining.min(real_remaining).min(Duration::from_millis(5)),
-            );
-        }
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            snapshot,
+            publication_lsn,
+            window,
+            None,
+            Box::new(registration),
+            None,
+        )))
     }
 
     /// Clone the shared accountant for an owned, suspendable request charge.

@@ -3025,7 +3025,6 @@ impl Database {
         &self,
         snapshot: SnapshotId,
         root: WriterSnapshotHandle,
-        recapture: bool,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -3069,13 +3068,10 @@ impl Database {
                     return Err(error);
                 }
                 Err(crate::persistence::OwnerCursorPinAdmissionError::Busy(_)) => {
-                    // A failed unregistered attempt owns no accepted view.
-                    // Release it before waiting and select a whole successor
-                    // pair afterward. Graph registrations already accepted a
-                    // view, and therefore preserve their original root.
-                    if recapture {
-                        drop(selected.take());
-                    }
+                    // No registration has been accepted yet. Release the
+                    // failed pin before waiting, then capture one whole
+                    // published successor after the handle becomes available.
+                    drop(selected.take());
                     #[cfg(test)]
                     {
                         owner_cursor_pin_retry_tests::after_busy_attempt_for_test();
@@ -3089,7 +3085,7 @@ impl Database {
                             .wait_for(&mut state, remaining.min(Duration::from_millis(5)));
                     }
                     drop(state);
-                    if recapture && !withdrawn.is_cancelled() {
+                    if !withdrawn.is_cancelled() {
                         budget.remaining()?;
                         let (snapshot, root) = self.capture_writer_transaction_statement(
                             self.active_read_transaction(),
