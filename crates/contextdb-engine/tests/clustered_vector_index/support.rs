@@ -269,6 +269,55 @@ pub struct BuildProgress {
     pub in_flight: bool,
     /// Builds abandoned before publication since this store was opened.
     pub aborted: u64,
+    /// The class of persisted build object the build's next maintenance step
+    /// writes, when a build is due or in flight.
+    pub next_write: Option<BuildWriteClass>,
+}
+
+/// The persisted object classes a build or replacement writes before it
+/// publishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildWriteClass {
+    TrainingReservoir,
+    BuildAccumulator,
+    UnpublishedRun,
+    PreparedReplacement,
+}
+
+/// One persisted build write, observed at the engine's own disk admission and
+/// write boundaries.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BuildWriteEvent {
+    /// The disk admission decision for one write of `class`, taken before any
+    /// byte of that write reaches the store.
+    Admission {
+        class: BuildWriteClass,
+        context: Vec<Value>,
+        /// Bytes the write asks the store to grow by.
+        requested_bytes: u64,
+        /// The store's size when the decision was taken.
+        current_store_bytes: u64,
+        /// The store's size if the write were admitted.
+        projected_store_bytes: u64,
+        /// The declared disk ceiling at the decision, if any.
+        ceiling: Option<u64>,
+        admitted: bool,
+    },
+    /// An admitted write of `class` was executed against the store.
+    Written {
+        class: BuildWriteClass,
+        context: Vec<Value>,
+        bytes: u64,
+    },
+}
+
+/// Calls `observer` for every persisted build write admission and execution
+/// that `operation` performs on the calling thread.
+pub fn observe_build_writes<T>(
+    _observer: Arc<dyn Fn(&BuildWriteEvent) + Send + Sync>,
+    _operation: impl FnOnce() -> T,
+) -> T {
+    unimplemented!("{UNBOUND}: persisted build write admission and execution")
 }
 
 pub fn build_progress(
@@ -326,6 +375,12 @@ impl PhysicalPlace {
             self,
             Self::TrainingReservoir | Self::BuildAccumulator | Self::UnpublishedRun
         )
+    }
+
+    /// Any persisted state of a build that has not published, including a
+    /// prepared replacement.
+    pub fn is_unpublished_build_state(&self) -> bool {
+        self.belongs_to_an_unpublished_build() || matches!(self, Self::PreparedReplacement)
     }
 }
 
