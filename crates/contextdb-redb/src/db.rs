@@ -694,6 +694,40 @@ impl ReadableDatabase for ReadOnlyDatabase {
 }
 
 impl ReadOnlyDatabase {
+    /// Select page capacity within the read cache's already prepaid index.
+    /// Snapshot identity is unchanged. Detached pinned pages keep their source
+    /// funding until their last physical holder releases them.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn set_read_cache_capacity(&self, bytes: usize) -> Result<usize, StorageError> {
+        self.mem.set_read_cache_capacity(bytes)
+    }
+
+    /// Settle funding at the serialized capacity boundary. The callback may
+    /// inspect atomic occupancy but must not read or modify cached pages.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn with_read_cache_capacity<R>(
+        &self,
+        bytes: usize,
+        settle: impl FnOnce() -> R,
+    ) -> Result<R, StorageError> {
+        self.mem.with_read_cache_capacity(bytes, settle)
+    }
+
+    /// Actual prepaid shared read-cache index storage, independent of page capacity.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_index_bytes(&self) -> usize {
+        self.mem.cache_index_bytes()
+    }
+
+    /// Physically held cache-paid pages, including detached cursor aliases.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_held_bytes(&self) -> usize {
+        self.mem.read_cache_held_bytes()
+    }
     /// Fraction of the supplied opaque page identifiers currently in the shared read cache.
     /// Identifiers use the existing eight-byte root-page encoding. Each supplied
     /// identifier contributes one observation; invalid identifiers count as absent,

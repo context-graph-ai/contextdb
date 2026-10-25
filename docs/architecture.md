@@ -309,8 +309,19 @@ session ceiling is declared, and
 reservations. An explicit percent applies to `B - F`. There is no fixed byte cap.
 `read_cache_share_status()` inspects the declared percent, default percent,
 budget, fixed reservation, cache capacity and effective percent of the complete
-budget. Cache capacity remains inside the original memory ceiling; opening and
-query work still refuse before allocation if their total does not fit.
+budget. `ReadSession::set_read_cache_share` changes the declaration at a statement
+boundary, without reopening or changing its snapshot. Growth is admitted before
+publication; shrink retires entries while cursor-held backing keeps its invoice
+until final physical release. Zero disables file page caching; 100 selects the
+whole remainder and is still subject to total admission. `None` restores the
+derived default. A refused change keeps the previous declaration and capacity.
+
+The native index slots are prepaid for the maximum selectable capacity `B - F`
+and reused across changes. Session inspection reports `prepaid_index_bytes`,
+even at share zero, and the physical page bytes still held by cursors. The index
+has its own admitted Layouts; it is separate from the selected page reserve.
+Cache capacity remains inside the original memory ceiling; opening and query
+work still refuse before allocation if their total does not fit.
 
 A stored value too large for a read's memory budget is refused before its source buffer is
 allocated. Opening a session need not read that value: the refusal belongs to the statement that

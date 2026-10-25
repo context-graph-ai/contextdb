@@ -1057,6 +1057,27 @@ its assertions and test bodies are unchanged.
 | `src/transaction_tracker.rs`, `src/transactions.rs`, `src/tree_store/{bounded_bytes,btree,table_tree,random_state_override}.rs`, `src/tree_store/page_store/{allocator_pager,cache_owner_contract_rows,cached_file,lru_cache,page_manager}.rs` | Equivalent fixed-array iteration, const-safe invariants, explicit absent-versus-empty root semantics, allocation-free observer capability requirements, feature-accurate passive accessors, and source formatting. |
 
 
+## Reader cache capacity changes
+
+A read-only handle may prepay index slots for its maximum selectable page
+capacity, then use `set_read_cache_capacity` to change the selected page capacity
+without replacing the index or reopening its snapshot. Increasing page capacity
+still requires the caller's original reserve admission before publication.
+`with_read_cache_capacity` serializes capacity publication and caller settlement
+with cache insertion. The settlement callback may inspect atomic occupancy and
+must not read or modify cached pages.
+
+Shrinking retires cache entries in CLOCK order. A detached reader alias keeps the
+same physical page, payment and original reserve owner. The optional inline
+`CacheReserveOwner::set_read_settlement` callback runs after page backing is
+freed; the original source owner reads current atomic occupancy under its funding
+lock before refunding excess. The fixed reserve therefore covers the selected
+capacity or live physical occupancy, whichever is larger. Counter custody keeps
+the callback context alive through its final call. Static reserves skip the
+callback mutex, and ordinary pressure eviction keeps its bounded victim walk.
+`read_cache_index_bytes` reports the prepaid index and native controls even when
+page capacity is zero; `read_cache_held_bytes` includes detached physical holders.
+
 ## Advisory shared-read-cache residency
 
 With `contextdb-internal`, `NativeReadView`, `ReadOnlyDatabase`, and `Database`

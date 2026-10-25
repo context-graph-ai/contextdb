@@ -1568,6 +1568,22 @@ impl DirectFileReader {
         Ok(reader)
     }
 
+    pub(crate) fn prepaid_cache_index_bytes(&self) -> usize {
+        self.retained_source.prepaid_cache_index_bytes()
+    }
+
+    pub(crate) fn held_cache_page_bytes(&self) -> usize {
+        self.retained_source.held_cache_page_bytes()
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Cache admission retains its inline refusal diagnostics."
+    )]
+    pub(crate) fn select_cache_capacity(&self, capacity: usize) -> contextdb_core::Result<()> {
+        self.retained_source.select_cache_capacity(capacity)
+    }
+
     #[allow(dead_code)]
     pub fn execute(
         &self,

@@ -679,6 +679,61 @@ impl PagedCachedFile {
         }
     }
 
+    /// Change a read-only cache's page capacity inside its prepaid index.
+    /// Retiring a pinned entry drops only its map hold: its physical page and
+    /// original fixed-reserve owner remain with the external reader.
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn set_read_cache_capacity(&self, bytes: usize) -> Result<usize> {
+        self.with_read_cache_capacity(bytes, || self.read_cache_held_bytes())
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn with_read_cache_capacity<R>(
+        &self,
+        bytes: usize,
+        settle: impl FnOnce() -> R,
+    ) -> Result<R> {
+        let page_size = usize::try_from(self.page_size).expect("page size fits usize");
+        if Self::read_index_entries(bytes, page_size, 0)
+            > self.read_cache[0].read().unwrap().arena_capacity()
+        {
+            return Err(StorageError::ValueTooLarge(bytes));
+        }
+        let _write = self.write_buffer.lock().unwrap();
+        self.max_cache_size.store(bytes, Ordering::Release);
+        self.no_victim_generation.store(0, Ordering::Release);
+        let mut retire = self
+            .read_cache_bytes
+            .load(Ordering::Acquire)
+            .saturating_sub(bytes);
+        let stripes = self.read_cache.len();
+        let start = self.next_eviction_stripe.load(Ordering::Relaxed) % stripes;
+        for index in 0..stripes {
+            if retire == 0 {
+                break;
+            }
+            let stripe = (start + index) % stripes;
+            self.next_eviction_stripe
+                .store((stripe + 1) % stripes, Ordering::Relaxed);
+            let mut cache = self.read_cache[stripe].write().unwrap();
+            while retire > 0 {
+                let Some((_, page)) = cache.pop_lowest_priority() else {
+                    break;
+                };
+                retire = retire.saturating_sub(cached_page_bytes(page.len()));
+                drop(page);
+            }
+        }
+        // No insertion can publish a tentative occupancy while the producer
+        // settles funding. Concurrent physical releases may only lower it.
+        Ok(settle())
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn read_cache_held_bytes(&self) -> usize {
+        self.read_cache_bytes.load(Ordering::Acquire)
+    }
+
     /// Settle the writer's share during its quiescent startup, before source
     /// roots are published. Eviction releases cache ownership only: any page
     /// held elsewhere keeps its original bytes and remains in the live count.
@@ -974,14 +1029,14 @@ impl PagedCachedFile {
         buffer: PageAllocation,
         scan_replace: bool,
     ) -> Result<PageMemory> {
+        // Serialize publication with read-capacity changes. Release this lock
+        // before transferring an opaque source receipt or dropping displacement.
+        let cache_lock = self.write_buffer.lock().unwrap();
         let page_bytes = cached_page_bytes(len);
         let cache_slot = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
         if scan_replace {
             let before = self.read_cache_bytes.load(Ordering::Acquire);
-            {
-                let lock = self.write_buffer.lock().unwrap();
-                self.evict_from_read_cache(page_bytes, &lock);
-            }
+            self.evict_from_read_cache(page_bytes, &cache_lock);
             let after = self.read_cache_bytes.load(Ordering::Acquire);
             if before.saturating_sub(after) < page_bytes {
                 return Ok(Self::uncached(buffer));
@@ -994,13 +1049,12 @@ impl PagedCachedFile {
                 .saturating_add(write_bytes)
                 > self.max_cache_size.load(Ordering::Acquire)
             {
-                let lock = self.write_buffer.lock().unwrap();
                 self.evict_from_read_cache(
                     cache_size
                         .saturating_add(page_bytes)
                         .saturating_add(write_bytes)
                         - self.max_cache_size.load(Ordering::Acquire),
-                    &lock,
+                    &cache_lock,
                 );
             }
         }
@@ -1033,6 +1087,7 @@ impl PagedCachedFile {
                 // Drop the stripe guard before running the opaque receipt's
                 // destructor; no byte/control allocation occurs at transfer.
                 drop(write_lock);
+                drop(cache_lock);
                 buffer.transfer(payment);
                 drop(displaced);
                 Ok(PageMemory::Cached(buffer))

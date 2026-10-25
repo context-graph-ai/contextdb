@@ -7,7 +7,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 fn allocation_failed(site: &'static str, layout: Layout) -> StorageError {
     crate::native_storage_admission::native_storage_error(
@@ -25,10 +25,22 @@ fn retain(owners: &AtomicUsize) {
 
 /// The counter itself has no Weak lifetime. Its genuine admission receipt, when
 /// installed, is held outside its destruction and physical deallocation too.
+#[derive(Clone, Copy)]
+struct CacheSettlement {
+    context: NonNull<()>,
+    after_free: unsafe fn(NonNull<()>, &AtomicUsize),
+}
+// SAFETY: the installing producer guarantees a Send + Sync context whose owner
+// is retained by this same counter's fixed-reserve receipt.
+unsafe impl Send for CacheSettlement {}
+unsafe impl Sync for CacheSettlement {}
+
 struct CounterBlock {
     owners: AtomicUsize,
     value: AtomicUsize,
     release_generation: AtomicU64,
+    dynamic_settlement: AtomicBool,
+    settlement: Mutex<Option<CacheSettlement>>,
     invoice: Option<ReadMemoryCharge>,
     preparation: Option<crate::native_storage_admission::NativeStorageCredit>,
     reserve: Mutex<Option<crate::native_storage_admission::NativeStorageCredit>>,
@@ -72,6 +84,22 @@ impl CacheCounter {
             })
             .expect("cache release generation exhausted");
     }
+    fn settle_after_free(&self) {
+        let block = unsafe { self.block.as_ref() };
+        if !block.dynamic_settlement.load(Ordering::Acquire) {
+            return;
+        }
+        let callback = *block
+            .settlement
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(callback) = callback {
+            // This CachePayment still owns the counter, and the counter still
+            // owns its fixed-reserve receipt, throughout the callback.
+            unsafe { (callback.after_free)(callback.context, &block.value) };
+        }
+    }
+
     pub(super) fn has_fixed_reserve(&self) -> bool {
         unsafe { self.block.as_ref() }
             .reserve
@@ -102,6 +130,8 @@ impl CacheCounter {
                 owners: AtomicUsize::new(1),
                 value: AtomicUsize::new(0),
                 release_generation: AtomicU64::new(1),
+                dynamic_settlement: AtomicBool::new(false),
+                settlement: Mutex::new(None),
                 invoice,
                 preparation,
                 reserve: Mutex::new(None),
@@ -196,6 +226,7 @@ impl CachePayment {
 impl Drop for CachePayment {
     fn drop(&mut self) {
         self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.counter.settle_after_free();
     }
 }
 
@@ -533,6 +564,31 @@ pub struct CacheReserveOwner {
 }
 #[cfg(feature = "contextdb-internal")]
 impl CacheReserveOwner {
+    /// Settle excess reader-reserve capacity after physical page free.
+    ///
+    /// # Safety
+    /// `context` must be a Send + Sync object owned by the reserve receipt
+    /// installed in this owner. It must remain valid through that receipt's
+    /// last release. The callback may refund unused funding but must not assume
+    /// a statement or database handle is still alive, or access the cache.
+    pub unsafe fn set_read_settlement(
+        &self,
+        context: NonNull<()>,
+        after_free: unsafe fn(NonNull<()>, &AtomicUsize),
+    ) {
+        let block = unsafe { self.read.block.as_ref() };
+        let mut callback = block
+            .settlement
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(callback.is_none(), "cache settlement is installed once");
+        *callback = Some(CacheSettlement {
+            context,
+            after_free,
+        });
+        block.dynamic_settlement.store(true, Ordering::Release);
+    }
+
     #[cfg(feature = "test-seams")]
     pub fn control_layout_for_test(&self) -> (usize, usize) {
         let layout = CacheCounter::layout();

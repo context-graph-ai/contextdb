@@ -68,14 +68,30 @@ pub struct ReadSessionOptions {
 /// The declaration and effective file-cache capacity of a read session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReadCacheShareStatus {
-    pub declared_percent: Option<u8>,
+    pub declared: Option<u8>,
     /// The default's displayed percent; its exact derivation is (B - F) / 7.
     pub default_percent: u8,
     pub budget_bytes: usize,
     pub fixed_reservation_bytes: usize,
-    pub cache_bytes: usize,
-    /// Cache capacity as a percent of the complete declared reader budget.
+    pub effective_bytes: usize,
+    /// Physical native index storage prepaid for every selectable share. None
+    /// means no opened file cache was inspected (including options-only inspection).
+    pub prepaid_index_bytes: Option<usize>,
+    /// Cache-paid physical pages, including detached cursor aliases.
+    pub held_page_bytes: Option<usize>,
+    /// Resolved percent of the budget remaining after fixed reservations.
     pub effective_percent: f64,
+}
+
+impl ReadCacheShareStatus {
+    /// Human-readable declaration source used by policy inspection.
+    pub const fn declaration_source(&self) -> &'static str {
+        if self.declared.is_none() {
+            "default (14%)"
+        } else {
+            "declared"
+        }
+    }
 }
 
 impl ReadSessionOptions {
@@ -86,16 +102,23 @@ impl ReadSessionOptions {
         let fixed = crate::persistence::read_source_fixed_reservation_bytes();
         let cache = crate::persistence::redb_reader_cache_bytes(budget, self.read_cache_share);
         ReadCacheShareStatus {
-            declared_percent: self.read_cache_share,
+            declared: self.read_cache_share,
             default_percent: 14,
             budget_bytes: budget,
             fixed_reservation_bytes: fixed,
-            cache_bytes: cache,
-            effective_percent: if budget == 0 {
-                0.0
-            } else {
-                cache as f64 * 100.0 / budget as f64
-            },
+            effective_bytes: cache,
+            prepaid_index_bytes: None,
+            held_page_bytes: None,
+            effective_percent: self.read_cache_share.map_or_else(
+                || {
+                    if budget <= fixed {
+                        0.0
+                    } else {
+                        cache as f64 * 100.0 / (budget - fixed) as f64
+                    }
+                },
+                f64::from,
+            ),
         }
     }
 }
@@ -1964,6 +1987,8 @@ pub(crate) fn session_kernel_probe_for_test()
 pub struct ReadSession {
     route: ReadRoute,
     options: ReadSessionOptions,
+    read_cache_share: std::sync::atomic::AtomicU8,
+    cache_policy_mutation: Mutex<()>,
     /// The runtime directory this session was opened against, when an operator
     /// supplied one. Kept because the session goes on asking the same
     /// deployment questions -- `.owner status` reaches the same owner the
@@ -2812,6 +2837,10 @@ impl ReadSession {
         observe(ReadSessionEvent::RouteSelected(route));
         Ok(Self {
             route,
+            read_cache_share: std::sync::atomic::AtomicU8::new(
+                options.read_cache_share.unwrap_or(u8::MAX),
+            ),
+            cache_policy_mutation: Mutex::new(()),
             options,
             runtime_dir,
             state: Arc::new(state),
@@ -2831,6 +2860,8 @@ impl ReadSession {
     pub(crate) fn from_live_database(database: Database, limits: ReadLimits) -> Self {
         Self {
             route: ReadRoute::Owner,
+            read_cache_share: std::sync::atomic::AtomicU8::new(u8::MAX),
+            cache_policy_mutation: Mutex::new(()),
             options: ReadSessionOptions {
                 limits,
                 timeouts: ReadClientTimeouts::default(),
@@ -2874,6 +2905,8 @@ impl ReadSession {
         observer.observe_event(ReadSessionEvent::RouteSelected(ReadRoute::Owner));
         Self {
             route: ReadRoute::Owner,
+            read_cache_share: std::sync::atomic::AtomicU8::new(u8::MAX),
+            cache_policy_mutation: Mutex::new(()),
             options: ReadSessionOptions {
                 limits,
                 timeouts: ReadClientTimeouts::default(),
@@ -2915,6 +2948,8 @@ impl ReadSession {
     ) -> Self {
         Self {
             route: ReadRoute::Owner,
+            read_cache_share: std::sync::atomic::AtomicU8::new(u8::MAX),
+            cache_policy_mutation: Mutex::new(()),
             options: ReadSessionOptions {
                 limits,
                 timeouts: ReadClientTimeouts::default(),
@@ -2985,8 +3020,61 @@ impl ReadSession {
         self.runtime_dir.as_deref()
     }
 
+    fn current_read_cache_share(&self) -> Option<u8> {
+        let share = self
+            .read_cache_share
+            .load(std::sync::atomic::Ordering::Acquire);
+        (share != u8::MAX).then_some(share)
+    }
+
     pub fn options(&self) -> ReadSessionOptions {
-        self.options.clone()
+        let mut options = self.options.clone();
+        options.read_cache_share = self.current_read_cache_share();
+        options
+    }
+
+    /// Inspect the current declaration and physical file-cache funding.
+    pub fn read_cache_share_status(&self) -> ReadCacheShareStatus {
+        let _mutation = self
+            .cache_policy_mutation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut status = self.options().read_cache_share_status();
+        if let ReadSessionState::DirectFile(reader) = &*self.state {
+            status.prepaid_index_bytes = Some(reader.prepaid_cache_index_bytes());
+            status.held_page_bytes = Some(reader.held_cache_page_bytes());
+        }
+        status
+    }
+
+    /// Change the file-cache share at this statement boundary without reopening
+    /// the pinned snapshot. Growth is admitted before publication. Shrink retires
+    /// entries while cursor-held backing remains funded through its final free.
+    /// None restores default (14%); values outside 0..=100 leave policy unchanged.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Refusals retain their original inline diagnostics."
+    )]
+    pub fn set_read_cache_share(&self, percent: Option<u8>) -> Result<()> {
+        if percent.is_some_and(|percent| percent > 100) {
+            return Err(Error::Other(
+                "READ_CACHE_SHARE must be between 0 and 100 percent".into(),
+            ));
+        }
+        let _mutation = self
+            .cache_policy_mutation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let ReadSessionState::DirectFile(reader) = &*self.state {
+            let mut options = self.options();
+            options.read_cache_share = percent;
+            reader.select_cache_capacity(options.read_cache_share_status().effective_bytes)?;
+        }
+        self.read_cache_share.store(
+            percent.unwrap_or(u8::MAX),
+            std::sync::atomic::Ordering::Release,
+        );
+        Ok(())
     }
 
     /// Run a bounded query with a fresh cancellation token.
@@ -3579,6 +3667,7 @@ impl ReadSession {
                                 self.options.principal.clone(),
                             );
                             config.memory_limit = self.options.memory_limit;
+                            config.read_cache_share = self.current_read_cache_share();
                             config.runtime_dir = Some(owner.runtime_dir.clone());
                             let retained_bytes =
                                 crate::executor::bounded::cursor_statement_bytes(sql, params)

@@ -2933,12 +2933,14 @@ pub(crate) fn load_read_image_at_registration_with_cache_share(
     let source_observation = direct_source_contract_rows::begin(0, &memory);
     let source_memory = SourceMemoryReservation::new(memory.clone(), source_bytes)
         .map_err(LoadReadImageError::Memory)?;
+    source_memory.configure_cache(cache_bytes);
     #[cfg(test)]
     drop(source_observation);
     let result = memory.scope(|| {
         let mut source = ReadImageSource::start(
             path,
             cache_bytes,
+            budget.saturating_sub(read_source_fixed_reservation_bytes()),
             source_memory,
             runtime_dir,
             registration,
@@ -7049,12 +7051,78 @@ struct ReadImageSource {
     source_released_for_test: bool,
 }
 
+struct SourceCacheFunding {
+    selected: usize,
+    fixed: usize,
+}
+
 struct SourceMemoryReservation {
     memory: crate::read_image_memory::ImageMemoryHandle,
     bytes: std::sync::atomic::AtomicUsize,
+    cache_funding: std::sync::Mutex<SourceCacheFunding>,
 }
 
 impl SourceMemoryReservation {
+    fn configure_cache(&self, selected: usize) {
+        let mut funding = self
+            .cache_funding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        funding.fixed = self
+            .bytes
+            .load(Ordering::Acquire)
+            .checked_sub(selected)
+            .expect("cache is inside source reserve");
+        funding.selected = selected;
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Admission failures retain their original inline diagnostics."
+    )]
+    fn select_cache_capacity(
+        &self,
+        selected: usize,
+        held: impl FnOnce() -> usize,
+    ) -> Result<usize> {
+        let mut funding = self
+            .cache_funding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let next = funding
+            .fixed
+            .checked_add(selected.max(held()))
+            .ok_or_else(|| Error::Other("reader cache reserve overflow".into()))?;
+        let previous = self.bytes.load(Ordering::Acquire);
+        if next > previous {
+            self.memory.reserve(next - previous)?;
+        }
+        self.bytes.store(next, Ordering::Release);
+        let old = funding.selected;
+        funding.selected = selected;
+        if next < previous {
+            self.memory.release(previous - next);
+        }
+        Ok(old)
+    }
+
+    fn settle_cache_free(&self, held: &std::sync::atomic::AtomicUsize) {
+        let funding = self
+            .cache_funding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let next = funding
+            .fixed
+            .saturating_add(funding.selected.max(held.load(Ordering::Acquire)));
+        let previous = self.bytes.load(Ordering::Acquire);
+        // This callback never admits storage: the selecting caller prepaid the
+        // capacity, and a detached holder keeps any physical excess until free.
+        if next < previous {
+            self.bytes.store(next, Ordering::Release);
+            self.memory.release(previous - next);
+        }
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -7076,6 +7144,10 @@ impl SourceMemoryReservation {
             Self {
                 memory,
                 bytes: std::sync::atomic::AtomicUsize::new(bytes),
+                cache_funding: std::sync::Mutex::new(SourceCacheFunding {
+                    selected: 0,
+                    fixed: bytes,
+                }),
             },
             control,
         )
@@ -7085,6 +7157,10 @@ impl SourceMemoryReservation {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn detach_control(&self, bytes: usize) -> Result<crate::memory_accounting::ControlCredit> {
+        let mut funding = self
+            .cache_funding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         #[cfg(test)]
         let _transfer_observation =
             direct_source_contract_rows::TransferObservation::begin(self, bytes);
@@ -7096,7 +7172,13 @@ impl SourceMemoryReservation {
                 Error::Other("source control exceeds its existing fixed reservation".into())
             })?;
         match self.memory.detach_direct_source_credit(bytes) {
-            Ok(credit) => Ok(credit),
+            Ok(credit) => {
+                funding.fixed = funding
+                    .fixed
+                    .checked_sub(bytes)
+                    .expect("retained control is in fixed reserve");
+                Ok(credit)
+            }
             Err(error) => {
                 self.bytes.fetch_add(bytes, Ordering::SeqCst);
                 Err(error)
@@ -8836,6 +8918,49 @@ pub struct SourceCacheChargeForTest {
 }
 
 impl RetainedReadSource {
+    pub(crate) fn prepaid_cache_index_bytes(&self) -> usize {
+        self.database.read_cache_index_bytes()
+    }
+
+    pub(crate) fn held_cache_page_bytes(&self) -> usize {
+        self.database.read_cache_held_bytes()
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Cache admission retains original inline refusal diagnostics."
+    )]
+    pub(crate) fn select_cache_capacity(&self, capacity: usize) -> Result<()> {
+        let source = &self._source_memory;
+        let old = source
+            .cache_funding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .selected;
+        let growing = capacity > old;
+        if growing {
+            source.select_cache_capacity(capacity, || self.database.read_cache_held_bytes())?;
+        }
+        let settled = self.database.with_read_cache_capacity(capacity, || {
+            source.select_cache_capacity(capacity, || self.database.read_cache_held_bytes())
+        });
+        match settled {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => {
+                self.database
+                    .set_read_cache_capacity(old)
+                    .map_err(RedbPersistence::storage_error)?;
+                source.select_cache_capacity(old, || self.database.read_cache_held_bytes())?;
+                Err(error)
+            }
+            Err(error) => {
+                if growing {
+                    source.select_cache_capacity(old, || self.database.read_cache_held_bytes())?;
+                }
+                Err(RedbPersistence::storage_error(error))
+            }
+        }
+    }
     #[cfg(test)]
     pub(crate) fn write_control_for_test(&self) -> redb::CacheWriteControlForTest {
         self.database.write_control_for_test()
@@ -12996,6 +13121,7 @@ impl ReadImageSource {
     fn start(
         database_path: &Path,
         cache_bytes: usize,
+        index_page_capacity: usize,
         source_memory: SourceShared<SourceMemoryReservation>,
         runtime_dir: Option<&Path>,
         registration: Option<ReadSnapshotRegistrationGuard>,
@@ -13030,7 +13156,9 @@ impl ReadImageSource {
         let opened = redb::with_retained_cache_preparation_admission(preparation, || {
             RedbPersistence::open_hook_suppressed(|| {
                 let mut builder = redb_builder();
-                builder.set_cache_size(cache_bytes);
+                // Prepay the index for every selectable share; later mutation
+                // reuses these physical slots rather than retaining old arenas.
+                builder.set_cache_size(index_page_capacity);
                 // A reader always reads at a registered root, so its handle never
                 // builds or loads allocator state. Where registration exists, the
                 // native open's clean-state verdict is asked for separately below.
@@ -13058,7 +13186,26 @@ impl ReadImageSource {
         // Carry the SAME source reservation into native cache occupancy owners.
         // Detached pages/transactions may outlive this Rust database wrapper;
         // their last physical free must precede the original reserve's refund.
-        drop(database.retain_cache_reserve(source_memory.clone().into_native_credit()));
+        database
+            .set_read_cache_capacity(cache_bytes)
+            .map_err(read_storage_error)?;
+        let cache_owner = database.retain_cache_reserve(source_memory.clone().into_native_credit());
+        unsafe fn settle_source_cache(
+            raw: std::ptr::NonNull<()>,
+            held: &std::sync::atomic::AtomicUsize,
+        ) {
+            unsafe { raw.cast::<SourceMemoryReservation>().as_ref() }.settle_cache_free(held);
+        }
+        // SAFETY: the SAME SourceShared strong owner is inside both reserve
+        // counters. The stable payload stays alive through the final callback;
+        // settlement only refunds already-freed excess and never accesses cache.
+        unsafe {
+            cache_owner.set_read_settlement(
+                std::ptr::NonNull::from(&*source_memory).cast(),
+                settle_source_cache,
+            );
+        }
+        drop(cache_owner);
         // A store whose writer died is read at the commit the next writer's
         // repair keeps, chosen at the same fixed cost as a healthy capture
         // below -- but only when that writer died on this boot, on this exact
@@ -58019,7 +58166,7 @@ mod empty_declared_index_readiness_tests {
             let load = image_memory
                 .scope(|| {
                     let mut source =
-                        ReadImageSource::start(&path, 0, source_memory, None, None, None)?;
+                        ReadImageSource::start(&path, 0, 0, source_memory, None, None, None)?;
                     let image = source.with_read_transaction(|read| {
                         decode_complete_read_image(
                             read,
@@ -69679,3 +69826,6 @@ pub(crate) fn install_source_fixture_cache_reserve_for_test(
 #[cfg(test)]
 #[path = "persistence/direct_source_contract_rows.rs"]
 mod direct_source_contract_rows;
+
+#[cfg(test)]
+mod cache_mutation_funding_tests;

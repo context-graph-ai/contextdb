@@ -795,6 +795,25 @@ impl TransactionalMemory {
         self.storage.retain_cache_reserve(reserve)
     }
 
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn set_read_cache_capacity(&self, bytes: usize) -> Result<usize> {
+        self.storage.set_read_cache_capacity(bytes)
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn with_read_cache_capacity<R>(
+        &self,
+        bytes: usize,
+        settle: impl FnOnce() -> R,
+    ) -> Result<R> {
+        self.storage.with_read_cache_capacity(bytes, settle)
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn read_cache_held_bytes(&self) -> usize {
+        self.storage.read_cache_held_bytes()
+    }
+
     pub(crate) fn cache_index_bytes(&self) -> usize {
         self.storage.index_bytes()
     }
