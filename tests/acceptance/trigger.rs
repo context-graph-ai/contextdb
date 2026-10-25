@@ -1,23 +1,69 @@
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use super::common::{count_rows, empty_params};
-use contextdb_core::{
-    CallbackKind, ContextId, Error, Incarnation, Lsn, Principal, Result, RowId, ScopeLabel,
-    SortDirection, TxId, UpsertResult, Value, VectorIndexRef, VectorPartitionKey, VersionedRow,
-};
-use contextdb_engine::sync_types::{
-    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
-    VectorChange,
-};
-use contextdb_engine::{
-    Database, MaintenancePolicy, TriggerAuditFilter, TriggerAuditStatus, TriggerAuditStatusFilter,
-    TriggerEvent,
-};
-use contextdb_server::protocol::{
-    WireChangeSet, WireDdlAuthor, WireDdlProvenance, canonical_ddl_provenance_digest,
-};
-use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
+#[cfg(feature = "test-seams")]
+use contextdb_core::CallbackKind;
+#[cfg(feature = "test-seams")]
+use contextdb_core::ContextId;
+use contextdb_core::Error;
+#[cfg(feature = "test-seams")]
+use contextdb_core::Incarnation;
+use contextdb_core::Lsn;
+#[cfg(feature = "test-seams")]
+use contextdb_core::Principal;
+use contextdb_core::Result;
+#[cfg(feature = "test-seams")]
+use contextdb_core::RowId;
+#[cfg(feature = "test-seams")]
+use contextdb_core::ScopeLabel;
+#[cfg(feature = "test-seams")]
+use contextdb_core::SortDirection;
+use contextdb_core::TxId;
+use contextdb_core::UpsertResult;
+use contextdb_core::Value;
+use contextdb_core::VectorIndexRef;
+#[cfg(feature = "test-seams")]
+use contextdb_core::VectorPartitionKey;
+use contextdb_core::VersionedRow;
+use contextdb_engine::sync_types::ChangeSet;
+use contextdb_engine::sync_types::DdlChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::EdgeChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::NaturalKey;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::RowChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::VectorChange;
+use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::MaintenancePolicy;
+use contextdb_engine::TriggerAuditFilter;
+use contextdb_engine::TriggerAuditStatus;
+use contextdb_engine::TriggerAuditStatusFilter;
+use contextdb_engine::TriggerEvent;
+use contextdb_server::protocol::WireChangeSet;
+#[cfg(feature = "test-seams")]
+use contextdb_server::protocol::WireDdlAuthor;
+use contextdb_server::protocol::WireDdlProvenance;
+use contextdb_server::protocol::canonical_ddl_provenance_digest;
+#[cfg(feature = "test-seams")]
+use contextdb_server::FabricIdentity;
+#[cfg(feature = "test-seams")]
+use contextdb_server::InProcessBroker;
+#[cfg(feature = "test-seams")]
+use contextdb_server::SyncClient;
+#[cfg(feature = "test-seams")]
+use contextdb_server::SyncServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+#[cfg(feature = "test-seams")]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+#[cfg(feature = "test-seams")]
+use std::sync::Barrier;
+use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -59,6 +105,7 @@ fn setup_host_tables(db: &Database) {
     .unwrap();
 }
 
+#[cfg(feature = "test-seams")]
 fn declare_host_sync_keep_latest(db: &Database) {
     for table in ["host_writes", "host_audits"] {
         db.execute(
@@ -69,6 +116,7 @@ fn declare_host_sync_keep_latest(db: &Database) {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn setup_ready_host_write_trigger(db: &Database) {
     db.execute(
         "CREATE TABLE host_writes (id UUID PRIMARY KEY, content TEXT)",
@@ -130,6 +178,7 @@ fn host_insert_sql() -> &'static str {
     "INSERT INTO host_writes (id, content) VALUES ($id, $content)"
 }
 
+#[cfg(feature = "test-seams")]
 fn row_change(table: &str, id: Uuid, content: &str, lsn: Lsn) -> RowChange {
     RowChange {
         table: table.to_string(),
@@ -160,6 +209,7 @@ fn row_for_column_uuid(db: &Database, table: &str, column: &str, id: Uuid) -> Op
         .find(|row| matches!(row.values.get(column), Some(Value::Uuid(value)) if *value == id))
 }
 
+#[cfg(feature = "test-seams")]
 fn changeset_has_data(changes: &ChangeSet) -> bool {
     !changes.rows.is_empty()
         || !changes.edges.is_empty()
@@ -167,6 +217,7 @@ fn changeset_has_data(changes: &ChangeSet) -> bool {
         || !changes.ddl.is_empty()
 }
 
+#[cfg(feature = "test-seams")]
 fn rollback_reason_contains_any(status: &TriggerAuditStatus, needles: &[&str]) -> bool {
     let TriggerAuditStatus::RolledBack { reason } = status else {
         return false;
@@ -177,6 +228,7 @@ fn rollback_reason_contains_any(status: &TriggerAuditStatus, needles: &[&str]) -
         .any(|needle| reason.contains(&needle.to_ascii_lowercase()))
 }
 
+#[cfg(feature = "test-seams")]
 fn rollback_audit_failure(db: &Database, label: &str, needles: &[&str]) -> Option<String> {
     let history = db
         .trigger_audit_history(TriggerAuditFilter {
@@ -204,6 +256,7 @@ fn rollback_audit_failure(db: &Database, label: &str, needles: &[&str]) -> Optio
     None
 }
 
+#[cfg(feature = "test-seams")]
 fn reopened_rollback_audit_failure(
     path: &std::path::Path,
     label: &str,
@@ -225,6 +278,7 @@ fn reopened_rollback_audit_failure(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "test-seams")]
 struct HnswBaseline {
     point_count: usize,
     layer0_points: usize,
@@ -233,6 +287,7 @@ struct HnswBaseline {
     raw_entry_counts: Vec<(RowId, usize)>,
 }
 
+#[cfg(feature = "test-seams")]
 impl HnswBaseline {
     fn row_ids(&self) -> Vec<RowId> {
         self.raw_entry_counts
@@ -242,6 +297,7 @@ impl HnswBaseline {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn hnsw_baseline_failure(
     db: &Database,
     index: VectorIndexRef,
@@ -324,6 +380,7 @@ fn hnsw_baseline_failure(
     None
 }
 
+#[cfg(feature = "test-seams")]
 fn reopened_rollback_absence_failure(
     path: &std::path::Path,
     label: &str,
@@ -380,6 +437,7 @@ fn reopened_rollback_absence_failure(
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn live_vector_rows<I>(db: &Database, row_ids: I) -> Vec<RowId>
 where
     I: IntoIterator<Item = RowId>,
@@ -393,6 +451,7 @@ where
         .collect()
 }
 
+#[cfg(feature = "test-seams")]
 fn live_vector_count(db: &Database, table: &str) -> usize {
     db.scan(table, db.snapshot())
         .unwrap()
@@ -405,6 +464,7 @@ fn live_vector_count(db: &Database, table: &str) -> usize {
         .count()
 }
 
+#[cfg(feature = "test-seams")]
 fn audited_edge_count(db: &Database, ids: &[Uuid]) -> usize {
     ids.iter()
         .copied()
@@ -412,6 +472,7 @@ fn audited_edge_count(db: &Database, ids: &[Uuid]) -> usize {
         .sum()
 }
 
+#[cfg(feature = "test-seams")]
 fn fired_trigger_history(
     db: &Database,
     trigger_name: &str,
@@ -423,8 +484,10 @@ fn fired_trigger_history(
     .unwrap()
 }
 
+#[cfg(feature = "test-seams")]
 const HNSW_FIXTURE_ROWS: usize = 1_001;
 
+#[cfg(feature = "test-seams")]
 fn warm_hnsw_fixture(
     db: &Database,
     index: VectorIndexRef,
@@ -514,6 +577,7 @@ fn warm_hnsw_fixture(
     baseline
 }
 
+#[cfg(feature = "test-seams")]
 fn seed_sibling_hnsw_vectors(db: &Database) -> (usize, u64, HnswBaseline) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     for idx in 0..HNSW_FIXTURE_ROWS {
@@ -552,6 +616,7 @@ fn seed_sibling_hnsw_vectors(db: &Database) -> (usize, u64, HnswBaseline) {
     (HNSW_FIXTURE_ROWS, max_row_id, baseline)
 }
 
+#[cfg(feature = "test-seams")]
 fn seed_host_audit_hnsw(db: &Database) -> (usize, u64, HnswBaseline) {
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
     for idx in 0..HNSW_FIXTURE_ROWS {
@@ -591,6 +656,7 @@ fn seed_host_audit_hnsw(db: &Database) -> (usize, u64, HnswBaseline) {
     (HNSW_FIXTURE_ROWS, max_row_id, baseline)
 }
 
+#[cfg(feature = "test-seams")]
 fn hnsw_raw_leaks<I>(db: &Database, index: VectorIndexRef, row_ids: I) -> Vec<(RowId, usize)>
 where
     I: IntoIterator<Item = RowId>,
@@ -605,6 +671,7 @@ where
         .collect()
 }
 
+#[cfg(feature = "test-seams")]
 fn candidate_row_ids_after(max_row_id: u64) -> Vec<RowId> {
     ((max_row_id + 1)..=(max_row_id + 32))
         .map(RowId::from_raw_wire)
@@ -664,6 +731,7 @@ fn row_group_signatures(db: &Database, changes: ChangeSet) -> Vec<BTreeSet<Strin
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("cold_gate.redb");
@@ -910,6 +978,7 @@ fn t3_gate_writes_to_trigger_table_rejected_until_callback_ready() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_apply_requires_complete_initialization_after_callback_registration() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("callback_registered_not_initialized.redb");
@@ -965,6 +1034,7 @@ fn t3_sync_apply_requires_complete_initialization_after_callback_registration() 
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callbacks() {
     let tmp = TempDir::new().unwrap();
 
@@ -1278,6 +1348,7 @@ fn t3_sync_trigger_tombstones_can_clear_cold_reopened_declarations_without_callb
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_rejects_invalid_event_bus_batch_without_trigger_leak() {
     let db = Database::open_memory();
     db.execute(
@@ -1342,6 +1413,7 @@ fn t3_sync_trigger_ddl_rejects_invalid_event_bus_batch_without_trigger_leak() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_with_same_batch_rows_fails_closed_until_callback_ready() {
     let db = Database::open_memory();
     db.execute(
@@ -1404,6 +1476,7 @@ fn t3_sync_trigger_ddl_with_same_batch_rows_fails_closed_until_callback_ready() 
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_with_same_batch_unrelated_data_fails_closed_until_callback_ready() {
     let db = Database::open_memory();
     db.execute(
@@ -1474,6 +1547,7 @@ fn t3_sync_trigger_ddl_with_same_batch_unrelated_data_fails_closed_until_callbac
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_with_same_batch_vector_data_fails_before_trigger_leak() {
     let db = Database::open_memory();
     db.execute(
@@ -1534,6 +1608,7 @@ fn t3_sync_trigger_ddl_with_same_batch_vector_data_fails_before_trigger_leak() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_mixed_ddl_preflight_uses_sender_lsn_order_before_trigger_side_effects() {
     let db = Database::open_memory();
     setup_ready_host_write_trigger(&db);
@@ -1590,6 +1665,7 @@ fn t3_sync_mixed_ddl_preflight_uses_sender_lsn_order_before_trigger_side_effects
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
     let invalid_type_db = Database::open_memory();
     let invalid_type_since = invalid_type_db.current_lsn();
@@ -1777,6 +1853,7 @@ fn t3_sync_mixed_ddl_preflight_rejects_invalid_table_ddl_before_side_effects() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_mixed_ddl_preflight_rejects_noncanonical_natural_key_envelopes_without_trigger_leak() {
     let cases = [
         (
@@ -1907,6 +1984,7 @@ fn t3_drop_table_removes_attached_triggers_and_persists_tombstones() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_preflight_rejects_fk_invalid_data_before_any_trigger_ddl_leaks() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
@@ -1976,6 +2054,7 @@ fn t3_sync_trigger_ddl_preflight_rejects_fk_invalid_data_before_any_trigger_ddl_
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_fk_preflight_respects_sender_lsn_order() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
@@ -2055,6 +2134,7 @@ fn t3_sync_trigger_ddl_fk_preflight_respects_sender_lsn_order() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_fk_preflight_rejects_parent_delete_before_trigger_leak() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
@@ -2142,6 +2222,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_parent_delete_before_trigger_leak() 
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_fk_preflight_rejects_stale_parent_prefix_after_update() {
     let db = Database::open_memory();
     db.execute(
@@ -2251,6 +2332,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_stale_parent_prefix_after_update() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_fk_preflight_accepts_child_update_before_parent_delete() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE parent_rows (id UUID PRIMARY KEY)", &empty())
@@ -2339,6 +2421,7 @@ fn t3_sync_trigger_ddl_fk_preflight_accepts_child_update_before_parent_delete() 
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_fk_preflight_rejects_server_wins_child_update_before_edge_wins_parent_delete()
  {
     let db = Database::open_memory();
@@ -2448,6 +2531,7 @@ fn t3_sync_trigger_ddl_fk_preflight_rejects_server_wins_child_update_before_edge
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_table_create_drop_history_replays_chronologically() {
     let db = Database::open_memory();
 
@@ -2650,6 +2734,7 @@ fn t3_sync_trigger_table_create_drop_history_replays_chronologically() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_vector_create_data_drop_history_replays_without_callbacks() {
     let db = Database::open_memory();
     db.execute(
@@ -2784,6 +2869,7 @@ fn t3_sync_trigger_vector_create_data_drop_history_replays_without_callbacks() {
 
 #[cfg(feature = "test-seams")]
 // Acceptance: each committed source unit releases its reader scratch before the next unit.
+#[cfg(feature = "test-seams")]
 fn assert_sequential_vector_source_unit_credit() {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let mut peaks = Vec::new();
@@ -2969,6 +3055,7 @@ fn assert_sequential_vector_source_unit_credit() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_reg_introspection_and_delete_event_rejection() {
     let db = Database::open_memory();
     db.execute(
@@ -4566,6 +4653,7 @@ fn t3_reg_introspection_and_delete_event_rejection() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_callback_writes_are_pinned_to_supplied_tx_bound_handle() {
     let db = Database::open_memory();
     db.execute(
@@ -5116,6 +5204,7 @@ fn t3_trigger_dispatch_uses_commit_final_write_set() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_trigger_ddl_replay_respects_sender_lsn_order() {
     let origin = Database::open_memory();
     setup_host_tables(&origin);
@@ -5463,6 +5552,7 @@ fn t3_atomicity_cascade_rows_share_lsn_and_event() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
     let mut failures = Vec::new();
 
@@ -5927,6 +6017,7 @@ fn t3_tier2_cascade_unique_violation_rolls_back_firing() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("trigger_persistence.redb");
@@ -6183,6 +6274,7 @@ fn t3_persist_trigger_declaration_audit_and_no_replay_refire() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_sync_originator_fires_receiver_does_not_refire() {
     let origin = Database::open_memory();
     let receiver = Database::open_memory();
@@ -6321,6 +6413,7 @@ fn t3_sync_originator_fires_receiver_does_not_refire() {
 }
 
 #[tokio::test]
+#[cfg(feature = "test-seams")]
 async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
     let fabric = InProcessBroker::new();
     let tenant_id = "t3-trigger-ddl-sync";
@@ -6843,6 +6936,7 @@ async fn t3_sync_client_push_pull_carries_trigger_ddl_and_drop() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_d7_wire_split_preserves_sender_lsn_under_byte_pressure() {
     // Authenticated received DDL's signed
     // provenance is what attests the schema the author actually sent, so this fixture
@@ -7059,6 +7153,7 @@ fn t3_d7_unsigned_authenticated_ddl_claim_is_refused() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_d8_apply_changes_groups_rows_by_sender_lsn() {
     let origin = Database::open_memory();
     let receiver = Database::open_memory();
@@ -7246,6 +7341,7 @@ fn t3_d8_apply_changes_groups_rows_by_sender_lsn() {
 }
 
 #[tokio::test]
+#[cfg(feature = "test-seams")]
 async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() {
     let fabric = InProcessBroker::new();
     let tenant_id = "t3-trigger-bootstrap-pull";
@@ -7372,6 +7468,7 @@ async fn t3_sync_client_fresh_pull_bootstraps_trigger_ddl_before_history_data() 
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_freshdisk_pull_replays_server_history_atomic_and_no_refire() {
     let tmp = TempDir::new().unwrap();
     let server = Database::open(tmp.path().join("server.redb")).unwrap();
@@ -7911,6 +8008,7 @@ fn t3_depth_self_cascade_cap_rolls_back_typed() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t3_cron_callback_write_can_fire_trigger_without_aliasing_flags() {
     let db = Arc::new(Database::open_memory());
     setup_host_tables(&db);
@@ -8400,6 +8498,7 @@ fn setup_received_insert_trigger(db: &Database, including_sync: bool) {
     .unwrap();
 }
 
+#[cfg(feature = "test-seams")]
 fn received_source_change(id: Uuid, lsn: Lsn) -> ChangeSet {
     ChangeSet {
         rows: vec![RowChange {
@@ -8417,6 +8516,7 @@ fn received_source_change(id: Uuid, lsn: Lsn) -> ChangeSet {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn register_received_derived_callback(db: &Database) {
     db.register_trigger_callback("received_insert", |handle, ctx| {
         let id = ctx.row_values["id"].as_uuid().copied().unwrap();
@@ -8440,6 +8540,7 @@ fn register_received_derived_callback(db: &Database) {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn including_sync_default_is_silent_and_opt_in_fires_once_on_received_insert() {
     for (including_sync, expected_fires) in [(false, 0), (true, 1)] {
         let db = Database::open_memory();
@@ -8488,6 +8589,7 @@ fn including_sync_default_is_silent_and_opt_in_fires_once_on_received_insert() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn including_sync_delete_received_ddl_is_typed_and_never_persisted() {
     let db = Database::open_memory();
     db.execute(
@@ -8526,6 +8628,7 @@ fn including_sync_delete_received_ddl_is_typed_and_never_persisted() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn including_sync_callback_failure_rolls_back_incoming_and_derived_rows() {
     let db = Database::open_memory();
     setup_received_insert_trigger(&db, true);
@@ -8562,6 +8665,7 @@ fn including_sync_callback_failure_rolls_back_incoming_and_derived_rows() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn including_sync_forbidden_effect_families_are_typed_atomic_and_audited() {
     #[derive(Clone, Copy, Debug)]
     enum Effect {
@@ -8754,6 +8858,7 @@ fn local_trigger_callback_keeps_graph_mutation_api() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn including_sync_rewrites_only_callback_txid_placeholders() {
     let db = Database::open_memory();
     let control = Database::open_memory();
@@ -8839,6 +8944,7 @@ fn including_sync_rewrites_only_callback_txid_placeholders() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn including_sync_txid_identity_placeholder_is_typed_while_fixed_and_local_are_allowed() {
     for active_placeholder in [true, false] {
         let db = Database::open_memory();
@@ -8961,6 +9067,7 @@ fn including_sync_txid_identity_placeholder_is_typed_while_fixed_and_local_are_a
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn including_sync_fires_when_received_schema_and_data_commit_together() {
     let db = Database::open_memory();
     setup_received_insert_trigger(&db, true);
@@ -8991,6 +9098,7 @@ fn including_sync_fires_when_received_schema_and_data_commit_together() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn including_sync_declaration_persists_reopens_and_transports_as_typed_ddl() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("including-sync.redb");
@@ -9030,6 +9138,7 @@ fn including_sync_declaration_persists_reopens_and_transports_as_typed_ddl() {
 }
 
 #[tokio::test]
+#[cfg(feature = "test-seams")]
 async fn including_sync_hub_derivation_reaches_another_edge_without_outbound_echo() {
     let fabric = InProcessBroker::new();
     let tenant_id = "including-sync-lineage";

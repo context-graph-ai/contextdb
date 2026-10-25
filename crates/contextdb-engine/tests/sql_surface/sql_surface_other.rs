@@ -1,7 +1,10 @@
 #[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
 use contextdb_core::{ContextId, Error, Lsn, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
+#[cfg(feature = "test-seams")]
 use contextdb_engine::memory_accounting::MemoryAccountant;
-use contextdb_engine::{Database, sync_types as sync};
+use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types as sync;
 use std::collections::{BTreeSet, HashMap};
 #[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
 use std::sync::{atomic::{AtomicBool, Ordering}, mpsc::{self, TryRecvError}, Arc, Barrier};
@@ -45,8 +48,8 @@ fn sql_01b_default_integer_literal_applies_on_omitted_insert() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Int64(5));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Int64(5));
 }
 
 #[test]
@@ -73,8 +76,8 @@ fn sql_01c_default_real_literal_applies_on_omitted_insert() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Float64(0.0));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Float64(0.0));
 }
 
 #[test]
@@ -110,9 +113,9 @@ fn sql_01d_numeric_defaults_survive_persisted_reopen() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Float64(0.0));
-    assert_eq!(result.rows[0][1], Value::Int64(5));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Float64(0.0));
+    assert_eq!(result.rows()[0][1], Value::Int64(5));
 }
 
 #[test]
@@ -146,11 +149,11 @@ fn sql_02_edge_insert_routes_to_graph_once() {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "graph traversal should see exactly one reachable target after duplicate SQL edge inserts"
     );
-    assert_eq!(result.rows[0][0], Value::Uuid(target));
+    assert_eq!(result.rows()[0][0], Value::Uuid(target));
 }
 
 #[test]
@@ -299,8 +302,14 @@ fn sql_05_scenario3_multi_hop_cascade() {
             &params(vec![("id", Value::Uuid(decision_b))]),
         )
         .unwrap();
-    assert_eq!(decision_a_row.rows[0][0], Value::Text("invalidated".into()));
-    assert_eq!(decision_b_row.rows[0][0], Value::Text("invalidated".into()));
+    assert_eq!(
+        decision_a_row.rows()[0][0],
+        Value::Text("invalidated".into())
+    );
+    assert_eq!(
+        decision_b_row.rows()[0][0],
+        Value::Text("invalidated".into())
+    );
 }
 
 #[test]
@@ -359,9 +368,9 @@ fn sql_07_join_double_qualification() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Text("employee".into()));
-    assert_eq!(result.rows[0][1], Value::Text("order".into()));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Text("employee".into()));
+    assert_eq!(result.rows()[0][1], Value::Text("order".into()));
 }
 
 #[test]
@@ -388,7 +397,7 @@ fn sql_08_distinct_not_quadratic() {
     let result = db
         .execute("SELECT DISTINCT tag FROM items", &empty())
         .unwrap();
-    assert_eq!(result.rows.len(), 100);
+    assert_eq!(result.rows().len(), 100);
 }
 
 #[test]
@@ -462,9 +471,9 @@ fn jn_04_cte_graph_join_relational() {
             &params(vec![("root_id", Value::Uuid(eid1))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
-    assert_eq!(result.rows[0][name_idx], Value::Text("child".into()));
+    assert_eq!(result.rows().len(), 1);
+    let name_idx = result.columns().iter().position(|c| c == "name").unwrap();
+    assert_eq!(result.rows()[0][name_idx], Value::Text("child".into()));
 }
 
 #[test]
@@ -541,11 +550,11 @@ fn jn_06_cte_filtered_vector_ordering_executes() {
         )
         .expect("CTE-backed vector ordering should execute");
 
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0][0], Value::Uuid(near));
-    assert_eq!(result.rows[0][1], Value::Text("near".into()));
-    assert_eq!(result.rows[1][0], Value::Uuid(far));
-    assert_eq!(result.rows[1][1], Value::Text("far".into()));
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(result.rows()[0][0], Value::Uuid(near));
+    assert_eq!(result.rows()[0][1], Value::Text("near".into()));
+    assert_eq!(result.rows()[1][0], Value::Uuid(far));
+    assert_eq!(result.rows()[1][1], Value::Text("far".into()));
 }
 
 fn sarg_uuid(n: u128) -> Uuid {
@@ -625,12 +634,12 @@ fn sarg_insert_node(db: &Database, id: Uuid, ctx: Option<Uuid>, kind: Option<&st
 
 fn sarg_uuid_column_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<Uuid> {
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == column || c.rsplit('.').next() == Some(column))
-        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns));
+        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns()));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[idx] {
             Value::Uuid(id) => *id,
@@ -741,6 +750,7 @@ fn ga_insert_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str) {
     .unwrap();
 }
 
+#[cfg(feature = "test-seams")]
 fn ga_insert_edge_with_context(
     db: &Database,
     source: Uuid,
@@ -761,6 +771,7 @@ fn ga_insert_edge_with_context(
     .unwrap();
 }
 
+#[cfg(feature = "test-seams")]
 fn ga_seed_unrelated_edges(db: &Database, base: u128, count: usize, edge_type: &str) {
     for i in 0..count {
         ga_insert_edge(
@@ -776,6 +787,7 @@ fn ga_uuid_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet
     sarg_uuid_column_set(result, column)
 }
 
+#[cfg(feature = "test-seams")]
 fn ga_assert_trace(
     result: &contextdb_engine::QueryResult,
     physical_plan: &str,
@@ -783,24 +795,25 @@ fn ga_assert_trace(
     predicates: &[&str],
     indexes_considered_len: usize,
 ) {
-    assert_eq!(result.trace.physical_plan, physical_plan);
-    assert_eq!(result.trace.index_used.as_deref(), index_used);
+    assert_eq!(result.trace().physical_plan, physical_plan);
+    assert_eq!(result.trace().index_used.as_deref(), index_used);
     let pushed: Vec<&str> = result
-        .trace
+        .trace()
         .predicates_pushed
         .iter()
         .map(|predicate| predicate.as_ref())
         .collect();
     assert_eq!(pushed, predicates);
     assert_eq!(
-        result.trace.indexes_considered.len(),
+        result.trace().indexes_considered.len(),
         indexes_considered_len,
         "unexpected indexes_considered: {:?}",
-        result.trace.indexes_considered
+        result.trace().indexes_considered
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga01_forward_pinned_single_hop_reports_forward_adjacency_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -834,22 +847,23 @@ fn ga01_forward_pinned_single_hop_reports_forward_adjacency_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), targets);
-    assert_eq!(result.rows.len(), targets.len());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.rows().len(), targets.len());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert!(
         result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .any(|predicate| predicate.as_ref() == "a.id"),
         "expected a.id in predicates_pushed, got {:?}",
-        result.trace.predicates_pushed
+        result.trace().predicates_pushed
     );
     assert_eq!(db.__rows_examined(), 5);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga02_reverse_pinned_single_hop_reports_reverse_adjacency_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -883,13 +897,14 @@ fn ga02_reverse_pinned_single_hop_reports_reverse_adjacency_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "d"), decisions);
-    assert_eq!(result.rows.len(), decisions.len());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("reverse_adj"));
+    assert_eq!(result.rows().len(), decisions.len());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("reverse_adj"));
     assert_eq!(db.__rows_examined(), 4);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga03_both_pinned_positive_applies_target_residual_after_degree_walk() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -911,25 +926,26 @@ fn ga03_both_pinned_positive_applies_target_residual_after_degree_walk() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert!(
         result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .any(|p| p.as_ref() == "a.id")
             && result
-                .trace
+                .trace()
                 .predicates_pushed
                 .iter()
                 .any(|p| p.as_ref() == "b.id"),
         "expected a.id and b.id predicates, got {:?}",
-        result.trace.predicates_pushed
+        result.trace().predicates_pushed
     );
     assert_eq!(db.__rows_examined(), 3);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga04_unpinned_single_hop_reports_honest_edges_scan_rejection() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -952,7 +968,7 @@ fn ga04_unpinned_single_hop_reports_honest_edges_scan_rejection() {
         .unwrap();
 
     let rows: BTreeSet<_> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Uuid(source), Value::Uuid(target)) => (*source, *target),
@@ -960,10 +976,10 @@ fn ga04_unpinned_single_hop_reports_honest_edges_scan_rejection() {
         })
         .collect();
     assert_eq!(rows, BTreeSet::from(pairs));
-    assert_eq!(result.trace.physical_plan, "EdgesScan");
-    assert_eq!(result.trace.index_used, None);
+    assert_eq!(result.trace().physical_plan, "EdgesScan");
+    assert_eq!(result.trace().index_used, None);
     let considered: Vec<(&str, &str)> = result
-        .trace
+        .trace()
         .indexes_considered
         .iter()
         .map(|candidate| (candidate.name.as_str(), candidate.rejected_reason.as_ref()))
@@ -973,6 +989,7 @@ fn ga04_unpinned_single_hop_reports_honest_edges_scan_rejection() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga05_non_id_pinned_start_resolves_through_index_then_probes() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -1022,11 +1039,12 @@ fn ga05_non_id_pinned_start_resolves_through_index_then_probes() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), targets);
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 2 + 9);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga06_variable_length_traversal_reports_graph_bfs_without_changing_results() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1054,11 +1072,12 @@ fn ga06_variable_length_traversal_reports_graph_bfs_without_changing_results() {
         ga_uuid_set(&result, "t"),
         BTreeSet::from([n1, n2, n3, side])
     );
-    assert_eq!(result.trace.physical_plan, "GraphBfs");
+    assert_eq!(result.trace().physical_plan, "GraphBfs");
     assert_eq!(db.__rows_examined(), 4);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga07_pre_insert_snapshot_does_not_see_later_edge() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1077,13 +1096,14 @@ fn ga07_pre_insert_snapshot_does_not_see_later_edge() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 0);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga08_delete_visibility_respects_pre_and_post_delete_snapshots() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1115,16 +1135,17 @@ fn ga08_delete_visibility_respects_pre_and_post_delete_snapshots() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&before, "t"), BTreeSet::from([y]));
-    assert_eq!(before.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(before.trace.index_used.as_deref(), Some("forward_adj"));
-    assert!(after.rows.is_empty());
-    assert_eq!(after.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(after.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(before.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(before.trace().index_used.as_deref(), Some("forward_adj"));
+    assert!(after.rows().is_empty());
+    assert_eq!(after.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(after.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(before_examined, 1);
     assert_eq!(db.__rows_examined(), 0);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga09_same_transaction_staged_edge_is_visible_only_inside_transaction() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1163,13 +1184,16 @@ fn ga09_same_transaction_staged_edge_is_visible_only_inside_transaction() {
         ga_uuid_set(&in_tx, "t"),
         BTreeSet::from([committed, staged])
     );
-    assert_eq!(in_tx.rows.len(), 2);
-    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(in_tx.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(in_tx.rows().len(), 2);
+    assert_eq!(in_tx.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(in_tx.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(in_tx_examined, 2);
     assert_eq!(ga_uuid_set(&outside_tx, "t"), BTreeSet::from([committed]));
-    assert_eq!(outside_tx.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(outside_tx.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(outside_tx.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(
+        outside_tx.trace().index_used.as_deref(),
+        Some("forward_adj")
+    );
     assert_eq!(outside_tx_examined, 1);
 
     let x2 = ga_uuid(810);
@@ -1197,23 +1221,24 @@ fn ga09_same_transaction_staged_edge_is_visible_only_inside_transaction() {
     let delete_outside_examined = db.__rows_examined();
     db.rollback(delete_tx).unwrap();
 
-    assert!(deleted_in_tx.rows.is_empty());
-    assert_eq!(deleted_in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert!(deleted_in_tx.rows().is_empty());
+    assert_eq!(deleted_in_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(
-        deleted_in_tx.trace.index_used.as_deref(),
+        deleted_in_tx.trace().index_used.as_deref(),
         Some("forward_adj")
     );
     assert_eq!(deleted_in_tx_examined, 0);
     assert_eq!(ga_uuid_set(&delete_outside_tx, "t"), BTreeSet::from([y2]));
-    assert_eq!(delete_outside_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(delete_outside_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(
-        delete_outside_tx.trace.index_used.as_deref(),
+        delete_outside_tx.trace().index_used.as_deref(),
         Some("forward_adj")
     );
     assert_eq!(delete_outside_examined, 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga10_rolled_back_staged_edge_never_leaks_to_later_read() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1233,13 +1258,14 @@ fn ga10_rolled_back_staged_edge_never_leaks_to_later_read() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 0);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga11_dag_edge_type_forward_probe_matches_plain_edge_type() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &empty())
@@ -1263,12 +1289,13 @@ fn ga11_dag_edge_type_forward_probe_matches_plain_edge_type() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga12_forward_probe_trace_tuple_is_exact() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1291,6 +1318,7 @@ fn ga12_forward_probe_trace_tuple_is_exact() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga13_indexed_subquery_start_feeds_probe_with_combined_accounting() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", kind TEXT", "");
@@ -1324,11 +1352,12 @@ fn ga13_indexed_subquery_start_feeds_probe_with_combined_accounting() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), expected);
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 3 + 30);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga14_both_pinned_negative_residual_returns_empty_after_degree_walk() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1349,12 +1378,13 @@ fn ga14_both_pinned_negative_residual_returns_empty_after_degree_walk() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 4);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga16_empty_start_vertex_still_reports_adjacency_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1369,12 +1399,13 @@ fn ga16_empty_start_vertex_still_reports_adjacency_probe() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 0);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga17_non_id_start_with_target_residual_pushes_start_predicate_only() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -1397,29 +1428,30 @@ fn ga17_non_id_start_with_target_residual_pushes_start_predicate_only() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([y]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert!(
         result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .any(|p| p.as_ref() == "a.name"),
         "expected a.name in predicates_pushed, got {:?}",
-        result.trace.predicates_pushed
+        result.trace().predicates_pushed
     );
     assert!(
         !result
-            .trace
+            .trace()
             .predicates_pushed
             .iter()
             .any(|p| p.as_ref() == "b.id"),
         "b.id is a target residual and must not be reported as routed start predicate: {:?}",
-        result.trace.predicates_pushed
+        result.trace().predicates_pushed
     );
     assert_eq!(db.__rows_examined(), 1 + 5);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga18_undirected_pinned_single_hop_probes_forward_and_reverse_maps() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1451,12 +1483,13 @@ fn ga18_undirected_pinned_single_hop_probes_forward_and_reverse_maps() {
     let expected: BTreeSet<_> = forward.union(&reverse).copied().collect();
     let expected: BTreeSet<_> = expected.into_iter().chain([shared]).collect();
     assert_eq!(ga_uuid_set(&result, "t"), expected);
-    assert_eq!(result.rows.len(), expected.len());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.rows().len(), expected.len());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 3 + 2 + 2);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga19_non_indexed_non_id_start_reports_honest_resolution_scan_plus_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", kind TEXT", "");
@@ -1492,8 +1525,8 @@ fn ga19_non_indexed_non_id_start_reports_honest_resolution_scan_plus_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), targets);
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), nodes_count as u64 + 6);
 }
 
@@ -1514,8 +1547,8 @@ fn ga21_start_id_residual_is_resolved_before_probe() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
@@ -1548,10 +1581,11 @@ fn ga22_start_only_or_filter_resolves_all_matching_starts_before_probe() {
         ga_uuid_set(&result, "t"),
         BTreeSet::from([x_target, y_target])
     );
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga23_context_gated_edge_table_has_auto_lookup_index_for_scoped_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(
@@ -1600,7 +1634,7 @@ fn ga23_context_gated_edge_table_has_auto_lookup_index_for_scoped_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(scoped.__rows_examined(), 1);
 }
 
@@ -1649,10 +1683,11 @@ fn ga24_start_only_or_filter_resolves_across_node_metadata_tables() {
         ga_uuid_set(&result, "t"),
         BTreeSet::from([named_target, kind_target])
     );
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga25_graph_edge_auto_index_cannot_be_dropped_by_user_or_sync_ddl() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", ", context_id UUID CONTEXT_ID");
@@ -1697,6 +1732,7 @@ fn ga25_graph_edge_auto_index_cannot_be_dropped_by_user_or_sync_ddl() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga26_alter_table_to_edge_shape_installs_graph_edge_auto_index() {
     let db = Database::open_memory();
     db.execute(
@@ -1737,11 +1773,12 @@ fn ga26_alter_table_to_edge_shape_installs_graph_edge_auto_index() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(scoped.__rows_examined(), 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga27_unpinned_edge_scan_respects_same_tx_graph_overlay() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1779,10 +1816,10 @@ fn ga27_unpinned_edge_scan_respects_same_tx_graph_overlay() {
         ga_uuid_set(&in_tx, "t"),
         BTreeSet::from([committed, staged])
     );
-    assert_eq!(in_tx.trace.physical_plan, "EdgesScan");
+    assert_eq!(in_tx.trace().physical_plan, "EdgesScan");
     assert_eq!(in_tx_examined, 2);
     assert_eq!(ga_uuid_set(&outside_tx, "t"), BTreeSet::from([committed]));
-    assert_eq!(outside_tx.trace.physical_plan, "EdgesScan");
+    assert_eq!(outside_tx.trace().physical_plan, "EdgesScan");
     assert_eq!(outside_tx_examined, 1);
 
     ga_insert_edge(&db, deleted_source, deleted_target, "LINKS");
@@ -1815,6 +1852,7 @@ fn ga27_unpinned_edge_scan_respects_same_tx_graph_overlay() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga28_multihop_bfs_respects_same_tx_graph_overlay() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1854,13 +1892,13 @@ fn ga28_multihop_bfs_respects_same_tx_graph_overlay() {
         ga_uuid_set(&in_tx, "t"),
         BTreeSet::from([middle, staged_leaf])
     );
-    assert_eq!(in_tx.trace.physical_plan, "GraphBfs");
+    assert_eq!(in_tx.trace().physical_plan, "GraphBfs");
     assert_eq!(in_tx_examined, 2);
     assert_eq!(
         ga_uuid_set(&outside_tx, "t"),
         BTreeSet::from([middle, committed_leaf])
     );
-    assert_eq!(outside_tx.trace.physical_plan, "GraphBfs");
+    assert_eq!(outside_tx.trace().physical_plan, "GraphBfs");
     assert_eq!(outside_tx_examined, 2);
 }
 
@@ -1920,10 +1958,11 @@ fn ga29_start_and_filter_resolves_across_node_metadata_tables() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga30_target_metadata_residual_filters_after_degree_walk() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -1945,11 +1984,12 @@ fn ga30_target_metadata_residual_filters_after_degree_walk() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([wanted]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 2);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga31_unqualified_id_start_filter_still_routes_as_start_pin() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -1972,12 +2012,13 @@ fn ga31_unqualified_id_start_filter_still_routes_as_start_pin() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga32_graph_where_sees_same_tx_node_metadata_overlay() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -2027,14 +2068,15 @@ fn ga32_graph_where_sees_same_tx_node_metadata_overlay() {
         ga_uuid_set(&in_tx, "t"),
         BTreeSet::from([updated_target, staged_target])
     );
-    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(in_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(in_tx_examined, 2);
-    assert!(outside_tx.rows.is_empty());
-    assert_eq!(outside_tx.trace.physical_plan, "AdjacencyProbe");
+    assert!(outside_tx.rows().is_empty());
+    assert_eq!(outside_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(outside_tx_examined, 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga33_graph_start_subquery_allows_inner_table_aliases() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", name TEXT", "");
@@ -2058,7 +2100,7 @@ fn ga33_graph_start_subquery_allows_inner_table_aliases() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(db.__rows_examined(), 1 + 1);
 }
 
@@ -2107,6 +2149,7 @@ fn ga34_graph_where_errors_for_referenced_node_metadata_without_id_index() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga35_public_edge_metadata_survives_unrelated_gated_edge_table() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, ", context_id UUID CONTEXT_ID", "");
@@ -2133,11 +2176,12 @@ fn ga35_public_edge_metadata_survives_unrelated_gated_edge_table() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(scoped.__rows_examined(), 1);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga36_graph_gates_see_same_tx_acl_grants() {
     let db = Database::open_memory();
     db.execute(
@@ -2211,9 +2255,9 @@ fn ga36_graph_gates_see_same_tx_acl_grants() {
     db.rollback(tx).unwrap();
 
     assert_eq!(ga_uuid_set(&in_tx, "t"), BTreeSet::from([target]));
-    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
+    assert_eq!(in_tx.trace().physical_plan, "AdjacencyProbe");
     assert_eq!(in_tx_examined, 1);
-    assert!(outside_tx.rows.is_empty());
+    assert!(outside_tx.rows().is_empty());
 }
 
 #[test]
@@ -2235,8 +2279,8 @@ fn ga37_column_id_residual_does_not_parse_column_as_uuid() {
         )
         .unwrap();
 
-    assert!(result.rows.is_empty());
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
+    assert!(result.rows().is_empty());
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
 }
 
 #[test]
@@ -2259,10 +2303,11 @@ fn ga38_start_is_null_filter_falls_back_to_graph_residual_semantics() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "EdgesScan");
+    assert_eq!(result.trace().physical_plan, "EdgesScan");
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga39_target_only_single_hop_uses_reverse_adjacency_probe() {
     let db = Database::open_memory();
     ga_create_graph_tables(&db, "", "");
@@ -2283,8 +2328,8 @@ fn ga39_target_only_single_hop_uses_reverse_adjacency_probe() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "s"), BTreeSet::from([source]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("reverse_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("reverse_adj"));
     assert_eq!(db.__rows_examined(), 1);
 }
 
@@ -2367,11 +2412,12 @@ fn ga40_metadata_start_filter_sees_same_tx_acl_grant() {
     db.rollback(tx).unwrap();
 
     assert_eq!(ga_uuid_set(&in_tx, "t"), BTreeSet::from([target]));
-    assert_eq!(in_tx.trace.physical_plan, "AdjacencyProbe");
-    assert!(outside_tx.rows.is_empty());
+    assert_eq!(in_tx.trace().physical_plan, "AdjacencyProbe");
+    assert!(outside_tx.rows().is_empty());
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga41_graph_node_metadata_ignores_non_uuid_id_tables() {
     let db = Database::open_memory();
     db.execute(
@@ -2422,8 +2468,8 @@ fn ga41_graph_node_metadata_ignores_non_uuid_id_tables() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&result, "t"), BTreeSet::from([target]));
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 1);
 
     let by_metadata = db
@@ -2435,8 +2481,11 @@ fn ga41_graph_node_metadata_ignores_non_uuid_id_tables() {
         .unwrap();
 
     assert_eq!(ga_uuid_set(&by_metadata, "t"), BTreeSet::from([target]));
-    assert_eq!(by_metadata.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(by_metadata.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(by_metadata.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(
+        by_metadata.trace().index_used.as_deref(),
+        Some("forward_adj")
+    );
     assert_eq!(
         db.__rows_examined(),
         2,
@@ -2445,6 +2494,7 @@ fn ga41_graph_node_metadata_ignores_non_uuid_id_tables() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ga42_graph_edge_insert_routing_requires_uuid_edge_shape() {
     let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
     let db = Database::open_memory_with_accountant(accountant.clone());
@@ -2477,11 +2527,11 @@ fn ga42_graph_edge_insert_routing_requires_uuid_edge_shape() {
         .unwrap();
 
     assert!(
-        result.rows.is_empty(),
+        result.rows().is_empty(),
         "UUID-looking text edge columns must not populate the internal graph"
     );
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 0);
 
     let tx = db.begin_or_panic();
@@ -3077,18 +3127,18 @@ fn scoped_list_query_continues_to_filter_hidden_rows_silently_across_shapes() {
     let y = scoped
         .execute("SELECT id FROM t WHERE category = 'y'", &empty())
         .unwrap();
-    assert!(y.rows.is_empty());
+    assert!(y.rows().is_empty());
     let limit = scoped
         .execute("SELECT id FROM t LIMIT 1", &empty())
         .unwrap();
-    assert_eq!(limit.rows.len(), 1);
+    assert_eq!(limit.rows().len(), 1);
     assert!(
         sarg_uuid_column_set(&limit, "id").is_subset(&BTreeSet::from([sarg_uuid(1), sarg_uuid(2)]))
     );
     let ordered = scoped
         .execute("SELECT id FROM t ORDER BY id LIMIT 1", &empty())
         .unwrap();
-    assert_eq!(ordered.rows, vec![vec![Value::Uuid(sarg_uuid(1))]]);
+    assert_eq!(ordered.rows(), vec![vec![Value::Uuid(sarg_uuid(1))]]);
 }
 
 #[test]
@@ -3115,7 +3165,7 @@ fn scoped_anchor_read_returns_empty_when_row_does_not_exist() {
             &params(vec![("id", Value::Uuid(sarg_uuid(999)))]),
         )
         .unwrap();
-    assert!(result.rows.is_empty());
+    assert!(result.rows().is_empty());
 }
 
 #[test]
@@ -3184,14 +3234,14 @@ fn update_delete_predicate_against_hidden_only_rows_preserves_rows_affected_zero
             ]),
         )
         .unwrap();
-    assert_eq!(update.rows_affected, 0);
+    assert_eq!(update.rows_affected(), 0);
     let delete = scoped
         .execute(
             "DELETE FROM t WHERE id = $id",
             &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
         )
         .unwrap();
-    assert_eq!(delete.rows_affected, 0);
+    assert_eq!(delete.rows_affected(), 0);
 }
 
 #[test]
@@ -3216,7 +3266,7 @@ fn admin_handle_anchor_read_under_no_constraints_returns_ok_rows() {
             &params(vec![("id", Value::Uuid(sarg_uuid(2)))]),
         )
         .unwrap();
-    assert_eq!(result.rows, vec![vec![Value::Text("b".to_string())]]);
+    assert_eq!(result.rows(), vec![vec![Value::Text("b".to_string())]]);
 }
 
 #[test]
@@ -3574,7 +3624,7 @@ fn graph_table_at_pinned_snapshot_with_no_pre_pin_edges_returns_ok_empty() {
             snapshot,
         )
         .unwrap();
-    assert!(result.rows.is_empty());
+    assert!(result.rows().is_empty());
 }
 
 #[test]
@@ -3672,6 +3722,7 @@ fn scoped_multi_cte_graph_table_with_cross_scope_anchor_parameter_reports_typed_
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn anchor_read_of_sync_replicated_row_under_scoped_handle_reports_typed_violation() {
     let db = Database::open_memory();
     db.execute(
@@ -3752,6 +3803,7 @@ fn anchor_read_of_sync_replicated_row_under_scoped_handle_reports_typed_violatio
 // its content happens to be byte-identical to what the receiver cannot look
 // at.
 #[test]
+#[cfg(feature = "test-seams")]
 fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
     let db = Database::open_memory();
     db.execute(
@@ -3828,7 +3880,10 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
             &params(vec![("id", Value::Uuid(visible_id))]),
         )
         .unwrap();
-    assert_eq!(visible.rows, vec![vec![Value::Text("visible".to_string())]]);
+    assert_eq!(
+        visible.rows(),
+        vec![vec![Value::Text("visible".to_string())]]
+    );
     let hidden = db
         .execute(
             "SELECT data FROM t WHERE id = $id",
@@ -3836,7 +3891,7 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
         )
         .unwrap();
     assert!(
-        hidden.rows.is_empty(),
+        hidden.rows().is_empty(),
         "hidden incoming sync row must not be stored by the scoped receiver"
     );
 }
@@ -3851,6 +3906,7 @@ fn scoped_sync_apply_skips_hidden_rows_and_applies_allowed_rows() {
 /// access-scope reason, proving the two refusal classes stay genuinely
 /// distinct.
 #[test]
+#[cfg(feature = "test-seams")]
 fn scoped_sync_apply_genuine_divergence_within_visible_scope_still_conflicts() {
     let db = Database::open_memory();
     db.execute(
@@ -3934,13 +3990,14 @@ fn scoped_sync_apply_genuine_divergence_within_visible_scope_still_conflicts() {
         )
         .unwrap();
     assert_eq!(
-        local.rows,
+        local.rows(),
         vec![vec![Value::Text("local-version".to_string())]],
         "ServerWins keeps the receiver's own value through the genuine conflict"
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn scoped_sync_apply_skips_hidden_graph_edges_and_applies_allowed_edges() {
     let db = Database::open_memory();
     db.execute(
@@ -4042,12 +4099,13 @@ fn scoped_sync_apply_skips_hidden_graph_edges_and_applies_allowed_edges() {
         )
         .unwrap();
     assert!(
-        hidden.rows.is_empty(),
+        hidden.rows().is_empty(),
         "hidden incoming graph endpoint must not be stored by the scoped receiver"
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_apply_replays_same_lsn_non_vector_delete_before_replacement_insert() {
     let db = Database::open_memory();
     db.execute(
@@ -4102,12 +4160,13 @@ fn sync_apply_replays_same_lsn_non_vector_delete_before_replacement_insert() {
         .execute("SELECT id, success FROM outcomes", &empty())
         .unwrap();
     assert_eq!(
-        rows.rows,
+        rows.rows(),
         vec![vec![Value::Uuid(new_id), Value::Bool(true)]]
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_edge_wins_replaces_committed_unique_conflict_with_incoming_row() {
     let db = Database::open_memory();
     db.execute(
@@ -4152,7 +4211,7 @@ fn sync_edge_wins_replaces_committed_unique_conflict_with_incoming_row() {
         .execute("SELECT id, success FROM outcomes", &empty())
         .unwrap();
     assert_eq!(
-        rows.rows,
+        rows.rows(),
         vec![vec![Value::Uuid(incoming_id), Value::Bool(true)]]
     );
 }
@@ -4223,7 +4282,7 @@ fn scoped_anchor_read_with_degenerate_input_returns_error_or_empty_no_panic() {
     }))
     .expect("wrong typed parameter query must not panic")
     .unwrap();
-    assert!(wrong_type.rows.is_empty());
+    assert!(wrong_type.rows().is_empty());
 }
 
 #[test]
@@ -4355,7 +4414,8 @@ fn trigger_callback_cannot_insert_or_update_a_null_primary_key() {
     let rows = db
         .execute("SELECT * FROM callback_target", &empty())
         .unwrap()
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], Value::Uuid(tenant_id));
     assert_eq!(rows[0][2], Value::Text("kept".to_string()));
@@ -4365,9 +4425,9 @@ fn trigger_callback_cannot_insert_or_update_a_null_primary_key() {
 fn dual_01_select_without_from() {
     let db = Database::open_memory();
     let result = db.execute("SELECT NOW()", &empty()).unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert!(
-        matches!(result.rows[0][0], Value::Timestamp(_)),
+        matches!(result.rows()[0][0], Value::Timestamp(_)),
         "SELECT NOW() without FROM should return timestamp"
     );
 }
@@ -4397,7 +4457,7 @@ fn err_01_triple_not_evaluates_correctly() {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         0,
         "triple NOT of true = false, so 0 rows"
     );
@@ -4426,9 +4486,9 @@ fn cmt_01_line_comment() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let val_idx = result.columns.iter().position(|c| c == "val").unwrap();
-    assert_eq!(result.rows[0][val_idx], Value::Text("hello".into()));
+    assert_eq!(result.rows().len(), 1);
+    let val_idx = result.columns().iter().position(|c| c == "val").unwrap();
+    assert_eq!(result.rows()[0][val_idx], Value::Text("hello".into()));
 }
 
 // ---------------------------------------------------------------------------
@@ -4454,9 +4514,9 @@ fn cmt_02_block_comment() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let val_idx = result.columns.iter().position(|c| c == "val").unwrap();
-    assert_eq!(result.rows[0][val_idx], Value::Text("hello".into()));
+    assert_eq!(result.rows().len(), 1);
+    let val_idx = result.columns().iter().position(|c| c == "val").unwrap();
+    assert_eq!(result.rows()[0][val_idx], Value::Text("hello".into()));
 }
 
 // ---------------------------------------------------------------------------
@@ -4562,8 +4622,8 @@ fn upd_03_update_embedding_changes_vector_recall_immediately() {
             &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap();
-    assert_eq!(before.rows.len(), 1);
-    assert_eq!(before.rows[0][0], Value::Uuid(id_a));
+    assert_eq!(before.rows().len(), 1);
+    assert_eq!(before.rows()[0][0], Value::Uuid(id_a));
 
     db.execute(
         "UPDATE observations SET embedding = $embedding WHERE id = $id",
@@ -4580,9 +4640,9 @@ fn upd_03_update_embedding_changes_vector_recall_immediately() {
             &params(vec![("query", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap();
-    assert_eq!(after.rows.len(), 2);
-    assert_eq!(after.rows[0][0], Value::Uuid(id_b));
-    assert_eq!(after.rows[1][0], Value::Uuid(id_a));
+    assert_eq!(after.rows().len(), 2);
+    assert_eq!(after.rows()[0][0], Value::Uuid(id_b));
+    assert_eq!(after.rows()[1][0], Value::Uuid(id_a));
 }
 
 #[test]
@@ -4622,8 +4682,8 @@ fn upd_04_stale_conditional_update_in_explicit_tx_commits_as_noop_atomically() {
             &stale_predicate,
         )
         .unwrap();
-    assert_eq!(a.rows_affected, 1);
-    assert_eq!(b.rows_affected, 1);
+    assert_eq!(a.rows_affected(), 1);
+    assert_eq!(b.rows_affected(), 1);
 
     db.commit(tx_a).expect("first conditional update commits");
     db.commit(tx_b)
@@ -4700,7 +4760,7 @@ fn upd_05_row_condition_guard_in_explicit_tx_fails_commit_atomically() {
         )
         .unwrap();
     assert_eq!(
-        audit_rows.rows.len(),
+        audit_rows.rows().len(),
         0,
         "guarded side effects must roll back with the stale transaction"
     );
@@ -4791,7 +4851,7 @@ fn cdb061_row_guard_treats_missing_nullable_columns_as_null_at_claim_and_commit(
     assert!(
         db.execute("SELECT id FROM claim_audit", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty(),
         "the refused stale claim rolls its side effect back"
     );
@@ -4879,13 +4939,13 @@ fn cte_01_outer_where_filters_cte_rows() {
         .unwrap();
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "outer WHERE on CTE should keep only sensor-prefixed active rows"
     );
-    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
+    let name_idx = result.columns().iter().position(|c| c == "name").unwrap();
     let names: Vec<_> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| row[name_idx].clone())
         .collect();
@@ -4909,17 +4969,21 @@ fn cte_02_outer_where_comparison_filters_cte_rows() {
         .unwrap();
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "outer WHERE on CTE should keep only rows above the reading threshold"
     );
-    let name_idx = result.columns.iter().position(|c| c == "name").unwrap();
-    let reading_idx = result.columns.iter().position(|c| c == "reading").unwrap();
+    let name_idx = result.columns().iter().position(|c| c == "name").unwrap();
+    let reading_idx = result
+        .columns()
+        .iter()
+        .position(|c| c == "reading")
+        .unwrap();
     assert_eq!(
-        result.rows[0][name_idx],
+        result.rows()[0][name_idx],
         Value::Text("widget-east".to_string())
     );
-    assert_eq!(result.rows[0][reading_idx], Value::Float64(99.0));
+    assert_eq!(result.rows()[0][reading_idx], Value::Float64(99.0));
 }
 
 #[test]
@@ -5038,9 +5102,9 @@ fn prop_01_fk_propagate_fires_on_update() {
             &params(vec![("id", Value::Uuid(decision_id))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert_eq!(
-        result.rows[0][0],
+        result.rows()[0][0],
         Value::Text("invalidated".to_string()),
         "child decision should be invalidated after parent UPDATE archives intention"
     );
@@ -5094,18 +5158,18 @@ fn prop_02_fk_propagate_cascades_multiple_children() {
     let result = db
         .execute("SELECT id, status FROM decisions ORDER BY id", &empty())
         .unwrap();
-    assert_eq!(result.rows.len(), 2);
-    let id_idx = result.columns.iter().position(|c| c == "id").unwrap();
-    let status_idx = result.columns.iter().position(|c| c == "status").unwrap();
+    assert_eq!(result.rows().len(), 2);
+    let id_idx = result.columns().iter().position(|c| c == "id").unwrap();
+    let status_idx = result.columns().iter().position(|c| c == "status").unwrap();
 
-    assert_eq!(result.rows[0][id_idx], Value::Uuid(decision_a));
+    assert_eq!(result.rows()[0][id_idx], Value::Uuid(decision_a));
     assert_eq!(
-        result.rows[0][status_idx],
+        result.rows()[0][status_idx],
         Value::Text("invalidated".to_string())
     );
-    assert_eq!(result.rows[1][id_idx], Value::Uuid(decision_b));
+    assert_eq!(result.rows()[1][id_idx], Value::Uuid(decision_b));
     assert_eq!(
-        result.rows[1][status_idx],
+        result.rows()[1][status_idx],
         Value::Text("invalidated".to_string())
     );
 }
@@ -5483,10 +5547,10 @@ fn disk_02_show_disk_limit_parses() {
     let db = Database::open_memory();
     let result = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
     assert_eq!(
-        result.columns,
+        result.columns(),
         vec!["limit", "used", "available", "startup_ceiling"]
     );
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
 }
 
 #[test]
@@ -5513,17 +5577,17 @@ fn disk_03_disk_limit_noop_for_memory() {
 
     let result = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
     assert_eq!(
-        result.columns,
+        result.columns(),
         vec!["limit", "used", "available", "startup_ceiling"]
     );
     assert!(
-        match &result.rows[0][0] {
+        match &result.rows()[0][0] {
             Value::Null => true,
             Value::Text(s) if s == "none" => true,
             _ => false,
         },
         "in-memory SHOW DISK_LIMIT must report no active limit: {:?}",
-        result.rows[0]
+        result.rows()[0]
     );
 }
 
@@ -5589,9 +5653,9 @@ fn disk_05_disk_limit_persists_across_reopen() {
             .unwrap();
         let before = db.execute("SHOW DISK_LIMIT", &empty()).unwrap();
         assert!(
-            before.rows[0].contains(&Value::Int64(configured_limit_bytes)),
+            before.rows()[0].contains(&Value::Int64(configured_limit_bytes)),
             "SHOW DISK_LIMIT must reflect configured limit before reopen: {:?}",
-            before.rows
+            before.rows()
         );
         db.close().unwrap();
         configured_limit_bytes
@@ -5600,9 +5664,9 @@ fn disk_05_disk_limit_persists_across_reopen() {
     let reopened = Database::open(&db_path).unwrap();
     let after = reopened.execute("SHOW DISK_LIMIT", &empty()).unwrap();
     assert!(
-        after.rows[0].contains(&Value::Int64(configured_limit_bytes)),
+        after.rows()[0].contains(&Value::Int64(configured_limit_bytes)),
         "SHOW DISK_LIMIT must reflect persisted limit after reopen: {:?}",
-        after.rows
+        after.rows()
     );
 
     let payload = "x".repeat(16 * 1024);
@@ -5630,6 +5694,7 @@ fn disk_05_disk_limit_persists_across_reopen() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn disk_06_sync_pull_rejected_when_over_disk_budget() {
     let edge_tmp = TempDir::new().expect("edge tempdir");
     let server_tmp = TempDir::new().expect("server tempdir");
@@ -5702,7 +5767,7 @@ fn disk_06_sync_pull_rejected_when_over_disk_budget() {
     let count = server
         .execute("SELECT COUNT(*) FROM items", &empty())
         .unwrap()
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     assert_eq!(
         count,
@@ -5741,17 +5806,21 @@ fn sql_09_vector_text_coercion() {
     let rows = db
         .execute("SELECT id, embedding FROM docs ORDER BY id", &empty())
         .unwrap();
-    let id_idx = rows.columns.iter().position(|c| c == "id").unwrap();
-    let embedding_idx = rows.columns.iter().position(|c| c == "embedding").unwrap();
+    let id_idx = rows.columns().iter().position(|c| c == "id").unwrap();
+    let embedding_idx = rows
+        .columns()
+        .iter()
+        .position(|c| c == "embedding")
+        .unwrap();
 
-    assert_eq!(rows.rows.len(), 2);
-    assert_eq!(rows.rows[0][id_idx], Value::Uuid(id_a));
-    assert!(matches!(rows.rows[0][embedding_idx], Value::Vector(_)));
-    assert_eq!(rows.rows[1][id_idx], Value::Uuid(id_b));
+    assert_eq!(rows.rows().len(), 2);
+    assert_eq!(rows.rows()[0][id_idx], Value::Uuid(id_a));
+    assert!(matches!(rows.rows()[0][embedding_idx], Value::Vector(_)));
+    assert_eq!(rows.rows()[1][id_idx], Value::Uuid(id_b));
     assert!(
-        matches!(rows.rows[1][embedding_idx], Value::Vector(_)),
+        matches!(rows.rows()[1][embedding_idx], Value::Vector(_)),
         "quoted vector literal should be coerced to Value::Vector, got {:?}",
-        rows.rows[1][embedding_idx]
+        rows.rows()[1][embedding_idx]
     );
 
     let search = db
@@ -5760,9 +5829,9 @@ fn sql_09_vector_text_coercion() {
             &params(vec![("query", Value::Vector(vec![0.4, 0.5, 0.6]))]),
         )
         .unwrap();
-    let search_id_idx = search.columns.iter().position(|c| c == "id").unwrap();
+    let search_id_idx = search.columns().iter().position(|c| c == "id").unwrap();
     let ids: Vec<Value> = search
-        .rows
+        .rows()
         .iter()
         .map(|r| r[search_id_idx].clone())
         .collect();
@@ -5814,12 +5883,13 @@ fn sql_10_edge_dedup_no_relational_leak() {
         .unwrap();
 
     assert_eq!(
-        count.rows[0][0],
+        count.rows()[0][0],
         Value::Int64(1),
         "duplicate logical edge should not leave a second relational row"
     );
     assert_eq!(
-        second.rows_affected, 0,
+        second.rows_affected(),
+        0,
         "deduped second edge insert should report zero affected rows"
     );
 }
@@ -5849,9 +5919,9 @@ fn sql_11_upsert_set_clause_values() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows().len(), 1);
     assert_eq!(
-        out.rows[0][0],
+        out.rows()[0][0],
         Value::Text("from-update".to_string()),
         "upsert should apply SET clause values, not the INSERT value map"
     );
@@ -5879,11 +5949,12 @@ fn sql_13_null_in_nullable_uuid() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(out.rows.len(), 1);
-    assert_eq!(out.rows[0][0], Value::Null);
+    assert_eq!(out.rows().len(), 1);
+    assert_eq!(out.rows()[0][0], Value::Null);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_01_text_memory_estimate_not_pathologically_high() {
     // The PK's auto index now permanently reserves the exact-probe filter at CREATE TABLE
     // time (the fixed charge is defined in `crates/contextdb-core/src/table_meta.rs`);
@@ -5923,6 +5994,7 @@ fn integrity_01_text_memory_estimate_not_pathologically_high() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_02_upsert_noop_does_not_leak_memory() {
     // The PK's auto index now permanently reserves the exact-probe filter at CREATE TABLE
     // time (crates/contextdb-relational/src/store.rs:388, contract in
@@ -5959,6 +6031,7 @@ fn integrity_02_upsert_noop_does_not_leak_memory() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_03_retain_pruning_releases_memory() {
     let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
     let db = Database::open_memory_with_accountant(accountant.clone());
@@ -5992,12 +6065,13 @@ fn integrity_03_retain_pruning_releases_memory() {
     assert_eq!(
         db.execute("SELECT COUNT(*) FROM obs", &empty())
             .unwrap()
-            .rows[0][0],
+            .rows()[0][0],
         Value::Int64(0)
     );
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_04_edge_delete_releases_memory() {
     // Deleting an edge tombstones it: the entry stays whole in both adjacency
     // maps, so the store is still holding it and is still charged for it. The
@@ -6083,6 +6157,7 @@ fn integrity_04_edge_delete_releases_memory() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_05_drop_table_releases_edge_memory() {
     let accountant = Arc::new(MemoryAccountant::with_budget(256 * 1024));
     let db = Database::open_memory_with_accountant(accountant.clone());
@@ -6206,7 +6281,8 @@ fn integrity_08_upsert_insert_indexes_vector() {
             &params(vec![("query", Value::Vector(vec![0.0, 1.0, 0.0]))]),
         )
         .unwrap()
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(
         result.len(),
         1,
@@ -6257,6 +6333,7 @@ fn integrity_09_drop_table_removes_vectors() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn integrity_10_failed_insert_does_not_leak_memory() {
     // Two exact-only automatic indexes here -- the PRIMARY KEY and the UNIQUE constraint on
     // `name` -- each now permanently reserve the exact-probe filter at CREATE TABLE time
@@ -6328,11 +6405,11 @@ fn test_coerce_uuid_name_based_still_works_post_catchall_removal() {
     let result = db
         .execute("SELECT * FROM t", &empty)
         .expect("SELECT * FROM t must succeed");
-    assert_eq!(result.rows.len(), 1, "exactly one row expected");
-    let row_vals = &result.rows[0];
+    assert_eq!(result.rows().len(), 1, "exactly one row expected");
+    let row_vals = &result.rows()[0];
     let col_idx = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|c| c == name)
             .unwrap_or_else(|| panic!("column {name:?} must exist in result"))
@@ -6399,17 +6476,17 @@ fn where_txid_bound_int64_returns_rows() {
         .expect("SELECT with bound Int64 must succeed on TXID column");
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "exactly one row must match x > 100 (only TxId(200))",
     );
     let x_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "x")
         .expect("result must have column \"x\"");
     assert_eq!(
-        result.rows[0][x_idx],
+        result.rows()[0][x_idx],
         Value::TxId(TxId(200)),
         "the one matching row must be Value::TxId(TxId(200))",
     );
@@ -6453,17 +6530,17 @@ fn where_txid_negative_literal_below_all() {
         .expect("COUNT(*) with negative bound must succeed on TXID column");
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "COUNT(*) result must have exactly one row",
     );
     let c_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "c")
         .expect("result must have the aliased count column \"c\"");
     assert_eq!(
-        result.rows[0][c_idx],
+        result.rows()[0][c_idx],
         Value::Int64(3),
         "COUNT(*) of TxIds > -1 must equal 3 (all three rows match)",
     );
@@ -6505,12 +6582,12 @@ fn where_txid_text_literal_returns_no_rows() {
         .execute("SELECT x FROM t", &empty)
         .expect("SELECT x FROM t (no filter) must succeed");
     assert_eq!(
-        unfiltered.rows.len(),
+        unfiltered.rows().len(),
         1,
         "positive control: exactly one row must be present after insert",
     );
     assert_eq!(
-        unfiltered.rows[0][0],
+        unfiltered.rows()[0][0],
         Value::TxId(TxId(42)),
         "positive control: the stored x column must be Value::TxId(TxId(42))",
     );
@@ -6522,10 +6599,10 @@ fn where_txid_text_literal_returns_no_rows() {
         .expect("SELECT with Text bound on TXID column must not error — just return empty");
 
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         0,
         "no rows must be returned — Text must never coerce to TxId; got rows: {:?}",
-        result.rows,
+        result.rows(),
     );
 }
 
@@ -6600,11 +6677,11 @@ fn orderby_txid_asc_desc() {
         .execute("SELECT x FROM t ORDER BY x ASC", &empty)
         .expect("SELECT ... ORDER BY x ASC must succeed");
     let x_idx = asc
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "x")
         .expect("asc result must have column \"x\"");
-    let asc_vals: Vec<Value> = asc.rows.iter().map(|r| r[x_idx].clone()).collect();
+    let asc_vals: Vec<Value> = asc.rows().iter().map(|r| r[x_idx].clone()).collect();
     assert_eq!(
         asc_vals,
         vec![
@@ -6621,11 +6698,11 @@ fn orderby_txid_asc_desc() {
         .execute("SELECT x FROM t ORDER BY x DESC", &empty)
         .expect("SELECT ... ORDER BY x DESC must succeed");
     let x_idx_d = desc
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "x")
         .expect("desc result must have column \"x\"");
-    let desc_vals: Vec<Value> = desc.rows.iter().map(|r| r[x_idx_d].clone()).collect();
+    let desc_vals: Vec<Value> = desc.rows().iter().map(|r| r[x_idx_d].clone()).collect();
     assert_eq!(
         desc_vals,
         vec![
@@ -6640,6 +6717,7 @@ fn orderby_txid_asc_desc() {
 
 #[cfg(feature = "test-seams")]
 const PER_INDEX_SQL_ROWS: usize = 1024;
+#[cfg(feature = "test-seams")]
 const PER_INDEX_SQL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(feature = "test-seams")]
@@ -6659,8 +6737,8 @@ fn per_index_top_id(db: &Database, table: &str, column: &str, query: Vec<f32>) -
     let result = db
         .execute(&sql, &params(vec![("query", Value::Vector(query))]))
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    match result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1);
+    match result.rows()[0][0] {
         Value::Uuid(id) => id,
         ref other => panic!("expected UUID id, got {other:?}"),
     }
@@ -6694,6 +6772,7 @@ fn seed_two_vector_evidence(db: &Database) -> Vec<Uuid> {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
     let db = Arc::new(Database::open_memory());
     db.execute(
@@ -6739,14 +6818,14 @@ fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
     assert_eq!(
         db.execute("SELECT id FROM table_text", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
     assert_eq!(
         db.execute("SELECT id FROM table_face", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
@@ -6756,7 +6835,7 @@ fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
             &params(vec![("query", Value::Vector(per_index_axis3(0)))])
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         0
     );
@@ -6766,7 +6845,7 @@ fn multi_ref_tx_mid_apply_state_invisible_post_commit_state_visible() {
             &params(vec![("query", Value::Vector(per_index_axis3(1)))])
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         0
     );
@@ -6820,14 +6899,14 @@ fn multi_ref_tx_abort_leaves_no_vectors_visible() {
     assert_eq!(
         db.execute("SELECT id FROM table_text", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
     assert_eq!(
         db.execute("SELECT id FROM table_face", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
@@ -6837,7 +6916,7 @@ fn multi_ref_tx_abort_leaves_no_vectors_visible() {
             &params(vec![("query", Value::Vector(per_index_axis3(0)))])
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         0
     );
@@ -7139,6 +7218,7 @@ fn alter_table_rename_vector_column_waits_for_inflight_build_then_moves_index() 
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_alter_table_drop_vector_column_removes_receiver_index() {
     let origin = Database::open_memory();
     let receiver = Database::open_memory();
@@ -7180,9 +7260,13 @@ fn sync_alter_table_drop_vector_column_removes_receiver_index() {
         .unwrap();
 
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -7203,6 +7287,7 @@ fn sync_alter_table_drop_vector_column_removes_receiver_index() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_alter_table_rename_vector_column_moves_receiver_index() {
     let origin = Database::open_memory();
     let receiver = Database::open_memory();
@@ -7245,9 +7330,13 @@ fn sync_alter_table_rename_vector_column_moves_receiver_index() {
         .unwrap();
 
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -7268,6 +7357,7 @@ fn sync_alter_table_rename_vector_column_moves_receiver_index() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn commit_rejects_staged_vector_insert_after_same_ref_sync_shape_change() {
     let db = Database::open_memory();
     db.execute(
@@ -7324,7 +7414,7 @@ fn commit_rejects_staged_vector_insert_after_same_ref_sync_shape_change() {
             "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
             &params(vec![("query", Value::Vector(vec![1.0_f32, 0.0, 0.0, 0.0]))]),
         ),
-        Ok(result) if result.rows.is_empty()
+        Ok(result) if result.rows().is_empty()
     ));
 }
 
@@ -7371,7 +7461,7 @@ fn commit_rejects_staged_vector_insert_after_same_ref_drop_readd_same_shape() {
             "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
             &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
         ),
-        Ok(result) if result.rows.is_empty()
+        Ok(result) if result.rows().is_empty()
     ));
 }
 
@@ -7434,10 +7524,11 @@ fn commit_rejects_commit_time_vector_exclusion_after_same_ref_drop_readd_same_sh
             &params(vec![("query", Value::Vector(per_index_axis3(1)))]),
         )
         .unwrap();
-    assert_eq!(result.rows, vec![vec![Value::Uuid(id)]]);
+    assert_eq!(result.rows(), vec![vec![Value::Uuid(id)]]);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn commit_rejects_staged_vector_update_after_same_ref_sync_shape_change() {
     let db = Database::open_memory();
     let id = Uuid::from_u128(45);
@@ -7501,6 +7592,7 @@ fn commit_rejects_staged_vector_update_after_same_ref_sync_shape_change() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_alter_table_shape_change_accepts_following_vector_payload() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(46);
@@ -7560,10 +7652,11 @@ fn sync_alter_table_shape_change_accepts_following_vector_payload() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+    assert_eq!(row.rows()[0][0], Value::Text("kept".to_string()));
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
     let sender = Database::open_memory();
     let receiver = Database::open_memory();
@@ -7626,7 +7719,7 @@ fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("vector owner".to_string()));
+    assert_eq!(row.rows()[0][0], Value::Text("vector owner".to_string()));
     assert_eq!(
         per_index_top_id(&receiver, "evidence", "embedding", per_index_axis3(1)),
         id
@@ -7634,6 +7727,7 @@ fn sync_vector_delta_restores_owner_row_in_vector_lsn_group() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(47);
@@ -7682,7 +7776,7 @@ fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
+    assert_eq!(row.rows()[0][0], Value::Text("kept".to_string()));
     assert!(matches!(
         receiver.execute(
             "SELECT id FROM evidence ORDER BY embedding <=> $query LIMIT 1",
@@ -7716,6 +7810,7 @@ fn sync_partial_vector_shape_alter_does_not_drop_omitted_side_columns() {
 // `sync_vector_rename_persists_row_image_across_reopen` above.
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column() {
     let tmp = TempDir::new().unwrap();
     let author_path = tmp.path().join("author.db");
@@ -7777,7 +7872,7 @@ fn sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column(
                     )
                 });
             assert_eq!(
-                row.rows[0][0],
+                row.rows()[0][0],
                 Value::Text("kept".to_string()),
                 "{label}: the omitted side column must keep its row value even though the \
                  primary key was restated"
@@ -7803,7 +7898,7 @@ fn sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column(
                 panic!("{label} after restart: note column must still be selectable; observed error: {e:?}")
             });
         assert_eq!(
-            row.rows[0][0],
+            row.rows()[0][0],
             Value::Text("kept".to_string()),
             "{label} after restart: the preserved column must still hold its value"
         );
@@ -7811,6 +7906,7 @@ fn sync_partial_alter_restating_primary_key_still_preserves_omitted_side_column(
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_operation() {
     let tmp = TempDir::new().unwrap();
     let author_path = tmp.path().join("author.db");
@@ -7911,7 +8007,7 @@ fn sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_oper
             )
             .unwrap();
         assert_eq!(
-            row.rows.len(),
+            row.rows().len(),
             1,
             "{label} after restart: the row itself must survive the column drop"
         );
@@ -7919,6 +8015,7 @@ fn sync_explicit_drop_column_removes_data_and_names_the_drop_as_the_authors_oper
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors_operation() {
     let tmp = TempDir::new().unwrap();
     let author_path = tmp.path().join("author.db");
@@ -7990,7 +8087,7 @@ fn sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors
                 )
                 .unwrap();
             assert_eq!(
-                row.rows[0][0],
+                row.rows()[0][0],
                 Value::Text("kept".to_string()),
                 "{label}: the side column must be untouched by the rename"
             );
@@ -8026,6 +8123,7 @@ fn sync_explicit_vector_rename_moves_vectors_and_names_the_rename_as_the_authors
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename() {
     let tmp = TempDir::new().unwrap();
     let author_path = tmp.path().join("author.db");
@@ -8089,7 +8187,7 @@ fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename
                     )
                 });
             assert_eq!(
-                note_row.rows[0][0],
+                note_row.rows()[0][0],
                 Value::Text("kept".to_string()),
                 "{label}: `note` must keep its original row value"
             );
@@ -8100,7 +8198,7 @@ fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename
                 )
                 .unwrap();
             assert_ne!(
-                memo_row.rows[0][0],
+                memo_row.rows()[0][0],
                 Value::Text("kept".to_string()),
                 "{label}: the newly declared column `memo` must not silently inherit `note`'s \
                  value as though a rename had been recorded"
@@ -8128,7 +8226,7 @@ fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename
                 )
             });
         assert_eq!(
-            note_row.rows[0][0],
+            note_row.rows()[0][0],
             Value::Text("kept".to_string()),
             "{label} after restart: the preserved column must still hold its value"
         );
@@ -8136,6 +8234,7 @@ fn sync_partial_alter_omitting_a_matching_type_column_is_not_treated_as_a_rename
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_additive_vector_alter_with_existing_non_vector_columns_keeps_old_vector_index() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(48);
@@ -8184,9 +8283,13 @@ fn sync_additive_vector_alter_with_existing_non_vector_columns_keeps_old_vector_
         id
     );
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -8195,6 +8298,7 @@ fn sync_additive_vector_alter_with_existing_non_vector_columns_keeps_old_vector_
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_additive_non_vector_alter_does_not_drop_omitted_vector_index() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(4801);
@@ -8248,10 +8352,11 @@ fn sync_additive_non_vector_alter_does_not_drop_omitted_vector_index() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Null);
+    assert_eq!(row.rows()[0][0], Value::Null);
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_vector_rename_persists_row_image_across_reopen() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("receiver.db");
@@ -8305,8 +8410,8 @@ fn sync_vector_rename_persists_row_image_across_reopen() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("kept".to_string()));
-    assert_eq!(row.rows[0][1], Value::Vector(vision));
+    assert_eq!(row.rows()[0][0], Value::Text("kept".to_string()));
+    assert_eq!(row.rows()[0][1], Value::Vector(vision));
     assert!(matches!(
         reopened.execute(
             "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
@@ -8318,6 +8423,7 @@ fn sync_vector_rename_persists_row_image_across_reopen() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_single_vector_column_rename_moves_receiver_index() {
     let origin = Database::open_memory();
     let receiver = Database::open_memory();
@@ -8357,9 +8463,13 @@ fn sync_single_vector_column_rename_moves_receiver_index() {
         id
     );
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -8376,6 +8486,7 @@ fn sync_single_vector_column_rename_moves_receiver_index() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn sync_additive_same_shape_vector_alter_does_not_rename_omitted_vector_index() {
     let receiver = Database::open_memory();
     let id = Uuid::from_u128(51);
@@ -8424,9 +8535,13 @@ fn sync_additive_same_shape_vector_alter_does_not_rename_omitted_vector_index() 
         id
     );
     let indexes = receiver.execute("SHOW VECTOR_INDEXES", &empty()).unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes
+        .columns()
+        .iter()
+        .position(|c| c == "column")
+        .unwrap();
     let columns = indexes
-        .rows
+        .rows()
         .iter()
         .map(|row| row[column_idx].clone())
         .collect::<Vec<_>>();
@@ -8438,7 +8553,7 @@ fn sync_additive_same_shape_vector_alter_does_not_rename_omitted_vector_index() 
             &params(vec![("query", Value::Vector(per_index_axis3(0)))]),
         )
         .unwrap();
-    assert!(added_search.rows.is_empty());
+    assert!(added_search.rows().is_empty());
 }
 
 #[cfg(feature = "test-seams")]
@@ -8621,15 +8736,15 @@ fn prv_expect_query_err(
 
 fn prv_column(result: &contextdb_engine::QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == name || column.rsplit('.').next() == Some(name))
-        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column {name} not found in {:?}", result.columns()))
 }
 
 fn prv_uuid_at(result: &contextdb_engine::QueryResult, row: usize, column: &str) -> Uuid {
     let idx = prv_column(result, column);
-    match result.rows.get(row).and_then(|values| values.get(idx)) {
+    match result.rows().get(row).and_then(|values| values.get(idx)) {
         Some(Value::Uuid(id)) => *id,
         other => panic!("expected UUID in row {row} column {column}, got {other:?}"),
     }
@@ -8637,7 +8752,7 @@ fn prv_uuid_at(result: &contextdb_engine::QueryResult, row: usize, column: &str)
 
 fn prv_score_at(result: &contextdb_engine::QueryResult, row: usize) -> f64 {
     let idx = prv_column(result, "score");
-    match result.rows.get(row).and_then(|values| values.get(idx)) {
+    match result.rows().get(row).and_then(|values| values.get(idx)) {
         Some(Value::Float64(score)) => *score,
         other => panic!("expected score in row {row}, got {other:?}"),
     }
@@ -8648,15 +8763,17 @@ fn prv_assert_same_signature(
     persisted: &contextdb_engine::QueryResult,
 ) {
     assert_eq!(
-        persisted.trace.physical_plan, literal.trace.physical_plan,
+        persisted.trace().physical_plan,
+        literal.trace().physical_plan,
         "persisted ROW_VECTOR query must match literal-vector plan label"
     );
     assert_eq!(
-        persisted.trace.index_used, literal.trace.index_used,
+        persisted.trace().index_used,
+        literal.trace().index_used,
         "persisted ROW_VECTOR query must match literal-vector index trace"
     );
-    assert_eq!(persisted.rows.len(), literal.rows.len());
-    for idx in 0..literal.rows.len() {
+    assert_eq!(persisted.rows().len(), literal.rows().len());
+    for idx in 0..literal.rows().len() {
         assert_eq!(
             prv_uuid_at(persisted, idx, "id"),
             prv_uuid_at(literal, idx, "id"),
@@ -8774,7 +8891,7 @@ fn prv_assert_result_has_no_vector_payload(
     result: &contextdb_engine::QueryResult,
     source_vec: &[f32],
 ) {
-    for row in &result.rows {
+    for row in result.rows() {
         for value in row {
             assert!(
                 !matches!(value, Value::Vector(_)),
@@ -8785,6 +8902,7 @@ fn prv_assert_result_has_no_vector_payload(
     prv_assert_no_source_vector_leak_in_debug(&format!("{result:?}"), source_vec);
 }
 
+#[cfg(feature = "test-seams")]
 fn prv_memory_usage_tuple(db: &Database) -> (Option<usize>, usize, Option<usize>, Option<usize>) {
     let usage = db.accountant().usage();
     (
@@ -8937,10 +9055,10 @@ fn prv_01_parser_accepts_row_vector_as_cosine_distance_rhs() {
         ),
         "well-formed persisted row vector RHS",
     );
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows().len(), 2);
     assert_eq!(prv_uuid_at(&result, 0, "id"), f.source);
     assert_eq!(
-        result.trace.query_vector_source,
+        result.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 }
@@ -9104,9 +9222,9 @@ fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results()
         "persisted row vector parity query",
     );
     prv_assert_same_signature(&literal, &persisted);
-    assert_eq!(literal.trace.query_vector_source, None);
+    assert_eq!(literal.trace().query_vector_source, None);
     assert_eq!(
-        persisted.trace.query_vector_source,
+        persisted.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 
@@ -9126,9 +9244,9 @@ fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results()
         )
         .unwrap();
     assert!(
-        hnsw_literal.trace.physical_plan.contains("HNSWSearch"),
+        hnsw_literal.trace().physical_plan.contains("HNSWSearch"),
         "literal-vector HNSW oracle must use the HNSW path, got {:?}",
-        hnsw_literal.trace
+        hnsw_literal.trace()
     );
     let hnsw_persisted = prv_expect_query_ok(
         hnsw_db.execute(
@@ -9139,7 +9257,7 @@ fn prv_03_row_vector_query_matches_literal_vector_parity_for_trace_and_results()
     );
     prv_assert_same_signature(&hnsw_literal, &hnsw_persisted);
     assert_eq!(
-        hnsw_persisted.trace.query_vector_source,
+        hnsw_persisted.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 }
@@ -9155,7 +9273,7 @@ fn prv_04_row_vector_query_returns_rows_score_trace_without_vector_bytes() {
         ),
         "persisted row vector byte non-exposure query",
     );
-    assert!(persisted.columns.iter().any(|column| column == "score"));
+    assert!(persisted.columns().iter().any(|column| column == "score"));
     assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.near);
     prv_assert_result_has_no_vector_payload(&persisted, &f.source_vec);
 }
@@ -9174,13 +9292,13 @@ fn prv_05_row_vector_query_respects_candidate_filter() {
         ),
         "candidate-filtered persisted row vector query",
     );
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert_eq!(prv_uuid_at(&result, 0, "id"), f.mid);
     assert!(
-        result.trace.physical_plan.contains("VectorSearch")
-            || result.trace.physical_plan.contains("HNSWSearch"),
+        result.trace().physical_plan.contains("VectorSearch")
+            || result.trace().physical_plan.contains("HNSWSearch"),
         "trace must show candidate plan feeding vector search, got {:?}",
-        result.trace
+        result.trace()
     );
 }
 
@@ -9396,12 +9514,14 @@ fn prv_07_row_vector_query_rejects_missing_or_wrong_index_source_with_distinct_v
     prv_assert_no_source_vector_leak_in_debug(&rendered_dim, &[1.0, 0.0, 0.0, 0.0]);
 }
 
+#[cfg(feature = "test-seams")]
 struct PrvPluginCounters {
     pre_commit: std::sync::atomic::AtomicUsize,
     post_commit: std::sync::atomic::AtomicUsize,
     commit_failed: std::sync::atomic::AtomicUsize,
 }
 
+#[cfg(feature = "test-seams")]
 impl contextdb_engine::plugin::DatabasePlugin for PrvPluginCounters {
     fn pre_commit(
         &self,
@@ -9431,6 +9551,7 @@ impl contextdb_engine::plugin::DatabasePlugin for PrvPluginCounters {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync() {
     let counters = Arc::new(PrvPluginCounters {
         pre_commit: std::sync::atomic::AtomicUsize::new(0),
@@ -9486,7 +9607,7 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     let before_failed = counters.commit_failed.load(Ordering::SeqCst);
     let before_watermark = db.committed_watermark();
     let before_lsn = db.current_lsn();
-    let before_sink = db.sink_metrics_for_test("prv08_sink");
+    let before_sink = db.sink_metrics("prv08_sink");
 
     let result = prv_expect_query_ok(
         db.execute(
@@ -9507,7 +9628,7 @@ fn prv_08_row_vector_query_is_read_only_no_trigger_no_plugin_no_reindex_no_sync(
     assert_eq!(counters.commit_failed.load(Ordering::SeqCst), before_failed);
     assert_eq!(db.committed_watermark(), before_watermark);
     assert_eq!(db.current_lsn(), before_lsn);
-    assert_eq!(db.sink_metrics_for_test("prv08_sink"), before_sink);
+    assert_eq!(db.sink_metrics("prv08_sink"), before_sink);
     assert_eq!(db.__debug_vector_hnsw_len(index.clone()), before_hnsw_len);
     assert_eq!(db.__debug_vector_hnsw_stats(index), before_hnsw_stats);
     assert!(
@@ -9540,8 +9661,8 @@ fn prv_09_existing_literal_and_parameter_cosine_distance_unchanged() {
             &params(vec![("query", Value::Vector(f.source_vec.clone()))]),
         )
         .unwrap();
-    assert_eq!(parameter.trace.physical_plan, "Scan -> VectorSearch");
-    assert_eq!(parameter.trace.query_vector_source, None);
+    assert_eq!(parameter.trace().physical_plan, "Scan -> VectorSearch");
+    assert_eq!(parameter.trace().query_vector_source, None);
     assert_eq!(prv_uuid_at(&parameter, 0, "id"), f.source);
     assert_eq!(prv_uuid_at(&parameter, 1, "id"), f.near);
 
@@ -9551,8 +9672,8 @@ fn prv_09_existing_literal_and_parameter_cosine_distance_unchanged() {
             &empty(),
         )
         .unwrap();
-    assert_eq!(literal.trace.physical_plan, "Scan -> VectorSearch");
-    assert_eq!(literal.trace.query_vector_source, None);
+    assert_eq!(literal.trace().physical_plan, "Scan -> VectorSearch");
+    assert_eq!(literal.trace().query_vector_source, None);
     assert_eq!(prv_uuid_at(&literal, 0, "id"), f.source);
     assert_eq!(prv_uuid_at(&literal, 1, "id"), f.near);
 }
@@ -9568,10 +9689,10 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
         )
         .unwrap();
     assert!(
-        small_literal.trace.physical_plan.contains("VectorSearch")
-            && !small_literal.trace.physical_plan.contains("HNSWSearch"),
+        small_literal.trace().physical_plan.contains("VectorSearch")
+            && !small_literal.trace().physical_plan.contains("HNSWSearch"),
         "small literal USE RANK query must exercise the non-HNSW path, got {:?}",
-        small_literal.trace
+        small_literal.trace()
     );
     let small_persisted = prv_expect_query_ok(
         small_db.execute(
@@ -9582,7 +9703,7 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
     );
     prv_assert_same_signature(&small_literal, &small_persisted);
     assert_eq!(
-        small_persisted.trace.query_vector_source,
+        small_persisted.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 
@@ -9602,9 +9723,9 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
         )
         .unwrap();
     assert!(
-        literal.trace.physical_plan.contains("HNSWSearch"),
+        literal.trace().physical_plan.contains("HNSWSearch"),
         "literal USE RANK query must report actual HNSW path before ROW_VECTOR parity is accepted, got {:?}",
-        literal.trace
+        literal.trace()
     );
     let persisted = prv_expect_query_ok(
         db.execute(
@@ -9615,12 +9736,12 @@ fn prv_10_row_vector_composes_with_use_rank_and_emits_hnsw_label_when_active() {
     );
     prv_assert_same_signature(&literal, &persisted);
     assert!(
-        persisted.trace.physical_plan.contains("HNSWSearch"),
+        persisted.trace().physical_plan.contains("HNSWSearch"),
         "persisted USE RANK query must report actual HNSW path, got {:?}",
-        persisted.trace
+        persisted.trace()
     );
     assert_eq!(
-        persisted.trace.query_vector_source,
+        persisted.trace().query_vector_source,
         Some(VectorIndexRef::new("docs", "embedding"))
     );
 }
@@ -9764,7 +9885,7 @@ fn prv_18_row_vector_query_keeps_target_vector_on_non_vector_tx_update() {
     assert_eq!(prv_uuid_at(&persisted, 0, "id"), f.near);
     let label_idx = prv_column(&persisted, "label");
     assert_eq!(
-        persisted.rows[0].get(label_idx),
+        persisted.rows()[0].get(label_idx),
         Some(&Value::Text("near-updated".to_string())),
         "vector search must preserve the committed vector while materializing the staged row"
     );
@@ -9806,7 +9927,7 @@ fn prv_19_row_vector_query_candidate_filter_uses_active_tx_row_overlay() {
     assert_eq!(prv_uuid_at(&newly_matching, 0, "id"), f.near);
     let label_idx = prv_column(&newly_matching, "label");
     assert_eq!(
-        newly_matching.rows[0].get(label_idx),
+        newly_matching.rows()[0].get(label_idx),
         Some(&Value::Text("eligible".to_string()))
     );
 
@@ -9828,7 +9949,7 @@ fn prv_19_row_vector_query_candidate_filter_uses_active_tx_row_overlay() {
         "in-transaction ROW_VECTOR query with staged candidate no longer matching filter",
     );
     assert!(
-        stopped_matching.rows.is_empty(),
+        stopped_matching.rows().is_empty(),
         "candidate bitmap must exclude the pre-update row image once the active tx changed the non-indexed filter column: {stopped_matching:?}"
     );
     db.commit(tx).unwrap();
@@ -9917,6 +10038,7 @@ fn prv_21_row_vector_query_treats_vector_null_update_as_null_cell() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_22_row_vector_query_removes_null_target_vectors_and_accounts_overlay() {
     let accountant = Arc::new(MemoryAccountant::with_budget(4 * 1024 * 1024));
     let db = Database::open_memory_with_accountant(accountant.clone());
@@ -10188,6 +10310,7 @@ fn prv_26_row_vector_use_rank_overfetch_includes_active_tx_vector_inserts() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
     let db = Database::open_memory();
     let f = prv_seed_hnsw_docs(&db, 1000);
@@ -10212,6 +10335,7 @@ fn prv_27_row_vector_explain_does_not_materialize_hnsw() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building() {
     let covering_db = Database::open_memory();
     covering_db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
@@ -10246,14 +10370,17 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
         )
         .unwrap();
     assert!(
-        covering_result.trace.physical_plan.contains("VectorSearch")
-            && !covering_result.trace.physical_plan.contains("HNSWSearch"),
+        covering_result
+            .trace()
+            .physical_plan
+            .contains("VectorSearch")
+            && !covering_result.trace().physical_plan.contains("HNSWSearch"),
         "a query cannot build HNSW and must use the same exact fallback EXPLAIN predicted: {:?}",
-        covering_result.trace.physical_plan
+        covering_result.trace().physical_plan
     );
     assert!(
         covering_result
-            .rows
+            .rows()
             .iter()
             .all(|row| row.first() != Some(&Value::Uuid(f.source))),
         "the exact fallback must preserve the candidate filter"
@@ -10293,14 +10420,17 @@ fn prv_28_row_vector_explain_matches_filtered_runtime_strategy_without_building(
         )
         .unwrap();
     assert!(
-        fallback_result.trace.physical_plan.contains("VectorSearch")
-            && !fallback_result.trace.physical_plan.contains("HNSWSearch"),
+        fallback_result
+            .trace()
+            .physical_plan
+            .contains("VectorSearch")
+            && !fallback_result.trace().physical_plan.contains("HNSWSearch"),
         "a caller-driven query cannot build HNSW and must use the exact fallback: {:?}",
-        fallback_result.trace.physical_plan
+        fallback_result.trace().physical_plan
     );
     assert!(
         fallback_result
-            .rows
+            .rows()
             .iter()
             .all(|row| row.first() != Some(&Value::Uuid(fallback.source))),
         "fallback path must preserve the candidate filter"
@@ -10428,6 +10558,7 @@ fn prv_14_row_vector_query_renders_in_explain_without_vector_bytes() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
     // Seam-interleaved rounds, not a wall-clock race: each round parks one
     // UPDATE writer INSIDE its commit (after the relational apply, before
@@ -10525,12 +10656,12 @@ fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
             )
             .unwrap();
         assert_eq!(
-            read.rows.len(),
+            read.rows().len(),
             1,
             "round {round}: row-vector read must complete with exactly one row while a writer is parked mid-commit"
         );
         assert_eq!(
-            read.rows[0][0],
+            read.rows()[0][0],
             Value::Uuid(doc),
             "round {round}: row-vector read must resolve the one doc row while a writer is parked mid-commit"
         );
@@ -10561,7 +10692,7 @@ fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
             )
             .unwrap();
         assert_eq!(
-            readback.rows[0][0],
+            readback.rows()[0][0],
             Value::Vector(new_vector),
             "round {round}: the committed vector must be visible immediately after the writer is released"
         );
@@ -10579,6 +10710,7 @@ fn prv_15_row_vector_query_does_not_deadlock_under_concurrent_writers() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn prv_16_row_vector_query_releases_accountant_on_every_error_path() {
     let db = Database::open_memory();
     let f = prv_seed_docs(&db);
@@ -10886,9 +11018,9 @@ fn inserting_a_scalar_where_an_embedding_belongs_stores_nothing() {
             .execute("SELECT id FROM evidence", &empty())
             .expect("the table still reads");
         assert!(
-            rows.rows.is_empty(),
+            rows.rows().is_empty(),
             "the refused INSERT of {label} left a row behind: {:?}",
-            rows.rows,
+            rows.rows(),
         );
 
         let search = db
@@ -10898,9 +11030,9 @@ fn inserting_a_scalar_where_an_embedding_belongs_stores_nothing() {
             )
             .expect("the neighbour search still answers");
         assert!(
-            search.rows.is_empty(),
+            search.rows().is_empty(),
             "the refused INSERT of {label} left a searchable embedding behind: {:?}",
-            search.rows,
+            search.rows(),
         );
     }
 }
@@ -10933,12 +11065,12 @@ fn a_vector_column_still_takes_an_embedding_and_its_text_form() {
         .execute("SELECT id, embedding FROM evidence ORDER BY note", &empty())
         .expect("both rows read back");
     let embedding_idx = rows
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "embedding")
         .expect("the embedding column is projected");
-    assert_eq!(rows.rows.len(), 2, "both accepted rows are stored");
-    for row in &rows.rows {
+    assert_eq!(rows.rows().len(), 2, "both accepted rows are stored");
+    for row in rows.rows() {
         assert!(
             matches!(row[embedding_idx], Value::Vector(_)),
             "an accepted embedding is stored as an embedding, got {:?}",
@@ -10993,9 +11125,9 @@ fn updating_an_embedding_with_a_scalar_leaves_the_stored_embedding_alone() {
                 &params(vec![("id", Value::Uuid(near))]),
             )
             .expect("the row still reads");
-        assert_eq!(rows.rows.len(), 1, "the refused UPDATE kept the row");
+        assert_eq!(rows.rows().len(), 1, "the refused UPDATE kept the row");
         assert_eq!(
-            rows.rows[0][0],
+            rows.rows()[0][0],
             Value::Vector(stored.clone()),
             "the refused UPDATE of {label} rewrote the stored embedding",
         );
@@ -11007,12 +11139,12 @@ fn updating_an_embedding_with_a_scalar_leaves_the_stored_embedding_alone() {
             )
             .expect("the neighbour search still answers");
         assert_eq!(
-            search.rows.len(),
+            search.rows().len(),
             1,
             "the neighbour search still answers after refusing {label}",
         );
         assert_eq!(
-            search.rows[0][0],
+            search.rows()[0][0],
             Value::Uuid(near),
             "the refused UPDATE of {label} moved the row in the neighbour search",
         );

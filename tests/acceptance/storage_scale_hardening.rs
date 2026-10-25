@@ -102,6 +102,7 @@ fn count_rows(db: &Database, table: &str) -> i64 {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn ssa_seed_fixture_journey() {
     let db = Database::open_memory();
     exec(&db, "CREATE TABLE t (id UUID PRIMARY KEY, col INTEGER)");

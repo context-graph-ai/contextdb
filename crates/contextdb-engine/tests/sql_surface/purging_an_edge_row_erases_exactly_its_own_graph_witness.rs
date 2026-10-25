@@ -117,7 +117,8 @@ impl Store {
             )
             .expect("insert an edge");
         assert_eq!(
-            inserted.rows_affected, 1,
+            inserted.rows_affected(),
+            1,
             "{} is inserted as a row of its own",
             edge.subtype
         );
@@ -135,7 +136,8 @@ impl Store {
         database
             .execute(FORWARD_SELECT, &self.key(edge.subtype))
             .expect("read an edge by its declared key")
-            .rows
+            .rows()
+            .to_vec()
             .into_iter()
             .map(|row| row.into_iter().next().expect("an id column"))
             .collect()
@@ -145,7 +147,7 @@ impl Store {
         database
             .execute("SELECT id FROM edges", &HashMap::new())
             .expect("scan the edges")
-            .rows
+            .rows()
             .len()
     }
 
@@ -157,7 +159,8 @@ impl Store {
                 &HashMap::from([("source_id".into(), Value::Uuid(self.source))]),
             )
             .expect("traverse from the source")
-            .rows
+            .rows()
+            .to_vec()
             .into_iter()
             .map(|row| row.into_iter().next().expect("a target column"))
             .collect()
@@ -284,7 +287,7 @@ fn purging_one_of_two_siblings_created_in_one_transaction_leaves_the_other() {
             .database
             .execute_in_tx(tx, INSERT, &store.row(edge, Value::TxId(tx)))
             .expect("insert in the transaction");
-        assert_eq!(inserted.rows_affected, 1, "{} is inserted", edge.subtype);
+        assert_eq!(inserted.rows_affected(), 1, "{} is inserted", edge.subtype);
     }
     store.database.commit(tx).expect("commit");
     store.purge_one(&first);
@@ -400,7 +403,7 @@ fn deleting_one_sibling_leaves_exactly_the_other_binding() {
             &HashMap::from([("id".into(), Value::Uuid(first.id))]),
         )
         .unwrap();
-    assert_eq!(result.rows_affected, 1);
+    assert_eq!(result.rows_affected(), 1);
     store.assert_only_survivor_remains(&second, &first, &store.database);
     assert!(
         store
@@ -439,7 +442,7 @@ fn update_first_owner(changes_target: bool) {
             ]),
         )
         .unwrap();
-    assert_eq!(result.rows_affected, 1);
+    assert_eq!(result.rows_affected(), 1);
     assert_eq!(store.row_count(&store.database), 2);
     let mut actual = store.reachable(&store.database);
     let mut expected = vec![
@@ -503,10 +506,10 @@ fn rolling_back_a_siblings_update_restores_both_original_bindings() {
             &HashMap::from([("source_id".into(), Value::Uuid(store.source))]),
         )
         .unwrap();
-    assert_eq!(inside.rows.len(), 2);
+    assert_eq!(inside.rows().len(), 2);
     assert_eq!(
         inside
-            .rows
+            .rows()
             .iter()
             .filter(|r| r[0] == Value::Uuid(replacement))
             .count(),
@@ -548,7 +551,7 @@ fn deleting_an_uncommitted_edge_row_leaves_no_graph_witness() {
             &HashMap::from([("source_id".into(), Value::Uuid(store.source))]),
         )
         .unwrap();
-    assert!(inside.rows.is_empty());
+    assert!(inside.rows().is_empty());
     store.database.commit(tx).unwrap();
     assert_eq!(store.row_count(&store.database), 0);
     assert!(store.reachable(&store.database).is_empty());
@@ -627,7 +630,7 @@ fn purging_one_tables_edge_preserves_another_tables_same_triad() {
                 &store.row(&other, Value::TxId(contextdb_core::TxId(1)))
             )
             .unwrap()
-            .rows_affected,
+            .rows_affected(),
         1
     );
     assert_eq!(
@@ -644,7 +647,7 @@ fn purging_one_tables_edge_preserves_another_tables_same_triad() {
             .database
             .execute("SELECT id FROM other_edges", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(other.id)]]
     );
 }
@@ -680,7 +683,7 @@ fn dropping_one_edge_table_preserves_another_tables_same_triad() {
                 &HashMap::from([("source_id".into(), Value::Uuid(store.source))])
             )
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(store.target)]]
     );
     assert_eq!(
@@ -688,11 +691,12 @@ fn dropping_one_edge_table_preserves_another_tables_same_triad() {
             .database
             .execute("SELECT id FROM other_edges", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(other.id)]]
     );
 }
 #[test]
+#[cfg(feature = "test-seams")]
 fn a_failed_purge_keeps_both_sibling_witnesses_across_reopen() {
     let store = store();
     let (first, second) = (store.new_edge("depends_on"), store.new_edge("posts_to"));
@@ -703,7 +707,8 @@ fn a_failed_purge_keeps_both_sibling_witnesses_across_reopen() {
         .database
         .execute("SELECT id FROM edges ORDER BY id", &HashMap::new())
         .expect("capture both live owners")
-        .rows;
+        .rows()
+        .to_vec();
     store
         .database
         .arm_authoritative_purge_point_remove_persistence_failure_for_test();
@@ -722,21 +727,21 @@ fn a_failed_purge_keeps_both_sibling_witnesses_across_reopen() {
             .database
             .execute("SELECT id FROM edges ORDER BY id", &HashMap::new())
             .expect("both rows survive the failed write")
-            .rows,
+            .rows(),
         rows
     );
     let assert_bindings = |db: &Database| {
         assert_eq!(
             db.execute(TRAVERSE, &store.key(first.subtype))
                 .expect("both forward witnesses survive")
-                .rows
+                .rows()
                 .len(),
             2
         );
         assert_eq!(db.execute(
             "SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:RELATES_TO]->(b) WHERE b.id = $target_id COLUMNS (a.id AS t))",
             &store.key(first.subtype),
-        ).expect("both reverse witnesses survive").rows.len(), 2);
+        ).expect("both reverse witnesses survive").rows().len(), 2);
     };
     assert_bindings(&store.database);
     store.database.close().expect("close after failed purge");
@@ -746,7 +751,7 @@ fn a_failed_purge_keeps_both_sibling_witnesses_across_reopen() {
         reopened
             .execute("SELECT id FROM edges ORDER BY id", &HashMap::new())
             .expect("both rows survived reopen")
-            .rows,
+            .rows(),
         rows
     );
     assert_bindings(&reopened);
@@ -799,7 +804,7 @@ fn propagated_edge_successor_witness(children_after_transition: bool) {
         database
             .execute("SELECT status FROM propagated_edges", &params)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("active".into())]; 2],
         "uncommitted parent transition cannot leak to committed children"
     );
@@ -809,7 +814,8 @@ fn propagated_edge_successor_witness(children_after_transition: bool) {
     let rows = database
         .execute("SELECT status FROM propagated_edges", &params)
         .unwrap()
-        .rows;
+        .rows()
+        .to_vec();
     assert_eq!(rows.len(), 2);
     assert_eq!(
         rows,
@@ -825,7 +831,7 @@ fn propagated_edge_successor_witness(children_after_transition: bool) {
             params["source"].clone()
         };
         assert_eq!(
-            database.execute(query, &params).unwrap().rows,
+            database.execute(query, &params).unwrap().rows(),
             vec![vec![endpoint]; 2],
             "each propagated sibling retains its own physical binding"
         );
@@ -837,34 +843,46 @@ fn propagated_edge_successor_witness(children_after_transition: bool) {
         database
             .execute("SELECT id FROM propagated_edges", &params)
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );
-    assert_eq!(database.execute("SELECT t FROM GRAPH_TABLE(propagated_edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &params).unwrap().rows.len(), 1);
+    assert_eq!(database.execute("SELECT t FROM GRAPH_TABLE(propagated_edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &params).unwrap().rows().len(), 1);
     drop(database);
     let reopened = Database::open(path(&directory)).unwrap();
     assert_eq!(
         reopened
             .execute("SELECT id FROM propagated_edges", &params)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![params["first"].clone()]],
         "purge selects exactly the second owner"
     );
     assert_eq!(
-        reopened.execute(reverse, &params).unwrap().rows,
+        reopened.execute(reverse, &params).unwrap().rows(),
         vec![vec![params["source"].clone()]]
     );
     assert_eq!(
-        reopened.execute(forward, &params).unwrap().rows,
+        reopened.execute(forward, &params).unwrap().rows(),
         vec![vec![params["target"].clone()]]
     );
     reopened
         .execute("PURGE FROM propagated_edges WHERE id = $first", &params)
         .expect("the final successor owns its own purge witness");
-    assert!(reopened.execute(forward, &params).unwrap().rows.is_empty());
-    assert!(reopened.execute(reverse, &params).unwrap().rows.is_empty());
+    assert!(
+        reopened
+            .execute(forward, &params)
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .execute(reverse, &params)
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
 }
 #[test]
 fn a_propagated_edge_row_keeps_an_exact_successor_witness() {
@@ -877,6 +895,7 @@ fn an_eagerly_propagated_edge_row_keeps_an_exact_successor_witness() {
 
 // Public cursor lifecycle on the existing real SQL graph fixture. These rows
 // prove committed graph controls; the public door rejects active transactions.
+#[cfg(feature = "test-seams")]
 fn committed_graph_cursor_lifecycle(action: &str) {
     use contextdb_core::read_contract::{OwnerReadCancellation, ReadFailureKind, ReadLimits};
     use contextdb_engine::local_transport::ManualDeadlineClock;
@@ -912,8 +931,11 @@ fn committed_graph_cursor_lifecycle(action: &str) {
         .read_session_with_clock_for_test(limits, clock.clone())
         .unwrap();
     let mut cursor = session.open_cursor(TRAVERSE, &s.key("one")).unwrap();
-    assert_eq!(cursor.first_page().rows, vec![vec![Value::Uuid(s.target)]]);
-    assert!(cursor.first_page().has_more);
+    assert_eq!(
+        cursor.first_page().rows(),
+        vec![vec![Value::Uuid(s.target)]]
+    );
+    assert!(cursor.first_page().has_more());
     assert!(cursor.is_live());
     match action {
         "purge" => {
@@ -946,11 +968,11 @@ fn committed_graph_cursor_lifecycle(action: &str) {
                 "fetch cancellation preserves the existing resumable cursor contract"
             );
             let page = cursor.fetch(NonZeroUsize::new(1)).unwrap();
-            assert_eq!(page.rows, vec![vec![Value::Uuid(s.target)]]);
-            assert!(page.has_more);
+            assert_eq!(page.rows(), vec![vec![Value::Uuid(s.target)]]);
+            assert!(page.has_more());
             let last = cursor.fetch(NonZeroUsize::new(1)).unwrap();
-            assert_eq!(last.rows, vec![vec![Value::Uuid(s.target)]]);
-            assert!(!last.has_more);
+            assert_eq!(last.rows(), vec![vec![Value::Uuid(s.target)]]);
+            assert!(!last.has_more());
         }
         "expiry" => {
             clock.advance_to(1011);
@@ -966,14 +988,17 @@ fn committed_graph_cursor_lifecycle(action: &str) {
     drop(session);
 }
 #[test]
+#[cfg(feature = "test-seams")]
 fn committed_graph_cursor_purge_fences_held_results() {
     committed_graph_cursor_lifecycle("purge");
 }
 #[test]
+#[cfg(feature = "test-seams")]
 fn committed_graph_cursor_cancellation_preserves_continuation() {
     committed_graph_cursor_lifecycle("cancel");
 }
 #[test]
+#[cfg(feature = "test-seams")]
 fn committed_graph_cursor_expiry_is_terminal() {
     committed_graph_cursor_lifecycle("expiry");
 }

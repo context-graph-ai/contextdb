@@ -1,14 +1,22 @@
 use super::common::*;
-use contextdb_core::{Error, Value};
+#[cfg(feature = "test-seams")]
+use contextdb_core::Error;
+use contextdb_core::Value;
 use contextdb_engine::cli_render::render_explain;
-use contextdb_engine::{Database, QueryResult};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::QueryResult;
+#[cfg(feature = "test-seams")]
+use std::panic::AssertUnwindSafe;
+#[cfg(feature = "test-seams")]
+use std::panic::catch_unwind;
 use uuid::Uuid;
 
 fn ce_uuid(n: u128) -> Uuid {
     Uuid::from_u128(0xCE00_0000_0000_0000_0000_0000_0000_0000 + n)
 }
 
+#[cfg(feature = "test-seams")]
 fn pushed(r: &QueryResult) -> Vec<&str> {
     r.trace()
         .predicates_pushed
@@ -17,10 +25,14 @@ fn pushed(r: &QueryResult) -> Vec<&str> {
         .collect()
 }
 
+#[cfg(feature = "test-seams")]
 const FEWER: &str = "fewer predicate columns matched than chosen index";
+#[cfg(feature = "test-seams")]
 const FIRST: &str = "first column not in WHERE";
+#[cfg(feature = "test-seams")]
 const MORE_COLUMNS: &str = "more indexed columns than chosen index";
 
+#[cfg(feature = "test-seams")]
 fn reason<'a>(r: &'a QueryResult, name: &str) -> Option<&'a str> {
     r.trace()
         .indexes_considered
@@ -29,6 +41,7 @@ fn reason<'a>(r: &'a QueryResult, name: &str) -> Option<&'a str> {
         .map(|c| c.rejected_reason.as_ref())
 }
 
+#[cfg(feature = "test-seams")]
 fn seed_edge(
     db: &Database,
     id_n: u128,
@@ -56,6 +69,7 @@ fn seed_edge(
 /// predicate so only the matching rows are read. When two composites push the same prefix, the
 /// shorter declared key wins before creation order and the longer key says why it lost.
 #[test]
+#[cfg(feature = "test-seams")]
 fn acceptance_explain_says_why_each_competing_composite_index_lost() {
     let db = Database::open_memory();
     db.execute(
@@ -232,6 +246,7 @@ fn acceptance_first_composite_index_explain_walkthrough() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn acceptance_degenerate_in_queries_graceful() {
     let db = Database::open_memory();
     db.execute(

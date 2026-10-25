@@ -1,9 +1,16 @@
 use contextdb_core::types::ContextId;
 use contextdb_core::{Direction, Error, Lsn, Value, VectorIndexRef};
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{
-    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange,
-};
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::ChangeSet;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::DdlChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::NaturalKey;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::RowChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use tempfile::TempDir;
@@ -709,6 +716,7 @@ fn t4_07d_scoped_view_observes_owner_close() {
 /// synchronously, on the SAME thread, inside `execute` itself) rather than
 /// depending on a second thread ever winning a real race.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t4_07e_execute_returns_typed_error_when_close_races_the_snapshot_registration() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("race-window.redb");
@@ -962,6 +970,7 @@ fn t4_13_scan_filter_predicate_sees_only_context_visible_rows() {
 
 /// RED — t4_14: sync apply's raw insert helper must not bypass context gates.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t4_14_sync_apply_does_not_insert_other_context_rows() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("sync_apply.redb");
@@ -1284,6 +1293,7 @@ fn t4_17b_changes_since_emits_delete_when_row_moves_out_of_context_after_ddl_lsn
 
 /// RED — t4_18: sync DDL apply requires an admin handle.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t4_18_scoped_apply_changes_rejects_ddl() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("sync_ddl.redb");

@@ -1,10 +1,27 @@
-use contextdb_core::{Direction, RowId, SnapshotId, Value, VectorIndexRef};
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
+use contextdb_core::Direction;
+#[cfg(feature = "test-seams")]
+use contextdb_core::RowId;
+#[cfg(feature = "test-seams")]
+use contextdb_core::SnapshotId;
+use contextdb_core::Value;
+use contextdb_core::VectorIndexRef;
 use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
 use contextdb_engine::memory_accounting::MemoryAccountant;
-use contextdb_engine::sync_types::{
-    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, NaturalKey, RowChange,
-    VectorChange,
-};
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::ChangeSet;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::DdlChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::EdgeChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::NaturalKey;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::RowChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::VectorChange;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +35,7 @@ fn empty() -> HashMap<String, Value> {
 
 /// RED — t21_01
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_01_concurrent_reader_never_sees_torn_three_paradigm_commit() {
     use contextdb_core::RowId;
     use std::sync::mpsc;
@@ -1353,6 +1371,7 @@ fn t21_13_same_tx_graph_delete_then_reinsert_keeps_new_edge() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_14_mixed_sync_edge_error_rolls_back_rows() {
     let db = Database::open_memory();
     db.execute(
@@ -1411,6 +1430,7 @@ fn t21_14_mixed_sync_edge_error_rolls_back_rows() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_16_mixed_sync_vector_error_rolls_back_rows() {
     let db = Database::open_memory();
     db.execute(
@@ -1829,6 +1849,7 @@ fn t21_17_fk_validation_uses_same_tx_final_state() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_18_mixed_sync_ddl_vector_error_does_not_apply_ddl() {
     let db = Database::open_memory();
     db.execute(
@@ -1880,6 +1901,7 @@ fn t21_18_mixed_sync_ddl_vector_error_does_not_apply_ddl() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_19_mixed_sync_ddl_edge_error_does_not_apply_ddl() {
     let db = Database::open_memory();
     let id = Uuid::from_u128(0x2119);
@@ -1927,6 +1949,7 @@ fn t21_19_mixed_sync_ddl_edge_error_does_not_apply_ddl() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_20_sync_drop_table_removes_vector_state_and_persists() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("sync-drop-vector.db");
@@ -2028,6 +2051,7 @@ fn t21_20_sync_drop_table_removes_vector_state_and_persists() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t21_21_mixed_sync_ddl_vector_memory_error_does_not_apply_ddl() {
     let accountant = Arc::new(MemoryAccountant::with_budget(1300));
     let db = Database::open_memory_with_accountant(accountant);

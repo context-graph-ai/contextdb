@@ -1,21 +1,46 @@
 use contextdb_core::Value;
+#[cfg(feature = "test-seams")]
 use contextdb_core::types::ScopeLabel;
-use contextdb_engine::{Database, SinkError, SinkEvent};
+use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::SinkError;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::SinkEvent;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+#[cfg(feature = "test-seams")]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+#[cfg(feature = "test-seams")]
 use std::env;
 #[cfg(unix)]
+#[cfg(feature = "test-seams")]
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "test-seams")]
+use std::process::Command;
+#[cfg(feature = "test-seams")]
+use std::process::Output;
+#[cfg(feature = "test-seams")]
+use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "test-seams")]
+use std::sync::atomic::AtomicU64;
+#[cfg(feature = "test-seams")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
+use std::sync::Mutex;
+#[cfg(feature = "test-seams")]
+use std::sync::Weak;
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(feature = "test-seams")]
 use tempfile::TempDir;
 use uuid::Uuid;
 
+#[cfg(feature = "test-seams")]
 const CHILD_ENV: &str = "CONTEXTDB_T34_CHILD";
+#[cfg(feature = "test-seams")]
 const RESULT_PREFIX: &str = "T34_RESULT ";
 
 // The acceptance binary's AllocCounter is thread-local opt-in, so respawned child tests inherit it safely.
@@ -24,6 +49,7 @@ thread_local! {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(feature = "test-seams")]
 enum CallbackExit {
     Panic,
     Ok,
@@ -32,11 +58,13 @@ enum CallbackExit {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(feature = "test-seams")]
 enum RegistrationPath {
     Unscoped,
     ScopedEdge,
 }
 
+#[cfg(feature = "test-seams")]
 struct ChildRun {
     output: Output,
     timed_out: bool,
@@ -46,6 +74,7 @@ struct DropSentinel {
     flag: Arc<AtomicBool>,
 }
 
+#[cfg(feature = "test-seams")]
 struct LastOwnerCallbackState {
     weak: Weak<Database>,
     exit: CallbackExit,
@@ -68,6 +97,7 @@ fn empty() -> HashMap<String, Value> {
     HashMap::new()
 }
 
+#[cfg(feature = "test-seams")]
 fn child_budget() -> Duration {
     if cfg!(debug_assertions) {
         Duration::from_secs(10)
@@ -76,6 +106,7 @@ fn child_budget() -> Duration {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn multi_iteration_budget() -> Duration {
     if cfg!(debug_assertions) {
         Duration::from_secs(30)
@@ -84,14 +115,17 @@ fn multi_iteration_budget() -> Duration {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn current_test_name(name: &str) -> String {
     format!("event_bus_self_join::{name}")
 }
 
+#[cfg(feature = "test-seams")]
 fn is_child(test_id: &str) -> bool {
     env::var(CHILD_ENV).as_deref() == Ok(test_id)
 }
 
+#[cfg(feature = "test-seams")]
 fn run_child(test_name: &str, test_id: &str, timeout: Duration) -> ChildRun {
     let mut command = Command::new(env::current_exe().expect("current test executable"));
     command
@@ -127,6 +161,7 @@ fn run_child(test_name: &str, test_id: &str, timeout: Duration) -> ChildRun {
     ChildRun { output, timed_out }
 }
 
+#[cfg(feature = "test-seams")]
 fn assert_child_success(run: &ChildRun) {
     let stdout = String::from_utf8_lossy(&run.output.stdout);
     let stderr = String::from_utf8_lossy(&run.output.stderr);
@@ -155,6 +190,7 @@ fn assert_child_success(run: &ChildRun) {
     );
 }
 
+#[cfg(feature = "test-seams")]
 fn result_json(run: &ChildRun) -> String {
     let stdout = String::from_utf8_lossy(&run.output.stdout);
     stdout
@@ -164,6 +200,7 @@ fn result_json(run: &ChildRun) -> String {
         .to_string()
 }
 
+#[cfg(feature = "test-seams")]
 fn json_u64(json: &str, key: &str) -> u64 {
     let marker = format!("\"{key}\":");
     let start = json
@@ -179,6 +216,7 @@ fn json_u64(json: &str, key: &str) -> u64 {
         .unwrap_or_else(|_| panic!("invalid u64 for {key} in {json}"))
 }
 
+#[cfg(feature = "test-seams")]
 fn json_bool(json: &str, key: &str) -> bool {
     let marker = format!("\"{key}\":");
     let start = json
@@ -194,6 +232,7 @@ fn json_bool(json: &str, key: &str) -> bool {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn assert_json_bool(json: &str, key: &str, expected: bool) {
     assert_eq!(
         json_bool(json, key),
@@ -202,6 +241,7 @@ fn assert_json_bool(json: &str, key: &str, expected: bool) {
     );
 }
 
+#[cfg(feature = "test-seams")]
 fn assert_json_u64(json: &str, key: &str, expected: u64) {
     assert_eq!(
         json_u64(json, key),
@@ -265,6 +305,7 @@ fn insert_inv(db: &Database, id: u128, scoped: bool) {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn register_last_owner_callback(
     db: &Arc<Database>,
     sink: &str,
@@ -346,6 +387,7 @@ fn register_last_owner_callback(
     db.runtime_starts_count_for_test(sink)
 }
 
+#[cfg(feature = "test-seams")]
 fn run_last_owner_drop_scenario(
     sink: &str,
     path: RegistrationPath,
@@ -433,6 +475,7 @@ fn run_last_owner_drop_scenario(
     )
 }
 
+#[cfg(feature = "test-seams")]
 fn run_file_backed_last_owner_drop_ack_scenario() -> String {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("event-bus-self-drop.redb");
@@ -492,7 +535,7 @@ fn run_file_backed_last_owner_drop_ack_scenario() -> String {
 
     let reopened = Database::open(&path).unwrap();
     reopened.complete_initialization().unwrap();
-    let queued_after_reopen = reopened.sink_metrics_for_test("durable").queued;
+    let queued_after_reopen = reopened.sink_metrics("durable").queued;
     format!(
         "{{\"last_strong_count\":{},\"after_drop\":{},\"invocations\":{},\"first_event_id\":{},\"runtime_starts\":{},\"dispatcher_released\":{},\"queued_after_reopen\":{}}}",
         last_strong_count.load(Ordering::SeqCst),
@@ -506,6 +549,7 @@ fn run_file_backed_last_owner_drop_ack_scenario() -> String {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t34_01_panic_callback_drops_resource_owner_arc_on_dispatcher_no_abort() {
     let name = "t34_01_panic_callback_drops_resource_owner_arc_on_dispatcher_no_abort";
     if is_child("t34_01") {
@@ -530,6 +574,7 @@ fn t34_01_panic_callback_drops_resource_owner_arc_on_dispatcher_no_abort() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t34_02_panic_through_scoped_registration_drops_resource_owner_arc_no_abort() {
     let name = "t34_02_panic_through_scoped_registration_drops_resource_owner_arc_no_abort";
     if is_child("t34_02") {
@@ -554,6 +599,7 @@ fn t34_02_panic_through_scoped_registration_drops_resource_owner_arc_no_abort() 
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t34_03_clean_drop_from_dispatcher_retires_sibling_within_bounded_budget() {
     let sibling_released = Arc::new(AtomicBool::new(false));
     let trigger_after_drop = Arc::new(AtomicBool::new(false));
@@ -817,16 +863,16 @@ fn t34_04_panic_isolation_counter_exact_and_same_event_delivered_to_sibling() {
     // surfaces as nextest's own harness slow-timeout, never as a
     // test-authored elapsed-time assertion.
     loop {
-        let panic_metrics = db.sink_metrics_for_test("s_panic");
-        let count_metrics = db.sink_metrics_for_test("s_count");
+        let panic_metrics = db.sink_metrics("s_panic");
+        let count_metrics = db.sink_metrics("s_count");
         if panic_metrics.uncertain >= 1 && count_metrics.delivered == 3 {
             break;
         }
         thread::yield_now();
     }
 
-    let panic_metrics = db.sink_metrics_for_test("s_panic");
-    let count_metrics = db.sink_metrics_for_test("s_count");
+    let panic_metrics = db.sink_metrics("s_panic");
+    let count_metrics = db.sink_metrics("s_count");
     assert!(panic_metrics.uncertain >= 1);
     assert_eq!(panic_metrics.queued, 3, "panicked actions remain pending");
     assert_eq!(panic_metrics.permanent_failures, 0);
@@ -845,6 +891,7 @@ fn t34_04_panic_isolation_counter_exact_and_same_event_delivered_to_sibling() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t34_05_dispatcher_thread_initiated_drop_is_deterministic_and_leak_free_across_iterations() {
     let name =
         "t34_05_dispatcher_thread_initiated_drop_is_deterministic_and_leak_free_across_iterations";
@@ -892,6 +939,7 @@ fn t34_05_dispatcher_thread_initiated_drop_is_deterministic_and_leak_free_across
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t34_06_post_shutdown_batch_entries_are_not_delivered() {
     let name = "t34_06_post_shutdown_batch_entries_are_not_delivered";
     if is_child("t34_06") {
@@ -918,6 +966,7 @@ fn t34_06_post_shutdown_batch_entries_are_not_delivered() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t34_07_clean_error_return_drops_resource_owner_arc_on_dispatcher_no_abort() {
     let name = "t34_07_clean_error_return_drops_resource_owner_arc_on_dispatcher_no_abort";
     if is_child("t34_07") {
@@ -1013,6 +1062,7 @@ fn t34_08_explicit_close_then_drop_is_idempotent_no_double_join() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t34_09_transient_error_return_drops_resource_owner_arc_on_dispatcher_no_abort() {
     let name = "t34_09_transient_error_return_drops_resource_owner_arc_on_dispatcher_no_abort";
     if is_child("t34_09") {
@@ -1037,6 +1087,7 @@ fn t34_09_transient_error_return_drops_resource_owner_arc_on_dispatcher_no_abort
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t34_10_file_backed_self_drop_acks_delivered_event_before_persistence_close() {
     let name = "t34_10_file_backed_self_drop_acks_delivered_event_before_persistence_close";
     if is_child("t34_10") {

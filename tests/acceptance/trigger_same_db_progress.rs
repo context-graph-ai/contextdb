@@ -4,6 +4,7 @@
 //! deadlock-guard timeout, schema-agnosticity across cascade types,
 //! Drop/close while parked, and the panic-freedom suite's regression guards.
 
+#[cfg(feature = "test-seams")]
 use crate::common_tracing::{
     T30_COUNT_ENABLED, T30_LAST_WARN_FIELDS, T30_WARN_COUNT, T37_COUNT_ENABLED, T37_TRACING_COUNT,
     install_global_subscriber as t30_install_global_subscriber, t30_reset_warn_counters, t37_reset,
@@ -12,9 +13,14 @@ use contextdb_core::{
     CallbackKind, Error, Result, Value, VectorIndexRef,
     types::{EdgeType, NodeId},
 };
+#[cfg(feature = "test-seams")]
 use contextdb_engine::memory_accounting::MemoryAccountant;
+#[cfg(feature = "test-seams")]
 use contextdb_engine::plugin::DatabasePlugin;
-use contextdb_engine::{CronAuditKind, Database, QueryResult};
+#[cfg(feature = "test-seams")]
+use contextdb_engine::CronAuditKind;
+use contextdb_engine::Database;
+use contextdb_engine::QueryResult;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -32,7 +38,9 @@ type LabeledUnitResults = Arc<Mutex<Vec<(&'static str, Result<()>)>>>;
 // changes nothing. The deadlock-guard journeys state their deadline through the
 // handle's private seam instead, because the environment is not a behavior
 // surface.
+#[cfg(feature = "test-seams")]
 pub(crate) struct EnvGuard(pub &'static str);
+#[cfg(feature = "test-seams")]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         // SAFETY: 2024 edition requires unsafe for env mutation.
@@ -77,12 +85,14 @@ impl Drop for BarrierReleaseGuard {
 }
 
 #[derive(Default)]
+#[cfg(feature = "test-seams")]
 struct ParkAutocommitOnQueryPlugin {
     armed: AtomicBool,
     entered: (Mutex<bool>, Condvar),
     release: (Mutex<bool>, Condvar),
 }
 
+#[cfg(feature = "test-seams")]
 impl ParkAutocommitOnQueryPlugin {
     fn arm(&self) {
         *self.entered.0.lock().unwrap() = false;
@@ -115,6 +125,7 @@ impl ParkAutocommitOnQueryPlugin {
     }
 }
 
+#[cfg(feature = "test-seams")]
 impl DatabasePlugin for ParkAutocommitOnQueryPlugin {
     fn on_query(&self, sql: &str) -> Result<()> {
         if self.armed.swap(false, AtomicOrdering::SeqCst) && sql.contains("INSERT INTO other") {
@@ -136,6 +147,7 @@ impl DatabasePlugin for ParkAutocommitOnQueryPlugin {
 
 // The deadline the deadlock-guard journeys wait before the typed cross-thread
 // error is due. Stated to each handle under test through the private seam.
+#[cfg(feature = "test-seams")]
 const GUARD_DEADLINE: Duration = Duration::from_millis(2000);
 
 fn empty() -> HashMap<String, Value> {
@@ -146,6 +158,7 @@ fn uuid(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 
+#[cfg(feature = "test-seams")]
 fn wait_until_trigger_wait_observed(db: &Database, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -189,6 +202,7 @@ where
 /// Build an in-memory `Database` with a trigger declared on table `t` and
 /// a callback parked on a barrier pair. The callback waits on `entered.wait()`
 /// to signal it is active, then waits on `done.wait()` to release.
+#[cfg(feature = "test-seams")]
 fn build_trigger_parked_db(entered: Arc<Barrier>, done: Arc<Barrier>) -> Arc<Database> {
     let db = Arc::new(Database::open_memory());
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY)", &empty())
@@ -217,6 +231,7 @@ fn build_trigger_parked_db(entered: Arc<Barrier>, done: Arc<Barrier>) -> Arc<Dat
 /// `commit()`/`rollback()`/`apply_changes()` (as opposed to `begin()`):
 /// Thread B already holds an open tx, so its commit-time path is the one
 /// that races against Thread A's parked callback.
+#[cfg(feature = "test-seams")]
 fn build_trigger_parked_with_open_tx(
     entered: Arc<Barrier>,
     done: Arc<Barrier>,
@@ -229,6 +244,7 @@ fn build_trigger_parked_with_open_tx(
 /// Build an in-memory `Database` with a paused cron tickler and a cron callback
 /// parked on a barrier pair. Tests explicitly drive the callback with
 /// `cron_run_due_now_for_test()`.
+#[cfg(feature = "test-seams")]
 fn build_cron_parked_db(
     entered: Arc<Barrier>,
     done: Arc<Barrier>,
@@ -285,6 +301,7 @@ fn fire_trigger_in_thread(db: Arc<Database>, key: u128) -> thread::JoinHandle<Re
 #[cfg(feature = "nightly-tests")]
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_01_sustained_writer_flood_50_threads_commits_under_lens7_baseline() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -428,6 +445,7 @@ fn t30_01_sustained_writer_flood_50_threads_commits_under_lens7_baseline() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_02_two_writer_interleave_same_db_thread_b_waits_then_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -491,6 +509,7 @@ fn t30_02_two_writer_interleave_same_db_thread_b_waits_then_proceeds() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_02_commit_same_db_b2_waits_then_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -534,6 +553,7 @@ fn t30_02_commit_same_db_b2_waits_then_proceeds() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_02_rollback_same_db_b2_waits_then_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -575,6 +595,7 @@ fn t30_02_rollback_same_db_b2_waits_then_proceeds() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_02_apply_changes_same_db_b2_waits_then_proceeds() {
     use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy};
     run_with_timeout(|| {
@@ -624,6 +645,7 @@ fn t30_02_apply_changes_same_db_b2_waits_then_proceeds() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_03_two_writer_interleave_cross_db_dby_no_callback_proceeds_without_engagement() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -662,6 +684,7 @@ fn t30_03_two_writer_interleave_cross_db_dby_no_callback_proceeds_without_engage
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_03b_two_writer_interleave_cross_db_non_owner_probe_proceeds_without_engagement() {
     run_with_timeout(|| {
         let db_y = Arc::new(Database::open_memory());
@@ -697,6 +720,7 @@ fn t30_03b_two_writer_interleave_cross_db_non_owner_probe_proceeds_without_engag
 #[cfg(feature = "nightly-tests")]
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_04_no_trigger_callback_baseline_throughput_n32_writers() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -755,6 +779,7 @@ fn t30_04_no_trigger_callback_baseline_throughput_n32_writers() {
 #[cfg(feature = "nightly-tests")]
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_05_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1136,6 +1161,7 @@ fn t30_11_direct_helpers_from_trigger_callback_against_other_db_return_callback_
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_11_execute_from_cron_callback_against_other_db_returns_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1232,6 +1258,7 @@ fn t30_11_execute_from_cron_callback_against_other_db_returns_callback_reentry()
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_11_execute_in_tx_from_cron_callback_against_other_db_returns_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1287,6 +1314,7 @@ fn t30_11_execute_in_tx_from_cron_callback_against_other_db_returns_callback_ree
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_11_direct_helpers_from_cron_callback_against_other_db_return_callback_reentry() {
     run_with_timeout(|| {
         let db_x = Arc::new(Database::open_memory());
@@ -1462,6 +1490,7 @@ fn t30_12b_captured_trigger_tx_execute_in_tx_read_from_wrong_thread_returns_type
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_13_trigger_inside_cron_callback_tx_nested_same_thread_same_db_atomic() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1526,6 +1555,7 @@ fn t30_13_trigger_inside_cron_callback_tx_nested_same_thread_same_db_atomic() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_14_b1_cron_active_same_db_returns_callback_active_cron_immediately() {
     run_with_timeout(|| {
         let entered_cron = Arc::new(Barrier::new(2));
@@ -1588,6 +1618,7 @@ fn t30_14_b1_cron_active_same_db_returns_callback_active_cron_immediately() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_14b_cron_trigger_dispatch_failure_rolls_back_active_tx_while_guard_retained() {
     run_with_timeout(|| {
         let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -1761,6 +1792,7 @@ fn t30_15_schema_agnosticity_relational_graph_vector_cascade_in_callback_n_write
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_15b_schema_agnosticity_wait_holds_mid_cascade() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1897,6 +1929,7 @@ fn t30_15b_schema_agnosticity_wait_holds_mid_cascade() {
 /// Variant of `fire_trigger_in_thread` that fires a trigger declared on
 /// table `host` (not `t`). Used by t30_15b where the firing table is the
 /// cascade host.
+#[cfg(feature = "test-seams")]
 fn fire_trigger_in_thread_into_host(
     db: Arc<Database>,
     key: u128,
@@ -1914,6 +1947,7 @@ fn fire_trigger_in_thread_into_host(
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_16_drop_while_callback_parked_no_panic_close_releases_after_callback_exits() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -1967,6 +2001,7 @@ fn t30_16_drop_while_callback_parked_no_panic_close_releases_after_callback_exit
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_16_close_requested_while_begin_waiter_parked_wakes_begin_to_closed() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2026,6 +2061,7 @@ fn t30_16_close_requested_while_begin_waiter_parked_wakes_begin_to_closed() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_16b_close_requested_while_sql_begin_waiter_parked_wakes_begin_to_closed() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2088,6 +2124,7 @@ fn t30_16b_close_requested_while_sql_begin_waiter_parked_wakes_begin_to_closed()
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_16c_close_requested_while_sql_rollback_waiter_parked_wakes_rollback_to_closed() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2152,6 +2189,7 @@ fn t30_16c_close_requested_while_sql_rollback_waiter_parked_wakes_rollback_to_cl
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_16d_sql_autocommit_dml_does_not_rewait_inside_outer_execute_operation() {
     run_with_timeout(|| {
         let plugin = Arc::new(ParkAutocommitOnQueryPlugin::default());
@@ -2229,6 +2267,7 @@ fn t30_16d_sql_autocommit_dml_does_not_rewait_inside_outer_execute_operation() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_17_deadlock_guard_timeout_unhealthy_park_returns_typed_err_plus_one_warn_event() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -2345,6 +2384,7 @@ fn t30_17_deadlock_guard_timeout_unhealthy_park_returns_typed_err_plus_one_warn_
 // needs a shorter deadline states it through the private seam instead.
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn c8_the_trigger_deadlock_environment_variable_changes_nothing() {
     // A hundredth of the shipped deadline: if the environment could move it,
     // the probe below would give up almost at once.
@@ -2436,6 +2476,7 @@ fn c8_the_trigger_deadlock_environment_variable_changes_nothing() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_17_deadlock_guard_commit() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -2519,6 +2560,7 @@ fn t30_17_deadlock_guard_commit() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_17_deadlock_guard_rollback() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -2585,6 +2627,7 @@ fn t30_17_deadlock_guard_rollback() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_17_deadlock_guard_apply_changes() {
     use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy};
     t30_install_global_subscriber();
@@ -2654,6 +2697,7 @@ fn t30_17_deadlock_guard_apply_changes() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_17_deadlock_guard_close() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -2726,6 +2770,7 @@ fn t30_17_deadlock_guard_close() {
 #[cfg(feature = "nightly-tests")]
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_18_deadlock_guard_healthy_contention_no_tracing_warn_emitted() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -2865,6 +2910,7 @@ fn t30_18_deadlock_guard_healthy_contention_no_tracing_warn_emitted() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_19_cron_then_trigger_sequential_phases_typed_err_then_wait() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -3076,6 +3122,7 @@ fn run_panic_freedom_begin_iterations(key_base: u128, label: &'static str) {
 #[cfg(not(debug_assertions))]
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_02_release_two_writer_interleave_same_db_b2_waits_then_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -3121,6 +3168,7 @@ fn t30_02_release_two_writer_interleave_same_db_b2_waits_then_proceeds() {
 #[cfg(feature = "nightly-tests")]
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_05_release_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -3218,6 +3266,7 @@ fn t30_05_release_sustained_writer_flood_n32_with_no_op_trigger_all_commit() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_22_source_order_priority_b1_unrelated_trigger_unchanged() {
     run_with_timeout(|| {
         // db: cron parks; db_y: trigger parks. Thread C's begin() on db must
@@ -3299,6 +3348,7 @@ fn t30_22_source_order_priority_b1_unrelated_trigger_unchanged() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_25_background_worker_handle_same_db_b2_waits_and_proceeds() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -3376,6 +3426,7 @@ fn t30_25_background_worker_handle_same_db_b2_waits_and_proceeds() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_02_execute_same_db_b2_waits_then_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -3435,6 +3486,7 @@ fn t30_02_execute_same_db_b2_waits_then_proceeds() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_panicking_callback_wakes_parked_waiter() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -3542,6 +3594,7 @@ fn t30_panicking_callback_wakes_parked_waiter() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_cron_b1_immediate_typed_err_remains_unparked() {
     run_with_timeout(|| {
         let entered_cron = Arc::new(Barrier::new(2));
@@ -3681,6 +3734,7 @@ fn t30_11_rollback_from_callback_against_other_db_returns_callback_reentry() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_11_apply_changes_from_callback_against_other_db_returns_callback_reentry() {
     use contextdb_engine::sync_types::{ChangeSet, ConflictPolicies, ConflictPolicy};
     run_with_timeout(|| {
@@ -3770,6 +3824,7 @@ fn t30_11_close_from_callback_against_other_db_returns_callback_reentry() {
 #[cfg(not(debug_assertions))]
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_16_release() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -3814,6 +3869,7 @@ fn t30_16_release() {
 #[cfg(not(debug_assertions))]
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_17_release() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -3907,6 +3963,7 @@ fn t30_17_release() {
 #[cfg(feature = "nightly-tests")]
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_18_release() {
     t30_install_global_subscriber();
     t30_reset_warn_counters();
@@ -4030,6 +4087,7 @@ fn t30_18_release() {
 
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_24_cross_db_independence_emits_no_warn() {
     // Relocated from trigger_concurrency_panic_freedom.rs (t37_cross_db, 2026-07-18):
     // its two t37 siblings were begin-surface copies of t30_17/t30_18 and were
@@ -4107,6 +4165,7 @@ fn t30_24_cross_db_independence_emits_no_warn() {
 /// same-DB writer provably waiting (wait_observed advances), zero warns.
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t30_28_healthy_same_db_wait_emits_no_warn() {
     t30_install_global_subscriber();
     t37_reset();
@@ -4173,6 +4232,7 @@ fn t30_28_healthy_same_db_wait_emits_no_warn() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t30_26_completed_callbacks_leave_no_stale_owner_entries() {
     // Deterministic state guard for TriggerCallbackThreadGuard::drop's
     // owner-map cleanup (its `*count > 1` match guards). The 32-writer flood

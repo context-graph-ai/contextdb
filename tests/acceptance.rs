@@ -47,7 +47,6 @@ mod common;
 mod common_tracing;
 #[path = "acceptance/composite_foreign_key.rs"]
 mod composite_foreign_key;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/composite_index_routing.rs"]
 mod composite_index_routing;
 #[path = "acceptance/composite_unique_concurrent_update.rs"]
@@ -74,18 +73,14 @@ mod docs_immutable_column;
 mod docs_query_language_auto_indexes;
 #[path = "acceptance/embedding.rs"]
 mod embedding;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/engine_cron.rs"]
 mod engine_cron;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/event_bus.rs"]
 mod event_bus;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/event_bus_self_join.rs"]
 mod event_bus_self_join;
 #[path = "acceptance/foreign_key_delete_race.rs"]
 mod foreign_key_delete_race;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/graph_adjacency_routing.rs"]
 mod graph_adjacency_routing;
 #[path = "acceptance/handle_scope_constraint.rs"]
@@ -96,12 +91,10 @@ mod infra_failures;
 mod memory_accounting;
 #[path = "acceptance/multi_edge.rs"]
 mod multi_edge;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/multi_table_atomic_visibility.rs"]
 mod multi_table_atomic_visibility;
 #[path = "acceptance/persistence.rs"]
 mod persistence;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/precommit_context_guard.rs"]
 mod precommit_context_guard;
 #[path = "acceptance/principal_scoped_handle.rs"]
@@ -125,24 +118,18 @@ mod snapshot_read_stability;
 mod state_machine_concurrent_legal_transition;
 #[path = "acceptance/state_machine_self_edge_check.rs"]
 mod state_machine_self_edge_check;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/storage_scale_hardening.rs"]
 mod storage_scale_hardening;
 #[path = "acceptance/test_alloc_counter.rs"]
 pub mod test_alloc_counter;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/trigger.rs"]
 mod trigger;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/trigger_concurrency_panic_freedom.rs"]
 mod trigger_concurrency_panic_freedom;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/trigger_same_db_progress.rs"]
 mod trigger_same_db_progress;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/txid_monotonic_concurrent_commits.rs"]
 mod txid_monotonic_concurrent_commits;
-#[cfg(feature = "test-seams")]
 #[path = "acceptance/vector_reindex_ordering.rs"]
 mod vector_reindex_ordering;
 

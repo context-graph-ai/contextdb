@@ -1,12 +1,24 @@
 use crate::common::run_cli_script;
+#[cfg(feature = "test-seams")]
 use crate::common_tracing::{
     T5_EVENT_BUS_COUNT_ENABLED, T5_EVENT_BUS_LAST_PANIC_FIELDS, T5_EVENT_BUS_PANIC_COUNT,
     install_global_subscriber as t5_install_global_subscriber, t5_event_bus_reset,
 };
-use contextdb_core::{Lsn, Value};
-use contextdb_engine::sync_types::{
-    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, NaturalKey, RowChange, SyncDirection,
-};
+#[cfg(feature = "test-seams")]
+use contextdb_core::Lsn;
+use contextdb_core::Value;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::ChangeSet;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::DdlChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::NaturalKey;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::RowChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::SyncDirection;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_engine::{Database, SinkError, SinkEvent, SinkMetrics};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +52,7 @@ fn wait_for_bus(what: &str, mut cond: impl FnMut() -> bool) {
 /// Wait until `sink` reports at least `n` completed deliveries.
 fn wait_delivered(db: &Database, sink: &str, n: u64) {
     wait_for_bus(&format!("{sink} delivered >= {n}"), || {
-        db.sink_metrics_for_test(sink).delivered >= n
+        db.sink_metrics(sink).delivered >= n
     });
 }
 
@@ -56,11 +68,11 @@ fn wait_drained(db: &Database, sink: &str, expected_delivered: u64) -> SinkMetri
     wait_for_bus(
         &format!("{sink} queue drained with complete delivery counters"),
         || {
-            let metrics = db.sink_metrics_for_test(sink);
+            let metrics = db.sink_metrics(sink);
             metrics.queued == 0 && metrics.delivered >= expected_delivered
         },
     );
-    db.sink_metrics_for_test(sink)
+    db.sink_metrics(sink)
 }
 
 /// Wait until `sink`'s dispatcher has examined every entry queued at call time
@@ -75,12 +87,12 @@ fn wait_drained(db: &Database, sink: &str, expected_delivered: u64) -> SinkMetri
 /// `Ok` (a transient-retry would re-examine the same entry and inflate the
 /// count); every caller here delivers cleanly.
 fn wait_full_sweep(db: &Database, sink: &str) -> SinkMetrics {
-    let start = db.sink_metrics_for_test(sink);
+    let start = db.sink_metrics(sink);
     let target = start.examined + start.queued;
     wait_for_bus(&format!("{sink} full dispatch sweep"), || {
-        db.sink_metrics_for_test(sink).examined >= target
+        db.sink_metrics(sink).examined >= target
     });
-    db.sink_metrics_for_test(sink)
+    db.sink_metrics(sink)
 }
 
 fn declare_inv_schema(db: &Database) {
@@ -339,7 +351,7 @@ fn t5_04_sink_failure_does_not_block_commit() {
     let metrics_deadline = Instant::now() + Duration::from_secs(5);
     let mut saw_permanent_failure = false;
     while Instant::now() <= metrics_deadline {
-        let m = db.sink_metrics_for_test("slack");
+        let m = db.sink_metrics("slack");
         if m.permanent_failures >= 1 {
             assert_eq!(
                 m.permanent_failures, 1,
@@ -385,7 +397,7 @@ fn t5_05_transient_failure_retries_and_succeeds() {
         "retry path must invoke the sink exactly twice (transient then success); got {}",
         attempts.load(Ordering::SeqCst)
     );
-    let metrics = db.sink_metrics_for_test("slack");
+    let metrics = db.sink_metrics("slack");
     assert_eq!(metrics.retried, 1, "exactly one retry");
     assert_eq!(metrics.delivered, 1);
 
@@ -559,7 +571,7 @@ DELETE FROM invalidations WHERE id = '00000000-0000-0000-0000-000000000001';
     // a non-zero queue depth AND a replay, so the empty-queue assertion is the
     // deterministic proof (no settle sleep needed).
     assert_eq!(
-        reopened.sink_metrics_for_test("slack").queued,
+        reopened.sink_metrics("slack").queued,
         0,
         "delivered durable queue entry must be acked/drained on reopen, leaving nothing to replay"
     );
@@ -594,7 +606,7 @@ fn t5_07_drop_route_stops_dispatch() {
     // already empty and delivered is pinned at 1. A regression that kept
     // dispatching would enqueue the event — showing up as queued > 0 or a
     // second delivery — so this is a deterministic terminal, not a settle wait.
-    let m = db.sink_metrics_for_test("slack");
+    let m = db.sink_metrics("slack");
     assert_eq!(m.delivered, 1, "DROP ROUTE must stop further deliveries");
     assert_eq!(
         m.queued, 0,
@@ -659,7 +671,7 @@ fn t5_09_route_fires_on_update_event_type() {
     // The INSERT does not match an UPDATE event type, so it enqueues nothing:
     // event preparation ran synchronously inside execute, so an empty queue and
     // zero deliveries here is a true terminal, not a not-yet-processed snapshot.
-    let m = db.sink_metrics_for_test("slack");
+    let m = db.sink_metrics("slack");
     assert_eq!(
         m.queued, 0,
         "INSERT must not enqueue for an UPDATE event type"
@@ -718,7 +730,7 @@ fn t5_10_route_fires_on_delete_event_type() {
     // INSERT does not match a DELETE event type — nothing is enqueued (event
     // preparation is synchronous), so an empty queue / zero deliveries here is a
     // true terminal.
-    let m = db.sink_metrics_for_test("slack");
+    let m = db.sink_metrics("slack");
     assert_eq!(
         m.queued, 0,
         "INSERT must not enqueue for a DELETE event type"
@@ -736,6 +748,7 @@ fn t5_10_route_fires_on_delete_event_type() {
 
 /// RED — t5_11: subscribe-scoped-to-context-and-scope-label (the context+scope-label routing seam).
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_11_route_scoped_to_context_excludes_other_contexts() {
     use contextdb_core::types::{ContextId, ScopeLabel};
     use std::collections::BTreeSet;
@@ -1344,6 +1357,7 @@ INSERT INTO secrets (id, body, acl_id) VALUES ('00000000-0000-0000-0000-00000000
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_17_context_scoped_sink_without_principal_does_not_bypass_acl() {
     use contextdb_core::types::ContextId;
     use std::collections::BTreeSet;
@@ -1415,6 +1429,7 @@ fn t5_17_context_scoped_sink_without_principal_does_not_bypass_acl() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_18_event_bus_ddl_full_snapshot_recreates_working_route_on_peer() {
     let source = Database::open_memory();
     declare_inv_schema(&source);
@@ -1471,6 +1486,7 @@ fn t5_18_event_bus_ddl_full_snapshot_recreates_working_route_on_peer() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_19_event_bus_direction_filter_preserves_authenticated_schema_vector() {
     let source = Database::open_memory();
     declare_inv_schema(&source);
@@ -1517,6 +1533,7 @@ fn t5_19_event_bus_direction_filter_preserves_authenticated_schema_vector() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_20_failed_sync_event_bus_ddl_does_not_persist_partial_sink() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE existing (id UUID PRIMARY KEY)", &empty())
@@ -1554,6 +1571,7 @@ fn t5_20_failed_sync_event_bus_ddl_does_not_persist_partial_sink() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_20b_failed_sync_event_bus_ddl_missing_table_does_not_persist_partial_sink() {
     let db = Database::open_memory();
     let changes = contextdb_engine::sync_types::ChangeSet {
@@ -1595,6 +1613,7 @@ fn t5_20b_failed_sync_event_bus_ddl_missing_table_does_not_persist_partial_sink(
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_21_full_snapshot_omits_event_bus_ddl_for_dropped_source_table() {
     let db = Database::open_memory();
     declare_inv_schema(&db);
@@ -1651,6 +1670,7 @@ fn t5_22_execute_in_tx_event_bus_ddl_is_not_a_noop() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_23_idempotent_event_bus_sync_ddl_does_not_echo_log() {
     let db = Database::open_memory();
     declare_inv_schema(&db);
@@ -1698,6 +1718,7 @@ fn t5_23_idempotent_event_bus_sync_ddl_does_not_echo_log() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_24_failed_sync_event_bus_ddl_rolls_back_rows_in_same_changeset() {
     let db = Database::open_memory();
     db.execute("CREATE TABLE existing (id UUID PRIMARY KEY)", &empty())
@@ -1848,6 +1869,7 @@ fn t5_26_event_bus_ddl_in_tx_routes_rows_from_same_commit() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_27_standalone_sink_survives_sync_snapshot_without_route() {
     let source = Database::open_memory();
     source
@@ -1903,7 +1925,7 @@ fn t5_14_sink_metrics_field_accuracy() {
     let deadline_p = Instant::now() + Duration::from_secs(5);
     let mut saw_slack_failures = false;
     while Instant::now() <= deadline_p {
-        let m = db.sink_metrics_for_test("slack");
+        let m = db.sink_metrics("slack");
         if m.permanent_failures >= 3 {
             assert_eq!(
                 m.permanent_failures, 3,
@@ -1932,7 +1954,7 @@ fn t5_14_sink_metrics_field_accuracy() {
     let deadline_q = Instant::now() + Duration::from_secs(5);
     let mut saw_held_queue = false;
     while Instant::now() <= deadline_q {
-        let m = db.sink_metrics_for_test("held");
+        let m = db.sink_metrics("held");
         if m.queued > 0 {
             assert_eq!(
                 m.queued, 3,
@@ -1954,9 +1976,9 @@ fn t5_14_sink_metrics_field_accuracy() {
 
     let deadline_d = Instant::now() + Duration::from_secs(5);
     let mut settled = false;
-    let mut last = db.sink_metrics_for_test("held");
+    let mut last = db.sink_metrics("held");
     while Instant::now() <= deadline_d {
-        let m = db.sink_metrics_for_test("held");
+        let m = db.sink_metrics("held");
         last = m.clone();
         if m.queued == 0 && m.delivered >= 3 {
             assert_eq!(m.queued, 0, "queued returns to 0 after gate release");
@@ -2195,7 +2217,7 @@ fn t5_29_scoped_with_constraints_register_sink_delivers_only_authorized_scope_la
     );
     drop(broad);
     assert_eq!(
-        db.sink_metrics_for_test("slack").queued,
+        db.sink_metrics("slack").queued,
         0,
         "broader re-registration must drain exactly the retained denied rows"
     );
@@ -2389,7 +2411,7 @@ fn t5_30_scoped_handle_principal_register_sink_excludes_acl_denied_rows() {
     );
     drop(broad);
     assert_eq!(
-        db.sink_metrics_for_test("alice_sink").queued,
+        db.sink_metrics("alice_sink").queued,
         0,
         "broader re-registration must drain exactly the retained ACL-denied rows"
     );
@@ -2460,6 +2482,7 @@ INSERT INTO invs (id, severity, context_id) VALUES ('00000000-0000-0000-0000-000
 
 /// RED — t5_32: re-registering same sink from different scoped handles replaces registration; one worker.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_32_scoped_handle_register_sink_replaces_prior_registration_one_worker_invariant() {
     use contextdb_core::types::ContextId;
     use std::collections::BTreeSet;
@@ -2500,13 +2523,13 @@ fn t5_32_scoped_handle_register_sink_replaces_prior_registration_one_worker_inva
     )
     .unwrap();
 
-    let initial_delivered = db.sink_metrics_for_test("slack").delivered;
+    let initial_delivered = db.sink_metrics("slack").delivered;
     assert_eq!(
         initial_delivered, 0,
         "ctx_b pre-replacement row is denied by the ctx_a registration and must not deliver"
     );
     assert_eq!(
-        db.sink_metrics_for_test("slack").queued,
+        db.sink_metrics("slack").queued,
         1,
         "pre-replacement denied row must remain queued before registration replacement"
     );
@@ -2566,14 +2589,14 @@ fn t5_32_scoped_handle_register_sink_replaces_prior_registration_one_worker_inva
     );
     drop(captured_a);
 
-    let final_delivered = db.sink_metrics_for_test("slack").delivered;
+    let final_delivered = db.sink_metrics("slack").delivered;
     assert_eq!(
         final_delivered - initial_delivered,
         2,
         "engine-route delivered count must include preserved pre-replacement ctx_b row plus live ctx_b row"
     );
     assert_eq!(
-        db.sink_metrics_for_test("slack").queued,
+        db.sink_metrics("slack").queued,
         1,
         "ctx_a row denied by scoped_b's access remains queued exactly once; ctx_b row was durably acked on delivery"
     );
@@ -2591,6 +2614,7 @@ fn t5_32_scoped_handle_register_sink_replaces_prior_registration_one_worker_inva
 
 /// RED — t5_33: panic in scoped-handle callback is isolated; next event delivers; engine emits a structured tracing event with the panic message.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_33_scoped_handle_register_sink_panic_isolated_emits_tracing_event() {
     use contextdb_core::types::ContextId;
     use std::collections::BTreeSet;
@@ -2642,7 +2666,7 @@ fn t5_33_scoped_handle_register_sink_panic_isolated_emits_tracing_event() {
     // The panicked action remains pending and retries with the same identity.
     // Wait until its retry and the second event have both been acknowledged.
     wait_for_bus("slack panic batch outcome", || {
-        let metrics = db.sink_metrics_for_test("slack");
+        let metrics = db.sink_metrics("slack");
         metrics.queued == 0
             && metrics.delivered == 2
             && metrics.uncertain >= 1
@@ -2661,7 +2685,7 @@ fn t5_33_scoped_handle_register_sink_panic_isolated_emits_tracing_event() {
         3,
         "the panicked first action retries before the second action is delivered"
     );
-    let metrics = db.sink_metrics_for_test("slack");
+    let metrics = db.sink_metrics("slack");
     assert_eq!(
         metrics.uncertain, 1,
         "panic on a scoped-handle callback must be recorded as uncertain"
@@ -2781,6 +2805,7 @@ fn t5_34_resource_owner_sink_unaffected_by_sibling_scoped_handle_sink() {
 
 /// RED — t5_35: scoped handle covering N contexts produces ONE worker admitting all authorized contexts.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_35_scoped_handle_register_sink_multi_context_one_worker_admits_all_authorized_contexts() {
     use contextdb_core::types::ContextId;
     use std::collections::BTreeSet;
@@ -2981,7 +3006,7 @@ fn t5_37_scoped_handle_register_sink_drop_route_stops_enqueueing_siblings_unaffe
     // sampled. Queue removal precedes metrics publication, so queue-empty
     // alone is not a settled delivery observation.
     wait_delivered(&db, "slack", 1);
-    let pre = db.sink_metrics_for_test("slack");
+    let pre = db.sink_metrics("slack");
     let pre_drop_scoped_delivered = pre.delivered;
     assert!(
         pre_drop_scoped_delivered >= 1,
@@ -3008,18 +3033,18 @@ fn t5_37_scoped_handle_register_sink_drop_route_stops_enqueueing_siblings_unaffe
     // The dropped slack route enqueues nothing new, so its counts stay pinned.
     wait_delivered(&db, "audit", 2);
     assert_eq!(
-        db.sink_metrics_for_test("audit").queued,
+        db.sink_metrics("audit").queued,
         0,
         "sibling audit queue must drain after both completed callbacks"
     );
 
-    let post_drop_scoped_delivered = db.sink_metrics_for_test("slack").delivered;
+    let post_drop_scoped_delivered = db.sink_metrics("slack").delivered;
     assert_eq!(
         post_drop_scoped_delivered, pre_drop_scoped_delivered,
         "DROP ROUTE must stop further deliveries to the scoped sink"
     );
     assert_eq!(
-        db.sink_metrics_for_test("slack").queued,
+        db.sink_metrics("slack").queued,
         0,
         "DROP ROUTE must stop enqueueing new slack entries, not merely suppress delivery"
     );
@@ -3119,6 +3144,7 @@ fn t5_39_scoped_handle_register_sink_in_process_pre_existing_queue_replays() {
 
 /// RED — t5_40: parallel registrations from distinct scoped handles spawn one worker.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_40_scoped_handle_register_sink_parallel_registrations_spawn_one_worker() {
     use contextdb_core::types::ContextId;
     use std::collections::BTreeSet;
@@ -3210,7 +3236,7 @@ fn t5_41_scoped_handle_register_sink_inprocess_drop_and_reopen_replay() {
         // on that observable depth instead of a fixed sleep before deleting the
         // source rows, so the reopen below genuinely replays from the queue.
         wait_for_bus("slack queue holds both offline events", || {
-            db.sink_metrics_for_test("slack").queued == 2
+            db.sink_metrics("slack").queued == 2
         });
         db.execute(
             "DELETE FROM invs WHERE id = $id",
@@ -3276,7 +3302,7 @@ fn t5_41_scoped_handle_register_sink_inprocess_drop_and_reopen_replay() {
         // dispatcher timing. An un-acked entry would surface as queue depth and
         // a replay, so the empty-queue check is the deterministic proof.
         assert_eq!(
-            db.sink_metrics_for_test("slack").queued,
+            db.sink_metrics("slack").queued,
             0,
             "first replay must have durably acked; second reopen must see empty queue"
         );
@@ -3395,6 +3421,7 @@ fn t5_42_scoped_handle_drop_mid_dispatch_does_not_panic() {
 
 /// RED — t5_43: scoped handle WITHOUT principal does not bypass ACL (production-path analog of t5_17).
 #[test]
+#[cfg(feature = "test-seams")]
 fn t5_43_scoped_handle_register_sink_no_principal_does_not_bypass_acl() {
     use contextdb_core::types::ContextId;
     use std::collections::BTreeSet;
@@ -3695,7 +3722,7 @@ fn t5_44_scoped_with_constraints_three_dimensions_combined_filter() {
     }
     drop(broad);
     assert_eq!(
-        db.sink_metrics_for_test("alice_sink").queued,
+        db.sink_metrics("alice_sink").queued,
         0,
         "broader re-registration must drain exactly the retained three-dimension denied rows"
     );

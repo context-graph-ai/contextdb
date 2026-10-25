@@ -3,6 +3,7 @@
 //! TxIdColumnMonotonicUnderConcurrentCommits.
 
 use std::collections::HashMap;
+#[cfg(feature = "test-seams")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -242,6 +243,7 @@ fn t18_04_caller_supplied_txid_above_watermark_rejected() {
 }
 
 #[test]
+#[cfg(feature = "test-seams")]
 fn t18_05_cron_callback_stamped_txid_matches_commit_event_lsn_resolution() {
     use std::sync::Mutex;
     let (_dir, db) = open_db();

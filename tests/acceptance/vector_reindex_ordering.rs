@@ -1,5 +1,7 @@
 use contextdb_core::{Value, VectorIndexRef};
-use contextdb_engine::{Database, MaintenancePolicy};
+use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::MaintenancePolicy;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -135,6 +137,7 @@ fn t17_02_batch_reindex_all_rows_resolve_to_new_vectors() {
 
 /// RED — t17_08: same-row reindex must invalidate/rebuild the HNSW ANN path too.
 #[test]
+#[cfg(feature = "test-seams")]
 fn t17_08_hnsw_delete_then_insert_recall_returns_new_vector() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);

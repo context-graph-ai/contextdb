@@ -1,23 +1,47 @@
 //! Trigger-active tx-control symmetry — typed-variant escape across all
 //! tx-control surfaces under all four distinct callback-active conditions.
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 
-use contextdb_core::{CallbackKind, Error, Lsn, Result, RowId, TxId, Value, VectorIndexRef};
+use contextdb_core::CallbackKind;
+use contextdb_core::Error;
+use contextdb_core::Lsn;
+use contextdb_core::Result;
+#[cfg(feature = "test-seams")]
+use contextdb_core::RowId;
+use contextdb_core::TxId;
+use contextdb_core::Value;
+#[cfg(feature = "test-seams")]
+use contextdb_core::VectorIndexRef;
 use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
 use contextdb_engine::plugin::DatabasePlugin;
-use contextdb_engine::sync_types::{
-    ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange, VectorChange,
-};
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::ChangeSet;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::DdlChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::EdgeChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::VectorChange;
 use serial_test::serial;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+#[cfg(feature = "test-seams")]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "test-seams")]
+use std::time::Instant;
 use uuid::Uuid;
 
 // ---------- Shared helpers ----------
 
+#[cfg(feature = "test-seams")]
 type ApplyShapeResult = (&'static str, Result<contextdb_engine::ApplyResult>);
+#[cfg(feature = "test-seams")]
 type ClosedSurfaceResult = (&'static str, Result<()>);
 type ForbiddenStatementResult = (&'static str, Result<contextdb_engine::QueryResult>);
 
@@ -90,6 +114,7 @@ where
     Ok(body())
 }
 
+#[cfg(feature = "test-seams")]
 fn wait_until_trigger_wait_observed(db: &Database, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -192,6 +217,7 @@ fn build_trigger_parked_db(entered: Arc<Barrier>, done: Arc<Barrier>) -> Arc<Dat
 /// Build a database with a cron schedule whose callback parks identically.
 /// The background tickler is paused; tests drive single dispatches via
 /// `dispatch_cron_now_in_thread` so timing is deterministic.
+#[cfg(feature = "test-seams")]
 fn build_cron_parked_db(
     entered: Arc<Barrier>,
     done: Arc<Barrier>,
@@ -218,6 +244,7 @@ fn build_cron_parked_db(
 
 /// Spawn a thread that dispatches a single cron tick. The 5ms sleep lets
 /// 1ms-interval schedules become due.
+#[cfg(feature = "test-seams")]
 fn dispatch_cron_now_in_thread(db: Arc<Database>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(5));
@@ -233,6 +260,7 @@ fn dispatch_cron_now_in_thread(db: Arc<Database>) -> thread::JoinHandle<()> {
 }
 
 /// Drive a single cron tick. Sleeps 5ms first so 1ms-interval schedules become due.
+#[cfg(feature = "test-seams")]
 fn fire_cron_now(db: &Database) {
     thread::sleep(Duration::from_millis(5));
     let _ = {
@@ -260,6 +288,7 @@ fn fire_trigger_in_thread(db: Arc<Database>, key: u128) -> thread::JoinHandle<Re
 /// Build a single-row `ChangeSet` against table `table` with id = `uuid(key)`.
 /// Used by t13–t16 / t47 to verify that `apply_changes` trips its callback-active
 /// gate BEFORE consuming the changeset (post-Err `db.scan(table, snap)` is empty).
+#[cfg(feature = "test-seams")]
 fn populated_changeset(table: &str, key: u128) -> ChangeSet {
     use contextdb_engine::sync_types::{NaturalKey, RowChange};
     let mut values = HashMap::new();
@@ -282,6 +311,7 @@ fn populated_changeset(table: &str, key: u128) -> ChangeSet {
 
 /// Build an N-row `ChangeSet` against table `table` with ids `uuid(key_base + i)`
 /// for i in 0..n. Used by t47 for the 100-row fail-early-and-rebuild probe.
+#[cfg(feature = "test-seams")]
 fn populated_changeset_n(table: &str, key_base: u128, n: usize) -> ChangeSet {
     use contextdb_engine::sync_types::{NaturalKey, RowChange};
     let mut rows = Vec::with_capacity(n);
@@ -307,6 +337,7 @@ fn populated_changeset_n(table: &str, key_base: u128, n: usize) -> ChangeSet {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn edge_only_changeset(lsn: u64) -> ChangeSet {
     ChangeSet {
         rows: vec![],
@@ -323,6 +354,7 @@ fn edge_only_changeset(lsn: u64) -> ChangeSet {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn vector_only_changeset(lsn: u64, row_id: RowId) -> ChangeSet {
     ChangeSet {
         rows: vec![],
@@ -338,6 +370,7 @@ fn vector_only_changeset(lsn: u64, row_id: RowId) -> ChangeSet {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn ddl_only_changeset(lsn: u64) -> ChangeSet {
     ChangeSet {
         rows: vec![],
@@ -355,12 +388,14 @@ fn ddl_only_changeset(lsn: u64) -> ChangeSet {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn invalid_ddl_lsn_changeset(lsn: u64) -> ChangeSet {
     let mut changes = ddl_only_changeset(lsn);
     changes.ddl_lsn.clear();
     changes
 }
 
+#[cfg(feature = "test-seams")]
 fn row_id_for_uuid(db: &Database, table: &str, key: u128) -> RowId {
     let expected = Value::Uuid(uuid(key));
     db.scan(table, db.snapshot())
@@ -379,6 +414,7 @@ fn table_contains_uuid(db: &Database, table: &str, key: u128) -> bool {
         .any(|row| row.values.get("id") == Some(&expected))
 }
 
+#[cfg(feature = "test-seams")]
 fn prepare_vector_shape_target(db: &Database, key: u128) -> RowId {
     db.execute(
         "CREATE TABLE vectors (id UUID PRIMARY KEY, embedding VECTOR(3))",
@@ -393,6 +429,7 @@ fn prepare_vector_shape_target(db: &Database, key: u128) -> RowId {
     row_id_for_uuid(db, "vectors", key)
 }
 
+#[cfg(feature = "test-seams")]
 fn assert_non_row_apply_shapes_left_no_side_effects(
     db: &Database,
     vector_row_id: RowId,
@@ -597,7 +634,7 @@ fn assert_forbidden_statement_family_left_no_side_effects(
     )
     .unwrap_or_else(|err| panic!("{context}: blocked route already existed: {err}"));
     assert_eq!(
-        db.accountant().usage().limit,
+        db.memory_limit(),
         None,
         "{context}: SET MEMORY_LIMIT side effect leaked"
     );
@@ -621,6 +658,7 @@ fn assert_forbidden_statement_family_left_no_side_effects(
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "test-seams")]
 struct DirectApiSideEffectProbe {
     delete_row_key: u128,
     delete_row_id: RowId,
@@ -634,6 +672,7 @@ struct DirectApiSideEffectProbe {
     delete_vector_row_id: RowId,
 }
 
+#[cfg(feature = "test-seams")]
 fn prepare_direct_api_side_effect_probe(db: &Database, key_base: u128) -> DirectApiSideEffectProbe {
     db.execute("CREATE TABLE w (id UUID PRIMARY KEY)", &empty())
         .unwrap();
@@ -699,6 +738,7 @@ fn prepare_direct_api_side_effect_probe(db: &Database, key_base: u128) -> Direct
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn assert_direct_api_typed_err_left_no_side_effects(
     db: &Database,
     probe: &DirectApiSideEffectProbe,
@@ -765,6 +805,7 @@ fn assert_direct_api_typed_err_left_no_side_effects(
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(feature = "test-seams")]
 enum TxControlSurface {
     Begin,
     Commit,
@@ -773,6 +814,7 @@ enum TxControlSurface {
     Close,
 }
 
+#[cfg(feature = "test-seams")]
 impl TxControlSurface {
     const ALL: [Self; 5] = [
         Self::Begin,
@@ -801,12 +843,14 @@ impl TxControlSurface {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "test-seams")]
 struct PreparedTxSurface {
     surface: TxControlSurface,
     tx: Option<TxId>,
     table: Option<String>,
 }
 
+#[cfg(feature = "test-seams")]
 fn prepare_tx_surface(db: &Database, surface: TxControlSurface, key: u128) -> PreparedTxSurface {
     let tx = match surface {
         TxControlSurface::Commit | TxControlSurface::Rollback => Some(db.begin_or_panic()),
@@ -827,6 +871,7 @@ fn prepare_tx_surface(db: &Database, surface: TxControlSurface, key: u128) -> Pr
     PreparedTxSurface { surface, tx, table }
 }
 
+#[cfg(feature = "test-seams")]
 fn run_tx_surface(db: &Database, probe: &PreparedTxSurface, key: u128) -> Result<()> {
     match probe.surface {
         TxControlSurface::Begin => match db.begin() {
@@ -848,12 +893,14 @@ fn run_tx_surface(db: &Database, probe: &PreparedTxSurface, key: u128) -> Result
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn cleanup_tx_surface(db: &Database, probe: &PreparedTxSurface) {
     if let Some(tx) = probe.tx {
         let _ = db.rollback(tx);
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn run_closed_tx_surface(db: &Database, surface: TxControlSurface, key: u128) -> Result<()> {
     match surface {
         TxControlSurface::Begin => db.begin().map(|tx| {
@@ -871,6 +918,7 @@ fn run_closed_tx_surface(db: &Database, surface: TxControlSurface, key: u128) ->
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn is_reentry_kind<T>(result: &Result<T>, expected: CallbackKind) -> bool {
     matches!(
         result,
@@ -878,6 +926,7 @@ fn is_reentry_kind<T>(result: &Result<T>, expected: CallbackKind) -> bool {
     )
 }
 
+#[cfg(feature = "test-seams")]
 fn is_cross_thread_kind<T>(result: &Result<T>, expected: CallbackKind) -> bool {
     matches!(
         result,
@@ -885,6 +934,7 @@ fn is_cross_thread_kind<T>(result: &Result<T>, expected: CallbackKind) -> bool {
     )
 }
 
+#[cfg(feature = "test-seams")]
 fn observe_surface_inside_fresh_trigger(
     target: Arc<Database>,
     probe: Arc<PreparedTxSurface>,
@@ -913,12 +963,14 @@ fn observe_surface_inside_fresh_trigger(
 }
 
 #[derive(Default)]
+#[cfg(feature = "test-seams")]
 struct CloseOnQueryPlugin {
     db: Mutex<Option<Arc<Database>>>,
     observed: Mutex<Option<Result<()>>>,
     armed: AtomicBool,
 }
 
+#[cfg(feature = "test-seams")]
 impl CloseOnQueryPlugin {
     fn attach(&self, db: Arc<Database>) {
         *self.db.lock().unwrap() = Some(db);
@@ -934,6 +986,7 @@ impl CloseOnQueryPlugin {
     }
 }
 
+#[cfg(feature = "test-seams")]
 impl DatabasePlugin for CloseOnQueryPlugin {
     fn on_query(&self, _sql: &str) -> Result<()> {
         if self.armed.swap(false, AtomicOrdering::SeqCst) {
@@ -954,6 +1007,7 @@ impl DatabasePlugin for CloseOnQueryPlugin {
     }
 }
 
+#[cfg(feature = "test-seams")]
 fn plugin_db_with_read_table() -> (Arc<Database>, Arc<CloseOnQueryPlugin>) {
     let plugin = Arc::new(CloseOnQueryPlugin::default());
     let db = Arc::new(Database::open_memory_with_plugin(plugin.clone()).unwrap());
@@ -1012,6 +1066,7 @@ fn assert_display_impl_does_not_allocate(iterations_per_case: usize, profile_lab
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t01_begin_a1_cron_reentry() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1099,6 +1154,7 @@ fn t02_begin_a2_trigger_reentry() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t03_begin_b1_cron_cross_thread() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -1144,6 +1200,7 @@ fn t04_begin_cross_db_trigger_independent() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t05_commit_a1_cron_reentry() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1239,6 +1296,7 @@ fn t06_commit_a2_trigger_reentry() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t07_commit_b1_cron_cross_thread() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -1296,6 +1354,7 @@ fn t08_commit_cross_db_trigger_independent() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t09_rollback_a1_cron_reentry() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1391,6 +1450,7 @@ fn t10_rollback_a2_trigger_reentry() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t11_rollback_b1_cron_cross_thread() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -1452,6 +1512,7 @@ fn t12_rollback_cross_db_trigger_independent() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t_apply_changes_positive_control_helper_inserts_when_uncontended() {
     let db = Arc::new(Database::open_memory());
     db.execute("CREATE TABLE applied (id UUID PRIMARY KEY)", &empty())
@@ -1474,6 +1535,7 @@ fn t_apply_changes_positive_control_helper_inserts_when_uncontended() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t13_apply_changes_a1_cron_reentry() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1526,6 +1588,7 @@ fn t13_apply_changes_a1_cron_reentry() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t13b_apply_changes_non_row_shapes_a1_cron_reentry() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1588,6 +1651,7 @@ fn t13b_apply_changes_non_row_shapes_a1_cron_reentry() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t14_apply_changes_a2_trigger_reentry() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1655,6 +1719,7 @@ fn t14_apply_changes_a2_trigger_reentry() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t14b_apply_changes_non_row_shapes_a2_trigger_reentry() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1723,6 +1788,7 @@ fn t14b_apply_changes_non_row_shapes_a2_trigger_reentry() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t15_apply_changes_b1_cron_cross_thread() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -1765,6 +1831,7 @@ fn t15_apply_changes_b1_cron_cross_thread() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t15b_apply_changes_non_row_shapes_b1_cron_cross_thread() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -1818,6 +1885,7 @@ fn t15b_apply_changes_non_row_shapes_b1_cron_cross_thread() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t16_apply_changes_cross_db_trigger_independent() {
     run_with_timeout(|| {
         let db_y = Arc::new(Database::open_memory());
@@ -1846,6 +1914,7 @@ fn t16_apply_changes_cross_db_trigger_independent() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t16b_apply_changes_non_row_shapes_cross_db_trigger_independent() {
     run_with_timeout(|| {
         let entered_x = Arc::new(Barrier::new(2));
@@ -1896,6 +1965,7 @@ fn t16b_apply_changes_non_row_shapes_cross_db_trigger_independent() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t17_close_a1_cron_reentry() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -1985,6 +2055,7 @@ fn t18_close_a2_trigger_reentry() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t19_close_b1_cron_cross_thread() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2034,6 +2105,7 @@ fn t20_close_cross_db_trigger_independent() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t21_helper_inside_cron_a1() {
     run_with_timeout(|| {
         for (idx, &(name, sql)) in forbidden_statement_samples().iter().enumerate() {
@@ -2151,6 +2223,7 @@ fn t22_helper_inside_trigger_a2() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t23_helper_cross_thread_b1() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2216,6 +2289,7 @@ fn t24_execute_helper_cross_db_trigger_independent() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t25_helper_tx_bound_b1() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2261,6 +2335,7 @@ fn t25_helper_tx_bound_b1() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t25b_direct_api_tx_bound_b1() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2358,6 +2433,7 @@ fn t25b_direct_api_tx_bound_b1() {
 // Symmetric direct library API coverage for same-DB wait/proceed gating.
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t26b_direct_api_tx_bound_same_db_b2_waits_and_proceeds() {
     run_with_timeout(|| {
         fn run_case<F, A>(name: &'static str, key_base: u128, action: F, assert_applied: A)
@@ -2519,6 +2595,7 @@ fn t26b_direct_api_tx_bound_same_db_b2_waits_and_proceeds() {
 // t26_helper_tx_bound_same_db_b2_waits_and_proceeds
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t26_helper_tx_bound_same_db_b2_waits_and_proceeds() {
     run_with_timeout(|| {
         let entered = Arc::new(Barrier::new(2));
@@ -2561,6 +2638,7 @@ fn t26_helper_tx_bound_same_db_b2_waits_and_proceeds() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t27_execute_in_tx_inline_a1() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -2852,6 +2930,7 @@ fn t31_cross_db_worker_progress_shape() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t32_priority_a1_over_a2() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
@@ -2922,6 +3001,7 @@ fn t32_priority_a1_over_a2() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t32b_priority_a2_over_b1_and_b2_when_trigger_active_and_other_callback_parked() {
     run_with_timeout(|| {
         let begin_inside_trigger = |probe_db: Arc<Database>, key: u128| {
@@ -3008,6 +3088,7 @@ fn t32b_priority_a2_over_b1_and_b2_when_trigger_active_and_other_callback_parked
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t32c_priority_b1_over_b2_when_cron_and_trigger_both_parked_cross_thread() {
     run_with_timeout(|| {
         let entered_cron = Arc::new(Barrier::new(2));
@@ -3092,6 +3173,7 @@ fn t32c_priority_b1_over_b2_when_cron_and_trigger_both_parked_cross_thread() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t32d_priority_source_order_is_symmetric_across_all_tx_control_surfaces() {
     run_with_timeout(|| {
         let mut failures = Vec::new();
@@ -3279,6 +3361,7 @@ fn t33_close_then_begin_returns_closed_database() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t33b_closed_database_wins_over_trigger_contention_for_open_operations() {
     run_with_timeout(|| {
         let closed_inside_cron: Arc<Mutex<Vec<ClosedSurfaceResult>>> =
@@ -3439,6 +3522,7 @@ fn t33b_closed_database_wins_over_trigger_contention_for_open_operations() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t33c_close_active_operation_wins_over_cross_thread_callback_contention() {
     run_with_timeout(|| {
         // B1 overlap: the probed database owns a parked cron callback, while a
@@ -3810,6 +3894,7 @@ fn t38_multi_handle_same_thread_reentry() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t39_cron_tickler_resilience_after_callback_active() {
     use contextdb_engine::CronAuditKind;
     run_with_timeout(|| {
@@ -3909,6 +3994,7 @@ fn t39_cron_tickler_resilience_after_callback_active() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t39c_cron_tickler_survives_sustained_b2_contention() {
     use contextdb_engine::CronAuditKind;
     run_with_timeout(|| {
@@ -4049,6 +4135,7 @@ fn t40_sync_wire_substring_contract() {
 // tokio runtime, which exercises the authenticated request/response path.
 #[tokio::test]
 #[serial]
+#[cfg(feature = "test-seams")]
 async fn t40b_sync_push_succeeds_despite_unrelated_trigger_contention() {
     use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 
@@ -4279,6 +4366,7 @@ fn t44b_rollback_cross_db_contention_no_panic_proceeds() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t44b_apply_changes_cross_db_contention_no_panic_proceeds() {
     run_with_timeout(|| {
         let db_y = Arc::new(Database::open_memory());
@@ -4323,6 +4411,7 @@ fn t44b_close_cross_db_contention_no_panic_proceeds() {
 // B2 now waits and proceeds because it shares the parked trigger's state.
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t45_constrained_handle_classifies_reentry_and_same_db_b2_progress() {
     use std::collections::BTreeSet;
     run_with_timeout(|| {
@@ -4401,6 +4490,7 @@ fn t45_constrained_handle_classifies_reentry_and_same_db_b2_progress() {
 // delivery itself remains independent of the same-DB wait being probed.
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t46_sink_callback_calling_tx_control_inside_parked_trigger_waits_and_delivers_without_retry() {
     use contextdb_engine::{SinkError, SinkEvent};
     run_with_timeout(|| {
@@ -4516,13 +4606,13 @@ fn t46_sink_callback_calling_tx_control_inside_parked_trigger_waits_and_delivers
         sink_drive_result.expect("sink-driving INSERT must succeed");
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            let m = event_db.sink_metrics_for_test("retry_probe");
+            let m = event_db.sink_metrics("retry_probe");
             if m.delivered >= 1 {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
         }
-        let m = event_db.sink_metrics_for_test("retry_probe");
+        let m = event_db.sink_metrics("retry_probe");
         assert!(
             m.delivered >= 1,
             "sink must deliver after contention clears; metrics={m:?}"
@@ -4552,6 +4642,7 @@ fn t46_sink_callback_calling_tx_control_inside_parked_trigger_waits_and_delivers
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t47_apply_changes_100_row_changeset_cross_db_contention_proceeds() {
     run_with_timeout(|| {
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -4610,6 +4701,7 @@ fn t47_apply_changes_100_row_changeset_cross_db_contention_proceeds() {
 // ============================================================================
 #[test]
 #[serial]
+#[cfg(feature = "test-seams")]
 fn t48_eventual_progress_under_cron_and_unrelated_trigger_contention() {
     run_with_timeout(|| {
         let db = Arc::new(Database::open_memory());
