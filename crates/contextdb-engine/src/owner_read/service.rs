@@ -917,6 +917,10 @@ struct OwnerConnectionControl {
 #[cfg(unix)]
 #[derive(Default)]
 struct OwnerServiceWorkerState {
+    #[cfg(feature = "test-seams")]
+    release_completion_for_test: Option<Arc<crate::database::ReleaseCompletionForTest>>,
+    #[cfg(feature = "test-seams")]
+    join_result_for_test: Option<std::result::Result<(), String>>,
     stop_requested: bool,
     accept_exited: bool,
     accept_exit_waiter: Option<Waker>,
@@ -938,6 +942,18 @@ struct OwnerServiceWorkers {
 
 #[cfg(unix)]
 impl OwnerServiceWorkers {
+    #[cfg(feature = "test-seams")]
+    fn note_join_for_test(&self, result: std::result::Result<(), String>) {
+        let completion = {
+            let mut state = self.state.lock().expect("owner service lifecycle");
+            state.join_result_for_test = Some(result.clone());
+            state.release_completion_for_test.take()
+        };
+        if let Some(completion) = completion {
+            completion.owner_tasks_joined(result);
+        }
+    }
+
     fn new(wake_writer: std::os::unix::net::UnixStream) -> Self {
         Self {
             wake_writer,
@@ -4384,6 +4400,26 @@ impl OwnerReadService {
         self.stop_workers_if_drained();
     }
 
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn observe_last_handle_release_for_test(
+        &self,
+        completion: Arc<crate::database::ReleaseCompletionForTest>,
+    ) {
+        #[cfg(unix)]
+        if completion.observe_owner_tasks() {
+            let mut state = self.workers.state.lock().expect("owner service lifecycle");
+            if let Some(result) = &state.join_result_for_test {
+                let result = result.clone();
+                drop(state);
+                completion.owner_tasks_joined(result);
+            } else {
+                state.release_completion_for_test = Some(completion);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = completion;
+    }
+
     #[cfg(unix)]
     fn join_accept_worker(&self) {
         let worker = self
@@ -4396,7 +4432,15 @@ impl OwnerReadService {
             // been joined. Nothing blocking remains in the worker beyond its
             // final return, so this join cannot outlive the configured drain
             // that already reached that fact.
-            let _ = worker.join();
+            let joined = worker.join();
+            #[cfg(feature = "test-seams")]
+            self.workers.note_join_for_test(
+                joined.map_err(|_| {
+                    "owner service thread panicked before release completion".to_owned()
+                }),
+            );
+            #[cfg(not(feature = "test-seams"))]
+            let _ = joined;
             #[cfg(any(test, feature = "test-seams"))]
             if let Some(hooks) = &self.spec.config.test_hooks {
                 if let Some(exited) = &hooks.accept_thread_exited {
@@ -4428,15 +4472,28 @@ impl OwnerReadService {
             .and_then(|hooks| hooks.accept_thread_exited.clone());
         // Failure to allocate this auxiliary reaper only detaches the
         // already-woken accept worker; ordinary Database drop never waits.
-        let _ = std::thread::Builder::new()
+        #[cfg(feature = "test-seams")]
+        let joined_for_test = Arc::clone(&self.workers);
+        let reaper = std::thread::Builder::new()
             .name("contextdb-service-reaper".to_owned())
             .spawn(move || {
-                let _ = worker.join();
+                let joined = worker.join();
+                #[cfg(feature = "test-seams")]
+                joined_for_test.note_join_for_test(joined.map_err(|_| {
+                    "owner service thread panicked before release completion".to_owned()
+                }));
+                #[cfg(not(feature = "test-seams"))]
+                let _ = joined;
                 #[cfg(any(test, feature = "test-seams"))]
                 if let Some(exited) = accept_thread_exited {
                     let _ = exited.send(());
                 }
             });
+        #[cfg(feature = "test-seams")]
+        if let Err(error) = &reaper {
+            self.workers.note_join_for_test(Err(error.to_string()));
+        }
+        let _ = reaper;
     }
 
     /// Take down the channel this service bound, once and only ours.

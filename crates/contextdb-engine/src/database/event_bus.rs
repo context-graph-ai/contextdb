@@ -2,6 +2,17 @@ use super::*;
 use crate::funded_error::{OriginalError, OriginalResult};
 use std::cell::Cell;
 
+#[cfg(feature = "test-seams")]
+#[path = "sink_dispatch_drive.rs"]
+mod sink_dispatch_drive;
+#[cfg(feature = "test-seams")]
+use sink_dispatch_drive::SinkDispatchControlForTest;
+#[cfg(feature = "test-seams")]
+pub use sink_dispatch_drive::{
+    SinkDispatchDriveForTest, SinkDispatchIdentity, SinkDispatchPrefix, SinkDispatchReceipt,
+    SinkDispatchRetryIdentity,
+};
+
 const EVENT_TYPES_CONFIG_KEY: &str = "__event_bus_event_types";
 const SINKS_CONFIG_KEY: &str = "__event_bus_sinks";
 const ROUTES_CONFIG_KEY: &str = "__event_bus_routes";
@@ -26,6 +37,8 @@ const ATTEMPT_COUNT_MASK: u32 = !UNCONFIRMED_ATTEMPT;
 type SinkCallback = Arc<dyn Fn(&SinkEvent) -> std::result::Result<(), SinkError> + Send + Sync>;
 
 pub(crate) struct EventBusState {
+    #[cfg(feature = "test-seams")]
+    dispatch_drive_for_test: Arc<SinkDispatchControlForTest>,
     pub(super) definitions: Mutex<EventBusDefinitions>,
     callbacks: RwLock<HashMap<String, SinkRegistration>>,
     queues: Mutex<HashMap<String, SinkQueue>>,
@@ -887,6 +900,8 @@ impl EventBusThreadShutdown {
 }
 
 pub(crate) struct EventBusResourceCleanup {
+    #[cfg(feature = "test-seams")]
+    release_completion_for_test: Arc<super::ReleaseCompletionForTest>,
     worker: Option<crate::owned_worker::OwnedWorker>,
     sink: String,
     persistence: Option<Arc<RedbPersistence>>,
@@ -937,6 +952,8 @@ impl EventBusResourceCleanup {
         if let Some(path) = self.open_registry_path {
             release_open_registry_path(&path);
         }
+        #[cfg(feature = "test-seams")]
+        self.release_completion_for_test.resources_released();
         if let Some((progress, changed, succeeded)) = self.close_completion {
             *progress.lock() = if succeeded {
                 CloseProgress::Complete
@@ -1044,6 +1061,8 @@ impl<'de> Deserialize<'de> for EventGrantRows {
 impl EventBusState {
     pub(super) fn new() -> Self {
         Self {
+            #[cfg(feature = "test-seams")]
+            dispatch_drive_for_test: Arc::new(SinkDispatchControlForTest::default()),
             definitions: Mutex::new(EventBusDefinitions::default()),
             callbacks: RwLock::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
@@ -3208,6 +3227,8 @@ impl Database {
                 runtime.shutdown.store(true, Ordering::SeqCst);
             }
             self.event_bus.waiters.notify_all();
+            #[cfg(feature = "test-seams")]
+            self.event_bus.dispatch_drive_for_test.notify_shutdown();
             std::mem::take(&mut *runtimes)
         };
         let mut current_dispatcher = None;
@@ -3245,6 +3266,8 @@ impl Database {
         // callback-initiated drop records the delivery first. Either way the
         // dispatcher owns the persistence resource until it exits.
         let cleanup = EventBusResourceCleanup {
+            #[cfg(feature = "test-seams")]
+            release_completion_for_test: Arc::clone(&self.finalization.release_completion_for_test),
             worker: Some(worker),
             sink,
             persistence: self.persistence.clone(),
@@ -3654,7 +3677,20 @@ impl EventBusWorker {
         // this registration nothing waits the idle pause before the next read,
         // so a queue it cannot see is not re-read back to back.
         let mut just_refilled = false;
+        #[cfg(feature = "test-seams")]
+        let dispatch_batch = sink_dispatch_drive::batch_size();
+        #[cfg(not(feature = "test-seams"))]
+        let dispatch_batch = SINK_DISPATCH_BATCH;
         'dispatch: while !shutdown.load(Ordering::SeqCst) {
+            #[cfg(feature = "test-seams")]
+            let _iteration = self
+                .event_bus
+                .dispatch_drive_for_test
+                .begin_iteration(&shutdown);
+            #[cfg(feature = "test-seams")]
+            if _iteration.is_none() {
+                break;
+            }
             let Some(registration) = self.event_bus.callbacks.read().get(&self.sink).cloned()
             else {
                 self.wait(&shutdown, Duration::from_millis(100));
@@ -3683,7 +3719,11 @@ impl EventBusWorker {
                     let mut chosen = Vec::new();
                     let mut chosen_bytes = 0usize;
                     for (position, entry) in queue.entries.iter().enumerate() {
-                        if chosen.len() == SINK_DISPATCH_BATCH {
+                        #[cfg(feature = "test-seams")]
+                        if !sink_dispatch_drive::permits(entry.id) {
+                            continue;
+                        }
+                        if chosen.len() == dispatch_batch {
                             break;
                         }
                         if event_visible_for_access(&registration.access, entry) {
@@ -3755,10 +3795,11 @@ impl EventBusWorker {
                         self.wait(&shutdown, Duration::from_millis(10));
                         continue;
                     }
-                    queue
-                        .entries
-                        .iter()
-                        .take(SINK_DISPATCH_BATCH)
+                    let selected = queue.entries.iter();
+                    #[cfg(feature = "test-seams")]
+                    let selected = selected.filter(|entry| sink_dispatch_drive::permits(entry.id));
+                    selected
+                        .take(dispatch_batch)
                         .take_while(|entry| event_visible_for_access(&registration.access, entry))
                         .cloned()
                         .collect::<Vec<_>>()
@@ -3932,6 +3973,16 @@ impl EventBusWorker {
                 }
             }
             let _ = self.ack_front_entries(&acked);
+            #[cfg(all(test, feature = "test-seams"))]
+            if let Some(pause) = self
+                .event_bus
+                .dispatch_drive_for_test
+                .acknowledgment_pause
+                .lock()
+                .clone()
+            {
+                pause.maybe_pause();
+            }
             self.record_batch_outcome(
                 delivered_count,
                 permanent_failure_count,
@@ -4044,6 +4095,10 @@ impl EventBusWorker {
     }
 
     fn wait(&self, shutdown: &AtomicBool, duration: Duration) {
+        #[cfg(feature = "test-seams")]
+        if sink_dispatch_drive::driving() {
+            return;
+        }
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
@@ -7635,6 +7690,10 @@ impl OwnedEventBusHandle {
                 }
                 let mut skipped = 0u64;
                 for entry in &queue.entries {
+                    #[cfg(feature = "test-seams")]
+                    if !sink_dispatch_drive::permits(entry.entry.id) {
+                        continue;
+                    }
                     if pins.body.len() == maximum {
                         break;
                     }
@@ -8880,6 +8939,10 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
         })
     }
     fn wait(&self, shutdown: &AtomicBool, duration: Duration) {
+        #[cfg(feature = "test-seams")]
+        if sink_dispatch_drive::driving() {
+            return;
+        }
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
@@ -8903,7 +8966,22 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
     }
     pub(super) fn dispatch_loop(self, shutdown: Arc<AtomicBool>) {
         let mut just_refilled = false;
+        #[cfg(feature = "test-seams")]
+        let dispatch_batch = sink_dispatch_drive::batch_size();
+        #[cfg(not(feature = "test-seams"))]
+        let dispatch_batch = SINK_DISPATCH_BATCH;
         'dispatch: while !shutdown.load(Ordering::SeqCst) {
+            #[cfg(feature = "test-seams")]
+            let _iteration = self
+                .events
+                .data()
+                .common
+                .dispatch_drive_for_test
+                .begin_iteration(&shutdown);
+            #[cfg(feature = "test-seams")]
+            if _iteration.is_none() {
+                break;
+            }
             let registration = match self.events.copy_owned_sink_registration(&self.sink.body) {
                 Ok(Some(registration)) => registration,
                 Ok(None) => {
@@ -8919,7 +8997,7 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
             let mut batch = match self.events.checkout_owned_sink_batch(
                 &self.sink.body,
                 &registration.registration.access,
-                SINK_DISPATCH_BATCH,
+                dispatch_batch,
             ) {
                 Ok(batch) => batch,
                 Err(error) => {
@@ -9103,6 +9181,18 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
                 &self.sink.body,
                 &mut batch,
             );
+            #[cfg(all(test, feature = "test-seams"))]
+            if let Some(pause) = self
+                .events
+                .data()
+                .common
+                .dispatch_drive_for_test
+                .acknowledgment_pause
+                .lock()
+                .clone()
+            {
+                pause.maybe_pause();
+            }
             self.events.record_owned_batch_outcome(
                 &self.sink.body,
                 delivered,

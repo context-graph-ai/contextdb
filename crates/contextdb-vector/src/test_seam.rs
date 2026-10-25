@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+mod pause_lifecycle_tests;
+
 static DORMANT_DECODE_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
 static DORMANT_DECODE_FAILURE_CONSUMED: AtomicBool = AtomicBool::new(false);
 static POST_LOAD_RECONCILIATION_FAILURE_ARMED: AtomicBool = AtomicBool::new(false);
@@ -184,7 +187,7 @@ impl PauseSlot {
     pub(crate) fn wait_until_reached(&self, generation: u64, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock();
-        while state.generation == generation && state.armed && !state.reached {
+        while state.generation == generation && state.armed && !state.reached && !state.released {
             let now = Instant::now();
             if now >= deadline {
                 return false;
@@ -192,13 +195,22 @@ impl PauseSlot {
             self.waiters
                 .wait_for(&mut state, deadline.saturating_duration_since(now));
         }
-        state.generation == generation && state.reached
+        state.generation == generation && state.reached && !state.released
+    }
+
+    fn wait_until_reached_blocking(&self, generation: u64) -> bool {
+        let mut state = self.state.lock();
+        while state.generation == generation && state.armed && !state.reached && !state.released {
+            self.waiters.wait(&mut state);
+        }
+        state.generation == generation && state.reached && !state.released
     }
 
     pub(crate) fn release(&self, generation: u64) {
         let mut state = self.state.lock();
         if state.generation == generation && state.armed {
             state.released = true;
+            state.armed = false;
             self.waiters.notify_all();
         }
     }
@@ -209,13 +221,16 @@ impl PauseSlot {
             return;
         }
         state.reached = true;
+        let generation = state.generation;
         self.waiters.notify_all();
-        while state.armed && !state.released {
+        while state.generation == generation && state.armed && !state.released {
             self.waiters.wait(&mut state);
         }
-        state.armed = false;
-        state.reached = false;
-        state.released = false;
+        if state.generation == generation {
+            state.armed = false;
+            state.reached = false;
+            state.released = false;
+        }
         self.waiters.notify_all();
     }
 }
@@ -226,12 +241,23 @@ pub struct MaintenancePauseHandle {
 }
 
 impl MaintenancePauseHandle {
+    #[doc(hidden)]
+    pub fn wait_until_reached_blocking(&self) -> bool {
+        self.slot.wait_until_reached_blocking(self.generation)
+    }
+
     pub fn wait_until_reached(&self, timeout: Duration) -> bool {
         self.slot.wait_until_reached(self.generation, timeout)
     }
 
     pub fn release(&self) {
         self.slot.release(self.generation);
+    }
+}
+
+impl Drop for MaintenancePauseHandle {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 

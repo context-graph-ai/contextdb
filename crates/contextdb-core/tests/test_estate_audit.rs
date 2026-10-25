@@ -508,7 +508,7 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // failures, only the failed one with one, and every one once when its index is incomplete.
     // Inventory increase (224 -> 225, +1): a refused full policy recheck keeps the failure
     // index incomplete, so a funded retry still finds every outstanding failure.
-    ("contextdb-vector", 225, RSN_TEST_COUNT),
+    ("contextdb-vector", 229, RSN_TEST_COUNT),
     ("contextdb-parser", 137, RSN_TEST_COUNT),
     ("contextdb-planner", 10, RSN_TEST_COUNT),
     // Approved continued-growth proofs: unique-key predicate writes match current-entry reads;
@@ -723,7 +723,7 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // Inventory (+1): historical vector public queries reject damaged selected-root
     // companions and global controls while retained healthy roots still answer.
     // Arriving readers wait for an opening writer; a serving owner answers route selection.
-    ("contextdb-engine", 4962, RSN_TEST_COUNT),
+    ("contextdb-engine", 4972, RSN_TEST_COUNT),
     //  - Inventory (+6): an oversized pending unit pushes from a reopened source whose read
     //    limit is smaller than the unit, the hub refuses a unit its writer can never fit before
     //    it transfers, a transiently refused unit stays pending and lands on retry, and a second

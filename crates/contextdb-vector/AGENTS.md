@@ -50,6 +50,11 @@ vector search needs from a graph is written here, in `hnsw.rs`, on top of that f
   feature (`test_seam.rs`, the `*ForTest` types re-exported from `lib.rs`). Production code never
   reads them.
 
+`MaintenancePauseHandle::wait_until_reached_blocking` observes its exact generation
+through the existing condition variable. Release, replacement and Drop wake waiters;
+a cancelled generation returns false and cannot clear a newer pause. The lifecycle
+guards are in `src/test_seam/pause_lifecycle_tests.rs`.
+
 ## Invariants and their guards
 
 | Invariant | Guard (file → test) |

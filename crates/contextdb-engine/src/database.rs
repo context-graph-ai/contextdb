@@ -12034,7 +12034,20 @@ pub(crate) mod gate;
 pub(crate) mod trigger;
 use cron::CronState;
 use event_bus::EventBusState;
+#[cfg(feature = "test-seams")]
+mod write_publication_drive;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use event_bus::{
+    SinkDispatchDriveForTest, SinkDispatchIdentity, SinkDispatchPrefix, SinkDispatchReceipt,
+    SinkDispatchRetryIdentity,
+};
 use trigger::{TriggerCallbackThreadGuard, TriggerContention, TriggerState};
+#[cfg(feature = "test-seams")]
+use write_publication_drive::WritePublicationControlForTest;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use write_publication_drive::{WritePublicationDriveForTest, WritePublicationReceipt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCandidate {
@@ -19941,6 +19954,11 @@ impl WriteSetApplicator for OwnedMemoryDynStore {
 /// So the owner hands what it holds to this record instead, and whichever
 /// holder turns out to be the last one pays it out on the way down.
 pub(crate) struct StoreFinalization {
+    #[cfg(feature = "test-seams")]
+    publication_drives_for_test:
+        Mutex<HashMap<VectorIndexRef, std::sync::Weak<WritePublicationControlForTest>>>,
+    #[cfg(feature = "test-seams")]
+    release_completion_for_test: Arc<ReleaseCompletionForTest>,
     live_holders: AtomicUsize,
     loaded_history: Mutex<Option<LoadedHistoryBuffers>>,
     local_policy_metadata_enabled: AtomicBool,
@@ -20100,6 +20118,8 @@ impl Drop for RetainedNonVectorMemoryOwner {
 
 /// The resources an owner acquired, waiting for the last holder to release.
 struct PendingStoreRelease {
+    #[cfg(feature = "test-seams")]
+    release_completion_for_test: Arc<ReleaseCompletionForTest>,
     persistence: Option<Arc<RedbPersistence>>,
     resource_closed: Arc<AtomicBool>,
     open_registry_path: Option<PathBuf>,
@@ -20157,6 +20177,10 @@ impl StoreFinalization {
         let non_vector_memory =
             RetainedNonVectorMemoryOwner::new(relational, graph, accountant.clone());
         let mut value = Self {
+            #[cfg(feature = "test-seams")]
+            publication_drives_for_test: Mutex::default(),
+            #[cfg(feature = "test-seams")]
+            release_completion_for_test: Arc::new(ReleaseCompletionForTest::new()),
             live_holders: AtomicUsize::new(1),
             loaded_history: Mutex::new(None),
             local_policy_metadata_enabled: AtomicBool::new(true),
@@ -20300,11 +20324,131 @@ fn release_store(release: PendingStoreRelease) {
     if let Some(path) = &release.open_registry_path {
         release_open_registry_path(path);
     }
+    #[cfg(feature = "test-seams")]
+    let _released_for_test =
+        ResourceReleaseCompletionForTest(Arc::clone(&release.release_completion_for_test));
     // The plugin hears about the close from whoever ends the store. The handle
     // that opened it went away while a reader was still inside, so nothing
     // else is left to tell it, and it is told exactly once -- here.
     if let Some(plugin) = &release.plugin {
         let _closed = plugin.on_close();
+    }
+}
+
+#[cfg(feature = "test-seams")]
+struct ResourceReleaseCompletionForTest(Arc<ReleaseCompletionForTest>);
+
+#[cfg(feature = "test-seams")]
+impl Drop for ResourceReleaseCompletionForTest {
+    fn drop(&mut self) {
+        self.0.resources_released();
+    }
+}
+
+#[cfg(feature = "test-seams")]
+struct ReleaseStateForTest {
+    owner_tasks_observed: bool,
+    resources_released: bool,
+    owner_tasks_joined: bool,
+    error: Option<String>,
+}
+
+#[cfg(feature = "test-seams")]
+pub(crate) struct ReleaseCompletionForTest {
+    generation: uuid::Uuid,
+    state: Mutex<ReleaseStateForTest>,
+    changed: Condvar,
+}
+
+#[cfg(feature = "test-seams")]
+impl ReleaseCompletionForTest {
+    fn new() -> Self {
+        Self {
+            generation: uuid::Uuid::new_v4(),
+            state: Mutex::new(ReleaseStateForTest {
+                owner_tasks_observed: false,
+                resources_released: false,
+                owner_tasks_joined: true,
+                error: None,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn observe_owner_tasks(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.owner_tasks_observed {
+            return false;
+        }
+        state.owner_tasks_observed = true;
+        state.owner_tasks_joined = false;
+        true
+    }
+
+    pub(crate) fn owner_tasks_joined(&self, result: std::result::Result<(), String>) {
+        let mut state = self.state.lock();
+        match result {
+            Ok(()) => state.owner_tasks_joined = true,
+            Err(error) => state.error = Some(error),
+        }
+        self.changed.notify_all();
+    }
+
+    fn resources_released(&self) {
+        self.state.lock().resources_released = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub struct LastHandleReleaseForTest {
+    completion: Arc<ReleaseCompletionForTest>,
+}
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastHandleReleaseReceipt {
+    pub generation: uuid::Uuid,
+}
+
+#[cfg(feature = "test-seams")]
+impl LastHandleReleaseForTest {
+    #[doc(hidden)]
+    pub fn is_released_for_test(&self) -> bool {
+        let state = self.completion.state.lock();
+        state.resources_released && state.owner_tasks_joined && state.error.is_none()
+    }
+
+    #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub fn wait_for_release_for_test(&self) -> Result<LastHandleReleaseReceipt> {
+        let mut state = self.completion.state.lock();
+        while !(state.resources_released && state.owner_tasks_joined) && state.error.is_none() {
+            self.completion.changed.wait(&mut state);
+        }
+        if let Some(error) = &state.error {
+            return Err(Error::Other(error.clone().into()));
+        }
+        Ok(LastHandleReleaseReceipt {
+            generation: self.completion.generation,
+        })
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl Database {
+    #[doc(hidden)]
+    pub fn last_handle_release_for_test(&self) -> LastHandleReleaseForTest {
+        let completion = Arc::clone(&self.finalization.release_completion_for_test);
+        if let Some(service) = &self.owner_read_service {
+            service.observe_last_handle_release_for_test(Arc::clone(&completion));
+        }
+        LastHandleReleaseForTest { completion }
     }
 }
 
@@ -32618,6 +32762,12 @@ impl Database {
             match db.start_owner_read_service(path) {
                 Ok(service) => {
                     db.owner_read_service = service;
+                    #[cfg(feature = "test-seams")]
+                    if let Some(service) = &db.owner_read_service {
+                        service.observe_last_handle_release_for_test(Arc::clone(
+                            &db.finalization.release_completion_for_test,
+                        ));
+                    }
                     if db.owner_read_service.is_some() {
                         observe_open_event!(test_observer, OwnerServiceStarted);
                         // A caller that arrived while this writer was still
@@ -40345,6 +40495,8 @@ impl Database {
         vector_copy_owner: &mut contextdb_vector::VectorCopyAdmission,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<CommitValidationOutcome> {
+        #[cfg(feature = "test-seams")]
+        let _publication_admission = self.publication_admission_for_test(tx);
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         // Source reads in preparation use this operation's reader. Each actual
@@ -41048,6 +41200,8 @@ impl Database {
                 }
             }
                 };
+                #[cfg(feature = "test-seams")]
+                self.publication_committed_for_test(tx, lsn);
                 self.pending_commit_metadata.lock().remove(&tx);
 
                 if !ws.is_empty() {
@@ -81019,6 +81173,13 @@ impl Database {
                 self.release_open_registry();
             }
         }
+        #[cfg(feature = "test-seams")]
+        let _released_for_test =
+            (self.resource_owner && !event_bus_shutdown.deferred_resource_cleanup()).then(|| {
+                ResourceReleaseCompletionForTest(Arc::clone(
+                    &self.finalization.release_completion_for_test,
+                ))
+            });
         let plugin_result = if self.resource_owner {
             self.plugin.on_close()
         } else {
@@ -106908,6 +107069,10 @@ impl Drop for Database {
                     // A read still running is exactly that case: its own hold
                     // keeps the store until the request is finished.
                     self.finalization.defer(PendingStoreRelease {
+                        #[cfg(feature = "test-seams")]
+                        release_completion_for_test: Arc::clone(
+                            &self.finalization.release_completion_for_test,
+                        ),
                         persistence: self.persistence.clone(),
                         resource_closed: Arc::clone(&self.resource_closed),
                         open_registry_path: self.open_registry_path.lock().take(),
@@ -106930,6 +107095,10 @@ impl Drop for Database {
             self.subscriptions.lock().subscribers.clear();
             let _stopped = self.stop_owner_reads_without_waiting();
             self.finalization.defer(PendingStoreRelease {
+                #[cfg(feature = "test-seams")]
+                release_completion_for_test: Arc::clone(
+                    &self.finalization.release_completion_for_test,
+                ),
                 persistence: self.persistence.clone(),
                 resource_closed: Arc::clone(&self.resource_closed),
                 open_registry_path: self.open_registry_path.lock().take(),
@@ -120004,6 +120173,8 @@ impl Database {
                 return Err(error);
             }
         };
+        #[cfg(feature = "test-seams")]
+        self.publication_committed_for_test(tx, lsn);
         let committed_tx = pair.with_legacy(|ws| -> Result<Option<TxId>> {
             if !ws.is_empty() {
                 self.plugin.post_commit(ws, source);
@@ -120479,3 +120650,7 @@ pub(crate) mod consolidation_metadata_contract_tests;
 #[cfg(all(test, feature = "test-seams"))]
 #[path = "database/selected_membership_proof_tests.rs"]
 mod selected_membership_proof_tests;
+
+#[cfg(all(test, feature = "test-seams", unix))]
+#[path = "database/last_handle_release_tests.rs"]
+mod last_handle_release_tests;

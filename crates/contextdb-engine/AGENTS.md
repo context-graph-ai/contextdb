@@ -105,6 +105,18 @@ Entries: `Database::open` / `open_with_options` / `open_memory` / `open_with_plu
 `DatabasePlugin` lifecycle hooks are not a storage seam. Transactional callbacks prepare writes
 before final validation; external effects belong to post-commit `register_sink` delivery.
 
+With `test-seams`, `Database::sink_dispatch_drive_for_test` quiesces background
+sink delivery and drives a captured committed prefix through the ordinary callback,
+durable acknowledgment and metrics path on the calling thread. Receipts name blocked
+actions and explicit retries; retry deadlines use canonical `Wallclock` on that thread.
+`Database::last_handle_release_for_test` retains independent completion state for one
+store generation and acknowledges actual resource release and owner-thread joins.
+`Database::write_publication_drive_for_test` parks actual conflicting vector writers
+before commit fences and acknowledges row/vector publication after those fences release.
+Dropping a drive releases its parked operations. Unit guards live in
+`src/database/sink_dispatch_drive/tests.rs`, `src/database/last_handle_release_tests.rs`
+and `src/database/write_publication_drive/tests.rs`.
+
 ## Clock and memory seams
 
 Persist timestamps through `contextdb_core::Wallclock::now()`, never raw epoch math. Tests use
