@@ -401,3 +401,46 @@ pub fn observe_reader_charges<T>(
 ) -> (T, ReaderCharges) {
     unimplemented!("{UNBOUND}: reader charges for index metadata")
 }
+
+/// Points inside the clustered index's own work where a cancellation is
+/// driven: the path checks its cancellation immediately after the observer
+/// returns from the point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexCancelPoint {
+    /// A search has admitted one list page and is about to read its records.
+    ListPageRead,
+    /// A search is scoring candidates or re-ranking them.
+    CandidateScoring,
+    /// Maintenance is inside one bounded build, replacement or delta replay
+    /// batch, before that batch commits its progress.
+    BuildBatch,
+    /// Maintenance is inside one bounded compaction or reclamation batch of a
+    /// retired generation, before that batch commits its progress.
+    ReclaimBatch,
+}
+
+/// Calls `observer` each time `operation`, on the calling thread, reaches one
+/// of the index's cancellation points.
+pub fn observe_index_cancel_points<T>(
+    _observer: Arc<dyn Fn(IndexCancelPoint) + Send + Sync>,
+    _operation: impl FnOnce() -> T,
+) -> T {
+    unimplemented!("{UNBOUND}: index cancellation points")
+}
+
+/// Runs one caller-driven maintenance cycle that stops, with the engine's
+/// existing typed cancellation, at its next checkpoint once `cancellation`
+/// is cancelled.
+pub fn run_maintenance_cycle_cancellable(
+    _db: &Database,
+    _cancellation: &contextdb_core::read_contract::OwnerReadCancellation,
+) -> contextdb_core::Result<()> {
+    unimplemented!("{UNBOUND}: a cancellable maintenance cycle")
+}
+
+/// Bytes currently held by the index's operation reservations of every kind:
+/// query workspaces, seal workspaces, maintenance step workspaces, and the
+/// whole-object metadata they admitted.
+pub fn outstanding_index_reservations(_db: &Database) -> u64 {
+    unimplemented!("{UNBOUND}: outstanding index reservations")
+}
