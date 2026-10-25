@@ -12200,12 +12200,36 @@ struct WriterReceiptContentionObserver {
     fired: bool,
 }
 #[cfg(any(test, feature = "test-seams"))]
-static WRITER_RECEIPT_CONTENTION_OBSERVERS: parking_lot::Mutex<Vec<WriterReceiptContentionObserver>> = parking_lot::Mutex::new(Vec::new());
+static WRITER_RECEIPT_CONTENTION_OBSERVERS: parking_lot::Mutex<WriterReceiptContentionState> = parking_lot::Mutex::new(WriterReceiptContentionState { observers: Vec::new(), samples: Vec::new() });
+#[cfg(any(test, feature = "test-seams"))]
+struct WriterReceiptContentionState {
+    observers: Vec<WriterReceiptContentionObserver>,
+    samples: Vec<usize>,
+}
+#[cfg(any(test, feature = "test-seams"))]
+struct WriterReceiptSampleHeld(usize);
+#[cfg(any(test, feature = "test-seams"))]
+impl WriterReceiptSampleHeld {
+    fn enter(identity: usize) -> Self {
+        WRITER_RECEIPT_CONTENTION_OBSERVERS.lock().samples.push(identity);
+        Self(identity)
+    }
+}
+#[cfg(any(test, feature = "test-seams"))]
+impl Drop for WriterReceiptSampleHeld {
+    fn drop(&mut self) {
+        let mut state = WRITER_RECEIPT_CONTENTION_OBSERVERS.lock();
+        let at = state.samples.iter().rposition(|identity| *identity == self.0)
+            .expect("a memory sample retains its actual exclusion");
+        state.samples.remove(at);
+    }
+}
 #[cfg(any(test, feature = "test-seams"))]
 fn note_writer_receipt_contention(identity: usize) {
     let callbacks = {
-        let mut observers = WRITER_RECEIPT_CONTENTION_OBSERVERS.lock();
-        observers.iter_mut().filter_map(|entry| {
+        let mut state = WRITER_RECEIPT_CONTENTION_OBSERVERS.lock();
+        if !state.samples.contains(&identity) { return; }
+        state.observers.iter_mut().filter_map(|entry| {
             if entry.identity == identity && !entry.fired {
                 entry.fired = true;
                 Some(entry.observer.clone())
@@ -81288,7 +81312,7 @@ impl Database {
         struct Remove { identity: usize, observer: Arc<dyn Fn() + Send + Sync> }
         impl Drop for Remove {
             fn drop(&mut self) {
-                WRITER_RECEIPT_CONTENTION_OBSERVERS.lock().retain(|entry|
+                WRITER_RECEIPT_CONTENTION_OBSERVERS.lock().observers.retain(|entry|
                     !(entry.identity == self.identity && Arc::ptr_eq(&entry.observer, &self.observer)));
             }
         }
@@ -81297,7 +81321,7 @@ impl Database {
         // even when the caller reuses its Arc callback.
         let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || observer());
         let _remove = Remove { identity, observer: observer.clone() };
-        WRITER_RECEIPT_CONTENTION_OBSERVERS.lock().push(WriterReceiptContentionObserver { identity, observer, fired: false });
+        WRITER_RECEIPT_CONTENTION_OBSERVERS.lock().observers.push(WriterReceiptContentionObserver { identity, observer, fired: false });
         operation()
     }
 
@@ -81338,6 +81362,7 @@ impl Database {
     ) -> R {
         let _maintenance = (!MaintenanceReceiptGuard::held_for(&self.pruning_guard))
             .then(|| MaintenanceReceiptGuard::lock(&self.pruning_guard));
+        let _sample_held = WriterReceiptSampleHeld::enter(Arc::as_ptr(&self.pruning_guard) as usize);
         self.with_commit_lock(|| {
             let mut receipt = WriterMemoryOwnershipReceiptForTest {
                 vector: self.vector_memory_ownership_receipt_for_test(),
