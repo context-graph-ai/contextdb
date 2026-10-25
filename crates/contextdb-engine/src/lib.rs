@@ -238,8 +238,8 @@ pub use read_progress::{ReadPhase, ReadProgress, ReadProgressObserver};
 pub use read_session::{
     DatabaseOpenOptions, MetadataAnswer, OpenDisposition, OwnerAdmissionReport,
     OwnerConfigurationSource, OwnerConfiguredValue, OwnerEffectiveLimits, OwnerMemoryReport,
-    OwnerReadConfig, OwnerReport, OwnerServingReport, OwnerTimeoutReport, ReadCursor, ReadSession,
-    ReadSessionOptions, ReaderWaitDeadline,
+    OwnerReadConfig, OwnerReport, OwnerServingReport, OwnerTimeoutReport, ReadCacheShareStatus,
+    ReadCursor, ReadSession, ReadSessionOptions, ReaderWaitDeadline,
 };
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]

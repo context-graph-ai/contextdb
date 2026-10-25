@@ -2886,9 +2886,37 @@ pub(crate) fn load_read_image_at_registration_with_context(
     registration: Option<ReadSnapshotRegistrationGuard>,
     open_context: crate::executor::bounded::ReadOpenContext,
 ) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
+    load_read_image_at_registration_with_cache_share(
+        path,
+        limit,
+        None,
+        runtime_dir,
+        registration,
+        open_context,
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+pub(crate) fn load_read_image_at_registration_with_cache_share(
+    path: &Path,
+    limit: Option<usize>,
+    cache_share: Option<u8>,
+    runtime_dir: Option<&Path>,
+    registration: Option<ReadSnapshotRegistrationGuard>,
+    open_context: crate::executor::bounded::ReadOpenContext,
+) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
     open_context
         .checkpoint()
         .map_err(LoadReadImageError::Memory)?;
+    if cache_share.is_some_and(|percent| percent > 100) {
+        return Err(LoadReadImageError::Memory(Error::Other(
+            "READ_CACHE_SHARE must be between 0 and 100 percent".into(),
+        )));
+    }
+    let budget = limit.unwrap_or_else(|| open_context.memory_limit());
     let read_memory = open_context.read_memory();
     let memory =
         crate::read_image_memory::ImageMemory::new_direct_reader(limit, read_memory.clone())
@@ -2896,14 +2924,11 @@ pub(crate) fn load_read_image_at_registration_with_context(
     // The persistence cache coexists with decoded records and later lazy page
     // reads. Admit its fixed ceiling before Redb opens and retain that charge
     // for the source handle's lifetime.
-    let cache_bytes = redb_cache_bytes_for_limit(limit);
-    let source_bytes = cache_bytes
-        .saturating_add(64 * 1024)
-        .saturating_add(content_identity::READ_VERIFIER_MEMORY_BYTES)
-        .saturating_add(std::mem::size_of::<Lsn>())
-        .saturating_add(std::mem::size_of::<
-            content_identity::ValidatedHistoryOpenControl,
-        >());
+    let cache_bytes = cache_share.map_or_else(
+        || redb_cache_bytes_for_limit(Some(budget)),
+        |percent| redb_reader_cache_bytes(budget, Some(percent)),
+    );
+    let source_bytes = cache_bytes.saturating_add(read_source_fixed_reservation_bytes());
     #[cfg(test)]
     let source_observation = direct_source_contract_rows::begin(0, &memory);
     let source_memory = SourceMemoryReservation::new(memory.clone(), source_bytes)
@@ -23619,28 +23644,40 @@ impl CacheInstallation {
 /// cannot work.
 pub(crate) const REDB_CACHE_FLOOR_BYTES: usize = 256 * 1024;
 
-/// One byte of every this many of a declared limit is the page cache's share.
-pub(crate) const REDB_CACHE_LIMIT_SHARE_DIVISOR: usize = 7;
+/// The exact fixed source reservation, independent of the page-cache declaration.
+pub(crate) fn read_source_fixed_reservation_bytes() -> usize {
+    64 * 1024
+        + content_identity::READ_VERIFIER_MEMORY_BYTES
+        + std::mem::size_of::<Lsn>()
+        + std::mem::size_of::<content_identity::ValidatedHistoryOpenControl>()
+}
 
-/// What that share gives up before the cache takes any of it, so a store
-/// under a small limit has room to open at all.
-pub(crate) const REDB_CACHE_LIMIT_SHARE_OFFSET_BYTES: usize = 64 * 1024;
+/// File-reader cache policy. The displayed default is 14%; its exact capacity
+/// is one seventh of the budget left after fixed source reservations. Explicit
+/// percentages select a share of that same remainder, without a fixed byte cap.
+pub(crate) fn redb_reader_cache_bytes(budget: usize, percent: Option<u8>) -> usize {
+    let available = budget.saturating_sub(read_source_fixed_reservation_bytes());
+    match percent {
+        None => available / 7,
+        Some(percent) => {
+            // Decompose before multiplying so valid percentages cannot overflow.
+            // Invalid declarations are refused before any storage open.
+            let percent = usize::from(percent.min(100));
+            available / 100 * percent + available % 100 * percent / 100
+        }
+    }
+}
 
-/// The page cache a store gets under a declared `MEMORY_LIMIT`.
-///
-/// Redb's cache is process-resident memory the store holds for as long as it
-/// is open, so a declared limit has to bound it: a flat 8 MiB is most of a
-/// small budget and all of a tiny one, and it used to be taken regardless of
-/// what the operator declared. This is the unchanged READ allocation used by
-/// `load_read_image_with_memory`; the writer's internal subdivision is in
-/// `redb_writer_cache_bytes_for_limit`. A reader limit at or above about
-/// 64 MiB still gets the whole 8 MiB.
 pub(crate) fn redb_cache_bytes_for_limit(limit: Option<usize>) -> usize {
-    limit.map_or(REDB_CACHE_BYTES, |limit| {
-        (limit / REDB_CACHE_LIMIT_SHARE_DIVISOR)
-            .saturating_sub(REDB_CACHE_LIMIT_SHARE_OFFSET_BYTES)
-            .min(REDB_CACHE_BYTES)
-    })
+    let budget = limit.unwrap_or_else(|| {
+        usize::try_from(
+            crate::read_session::ReadSessionOptions::default()
+                .limits
+                .memory,
+        )
+        .unwrap_or(usize::MAX)
+    });
+    redb_reader_cache_bytes(budget, None)
 }
 
 /// Internal writer subdivision of the unchanged memory budget: for limit L,
@@ -23674,10 +23711,7 @@ pub fn redb_writer_cache_bytes_for_limit_for_test(limit: Option<usize>) -> usize
 pub fn read_source_cache_reservation_for_limit_for_test(limit: Option<usize>) -> (usize, usize) {
     (
         redb_cache_bytes_for_limit(limit),
-        64 * 1024
-            + content_identity::READ_VERIFIER_MEMORY_BYTES
-            + std::mem::size_of::<Lsn>()
-            + std::mem::size_of::<content_identity::ValidatedHistoryOpenControl>(),
+        read_source_fixed_reservation_bytes(),
     )
 }
 

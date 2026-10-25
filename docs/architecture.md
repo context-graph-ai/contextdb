@@ -299,6 +299,19 @@ still held by the session or another reader stays charged until its last holder 
 Evicting the cache entry alone does not release that charge.
 <!-- enforced by: session_charged_bytes::public_charged_bytes_reports_and_releases_cursor_hydration_on_both_routes, direct_file_image_memory_lifetime::a_read_within_limit_succeeds_and_keeps_its_page_charged_until_the_session_drops, crates/contextdb-engine/src/persistence/search_page_reuse_tests.rs::a_proof_page_a_statement_still_holds_stays_charged_after_the_cache_evicts_it, crates/contextdb-engine/src/persistence/search_page_reuse_tests.rs::statement_cleanup_after_success_refusal_and_cancellation_leaves_no_uncharged_page -->
 
+The file reader's page-cache policy is declared per session through
+`ReadSessionOptions::read_cache_share`, an optional integer percent from 0 to 100.
+The declaration persists for the session and travels to each direct-file open.
+The policy default is **default (14%)**: exactly `(B - F) / 7`, saturating at zero,
+where `B` is the declared session memory ceiling, or `limits.memory` when no
+session ceiling is declared, and
+`F` is the 64 KiB source overhead plus the verifier, LSN and history-open control
+reservations. An explicit percent applies to `B - F`. There is no fixed byte cap.
+`read_cache_share_status()` inspects the declared percent, default percent,
+budget, fixed reservation, cache capacity and effective percent of the complete
+budget. Cache capacity remains inside the original memory ceiling; opening and
+query work still refuse before allocation if their total does not fit.
+
 A stored value too large for a read's memory budget is refused before its source buffer is
 allocated. Opening a session need not read that value: the refusal belongs to the statement that
 selects it, on both the file and owner routes, and leaves no new charge behind.

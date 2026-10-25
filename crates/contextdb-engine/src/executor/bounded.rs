@@ -724,6 +724,10 @@ impl ReadOpenContext {
         self.0.checkpoint().map_err(Self::engine_error)
     }
 
+    pub(crate) fn memory_limit(&self) -> usize {
+        usize::try_from(self.0.limits.memory).unwrap_or(usize::MAX)
+    }
+
     pub(crate) fn read_memory(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
         self.0.reader_budget.clone()
     }

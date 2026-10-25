@@ -27,6 +27,8 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct DirectReaderConfig {
     pub memory_limit: Option<usize>,
+    /// Session declaration carried by ReadSessionOptions; None uses the derived default.
+    pub read_cache_share: Option<u8>,
     /// Resolved runtime-state directory selected by the session opener.
     pub runtime_dir: Option<PathBuf>,
     pub limits: ReadLimits,
@@ -47,6 +49,7 @@ impl DirectReaderConfig {
     pub fn new(limits: ReadLimits, clock: Arc<dyn DeadlineClock>) -> Self {
         Self {
             memory_limit: None,
+            read_cache_share: None,
             runtime_dir: None,
             limits,
             clock,
@@ -1530,7 +1533,11 @@ impl DirectFileReader {
         // Resolve this image's declared parent once. Preparation and captured
         // directory reads retain one child; statements use this same parent.
         let declared_read_memory =
-            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(config.limits.memory)
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
+                config.memory_limit.map_or(config.limits.memory, |limit| {
+                    u64::try_from(limit).unwrap_or(u64::MAX)
+                }),
+            )
                 .map_err(crate::read_image::history_answer_error)?;
         #[cfg(all(test, feature = "test-seams"))]
         let (open_child, original_image_counter) = declared_read_memory
@@ -1546,9 +1553,10 @@ impl DirectFileReader {
             cancellation.clone(),
         )
         .map_err(crate::read_image::history_answer_error)?;
-        let load = crate::persistence::load_read_image_at_registration_with_context(
+        let load = crate::persistence::load_read_image_at_registration_with_cache_share(
             path,
             config.memory_limit,
+            config.read_cache_share,
             config.runtime_dir.as_deref(),
             registration,
             open_context,

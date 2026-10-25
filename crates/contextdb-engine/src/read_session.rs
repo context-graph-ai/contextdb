@@ -52,11 +52,52 @@ pub struct ReadSessionOptions {
     /// state and combines with `limits.memory` for each read on either route.
     /// It never changes the store's durable MEMORY_LIMIT declaration.
     pub memory_limit: Option<usize>,
+    /// Percent of the reader budget remaining after fixed source reservations
+    /// assigned to its file page cache. None selects default (14%): one seventh
+    /// of that remainder. The declaration follows this session across file opens.
+    /// Values from 0 through 100 are accepted; the original memory ceiling still
+    /// admits the complete open and every query before allocation.
+    pub read_cache_share: Option<u8>,
     pub limits: ReadLimits,
     pub timeouts: ReadClientTimeouts,
     pub contexts: Option<BTreeSet<ContextId>>,
     pub scope_labels: Option<BTreeSet<ScopeLabel>>,
     pub principal: Option<Principal>,
+}
+
+/// The declaration and effective file-cache capacity of a read session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReadCacheShareStatus {
+    pub declared_percent: Option<u8>,
+    /// The default's displayed percent; its exact derivation is (B - F) / 7.
+    pub default_percent: u8,
+    pub budget_bytes: usize,
+    pub fixed_reservation_bytes: usize,
+    pub cache_bytes: usize,
+    /// Cache capacity as a percent of the complete declared reader budget.
+    pub effective_percent: f64,
+}
+
+impl ReadSessionOptions {
+    /// Inspect the file-cache declaration without opening storage or allocating.
+    pub fn read_cache_share_status(&self) -> ReadCacheShareStatus {
+        let budget = usize::try_from(self.limits.memory).unwrap_or(usize::MAX);
+        let budget = self.memory_limit.unwrap_or(budget);
+        let fixed = crate::persistence::read_source_fixed_reservation_bytes();
+        let cache = crate::persistence::redb_reader_cache_bytes(budget, self.read_cache_share);
+        ReadCacheShareStatus {
+            declared_percent: self.read_cache_share,
+            default_percent: 14,
+            budget_bytes: budget,
+            fixed_reservation_bytes: fixed,
+            cache_bytes: cache,
+            effective_percent: if budget == 0 {
+                0.0
+            } else {
+                cache as f64 * 100.0 / budget as f64
+            },
+        }
+    }
 }
 
 /// Owner inspection policy attached to a writable database open.
@@ -1678,6 +1719,7 @@ fn open_direct_route(
         options.principal.clone(),
     );
     config.memory_limit = options.memory_limit;
+    config.read_cache_share = options.read_cache_share;
     config.runtime_dir = coordination_runtime;
     match crate::direct_file_reader::DirectFileReader::open(path, config) {
         Ok(reader) => {
@@ -2681,6 +2723,14 @@ impl ReadSession {
         #[cfg(not(any(test, feature = "test-seams")))]
         let _ = (&session_observer, &kernel_observer);
         let mut options = options;
+        if options
+            .read_cache_share
+            .is_some_and(|percent| percent > 100)
+        {
+            return Err(Error::Other(
+                "READ_CACHE_SHARE must be between 0 and 100 percent".into(),
+            ));
+        }
         if let Some(limit) = options.memory_limit {
             options.limits.memory = options.limits.memory.min(limit as u64);
         }
