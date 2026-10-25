@@ -940,3 +940,28 @@ pub fn quantized_codes(
 ) -> Vec<i32> {
     unimplemented!("{UNBOUND}: the codec's codes for a vector")
 }
+
+/// The list of the serving generation that holds the row with this primary
+/// key.
+pub fn assigned_list(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _key: &Value,
+) -> u64 {
+    unimplemented!("{UNBOUND}: a row's list assignment")
+}
+
+/// The `n` lists whose centroids the serving generation ranks nearest to
+/// `query`, nearest first: the lists an `n`-probe search reads.
+pub fn nearest_lists(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _query: &[f32],
+    _n: u64,
+) -> Vec<u64> {
+    unimplemented!("{UNBOUND}: the lists a search probes")
+}

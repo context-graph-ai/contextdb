@@ -262,9 +262,10 @@ const DECOYS: usize = 99;
 const BACKGROUND: i64 = 5_000;
 const NEAREST_ID: i64 = 1_000_000;
 const FIRST_DECOY_ID: i64 = 2_000_000;
-/// Every evaluated depth runs at this pinned point; depth 1 rescores
-/// ceil(1 x 2) = 2 candidates and depth 100 rescores 200.
-const PINNED_PROBES: u64 = 1_024;
+/// Every evaluated depth runs at this pinned point: two probed lists, so the
+/// indexed route scores a small fraction of the 5,100 vectors EXACT compares;
+/// depth 1 rescores ceil(1 x 2) = 2 candidates and depth 100 rescores 200.
+const PINNED_PROBES: u64 = 2;
 const PINNED_FACTOR: f64 = 2.0;
 /// Offsets as fractions of a dimension's quantization step. A decoy's offset
 /// stays a margin below half a step, so it can keep the query's code; the true
@@ -387,10 +388,12 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
         "enough axes keep the query's code at the decoy offset for 99 distinct decoys: \
          {decoy_offsets:?}"
     );
+    let nearest_offset =
+        moves(nearest_axis).expect("the verified signed offset of the true nearest");
     probe.close().expect("close the probe store");
 
     let mut nearest = axis_query();
-    nearest[nearest_axis] = moves(nearest_axis).unwrap_or(NEAREST_FRACTION * steps[nearest_axis]);
+    nearest[nearest_axis] = nearest_offset;
     // Distinct decoys: the first 99 subsets of DECOY_AXES code-keeping axes.
     let mut decoys = Vec::with_capacity(DECOYS);
     let mut chosen = (0..DECOY_AXES).collect::<Vec<_>>();
@@ -487,6 +490,31 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
         "depth 1 persists the candidates it rescored: {one:?}"
     );
     assert!(hundred.effective_candidates >= 100, "{hundred:?}");
+    // The true nearest and every decoy sit in lists the pinned two-probe
+    // search reads.
+    let probed = super::support::nearest_lists(
+        &db,
+        "near_items",
+        "embedding",
+        &[],
+        &axis_query(),
+        PINNED_PROBES,
+    );
+    assert_eq!(
+        probed.len() as u64,
+        PINNED_PROBES,
+        "the pinned search probes two lists"
+    );
+    for key in
+        std::iter::once(NEAREST_ID).chain((0..DECOYS as i64).map(|offset| FIRST_DECOY_ID + offset))
+    {
+        let list =
+            super::support::assigned_list(&db, "near_items", "embedding", &[], &Value::Int64(key));
+        assert!(
+            probed.contains(&list),
+            "precondition: row {key} is in list {list}, among the probed lists {probed:?}"
+        );
+    }
     let order = super::support::quantized_order(&db, "near_items", "embedding", &[], &axis_query());
     let rank = order
         .iter()
@@ -520,7 +548,19 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
         vec![NEAREST_ID],
         "the depth-1 run misses under its own shortlist"
     );
-    let (depth_hundred, _) = indexed(100);
+    let (depth_hundred, depth_hundred_work) = indexed(100);
+    let (_, exact_hundred_work) = observe_search(&db, || {
+        db.execute(
+            "SELECT id FROM near_items ORDER BY embedding <=> $query USE VECTOR EXACT LIMIT 100",
+            &params([("query", Value::Vector(axis_query()))]),
+        )
+        .unwrap()
+    });
+    assert!(
+        depth_hundred_work.distance_evaluations() < exact_hundred_work.distance_evaluations(),
+        "precondition: at the pinned point the depth-100 search does less work than EXACT: \
+         indexed {depth_hundred_work:?}, exact {exact_hundred_work:?}"
+    );
     assert_eq!(
         depth_hundred.first(),
         Some(&NEAREST_ID),
