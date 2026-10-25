@@ -3,7 +3,6 @@
 use super::*;
 use crate::persistence::native_storage_admission::StorageAdmissionScope;
 use crate::vector_read_memory::{DeclaredReadMemory, DeclaredReadRoot, declared_child_observer};
-use contextdb_core::read_memory::ReadMemoryBudget;
 use redb::ScanAllowance;
 use std::sync::{Arc, Barrier};
 
@@ -146,21 +145,50 @@ fn freed_pair(requests: &[Request], before: usize) {
     );
 }
 
+// A native scan value is an inline clone of the original admission: building
+// or cloning it allocates nothing and debits nothing. Every native entry
+// still prepays its own node and receipt from that original payer.
+fn construct_with_no_allocation(reader: &Reader) -> ScanAllowance {
+    let before = reader.used();
+    let (allowance, _, count, _) = capture(reader, || reader.allowance());
+    assert_eq!(count, 0, "a native scan value allocates nothing");
+    assert_eq!(reader.used(), before, "and adds no debit");
+    let (clone, _, count, _) = capture(reader, || allowance.clone());
+    assert_eq!(count, 0, "a clone of it allocates nothing");
+    assert_eq!(reader.used(), before, "and adds no debit");
+    drop(clone);
+    allowance
+}
+
+/// The reader's own scope control: the original admission every native scan
+/// value and node retains.
+fn scope_control(reader: &Reader) -> Request {
+    let (pointer, layout) = reader.scope.allocation_observation_for_scan_test();
+    (pointer, layout.size(), layout.align())
+}
+
+/// Drop the reader's own scope and child and prove the declared root ends
+/// with only its control, physically free.
+fn finish_parts(parent: DeclaredReadRoot, child: contextdb_core::read_memory::ReadMemoryOwner) {
+    drop(child);
+    assert_eq!(
+        parent.retained_bytes_for_test(),
+        crate::vector_read_memory::native_control_layouts_for_test()
+            .0
+            .size() as u64
+    );
+    parent.assert_final_root_free_for_test();
+}
+
 // Separate test: exact physical ownership cannot be a row of a cache-behavior
 // test; decisive mutants substitute an equal-sized payer or refund before free.
 #[test]
 #[serial]
-fn native_scan_counter_and_node_keep_original_invoices_through_last_physical_free() {
+fn native_scan_value_allocates_nothing_and_its_node_keeps_original_invoices_through_last_physical_free()
+ {
     let reader = Reader::new(1 << 20);
     let standing = reader.used();
-    let (allowance, counter_requests, count, credit) = capture(&reader, || reader.allowance());
-    pair(
-        &reader,
-        &counter_requests[..count],
-        allowance.allocation_observation_for_test(),
-        &credit,
-    );
-    let counter_cost = reader.used() - standing;
+    let allowance = construct_with_no_allocation(&reader);
     let decoy = Reader::new(1 << 20);
     let decoy_standing = decoy.used();
     let (guard, node_requests, count, credit) = capture(&reader, || {
@@ -181,7 +209,13 @@ fn native_scan_counter_and_node_keep_original_invoices_through_last_physical_fre
         guard.allocation_observation_for_test(),
         &credit,
     );
-    let node_cost = reader.used() - standing - counter_cost;
+    let node_cost = reader.used() - standing;
+    assert_eq!(
+        node_cost,
+        ScanAllowance::node_layout_for_test().size()
+            + StorageAdmissionScope::receipt_layout_for_scan_test().size(),
+        "the node and its receipt are the only debit of a native scan entry"
+    );
     watch_source_free_for_test(&node_requests[..count], reader.counter);
     let _watches = Watches;
     let before = reader.used();
@@ -192,146 +226,157 @@ fn native_scan_counter_and_node_keep_original_invoices_through_last_physical_fre
     assert_eq!(reader.used(), before);
     drop(helper);
     freed_pair(&node_requests[..count], before);
-    assert_eq!(reader.used(), standing + counter_cost);
-    assert_eq!(ScanAllowance::current_node_for_test(), 0);
-    watch_source_free_for_test(&counter_requests[..2], reader.counter);
-    let last = allowance.clone();
-    drop(allowance);
-    assert_eq!(source_free_for_test(2)[1].2, 0);
-    let before = reader.used();
-    drop(last);
-    freed_pair(&counter_requests[..2], before);
     assert_eq!(reader.used(), standing);
-    assert!(node_cost > 0);
+    assert_eq!(ScanAllowance::current_node_for_test(), 0);
+    // The original admission control stays paid and allocated while any
+    // captured holder lives, and is physically freed under its own invoice
+    // only when the last one drops.
+    watch_exact_frees_for_test(&[scope_control(&reader)], reader.counter);
+    let last = allowance.clone();
+    let Reader {
+        parent,
+        child,
+        scope,
+        counter,
+    } = reader;
+    let used = || {
+        unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
+            .load(AtomicOrdering::SeqCst) as usize
+    };
+    drop(scope);
+    drop(allowance);
+    assert_eq!(
+        source_free_for_test(1)[0].2,
+        0,
+        "a captured holder keeps the original admission control allocated"
+    );
+    assert_eq!(used(), standing, "and its invoice in place");
+    drop(last);
+    assert_eq!(
+        source_free_for_test(1)[0],
+        (standing, standing, 1),
+        "the last captured holder frees the control before its invoice settles"
+    );
+    assert_eq!(used(), 0);
     disarm_source_free_watch();
-    reader.finish();
+    finish_parts(parent, child);
 }
 
 // A distinct proof of preallocation refusal/actual null. No fake callback or
 // post-failure String/Box allocation is allowed to pass as a native refusal.
 #[test]
 #[serial]
-fn native_scan_denial_and_null_distinguish_counter_node_and_receipt() {
-    let roomy = Reader::new(1 << 20);
-    let allowance = roomy.allowance();
-    let counter_layout = allowance.allocation_observation_for_test().1;
+fn native_scan_value_needs_only_an_admission_and_entry_refusals_distinguish_node_and_receipt() {
     let node_layout = ScanAllowance::node_layout_for_test();
     let receipt = StorageAdmissionScope::receipt_layout_for_scan_test();
-    let parent_standing = {
-        drop(allowance);
-        roomy.parent.retained_bytes_for_test()
-    };
+    let roomy = Reader::new(1 << 20);
+    let parent_standing = roomy.parent.retained_bytes_for_test();
     roomy.finish();
-    for node in [false, true] {
-        for receipt_denied in [false, true] {
-            // Include a live counter for the node rows, then leave exactly one
-            // byte less than the requested target or its independent receipt.
-            let existing = if node {
-                counter_layout.size() + receipt.size()
-            } else {
-                0
-            };
-            let target = if node { node_layout } else { counter_layout };
-            let extra = target.size() + if receipt_denied { receipt.size() } else { 0 };
-            let reader = Reader::new(parent_standing + (existing + extra - 1) as u64);
-            let allowance = node.then(|| reader.allowance());
-            let before = reader.used();
-            let (result, _, count, _) = capture(&reader, || match &allowance {
-                Some(a) => a.try_enter_native().map(drop),
-                None => {
-                    redb::with_native_storage_admission(reader.scope.retain_admission(), || {
-                        ScanAllowance::try_new_native()
-                    })
-                    .map(drop)
-                }
-            });
-            assert!(matches!(
-                result,
-                Err(redb::StorageError::Native(
-                    redb::NativeColdReadError::AdmissionRefusedAt(_)
-                ))
-            ));
-            assert_eq!(count, 0, "deny before receipt AND target allocation");
-            assert_eq!(reader.used(), before, "partial reservation rolls back");
-            assert_eq!(ScanAllowance::current_node_for_test(), 0);
-            drop(result);
-            drop(allowance);
-            reader.finish();
+    // With a valid admission and not one byte of headroom, the value still
+    // builds; without any admission it refuses, and neither path allocates.
+    {
+        let reader = Reader::new(parent_standing);
+        drop(construct_with_no_allocation(&reader));
+        let (refused, _, count, _) = capture(&reader, ScanAllowance::try_new_native);
+        assert!(matches!(
+            refused,
+            Err(redb::StorageError::Native(
+                redb::NativeColdReadError::AdmissionRefused
+            ))
+        ));
+        assert_eq!(count, 0, "a missing admission refuses before any allocation");
+        reader.finish();
+    }
+    for receipt_denied in [false, true] {
+        // Leave exactly one byte less than the node, or than the node plus its
+        // independent receipt.
+        let extra = node_layout.size() + if receipt_denied { receipt.size() } else { 0 };
+        let reader = Reader::new(parent_standing + (extra - 1) as u64);
+        let allowance = construct_with_no_allocation(&reader);
+        let before = reader.used();
+        let (result, _, count, _) = capture(&reader, || allowance.try_enter_native().map(drop));
+        assert!(matches!(
+            result,
+            Err(redb::StorageError::Native(
+                redb::NativeColdReadError::AdmissionRefusedAt(_)
+            ))
+        ));
+        assert_eq!(count, 0, "deny before receipt AND node allocation");
+        assert_eq!(reader.used(), before, "partial reservation rolls back");
+        assert_eq!(ScanAllowance::current_node_for_test(), 0);
+        drop(result);
+        drop(allowance);
+        reader.finish();
+    }
+    for receipt_null in [false, true] {
+        let reader = Reader::new(1 << 20);
+        let allowance = construct_with_no_allocation(&reader);
+        // The existing allocator injects null BEFORE System, at the actual
+        // selected producer request, never by manufacturing an error value.
+        let refused = if receipt_null { receipt } else { node_layout };
+        NULL_REQUEST.with(|slot| slot.set((0, 0, 0)));
+        crate::vector_read_memory::native_ownership_proof::arm_refuse_one_live_layout(refused);
+        let before = reader.used();
+        let _watches = Watches;
+        if !receipt_null {
+            watch_next_exact_free_for_test(receipt, reader.counter);
         }
-        for receipt_null in [false, true] {
-            let reader = Reader::new(1 << 20);
-            let allowance = node.then(|| reader.allowance());
-            let target = if node { node_layout } else { counter_layout };
-            // The existing allocator injects null BEFORE System, at the actual
-            // selected producer request, never by manufacturing an error value.
-            let refused = if receipt_null { receipt } else { target };
-            NULL_REQUEST.with(|slot| slot.set((0, 0, 0)));
-            crate::vector_read_memory::native_ownership_proof::arm_refuse_one_live_layout(refused);
-            let before = reader.used();
-            let _watches = Watches;
-            if !receipt_null {
-                watch_next_exact_free_for_test(receipt, reader.counter);
-            }
-            let (result, requests, count, _) = capture(&reader, || match &allowance {
-                Some(a) => a.try_enter_native().map(drop),
-                None => {
-                    redb::with_native_storage_admission(reader.scope.retain_admission(), || {
-                        ScanAllowance::try_new_native()
-                    })
-                    .map(drop)
-                }
-            });
-            assert!(!crate::vector_read_memory::native_ownership_proof::refusal_armed_for_test());
+        let (result, requests, count, _) =
+            capture(&reader, || allowance.try_enter_native().map(drop));
+        assert!(!crate::vector_read_memory::native_ownership_proof::refusal_armed_for_test());
+        assert_eq!(
+            NULL_REQUEST.with(std::cell::Cell::get),
+            (
+                refused.size(),
+                refused.align(),
+                node_layout.size() + receipt.size()
+            ),
+            "the actual null request observes both original child invoices already paid"
+        );
+        if receipt_null {
+            assert!(matches!(&result, Err(redb::StorageError::Native(
+                redb::NativeColdReadError::AdmissionRefusedAt(owner))) if owner.inspect_failure(|failure|
+                    failure.and_then(|e| e.downcast_ref::<crate::persistence::native_storage_admission::NativeStorageFailure>())
+                        .is_some_and(|e| matches!(e,
+                            crate::persistence::native_storage_admission::NativeStorageFailure::AllocatorFailed { layout, .. } if *layout == receipt)))));
+            assert_eq!(count, 0);
+        } else {
+            assert!(matches!(&result, Err(redb::StorageError::Native(
+                redb::NativeColdReadError::AllocatorFailed { layout, .. })) if *layout == node_layout));
             assert_eq!(
-                NULL_REQUEST.with(std::cell::Cell::get),
-                (
-                    refused.size(),
-                    refused.align(),
-                    target.size() + receipt.size()
-                ),
-                "the actual null request observes both original child invoices already paid"
+                count, 1,
+                "only the authentic receipt was allocated then freed"
             );
-            if receipt_null {
-                assert!(matches!(&result, Err(redb::StorageError::Native(
-                    redb::NativeColdReadError::AdmissionRefusedAt(owner))) if owner.inspect_failure(|failure|
-                        failure.and_then(|e| e.downcast_ref::<crate::persistence::native_storage_admission::NativeStorageFailure>())
-                            .is_some_and(|e| matches!(e,
-                                crate::persistence::native_storage_admission::NativeStorageFailure::AllocatorFailed { layout, .. } if *layout == receipt)))));
-                assert_eq!(count, 0);
-            } else {
-                assert!(matches!(&result, Err(redb::StorageError::Native(
-                    redb::NativeColdReadError::AllocatorFailed { layout, .. })) if *layout == target));
-                assert_eq!(
-                    count, 1,
-                    "only the authentic receipt was allocated then freed"
-                );
-                assert_eq!(
-                    (requests[0].1, requests[0].2),
-                    (receipt.size(), receipt.align())
-                );
-                let paid = before + target.size() + receipt.size();
-                assert_eq!(
-                    source_free_for_test(1)[0],
-                    (paid, paid, 1),
-                    "actual failed target releases its real receipt only after its physical free"
-                );
-            }
-            disarm_source_free_watch();
-            assert_eq!(reader.used(), before);
-            assert_eq!(ScanAllowance::current_node_for_test(), 0);
-            drop(result);
-            drop(allowance);
-            reader.finish();
+            assert_eq!(
+                (requests[0].1, requests[0].2),
+                (receipt.size(), receipt.align())
+            );
+            let paid = before + node_layout.size() + receipt.size();
+            assert_eq!(
+                source_free_for_test(1)[0],
+                (paid, paid, 1),
+                "actual failed node releases its real receipt only after its physical free"
+            );
         }
+        disarm_source_free_watch();
+        assert_eq!(reader.used(), before);
+        assert_eq!(ScanAllowance::current_node_for_test(), 0);
+        drop(result);
+        drop(allowance);
+        reader.finish();
     }
 }
 
 // A/B/A creates three distinct entries; current-node helpers must NOT move or
 // allocate nodes. All six unlink permutations exercise interior and tail cuts.
+// Native entries draw on no fixed growth allowance: the shared cache's own
+// capacity bounds their working set, proved by its separate guards.
 #[test]
 #[serial]
-fn native_scan_nested_helpers_and_every_drop_order_share_monotone_allowances() {
+fn native_scan_nested_helpers_and_every_drop_order_retain_the_original_admission() {
     std::thread::spawn(|| {
+        let entry_cost = ScanAllowance::node_layout_for_test().size()
+            + StorageAdmissionScope::receipt_layout_for_scan_test().size();
         for order in [
             [0, 1, 2],
             [0, 2, 1],
@@ -341,8 +386,9 @@ fn native_scan_nested_helpers_and_every_drop_order_share_monotone_allowances() {
             [2, 1, 0],
         ] {
             let reader = Reader::new(1 << 20);
-            let a = reader.allowance();
-            let b = reader.allowance();
+            let standing = reader.used();
+            let a = construct_with_no_allocation(&reader);
+            let b = construct_with_no_allocation(&reader);
             let mut guards = [None, None, None];
             for (index, allowance) in [&a, &b, &a].into_iter().enumerate() {
                 let (guard, requests, count, credit) =
@@ -361,6 +407,7 @@ fn native_scan_nested_helpers_and_every_drop_order_share_monotone_allowances() {
             assert_ne!(nodes[0], nodes[1]);
             assert_ne!(nodes[0], nodes[2]);
             assert_ne!(nodes[1], nodes[2]);
+            assert_eq!(reader.used(), standing + 3 * entry_cost);
             let before = reader.used();
             let ((helper, ()), _, count, _) = capture(&reader, || {
                 (
@@ -368,7 +415,10 @@ fn native_scan_nested_helpers_and_every_drop_order_share_monotone_allowances() {
                     redb::with_scan_reads(|| {
                         redb::with_scan_reads(|| {
                             assert_eq!(ScanAllowance::current_node_for_test(), nodes[2]);
-                            assert!(ScanAllowance::take_current_growth_for_test(16 * 1024));
+                            assert!(
+                                !ScanAllowance::take_current_growth_for_test(1),
+                                "a native entry draws on no fixed growth allowance"
+                            );
                         })
                     }),
                 )
@@ -378,36 +428,42 @@ fn native_scan_nested_helpers_and_every_drop_order_share_monotone_allowances() {
                 "ordinary nested redb body helpers allocate no scan controls"
             );
             assert_eq!(reader.used(), before);
-            assert_eq!(a.remaining_for_test(), 0);
-            assert_eq!(b.remaining_for_test(), 16 * 1024);
-            assert!(!ScanAllowance::take_current_growth_for_test(1));
             drop(helper);
-            let mut b_debits = 0;
-            for index in order {
+            for (dropped, index) in order.into_iter().enumerate() {
                 drop(guards[index].take());
                 let expected = (0..3)
                     .rev()
                     .find(|i| guards[*i].is_some())
                     .map_or(0, |i| nodes[i]);
-                assert_eq!(ScanAllowance::current_node_for_test(), expected);
-                if expected == nodes[1] {
-                    assert!(ScanAllowance::take_current_growth_for_test(1));
-                    b_debits += 1;
-                } else {
-                    assert!(!ScanAllowance::take_current_growth_for_test(1));
-                }
-                assert_eq!(a.remaining_for_test(), 0, "unlink never replenishes A");
-                assert_eq!(b.remaining_for_test(), 16 * 1024 - b_debits);
+                assert_eq!(
+                    ScanAllowance::current_node_for_test(),
+                    expected,
+                    "the innermost live node is current again"
+                );
+                assert!(!ScanAllowance::take_current_growth_for_test(1));
+                assert_eq!(
+                    reader.used(),
+                    standing + (2 - dropped) * entry_cost,
+                    "each unlinked entry returns exactly its own node and receipt to the original payer"
+                );
             }
             assert_eq!(ScanAllowance::current_node_for_test(), 0);
-            let ((), _, count, _) = capture(&reader, || {
-                let _resumed = a.try_enter_native().unwrap();
+            let (resumed, requests, count, _) = capture(&reader, || {
+                let resumed = a.try_enter_native().unwrap();
+                assert_eq!(reader.used(), standing + entry_cost);
                 assert!(!ScanAllowance::take_current_growth_for_test(1));
+                resumed.allocation_observation_for_test()
             });
             assert_eq!(
                 count, 2,
                 "one receipt/node only, no retained TLS Vec backing"
             );
+            assert_eq!(
+                (requests[0].0, requests[1].0),
+                (resumed.2, resumed.0),
+                "the resumed entry allocates its own fresh receipt and node"
+            );
+            assert_eq!(reader.used(), standing);
             drop((a, b));
             reader.finish();
         }
@@ -415,8 +471,8 @@ fn native_scan_nested_helpers_and_every_drop_order_share_monotone_allowances() {
         // entry: an uncharged TLS buffer created/retained during cleanup must
         // fail the physical live-byte census, even if all invoices refund.
         let reader = Reader::new(1 << 20);
-        let a = reader.allowance();
-        let b = reader.allowance();
+        let a = construct_with_no_allocation(&reader);
+        let b = construct_with_no_allocation(&reader);
         let before = reader.used();
         let ((), _, count) = native_requests_for_test(|| {
             let outer = a.try_enter_native().unwrap();
@@ -462,16 +518,10 @@ fn native_scan_error_and_unwind_restore_scope_and_physically_free_entries() {
         let parent = reader.parent.clone();
         let child = reader.child.clone(); // keeps ONLY the sampled child alive
         let child_control = parent.retained_bytes_for_test() as usize - reader.used();
-        let scope = reader.scope.allocation_observation_for_scan_test();
-        let scope_cost = scope.1.size();
+        let scope = scope_control(&reader);
+        let scope_cost = scope.1;
         assert_eq!(reader.used(), scope_cost);
-        let (allowance, counter_requests, count, credit) = capture(&reader, || reader.allowance());
-        pair(
-            &reader,
-            &counter_requests[..count],
-            allowance.allocation_observation_for_test(),
-            &credit,
-        );
+        let allowance = construct_with_no_allocation(&reader);
         let (guard, node_requests, count, credit) =
             capture(&reader, || allowance.try_enter_native().unwrap());
         pair(
@@ -480,13 +530,7 @@ fn native_scan_error_and_unwind_restore_scope_and_physically_free_entries() {
             guard.allocation_observation_for_test(),
             &credit,
         );
-        let all = [
-            (scope.0, scope.1.size(), scope.1.align()),
-            counter_requests[0],
-            counter_requests[1],
-            node_requests[0],
-            node_requests[1],
-        ];
+        let all = [scope, node_requests[0], node_requests[1]];
         // Scope was created outside the measured window. Its exact pointer and
         // actual allocator header still bind its physical free, including window 0.
         watch_exact_frees_for_test(&all, reader.counter);
@@ -513,27 +557,18 @@ fn native_scan_error_and_unwind_restore_scope_and_physically_free_entries() {
         }
         assert!(!redb::native_storage_active());
         assert_eq!(ScanAllowance::current_node_for_test(), 0);
-        let free = source_free_for_test(5);
-        let counter_cost = all[1].1 + all[2].1;
-        let node_cost = all[3].1 + all[4].1;
-        // The last node owns the last counter clone. Its physical free comes
-        // first; its counter dies while the node invoice is still retained.
-        let peak = scope_cost + counter_cost + node_cost;
-        assert_eq!(free[4], (peak, peak, 1));
+        let free = source_free_for_test(3);
+        let node_cost = all[1].1 + all[2].1;
+        // The node frees first and its receipt follows while both of its
+        // invoices remain; the original admission control frees last, under
+        // its own invoice, once no captured holder remains.
+        let peak = scope_cost + node_cost;
         assert_eq!(free[2], (peak, peak, 1));
         assert_eq!(free[1], (peak, peak, 1));
-        assert_eq!(free[3], (scope_cost + node_cost, scope_cost + node_cost, 1));
         assert_eq!(free[0], (scope_cost, scope_cost, 1));
         assert_eq!(parent.retained_bytes_for_test() as usize, child_control);
         disarm_source_free_watch();
-        drop(child);
-        assert_eq!(
-            parent.retained_bytes_for_test(),
-            crate::vector_read_memory::native_control_layouts_for_test()
-                .0
-                .size() as u64
-        );
-        parent.assert_final_root_free_for_test();
+        finish_parts(parent, child);
     }
 }
 
@@ -542,10 +577,10 @@ fn native_scan_error_and_unwind_restore_scope_and_physically_free_entries() {
 // setup allocation falls inside either node measurement window.
 #[test]
 #[serial]
-fn native_scan_threads_share_one_counter_and_resume_after_first_thread_entry_drops() {
+fn native_scan_threads_share_one_captured_admission_and_resume_after_first_thread_entry_drops() {
     for first in [0, 1] {
         let reader = Reader::new(1 << 20);
-        let allowance = reader.allowance();
+        let allowance = construct_with_no_allocation(&reader);
         let standing = reader.used();
         let start = Arc::new(Barrier::new(3));
         let staged = Arc::new(Barrier::new(2));
@@ -567,8 +602,8 @@ fn native_scan_threads_share_one_counter_and_resume_after_first_thread_entry_dro
             let counter = reader.counter;
             std::thread::spawn(move || {
                 start.wait();
-                // Serialize allocation observation only: both genuine entries remain
-                // alive together at consume, and both contend on the SAME counter.
+                // Serialize allocation observation only: both genuine entries
+                // remain alive together, both paid from the SAME captured admission.
                 if index == 1 {
                     staged.wait();
                 }
@@ -596,11 +631,14 @@ fn native_scan_threads_share_one_counter_and_resume_after_first_thread_entry_dro
                 observe.wait();
                 release.wait();
                 consume.wait();
-                let took = ScanAllowance::take_current_growth_for_test(8 * 1024);
+                // Both entries are live together; each is its own thread's
+                // current node and draws on no fixed growth allowance.
+                let current = ScanAllowance::current_node_for_test();
+                let own_current = guard
+                    .as_ref()
+                    .is_some_and(|guard| guard.allocation_observation_for_test().0 == current);
+                let no_growth = !ScanAllowance::take_current_growth_for_test(1);
                 consume.wait();
-                let remaining = a.remaining_for_test();
-                let exhausted = !ScanAllowance::take_current_growth_for_test(1);
-                // Both entries were simultaneously live and consumed concurrently.
                 // Stage only physical cleanup, so another thread's legitimate
                 // refund cannot obscure either side of the exact System.free cut.
                 if index != first {
@@ -611,8 +649,10 @@ fn native_scan_threads_share_one_counter_and_resume_after_first_thread_entry_dro
                     cleanup.wait();
                 }
                 let tail = ScanAllowance::current_node_for_test();
+                let native_left = redb::native_storage_active();
+                drop(a);
                 drop(child);
-                (valid, took, remaining, exhausted, tail)
+                (valid, own_current, no_growth, tail, native_left)
             })
         });
         start.wait();
@@ -628,7 +668,7 @@ fn native_scan_threads_share_one_counter_and_resume_after_first_thread_entry_dro
         // producer must fail a proof without stranding its sibling at a barrier.
         let outcomes = handles.map(|handle| handle.join());
         for outcome in outcomes {
-            assert_eq!(outcome.unwrap(), (true, true, 0, true, 0));
+            assert_eq!(outcome.unwrap(), (true, true, true, 0, false));
         }
         assert_eq!(
             reader.used(),
@@ -651,13 +691,16 @@ fn native_scan_threads_share_one_counter_and_resume_after_first_thread_entry_dro
             watched[0][1].0, watched[1][1].0,
             "simultaneously live thread-bound nodes differ"
         );
-        assert_eq!(allowance.remaining_for_test(), 0);
-        let clone = allowance.clone();
+        // A continuation admits a fresh paid entry from the same captured
+        // admission after the threads' entries are gone.
+        let (clone, _, count, _) = capture(&reader, || allowance.clone());
+        assert_eq!(count, 0);
         let ((), _, count) = native_requests_for_test(|| {
             let _guard = clone.try_enter_native().unwrap();
             assert!(!ScanAllowance::take_current_growth_for_test(1));
         });
         assert_eq!(count, 2);
+        assert_eq!(reader.used(), standing);
         drop((allowance, clone));
         reader.finish();
     }
