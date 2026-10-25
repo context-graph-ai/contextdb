@@ -309,12 +309,27 @@ session ceiling is declared, and
 reservations. An explicit percent applies to `B - F`. There is no fixed byte cap.
 `read_cache_share_status()` inspects the declared percent, default percent,
 budget, fixed reservation, cache capacity and effective percent of the complete
-budget. `ReadSession::set_read_cache_share` changes the declaration at a statement
-boundary, without reopening or changing its snapshot. Growth is admitted before
+budget. The file reader's admitted read root now follows the session's declared
+`memory_limit`, falling back to `limits.memory` when no session limit is declared.
+For example, `memory_limit = 1 GiB` with the shipped 16 MiB `limits.memory` gives
+the file reader a 1 GiB root for loaded state and cache; previously that root was
+bounded by 16 MiB. Each statement remains bounded by `limits.memory`.
+
+`ReadSession::set_read_cache_share` changes capacity immediately under the cache
+insertion lock, without reopening or changing its snapshot. Growth is admitted before
 publication; shrink retires entries while cursor-held backing keeps its invoice
 until final physical release. Zero disables file page caching; 100 selects the
-whole remainder and is still subject to total admission. `None` restores the
-derived default. A refused change keeps the previous declaration and capacity.
+whole remainder and is still subject to total admission. A 100% declaration is
+valid, but a file open or resize then refuses it when the reservation consumes
+all B and leaves no room for the prepaid index and decoded state. `None` restores
+the derived default. A refused change keeps the previous declaration and capacity.
+
+On the owner route, inspection reports the session's formula values for its file
+cache policy, with `prepaid_index_bytes` and `held_page_bytes` both `None`; it does
+not report or resize the writer's shared cache. The owner route can retain a 100%
+declaration without allocating a file cache; a later file open must still pass
+total admission. Lazy owner-cursor continuations and newly selected file readers
+resolve the session's current declaration when they open.
 
 The native index slots are prepaid for the maximum selectable capacity `B - F`
 and reused across changes. Session inspection reports `prepaid_index_bytes`,

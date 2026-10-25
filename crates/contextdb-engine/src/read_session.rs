@@ -787,6 +787,9 @@ pub struct ReadRouteResourceSnapshot {
 /// What one selected route is holding, counted as it is actually used.
 #[derive(Default)]
 struct RouteResources {
+    // Zero means undeclared; a declared percent is encoded as percent + 1.
+    // The existing shared route control outlives every owner continuation.
+    read_cache_share: std::sync::atomic::AtomicU8,
     expiry: SessionExpiry,
     channel_identity: Mutex<Option<ChannelAddress>>,
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
@@ -877,6 +880,20 @@ impl SessionExpiry {
 }
 
 impl RouteResources {
+    fn current_read_cache_share(&self) -> Option<u8> {
+        self.read_cache_share
+            .load(std::sync::atomic::Ordering::Acquire)
+            .checked_sub(1)
+    }
+
+    fn publish_read_cache_share(&self, percent: Option<u8>) {
+        // Both public construction and mutation validate 0..=100 first.
+        self.read_cache_share.store(
+            percent.map_or(0, |percent| percent + 1),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
     fn note_channel_operation(&self) {
         self.local_channel_operations
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1742,7 +1759,7 @@ fn open_direct_route(
         options.principal.clone(),
     );
     config.memory_limit = options.memory_limit;
-    config.read_cache_share = options.read_cache_share;
+    config.read_cache_share = resources.current_read_cache_share();
     config.runtime_dir = coordination_runtime;
     match crate::direct_file_reader::DirectFileReader::open(path, config) {
         Ok(reader) => {
@@ -1987,7 +2004,6 @@ pub(crate) fn session_kernel_probe_for_test()
 pub struct ReadSession {
     route: ReadRoute,
     options: ReadSessionOptions,
-    read_cache_share: std::sync::atomic::AtomicU8,
     cache_policy_mutation: Mutex<()>,
     /// The runtime directory this session was opened against, when an operator
     /// supplied one. Kept because the session goes on asking the same
@@ -2775,6 +2791,7 @@ impl ReadSession {
         // established typed missing-store answer.
         let canonical_path = resolved_route_path(path)?;
         let resources = Arc::new(RouteResources::default());
+        resources.publish_read_cache_share(options.read_cache_share);
         #[cfg(any(test, feature = "test-seams"))]
         let observed = session_observer.clone();
         let observe = move |event: ReadSessionEvent| {
@@ -2837,9 +2854,6 @@ impl ReadSession {
         observe(ReadSessionEvent::RouteSelected(route));
         Ok(Self {
             route,
-            read_cache_share: std::sync::atomic::AtomicU8::new(
-                options.read_cache_share.unwrap_or(u8::MAX),
-            ),
             cache_policy_mutation: Mutex::new(()),
             options,
             runtime_dir,
@@ -2860,7 +2874,6 @@ impl ReadSession {
     pub(crate) fn from_live_database(database: Database, limits: ReadLimits) -> Self {
         Self {
             route: ReadRoute::Owner,
-            read_cache_share: std::sync::atomic::AtomicU8::new(u8::MAX),
             cache_policy_mutation: Mutex::new(()),
             options: ReadSessionOptions {
                 limits,
@@ -2905,7 +2918,6 @@ impl ReadSession {
         observer.observe_event(ReadSessionEvent::RouteSelected(ReadRoute::Owner));
         Self {
             route: ReadRoute::Owner,
-            read_cache_share: std::sync::atomic::AtomicU8::new(u8::MAX),
             cache_policy_mutation: Mutex::new(()),
             options: ReadSessionOptions {
                 limits,
@@ -2948,7 +2960,6 @@ impl ReadSession {
     ) -> Self {
         Self {
             route: ReadRoute::Owner,
-            read_cache_share: std::sync::atomic::AtomicU8::new(u8::MAX),
             cache_policy_mutation: Mutex::new(()),
             options: ReadSessionOptions {
                 limits,
@@ -3020,16 +3031,9 @@ impl ReadSession {
         self.runtime_dir.as_deref()
     }
 
-    fn current_read_cache_share(&self) -> Option<u8> {
-        let share = self
-            .read_cache_share
-            .load(std::sync::atomic::Ordering::Acquire);
-        (share != u8::MAX).then_some(share)
-    }
-
     pub fn options(&self) -> ReadSessionOptions {
         let mut options = self.options.clone();
-        options.read_cache_share = self.current_read_cache_share();
+        options.read_cache_share = self.resources.current_read_cache_share();
         options
     }
 
@@ -3047,7 +3051,7 @@ impl ReadSession {
         status
     }
 
-    /// Change the file-cache share at this statement boundary without reopening
+    /// Change the file-cache share immediately without reopening
     /// the pinned snapshot. Growth is admitted before publication. Shrink retires
     /// entries while cursor-held backing remains funded through its final free.
     /// None restores default (14%); values outside 0..=100 leave policy unchanged.
@@ -3070,10 +3074,7 @@ impl ReadSession {
             options.read_cache_share = percent;
             reader.select_cache_capacity(options.read_cache_share_status().effective_bytes)?;
         }
-        self.read_cache_share.store(
-            percent.unwrap_or(u8::MAX),
-            std::sync::atomic::Ordering::Release,
-        );
+        self.resources.publish_read_cache_share(percent);
         Ok(())
     }
 
@@ -3667,7 +3668,6 @@ impl ReadSession {
                                 self.options.principal.clone(),
                             );
                             config.memory_limit = self.options.memory_limit;
-                            config.read_cache_share = self.current_read_cache_share();
                             config.runtime_dir = Some(owner.runtime_dir.clone());
                             let retained_bytes =
                                 crate::executor::bounded::cursor_statement_bytes(sql, params)
@@ -5507,6 +5507,7 @@ impl OwnerCursorContinuation {
         &mut self,
         rows: Option<NonZeroUsize>,
         cancellation: &OwnerReadCancellation,
+        resources: &RouteResources,
     ) -> Result<ObservedCursorPage> {
         crate::executor::bounded::cursor_replay_checkpoint().map_err(read_error)?;
         if rows.is_some_and(|rows| rows.get() as u64 > self.config.limits.result_rows) {
@@ -5528,6 +5529,9 @@ impl OwnerCursorContinuation {
                 .ok_or_else(|| Error::ReadFailure(owner_disconnected()))?
                 .retain_owner_snapshot();
             let mut config = self.config.clone();
+            // The cursor may have opened before the session changed its share.
+            // Resolve the live declaration only when this reader is created.
+            config.read_cache_share = resources.current_read_cache_share();
             let available = usize::try_from(config.limits.memory)
                 .unwrap_or(usize::MAX)
                 .min(config.memory_limit.unwrap_or(usize::MAX))
@@ -5696,7 +5700,7 @@ impl OwnerCursorExecution {
                 self.continuation
                     .as_mut()
                     .unwrap()
-                    .fetch(rows, cancellation)
+                    .fetch(rows, cancellation, &self.resources)
             },
         );
         if fetched.is_err() {
