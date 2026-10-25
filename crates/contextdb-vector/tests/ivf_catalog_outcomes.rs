@@ -164,7 +164,8 @@ fn deletion_and_replacement_during_build_and_prepared_remap_do_not_resurrect_row
     let mut state = i.begin_build(0).unwrap();
     let mut source = (0..16).map(|n| (n, vector(n)));
     i.ingest_batch(&mut state, &mut source).unwrap();
-    i.delete_slot(0, 3).unwrap();
+    let identity = i.current_row_identity(0, 3).unwrap().unwrap();
+    i.delete_row(0, identity).unwrap();
     i.commit_insert(Vector {
         partition: 0,
         row: 9,

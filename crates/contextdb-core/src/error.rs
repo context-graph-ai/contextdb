@@ -980,6 +980,10 @@ pub enum Error {
     ImmutableColumn { table: String, column: String },
     #[error("invalid state transition: {0}")]
     InvalidStateTransition(String),
+
+    /// A conditional row mutation no longer names the current committed version.
+    #[error("stale row version: expected LSN {expected}, current {current:?}")]
+    StaleRowVersion { expected: u64, current: Option<u64> },
     #[error("conditional update conflict: {count} staged update(s) no longer matched at commit")]
     ConditionalUpdateConflict { count: u64 },
     #[error("propagation aborted: {table}.{column} transition {from} -> {to} is invalid")]

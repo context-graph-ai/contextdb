@@ -20,13 +20,74 @@ pub fn search(
     mode: Mode,
     output: &mut [Hit],
 ) -> Result<(usize, Work)> {
+    let mut work = Work::default();
+    let n = search_with_work(
+        source, policy, owner, query, contexts, mode, output, &mut work,
+    )?;
+    Ok((n, work))
+}
+/// Keeps actual work readable even on refusal/cancellation and includes failed indexed attempts.
+#[allow(clippy::too_many_arguments)]
+pub fn search_with_work(
+    source: &impl ReadPages,
+    policy: Policy,
+    owner: &MemoryBudgetOwner,
+    query: &[f32],
+    contexts: Option<&[u64]>,
+    mode: Mode,
+    output: &mut [Hit],
+    work: &mut Work,
+) -> Result<usize> {
+    *work = Work::default();
+    let tracked = super::page_work::Tracked::new(source);
+    let attempted = search_impl(
+        &tracked,
+        policy,
+        owner,
+        query,
+        contexts,
+        if mode == Mode::Auto {
+            Mode::Indexed
+        } else {
+            mode
+        },
+        output,
+        work,
+    );
+    let result = match attempted {
+        Err(contextdb_core::Error::StoreCorrupted { .. }) if mode == Mode::Auto => search_impl(
+            &tracked,
+            policy,
+            owner,
+            query,
+            contexts,
+            Mode::Exact,
+            output,
+            work,
+        ),
+        result => result,
+    };
+    tracked.apply(work);
+    result
+}
+#[allow(clippy::too_many_arguments)]
+fn search_impl(
+    source: &impl ReadPages,
+    policy: Policy,
+    owner: &MemoryBudgetOwner,
+    query: &[f32],
+    contexts: Option<&[u64]>,
+    mode: Mode,
+    output: &mut [Hit],
+    work: &mut Work,
+) -> Result<usize> {
     if query.len() != policy.dimensions {
         return Err(dimension(source, policy.dimensions, query.len()));
     }
     source.check_cancel()?;
     let k = output.len();
     if k == 0 {
-        return Ok((0, Work::default()));
+        return Ok(0);
     }
     let depth = policy.rerank.max(k);
     let raw_bytes = policy
@@ -43,7 +104,8 @@ pub fn search(
             x.checked_add(
                 PAGE_BYTES * 12
                     + std::mem::size_of::<blake3::Hasher>()
-                    + std::mem::size_of::<Catalog>() * 2,
+                    + std::mem::size_of::<Catalog>() * 2
+                    + std::mem::size_of::<Work>(),
             )
         })
         .ok_or_else(overflow)?;
@@ -68,14 +130,17 @@ pub fn search(
                 .clamp(-127.0, 127.0) as i8
         };
     }
-    let mut work = Work::default();
     let mut visit = |partition| -> Result<()> {
         let Some(m) = source.manifest(partition)? else {
             return Ok(());
         };
         validate(source, m, policy)?;
         let c = Catalog::load(source, m)?;
-        work.catalog_pages_read += 1;
+        if mode == Mode::Indexed
+            && let Some(key) = c.unserviceable
+        {
+            return Err(super::memory::corrupt_page(key));
+        }
         // At most two codebooks in state B, visited sequentially under whole-object funding.
         for old in [false, true] {
             let manifest = if old {
@@ -92,12 +157,12 @@ pub fn search(
             let mut vis_loaded = None;
             let mut metadata = MetadataWindow::new(source, manifest);
             let mut canonical = CanonicalWindow::new(source, manifest);
-            if mode == Mode::Exact || manifest.active_lists == 0 {
+            if mode == Mode::Exact || manifest.active_lists == 0 || (old && c.legacy_unserviceable)
+            {
                 if old {
                     let mut id = c.legacy_first;
                     for _ in 0..c.legacy_runs {
                         let run = Run::load(source, manifest, id)?;
-                        work.catalog_pages_read += 1;
                         let mut slot = run.first;
                         for _ in 0..run.entries {
                             source.check_cancel()?;
@@ -110,7 +175,6 @@ pub fn search(
                                     slot,
                                     &mut visibility,
                                     &mut vis_loaded,
-                                    &mut work,
                                 )?
                             {
                                 score_exact(
@@ -124,7 +188,7 @@ pub fn search(
                                     &mut values,
                                     &mut candidates,
                                     depth,
-                                    &mut work,
+                                    work,
                                 )?;
                             }
                             slot = e.next;
@@ -145,7 +209,6 @@ pub fn search(
                                 slot,
                                 &mut visibility,
                                 &mut vis_loaded,
-                                &mut work,
                             )?
                         {
                             continue;
@@ -162,13 +225,12 @@ pub fn search(
                             &mut values,
                             &mut candidates,
                             depth,
-                            &mut work,
+                            work,
                         )?;
                     }
                 }
             } else {
                 let book = Codebook::load_values(owner, source, manifest)?;
-                work.codebook_pages_read += book.pages_read();
                 for list in 0..manifest.active_lists {
                     source.check_cancel()?;
                     source.before_distance(DistanceKind::Centroid)?;
@@ -189,20 +251,18 @@ pub fn search(
                     let roots = if old {
                         c.legacy_runs
                     } else {
-                        current_catalog.runs + 1
+                        current_catalog.runs.checked_add(1).ok_or_else(corrupt)?
                     };
                     for root in 0..roots {
                         let mut view = manifest;
                         view.run = id;
                         let run = if id != 0 {
                             let r = Run::load(source, manifest, id)?;
-                            work.catalog_pages_read += 1;
                             Some(r)
                         } else {
                             None
                         };
                         let d = codec::directory(source, view, *list)?;
-                        work.directory_pages_read += 1;
                         let mut remaining = d.count;
                         let mut page_id = d.head;
                         while remaining > 0 {
@@ -217,9 +277,7 @@ pub fn search(
                             {
                                 return Err(corrupt());
                             }
-                            work.list_pages_read += 1;
                             let used = list_page_used(source, manifest, *list, page_id)?;
-                            work.list_link_pages_read += 1;
                             let stride = 16 + policy.dimensions;
                             if used == 0 || used > PAGE_BYTES / stride || used as u64 > remaining {
                                 return Err(corrupt());
@@ -246,7 +304,6 @@ pub fn search(
                                     slot,
                                     &mut visibility,
                                     &mut vis_loaded,
-                                    &mut work,
                                 )? {
                                     continue;
                                 }
@@ -278,7 +335,6 @@ pub fn search(
                             remaining -= used as u64;
                             if remaining > 0 {
                                 page_id = codec::next_list_page(source, manifest, *list, page_id)?;
-                                work.list_link_pages_read += 1;
                             }
                         }
                         id = if old {
@@ -308,15 +364,7 @@ pub fn search(
                 if !old {
                     for seq in c.tail_head..c.tail_end {
                         let slot = tail_slot(source, manifest, seq)?;
-                        work.tail_pages_read += 1;
-                        if !is_visible(
-                            source,
-                            manifest,
-                            slot,
-                            &mut visibility,
-                            &mut vis_loaded,
-                            &mut work,
-                        )? {
+                        if !is_visible(source, manifest, slot, &mut visibility, &mut vis_loaded)? {
                             continue;
                         }
                         score_exact(
@@ -330,13 +378,11 @@ pub fn search(
                             &mut values,
                             &mut candidates,
                             depth,
-                            &mut work,
+                            work,
                         )?;
                     }
                 }
             }
-            work.canonical_pages_read += canonical.pages;
-            work.slot_metadata_pages_read += metadata.pages;
             for candidate in &candidates {
                 retain_best(&mut merged, k, *candidate);
             }
@@ -362,7 +408,7 @@ pub fn search(
             distance: src.distance,
         };
     }
-    Ok((merged.len(), work))
+    Ok(merged.len())
 }
 fn validate(source: &impl ReadPages, m: Manifest, p: Policy) -> Result<()> {
     if m.dimensions != p.dimensions {
@@ -424,13 +470,8 @@ fn is_visible(
     slot: u64,
     page: &mut [u8; PAGE_BYTES],
     loaded: &mut Option<u64>,
-    work: &mut Work,
 ) -> Result<bool> {
-    let before = *loaded;
     let result = codec::visible(s, m, slot, page, loaded)?;
-    if before != *loaded {
-        work.visibility_pages_read += 1;
-    }
     Ok(result)
 }
 struct MetadataWindow<'a, S> {
@@ -438,7 +479,6 @@ struct MetadataWindow<'a, S> {
     manifest: Manifest,
     page: [u8; PAGE_BYTES],
     loaded: Option<u64>,
-    pages: u64,
 }
 impl<'a, S: ReadPages> MetadataWindow<'a, S> {
     fn new(source: &'a S, manifest: Manifest) -> Self {
@@ -447,12 +487,11 @@ impl<'a, S: ReadPages> MetadataWindow<'a, S> {
             manifest,
             page: [0; PAGE_BYTES],
             loaded: None,
-            pages: 0,
         }
     }
     fn entry(&mut self, slot: u64) -> Result<Entry> {
         let mut raw = [0; 40];
-        let mut offset = slot.checked_mul(40).ok_or_else(overflow)?;
+        let mut offset = slot.checked_mul(40).ok_or_else(corrupt)?;
         let mut out = &mut raw[..];
         while !out.is_empty() {
             let ordinal = offset / PAGE_BYTES as u64;
@@ -466,13 +505,12 @@ impl<'a, S: ReadPages> MetadataWindow<'a, S> {
                     return Err(corrupt());
                 }
                 self.loaded = Some(ordinal);
-                self.pages += 1;
             }
             let at = (offset % PAGE_BYTES as u64) as usize;
             let n = out.len().min(PAGE_BYTES - at);
             out[..n].copy_from_slice(&self.page[at..at + n]);
             out = &mut out[n..];
-            offset += n as u64;
+            offset = offset.checked_add(n as u64).ok_or_else(corrupt)?;
         }
         let w = |i: usize| -> Result<u64> {
             Ok(u64::from_le_bytes(
@@ -496,7 +534,6 @@ struct CanonicalWindow<'a, S> {
     manifest: Manifest,
     page: [u8; PAGE_BYTES],
     loaded: Option<u64>,
-    pages: u64,
 }
 impl<'a, S: ReadPages> CanonicalWindow<'a, S> {
     fn new(source: &'a S, manifest: Manifest) -> Self {
@@ -505,11 +542,10 @@ impl<'a, S: ReadPages> CanonicalWindow<'a, S> {
             manifest,
             page: [0; PAGE_BYTES],
             loaded: None,
-            pages: 0,
         }
     }
     fn vector(&mut self, slot: u64, raw: &mut [u8], values: &mut [f32]) -> Result<u64> {
-        let mut offset = slot.checked_mul(raw.len() as u64).ok_or_else(overflow)?;
+        let mut offset = slot.checked_mul(raw.len() as u64).ok_or_else(corrupt)?;
         let mut out = &mut *raw;
         while !out.is_empty() {
             let ordinal = offset / PAGE_BYTES as u64;
@@ -524,13 +560,12 @@ impl<'a, S: ReadPages> CanonicalWindow<'a, S> {
                 }
                 self.source.check_cancel()?;
                 self.loaded = Some(ordinal);
-                self.pages += 1;
             }
             let at = (offset % PAGE_BYTES as u64) as usize;
             let n = out.len().min(PAGE_BYTES - at);
             out[..n].copy_from_slice(&self.page[at..at + n]);
             out = &mut out[n..];
-            offset += n as u64;
+            offset = offset.checked_add(n as u64).ok_or_else(corrupt)?;
         }
         let row = u64::from_le_bytes(raw[..8].try_into().map_err(|_| corrupt())?);
         for (i, v) in values.iter_mut().enumerate() {

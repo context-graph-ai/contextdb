@@ -4,11 +4,21 @@ use super::{
     codec,
     memory::{Invoice, corrupt, dimension, overflow, phase},
     storage::{BuildPhase, BuildState, Manifest, PageKind, PageStore, ReadPages, WritePages},
-    types::{BufferState, Policy, TrainingPolicy, Vector},
+    types::{BufferState, Policy, RowIdentity, TrainingPolicy, Vector},
     versions::Version,
 };
 use crate::MemoryBudgetOwner;
 use contextdb_core::Result;
+pub(crate) const CONTROL_PAGES: usize = 15;
+pub(crate) const DIRECTORY_PAGES: usize = 10;
+pub(crate) fn coalesce_control_pages(m: Manifest) -> Result<usize> {
+    let maps = u64::from(m.lists)
+        .div_ceil((super::storage::PAGE_BYTES / 24) as u64)
+        .div_ceil(super::storage::PAGE_BYTES as u64 * 8);
+    CONTROL_PAGES
+        .checked_add(usize::try_from(maps).map_err(|_| corrupt())?)
+        .ok_or_else(corrupt)
+}
 
 /// Bounded writer window over the native committed canonical tail. Search reads
 /// the same native slots, including after this window is evicted/reopened.
@@ -167,6 +177,17 @@ impl<S: PageStore> ClusteredIndex<S> {
                 build.phase
             )));
         }
+        if let Some(current) = self.store.manifest(partition)? {
+            let mut catalog = Catalog::load(&self.store, current)?;
+            if catalog.unserviceable.is_none()
+                && let Some(key) = super::recovery::inspect_damage(&self.store, current, catalog)?
+            {
+                catalog.unserviceable = Some(key);
+                let mut tx = self.store.begin()?;
+                catalog.store(&mut tx, current)?;
+                tx.commit()?;
+            }
+        }
         let source_lsn = self.store.snapshot_lsn()?;
         let serving_at_start = self.store.manifest(partition)?;
         let generation = serving_at_start
@@ -190,8 +211,10 @@ impl<S: PageStore> ClusteredIndex<S> {
             training: self.training,
             serving_at_start,
             source_lsn,
+            publication_coalesce: None,
         };
         let mut tx = self.store.begin()?;
+        codec::init_directory_presence(&mut tx, state.manifest)?;
         Catalog::new(0).store(&mut tx, state.manifest)?;
         tx.stage_build(state)?;
         tx.commit()?;
@@ -202,6 +225,25 @@ impl<S: PageStore> ClusteredIndex<S> {
         &mut self,
         state: &mut BuildState,
         source: &mut impl Iterator<Item = (u64, V)>,
+    ) -> Result<usize> {
+        self.ingest_rows(state, &mut source.map(|(row, v)| (row, None, v)))
+    }
+    /// Native ingestion supplies each row's real committed identity, never F0 as a row LSN.
+    /// Input vectors are finite, as checked by the engine boundary.
+    pub fn ingest_versioned_batch<V: AsRef<[f32]>>(
+        &mut self,
+        state: &mut BuildState,
+        source: &mut impl Iterator<Item = (RowIdentity, V)>,
+    ) -> Result<usize> {
+        self.ingest_rows(
+            state,
+            &mut source.map(|(identity, v)| (identity.row, Some(identity.commit_lsn), v)),
+        )
+    }
+    fn ingest_rows<V: AsRef<[f32]>>(
+        &mut self,
+        state: &mut BuildState,
+        source: &mut impl Iterator<Item = (u64, Option<u64>, V)>,
     ) -> Result<usize> {
         self.check_build_cursor(state)?;
         if state.phase != BuildPhase::Ingest {
@@ -214,7 +256,7 @@ impl<S: PageStore> ClusteredIndex<S> {
         let mut next = *state;
         let mut tx = self.store.begin()?;
         let mut count = 0;
-        for (row, values) in source.take(state.training.ingest_batch_keys) {
+        for (row, source_version, values) in source.take(state.training.ingest_batch_keys) {
             let values = values.as_ref();
             if values.len() != next.manifest.dimensions {
                 return Err(dimension(&tx, next.manifest.dimensions, values.len()));
@@ -235,15 +277,31 @@ impl<S: PageStore> ClusteredIndex<S> {
                 raw,
             )?;
             let mut version = Version::load(&tx, next.manifest, row)?;
-            if let Some(serving) = next.serving_at_start {
-                version.promote(serving.generation);
+            // Compatibility bulk input has explicit genesis0 only when no journal identity exists.
+            let row_lsn = source_version.unwrap_or(version.lsn.unwrap_or(0));
+            if source_version.is_some() && row_lsn > next.source_lsn {
+                return Err(phase(
+                    "clustered Ingest row identity is newer than its pinned source frontier",
+                ));
             }
-            let live = !version.deleted && version.lsn <= next.source_lsn;
+            if version.lsn.is_none() {
+                version.reset(row_lsn, false);
+            }
+            let live = !version.deleted
+                && version.current_lsn() == Some(row_lsn)
+                && row_lsn <= next.source_lsn;
             codec::set_visible(&mut tx, next.manifest, next.manifest.slots, live)?;
-            version.other = Some((next.manifest.generation, next.manifest.slots));
+            if live {
+                version.add_copy(
+                    &mut tx,
+                    next.manifest,
+                    next.manifest.generation,
+                    next.manifest.slots,
+                )?;
+            }
             version.store(&mut tx, next.manifest, row)?;
             Entry {
-                lsn: next.source_lsn,
+                lsn: row_lsn,
                 next: 0,
                 run: 0,
                 tail: u64::MAX,
@@ -265,7 +323,7 @@ impl<S: PageStore> ClusteredIndex<S> {
             let choice = if ordinal < sample_count {
                 ordinal
             } else {
-                random % (ordinal + 1)
+                random % ordinal.checked_add(1).ok_or_else(corrupt)?
             };
             if choice < sample_count {
                 codec::write(
@@ -273,11 +331,11 @@ impl<S: PageStore> ClusteredIndex<S> {
                     next.manifest,
                     PageKind::Reservoir,
                     0,
-                    choice * 8,
+                    choice.checked_mul(8).ok_or_else(corrupt)?,
                     &ordinal.to_le_bytes(),
                 )?;
             }
-            next.manifest.slots += 1;
+            next.manifest.slots = next.manifest.slots.checked_add(1).ok_or_else(corrupt)?;
             count += 1;
         }
         tx.stage_build(next)?;
@@ -334,10 +392,11 @@ impl<S: PageStore> ClusteredIndex<S> {
         let mut tx = self.store.begin()?;
         match state.phase {
             BuildPhase::Seed => {
-                let end = u64::from(manifest.active_lists).min(
-                    next.cursor
-                        .saturating_add(next.training.phase_batch_entries as u64),
-                );
+                let end = super::memory::stored_end(
+                    next.cursor,
+                    u64::from(manifest.active_lists),
+                    next.training.phase_batch_entries as u64,
+                )?;
                 for list in next.cursor..end {
                     let sample_count = manifest.slots.min(next.training.reservoir_samples as u64);
                     let mut hash = blake3::Hasher::new();
@@ -385,10 +444,11 @@ impl<S: PageStore> ClusteredIndex<S> {
             }
             BuildPhase::Train => {
                 let sample_count = manifest.slots.min(next.training.reservoir_samples as u64);
-                let end = sample_count.min(
-                    next.cursor
-                        .saturating_add(next.training.phase_batch_entries as u64),
-                );
+                let end = super::memory::stored_end(
+                    next.cursor,
+                    sample_count,
+                    next.training.phase_batch_entries as u64,
+                )?;
                 for slot in next.cursor..end {
                     let mut saved = [0u8; 8];
                     codec::read(&tx, manifest, PageKind::Reservoir, 0, slot * 8, &mut saved)?;
@@ -399,7 +459,7 @@ impl<S: PageStore> ClusteredIndex<S> {
                 next.cursor = end;
                 next.manifest.codebook = book.store(&mut tx, manifest)?;
                 if end == sample_count {
-                    next.iteration += 1;
+                    next.iteration = next.iteration.checked_add(1).ok_or_else(corrupt)?;
                     next.cursor = 0;
                     if next.iteration == next.training.iterations {
                         next.phase = BuildPhase::Assign;
@@ -407,10 +467,11 @@ impl<S: PageStore> ClusteredIndex<S> {
                 }
             }
             BuildPhase::Assign => {
-                let end = manifest.slots.min(
-                    next.cursor
-                        .saturating_add(next.training.phase_batch_entries as u64),
-                );
+                let end = super::memory::stored_end(
+                    next.cursor,
+                    manifest.slots,
+                    next.training.phase_batch_entries as u64,
+                )?;
                 for slot in next.cursor..end {
                     let row = read_vector(&tx, manifest, slot, raw, values)?;
                     let list = book.nearest(&tx, values)? as u32;
@@ -420,6 +481,13 @@ impl<S: PageStore> ClusteredIndex<S> {
                 if end == manifest.slots {
                     next.manifest.sealed_slots = manifest.slots;
                     next.phase = BuildPhase::Publish;
+                    if let Some(serving) = tx.manifest(manifest.partition)? {
+                        let catalog = Catalog::load(&tx, serving)?;
+                        if catalog.coalesce_output != 0 {
+                            next.publication_coalesce =
+                                Some((serving.generation, catalog.coalesce_output));
+                        }
+                    }
                 }
             }
             BuildPhase::Ingest | BuildPhase::Publish | BuildPhase::Ready => {
@@ -446,14 +514,18 @@ impl<S: PageStore> ClusteredIndex<S> {
     }
     fn publish_ready(&mut self, state: &mut BuildState) -> Result<bool> {
         let partition = state.manifest.partition;
-        if let Some(old) = self.store.manifest(partition)? {
-            let c = Catalog::load(&self.store, old)?;
-            if c.coalesce_output != 0 {
-                // The adapter supplies the resolved declared maintenance page allowance.
-                // Training entry counts never become an implicit page-policy default.
-                let pages = self.policy.coalesce_pages_per_step.ok_or_else(||
-                    phase("clustered Coalesce requires the resolved declared maintenance page allowance"))?;
-                self.advance_coalescing(partition, pages)?;
+        if let Some((generation, blocking)) = state.publication_coalesce
+            && let Some(old) = self.store.manifest(partition)?
+            && old.generation == generation
+            && Catalog::load(&self.store, old)?.coalesce_output == blocking
+        {
+            let pages = self.policy.coalesce_pages_per_step.ok_or_else(|| {
+                phase(
+                    "clustered Coalesce requires the resolved declared maintenance page allowance",
+                )
+            })?;
+            self.advance_coalescing(partition, pages)?;
+            if Catalog::load(&self.store, old)?.coalesce_output == blocking {
                 return Ok(false);
             }
         }
@@ -463,6 +535,11 @@ impl<S: PageStore> ClusteredIndex<S> {
         let mut new_catalog = Catalog::new(next.manifest.slots);
         if let Some(mut old) = tx.manifest(partition)? {
             let mut old_catalog = Catalog::load(&tx, old)?;
+            // Later coalesces cannot delay F1. Their prepared directories remain registered scratch.
+            old_catalog.coalesce_left = 0;
+            old_catalog.coalesce_right = 0;
+            old_catalog.coalesce_output = 0;
+            old_catalog.coalesce_list = 0;
             seal_tail(
                 &mut tx,
                 &self.owner,
@@ -480,6 +557,7 @@ impl<S: PageStore> ClusteredIndex<S> {
                 new_catalog.legacy_runs = old_catalog.runs;
                 new_catalog.frontier = state.source_lsn;
                 new_catalog.switch_lsn = tx.commit_lsn()?;
+                new_catalog.legacy_unserviceable = old_catalog.unserviceable.is_some();
             }
         }
         new_catalog.store(&mut tx, next.manifest)?;
@@ -516,7 +594,51 @@ impl<S: PageStore> ClusteredIndex<S> {
         while !self.advance_build(&mut state)? {}
         Ok(())
     }
+    /// Insert/upsert receives its new row version from the committing native transaction.
+    /// Input vectors must be finite; validation belongs to the engine boundary.
     pub fn commit_insert(&mut self, vector: Vector<'_>) -> Result<()> {
+        self.commit_vector(vector, None).map(|_| ())
+    }
+    pub fn current_row_identity(&self, partition: u64, row: u64) -> Result<Option<RowIdentity>> {
+        self.store.check_cancel()?;
+        let Some(m) = self.store.manifest(partition)? else {
+            return Ok(None);
+        };
+        Ok(Version::load(&self.store, m, row)?
+            .current_lsn()
+            .map(|commit_lsn| RowIdentity { row, commit_lsn }))
+    }
+    pub fn commit_update(
+        &mut self,
+        partition: u64,
+        expected: RowIdentity,
+        values: &[f32],
+    ) -> Result<RowIdentity> {
+        self.commit_vector(
+            Vector {
+                partition,
+                row: expected.row,
+                values,
+            },
+            Some(expected),
+        )
+    }
+    fn commit_vector(
+        &mut self,
+        vector: Vector<'_>,
+        expected: Option<RowIdentity>,
+    ) -> Result<RowIdentity> {
+        if let Some(expected) = expected {
+            let current = self
+                .current_row_identity(vector.partition, expected.row)?
+                .map(|x| x.commit_lsn);
+            if current != Some(expected.commit_lsn) {
+                return Err(contextdb_core::Error::StaleRowVersion {
+                    expected: expected.commit_lsn,
+                    current,
+                });
+            }
+        }
         if vector.values.len() != self.policy.dimensions {
             return Err(dimension(
                 &self.store,
@@ -550,18 +672,14 @@ impl<S: PageStore> ClusteredIndex<S> {
             manifest,
             PageKind::Canonical,
             0,
-            slot.checked_mul(raw.len() as u64).ok_or_else(overflow)?,
+            slot.checked_mul(raw.len() as u64).ok_or_else(corrupt)?,
             raw,
         )?;
         let mut version = Version::load(&tx, manifest, vector.row)?;
         version.invalidate(&mut tx, manifest)?;
-        version.promote(manifest.generation);
-        if version.other.is_some_and(|x| x.0 == manifest.generation) {
-            version.other = None;
-        }
-        version.current = Some((manifest.generation, slot));
-        version.lsn = tx.commit_lsn()?;
-        version.deleted = false;
+        let commit_lsn = tx.commit_lsn()?;
+        version.reset(commit_lsn, false);
+        version.add_copy(&mut tx, manifest, manifest.generation, slot)?;
         version.store(&mut tx, manifest, vector.row)?;
         codec::set_visible(&mut tx, manifest, slot, true)?;
         let mut c = Catalog::load(&tx, manifest)?;
@@ -575,11 +693,14 @@ impl<S: PageStore> ClusteredIndex<S> {
         }
         .store(&mut tx, manifest, slot)?;
         c.store(&mut tx, manifest)?;
-        manifest.slots = manifest.slots.checked_add(1).ok_or_else(overflow)?;
+        manifest.slots = manifest.slots.checked_add(1).ok_or_else(corrupt)?;
         tx.publish_manifest(manifest)?;
         tx.commit()?;
         self.cache(vector, slot, manifest.generation, sequence);
-        Ok(())
+        Ok(RowIdentity {
+            row: vector.row,
+            commit_lsn,
+        })
     }
     pub fn seal(&mut self) -> Result<()> {
         self.store.check_cancel()?;
@@ -625,11 +746,10 @@ impl<S: PageStore> ClusteredIndex<S> {
             };
             let mut run_m = m;
             run_m.run = id;
-            let book = if m.active_lists > 0 {
-                Some(Codebook::load_values(&self.owner, &tx, m)?)
-            } else {
-                None
-            };
+            let book = load_seal_book(&self.owner, &tx, m, &mut c)?;
+            if !append_existing {
+                codec::init_directory_presence(&mut tx, run_m)?;
+            }
             let mut boundary = m.sealed_slots;
             for &i in &self.order[at..end] {
                 let r = &self.buffer[i * stride..(i + 1) * stride];
@@ -652,21 +772,23 @@ impl<S: PageStore> ClusteredIndex<S> {
                 } else {
                     0
                 };
-                append_list(
-                    &mut tx,
-                    run_m,
-                    list,
-                    slot,
-                    row,
-                    &self.values,
-                    &mut self.encoded,
-                )?;
+                if c.unserviceable.is_none() {
+                    append_list(
+                        &mut tx,
+                        run_m,
+                        list,
+                        slot,
+                        row,
+                        &self.values,
+                        &mut self.encoded,
+                    )?;
+                }
                 let mut e = Entry::load(&tx, m, slot)?;
                 e.run = id;
                 e.store(&mut tx, m, slot)?;
                 run.append(&mut tx, m, slot)?;
-                c.tail_head = c.tail_head.max(seq.checked_add(1).ok_or_else(overflow)?);
-                boundary = boundary.max(slot.checked_add(1).ok_or_else(overflow)?);
+                c.tail_head = c.tail_head.max(seq.checked_add(1).ok_or_else(corrupt)?);
+                boundary = boundary.max(slot.checked_add(1).ok_or_else(corrupt)?);
             }
             if append_existing {
                 run.store(&mut tx, m, id)?;
@@ -687,37 +809,45 @@ impl<S: PageStore> ClusteredIndex<S> {
         self.state.sealed_runs += 1;
         Ok(())
     }
-    /// The authoritative row mutation and this tombstone must use the same native
-    /// transaction at the engine boundary. Slots avoid population-sized reverse maps.
-    pub fn delete_slot(&mut self, partition: u64, slot: u64) -> Result<()> {
-        let manifest = self
-            .store
-            .manifest(partition)?
-            .ok_or_else(|| phase("clustered Delete partition has no serving generation"))?;
-        if slot >= manifest.slots {
-            return Err(phase(
-                "clustered delete slot is outside the serving generation",
-            ));
+    /// The engine composes the authoritative row mutation and this journal update
+    /// in one native commit. No caller needs a serving or legacy slot identity.
+    pub fn delete_row(&mut self, partition: u64, expected: RowIdentity) -> Result<()> {
+        self.store.check_cancel()?;
+        let current = self
+            .current_row_identity(partition, expected.row)?
+            .map(|x| x.commit_lsn);
+        if current != Some(expected.commit_lsn) {
+            return Err(contextdb_core::Error::StaleRowVersion {
+                expected: expected.commit_lsn,
+                current,
+            });
         }
+        let manifest = self.store.manifest(partition)?.ok_or_else(corrupt)?;
         let mut tx = self.store.begin()?;
-        let row = read_vector(&tx, manifest, slot, &mut self.raw, &mut self.values)?;
-        let mut version = Version::load(&tx, manifest, row)?;
+        let mut version = Version::load(&tx, manifest, expected.row)?;
+        if version.current_lsn() != Some(expected.commit_lsn) {
+            return Err(contextdb_core::Error::StaleRowVersion {
+                expected: expected.commit_lsn,
+                current: version.current_lsn(),
+            });
+        }
         version.invalidate(&mut tx, manifest)?;
-        codec::set_visible(&mut tx, manifest, slot, false)?;
-        version.lsn = tx.commit_lsn()?;
-        version.deleted = true;
-        version.store(&mut tx, manifest, row)?;
-        let mut tombstone = [0; 16];
-        tombstone[..8].copy_from_slice(&slot.to_le_bytes());
-        tombstone[8..].copy_from_slice(&version.lsn.to_le_bytes());
-        codec::write(
-            &mut tx,
-            manifest,
-            PageKind::Tombstones,
-            0,
-            slot.checked_mul(16).ok_or_else(overflow)?,
-            &tombstone,
-        )?;
+        version.reset(tx.commit_lsn()?, true);
+        version.store(&mut tx, manifest, expected.row)?;
+        // Journal tombstones are keyed by row identity, independent of generation slots.
+        let mut page = [0; super::storage::PAGE_BYTES];
+        let per = (super::storage::PAGE_BYTES / 24) as u64;
+        let key = manifest.key(PageKind::Tombstones, 0, expected.row / per);
+        super::storage::read_page(&tx, key, &mut page)?;
+        let at = (expected.row % per) as usize * 24;
+        for (dst, w) in page[at..at + 24].as_chunks_mut::<8>().0.iter_mut().zip([
+            expected.row,
+            expected.commit_lsn,
+            tx.commit_lsn()?,
+        ]) {
+            dst.copy_from_slice(&w.to_le_bytes());
+        }
+        super::storage::put_page(&mut tx, key, &page)?;
         tx.commit()
     }
 }
@@ -742,6 +872,9 @@ fn start_coalesce(tx: &mut impl WritePages, m: Manifest, c: &mut Catalog) -> Res
         return Err(corrupt());
     }
     c.coalesce_output = c.allocate_run()?;
+    let mut view = m;
+    view.run = c.coalesce_output;
+    codec::init_directory_presence(tx, view)?;
     c.coalesce_list = 0;
     Ok(())
 }
@@ -759,15 +892,23 @@ fn seal_tail(
     if c.tail_head == c.tail_end {
         return Ok(());
     }
-    let id = c.allocate_run()?;
-    let mut run = Run::default();
+    let append_existing = c.last != 0;
+    let id = if append_existing {
+        c.last
+    } else {
+        c.allocate_run()?
+    };
+    let mut run = if append_existing {
+        Run::load(tx, m, id)?
+    } else {
+        Run::default()
+    };
     let mut view = m;
     view.run = id;
-    let book = if m.active_lists > 0 {
-        Some(Codebook::load_values(owner, tx, m)?)
-    } else {
-        None
-    };
+    let book = load_seal_book(owner, tx, m, c)?;
+    if !append_existing {
+        codec::init_directory_presence(tx, view)?;
+    }
     for seq in c.tail_head..c.tail_end {
         tx.check_cancel()?;
         let slot = catalog::tail_slot(tx, m, seq)?;
@@ -777,13 +918,19 @@ fn seal_tail(
         } else {
             0
         };
-        append_list(tx, view, list, slot, row, values, encoded)?;
+        if c.unserviceable.is_none() {
+            append_list(tx, view, list, slot, row, values, encoded)?;
+        }
         let mut entry = Entry::load(tx, m, slot)?;
         entry.run = id;
         entry.store(tx, m, slot)?;
         run.append(tx, m, slot)?;
     }
-    c.attach(tx, m, id, run)?;
+    if append_existing {
+        run.store(tx, m, id)?;
+    } else {
+        c.attach(tx, m, id, run)?;
+    }
     c.tail_head = c.tail_end;
     Ok(())
 }
@@ -817,16 +964,15 @@ impl<S: PageStore> ClusteredIndex<S> {
             });
         };
         let source_run = Run::load(&self.store, old, c.legacy_first)?;
-        let book = if m.active_lists > 0 {
-            Some(Codebook::load_values(&self.owner, &self.store, m)?)
-        } else {
-            None
-        };
+        let book = load_seal_book(&self.owner, &self.store, m, &mut c)?;
         let mut tx = self.store.begin()?;
         if c.remap_output == 0 {
             c.remap_output = c.allocate_run()?;
             c.remap_slot = source_run.first;
             c.remap_examined = 0;
+            let mut view = m;
+            view.run = c.remap_output;
+            codec::init_directory_presence(&mut tx, view)?;
             Run::default().store(&mut tx, m, c.remap_output)?;
         }
         let mut prepared = Run::load(&tx, m, c.remap_output)?;
@@ -859,14 +1005,16 @@ impl<S: PageStore> ClusteredIndex<S> {
                 )?;
                 let mut version = Version::load(&tx, m, row)?;
                 // Invalidation also reaches prepared copies when a row changes before retirement.
-                if version.lsn > e.lsn || version.deleted {
+                if version.current_lsn() != Some(e.lsn) || version.deleted {
                     c.remap_slot = e.next;
-                    c.remap_examined += 1;
-                    progress.entries_examined += 1;
+                    c.remap_examined = c.remap_examined.checked_add(1).ok_or_else(corrupt)?;
+                    progress.entries_examined = progress
+                        .entries_examined
+                        .checked_add(1)
+                        .ok_or_else(corrupt)?;
                     continue;
                 }
-                version.promote(m.generation);
-                version.other = Some((m.generation, target_slot));
+                version.add_copy(&mut tx, m, m.generation, target_slot)?;
                 version.store(&mut tx, m, row)?;
                 codec::set_visible(&mut tx, m, target_slot, true)?;
                 Entry {
@@ -882,22 +1030,30 @@ impl<S: PageStore> ClusteredIndex<S> {
                 } else {
                     0
                 };
-                append_list(
-                    &mut tx,
-                    view,
-                    list,
-                    target_slot,
-                    row,
-                    &self.values,
-                    &mut self.encoded,
-                )?;
+                if c.unserviceable.is_none() {
+                    append_list(
+                        &mut tx,
+                        view,
+                        list,
+                        target_slot,
+                        row,
+                        &self.values,
+                        &mut self.encoded,
+                    )?;
+                }
                 prepared.append(&mut tx, m, target_slot)?;
-                m.slots = m.slots.checked_add(1).ok_or_else(overflow)?;
-                progress.entries_remapped += 1;
+                m.slots = m.slots.checked_add(1).ok_or_else(corrupt)?;
+                progress.entries_remapped = progress
+                    .entries_remapped
+                    .checked_add(1)
+                    .ok_or_else(corrupt)?;
             }
             c.remap_slot = e.next;
-            c.remap_examined += 1;
-            progress.entries_examined += 1;
+            c.remap_examined = c.remap_examined.checked_add(1).ok_or_else(corrupt)?;
+            progress.entries_examined = progress
+                .entries_examined
+                .checked_add(1)
+                .ok_or_else(corrupt)?;
         }
         prepared.store(&mut tx, m, c.remap_output)?;
         if c.remap_examined == source_run.entries
@@ -918,6 +1074,7 @@ impl<S: PageStore> ClusteredIndex<S> {
             if c.legacy_runs == 0 {
                 c.legacy = None;
                 c.legacy_first = 0;
+                c.legacy_unserviceable = false;
                 progress.complete = true;
             }
         }
@@ -942,13 +1099,12 @@ impl<S: PageStore> ClusteredIndex<S> {
         }
         // Four descriptor/control reads, three control writes and one checked
         // directory/link unit (<=six reads/writes) fit this format-derived bound.
-        const CONTROL_PAGES: usize = 20;
-        const DIRECTORY_PAGES: usize = 6;
-        let units = page_limit.saturating_sub(CONTROL_PAGES) / DIRECTORY_PAGES;
+        let control = coalesce_control_pages(m)?;
+        let units = page_limit.saturating_sub(control) / DIRECTORY_PAGES;
         if units == 0 {
             return Err(phase(format!(
                 "clustered Coalesce needs an admitted page unit of at least {}; supplied {}",
-                CONTROL_PAGES + DIRECTORY_PAGES,
+                control + DIRECTORY_PAGES,
                 page_limit
             )));
         }
@@ -968,13 +1124,16 @@ impl<S: PageStore> ClusteredIndex<S> {
         );
         for list in c.coalesce_list..end {
             tx.check_cancel()?;
+            if c.unserviceable.is_some() {
+                continue;
+            }
             let x = codec::directory(&tx, a, list)?;
             let y = codec::directory(&tx, b, list)?;
             if x.count != 0 && y.count != 0 {
                 codec::set_next_list_page(&mut tx, m, list, x.tail, y.head)?;
             }
             let joined = codec::Directory {
-                count: x.count.checked_add(y.count).ok_or_else(overflow)?,
+                count: x.count.checked_add(y.count).ok_or_else(corrupt)?,
                 head: if x.count == 0 { y.head } else { x.head },
                 tail: if y.count == 0 { x.tail } else { y.tail },
             };
@@ -1002,7 +1161,7 @@ impl<S: PageStore> ClusteredIndex<S> {
                 entries: left
                     .entries
                     .checked_add(right.entries)
-                    .ok_or_else(overflow)?,
+                    .ok_or_else(corrupt)?,
                 next: right.next,
             };
             merged.store(&mut tx, m, c.coalesce_output)?;
@@ -1024,4 +1183,30 @@ impl<S: PageStore> ClusteredIndex<S> {
         tx.commit()?;
         Ok(restored)
     }
+}
+
+/// Only derived codebook/directory failures select this route. Canonical and journal
+/// damage, cancellation and resource refusals keep their original typed errors.
+fn load_seal_book(
+    owner: &MemoryBudgetOwner,
+    source: &impl ReadPages,
+    m: Manifest,
+    c: &mut Catalog,
+) -> Result<Option<Codebook>> {
+    if c.unserviceable.is_some() || m.active_lists == 0 {
+        return Ok(None);
+    }
+    let book = match Codebook::load_values(owner, source, m) {
+        Ok(book) => book,
+        Err(error) if super::recovery::damaged_page(&error) => {
+            c.unserviceable = Some(m.key(PageKind::Codebook, 0, 0));
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(key) = super::recovery::directory_damage(source, m, *c)? {
+        c.unserviceable = Some(key);
+        return Ok(None);
+    }
+    Ok(Some(book))
 }

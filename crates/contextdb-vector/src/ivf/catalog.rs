@@ -3,7 +3,7 @@
 //! list chains; it never copies the already merged population on each seal.
 use super::{
     codec,
-    memory::{corrupt, overflow},
+    memory::corrupt,
     storage::{Manifest, PageKind, ReadPages, WritePages},
 };
 use contextdb_core::Result;
@@ -32,6 +32,8 @@ pub(crate) struct Catalog {
     pub coalesce_right: u64,
     pub coalesce_output: u64,
     pub coalesce_list: u32,
+    pub unserviceable: Option<super::storage::PageKey>,
+    pub legacy_unserviceable: bool,
 }
 impl Catalog {
     pub fn new(base_slots: u64) -> Self {
@@ -61,8 +63,14 @@ impl Catalog {
             || w[5] > m.slots
             || (w[4] == 0) != (w[2] == 0)
             || (w[4] == 0) != (w[3] == 0)
+            || w[4] >= w[1]
+            || w[4] > m.slots
             || w[8] != 0
-            || w[27..].iter().any(|x| *x != 0)
+            || w[27] > 2
+            || w[31] > 1
+            || w[26] > u64::from(m.active_lists.max(1))
+            || ((w[25] == 0) != (w[23] == 0))
+            || ((w[25] == 0) != (w[24] == 0))
         {
             return Err(corrupt());
         }
@@ -103,6 +111,23 @@ impl Catalog {
             coalesce_right: w[24],
             coalesce_output: w[25],
             coalesce_list: u32::try_from(w[26]).map_err(|_| corrupt())?,
+            unserviceable: if w[27] == 0 {
+                None
+            } else {
+                Some(super::storage::PageKey {
+                    partition: m.partition,
+                    generation: m.generation,
+                    kind: if w[27] == 1 {
+                        PageKind::Codebook
+                    } else {
+                        PageKind::Directory
+                    },
+                    list: u32::try_from(w[28]).map_err(|_| corrupt())?,
+                    run: w[29],
+                    ordinal: w[30],
+                })
+            },
+            legacy_unserviceable: w[31] == 1,
         })
     }
     pub fn store(self, tx: &mut impl WritePages, m: Manifest) -> Result<()> {
@@ -135,11 +160,12 @@ impl Catalog {
             self.coalesce_right,
             self.coalesce_output,
             u64::from(self.coalesce_list),
-            0,
-            0,
-            0,
-            0,
-            0,
+            self.unserviceable
+                .map_or(0, |k| if k.kind == PageKind::Codebook { 1 } else { 2 }),
+            self.unserviceable.map_or(0, |k| u64::from(k.list)),
+            self.unserviceable.map_or(0, |k| k.run),
+            self.unserviceable.map_or(0, |k| k.ordinal),
+            u64::from(self.legacy_unserviceable),
         ];
         let mut raw = [0; super::storage::PAGE_BYTES];
         for (dst, word) in raw.as_chunks_mut::<8>().0.iter_mut().zip(w) {
@@ -152,7 +178,7 @@ impl Catalog {
     }
     pub fn allocate_run(&mut self) -> Result<u64> {
         let id = self.next_run;
-        self.next_run = id.checked_add(1).ok_or_else(overflow)?;
+        self.next_run = id.checked_add(1).ok_or_else(corrupt)?;
         Ok(id)
     }
     pub fn attach(
@@ -172,7 +198,7 @@ impl Catalog {
             self.first = id;
         }
         self.last = id;
-        self.runs = self.runs.checked_add(1).ok_or_else(overflow)?;
+        self.runs = self.runs.checked_add(1).ok_or_else(corrupt)?;
         Ok(())
     }
 }
@@ -227,7 +253,7 @@ impl Run {
             prev.store(tx, m, self.last)?;
         }
         self.last = slot;
-        self.entries = self.entries.checked_add(1).ok_or_else(overflow)?;
+        self.entries = self.entries.checked_add(1).ok_or_else(corrupt)?;
         Ok(())
     }
 }
@@ -249,7 +275,7 @@ impl Entry {
             m,
             PageKind::SlotMetadata,
             0,
-            slot.checked_mul(40).ok_or_else(overflow)?,
+            slot.checked_mul(40).ok_or_else(corrupt)?,
             &mut raw,
         )?;
         let word = |i: usize| -> Result<u64> {
@@ -284,7 +310,7 @@ impl Entry {
             m,
             PageKind::SlotMetadata,
             0,
-            slot.checked_mul(40).ok_or_else(overflow)?,
+            slot.checked_mul(40).ok_or_else(corrupt)?,
             &raw,
         )
     }
@@ -297,7 +323,7 @@ pub(crate) fn tail_slot(s: &impl ReadPages, m: Manifest, ordinal: u64) -> Result
         m,
         PageKind::Tail,
         0,
-        ordinal.checked_mul(8).ok_or_else(overflow)?,
+        ordinal.checked_mul(8).ok_or_else(corrupt)?,
         &mut raw,
     )?;
     Ok(u64::from_le_bytes(raw))
@@ -314,10 +340,10 @@ pub(crate) fn append_tail(
         m,
         PageKind::Tail,
         0,
-        seq.checked_mul(8).ok_or_else(overflow)?,
+        seq.checked_mul(8).ok_or_else(corrupt)?,
         &slot.to_le_bytes(),
     )?;
-    c.tail_end = c.tail_end.checked_add(1).ok_or_else(overflow)?;
+    c.tail_end = c.tail_end.checked_add(1).ok_or_else(corrupt)?;
     Ok(seq)
 }
 
@@ -330,7 +356,11 @@ pub struct CatalogState {
     pub remap_entries_examined: u64,
     pub remap_output_run: u64,
     pub coalesce_list: u32,
+    pub unserviceable: Option<super::storage::PageKey>,
+    pub legacy_unserviceable: bool,
     pub coalescing: bool,
+    pub pending_coalesce_pages: u64,
+    pub recovery_action: Option<&'static str>,
 }
 pub fn inspect(
     source: &impl ReadPages,
@@ -341,6 +371,7 @@ pub fn inspect(
         return Ok(None);
     };
     let c = Catalog::load(source, m)?;
+    let damage = super::recovery::inspect_damage(source, m, c)?;
     Ok(Some(CatalogState {
         delta_runs: c.runs,
         runs_over_cap: c.runs.saturating_sub(max_delta_runs),
@@ -349,6 +380,26 @@ pub fn inspect(
         remap_entries_examined: c.remap_examined,
         remap_output_run: c.remap_output,
         coalesce_list: c.coalesce_list,
+        unserviceable: damage,
+        legacy_unserviceable: c.legacy_unserviceable,
         coalescing: c.coalesce_output != 0,
+        recovery_action: damage.map(|_| "rebuild"),
+        pending_coalesce_pages: if c.coalesce_output == 0 {
+            0
+        } else {
+            let rounds = c.runs.saturating_sub(max_delta_runs).max(1);
+            let lists = u64::from(m.active_lists.max(1));
+            let control = super::writer::coalesce_control_pages(m)? as u64;
+            rounds
+                .checked_mul(lists)
+                .and_then(|v| v.checked_sub(u64::from(c.coalesce_list)))
+                .and_then(|v| v.checked_mul(super::writer::DIRECTORY_PAGES as u64))
+                .and_then(|v| {
+                    rounds
+                        .checked_mul(control)
+                        .and_then(|control| v.checked_add(control))
+                })
+                .ok_or_else(corrupt)?
+        },
     }))
 }

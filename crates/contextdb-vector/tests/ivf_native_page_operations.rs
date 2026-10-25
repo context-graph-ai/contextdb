@@ -104,7 +104,8 @@ fn an_unsealed_insert_replays_and_a_committed_delete_survives_seal_and_reopen() 
     assert_eq!(out[0].row, 900);
     assert_eq!(w.exact_score_count, 33);
     assert_eq!(w.buffer_evaluations, 1);
-    i.delete_slot(0, 32).unwrap();
+    let identity = i.current_row_identity(0, 900).unwrap().unwrap();
+    i.delete_row(0, identity).unwrap();
     i.seal().unwrap();
     let storage = i.into_storage();
     let i = ClusteredIndex::new(storage, policy, training, budget.clone().into()).unwrap();
@@ -112,7 +113,10 @@ fn an_unsealed_insert_replays_and_a_committed_delete_survives_seal_and_reopen() 
     let mut page = [0; PAGE_BYTES];
     assert!(
         i.storage()
-            .read_admitted_page(m.key(PageKind::Tombstones, 0, 0), &mut page)
+            .read_admitted_page(
+                m.key(PageKind::Tombstones, 0, 900 / (PAGE_BYTES / 24) as u64),
+                &mut page
+            )
             .unwrap()
     );
     for mode in [Mode::Exact, Mode::Indexed] {

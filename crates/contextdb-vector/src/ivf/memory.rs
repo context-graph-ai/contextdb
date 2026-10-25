@@ -67,3 +67,16 @@ pub(crate) fn dimension(
 pub(crate) fn phase(name: impl Into<String>) -> Error {
     Error::InvalidStateTransition(name.into())
 }
+
+/// Arithmetic on authenticated stored counters reports corruption, never caller budget refusal.
+pub(crate) fn stored_end(cursor: u64, total: u64, batch: u64) -> Result<u64> {
+    let remaining = total.checked_sub(cursor).ok_or_else(corrupt)?;
+    cursor.checked_add(remaining.min(batch)).ok_or_else(corrupt)
+}
+pub(crate) fn corrupt_page(key: super::storage::PageKey) -> Error {
+    Error::StoreCorrupted {
+        path: "vector index".into(),
+        reason: format!("clustered page {key:?} is missing or does not match its content identity")
+            .into(),
+    }
+}

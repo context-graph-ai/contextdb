@@ -16,7 +16,6 @@ pub(crate) struct Codebook {
     data: Box<BookData>,
     dimensions: usize,
     active: usize,
-    pages_read: u64,
     _invoice: Invoice,
 }
 impl Codebook {
@@ -51,7 +50,6 @@ impl Codebook {
             }),
             dimensions: manifest.dimensions,
             active: manifest.active_lists as usize,
-            pages_read: 0,
             _invoice: invoice,
         })
     }
@@ -69,9 +67,6 @@ impl Codebook {
     ) -> Result<Self> {
         Self::load_inner(owner, source, manifest, false)
     }
-    pub(crate) fn pages_read(&self) -> u64 {
-        self.pages_read
-    }
     fn load_inner(
         owner: &MemoryBudgetOwner,
         source: &impl ReadPages,
@@ -79,38 +74,8 @@ impl Codebook {
         counts: bool,
     ) -> Result<Self> {
         let mut book = Self::allocate(owner, manifest, counts)?;
-        let mut page = [0u8; PAGE_BYTES];
-        if !super::storage::read_page(source, manifest.key(PageKind::Codebook, 0, 0), &mut page)? {
-            return Err(corrupt());
-        }
-        book.pages_read += 1;
-        if &page[..8] != b"IVFCB001" {
-            return Err(corrupt());
-        }
-        let values_digest: [u8; 32] = page[8..40].try_into().map_err(|_| corrupt())?;
-        let counts_digest: [u8; 32] = page[40..72].try_into().map_err(|_| corrupt())?;
-        if identity(manifest, values_digest, counts_digest) != manifest.codebook {
-            return Err(corrupt());
-        }
-        let mut hash = blake3::Hasher::new();
-        for (ordinal, chunk) in book.data.values.chunks_mut(PAGE_BYTES / 4).enumerate() {
-            if !super::storage::read_page(
-                source,
-                manifest.key(PageKind::Codebook, 0, ordinal as u64 + 1),
-                &mut page,
-            )? {
-                return Err(corrupt());
-            }
-            book.pages_read += 1;
-            for (i, value) in chunk.iter_mut().enumerate() {
-                let bits: [u8; 4] = page[i * 4..i * 4 + 4].try_into().map_err(|_| corrupt())?;
-                hash.update(&bits);
-                *value = f32::from_le_bytes(bits);
-            }
-        }
-        if *hash.finalize().as_bytes() != values_digest {
-            return Err(corrupt());
-        }
+        let counts_digest = read_values(source, manifest, Some(&mut book.data.values))?;
+        let mut page = [0; PAGE_BYTES];
         if counts {
             let mut hash = blake3::Hasher::new();
             for (ordinal, chunk) in book.data.counts.chunks_mut(PAGE_BYTES / 8).enumerate() {
@@ -132,6 +97,9 @@ impl Codebook {
             }
         }
         Ok(book)
+    }
+    pub(crate) fn verify_values(source: &impl ReadPages, m: Manifest) -> Result<()> {
+        read_values(source, m, None).map(|_| ())
     }
     pub(crate) fn nearest(&self, source: &impl ReadPages, vector: &[f32]) -> Result<usize> {
         let mut best = 0;
@@ -171,7 +139,7 @@ impl Codebook {
     }
     pub(crate) fn train(&mut self, source: &impl ReadPages, vector: &[f32]) -> Result<()> {
         let list = self.nearest(source, vector)?;
-        self.data.counts[list] += 1;
+        self.data.counts[list] = self.data.counts[list].checked_add(1).ok_or_else(corrupt)?;
         let count = self.data.counts[list] as f64;
         let norm = vector
             .iter()
@@ -256,7 +224,7 @@ pub(crate) fn read_vector(
         manifest,
         PageKind::Canonical,
         0,
-        slot.checked_mul(raw.len() as u64).ok_or_else(overflow)?,
+        slot.checked_mul(raw.len() as u64).ok_or_else(corrupt)?,
         raw,
     )?;
     let row = u64::from_le_bytes(raw[..8].try_into().map_err(|_| corrupt())?);
@@ -328,7 +296,7 @@ pub(crate) fn append_list(
         &page,
     )?;
     set_list_page_used(target, manifest, list, directory.tail, used + 1)?;
-    directory.count = count.checked_add(1).ok_or_else(overflow)?;
+    directory.count = count.checked_add(1).ok_or_else(corrupt)?;
     codec::set_directory(target, manifest, list, directory)
 }
 
@@ -344,7 +312,9 @@ pub(crate) fn list_page_used(
         m,
         PageKind::ListUsed,
         list,
-        (id - 1).checked_mul(8).ok_or_else(overflow)?,
+        id.checked_sub(1)
+            .and_then(|v| v.checked_mul(8))
+            .ok_or_else(corrupt)?,
         &mut raw,
     )?;
     usize::try_from(u64::from_le_bytes(raw)).map_err(|_| corrupt())
@@ -361,7 +331,66 @@ fn set_list_page_used(
         m,
         PageKind::ListUsed,
         list,
-        (id - 1).checked_mul(8).ok_or_else(overflow)?,
+        id.checked_sub(1)
+            .and_then(|v| v.checked_mul(8))
+            .ok_or_else(corrupt)?,
         &(n as u64).to_le_bytes(),
     )
+}
+
+fn read_values(
+    source: &impl ReadPages,
+    m: Manifest,
+    mut decoded: Option<&mut [f32]>,
+) -> Result<[u8; 32]> {
+    let key = m.key(PageKind::Codebook, 0, 0);
+    let mut page = [0; PAGE_BYTES];
+    if !super::storage::read_page(source, key, &mut page)? || &page[..8] != b"IVFCB001" {
+        return Err(super::memory::corrupt_page(key));
+    }
+    let values_digest: [u8; 32] = page[8..40]
+        .try_into()
+        .map_err(|_| super::memory::corrupt_page(key))?;
+    let counts_digest: [u8; 32] = page[40..72]
+        .try_into()
+        .map_err(|_| super::memory::corrupt_page(key))?;
+    if identity(m, values_digest, counts_digest) != m.codebook {
+        return Err(super::memory::corrupt_page(key));
+    }
+    let count = m
+        .dimensions
+        .checked_mul(m.active_lists as usize)
+        .ok_or_else(corrupt)?;
+    if decoded.as_ref().is_some_and(|v| v.len() != count) {
+        return Err(super::memory::corrupt_page(key));
+    }
+    let mut hash = blake3::Hasher::new();
+    let per = PAGE_BYTES / 4;
+    let pages = count.div_ceil(per);
+    for ordinal in 0..pages {
+        let key = m.key(
+            PageKind::Codebook,
+            0,
+            (ordinal as u64).checked_add(1).ok_or_else(corrupt)?,
+        );
+        if !super::storage::read_page(source, key, &mut page)? {
+            return Err(super::memory::corrupt_page(key));
+        }
+        let begin = ordinal.checked_mul(per).ok_or_else(corrupt)?;
+        let n = (count - begin).min(per);
+        hash.update(&page[..n * 4]);
+        if let Some(values) = decoded.as_mut() {
+            for (i, dst) in values[begin..begin + n].iter_mut().enumerate() {
+                *dst = f32::from_le_bytes(
+                    page[i * 4..i * 4 + 4]
+                        .try_into()
+                        .map_err(|_| super::memory::corrupt_page(key))?,
+                );
+            }
+        }
+    }
+    if *hash.finalize().as_bytes() != values_digest {
+        return Err(super::memory::corrupt_page(m.key(PageKind::Codebook, 0, 1)));
+    }
+    Ok(counts_digest)
 }

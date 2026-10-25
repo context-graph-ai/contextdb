@@ -9,6 +9,7 @@ pub enum PageKind {
     Canonical,
     Lists,
     Directory,
+    DirectoryPresence,
     Visibility,
     Codebook,
     Accumulators,
@@ -21,6 +22,7 @@ pub enum PageKind {
     ListAllocator,
     ListUsed,
     RowVersions,
+    RowCopies,
 }
 
 /// A page's role inside the captured generation. The native reader must authenticate
@@ -53,7 +55,7 @@ impl Manifest {
     pub fn key(self, kind: PageKind, list: u32, ordinal: u64) -> PageKey {
         PageKey {
             partition: self.partition,
-            generation: if kind == PageKind::RowVersions {
+            generation: if matches!(kind, PageKind::RowVersions | PageKind::RowCopies) {
                 0
             } else {
                 self.generation
@@ -61,7 +63,10 @@ impl Manifest {
             kind,
             list,
             ordinal,
-            run: if kind == PageKind::Directory {
+            run: if matches!(
+                kind,
+                PageKind::Directory | PageKind::DirectoryPresence | PageKind::RowCopies
+            ) {
                 self.run
             } else {
                 0
@@ -91,6 +96,8 @@ pub struct BuildState {
     pub training: super::TrainingPolicy,
     pub serving_at_start: Option<Manifest>,
     pub source_lsn: u64,
+    /// Only this coalesce may delay publication; later seals never extend the fence.
+    pub publication_coalesce: Option<(u64, u64)>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DistanceKind {
@@ -130,6 +137,10 @@ pub trait WritePages: ReadPages {
         Self: Sized;
 }
 
+/// The native adapter uses one writer handle per partition for inserts, updates,
+/// deletes, build, remap and coalescing. Separate handles may not allocate slots
+/// concurrently in one partition. After an outer native transaction aborts, its
+/// staged writer window is discarded/reopened before that handle is reused.
 pub trait PageStore: ReadPages {
     type Transaction<'a>: WritePages
     where

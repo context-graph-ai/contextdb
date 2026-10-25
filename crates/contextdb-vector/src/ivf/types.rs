@@ -87,16 +87,26 @@ impl Policy {
     }
 }
 
+/// Inputs are finite; the engine rejects NaN/infinity with a typed InvalidVectorValue.
 #[derive(Clone, Copy, Debug)]
 pub struct Vector<'a> {
     pub partition: u64,
     pub row: u64,
     pub values: &'a [f32],
 }
+/// Canonical row version, independent of its physical generation or slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowIdentity {
+    pub row: u64,
+    pub commit_lsn: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Exact,
     Indexed,
+    /// Planner-selected index attempt with a canonical fallback on derived corruption.
+    Auto,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Hit {
@@ -113,6 +123,9 @@ pub struct Work {
     pub codebook_pages_read: u64,
     pub accumulator_pages_read: u64,
     pub directory_pages_read: u64,
+    pub directory_presence_pages_read: u64,
+    pub row_version_pages_read: u64,
+    pub row_copy_pages_read: u64,
     pub canonical_pages_read: u64,
     pub visibility_pages_read: u64,
     pub lists_probed: u64,
