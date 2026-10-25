@@ -117,8 +117,11 @@ impl TableTree {
         })
     }
 
-
     #[cfg(feature = "contextdb-internal")]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub(crate) fn new_prepared(
         root: Option<BtreeHeader>,
         guard: Arc<TransactionGuard>,
@@ -133,6 +136,10 @@ impl TableTree {
     }
 
     #[cfg(feature = "contextdb-internal")]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub(crate) fn prepared_bytes_equal(
         &self,
         physical_name: &str,
@@ -141,17 +148,31 @@ impl TableTree {
     ) -> std::result::Result<bool, crate::PreparedReadError> {
         // Prepare requested-name custody before the descriptor producer. Its
         // independent invoice travels with a retained malformed descriptor.
-        let mut requested = crate::native_storage_admission::NativeStorageBuffer::with_capacity(physical_name.len())?;
-        for byte in physical_name.as_bytes() { requested.push(*byte)?; }
+        let mut requested = crate::native_storage_admission::NativeStorageBuffer::with_capacity(
+            physical_name.len(),
+        )?;
+        for byte in physical_name.as_bytes() {
+            requested.push(*byte)?;
+        }
         let Some(directory) = super::btree::prepared_byte_get(
-            self.root(), &self.mem, physical_name.as_bytes(), true, self.prepared_root.as_ref(),
-        )? else { return Ok(false); };
+            self.root(),
+            &self.mem,
+            physical_name.as_bytes(),
+            true,
+            self.prepared_root.as_ref(),
+        )?
+        else {
+            return Ok(false);
+        };
         // Validate both stored names in place. The directory guard keeps the
         // original bytes alive until the scalar root has been extracted.
         let root = match super::table_tree_base::native_byte_table_root(directory.value()) {
             Ok(root) => root,
-            Err(cause) => return Err(crate::PreparedReadError::TableDefinition(
-                crate::PreparedTableDefinitionError::new(cause, directory, requested))),
+            Err(cause) => {
+                return Err(crate::PreparedReadError::TableDefinition(
+                    crate::PreparedTableDefinitionError::new(cause, directory, requested),
+                ));
+            }
         };
         let value = super::btree::prepared_byte_get(root, &self.mem, key, false, None)?;
         Ok(value.is_some_and(|value| value.value() == expected))
@@ -451,7 +472,10 @@ impl TableTreeMut<'_> {
 
     pub(crate) fn clear_root_updates_and_close(&mut self) {
         self.pending_table_updates.clear();
-        self.allocated_pages.lock().unwrap_or_else(|error| error.into_inner()).close();
+        self.allocated_pages
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .close();
     }
 
     // Sealing does not consume allocation custody. A refused preparation can
@@ -1241,6 +1265,10 @@ impl TableTree {
 #[cfg(feature = "contextdb-internal")]
 impl TableTree {
     // Native descriptor authentication shared with the ordinary tree's byte reader.
+    #[expect(
+        clippy::option_option,
+        reason = "The outer option distinguishes an absent table and the inner option an empty persisted root."
+    )]
     pub(crate) fn captured_native_table_root(
         root: Option<BtreeHeader>,
         mem: &TransactionalMemory,
@@ -1290,6 +1318,49 @@ impl TableTree {
     }
 }
 
+#[cfg(feature = "contextdb-internal")]
+impl TableTree {
+    pub(crate) fn next_native_directory_record(
+        &self,
+        lower: &[u8],
+        exclusive: bool,
+        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError>
+    {
+        super::btree::native_text_range_next(
+            self.root(),
+            &self.mem,
+            lower,
+            exclusive,
+            None,
+            true,
+            before,
+        )
+    }
+    pub(crate) fn next_native_u64_bytes_range(
+        &self,
+        name: &str,
+        lower: u64,
+        exclusive: bool,
+        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError>
+    {
+        before()?;
+        let directory =
+            super::btree::native_byte_get(self.root(), &self.mem, name.as_bytes(), true)?
+                .ok_or(crate::NativeColdReadError::TableAbsent)?;
+        let root = super::table_tree_base::native_u64_bytes_table_root(directory.value())?;
+        super::btree::native_u64_range_next(
+            root,
+            &self.mem,
+            &lower.to_le_bytes(),
+            exclusive,
+            None,
+            before,
+        )
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::Value;
@@ -1310,23 +1381,5 @@ mod test {
         };
         let y = InternalTableDefinition::from_bytes(InternalTableDefinition::as_bytes(&x).as_ref());
         assert_eq!(x, y);
-    }
-}
-
-#[cfg(feature = "contextdb-internal")]
-impl TableTree {
-    pub(crate) fn next_native_directory_record(&self, lower: &[u8], exclusive: bool,
-        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>)
-        -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
-        super::btree::native_text_range_next(self.root(), &self.mem, lower, exclusive, None, true, before)
-    }
-    pub(crate) fn next_native_u64_bytes_range(&self, name: &str, lower: u64, exclusive: bool,
-        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>)
-        -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
-        before()?;
-        let directory = super::btree::native_byte_get(self.root(), &self.mem, name.as_bytes(), true)?
-            .ok_or(crate::NativeColdReadError::TableAbsent)?;
-        let root = super::table_tree_base::native_u64_bytes_table_root(directory.value())?;
-        super::btree::native_u64_range_next(root, &self.mem, &lower.to_le_bytes(), exclusive, None, before)
     }
 }

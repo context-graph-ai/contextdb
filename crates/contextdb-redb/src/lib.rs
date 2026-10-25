@@ -96,12 +96,12 @@ pub use table::{
 pub use transactions::StorageStatisticsSnapshot;
 #[doc(hidden)]
 pub use transactions::{CompactionCursor, CompactionProgress};
-#[cfg(feature = "contextdb-internal")]
-#[doc(hidden)]
-pub use transactions::{PreparedReadInput, PreparedReadView, PreparedWrite};
 pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransaction};
 #[doc(hidden)]
 pub use transactions::{ExternalSnapshotProvider, ExternalSnapshotRetentionStats};
+#[cfg(feature = "contextdb-internal")]
+#[doc(hidden)]
+pub use transactions::{PreparedReadInput, PreparedReadView, PreparedWrite};
 #[doc(hidden)]
 pub use transactions::{StorageSnapshotIdentity, StorageUserRootIdentity};
 pub use tree_store::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace, Savepoint};
@@ -137,13 +137,13 @@ pub use table_registry::{RegistryMonitor, RegistryReplacement, RegistryReserveEr
 mod table_write_observer;
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
-pub use tree_store::with_random_state_for_test;
-#[cfg(feature = "test-seams")]
-#[doc(hidden)]
 pub use table_write_observer::{
     TableWriteForTest, TableWriteObservationGuardForTest, TableWriteObserverForTest,
     TableWriteOperationForTest,
 };
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use tree_store::with_random_state_for_test;
 mod transaction_tracker;
 mod transactions;
 mod tree_store;
@@ -163,10 +163,12 @@ mod native_storage_admission;
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
 pub use native_storage_admission::{
-    PreparedReadError, PreparedTableDefinitionError, NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit,
-    NativeStorageRefused, native_storage_active, with_native_storage_admission,
+    NativeColdFault, NativeColdReadError, NativeStorageAdmission, NativeStorageCredit,
+    NativeStorageRefused, PreparedReadError, PreparedTableDefinitionError, native_storage_active,
+    with_native_storage_admission,
 };
 
+mod atomic_compat;
 mod read_admission;
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
@@ -198,12 +200,13 @@ pub use tree_store::CacheReserveOwner;
 
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
-pub use read_admission::{with_cache_preparation_admission, with_retained_cache_preparation_admission};
-
+pub use read_admission::{
+    with_cache_preparation_admission, with_retained_cache_preparation_admission,
+};
 
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
-pub use tree_store::{CachePageForTest, CacheWriteForTest, CacheWriteControlForTest};
+pub use tree_store::{CachePageForTest, CacheWriteControlForTest, CacheWriteForTest};
 
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]

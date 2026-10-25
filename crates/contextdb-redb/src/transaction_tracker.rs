@@ -91,6 +91,7 @@ impl Key for SavepointId {
 }
 
 // A single registry preserves counts independently from physical backing ownership.
+#[cfg_attr(not(feature = "contextdb-internal"), derive(Default))]
 struct ReaderRegistry {
     #[cfg(feature = "contextdb-internal")]
     map: hashbrown::HashMap<
@@ -103,6 +104,7 @@ struct ReaderRegistry {
     map: BTreeMap<TransactionId, u64>,
     minimum: Option<TransactionId>,
 }
+#[cfg(feature = "contextdb-internal")]
 impl Default for ReaderRegistry {
     fn default() -> Self {
         Self {
@@ -162,9 +164,17 @@ impl ReaderRegistry {
         Ok(())
     }
     #[cfg(feature = "test-seams")]
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Borrowed transaction identities preserve the tracker lookup interface."
+    )]
     fn get(&self, id: &TransactionId) -> Option<&u64> {
         self.map.get(id)
     }
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Borrowed transaction identities preserve the tracker lookup interface."
+    )]
     fn get_mut(&mut self, id: &TransactionId) -> Option<&mut u64> {
         self.map.get_mut(id)
     }
@@ -177,6 +187,10 @@ impl ReaderRegistry {
     fn first_key_value(&self) -> Option<(&TransactionId, &u64)> {
         self.minimum.and_then(|id| self.map.get_key_value(&id))
     }
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Borrowed transaction identities preserve the tracker lookup interface."
+    )]
     fn remove(&mut self, id: &TransactionId) {
         self.map.remove(id);
         if self.minimum == Some(*id) {
@@ -373,10 +387,10 @@ impl TransactionTracker {
             while let Some(node) = next {
                 // Inactive roots belong exclusively to preparation. Refresh
                 // must not retain their guards across a refused write's abort.
-                if node.active.load(std::sync::atomic::Ordering::Acquire) {
-                    if let Some(guard) = node.guard.upgrade() {
-                        pins.push((node.identity, guard));
-                    }
+                if node.active.load(std::sync::atomic::Ordering::Acquire)
+                    && let Some(guard) = node.guard.upgrade()
+                {
+                    pins.push((node.identity, guard));
                 }
                 next = node.next.as_deref();
             }
@@ -415,8 +429,14 @@ impl TransactionTracker {
                 )
                 .min();
             #[cfg(feature = "contextdb-internal")]
-            let retained_floor = retained_floor.into_iter()
-                .chain(prepared_pins.iter().map(|(identity, _)| identity.transaction_id)).min();
+            let retained_floor = retained_floor
+                .into_iter()
+                .chain(
+                    prepared_pins
+                        .iter()
+                        .map(|(identity, _)| identity.transaction_id),
+                )
+                .min();
             if state.external_snapshot_admission_complete
                 && supplied.iter().any(|snapshot| {
                     snapshot.transaction_id != 0
@@ -445,16 +465,18 @@ impl TransactionTracker {
             // Only the exact actual-write-issued root can bypass a stale live
             // header after confirmed durability. Arbitrary future ids still fail.
             #[cfg(feature = "contextdb-internal")]
-            if prepared_pins.iter().any(|(identity, guard)| identity == snapshot && guard.prepared_active()) {
+            if prepared_pins
+                .iter()
+                .any(|(identity, guard)| identity == snapshot && guard.prepared_active())
+            {
                 continue;
             }
-            let last_committed = match last_committed {
-                Some(id) => id,
-                None => {
-                    let id = mem.get_last_committed_transaction_id()?.raw_id();
-                    last_committed = Some(id);
-                    id
-                }
+            let last_committed = if let Some(id) = last_committed {
+                id
+            } else {
+                let id = mem.get_last_committed_transaction_id()?.raw_id();
+                last_committed = Some(id);
+                id
             };
             if snapshot.transaction_id > last_committed {
                 return Err(StorageError::Corrupted(format!(
@@ -657,11 +679,21 @@ impl TransactionTracker {
 
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn register_prepared_pin(
-        &self, identity: StorageSnapshotIdentity, guard: &Arc<TransactionGuard>,
+        &self,
+        identity: StorageSnapshotIdentity,
+        guard: &Arc<TransactionGuard>,
     ) -> Result {
-        let mut node = Box::new(PreparedPin { identity, guard: Arc::downgrade(guard), active: guard.prepared_activation(), next: None });
+        let mut node = Box::new(PreparedPin {
+            identity,
+            guard: Arc::downgrade(guard),
+            active: guard.prepared_activation(),
+            next: None,
+        });
         let mut state = self.state.lock()?;
-        debug_assert_eq!(state.live_write_transaction.map(|id| id.raw_id()), Some(identity.transaction_id));
+        debug_assert_eq!(
+            state.live_write_transaction.map(|id| id.raw_id()),
+            Some(identity.transaction_id)
+        );
         node.next = state.prepared_pins.take();
         state.prepared_pins = Some(node);
         Ok(())
@@ -829,10 +861,13 @@ impl TransactionTracker {
             let mut oldest = ordinary;
             let mut pin = state.prepared_pins.as_deref();
             while let Some(node) = pin {
-                oldest = oldest.into_iter().chain(Some(TransactionId::new(node.identity.transaction_id))).min();
+                oldest = oldest
+                    .into_iter()
+                    .chain(Some(TransactionId::new(node.identity.transaction_id)))
+                    .min();
                 pin = node.next.as_deref();
             }
-            return oldest;
+            oldest
         }
         #[cfg(not(feature = "contextdb-internal"))]
         ordinary
@@ -843,7 +878,9 @@ impl TransactionTracker {
     pub(crate) fn has_native_read_transactions(&self) -> bool {
         let state = self.state.lock().unwrap();
         #[cfg(feature = "contextdb-internal")]
-        if state.prepared_pins.is_some() { return true; }
+        if state.prepared_pins.is_some() {
+            return true;
+        }
         !state.live_read_transactions.is_empty()
     }
 

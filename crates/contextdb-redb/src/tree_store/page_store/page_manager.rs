@@ -1,3 +1,4 @@
+use crate::CacheStats;
 use crate::ScratchBackend;
 use crate::transaction_tracker::TransactionId;
 #[cfg(feature = "contextdb-internal")]
@@ -18,7 +19,6 @@ use crate::tree_store::page_store::region::{
 };
 use crate::tree_store::page_store::{PageImpl, PageMut, hash128_with_seed};
 use crate::tree_store::{Page, PageNumber, PageTrackerPolicy};
-use crate::CacheStats;
 use crate::{DatabaseError, Result, StorageError};
 use std::cmp::{max, min};
 #[cfg(debug_assertions)]
@@ -101,9 +101,9 @@ impl SavedAllocatorValue<'_> {
             let mut lengths = [0; 84];
             self.read(4, &mut lengths)?;
             let mut start = 4 + orders * 4;
-            for field in lengths.chunks_exact(4).take(usize::from(order)) {
+            for field in lengths.as_chunks::<4>().0.iter().take(usize::from(order)) {
                 start = start
-                    .checked_add(u32::from_le_bytes(field.try_into().unwrap()) as usize)
+                    .checked_add(u32::from_le_bytes(*field) as usize)
                     .ok_or_else(invalid)?;
             }
             let field = usize::from(order) * 4;
@@ -418,20 +418,34 @@ impl TransactionalMemory {
     }
 
     #[cfg(feature = "test-seams")]
-    pub(crate) fn cache_allocations_for_test(&self, visit: &mut dyn FnMut((usize, usize, usize))) -> usize {
+    pub(crate) fn cache_allocations_for_test(
+        &self,
+        visit: &mut dyn FnMut((usize, usize, usize)),
+    ) -> usize {
         self.storage.allocations_for_test(visit)
     }
 
     #[cfg(feature = "test-seams")]
-    pub(crate) fn controls_for_test(&self) -> [(usize, usize); 2] { self.storage.controls_for_test() }
+    pub(crate) fn controls_for_test(&self) -> [(usize, usize); 2] {
+        self.storage.controls_for_test()
+    }
 
     #[cfg(feature = "test-seams")]
-    pub(crate) fn lifetime_aliases_for_test(&self) -> Result<(crate::CachePageForTest, crate::CachePageForTest, crate::CacheWriteForTest)> {
+    pub(crate) fn lifetime_aliases_for_test(
+        &self,
+    ) -> Result<(
+        crate::CachePageForTest,
+        crate::CachePageForTest,
+        crate::CacheWriteForTest,
+    )> {
         self.storage.lifetime_aliases_for_test()
     }
 
     #[cfg(feature = "test-seams")]
-    pub(crate) fn detach_cached_memory_for_test(&self, memory: &super::cached_file::PageMemory) -> (u64, usize, usize, bool) {
+    pub(crate) fn detach_cached_memory_for_test(
+        &self,
+        memory: &super::cached_file::PageMemory,
+    ) -> (u64, usize, usize, bool) {
         self.storage.detach_cached_memory_for_test(memory)
     }
 
@@ -450,7 +464,9 @@ impl TransactionalMemory {
     /// Charge one read of `range` inside an extent of `extent_len` bytes.
     #[cfg(feature = "contextdb-internal")]
     fn charge_read(&self, extent_len: u64, range: std::ops::Range<u64>) -> Result {
-        self.charge_read_with(extent_len, range, |reason| StorageError::Corrupted(reason.to_owned()))
+        self.charge_read_with(extent_len, range, |reason| {
+            StorageError::Corrupted(reason.to_owned())
+        })
     }
 
     #[cfg(feature = "contextdb-internal")]
@@ -2525,15 +2541,25 @@ impl TransactionalMemory {
         self.storage.read_native_clean_miss(offset, len)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub(crate) fn get_prepared_page_memory(
         &self,
         page: PageNumber,
     ) -> std::result::Result<super::cached_file::PageMemory, crate::PreparedReadError> {
         // Preserve the existing read-work checkpoint and its producer error.
-        if self.read_budget.lock().map_err(StorageError::from)?.is_some()
-            && page.page_order > MAX_MAX_PAGE_ORDER {
+        if self
+            .read_budget
+            .lock()
+            .map_err(StorageError::from)?
+            .is_some()
+            && page.page_order > MAX_MAX_PAGE_ORDER
+        {
             return Err(crate::PreparedReadError::StaticCorrupted(
-                "admission read names a page order no store can carry"));
+                "admission read names a page order no store can carry",
+            ));
         }
         if page.page_order <= MAX_MAX_PAGE_ORDER {
             let len = (1u64 << page.page_order) * u64::from(self.page_size);

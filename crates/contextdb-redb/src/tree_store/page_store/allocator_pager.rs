@@ -270,6 +270,7 @@ impl AllocatorPager {
     /// Admit the window set a `cache_bytes` share funds. A smaller set spills
     /// its surplus dirty windows to scratch before releasing them.
     pub(super) fn set_cache_budget(&self, cache_bytes: usize) -> crate::Result<()> {
+        use std::alloc::Layout;
         let capacity = Self::capacity_for_cache(cache_bytes);
         let mut inner = self.inner.lock().unwrap();
         if capacity == inner.capacity {
@@ -278,7 +279,6 @@ impl AllocatorPager {
         // Admit all planned simultaneous replacement backings before changing
         // the existing set. The old set/index remains paid until physical free;
         // an allocation refusal leaves capacity, slots and windows unchanged.
-        use std::alloc::Layout;
         let quote_array =
             |layout: std::result::Result<Layout, std::alloc::LayoutError>| -> crate::Result<()> {
                 crate::read_admission::prepare_cache_allocation(
@@ -576,7 +576,8 @@ impl AllocatorPager {
             if !loaded {
                 prior.bytes.fill(0xFF);
                 if optimistic {
-                    for (index, chunk) in prior.bytes.chunks_exact_mut(8).enumerate() {
+                    for (index, chunk) in prior.bytes.as_chunks_mut::<8>().0.iter_mut().enumerate()
+                    {
                         let first =
                             (usize::try_from(page).unwrap() * WINDOW_BYTES / 8 + index) * 64;
                         let free_bits = (len as usize).saturating_sub(first).min(64);

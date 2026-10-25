@@ -483,6 +483,10 @@ fn a_scan_leaves_its_working_set_cached_for_the_next_query() {
 /// The native read entry point, under a declared native reader budget,
 /// keeps the pages it reads cached the same way the ordinary read path must.
 #[cfg(feature = "contextdb-internal")]
+#[expect(
+    clippy::big_endian_bytes,
+    reason = "Opaque byte keys use big-endian order to preserve numeric lexical ordering."
+)]
 mod native_reads {
     use super::{
         CHARGE_PER_KEPT_PAGE, FileReads, Mutex, Observed, PASSES, Path, READER_LIMIT, VALUE_BYTES,

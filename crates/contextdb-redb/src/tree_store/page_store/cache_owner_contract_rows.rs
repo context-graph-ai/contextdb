@@ -1,11 +1,11 @@
 //! Independent rows of the existing page-lifetime contract. These exercise the
 //! real cache/write/window handles and the existing allocator observation seam.
 use super::*;
+use crate::StorageBackend;
 use crate::backends::InMemoryBackend;
 use crate::tree_store::page_store::lru_cache::arena_index_tests::{FreeWatch, Watch};
 use std::io;
 use std::sync::Arc;
-use crate::StorageBackend;
 
 fn owner(page: &PageMemory) -> &PageAllocation {
     match page {
@@ -15,13 +15,13 @@ fn owner(page: &PageMemory) -> &PageAllocation {
     }
 }
 fn linked(file: &PagedCachedFile, offset: u64, identity: &PageAllocation) -> bool {
-    let stripe = file.read_cache[(offset % PagedCachedFile::lock_stripes()) as usize]
-        .read()
-        .unwrap();
-    let present = stripe
+    let stripe = file.read_cache
+        [usize::try_from(offset % PagedCachedFile::lock_stripes()).expect("stripe fits usize")]
+    .read()
+    .unwrap();
+    stripe
         .iter()
-        .any(|(key, page)| key == offset && PageAllocation::ptr_eq(&*page, identity));
-    present
+        .any(|(key, page)| key == offset && PageAllocation::ptr_eq(&page, identity))
 }
 fn file(cap: usize) -> PagedCachedFile {
     let backend = InMemoryBackend::new();
@@ -96,7 +96,7 @@ fn displaced_and_linked_rows() {
             assert!(
                 stripe
                     .iter()
-                    .any(|(offset, page)| offset == 0 && PageAllocation::as_ptr(&*page) == pointer)
+                    .any(|(offset, page)| offset == 0 && PageAllocation::as_ptr(&page) == pointer)
             );
             drop(stripe);
             file.invalidate_cache(0, 128);
@@ -259,9 +259,7 @@ impl StorageBackend for FaultBackend {
     }
     fn read(&self, _: u64, _: &mut [u8]) -> io::Result<()> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        if self.panic {
-            panic!("backend read unwind")
-        }
+        assert!(!self.panic, "backend read unwind");
         Err(io::Error::from_raw_os_error(5))
     }
     fn write(&self, _: u64, _: &[u8]) -> io::Result<()> {

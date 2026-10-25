@@ -83,7 +83,6 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
     }
 }
 
-
 /// Original construction capability. Legacy or wrapped backends never acquire it implicitly.
 #[cfg(feature = "contextdb-internal")]
 #[doc(hidden)]
@@ -110,10 +109,14 @@ impl Debug for Backend {
     }
 }
 impl<T: StorageBackend> From<Box<T>> for Backend {
-    fn from(file: Box<T>) -> Self { Self::Legacy(file) }
+    fn from(file: Box<T>) -> Self {
+        Self::Legacy(file)
+    }
 }
 impl From<Box<dyn StorageBackend>> for Backend {
-    fn from(file: Box<dyn StorageBackend>) -> Self { Self::Legacy(file) }
+    fn from(file: Box<dyn StorageBackend>) -> Self {
+        Self::Legacy(file)
+    }
 }
 impl Backend {
     pub(crate) fn scratch_backend(&self) -> std::io::Result<Option<Box<dyn ScratchBackend>>> {
@@ -134,11 +137,16 @@ impl Backend {
         match self {
             Self::Legacy(file) => file.len().map_err(StorageError::from),
             #[cfg(feature = "contextdb-internal")]
-            Self::Native(file) => file.native_len().map_err(|error|
-                crate::native_storage_admission::native_storage_error(error.into_native())),
+            Self::Native(file) => file.native_len().map_err(|error| {
+                crate::native_storage_admission::native_storage_error(error.into_native())
+            }),
         }
     }
-    pub(crate) fn read_cause(&self, offset: u64, out: &mut [u8]) -> Result<(), crate::NativeBackendError> {
+    pub(crate) fn read_cause(
+        &self,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<(), crate::NativeBackendError> {
         match self {
             Self::Legacy(file) => file.read(offset, out).map_err(Into::into),
             #[cfg(feature = "contextdb-internal")]
@@ -146,31 +154,35 @@ impl Backend {
         }
     }
     pub(crate) fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), StorageError> {
-        self.read_cause(offset, out).map_err(|error|
-            crate::native_storage_admission::native_storage_error(error.into_native()))
+        self.read_cause(offset, out).map_err(|error| {
+            crate::native_storage_admission::native_storage_error(error.into_native())
+        })
     }
     pub(crate) fn write(&self, offset: u64, data: &[u8]) -> Result<(), StorageError> {
         match self {
             Self::Legacy(file) => file.write(offset, data).map_err(StorageError::from),
             #[cfg(feature = "contextdb-internal")]
-            Self::Native(file) => file.native_write(offset, data).map_err(|error|
-                crate::native_storage_admission::native_storage_error(error.into_native())),
+            Self::Native(file) => file.native_write(offset, data).map_err(|error| {
+                crate::native_storage_admission::native_storage_error(error.into_native())
+            }),
         }
     }
     pub(crate) fn set_len(&self, len: u64) -> Result<(), StorageError> {
         match self {
             Self::Legacy(file) => file.set_len(len).map_err(StorageError::from),
             #[cfg(feature = "contextdb-internal")]
-            Self::Native(file) => file.native_set_len(len).map_err(|error|
-                crate::native_storage_admission::native_storage_error(error.into_native())),
+            Self::Native(file) => file.native_set_len(len).map_err(|error| {
+                crate::native_storage_admission::native_storage_error(error.into_native())
+            }),
         }
     }
     pub(crate) fn sync_data(&self) -> Result<(), StorageError> {
         match self {
             Self::Legacy(file) => file.sync_data().map_err(StorageError::from),
             #[cfg(feature = "contextdb-internal")]
-            Self::Native(file) => file.native_sync_data().map_err(|error|
-                crate::native_storage_admission::native_storage_error(error.into_native())),
+            Self::Native(file) => file.native_sync_data().map_err(|error| {
+                crate::native_storage_admission::native_storage_error(error.into_native())
+            }),
         }
     }
 }
@@ -179,7 +191,9 @@ pub(crate) fn backend_quota_refused(error: &StorageError) -> bool {
     match error {
         StorageError::Io(error) => error.kind() == std::io::ErrorKind::QuotaExceeded,
         #[cfg(feature = "contextdb-internal")]
-        StorageError::Native(crate::NativeColdReadError::BackendIo(crate::NativeIoCause::DiskGrowthRefused { .. })) => true,
+        StorageError::Native(crate::NativeColdReadError::BackendIo(
+            crate::NativeIoCause::DiskGrowthRefused { .. },
+        )) => true,
         _ => false,
     }
 }
@@ -310,6 +324,10 @@ impl<'a, K: Key + 'static, V: Value + 'static> TableDefinition<'a, K, V> {
     /// Panics if `name` is empty. When `name` is a non-empty string literal
     /// this is checked at compile time, but callers that build the name at
     /// runtime are responsible for ensuring it is non-empty.
+    #[expect(
+        clippy::assert_is_empty,
+        reason = "The constructor remains const on the declared minimum Rust version."
+    )]
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {
@@ -370,6 +388,10 @@ impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableDefinition<'a, K, V> {
     /// Panics if `name` is empty. When `name` is a non-empty string literal
     /// this is checked at compile time, but callers that build the name at
     /// runtime are responsible for ensuring it is non-empty.
+    #[expect(
+        clippy::assert_is_empty,
+        reason = "The constructor remains const on the declared minimum Rust version."
+    )]
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {
@@ -482,7 +504,10 @@ impl TransactionGuard {
     }
 
     #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn new_prepared(transaction_id: TransactionId, tracker: Arc<TransactionTracker>) -> Self {
+    pub(crate) fn new_prepared(
+        transaction_id: TransactionId,
+        tracker: Arc<TransactionTracker>,
+    ) -> Self {
         let mut guard = Self::new_read(transaction_id, tracker);
         guard.prepared = true;
         guard.prepared_active = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
@@ -498,12 +523,17 @@ impl TransactionGuard {
 
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn prepared_active(&self) -> bool {
-        self.prepared_active.as_ref().is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
+        self.prepared_active
+            .as_ref()
+            .is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
     }
 
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn prepared_activation(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        self.prepared_active.as_ref().expect("prepared guard").clone()
+        self.prepared_active
+            .as_ref()
+            .expect("prepared guard")
+            .clone()
     }
 
     pub(crate) fn new_write(
@@ -562,7 +592,10 @@ impl Drop for TransactionGuard {
         }
         #[cfg(feature = "contextdb-internal")]
         if self.prepared {
-            self.transaction_tracker.as_ref().unwrap().remove_prepared_pin(self.id());
+            self.transaction_tracker
+                .as_ref()
+                .unwrap()
+                .remove_prepared_pin(self.id());
             return;
         }
         if let Some(transaction_id) = self.transaction_id {
@@ -697,7 +730,10 @@ impl ReadOnlyDatabase {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
-    pub fn cache_allocations_for_test(&self, visit: &mut dyn FnMut((usize, usize, usize))) -> usize {
+    pub fn cache_allocations_for_test(
+        &self,
+        visit: &mut dyn FnMut((usize, usize, usize)),
+    ) -> usize {
         self.mem.cache_allocations_for_test(visit)
     }
 
@@ -717,7 +753,6 @@ impl ReadOnlyDatabase {
     ) -> crate::CacheReserveOwner {
         self.mem.retain_cache_reserve(reserve)
     }
-
 
     /// Opens an existing redb database.
     pub fn open(path: impl AsRef<Path>) -> Result<ReadOnlyDatabase, DatabaseError> {
@@ -1327,18 +1362,33 @@ impl Database {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
-    pub fn cache_controls_for_test(&self) -> [(usize, usize); 2] { self.mem.controls_for_test() }
+    pub fn cache_controls_for_test(&self) -> [(usize, usize); 2] {
+        self.mem.controls_for_test()
+    }
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
-    pub fn lifetime_aliases_for_test(&self) -> Result<(crate::CachePageForTest, crate::CachePageForTest, crate::CacheWriteForTest)> {
+    pub fn lifetime_aliases_for_test(
+        &self,
+    ) -> Result<(
+        crate::CachePageForTest,
+        crate::CachePageForTest,
+        crate::CacheWriteForTest,
+    )> {
         self.mem.lifetime_aliases_for_test()
     }
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
-    pub fn detach_cached_guard_for_test<V: Value + 'static>(&self, guard: &crate::AccessGuard<'_, V>) -> (u64, usize, usize, bool) {
-        self.mem.detach_cached_memory_for_test(guard.cached_memory_for_test().expect("fixture must retain a page"))
+    pub fn detach_cached_guard_for_test<V: Value + 'static>(
+        &self,
+        guard: &crate::AccessGuard<'_, V>,
+    ) -> (u64, usize, usize, bool) {
+        self.mem.detach_cached_memory_for_test(
+            guard
+                .cached_memory_for_test()
+                .expect("fixture must retain a page"),
+        )
     }
 
     /// Capture a native retained read that authenticates every consumed page.
@@ -1390,7 +1440,10 @@ impl Database {
 
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
-    pub fn cache_allocations_for_test(&self, visit: &mut dyn FnMut((usize, usize, usize))) -> usize {
+    pub fn cache_allocations_for_test(
+        &self,
+        visit: &mut dyn FnMut((usize, usize, usize)),
+    ) -> usize {
         self.mem.cache_allocations_for_test(visit)
     }
 
@@ -2327,6 +2380,10 @@ impl Database {
             .map_err(|e| e.into())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
         // Make a new quick-repair commit to update the allocator state table
         #[cfg(feature = "logging")]
@@ -2344,6 +2401,10 @@ impl Database {
     /// extent and entry limits; a live snapshot leaves its protected backlog
     /// for a later writer instead of making shutdown wait for that reader.
     #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub fn drain_deferred_frees(&self) -> Result<(), Error> {
         loop {
             let mut tx = self.begin_write()?;
@@ -2386,6 +2447,10 @@ impl Database {
     /// block reclamation exactly as in `drain_deferred_frees`.
     #[cfg(any(test, feature = "contextdb-internal"))]
     #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub fn reclaim_deferred_step(
         &self,
         boundary: Option<ReclaimBoundary>,
@@ -2458,6 +2523,10 @@ impl Database {
     /// lock, then allow read-only opens over the committed root during a
     /// graceful drain. The caller must prevent all later writes. Drop releases
     /// this handle without another housekeeping or header write.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub fn prepare_read_only_handoff(&mut self) -> Result<(), Error> {
         if !self.read_only_handoff_prepared {
             self.ensure_allocator_state_table_and_trim()?;
@@ -2834,20 +2903,40 @@ impl Builder {
     #[cfg(feature = "contextdb-internal")]
     #[doc(hidden)]
     pub fn create_with_native_backend_and_external_snapshots(
-        &self, backend: impl NativeStorageBackend, provider: ExternalSnapshotProvider,
+        &self,
+        backend: impl NativeStorageBackend,
+        provider: ExternalSnapshotProvider,
     ) -> Result<Database, DatabaseError> {
-        Database::new(Backend::Native(Box::new(backend)), true, self.page_size,
-            self.region_size, self.cache_size, &self.repair_callback, Some(provider),
-            self.deferred_free_budget, self.keep_pace_reclaim)
+        Database::new(
+            Backend::Native(Box::new(backend)),
+            true,
+            self.page_size,
+            self.region_size,
+            self.cache_size,
+            &self.repair_callback,
+            Some(provider),
+            self.deferred_free_budget,
+            self.keep_pace_reclaim,
+        )
     }
     #[cfg(feature = "contextdb-internal")]
     #[doc(hidden)]
     pub fn open_with_native_backend_and_external_snapshots(
-        &self, backend: impl NativeStorageBackend, provider: ExternalSnapshotProvider,
+        &self,
+        backend: impl NativeStorageBackend,
+        provider: ExternalSnapshotProvider,
     ) -> Result<Database, DatabaseError> {
-        Database::new(Backend::Native(Box::new(backend)), false, self.page_size,
-            None, self.cache_size, &self.repair_callback, Some(provider),
-            self.deferred_free_budget, self.keep_pace_reclaim)
+        Database::new(
+            Backend::Native(Box::new(backend)),
+            false,
+            self.page_size,
+            None,
+            self.cache_size,
+            &self.repair_callback,
+            Some(provider),
+            self.deferred_free_budget,
+            self.keep_pace_reclaim,
+        )
     }
 
     /// Open an existing or create a new database with the given backend.
@@ -2881,6 +2970,7 @@ mod open_with_backend_region_override_tests;
 
 #[cfg(test)]
 mod test {
+    use crate::atomic_compat::AtomicUpdate as _;
     use crate::backends::FileBackend;
     use crate::{
         CommitError, Database, DatabaseError, Durability, ReadableDatabase, ReadableTable,
@@ -3109,7 +3199,7 @@ mod test {
         fn decrement_countdown(&self) -> Result<(), std::io::Error> {
             if self
                 .countdown
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+                .fetch_update_compat(Ordering::SeqCst, Ordering::SeqCst, |x| {
                     if x > 0 { Some(x - 1) } else { None }
                 })
                 .is_err()

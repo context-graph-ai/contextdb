@@ -1,10 +1,10 @@
+use super::page_allocation::{CacheShared, cache_array_prepaid};
 use crate::tree_store::page_store::fast_hash::FastHashMapU64;
 use crate::tree_store::page_store::fast_hash::FastHasher64;
 use std::hash::Hasher;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard};
-use super::page_allocation::{CacheShared, cache_array_prepaid};
 
 const NONE: u32 = u32::MAX;
 
@@ -45,16 +45,19 @@ impl<T> EntryArena<T> {
 
     pub(crate) fn try_new(capacity: usize) -> crate::Result<CacheShared<Self>> {
         assert!(capacity < NONE as usize);
-        let entries = cache_array_prepaid(capacity, |_| Ok(Entry {
-            key: AtomicU64::new(0),
-            second_chance: AtomicBool::new(false),
-            previous: AtomicU32::new(NONE),
-            next: AtomicU32::new(NONE),
-            chain: AtomicU32::new(NONE),
-            value: RwLock::new(None),
-        }))?;
-        let slots = cache_array_prepaid(capacity, |index|
-            Ok(u32::try_from(capacity - index - 1).unwrap()))?;
+        let entries = cache_array_prepaid(capacity, |_| {
+            Ok(Entry {
+                key: AtomicU64::new(0),
+                second_chance: AtomicBool::new(false),
+                previous: AtomicU32::new(NONE),
+                next: AtomicU32::new(NONE),
+                chain: AtomicU32::new(NONE),
+                value: RwLock::new(None),
+            })
+        })?;
+        let slots = cache_array_prepaid(capacity, |index| {
+            Ok(u32::try_from(capacity - index - 1).unwrap())
+        })?;
         CacheShared::new_prepaid(Self {
             entries,
             free: Mutex::new(FreeSlots {
@@ -105,11 +108,19 @@ pub struct LRUCache<T> {
 
 impl<T> LRUCache<T> {
     #[cfg(feature = "test-seams")]
-    pub(crate) fn allocations_for_test(&self, arena: bool, visit: &mut dyn FnMut((usize, usize, usize))) {
+    pub(crate) fn allocations_for_test(
+        &self,
+        arena: bool,
+        visit: &mut dyn FnMut((usize, usize, usize)),
+    ) {
         if arena {
             visit(self.arena.allocation_for_test());
             let layout = std::alloc::Layout::for_value(self.arena.entries.as_ref());
-            visit((self.arena.entries.as_ptr() as usize, layout.size(), layout.align()));
+            visit((
+                self.arena.entries.as_ptr() as usize,
+                layout.size(),
+                layout.align(),
+            ));
             let free = self.arena.free.lock().unwrap();
             let layout = std::alloc::Layout::for_value(free.slots.as_ref());
             visit((free.slots.as_ptr() as usize, layout.size(), layout.align()));
@@ -118,11 +129,13 @@ impl<T> LRUCache<T> {
         visit((self.heads.as_ptr() as usize, layout.size(), layout.align()));
     }
     #[cfg(test)]
-
     pub(crate) fn new(arena: CacheShared<EntryArena<T>>, head_count: usize) -> Self {
         Self::try_new(arena, head_count).expect("test cache stripe allocation")
     }
-    pub(crate) fn try_new(arena: CacheShared<EntryArena<T>>, head_count: usize) -> crate::Result<Self> {
+    pub(crate) fn try_new(
+        arena: CacheShared<EntryArena<T>>,
+        head_count: usize,
+    ) -> crate::Result<Self> {
         assert!(head_count.is_power_of_two());
         Ok(Self {
             arena,
@@ -544,13 +557,22 @@ pub(crate) mod arena_index_tests {
     }
     pub(crate) struct FreeWatch<'a>(std::marker::PhantomData<&'a std::sync::atomic::AtomicUsize>);
     impl<'a> FreeWatch<'a> {
-        pub(crate) fn start(pointer: *const (), counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        pub(crate) fn start(
+            pointer: *const (),
+            counter: &'a std::sync::atomic::AtomicUsize,
+        ) -> Self {
             FREE_TARGET.with(|slot| assert_eq!(slot.replace(pointer as usize), 0));
             FREE_COUNTER.with(|slot| slot.set(counter));
             FREE_CUT.with(|slot| slot.set([0; 4]));
             Self(std::marker::PhantomData)
         }
-        pub(crate) fn cut(&self) -> [usize; 4] { FREE_CUT.with(Cell::get) }
+        #[expect(
+            clippy::unused_self,
+            reason = "The live guard authorizes observation of its original allocation window."
+        )]
+        pub(crate) fn cut(&self) -> [usize; 4] {
+            FREE_CUT.with(Cell::get)
+        }
     }
     impl Drop for FreeWatch<'_> {
         fn drop(&mut self) {
@@ -591,11 +613,19 @@ pub(crate) mod arena_index_tests {
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             note(1, 4, layout.size());
-            let selected = FREE_TARGET.try_with(|slot| slot.get() == ptr as usize).unwrap_or(false);
+            let selected = FREE_TARGET
+                .try_with(|slot| slot.get() == ptr as usize)
+                .unwrap_or(false);
             let counter = if selected {
                 FREE_COUNTER.try_with(Cell::get).unwrap_or(std::ptr::null())
-            } else { std::ptr::null() };
-            let before = if counter.is_null() { 0 } else { unsafe { &*counter }.load(std::sync::atomic::Ordering::SeqCst) };
+            } else {
+                std::ptr::null()
+            };
+            let before = if counter.is_null() {
+                0
+            } else {
+                unsafe { &*counter }.load(std::sync::atomic::Ordering::SeqCst)
+            };
             unsafe { System.dealloc(ptr, layout) };
             if !counter.is_null() {
                 let after = unsafe { &*counter }.load(std::sync::atomic::Ordering::SeqCst);

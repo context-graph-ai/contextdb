@@ -177,8 +177,8 @@ fn validate_node(bytes: &[u8]) -> Result<()> {
             let data_start = 4 + 8 * count;
             let offsets = bytes.get(4..data_start).ok_or_else(corrupt)?;
             let mut end = data_start;
-            for offset in offsets.chunks_exact(4) {
-                let next = u32::from_le_bytes(offset.try_into().unwrap()) as usize;
+            for offset in offsets.as_chunks::<4>().0 {
+                let next = u32::from_le_bytes(*offset) as usize;
                 if next < end || next > bytes.len() {
                     return Err(corrupt());
                 }
@@ -201,16 +201,16 @@ fn validate_node(bytes: &[u8]) -> Result<()> {
             let offset_start = page_start + PageNumber::serialized_size() * children;
             let data_start = offset_start + 4 * count;
             let pages = bytes.get(page_start..offset_start).ok_or_else(corrupt)?;
-            for page in pages.chunks_exact(PageNumber::serialized_size()) {
-                if PageNumber::validated_from_le_bytes(page.try_into().unwrap()).is_none() {
+            for page in pages.as_chunks::<{ PageNumber::serialized_size() }>().0 {
+                if PageNumber::validated_from_le_bytes(*page).is_none() {
                     return Err(corrupt());
                 }
             }
             let offsets = bytes.get(offset_start..data_start).ok_or_else(corrupt)?;
             let mut start = data_start;
             let mut previous: Option<&[u8]> = None;
-            for offset in offsets.chunks_exact(4) {
-                let end = u32::from_le_bytes(offset.try_into().unwrap()) as usize;
+            for offset in offsets.as_chunks::<4>().0 {
+                let end = u32::from_le_bytes(*offset) as usize;
                 let key = bytes.get(start..end).ok_or_else(corrupt)?;
                 if previous.is_some_and(|prior| prior >= key) {
                     return Err(corrupt());
@@ -252,28 +252,54 @@ pub struct BoundedByteHandle<'a> {
 impl<'a> BoundedByteHandle<'a> {
     /// Lengths belong to the captured table loan; no key/value copy is made.
     pub fn key_len(&self) -> usize {
-        match &self.source { HandleSource::Singleton {key,..} | HandleSource::Loaded {key,..} => key.len() }
+        match &self.source {
+            HandleSource::Singleton { key, .. } | HandleSource::Loaded { key, .. } => key.len(),
+        }
     }
     pub fn value_len(&self) -> usize {
-        match &self.source { HandleSource::Singleton {value,..} | HandleSource::Loaded {value,..} => value.len() }
+        match &self.source {
+            HandleSource::Singleton { value, .. } | HandleSource::Loaded { value, .. } => {
+                value.len()
+            }
+        }
     }
     /// A synchronous borrowed window. Only authenticated cursors expose bytes;
     /// oversized singletons use charged windows, never a complete page read.
-    pub fn with_bytes<R>(&self, key: bool, range: Range<usize>, consume: impl FnOnce(&[u8]) -> R) -> Result<R> {
-        if !self.authenticated { return Err(StorageError::Corrupted("byte loan requires an authenticated cursor".into())); }
+    pub fn with_bytes<R>(
+        &self,
+        key: bool,
+        range: Range<usize>,
+        consume: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
+        if !self.authenticated {
+            return Err(StorageError::Corrupted(
+                "byte loan requires an authenticated cursor".into(),
+            ));
+        }
         let stored = match &self.source {
-            HandleSource::Singleton {key: k,value:v,..} | HandleSource::Loaded {key:k,value:v,..} => if key {k} else {v},
+            HandleSource::Singleton {
+                key: k, value: v, ..
+            }
+            | HandleSource::Loaded {
+                key: k, value: v, ..
+            } => {
+                if key {
+                    k
+                } else {
+                    v
+                }
+            }
         };
         if range.start > range.end || range.end > stored.len() {
             return Err(StorageError::Corrupted("byte loan exceeds record".into()));
         }
         let range = stored.start + range.start..stored.start + range.end;
         match &self.source {
-            HandleSource::Singleton {number,..} => {
-                let window = self.mem.get_page_window(*number,range,self.hint)?;
+            HandleSource::Singleton { number, .. } => {
+                let window = self.mem.get_page_window(*number, range, self.hint)?;
                 Ok(consume(&window))
             }
-            HandleSource::Loaded {page,..} => Ok(consume(&page.memory()[range])),
+            HandleSource::Loaded { page, .. } => Ok(consume(&page.memory()[range])),
         }
     }
 
@@ -335,9 +361,13 @@ impl<'a> BoundedByteHandle<'a> {
                 validate_node(page.memory())?;
                 if self.authenticated {
                     if page_checksum(&page, None, None)? != *checksum {
-                        return Err(StorageError::Corrupted("authenticated singleton changed".into()));
+                        return Err(StorageError::Corrupted(
+                            "authenticated singleton changed".into(),
+                        ));
                     }
-                } else { verify(&page, *checksum, self.hint)?; }
+                } else {
+                    verify(&page, *checksum, self.hint)?;
+                }
                 if page.memory()[0] != LEAF {
                     return Err(StorageError::Corrupted(
                         "bounded singleton changed node type".into(),
@@ -447,13 +477,22 @@ impl<'a> BoundedByteCursor<'a> {
                 if self.authenticated {
                     // Authenticate the complete encoded leaf (including offsets,
                     // key and value) without allocating the complete extent.
-                    let actual = super::page_store::hash128_from_windows(layout.value.end, |start, out: &mut [u8]| {
-                        let window = self.mem.get_page_window(number, start..start + out.len(), self.hint)?;
-                        out.copy_from_slice(&window);
-                        Ok::<_, StorageError>(())
-                    })?;
+                    let actual = super::page_store::hash128_from_windows(
+                        layout.value.end,
+                        |start, out: &mut [u8]| {
+                            let window = self.mem.get_page_window(
+                                number,
+                                start..start + out.len(),
+                                self.hint,
+                            )?;
+                            out.copy_from_slice(&window);
+                            Ok::<_, StorageError>(())
+                        },
+                    )?;
                     if actual != checksum {
-                        return Err(StorageError::Corrupted("streamed byte leaf failed checksum verification".into()));
+                        return Err(StorageError::Corrupted(
+                            "streamed byte leaf failed checksum verification".into(),
+                        ));
                     }
                 }
                 let handle = self.handle(HandleSource::Singleton {
@@ -469,20 +508,32 @@ impl<'a> BoundedByteCursor<'a> {
             validate_node(page.memory())?;
             if self.authenticated && !self.mem.uncommitted(number) {
                 if page_checksum(&page, None, None)? != checksum {
-                    return Err(StorageError::Corrupted("same-write byte path failed checksum verification".into()));
+                    return Err(StorageError::Corrupted(
+                        "same-write byte path failed checksum verification".into(),
+                    ));
                 }
-            } else { verify(&page, checksum, self.hint)?; }
+            } else {
+                verify(&page, checksum, self.hint)?;
+            }
             match page.memory()[0] {
                 LEAF => self.leaf = Some((page, 0)),
                 BRANCH => {
-                    if self.authenticated && self.branches.len()==self.branches.capacity() {
-                        let capacity=self.branches.capacity().checked_mul(2).map(|n|n.max(1))
-                            .ok_or_else(||StorageError::Corrupted("byte cursor navigation overflow".into()))?;
-                        let layout=std::alloc::Layout::array::<(PageImpl,usize)>(capacity)
-                            .map_err(|_|StorageError::Corrupted("byte cursor navigation overflow".into()))?;
-                        let invoice=crate::read_admission::admit_read_memory(layout.size())?;
-                        self.branches.reserve_exact(capacity-self.branches.len());
-                        self.navigation_invoice=invoice;
+                    if self.authenticated && self.branches.len() == self.branches.capacity() {
+                        let capacity = self
+                            .branches
+                            .capacity()
+                            .checked_mul(2)
+                            .map(|n| n.max(1))
+                            .ok_or_else(|| {
+                                StorageError::Corrupted("byte cursor navigation overflow".into())
+                            })?;
+                        let layout = std::alloc::Layout::array::<(PageImpl, usize)>(capacity)
+                            .map_err(|_| {
+                                StorageError::Corrupted("byte cursor navigation overflow".into())
+                            })?;
+                        let invoice = crate::read_admission::admit_read_memory(layout.size())?;
+                        self.branches.reserve_exact(capacity - self.branches.len());
+                        self.navigation_invoice = invoice;
                     }
                     self.branches.push((page, 0));
                     self.advance_branch();
@@ -698,11 +749,20 @@ impl Btree<&'static [u8], &'static [u8]> {
 }
 
 impl BtreeMut<'_, &'static [u8], &'static [u8]> {
-    pub(crate) fn cursor_authenticated(&self, guard: Arc<TransactionGuard>) -> BoundedByteCursor<'_> {
+    pub(crate) fn cursor_authenticated(
+        &self,
+        guard: Arc<TransactionGuard>,
+    ) -> BoundedByteCursor<'_> {
         BoundedByteCursor {
-            mem: self.mem.clone(), guard, hint: PageHint::None,
-            next: self.get_root().map(|root| (root.root,root.checksum)),
-            branches: Vec::new(), navigation_invoice: None, leaf: None, failed: false, authenticated: true,
+            mem: self.mem.clone(),
+            guard,
+            hint: PageHint::None,
+            next: self.get_root().map(|root| (root.root, root.checksum)),
+            branches: Vec::new(),
+            navigation_invoice: None,
+            leaf: None,
+            failed: false,
+            authenticated: true,
             _table: PhantomData,
         }
     }

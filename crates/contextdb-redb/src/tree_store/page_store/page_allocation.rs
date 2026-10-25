@@ -1,5 +1,6 @@
 //! Concrete, weakless owners for the legacy page cache. No byte/control Arc can
 //! escape independently of the payer. Native copies retain their separate owner.
+use crate::atomic_compat::AtomicUpdate as _;
 use crate::read_admission::{ReadMemoryCharge, admit_read_memory};
 use crate::{Result, StorageError};
 use std::alloc::{Layout, alloc, dealloc};
@@ -16,7 +17,7 @@ fn allocation_failed(site: &'static str, layout: Layout) -> StorageError {
 
 fn retain(owners: &AtomicUsize) {
     owners
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        .fetch_update_compat(Ordering::Relaxed, Ordering::Relaxed, |n| {
             n.checked_add(1).filter(|n| isize::try_from(*n).is_ok())
         })
         .expect("cache allocation strong count overflow");
@@ -47,7 +48,10 @@ impl CacheCounter {
     }
     #[cfg(feature = "test-seams")]
     pub(super) fn preparation_for_test(&self) -> usize {
-        unsafe { self.block.as_ref() }.preparation.as_ref().map_or(0, |p| p.identity_for_test())
+        unsafe { self.block.as_ref() }
+            .preparation
+            .as_ref()
+            .map_or(0, |p| p.identity_for_test())
     }
 
     #[cfg(feature = "test-seams")]
@@ -56,15 +60,24 @@ impl CacheCounter {
     }
 
     pub(super) fn release_generation(&self) -> u64 {
-        unsafe { self.block.as_ref() }.release_generation.load(Ordering::Acquire)
+        unsafe { self.block.as_ref() }
+            .release_generation
+            .load(Ordering::Acquire)
     }
     fn note_external_release(&self) {
-        unsafe { self.block.as_ref() }.release_generation
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |generation| generation.checked_add(1))
+        unsafe { self.block.as_ref() }
+            .release_generation
+            .fetch_update_compat(Ordering::Release, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
             .expect("cache release generation exhausted");
     }
     pub(super) fn has_fixed_reserve(&self) -> bool {
-        unsafe { self.block.as_ref() }.reserve.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        unsafe { self.block.as_ref() }
+            .reserve
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
     pub(super) fn layout() -> Layout {
         Layout::new::<CounterBlock>()
@@ -78,7 +91,8 @@ impl CacheCounter {
         } else {
             admit_read_memory(layout.size())?
         };
-        let Some(block) = NonNull::new(unsafe { alloc(layout) }.cast::<CounterBlock>()) else {
+        let Some(block) = NonNull::new(unsafe { alloc(layout) }).map(NonNull::cast::<CounterBlock>)
+        else {
             // No backing was created. Returning the actual allocator fact does
             // not allocate a diagnostic Box or reinterpret a caller refusal.
             return Err(allocation_failed("cache occupancy control", layout));
@@ -160,7 +174,7 @@ impl CachePayment {
         // strand an occupancy increment without its rollback owner.
         let owner = counter.clone();
         let previous = counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .fetch_update_compat(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
             })
             .map_err(|_| StorageError::ValueTooLarge(bytes))?;
@@ -215,7 +229,9 @@ struct PageBlock {
 }
 
 impl PageBlock {
-    fn len(&self) -> usize { self.len_and_origin & (isize::MAX as usize) }
+    fn len(&self) -> usize {
+        self.len_and_origin & (isize::MAX as usize)
+    }
 }
 
 /// Exactly one allocation: reference control, checksum, payer and inline bytes.
@@ -250,25 +266,36 @@ impl PageAllocation {
         )
     }
     #[cfg(feature = "contextdb-internal")]
-    pub(super) fn zeroed_native(len: usize) -> std::result::Result<Self, crate::NativeColdReadError> {
-        use crate::native_storage_admission::{NativeColdFault, NativeColdReadError, admit_native_storage};
-        let (layout, _) = Self::layout(len).map_err(|_| NativeColdReadError::Corrupt(
-            NativeColdFault::new("native page layout overflow")))?;
+    pub(super) fn zeroed_native(
+        len: usize,
+    ) -> std::result::Result<Self, crate::NativeColdReadError> {
+        use crate::native_storage_admission::{
+            NativeColdFault, NativeColdReadError, admit_native_storage,
+        };
+        let (layout, _) = Self::layout(len).map_err(|_| {
+            NativeColdReadError::Corrupt(NativeColdFault::new("native page layout overflow"))
+        })?;
         let credit = admit_native_storage(layout)?;
-        let mut page = Self::zeroed(len, Some(ReadMemoryCharge::Native(credit.into_page_charge())))
-            .map_err(|error| match error {
-                StorageError::Native(error) => error,
-                _ => unreachable!("checked native page layout"),
-            })?;
+        let mut page = Self::zeroed(
+            len,
+            Some(ReadMemoryCharge::Native(credit.into_page_charge())),
+        )
+        .map_err(|error| match error {
+            StorageError::Native(error) => error,
+            _ => unreachable!("checked native page layout"),
+        })?;
         // The unique, unpublished allocation was paid by the native producer.
         unsafe { page.block.as_mut() }.len_and_origin |= !(isize::MAX as usize);
         Ok(page)
     }
     #[cfg(feature = "contextdb-internal")]
-    pub(super) fn is_native(&self) -> bool { (unsafe { self.block.as_ref() }.len_and_origin & !(isize::MAX as usize)) != 0 }
+    pub(super) fn is_native(&self) -> bool {
+        (unsafe { self.block.as_ref() }.len_and_origin & !(isize::MAX as usize)) != 0
+    }
 
     fn allocate(len: usize, layout: Layout, offset: usize, payer: PagePayer) -> Result<Self> {
-        let Some(block) = NonNull::new(unsafe { alloc(layout) }.cast::<PageBlock>()) else {
+        let Some(block) = NonNull::new(unsafe { alloc(layout) }).map(NonNull::cast::<PageBlock>)
+        else {
             return Err(allocation_failed("cache page allocation", layout));
         };
         // All operations after alloc are infallible, with no user callback.
@@ -289,18 +316,27 @@ impl PageAllocation {
     // observation only: it retains no payer and changes no cache state.
     #[cfg(feature = "test-seams")]
     pub(super) fn payment_for_test(&self) -> (&'static str, usize, usize) {
-        let slot = unsafe { self.block.as_ref() }.payer.lock()
+        let slot = unsafe { self.block.as_ref() }
+            .payer
+            .lock()
             .unwrap_or_else(|e| e.into_inner());
         match &*slot {
-            Some(PagePayer::Cache(payment)) =>
-                ("cache", payment.counter.block.as_ptr() as usize, payment.bytes),
-            Some(PagePayer::SourceCounted { occupancy, .. }) =>
-                ("source_counted", occupancy.counter.block.as_ptr() as usize, occupancy.bytes),
+            Some(PagePayer::Cache(payment)) => (
+                "cache",
+                payment.counter.block.as_ptr() as usize,
+                payment.bytes,
+            ),
+            Some(PagePayer::SourceCounted { occupancy, .. }) => (
+                "source_counted",
+                occupancy.counter.block.as_ptr() as usize,
+                occupancy.bytes,
+            ),
             Some(PagePayer::Source(_)) => ("source", 0, 0),
             Some(PagePayer::Unscoped) => ("unscoped", 0, 0),
             None => ("missing", 0, 0),
         }
     }
+    #[cfg(any(test, feature = "contextdb-internal"))]
     pub(super) fn checksum(&self) -> &Mutex<Option<u128>> {
         &unsafe { self.block.as_ref() }.checksum
     }
@@ -396,7 +432,10 @@ impl PageAllocation {
         *block.checksum.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
         let (_, offset) = Self::layout(block.len()).expect("live page has a valid Layout");
         Some(unsafe {
-            std::slice::from_raw_parts_mut(this.block.as_ptr().cast::<u8>().add(offset), block.len())
+            std::slice::from_raw_parts_mut(
+                this.block.as_ptr().cast::<u8>().add(offset),
+                block.len(),
+            )
         })
     }
 }
@@ -432,18 +471,31 @@ impl Drop for PageAllocation {
         // still owned. After decrement another thread may free the page, so
         // no page field may be touched while publishing the release notice.
         let counter = {
-            let payer = unsafe { self.block.as_ref() }.payer.lock()
+            let payer = unsafe { self.block.as_ref() }
+                .payer
+                .lock()
                 .unwrap_or_else(|error| error.into_inner());
             match &*payer {
-                Some(PagePayer::Cache(payment) | PagePayer::SourceCounted { occupancy: payment, .. }) => Some(payment.counter.clone()),
+                Some(
+                    PagePayer::Cache(payment)
+                    | PagePayer::SourceCounted {
+                        occupancy: payment, ..
+                    },
+                ) => Some(payment.counter.clone()),
                 _ => None,
             }
         };
-        let previous = unsafe { self.block.as_ref() }.owners.fetch_sub(1, Ordering::Release);
-        if previous == 2 {
-            if let Some(counter) = &counter { counter.note_external_release(); }
+        let previous = unsafe { self.block.as_ref() }
+            .owners
+            .fetch_sub(1, Ordering::Release);
+        if previous == 2
+            && let Some(counter) = &counter
+        {
+            counter.note_external_release();
         }
-        if previous != 1 { return; }
+        if previous != 1 {
+            return;
+        }
         fence(Ordering::Acquire);
         let block = unsafe { self.block.as_mut() };
         let (layout, _) = Self::layout(block.len()).expect("live page has a valid Layout");
@@ -488,7 +540,10 @@ impl CacheReserveOwner {
     }
     #[cfg(feature = "test-seams")]
     pub fn observation_for_test(&self) -> [(usize, usize); 2] {
-        [self.read.observation_for_test(), self.write.observation_for_test()]
+        [
+            self.read.observation_for_test(),
+            self.write.observation_for_test(),
+        ]
     }
 
     pub(super) fn install(
@@ -550,7 +605,7 @@ pub(crate) struct CacheShared<T> {
 unsafe impl<T: Send + Sync> Send for CacheShared<T> {}
 unsafe impl<T: Send + Sync> Sync for CacheShared<T> {}
 impl<T> CacheShared<T> {
-    #[cfg(any(test, feature = "test-seams"))]
+    #[cfg(any(feature = "test-seams", all(test, feature = "contextdb-internal")))]
     pub(crate) fn allocation_for_test(&self) -> (usize, usize, usize) {
         let layout = Self::layout();
         (self.block.as_ptr() as usize, layout.size(), layout.align())
@@ -574,7 +629,7 @@ impl<T> CacheShared<T> {
                 owners: AtomicUsize::new(1),
                 payload: std::mem::ManuallyDrop::new(payload),
                 preparation,
-            })
+            });
         };
         Ok(Self { block })
     }
@@ -627,13 +682,6 @@ pub(crate) fn cache_array_prepaid<T>(
     len: usize,
     mut initialize: impl FnMut(usize) -> Result<T>,
 ) -> Result<Box<[T]>> {
-    let layout = Layout::array::<T>(len).map_err(|_| StorageError::ValueTooLarge(len))?;
-    let pointer = if layout.size() == 0 {
-        NonNull::<T>::dangling()
-    } else {
-        NonNull::new(unsafe { alloc(layout) }.cast::<T>())
-            .ok_or_else(|| allocation_failed("cache index array", layout))?
-    };
     struct FreeRaw {
         pointer: NonNull<u8>,
         layout: Layout,
@@ -660,10 +708,17 @@ pub(crate) fn cache_array_prepaid<T>(
                 std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
                     self.pointer.as_ptr(),
                     self.initialized,
-                ))
+                ));
             };
         }
     }
+    let layout = Layout::array::<T>(len).map_err(|_| StorageError::ValueTooLarge(len))?;
+    let pointer = if layout.size() == 0 {
+        NonNull::<T>::dangling()
+    } else {
+        NonNull::new(unsafe { alloc(layout) }.cast::<T>())
+            .ok_or_else(|| allocation_failed("cache index array", layout))?
+    };
     let mut guard = Initializing {
         pointer,
         initialized: 0,

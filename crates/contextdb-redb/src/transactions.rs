@@ -330,6 +330,10 @@ pub struct SystemTableDefinition<'a, K: Key + 'static, V: Value + 'static> {
 }
 
 impl<'a, K: Key + 'static, V: Value + 'static> SystemTableDefinition<'a, K, V> {
+    #[expect(
+        clippy::assert_is_empty,
+        reason = "The constructor remains const on the declared minimum Rust version."
+    )]
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {
@@ -1144,7 +1148,10 @@ impl PreparedReadInput {
     ) -> std::result::Result<PreparedWrite<P>, E> {
         // The old wrapper becomes empty before the consuming path takes over;
         // exactly one owner can abort/close the actual allocation tracker.
-        self.0.write.take().expect("one actual write preparation")
+        self.0
+            .write
+            .take()
+            .expect("one actual write preparation")
             .prepare_commit_with_read(admission, map_storage, map_read, prepare)
     }
 }
@@ -1156,40 +1163,61 @@ pub struct PreparedReadView<'a>(&'a ReadTransaction);
 
 #[cfg(feature = "contextdb-internal")]
 impl PreparedReadView<'_> {
-    pub fn identity(&self) -> StorageSnapshotIdentity { self.0.storage_snapshot_identity() }
+    pub fn identity(&self) -> StorageSnapshotIdentity {
+        self.0.storage_snapshot_identity()
+    }
 
     /// Scalar lookup for the admitted prepared reader. Names are borrowed and
     /// all new pages/navigation controls use the enclosing exact admission.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub fn bytes_equal_prepared(
         &self,
         table: TableDefinition<&[u8], &[u8]>,
         key: &[u8],
         expected: &[u8],
     ) -> std::result::Result<bool, crate::PreparedReadError> {
-        self.0.tree.prepared_bytes_equal(table.name(), key, expected)
+        self.0
+            .tree
+            .prepared_bytes_equal(table.name(), key, expected)
     }
 
-    pub fn bytes_equal(&self, table: TableDefinition<&[u8], &[u8]>, key: &[u8], expected: &[u8]) -> Result<bool> {
+    pub fn bytes_equal(
+        &self,
+        table: TableDefinition<&[u8], &[u8]>,
+        key: &[u8],
+        expected: &[u8],
+    ) -> Result<bool> {
         let table = match self.0.open_table(table) {
             Ok(table) => table,
             Err(TableError::TableDoesNotExist(_)) => return Ok(false),
             Err(error) => return Err(error.into_storage_error_or_corrupted("prepared root table")),
         };
-        Ok(table.get(key)?.is_some_and(|value| value.value() == expected))
+        Ok(table
+            .get(key)?
+            .is_some_and(|value| value.value() == expected))
     }
 }
 
 #[cfg(feature = "contextdb-internal")]
 impl<P> PreparedWrite<P> {
     /// These are concrete controls, excluding page buffers covered by the
-    /// caller's ordinary read/page admission. Pay before prepare_commit.
+    /// caller's ordinary read/page admission. Pay before `prepare_commit`.
     pub fn control_bytes() -> usize {
         fn arc_bytes<T>() -> usize {
-            std::alloc::Layout::new::<[usize; 2]>().extend(std::alloc::Layout::new::<T>())
-                .unwrap().0.pad_to_align().size()
+            std::alloc::Layout::new::<[usize; 2]>()
+                .extend(std::alloc::Layout::new::<T>())
+                .unwrap()
+                .0
+                .pad_to_align()
+                .size()
         }
-        std::mem::size_of::<Self>() + arc_bytes::<ReadTransaction>()
-            + arc_bytes::<TransactionGuard>() + arc_bytes::<AtomicBool>()
+        std::mem::size_of::<Self>()
+            + arc_bytes::<ReadTransaction>()
+            + arc_bytes::<TransactionGuard>()
+            + arc_bytes::<AtomicBool>()
             + std::mem::size_of::<crate::transaction_tracker::PreparedPin>()
     }
 
@@ -1198,20 +1226,30 @@ impl<P> PreparedWrite<P> {
         let write = self.write.as_mut().expect("one sealed commit");
         // Keep write in this owner on refusal: its prepared read must disappear
         // before abort. Acquire both close locks before consuming either list.
-        let (allocated, freed) = write.tables.lock().map_err(StorageError::from)?.table_tree.close_sealed()?;
+        let (allocated, freed) = write
+            .tables
+            .lock()
+            .map_err(StorageError::from)?
+            .table_tree
+            .close_sealed()?;
         write.completed = true;
         let mut write = self.write.take().unwrap();
-        let result = write.commit_finalized_publishing(self.user_root, allocated, freed, &self.marker);
+        let result =
+            write.commit_finalized_publishing(self.user_root, allocated, freed, &self.marker);
         self.preserve_failure = result.is_err();
         result
     }
 
-    pub fn is_durable(&self) -> bool { self.marker.is_durable() }
+    pub fn is_durable(&self) -> bool {
+        self.marker.is_durable()
+    }
 
     /// Only moves prepaid owners. It neither reads storage nor registers a
     /// root, and is valid after a postflush Err or caught unwind.
     pub fn take_durable(&mut self) -> Option<(Arc<ReadTransaction>, P)> {
-        if !self.marker.is_durable() { return None; }
+        if !self.marker.is_durable() {
+            return None;
+        }
         match (self.read.take(), self.prepared.take()) {
             (Some(read), Some(prepared)) => Some((read, prepared)),
             _ => None,
@@ -1226,7 +1264,11 @@ impl<P> Drop for PreparedWrite<P> {
         let mut first = None;
         let mut cleanup = |action: &mut dyn FnMut()| {
             if let Err(payload) = panic::catch_unwind(panic::AssertUnwindSafe(action)) {
-                if first.is_none() { first = Some(payload); } else { std::mem::forget(payload); }
+                if first.is_none() {
+                    first = Some(payload);
+                } else {
+                    std::mem::forget(payload);
+                }
             }
         };
         // Each owner is taken before its destructor runs. Even a failed refund
@@ -1234,9 +1276,17 @@ impl<P> Drop for PreparedWrite<P> {
         cleanup(&mut || drop(self.read.take()));
         cleanup(&mut || drop(self.marker.prepared_guard.take()));
         cleanup(&mut || drop(self.prepared.take()));
-        cleanup(&mut || { if let Some(write) = self.write.take() { let _ = write.abort(); } });
+        cleanup(&mut || {
+            if let Some(write) = self.write.take() {
+                let _ = write.abort();
+            }
+        });
         if let Some(payload) = first {
-            if already_unwinding { std::mem::forget(payload); } else { panic::resume_unwind(payload); }
+            if already_unwinding {
+                std::mem::forget(payload);
+            } else {
+                panic::resume_unwind(payload);
+            }
         }
     }
 }
@@ -1323,6 +1373,10 @@ impl WriteTransaction {
         self.capture_table_root(name, false)
     }
 
+    #[expect(
+        clippy::option_option,
+        reason = "The outer option distinguishes an absent table and the inner option an empty persisted root."
+    )]
     fn capture_table_root(
         &self,
         name: &str,
@@ -1482,7 +1536,9 @@ impl WriteTransaction {
         let free_until = self
             .transaction_tracker
             .oldest_live_read_transaction()
-            .map_or(self.transaction_id, |id| TransactionId::min(id.next(), self.transaction_id))
+            .map_or(self.transaction_id, |id| {
+                TransactionId::min(id.next(), self.transaction_id)
+            })
             .raw_id();
         let mut system_tables = self.system_tables.lock().unwrap();
         for definition in [DATA_FREED_TABLE, SYSTEM_FREED_TABLE] {
@@ -2355,7 +2411,9 @@ impl WriteTransaction {
     ) -> std::result::Result<PreparedWrite<P>, E> {
         self.prepare_commit_read_with(
             &map_storage,
-            |root, guard, mem| TableTree::new(root, PageHint::Verified, guard, mem).map_err(&map_storage),
+            |root, guard, mem| {
+                TableTree::new(root, PageHint::Verified, guard, mem).map_err(&map_storage)
+            },
             prepare,
         )
     }
@@ -2366,8 +2424,12 @@ impl WriteTransaction {
     #[doc(hidden)]
     pub fn into_prepared_read(self) -> PreparedReadInput {
         PreparedReadInput(PreparedWrite {
-            read: None, prepared: None, marker: self.durable_publication(),
-            user_root: None, write: Some(self), preserve_failure: true,
+            read: None,
+            prepared: None,
+            marker: self.durable_publication(),
+            user_root: None,
+            write: Some(self),
+            preserve_failure: true,
         })
     }
 
@@ -2397,30 +2459,58 @@ impl WriteTransaction {
     fn prepare_commit_read_with<P, E>(
         self,
         map_storage: impl Fn(StorageError) -> E,
-        read_tree: impl FnOnce(Option<BtreeHeader>, Arc<TransactionGuard>, Arc<TransactionalMemory>)
-            -> std::result::Result<TableTree, E>,
+        read_tree: impl FnOnce(
+            Option<BtreeHeader>,
+            Arc<TransactionGuard>,
+            Arc<TransactionalMemory>,
+        ) -> std::result::Result<TableTree, E>,
         prepare: impl FnOnce(&PreparedReadView<'_>) -> std::result::Result<P, E>,
     ) -> std::result::Result<PreparedWrite<P>, E> {
         let mut prepared = PreparedWrite {
-            read: None, prepared: None, marker: self.durable_publication(), user_root: None, write: Some(self), preserve_failure: true,
+            read: None,
+            prepared: None,
+            marker: self.durable_publication(),
+            user_root: None,
+            write: Some(self),
+            preserve_failure: true,
         };
         let write = prepared.write.as_ref().unwrap();
         if !matches!(write.durability, InternalDurability::Immediate) {
-            return Err(map_storage(StorageError::Io(io::Error::new(io::ErrorKind::InvalidInput,
-                "prepared publication requires Immediate durability"))));
+            return Err(map_storage(StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prepared publication requires Immediate durability",
+            ))));
         }
-        if let Some(error) = write.table_root_hook_error.lock().map_err(StorageError::from).map_err(&map_storage)?.take() {
+        if let Some(error) = write
+            .table_root_hook_error
+            .lock()
+            .map_err(StorageError::from)
+            .map_err(&map_storage)?
+            .take()
+        {
             return Err(map_storage(error));
         }
-        let root = write.tables.lock().map_err(StorageError::from).map_err(&map_storage)?
-            .table_tree.seal_user_root().map_err(&map_storage)?;
+        let root = write
+            .tables
+            .lock()
+            .map_err(StorageError::from)
+            .map_err(&map_storage)?
+            .table_tree
+            .seal_user_root()
+            .map_err(&map_storage)?;
         prepared.user_root = root;
-        let guard = Arc::new(TransactionGuard::new_prepared(write.transaction_id, write.transaction_tracker.clone()));
+        let guard = Arc::new(TransactionGuard::new_prepared(
+            write.transaction_id,
+            write.transaction_tracker.clone(),
+        ));
         let read = Arc::new(ReadTransaction {
             mem: write.mem.clone(),
             tree: read_tree(root, guard.clone(), write.mem.clone())?,
         });
-        write.transaction_tracker.register_prepared_pin(read.storage_snapshot_identity(), &guard).map_err(&map_storage)?;
+        write
+            .transaction_tracker
+            .register_prepared_pin(read.storage_snapshot_identity(), &guard)
+            .map_err(&map_storage)?;
         prepared.marker.prepared_guard = Some(guard);
         prepared.read = Some(read);
         let value = prepare(&PreparedReadView(prepared.read.as_deref().unwrap()))?;
@@ -2567,7 +2657,9 @@ impl WriteTransaction {
         data_freed: Vec<PageNumber>,
         marker: &DurablePublication,
     ) -> Result<(), CommitError> {
-        if self.quick_repair { self.two_phase_commit = true; }
+        if self.quick_repair {
+            self.two_phase_commit = true;
+        }
         #[cfg(feature = "test-seams")]
         let span_started = std::time::Instant::now();
         let allocated_pages: Vec<_> = allocated_pages.into_iter().collect();
@@ -2756,7 +2848,9 @@ impl WriteTransaction {
         let mut free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
-            .map_or(self.transaction_id, |x| TransactionId::min(x.next(), self.transaction_id));
+            .map_or(self.transaction_id, |x| {
+                TransactionId::min(x.next(), self.transaction_id)
+            });
         if let Some(ceiling) = self.reclaim_ceiling {
             free_until_transaction = TransactionId::min(free_until_transaction, ceiling);
         }
@@ -2872,7 +2966,9 @@ impl WriteTransaction {
         let mut free_until_transaction = self
             .transaction_tracker
             .oldest_live_read_transaction()
-            .map_or(self.transaction_id, |x| TransactionId::min(x.next(), self.transaction_id));
+            .map_or(self.transaction_id, |x| {
+                TransactionId::min(x.next(), self.transaction_id)
+            });
         if let Some(ceiling) = self.reclaim_ceiling {
             free_until_transaction = TransactionId::min(free_until_transaction, ceiling);
         }
@@ -5243,16 +5339,27 @@ impl NativeReadView {
 impl ReadTransaction {
     /// Borrow directory records of THIS captured user root; no table-name list.
     #[doc(hidden)]
-    pub fn next_native_directory_record(&self, lower: &[u8], exclusive: bool,
-        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>)
-        -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
-        self.tree.next_native_directory_record(lower, exclusive, before)
+    pub fn next_native_directory_record(
+        &self,
+        lower: &[u8],
+        exclusive: bool,
+        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError>
+    {
+        self.tree
+            .next_native_directory_record(lower, exclusive, before)
     }
     /// Internal numeric-key/byte-value range for the vector cleanup owner.
     #[doc(hidden)]
-    pub fn next_native_u64_bytes_range(&self, name: &str, lower: u64, exclusive: bool,
-        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>)
-        -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError> {
-        self.tree.next_native_u64_bytes_range(name, lower, exclusive, before)
+    pub fn next_native_u64_bytes_range(
+        &self,
+        name: &str,
+        lower: u64,
+        exclusive: bool,
+        before: &mut dyn FnMut() -> std::result::Result<(), crate::NativeColdReadError>,
+    ) -> std::result::Result<Option<crate::tree_store::NativeRangeEntry>, crate::NativeColdReadError>
+    {
+        self.tree
+            .next_native_u64_bytes_range(name, lower, exclusive, before)
     }
 }

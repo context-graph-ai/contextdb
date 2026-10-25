@@ -691,7 +691,10 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
             fake_allocated_pages,
         );
         operation.insert_inplace(key, value)?;
-        assert!(fake_freed_pages.is_empty());
+        assert_eq!(
+            fake_freed_pages,
+            Vec::<crate::tree_store::PageNumber>::new()
+        );
         Ok(())
     }
 
@@ -1537,8 +1540,8 @@ fn native_validate_key_node(
             let offset_start = page_start + PageNumber::serialized_size() * children;
             let data_start = offset_start + if u8_key { 0 } else { 4 * count };
             let pages = bytes.get(page_start..offset_start).ok_or_else(corrupt)?;
-            for page in pages.chunks_exact(PageNumber::serialized_size()) {
-                if PageNumber::validated_from_le_bytes(page.try_into().unwrap()).is_none() {
+            for page in pages.as_chunks::<{ PageNumber::serialized_size() }>().0 {
+                if PageNumber::validated_from_le_bytes(*page).is_none() {
                     return Err(corrupt());
                 }
             }
@@ -1559,8 +1562,8 @@ fn native_validate_key_node(
         start += count;
     }
     let mut previous: Option<&[u8]> = None;
-    for (index, offset) in offsets.chunks_exact(4).enumerate() {
-        let end = u32::from_le_bytes(offset.try_into().unwrap()) as usize;
+    for (index, offset) in offsets.as_chunks::<4>().0.iter().enumerate() {
+        let end = u32::from_le_bytes(*offset) as usize;
         let value = bytes.get(start..end).ok_or_else(corrupt)?;
         if !u8_key && index < count {
             if previous.is_some_and(|prior| prior >= value)
@@ -1595,10 +1598,16 @@ pub(crate) fn native_key_get(
     directory: bool,
     u8_key: bool,
 ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::NativeColdReadError> {
-    native_key_get_with(root, key, directory, u8_key, None, |page| mem.get_native_page_memory(page))
+    native_key_get_with(root, key, directory, u8_key, None, |page| {
+        mem.get_native_page_memory(page)
+    })
 }
 
 #[cfg(feature = "contextdb-internal")]
+#[allow(
+    clippy::result_large_err,
+    reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+)]
 pub(crate) fn prepared_byte_get(
     root: Option<BtreeHeader>,
     mem: &TransactionalMemory,
@@ -1606,26 +1615,37 @@ pub(crate) fn prepared_byte_get(
     directory: bool,
     first_page: Option<&super::page_store::PageMemory>,
 ) -> std::result::Result<Option<AccessGuard<'static, &'static [u8]>>, crate::PreparedReadError> {
-    native_key_get_with(root, key, directory, false, first_page, |page| mem.get_prepared_page_memory(page))
+    native_key_get_with(root, key, directory, false, first_page, |page| {
+        mem.get_prepared_page_memory(page)
+    })
 }
 
 /// Eagerly verify and retain the actual sealed directory root. Validation uses
-/// borrowed bytes and stack scalars; no PageImpl/debug map or TypeName is built.
+/// borrowed bytes and stack scalars; no `PageImpl`/debug map or `TypeName` is built.
 #[cfg(feature = "contextdb-internal")]
+#[allow(
+    clippy::result_large_err,
+    reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+)]
 pub(crate) fn prepared_directory_root(
     root: Option<BtreeHeader>,
     mem: &TransactionalMemory,
 ) -> std::result::Result<Option<super::page_store::PageMemory>, crate::PreparedReadError> {
-    let Some(header) = root else { return Ok(None); };
+    let Some(header) = root else {
+        return Ok(None);
+    };
     let page = mem.get_prepared_page_memory(header.root)?;
     let end = native_validate_byte_node(&page, header.root, true)?;
     let actual = super::page_store::xxh3_checksum(&page[..end]);
     if actual != header.checksum {
         return Err(crate::NativeColdReadError::Corrupt(crate::NativeColdFault {
             reason: "retained snapshot root page failed checksum verification",
-            page: header.root.to_le_bytes(), offset: end,
-            expected: header.checksum, actual,
-        }).into());
+            page: header.root.to_le_bytes(),
+            offset: end,
+            expected: header.checksum,
+            actual,
+        })
+        .into());
     }
     Ok(Some(page))
 }
@@ -1669,7 +1689,8 @@ fn native_key_get_with<E: From<crate::NativeColdReadError>>(
                 offset: end,
                 expected: header.checksum,
                 actual,
-            }).into());
+            })
+            .into());
         }
         match memory[0] {
             LEAF => {
@@ -1831,19 +1852,15 @@ fn native_validate_u64_node(
         return Err(corrupt());
     }
     let (offset_start, data_start, offset_count) = match header[0] {
-        LEAF => (
-            4,
-            4 + count * 4,
-            count,
-        ),
+        LEAF => (4, 4 + count * 4, count),
         BRANCH => {
             let children = count + 1;
             let page_start = 8 + size_of::<Checksum>() * children;
             let offset_start = page_start + PageNumber::serialized_size() * children;
             let data_start = offset_start;
             let pages = bytes.get(page_start..offset_start).ok_or_else(corrupt)?;
-            for page in pages.chunks_exact(PageNumber::serialized_size()) {
-                if PageNumber::validated_from_le_bytes(page.try_into().unwrap()).is_none() {
+            for page in pages.as_chunks::<{ PageNumber::serialized_size() }>().0 {
+                if PageNumber::validated_from_le_bytes(*page).is_none() {
                     return Err(corrupt());
                 }
             }
@@ -1858,20 +1875,31 @@ fn native_validate_u64_node(
     let mut start = data_start;
     {
         let keys = bytes.get(start..start + count * 8).ok_or_else(corrupt)?;
-        if keys.chunks_exact(8).map(|key| u64::from_le_bytes(key.try_into().unwrap()))
-            .try_fold(None, |prior, next| if prior.is_some_and(|p| p >= next) { Err(()) } else { Ok(Some(next)) }).is_err() {
+        if keys
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|key| u64::from_le_bytes(*key))
+            .try_fold(None, |prior, next| {
+                if prior.is_some_and(|p| p >= next) {
+                    Err(())
+                } else {
+                    Ok(Some(next))
+                }
+            })
+            .is_err()
+        {
             return Err(corrupt());
         }
         start += count * 8;
     }
-    for offset in offsets.chunks_exact(4) {
-        let end = u32::from_le_bytes(offset.try_into().unwrap()) as usize;
+    for offset in offsets.as_chunks::<4>().0 {
+        let end = u32::from_le_bytes(*offset) as usize;
         bytes.get(start..end).ok_or_else(corrupt)?;
         start = end;
     }
     Ok(start)
 }
-
 
 #[cfg(feature = "contextdb-internal")]
 pub(crate) fn native_u64_range_next(
@@ -1953,7 +1981,10 @@ pub(crate) fn native_u64_range_next(
         let index = position + usize::from(found && exclusive && !leftmost);
         if let Some((key_range, value_range)) = leaf.entry_ranges(index) {
             let key = &memory[key_range.clone()];
-            if upper.is_some_and(|end| u64::from_le_bytes(key.try_into().unwrap()) >= u64::from_le_bytes(end.try_into().unwrap())) {
+            if upper.is_some_and(|end| {
+                u64::from_le_bytes(key.try_into().unwrap())
+                    >= u64::from_le_bytes(end.try_into().unwrap())
+            }) {
                 return Ok(None);
             }
             // UTF-8 for all node keys was checked before indexing. Both guards

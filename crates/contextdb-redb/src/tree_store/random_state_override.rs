@@ -6,7 +6,9 @@ thread_local! {
 }
 
 pub(crate) fn fixture_random_state() -> RandomState {
-    FIXTURE_RANDOM_STATE.with(|state| state.borrow().clone()).unwrap_or_else(RandomState::new)
+    FIXTURE_RANDOM_STATE
+        .with(|state| state.borrow().clone())
+        .unwrap_or_default()
 }
 
 pub fn with_random_state_for_test<R>(state: RandomState, f: impl FnOnce() -> R) -> R {

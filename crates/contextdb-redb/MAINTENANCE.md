@@ -1035,3 +1035,23 @@ persisted format, declared memory limit, cache share or query route changes.
 |---|---|
 | `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/mod.rs` | Declared-scan detection under the original caller admission; remove the redundant operation page index. Upstream proposal: retain scan working sets within the admitted shared cache rather than impose an unrelated scan-growth constant. |
 | `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/native_storage_admission.rs` | Shared warm-page retention for declared and native clean reads; retain original native invoices through physical free. Preserve caller capacity checks and genuine fixed-reserve transfer. Continue the clock from the last visited stripe and cache an unsuccessful victim search only until an actual external holder releases a page. |
+
+
+## Minimum-version compatible strict linting
+
+`src/atomic_compat.rs` implements the same conditional compare/exchange loop on
+AtomicUsize and AtomicU64 without requiring the renamed API from newer compilers.
+Original success/failure ordering and overflow/refusal behavior are preserved.
+Fixed-width byte iteration uses array chunks with the same ignored remainder;
+nonnull pointer conversions preserve the actual allocated Layout alignment.
+Inline typed native errors and const constructors retain narrow documented lint
+exceptions where changing representation or const behavior would change their
+contract. Unused private native-page construction helpers are removed. Test
+modules follow production items, and passive observers require their live guard.
+The opaque native byte-key fixture keeps its intentional big-endian lexical order;
+its assertions and test bodies are unchanged.
+
+| Changed source | Reason |
+|---|---|
+| `src/atomic_compat.rs` (added), `src/lib.rs`, `src/db.rs`, `src/read_admission.rs`, `src/native_storage_admission.rs`, `src/tree_store/page_store/page_allocation.rs` | Preserve conditional atomic update semantics on the minimum supported Rust version, preserve typed error custody and actual allocation-pointer provenance, and remove unused private construction methods. |
+| `src/transaction_tracker.rs`, `src/transactions.rs`, `src/tree_store/{bounded_bytes,btree,table_tree,random_state_override}.rs`, `src/tree_store/page_store/{allocator_pager,cache_owner_contract_rows,cached_file,lru_cache,page_manager}.rs` | Equivalent fixed-array iteration, const-safe invariants, explicit absent-versus-empty root semantics, allocation-free observer capability requirements, feature-accurate passive accessors, and source formatting. |

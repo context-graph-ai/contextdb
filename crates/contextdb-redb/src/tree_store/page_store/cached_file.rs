@@ -1,3 +1,4 @@
+use super::page_allocation::{CacheShared, cache_array_prepaid};
 use crate::tree_store::page_store::base::PageHint;
 use crate::tree_store::page_store::header::DB_HEADER_SIZE;
 use crate::tree_store::page_store::lru_cache::{EntryArena, LRUCache, WriteCache};
@@ -7,7 +8,6 @@ use std::slice::SliceIndex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
-use super::page_allocation::{CacheShared, cache_array_prepaid};
 
 use super::page_allocation::{CacheCounter, CachePayment, PageAllocation};
 
@@ -381,11 +381,14 @@ pub(super) struct PagedCachedFile {
 pub struct CachePageForTest(PageMemory);
 #[cfg(feature = "test-seams")]
 impl CachePageForTest {
-    pub fn bytes(&self) -> &[u8] { &self.0 }
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
     pub fn payment(&self) -> (&'static str, usize, usize) {
         match &self.0 {
-            PageMemory::Cached(p) | PageMemory::Plain(p) | PageMemory::Charged(p) =>
-                p.payment_for_test(),
+            PageMemory::Cached(p) | PageMemory::Plain(p) | PageMemory::Charged(p) => {
+                p.payment_for_test()
+            }
             #[cfg(feature = "contextdb-internal")]
             PageMemory::Native(_) => panic!("expected real legacy cache allocation"),
         }
@@ -397,7 +400,11 @@ impl CachePageForTest {
             PageMemory::Native(_) => panic!("expected real legacy cache allocation"),
         };
         let layout = PageAllocation::layout(page.len()).unwrap().0;
-        (PageAllocation::as_ptr(page) as usize, layout.size(), layout.align())
+        (
+            PageAllocation::as_ptr(page) as usize,
+            layout.size(),
+            layout.align(),
+        )
     }
 }
 #[cfg(feature = "test-seams")]
@@ -408,7 +415,9 @@ pub struct CacheWriteForTest {
 }
 #[cfg(feature = "test-seams")]
 impl CacheWriteForTest {
-    pub fn bytes(&self) -> &[u8] { &self.data }
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 #[cfg(feature = "test-seams")]
@@ -417,7 +426,9 @@ impl CacheWriteForTest {
 pub struct CacheWriteControlForTest(CacheShared<Mutex<LRUWriteCache>>);
 #[cfg(feature = "test-seams")]
 impl CacheWriteControlForTest {
-    pub fn allocation(&self) -> (usize, usize, usize) { self.0.allocation_for_test() }
+    pub fn allocation(&self) -> (usize, usize, usize) {
+        self.0.allocation_for_test()
+    }
 }
 
 impl PagedCachedFile {
@@ -434,32 +445,56 @@ impl PagedCachedFile {
     }
 
     #[cfg(feature = "test-seams")]
-    pub(crate) fn allocations_for_test(&self, visit: &mut dyn FnMut((usize, usize, usize))) -> usize {
+    pub(crate) fn allocations_for_test(
+        &self,
+        visit: &mut dyn FnMut((usize, usize, usize)),
+    ) -> usize {
         visit(self.read_cache_bytes.allocation_for_test());
         visit(self.write_buffer_bytes.allocation_for_test());
         visit(self.write_buffer.allocation_for_test());
         let layout = std::alloc::Layout::for_value(self.read_cache.as_ref());
-        visit((self.read_cache.as_ptr() as usize, layout.size(), layout.align()));
+        visit((
+            self.read_cache.as_ptr() as usize,
+            layout.size(),
+            layout.align(),
+        ));
         for (index, stripe) in self.read_cache.iter().enumerate() {
-            stripe.read().unwrap().allocations_for_test(index == 0, visit);
+            stripe
+                .read()
+                .unwrap()
+                .allocations_for_test(index == 0, visit);
         }
         self.read_cache_bytes.preparation_for_test()
     }
 
     #[cfg(feature = "test-seams")]
     pub(crate) fn controls_for_test(&self) -> [(usize, usize); 2] {
-        [self.read_cache_bytes.observation_for_test(), self.write_buffer_bytes.observation_for_test()]
+        [
+            self.read_cache_bytes.observation_for_test(),
+            self.write_buffer_bytes.observation_for_test(),
+        ]
     }
 
     #[cfg(feature = "test-seams")]
-    pub(crate) fn lifetime_aliases_for_test(&self) -> Result<(CachePageForTest, CachePageForTest, CacheWriteForTest)> {
+    pub(crate) fn lifetime_aliases_for_test(
+        &self,
+    ) -> Result<(CachePageForTest, CachePageForTest, CacheWriteForTest)> {
         // Use the authenticated header bytes unchanged; this is the actual
         // read -> COW write -> dirty alias path, without a logical mutation.
         let cached = self.read(0, DB_HEADER_SIZE, PageHint::Clean)?;
         assert!(matches!(cached, PageMemory::Cached(_)));
         let writable = self.write(0, DB_HEADER_SIZE, false)?;
-        let control = CacheWriteForTest { _buffer: writable.buffer.clone(), data: writable.data.clone() };
-        assert!(!PageAllocation::ptr_eq(match &cached { PageMemory::Cached(p) => p, _ => unreachable!() }, &writable.data));
+        let control = CacheWriteForTest {
+            _buffer: writable.buffer.clone(),
+            data: writable.data.clone(),
+        };
+        assert!(!PageAllocation::ptr_eq(
+            match &cached {
+                PageMemory::Cached(p) => p,
+                _ => unreachable!(),
+            },
+            &writable.data
+        ));
         // Return the checked-out write before close/flush. The test retains the
         // SAME genuine map Arc and data, never an unreturned None placeholder.
         drop(writable);
@@ -554,9 +589,11 @@ impl PagedCachedFile {
     }
 
     #[cfg(test)]
-    fn new_read_index(bytes: usize, page_size: usize, held_entries: usize)
-        -> Box<[RwLock<LRUCache<PageAllocation>>]>
-    {
+    fn new_read_index(
+        bytes: usize,
+        page_size: usize,
+        held_entries: usize,
+    ) -> Box<[RwLock<LRUCache<PageAllocation>>]> {
         Self::try_new_read_index(bytes, page_size, held_entries)
             .expect("test cache index allocation")
     }
@@ -708,7 +745,9 @@ impl PagedCachedFile {
         _write_lock: &MutexGuard<'_, LRUWriteCache>,
     ) {
         let generation = self.read_cache_bytes.release_generation();
-        if self.no_victim_generation.load(Ordering::Acquire) == generation { return; }
+        if self.no_victim_generation.load(Ordering::Acquire) == generation {
+            return;
+        }
         let num_stripes = self.read_cache.len();
         let start = self.next_eviction_stripe.load(Ordering::Relaxed) % num_stripes;
         let mut freed = 0;
@@ -717,16 +756,15 @@ impl PagedCachedFile {
                 break;
             }
             let stripe = (start + i) % num_stripes;
-            self.next_eviction_stripe.store((stripe + 1) % num_stripes, Ordering::Relaxed);
+            self.next_eviction_stripe
+                .store((stripe + 1) % num_stripes, Ordering::Relaxed);
             let mut lock = self.read_cache[stripe].write().unwrap();
             while freed < bytes_needed {
-                if let Some((_, v)) =
-                    lock.pop_lowest_priority_where(|page| {
-                        #[cfg(test)]
-                        self.eviction_visits.fetch_add(1, Ordering::Relaxed);
-                        PageAllocation::strong_count(page) == 1
-                    })
-                {
+                if let Some((_, v)) = lock.pop_lowest_priority_where(|page| {
+                    #[cfg(test)]
+                    self.eviction_visits.fetch_add(1, Ordering::Relaxed);
+                    PageAllocation::strong_count(page) == 1
+                }) {
                     #[cfg(feature = "cache_metrics")]
                     {
                         self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -741,7 +779,8 @@ impl PagedCachedFile {
             }
         }
         if freed < bytes_needed {
-            self.no_victim_generation.store(generation, Ordering::Release);
+            self.no_victim_generation
+                .store(generation, Ordering::Release);
         }
     }
 
@@ -849,9 +888,9 @@ impl PagedCachedFile {
     pub(crate) fn retire_read_cache_request(&self, request: u64) {
         for stripe in &self.read_cache {
             let mut cache = stripe.write().unwrap();
-            while let Some((_, page)) = cache.pop_lowest_priority_where(|page|
-                page.belongs_to_request(request) && PageAllocation::strong_count(page) == 1)
-            {
+            while let Some((_, page)) = cache.pop_lowest_priority_where(|page| {
+                page.belongs_to_request(request) && PageAllocation::strong_count(page) == 1
+            }) {
                 drop(page);
             }
         }
@@ -872,7 +911,8 @@ impl PagedCachedFile {
             && crate::native_storage_admission::native_storage_active()
         {
             let mut page = PageAllocation::zeroed_native(len).map_err(StorageError::Native)?;
-            self.file.read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
+            self.file
+                .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
             return Ok(page);
         }
         let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
@@ -917,7 +957,13 @@ impl PagedCachedFile {
         self.cache_loaded_page(offset, len, buffer, scan_replace)
     }
 
-    fn cache_loaded_page(&self, offset: u64, len: usize, buffer: PageAllocation, scan_replace: bool) -> Result<PageMemory> {
+    fn cache_loaded_page(
+        &self,
+        offset: u64,
+        len: usize,
+        buffer: PageAllocation,
+        scan_replace: bool,
+    ) -> Result<PageMemory> {
         let page_bytes = cached_page_bytes(len);
         let cache_slot = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
         if scan_replace {
@@ -1051,23 +1097,39 @@ impl PagedCachedFile {
     /// Detach only the map entry whose physical allocation the guard retains.
     /// The coordinate comes from the real cache map, never a SQL row ordinal.
     #[cfg(feature = "test-seams")]
-    pub(crate) fn detach_cached_memory_for_test(&self, memory: &PageMemory) -> (u64, usize, usize, bool) {
-        let PageMemory::Cached(owner) = memory else { panic!("fixture must hold a Cached page") };
+    pub(crate) fn detach_cached_memory_for_test(
+        &self,
+        memory: &PageMemory,
+    ) -> (u64, usize, usize, bool) {
+        let PageMemory::Cached(owner) = memory else {
+            panic!("fixture must hold a Cached page")
+        };
         let identity = PageAllocation::as_ptr(owner) as usize;
         let mut coordinate = None;
         for stripe in &self.read_cache {
             for (offset, page) in stripe.read().unwrap().iter() {
-                if PageAllocation::ptr_eq(&*page, owner) {
-                    assert!(coordinate.replace(offset).is_none(), "one physical cached identity");
+                if PageAllocation::ptr_eq(&page, owner) {
+                    assert!(
+                        coordinate.replace(offset).is_none(),
+                        "one physical cached identity"
+                    );
                 }
             }
         }
         let offset = coordinate.expect("held Cached identity must still be linked");
         let len = owner.len();
         self.invalidate_cache(offset, len);
-        let absent = self.read_cache.iter().all(|stripe| stripe.read().unwrap().iter()
-            .all(|(_, page)| !PageAllocation::ptr_eq(&*page, owner)));
-        assert!(absent, "exact held identity must be absent after invalidation");
+        let absent = self.read_cache.iter().all(|stripe| {
+            stripe
+                .read()
+                .unwrap()
+                .iter()
+                .all(|(_, page)| !PageAllocation::ptr_eq(&page, owner))
+        });
+        assert!(
+            absent,
+            "exact held identity must be absent after invalidation"
+        );
         (offset, len, identity, absent)
     }
 
@@ -1217,7 +1279,9 @@ impl PagedCachedFile {
     /// A legacy hit is copied under the original native admission before it
     /// enters that cache; no opaque legacy receipt is certified as native.
     pub(super) fn read_native_clean_miss(
-        &self, offset: u64, len: usize,
+        &self,
+        offset: u64,
+        len: usize,
     ) -> std::result::Result<PageMemory, crate::NativeColdReadError> {
         use crate::native_storage_admission::{NativeColdFault, NativeColdReadError};
         if !crate::native_storage_admission::native_storage_active() {
@@ -1225,14 +1289,22 @@ impl PagedCachedFile {
         }
         if self.file.io_failed.load(Ordering::Acquire) {
             return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
-                "native read requires an available backend")));
+                "native read requires an available backend",
+            )));
         }
         let stripe = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
-        let cached = self.read_cache[stripe].read().unwrap().get(offset).map(|page| page.clone());
+        let cached = self.read_cache[stripe]
+            .read()
+            .unwrap()
+            .get(offset)
+            .map(|page| page.clone());
         if let Some(cached) = &cached {
             if cached.len() != len {
-                let mut fault = NativeColdFault::new("native cache page length does not match the requested extent");
-                fault.expected = len as u128; fault.actual = cached.len() as u128;
+                let mut fault = NativeColdFault::new(
+                    "native cache page length does not match the requested extent",
+                );
+                fault.expected = len as u128;
+                fault.actual = cached.len() as u128;
                 return Err(NativeColdReadError::Corrupt(fault));
             }
             if cached.is_native() {
@@ -1242,8 +1314,9 @@ impl PagedCachedFile {
         }
         let mut page = PageAllocation::zeroed_native(len)?;
         let output = PageAllocation::get_mut(&mut page).expect("unpublished native page is unique");
-        if let Some(cached) = cached { output.copy_from_slice(&cached); }
-        else {
+        if let Some(cached) = cached {
+            output.copy_from_slice(&cached);
+        } else {
             if let Err(error) = self.file.file.read_cause(offset, output) {
                 self.file.io_failed.store(true, Ordering::Release);
                 return Err(error.into_native());
@@ -1252,15 +1325,20 @@ impl PagedCachedFile {
         }
         // The shared cache takes custody under its actual fixed reserve; if
         // it cannot, the page keeps its genuine original source invoice.
-        let page = self.cache_loaded_page(offset, len, page, false)
-            .map_err(|error| match error {
-                StorageError::Native(error) => error,
-                StorageError::ValueTooLarge(_) => NativeColdReadError::Corrupt(
-                    NativeColdFault::new("native cache capacity overflow")),
-                _ => unreachable!("cache insertion retains native allocation failures"),
-            })?;
+        let page =
+            self.cache_loaded_page(offset, len, page, false)
+                .map_err(|error| match error {
+                    StorageError::Native(error) => error,
+                    StorageError::ValueTooLarge(_) => NativeColdReadError::Corrupt(
+                        NativeColdFault::new("native cache capacity overflow"),
+                    ),
+                    _ => unreachable!("cache insertion retains native allocation failures"),
+                })?;
         let page = match page {
-            PageMemory::Cached(page) | PageMemory::Charged(page) | PageMemory::Plain(page) | PageMemory::Native(page) => PageMemory::Native(page),
+            PageMemory::Cached(page)
+            | PageMemory::Charged(page)
+            | PageMemory::Plain(page)
+            | PageMemory::Native(page) => PageMemory::Native(page),
         };
         Ok(page)
     }
@@ -1268,6 +1346,10 @@ impl PagedCachedFile {
     /// Copy the sealed write's unflushed bytes before consulting clean storage.
     /// Old dirty/cache backing retains its original owner throughout this copy;
     /// only the new allocation and control receive preparation's admission.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Typed native refusals stay inline so an exhausted budget can return its original error without allocating."
+    )]
     pub(super) fn read_native_prepared(
         &self,
         offset: u64,
@@ -1292,7 +1374,7 @@ impl PagedCachedFile {
                 return Ok(PageMemory::Native(page));
             }
         }
-        let stripe = (offset % Self::lock_stripes()) as usize;
+        let stripe = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
         {
             let cache = self.read_cache[stripe].read().unwrap();
             if let Some(cell) = cache.get(offset) {
@@ -1314,8 +1396,7 @@ impl PagedCachedFile {
         // read observer; a prepared read must not invent a corruption instead.
         self.file.read(
             offset,
-            PageAllocation::get_mut(&mut page)
-                .expect("unpublished native page is unique"),
+            PageAllocation::get_mut(&mut page).expect("unpublished native page is unique"),
         )?;
         Ok(PageMemory::Native(page))
     }
@@ -1325,6 +1406,39 @@ impl PagedCachedFile {
 #[path = "cache_owner_contract_rows.rs"]
 mod owner_contract_rows;
 
+// Test-only access to the actual dispatch and failure latch, with no substitute
+// error producer or observer allocation. Box construction stays outside claims.
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+#[doc(hidden)]
+pub struct CheckedWriterBackendForTest(CheckedBackend);
+#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
+#[allow(clippy::len_without_is_empty)]
+impl CheckedWriterBackendForTest {
+    pub fn native(backend: impl crate::NativeStorageBackend) -> Self {
+        Self(CheckedBackend::new(crate::db::Backend::Native(Box::new(
+            backend,
+        ))))
+    }
+    pub fn legacy(backend: impl crate::StorageBackend) -> Self {
+        Self(CheckedBackend::new(Box::new(backend)))
+    }
+    pub fn len(&self) -> crate::Result<u64> {
+        self.0.len()
+    }
+    pub fn read(&self, offset: u64, out: &mut [u8]) -> crate::Result<()> {
+        self.0.read(offset, out)
+    }
+    pub fn write(&self, offset: u64, data: &[u8]) -> crate::Result<()> {
+        self.0.write(offset, data)
+    }
+    pub fn set_len(&self, len: u64) -> crate::Result<()> {
+        self.0.set_len(len)
+    }
+    pub fn sync_data(&self) -> crate::Result<()> {
+        self.0.sync_data()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::StorageBackend;
@@ -1332,7 +1446,7 @@ mod test {
     use crate::tree_store::PageHint;
     use crate::tree_store::page_store::cached_file::{CheckedBackend, PagedCachedFile};
     use std::io;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Debug, Default)]
@@ -1371,9 +1485,14 @@ mod test {
         bytes: usize,
     }
     impl Drop for ReaderCharge {
-        fn drop(&mut self) { self.held.fetch_sub(self.bytes, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.held.fetch_sub(self.bytes, Ordering::SeqCst);
+        }
     }
-    fn charged_reader(limit: usize, held: &Arc<AtomicUsize>) -> Arc<dyn Fn(usize) -> io::Result<crate::ReadPageCharge> + Send + Sync> {
+    fn charged_reader(
+        limit: usize,
+        held: &Arc<AtomicUsize>,
+    ) -> Arc<dyn Fn(usize) -> io::Result<crate::ReadPageCharge> + Send + Sync> {
         let held = held.clone();
         Arc::new(move |bytes| {
             let previous = held.fetch_add(bytes, Ordering::SeqCst);
@@ -1381,7 +1500,10 @@ mod test {
                 held.fetch_sub(bytes, Ordering::SeqCst);
                 return Err(io::Error::from(io::ErrorKind::OutOfMemory));
             }
-            Ok(Box::new(ReaderCharge { held: held.clone(), bytes }))
+            Ok(Box::new(ReaderCharge {
+                held: held.clone(),
+                bytes,
+            }))
         })
     }
 
@@ -1395,7 +1517,9 @@ mod test {
         let held = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
         let observed = reads.clone();
-        let _observe = crate::observe_backend_reads(Arc::new(move |_| { observed.fetch_add(1, Ordering::SeqCst); }));
+        let _observe = crate::observe_backend_reads(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
         crate::with_read_page_charge(charged_reader(5 * source_bytes, &held), || {
             crate::with_scan_reads(|| {
                 for ordinal in 0..128 {
@@ -1438,7 +1562,10 @@ mod test {
             assert_eq!(held.load(Ordering::SeqCst), 2 * source_bytes);
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let released = barrier.clone();
-            let reader = std::thread::spawn(move || { released.wait(); drop(first); });
+            let reader = std::thread::spawn(move || {
+                released.wait();
+                drop(first);
+            });
             barrier.wait();
             reader.join().unwrap();
             // Unpinning did not free or refund the still-cached original page.
@@ -1550,13 +1677,13 @@ mod test {
     }
     #[test]
     fn immutable_byte_checksum_owners_are_charged_and_release_at_final_holder() {
-        super::owner_contract_rows::run();
         struct Charge(Arc<std::sync::atomic::AtomicUsize>, usize);
         impl Drop for Charge {
             fn drop(&mut self) {
                 self.0.fetch_sub(self.1, Ordering::SeqCst);
             }
         }
+        super::owner_contract_rows::run();
         let backend = InMemoryBackend::new();
         backend.set_len(1024).unwrap();
         let bytes = super::cached_page_bytes(128);
@@ -1713,12 +1840,25 @@ mod test {
     const UNIFORM_PAGE_BYTES: usize = 4096;
     const UNIFORM_CACHE_CAP: usize = 4 * 1024 * 1024;
     fn uniform_cache_slots() -> usize {
-        UNIFORM_CACHE_CAP / super::PageAllocation::layout(UNIFORM_PAGE_BYTES).unwrap().0.size()
+        UNIFORM_CACHE_CAP
+            / super::PageAllocation::layout(UNIFORM_PAGE_BYTES)
+                .unwrap()
+                .0
+                .size()
     }
 
     fn uniform_cache_file(extra_pages: usize) -> PagedCachedFile {
-        assert_eq!(super::cached_page_bytes(UNIFORM_PAGE_BYTES), super::PageAllocation::layout(UNIFORM_PAGE_BYTES).unwrap().0.size());
-        assert_eq!(UNIFORM_CACHE_CAP / super::cached_page_bytes(UNIFORM_PAGE_BYTES), uniform_cache_slots());
+        assert_eq!(
+            super::cached_page_bytes(UNIFORM_PAGE_BYTES),
+            super::PageAllocation::layout(UNIFORM_PAGE_BYTES)
+                .unwrap()
+                .0
+                .size()
+        );
+        assert_eq!(
+            UNIFORM_CACHE_CAP / super::cached_page_bytes(UNIFORM_PAGE_BYTES),
+            uniform_cache_slots()
+        );
         let backend = InMemoryBackend::new();
         backend
             .set_len(((uniform_cache_slots() + extra_pages) * UNIFORM_PAGE_BYTES) as u64)
@@ -1756,7 +1896,7 @@ mod test {
                 entries += 1;
                 payload += page.len();
                 charge += super::cached_page_bytes(page.len());
-                pinned += usize::from(super::PageAllocation::strong_count(&*page) > 1);
+                pinned += usize::from(super::PageAllocation::strong_count(&page) > 1);
             }
         }
         (entries, payload, charge, pinned)
@@ -1783,8 +1923,14 @@ mod test {
             file.max_cache_size.load(Ordering::Acquire),
             UNIFORM_CACHE_CAP
         );
-        assert!(uniform_cache_slots() * super::cached_page_bytes(UNIFORM_PAGE_BYTES) <= UNIFORM_CACHE_CAP);
-        assert!((uniform_cache_slots() + 1) * super::cached_page_bytes(UNIFORM_PAGE_BYTES) > UNIFORM_CACHE_CAP);
+        assert!(
+            uniform_cache_slots() * super::cached_page_bytes(UNIFORM_PAGE_BYTES)
+                <= UNIFORM_CACHE_CAP
+        );
+        assert!(
+            (uniform_cache_slots() + 1) * super::cached_page_bytes(UNIFORM_PAGE_BYTES)
+                > UNIFORM_CACHE_CAP
+        );
     }
 
     #[test]
@@ -1869,7 +2015,7 @@ mod test {
             let mut entries = std::collections::BTreeMap::new();
             for stripe in &file.read_cache {
                 for (offset, page) in stripe.read().unwrap().iter() {
-                    entries.insert(offset, super::PageAllocation::as_ptr(&*page) as usize);
+                    entries.insert(offset, super::PageAllocation::as_ptr(&page) as usize);
                 }
             }
             entries
@@ -1951,10 +2097,10 @@ mod test {
                         usize::try_from(ordinal).unwrap() % stripes.len()
                     };
                     assert!(matches!(
-                        stripes[stripe]
-                            .write()
-                            .unwrap()
-                            .try_insert(round * u64::try_from(uniform_cache_slots()).unwrap() + ordinal, page.clone()),
+                        stripes[stripe].write().unwrap().try_insert(
+                            round * u64::try_from(uniform_cache_slots()).unwrap() + ordinal,
+                            page.clone()
+                        ),
                         Ok(None)
                     ));
                 }
@@ -2012,7 +2158,10 @@ mod test {
     #[test]
     fn one_stripe_pressure_uses_all_996_shared_read_arena_slots() {
         let cap = 4 * 1024 * 1024;
-        assert_eq!(super::cached_page_bytes(4096), super::PageAllocation::layout(4096).unwrap().0.size());
+        assert_eq!(
+            super::cached_page_bytes(4096),
+            super::PageAllocation::layout(4096).unwrap().0.size()
+        );
         assert_eq!(cap / super::cached_page_bytes(4096), uniform_cache_slots());
         let pages = 3 * uniform_cache_slots();
         let backend = SparseZeroFixture(std::sync::atomic::AtomicU64::new(
@@ -2028,13 +2177,19 @@ mod test {
             assert!(page.iter().all(|byte| *byte == 0));
             drop(page);
             if ordinal + 1 >= uniform_cache_slots() {
-                assert_eq!(file.read_cache[0].read().unwrap().len(), uniform_cache_slots());
+                assert_eq!(
+                    file.read_cache[0].read().unwrap().len(),
+                    uniform_cache_slots()
+                );
                 assert!(
                     file.read_cache[1..]
                         .iter()
                         .all(|s| s.read().unwrap().len() == 0)
                 );
-                assert_eq!(file.read_cache_bytes.load(Ordering::SeqCst), uniform_cache_slots() * super::cached_page_bytes(4096));
+                assert_eq!(
+                    file.read_cache_bytes.load(Ordering::SeqCst),
+                    uniform_cache_slots() * super::cached_page_bytes(4096)
+                );
                 assert_eq!(file.index_bytes(), index_bytes);
             }
         }
@@ -2072,7 +2227,7 @@ mod test {
                     let stripe = stripe.read().unwrap();
                     stripe
                         .iter()
-                        .map(|(key, value)| (key, super::PageAllocation::as_ptr(&*value) as usize))
+                        .map(|(key, value)| (key, super::PageAllocation::as_ptr(&value) as usize))
                         .collect::<Vec<_>>()
                 })
                 .collect::<std::collections::BTreeMap<_, _>>()
@@ -2160,7 +2315,13 @@ mod test {
         assert_eq!(header_len, 320);
         let full_bytes = super::cached_page_bytes(4096);
         let header_bytes = super::cached_page_bytes(header_len);
-        assert_eq!((full_bytes, header_bytes), (super::PageAllocation::layout(4096).unwrap().0.size(), super::PageAllocation::layout(header_len).unwrap().0.size()));
+        assert_eq!(
+            (full_bytes, header_bytes),
+            (
+                super::PageAllocation::layout(4096).unwrap().0.size(),
+                super::PageAllocation::layout(header_len).unwrap().0.size()
+            )
+        );
         for cap in [4 * 1024 * 1024, 64 * 1024 * 1024] {
             let control = PagedCachedFile::new_read_index(cap, 4096, 0);
             let backend = Box::new(WritableHeaderFixture::new(4096));
@@ -2168,30 +2329,47 @@ mod test {
             let actual = PagedCachedFile::new(backend, 4096, cap).unwrap();
             let construction = write_observer.cut();
             assert_eq!(construction[2], 0);
-            assert_eq!(construction[3], actual.index_bytes(), "the real file constructor allocates exactly its index Layouts");
+            assert_eq!(
+                construction[3],
+                actual.index_bytes(),
+                "the real file constructor allocates exactly its index Layouts"
+            );
             drop(write_observer);
-            let (write_pointer, write_bytes, write_align) = actual.write_buffer.allocation_for_test();
-            let write_control = std::alloc::Layout::from_size_align(write_bytes, write_align).unwrap();
+            let (write_pointer, write_bytes, write_align) =
+                actual.write_buffer.allocation_for_test();
+            let write_control =
+                std::alloc::Layout::from_size_align(write_bytes, write_align).unwrap();
             assert_ne!(write_pointer, 0);
             assert_eq!(write_pointer % write_align, 0);
             // The very same control belongs to this file; constructing a second
             // Arc would certify a different producer and a different ABI.
-            assert_eq!(write_control, PagedCachedFile::write_buffer_control_layout());
+            assert_eq!(
+                write_control,
+                PagedCachedFile::write_buffer_control_layout()
+            );
             let write_alias = actual.write_buffer.clone();
             let counter_alias = actual.write_buffer_bytes.clone();
             let free = super::super::lru_cache::arena_index_tests::FreeWatch::start(
-                write_pointer as *const (), &counter_alias);
+                write_pointer as *const (),
+                &counter_alias,
+            );
             drop(actual);
             assert_eq!(free.cut(), [0; 4]);
             drop(write_alias);
-            assert_eq!(free.cut(), [1, write_control.size(), 0, 0],
-                "the actual native write-control is physically freed once at its producer Layout");
+            assert_eq!(
+                free.cut(),
+                [1, write_control.size(), 0, 0],
+                "the actual native write-control is physically freed once at its producer Layout"
+            );
             drop(free);
             drop(counter_alias);
             let expected_index = 2 * super::CacheCounter::layout().size()
                 + write_control.size()
                 + control[0].read().unwrap().arena_index_bytes()
-                + control.iter().map(|stripe| stripe.read().unwrap().index_bytes()).sum::<usize>()
+                + control
+                    .iter()
+                    .map(|stripe| stripe.read().unwrap().index_bytes())
+                    .sum::<usize>()
                 + std::mem::size_of_val(control.as_ref());
             drop(control);
             for stride in [1, 131] {
@@ -2333,25 +2511,4 @@ mod test {
             }
         }
     }
-}
-
-// Test-only access to the actual dispatch and failure latch, with no substitute
-// error producer or observer allocation. Box construction stays outside claims.
-#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
-#[doc(hidden)]
-pub struct CheckedWriterBackendForTest(CheckedBackend);
-#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
-#[allow(clippy::len_without_is_empty)]
-impl CheckedWriterBackendForTest {
-    pub fn native(backend: impl crate::NativeStorageBackend) -> Self {
-        Self(CheckedBackend::new(crate::db::Backend::Native(Box::new(backend))))
-    }
-    pub fn legacy(backend: impl crate::StorageBackend) -> Self {
-        Self(CheckedBackend::new(Box::new(backend)))
-    }
-    pub fn len(&self) -> crate::Result<u64> { self.0.len() }
-    pub fn read(&self, offset: u64, out: &mut [u8]) -> crate::Result<()> { self.0.read(offset, out) }
-    pub fn write(&self, offset: u64, data: &[u8]) -> crate::Result<()> { self.0.write(offset, data) }
-    pub fn set_len(&self, len: u64) -> crate::Result<()> { self.0.set_len(len) }
-    pub fn sync_data(&self) -> crate::Result<()> { self.0.sync_data() }
 }

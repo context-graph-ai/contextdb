@@ -1,6 +1,7 @@
 //! Operation-scoped admission before allocating a source page. The caller
 //! keeps admitted bytes owned until its read handles have been released.
 use crate::StorageError;
+use crate::atomic_compat::AtomicUpdate as _;
 use std::{cell::RefCell, io, sync::Arc};
 use std::{marker::PhantomData, rc::Rc};
 type Admission = Arc<dyn Fn(usize) -> io::Result<()> + Send + Sync>;
@@ -31,30 +32,31 @@ unsafe impl Send for OwnedReadPageCharge {}
 unsafe impl Sync for OwnedReadPageCharge {}
 #[cfg(feature = "contextdb-internal")]
 impl OwnedReadPageCharge {
-    /// The caller prepays Layout::new::<T>() from the receipt's ORIGINAL budget
+    /// The caller prepays `Layout::new::<T>()` from the receipt's ORIGINAL budget
     /// before entry and includes that charge in T. This allocates only that
     /// concrete layout. A foreign Box payload's contents are not moved/freed by
     /// this protocol and never acquire a physical-funding certificate here.
     /// This is an ownership mechanism, not a certificate of caller funding.
     /// On allocator null, T is dropped with no backing to free; the actual
     /// failed Layout is returned without constructing diagnostic backing.
-    pub fn try_new_prepaid<T: Send + Sync + 'static>(
-        value: T,
-    ) -> Result<Self, std::alloc::Layout> {
+    pub fn try_new_prepaid<T: Send + Sync + 'static>(value: T) -> Result<Self, std::alloc::Layout> {
         let layout = std::alloc::Layout::new::<T>();
         let pointer = if layout.size() == 0 {
             std::ptr::NonNull::<T>::dangling()
         } else {
-            let Some(pointer) = std::ptr::NonNull::new(
-                unsafe { std::alloc::alloc(layout) }.cast::<T>(),
-            ) else {
+            let Some(pointer) =
+                std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) }.cast::<T>())
+            else {
                 return Err(layout);
             };
             pointer
         };
         // No fallible/user operation occurs after allocation and before custody.
         unsafe { pointer.as_ptr().write(value) };
-        Ok(Self { pointer: pointer.cast(), finish: finish_owned_charge::<T> })
+        Ok(Self {
+            pointer: pointer.cast(),
+            finish: finish_owned_charge::<T>,
+        })
     }
 }
 #[cfg(feature = "contextdb-internal")]
@@ -179,15 +181,19 @@ pub(crate) fn has_read_memory_admission() -> bool {
 pub(crate) fn admit_read_memory(bytes: usize) -> Result<Option<ReadMemoryCharge>, StorageError> {
     ACTIVE.with(|active| match active.borrow().last() {
         #[cfg(feature = "contextdb-internal")]
-        Some(ActiveAdmission::Owned(admit)) => admit(bytes).map(|charge| Some(ReadMemoryCharge::Owned(charge))),
+        Some(ActiveAdmission::Owned(admit)) => {
+            admit(bytes).map(|charge| Some(ReadMemoryCharge::Owned(charge)))
+        }
         Some(ActiveAdmission::Scoped(admit)) => {
             admit(bytes).map(|()| None).map_err(StorageError::from)
         }
-        Some(ActiveAdmission::Charging(admit)) => {
-            admit(bytes).map(|charge| Some(ReadMemoryCharge::Legacy(charge))).map_err(StorageError::from)
-        }
+        Some(ActiveAdmission::Charging(admit)) => admit(bytes)
+            .map(|charge| Some(ReadMemoryCharge::Legacy(charge)))
+            .map_err(StorageError::from),
         Some(ActiveAdmission::StorageScoped(admit)) => admit(bytes).map(|()| None),
-        Some(ActiveAdmission::StorageCharging(admit)) => admit(bytes).map(|charge| Some(ReadMemoryCharge::Legacy(charge))),
+        Some(ActiveAdmission::StorageCharging(admit)) => {
+            admit(bytes).map(|charge| Some(ReadMemoryCharge::Legacy(charge)))
+        }
         None => Ok(None),
     })
 }
@@ -259,8 +265,9 @@ impl ScanAllowance {
     pub fn enter(&self) -> ScanReads {
         let allowance = self.clone();
         let layout = std::alloc::Layout::new::<ScanScopeNode>();
-        let pointer = unsafe { std::alloc::alloc(layout) }.cast::<ScanScopeNode>();
-        let Some(pointer) = std::ptr::NonNull::new(pointer) else {
+        let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) })
+            .map(std::ptr::NonNull::cast::<ScanScopeNode>);
+        let Some(pointer) = pointer else {
             std::alloc::handle_alloc_error(layout);
         };
         Self::link_entry(allowance, pointer, ScanNodeInvoice::Legacy)
@@ -284,8 +291,9 @@ impl ScanAllowance {
             admit_native_storage(layout)
         })
         .map_err(native_storage_error)?;
-        let pointer = unsafe { std::alloc::alloc(layout) }.cast::<ScanScopeNode>();
-        let Some(pointer) = std::ptr::NonNull::new(pointer) else {
+        let pointer = std::ptr::NonNull::new(unsafe { std::alloc::alloc(layout) })
+            .map(std::ptr::NonNull::cast::<ScanScopeNode>);
+        let Some(pointer) = pointer else {
             // No node exists. The genuine invoice settles on this error return.
             return Err(native_storage_error(
                 crate::NativeColdReadError::AllocatorFailed {
@@ -316,8 +324,8 @@ impl ScanAllowance {
                     previous: std::cell::Cell::new(previous),
                     next: std::cell::Cell::new(None),
                     allowance,
-                    _invoice: invoice,
-                })
+                    invoice,
+                });
             };
             if let Some(previous) = previous {
                 unsafe { previous.as_ref() }.next.set(Some(pointer));
@@ -351,7 +359,11 @@ struct ScanScopeNode {
     previous: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
     next: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
     allowance: ScanAllowance,
-    _invoice: ScanNodeInvoice,
+    #[allow(
+        dead_code,
+        reason = "Retained for destruction and inspected only with test-seams."
+    )]
+    invoice: ScanNodeInvoice,
 }
 
 /// Declared reads use the shared cache capacity; unscoped reads use the
@@ -409,7 +421,7 @@ impl Drop for ScanReads {
             std::alloc::dealloc(
                 self.node.as_ptr().cast(),
                 std::alloc::Layout::new::<ScanScopeNode>(),
-            )
+            );
         };
         drop(node); // allowance and real node invoice settle after physical free
     }
@@ -440,10 +452,18 @@ pub fn with_scan_reads<R>(operation: impl FnOnce() -> R) -> R {
 // its own capacity. Reuse that bounded cache instead of imposing an unrelated
 // per-scan growth constant or retaining a second set of pinned page handles.
 pub(crate) fn declared_scan_reads_active() -> bool {
-    if ACTIVE.with(|active| !active.borrow().is_empty()) { return true; }
+    if ACTIVE.with(|active| !active.borrow().is_empty()) {
+        return true;
+    }
     #[cfg(feature = "contextdb-internal")]
-    return SCAN_TAIL.with(|tail| tail.get().is_some_and(|node|
-        matches!(&unsafe { node.as_ref() }.allowance.0, ScanRemaining::Native { .. })));
+    return SCAN_TAIL.with(|tail| {
+        tail.get().is_some_and(|node| {
+            matches!(
+                &unsafe { node.as_ref() }.allowance.0,
+                ScanRemaining::Native { .. }
+            )
+        })
+    });
     #[cfg(not(feature = "contextdb-internal"))]
     false
 }
@@ -460,7 +480,7 @@ pub(crate) fn take_scan_growth(bytes: usize) -> bool {
             unsafe { node.as_ref() }
                 .allowance
                 .remaining()
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                .fetch_update_compat(Ordering::AcqRel, Ordering::Acquire, |left| {
                     left.checked_sub(bytes)
                 })
                 .is_ok()
@@ -545,11 +565,20 @@ fn with_cache_preparation_scope<R>(
 
 /// Clone the actual preparation owner without new admission or a receipt cell.
 /// Legacy/unscoped construction returns None, never a fabricated native payer.
-pub(crate) fn cache_preparation_credit() -> Option<crate::native_storage_admission::NativeStorageCredit> {
+pub(crate) fn cache_preparation_credit()
+-> Option<crate::native_storage_admission::NativeStorageCredit> {
     #[cfg(feature = "contextdb-internal")]
-    { CACHE_PREPARATION.with(|slot| slot.borrow().as_ref().and_then(|(owner, retain)| retain.then(|| owner.cache_preparation_credit()))) }
+    {
+        CACHE_PREPARATION.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|(owner, retain)| retain.then(|| owner.cache_preparation_credit()))
+        })
+    }
     #[cfg(not(feature = "contextdb-internal"))]
-    { None }
+    {
+        None
+    }
 }
 
 pub(crate) fn prepare_cache_allocation(layout: std::alloc::Layout) -> Result<(), StorageError> {
@@ -584,7 +613,9 @@ impl ScanAllowance {
         SCAN_TAIL.with(|tail| tail.get().map_or(0, |node| node.as_ptr() as usize))
     }
     #[doc(hidden)]
-    pub fn take_current_growth_for_test(bytes: usize) -> bool { take_scan_growth(bytes) }
+    pub fn take_current_growth_for_test(bytes: usize) -> bool {
+        take_scan_growth(bytes)
+    }
     #[doc(hidden)]
     pub fn remaining_for_test(&self) -> usize {
         self.remaining().load(std::sync::atomic::Ordering::SeqCst)
@@ -595,14 +626,17 @@ impl ScanReads {
     #[doc(hidden)]
     pub fn allocation_observation_for_test(&self) -> (usize, std::alloc::Layout, usize) {
         let node = unsafe { self.node.as_ref() };
-        let receipt = match &node._invoice {
+        let receipt = match &node.invoice {
             ScanNodeInvoice::Native(invoice) => invoice.receipt_identity_for_test(),
             ScanNodeInvoice::Legacy => 0,
         };
-        (self.node.as_ptr() as usize, std::alloc::Layout::new::<ScanScopeNode>(), receipt)
+        (
+            self.node.as_ptr() as usize,
+            std::alloc::Layout::new::<ScanScopeNode>(),
+            receipt,
+        )
     }
 }
-
 
 // Cache misses are attributed to the enclosing engine request without retaining
 // a reader, callback or allocation. Existing hits retain their original tag.
@@ -626,28 +660,49 @@ pub struct ReadCacheRequest {
 impl ReadCacheRequest {
     pub fn enter() -> Self {
         use std::sync::atomic::Ordering;
-        let id = NEXT_CACHE_REQUEST.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-            |next| next.checked_add(1)).expect("cache request identity exhausted");
+        let id = NEXT_CACHE_REQUEST
+            .fetch_update_compat(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .expect("cache request identity exhausted");
         let previous = CACHE_REQUEST.with(|slot| slot.replace(id));
-        Self { id, previous, committed: false, _thread: PhantomData }
+        Self {
+            id,
+            previous,
+            committed: false,
+            _thread: PhantomData,
+        }
     }
-    pub fn commit(&mut self) { self.committed = true; }
+    pub fn commit(&mut self) {
+        self.committed = true;
+    }
     pub fn release(&self, release: impl FnOnce()) {
         struct Restore(u64);
         impl Drop for Restore {
-            fn drop(&mut self) { RETIRING_CACHE_REQUEST.with(|slot| slot.set(self.0)); }
+            fn drop(&mut self) {
+                RETIRING_CACHE_REQUEST.with(|slot| slot.set(self.0));
+            }
         }
-        let _restore = Restore(RETIRING_CACHE_REQUEST.with(|slot|
-            slot.replace(if self.committed { 0 } else { self.id })));
+        let _restore = Restore(
+            RETIRING_CACHE_REQUEST
+                .with(|slot| slot.replace(if self.committed { 0 } else { self.id })),
+        );
         release();
     }
     pub fn retiring() -> Option<u64> {
-        RETIRING_CACHE_REQUEST.with(|slot| match slot.get() { 0 => None, id => Some(id) })
+        RETIRING_CACHE_REQUEST.with(|slot| match slot.get() {
+            0 => None,
+            id => Some(id),
+        })
     }
 }
 #[cfg(feature = "contextdb-internal")]
 impl Drop for ReadCacheRequest {
-    fn drop(&mut self) { CACHE_REQUEST.with(|slot| slot.set(self.previous)); }
+    fn drop(&mut self) {
+        CACHE_REQUEST.with(|slot| slot.set(self.previous));
+    }
 }
 #[cfg(feature = "contextdb-internal")]
-pub(crate) fn cache_request() -> u64 { CACHE_REQUEST.with(std::cell::Cell::get) }
+pub(crate) fn cache_request() -> u64 {
+    CACHE_REQUEST.with(std::cell::Cell::get)
+}
