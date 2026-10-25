@@ -46788,6 +46788,8 @@ graph_commit_result }.map_err(Self::storage_error)?;
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn decode_vector_entry_inner(bytes: &[u8]) -> Result<VectorEntry> {
+        #[cfg(any(test, feature = "test-seams"))]
+        crate::database::resident_history_test_seams::note(|work| work.stored_vector_decodes += 1);
         // Borrow the stored body and scalar header. Only the final F32 Vec
         // and route strings are allocated; quantized payloads need no mirror.
         enum Encoded<'a> {

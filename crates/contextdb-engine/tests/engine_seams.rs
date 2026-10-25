@@ -266,3 +266,8 @@ mod an_exact_identity_search_stays_inside_its_work_ceiling;
 
 #[path = "engine_seams/storage_journeys_keep_the_measured_test_profile.rs"]
 mod storage_journeys_keep_the_measured_test_profile;
+
+#[path = "engine_seams/primitive_work_support.rs"]
+mod primitive_work_support;
+#[path = "engine_seams/saved_search_and_append_work_ceiling.rs"]
+mod saved_search_and_append_work_ceiling;

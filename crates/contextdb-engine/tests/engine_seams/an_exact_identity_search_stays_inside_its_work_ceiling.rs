@@ -10,40 +10,13 @@
 //! engine does today, asserted as "no more than", so a change that makes one
 //! search do more of any kind of work fails here instead of slowing the
 //! journey unnoticed. A change that does less lowers the ceiling with it.
+use crate::primitive_work_support::{SearchWork, Work, observe_work};
 use crate::resident_history_support::{exec, insert_vector, open, query_vector};
 use contextdb_core::{Value, Wallclock};
-use contextdb_engine::database::resident_history_test_seams::observe as observe_resident;
-use contextdb_engine::direct_file_reader::test_seams::{ReadWorkObservationScope, ReadWorkPhase};
-use contextdb_engine::memory_accounting::{
-    take_budget_ledger_for_test, watch_budget_ledger_for_test,
-};
 use contextdb_engine::read_work_probe::{BillingWork, observe_billing_work_for_test};
-use contextdb_engine::vector_read_memory::{
-    take_native_admissions_for_test, watch_native_admissions_for_test,
-};
-use contextdb_vector::mem::{
-    NativeVectorScoreObserver, with_native_vector_score_observer_for_test,
-};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const ROWS: usize = 1024;
 const DIM: usize = 128;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SearchWork {
-    /// Page requests to the writer's page cache, hits and misses alike.
-    page_requests: u64,
-    /// Live and superseded membership records examined.
-    membership_records: u64,
-    decoded_rows: u64,
-    decoded_vectors: u64,
-    vector_body_accesses: u64,
-    vectors_scored: u64,
-    reader_admissions: u64,
-    writer_budget_charges: u64,
-    billing: BillingWork,
-}
 
 /// Measured on the engine as it stands: 1,024 live memberships plus the 512
 /// superseded ones the fixture's updates leave behind, each live body decoded
@@ -58,63 +31,36 @@ const CEILING: SearchWork = SearchWork {
     vectors_scored: 1_024,
     reader_admissions: 1,
     writer_budget_charges: 0,
-    billing: BillingWork {
-        native_child_identities: 9_775,
-        metadata_reservations: 1_202,
-        copy_reservations: 10,
-    },
 };
 
-struct CountScores(AtomicU64);
-impl NativeVectorScoreObserver for CountScores {
-    fn before_native_vector_score(&self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
+const BILLING_CEILING: BillingWork = BillingWork {
+    native_child_identities: 9_775,
+    metadata_reservations: 1_202,
+    copy_reservations: 10,
+};
 
-fn measure(db: &contextdb_engine::Database, id: usize) -> SearchWork {
-    let reader = db
-        .declared_read_memory_for_test()
-        .witness_identity_for_test();
-    let scored = Arc::new(CountScores(AtomicU64::new(0)));
-    let cache_before = db.__writer_cache_stats_for_test().unwrap();
-    let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
-    watch_native_admissions_for_test();
-    watch_budget_ledger_for_test();
-    let ((answer, resident), billing) = observe_billing_work_for_test(|| {
-        observe_resident(|| {
-            with_native_vector_score_observer_for_test(scored.clone(), || {
-                query_vector(db, "building", id, DIM, "EXACT")
-            })
-        })
+const EXTENDED_CEILING: Work = Work {
+    search: CEILING,
+    backend_bytes: Some(323_584),
+    backend_reads: Some(79),
+    reader_peak: Some(1_345),
+    stored_vector_decodes: 1_024,
+    writer_after: 4_266_339,
+    writer_before: 4_266_339,
+    writer_peak: 4_266_923,
+};
+
+fn measure(db: &contextdb_engine::Database, id: usize) -> (Work, BillingWork) {
+    // Observe only the operation, excluding observer setup and witness inspection.
+    let ((answer, billing), work) = observe_work(db, || {
+        observe_billing_work_for_test(|| query_vector(db, "building", id, DIM, "EXACT"))
     });
-    let ledger = take_budget_ledger_for_test();
-    let admissions = take_native_admissions_for_test();
-    let read = scope.counters();
-    drop(scope);
-    let cache_after = db.__writer_cache_stats_for_test().unwrap();
-    assert_eq!(
-        answer,
-        vec![vec![Value::Int64(id as i64)]],
-        "the exact search returns the identity it was asked for"
+    assert_eq!(answer, vec![vec![Value::Int64(id as i64)]]);
+    eprintln!(
+        "PRIMITIVE {}",
+        serde_json::json!({"fixture":"exact-maintained-1024x128", "work":work, "billing":{"native_child_identities":billing.native_child_identities,"metadata_reservations":billing.metadata_reservations,"copy_reservations":billing.copy_reservations}})
     );
-    SearchWork {
-        page_requests: (cache_after.0 + cache_after.1) - (cache_before.0 + cache_before.1),
-        membership_records: resident.membership_keys_examined as u64,
-        decoded_rows: read.decoded_rows,
-        decoded_vectors: read.decoded_vectors,
-        vector_body_accesses: read.vector_body_accesses,
-        vectors_scored: scored.0.load(Ordering::SeqCst),
-        reader_admissions: admissions
-            .iter()
-            .filter(|witness| witness.parent == reader && witness.admitted)
-            .count() as u64,
-        billing,
-        writer_budget_charges: ledger
-            .iter()
-            .filter(|entry| entry.what != "release")
-            .count() as u64,
-    }
+    (work, billing)
 }
 
 #[test]
@@ -142,8 +88,22 @@ fn an_exact_identity_search_over_a_maintained_partition_stays_inside_its_work_ce
     // A first search warms whatever a search may legitimately keep; the
     // ceiling is for a search in steady state, as the journey issues them.
     query_vector(&db, "building", ROWS - 1, DIM, "EXACT");
-    let first = measure(&db, 0);
-    let second = measure(&db, 0);
+    let (first, first_billing) = measure(&db, 0);
+    let (second, second_billing) = measure(&db, 0);
+    assert_eq!(
+        first_billing, second_billing,
+        "repeated searches do the same billing work"
+    );
+    assert!(
+        first_billing.native_child_identities <= BILLING_CEILING.native_child_identities
+            && first_billing.metadata_reservations <= BILLING_CEILING.metadata_reservations
+            && first_billing.copy_reservations <= BILLING_CEILING.copy_reservations,
+        "billing calls per exact search grew: {first_billing:?}, ceiling {BILLING_CEILING:?}"
+    );
+    first.assert_within("maintained exact search", &EXTENDED_CEILING);
+    second.assert_within("maintained exact search", &EXTENDED_CEILING);
+    let first = first.search;
+    let second = second.search;
     eprintln!("exact identity search work: {first:?}");
     assert_eq!(
         first, second,
@@ -168,11 +128,5 @@ fn an_exact_identity_search_over_a_maintained_partition_stays_inside_its_work_ce
         first.reader_admissions <= CEILING.reader_admissions
             && first.writer_budget_charges <= CEILING.writer_budget_charges,
         "admissions per exact search grew: {first:?}, ceiling {CEILING:?}"
-    );
-    assert!(
-        first.billing.native_child_identities <= CEILING.billing.native_child_identities
-            && first.billing.metadata_reservations <= CEILING.billing.metadata_reservations
-            && first.billing.copy_reservations <= CEILING.billing.copy_reservations,
-        "billing calls per exact search grew: {first:?}, ceiling {CEILING:?}"
     );
 }

@@ -9,6 +9,8 @@ pub struct Work {
     pub retention_keys_examined: usize,
     pub graph_keys_examined: usize,
     pub membership_envelopes_verified: usize,
+    /// Calls to the stored vector-entry decoder, including import replay.
+    pub stored_vector_decodes: usize,
     pub membership_keys_examined: usize,
     pub pending_summary_reads: usize,
     pub log_keys_examined: usize,
@@ -29,6 +31,7 @@ impl Default for Work {
             retention_keys_examined: 0,
             graph_keys_examined: 0,
             membership_envelopes_verified: 0,
+            stored_vector_decodes: 0,
             membership_keys_examined: 0,
             pending_summary_reads: 0,
             log_keys_examined: 0,
@@ -287,6 +290,17 @@ impl Database {
             log_refcounts: self.change_log_lsn_refcounts.read().len()
                 * (std::mem::size_of::<(Lsn, u64)>() + 16),
         }
+    }
+    /// Reset the existing writer peak and return the live charged baseline.
+    #[doc(hidden)]
+    pub fn __reset_writer_peak_for_test(&self) -> usize {
+        self.finalization.accountant.reset_high_water_for_test();
+        self.finalization.accountant.usage().used
+    }
+    /// Sample the existing writer counter without constructing a receipt.
+    #[doc(hidden)]
+    pub fn __writer_charged_bytes_for_test(&self) -> usize {
+        self.finalization.accountant.usage().used
     }
     #[doc(hidden)]
     pub fn __writer_cache_stats_for_test(&self) -> Result<(u64, u64, u64, usize)> {
