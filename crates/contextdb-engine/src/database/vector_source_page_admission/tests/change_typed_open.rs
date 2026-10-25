@@ -201,10 +201,22 @@ fn prove_change_loader_cold_root_refusal(oversized_base: bool) {
 
 #[test]
 fn change_loader_cold_base_root_preserves_typed_source_refusal_and_retry() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     prove_change_loader_cold_root_refusal(true);
 }
 
 #[test]
 fn change_loader_cold_change_root_preserves_typed_source_refusal_and_retry() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     prove_change_loader_cold_root_refusal(false);
 }

@@ -8367,7 +8367,8 @@ impl CheckpointReadSource {
             crate::read_image_memory::active_owner().unwrap_or_else(|_| self.decode_memory.clone());
         let admission = ExportBodyAdmission::empty(memory.row_owner()?);
         let operation = admission.memory.enter();
-        let filled = self.load_export_row_values_in_scope(&operation, name, meta, rows, &admission)?;
+        let filled =
+            self.load_export_row_values_in_scope(&operation, name, meta, rows, &admission)?;
         Ok((filled, admission))
     }
 
@@ -27491,9 +27492,8 @@ impl RedbPersistence {
         path: &Path,
         accountant: crate::memory_accounting::AccountantHandle,
     ) -> Result<Self> {
-        let _operation = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            accountant.clone(),
-        )?;
+        let _operation =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(accountant.clone())?;
         let companion_preexists = companion_exists(path)?;
         let (lock_file, old_db) = if companion_preexists {
             let lock_file = CompanionGuard::acquire(path, CompanionAdmission::Existing)?;
@@ -27515,7 +27515,13 @@ impl RedbPersistence {
             (lock_file, old_db)
         };
         if old_db.1.is_none() {
-            return Self::create_with_lock(path, lock_file, Some(accountant), REDB_CACHE_BYTES, None);
+            return Self::create_with_lock(
+                path,
+                lock_file,
+                Some(accountant),
+                REDB_CACHE_BYTES,
+                None,
+            );
         }
         lock_file.publish_writer_run(path, false, None)?;
         #[cfg(any(test, feature = "test-seams"))]
@@ -28088,7 +28094,11 @@ impl RedbPersistence {
 
     #[cfg(feature = "test-seams")]
     pub(crate) fn reader_registry_charge_for_test(&self, accountant: usize) -> usize {
-        self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |db| db.reader_registry_charge_for_test(accountant))
+        self.db
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, |db| db.reader_registry_charge_for_test(accountant))
     }
 
     /// Writer cache charge metadata; physical owners alone release its invoice.
@@ -28501,9 +28511,8 @@ impl RedbPersistence {
             Some(bytes) => crate::memory_accounting::MemoryAccountant::writer_budget(bytes)?,
             None => crate::memory_accounting::MemoryAccountant::writer_no_limit()?,
         };
-        let _operation = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            writer.accountant(),
-        )?;
+        let _operation =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(writer.accountant())?;
         Self::legacy_format_verdict(path, AbsentStoreAnswer::Taxonomy, REDB_CACHE_BYTES, None)
     }
 
@@ -58717,6 +58726,12 @@ mod empty_declared_index_readiness_tests {
 
     #[test]
     fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         {
             use redb::ReadableTable;
             let mut failures = Vec::new();
@@ -59777,7 +59792,15 @@ macro_rules! raw_persistence_surface {
         impl RedbPersistence {
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     $visibility fn create(path: &Path) -> Result<Self> {
-        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant()?;
+        // This raw constructor declares its own default open budget at entry
+        // when it has no enclosing operation. Decode never chooses a payer.
+        let accountant = match crate::read_image_memory::active_owner() {
+            Ok(owner) => owner.accountant.clone(),
+            Err(_) => crate::memory_accounting::AccountantHandle::standalone(
+                crate::read_session::DatabaseOpenOptions::default().memory_limit,
+                true,
+            )?,
+        };
         let _decode_scope = if let Ok(owner) = crate::read_image_memory::active_owner() {
             owner.enter()
         } else {
@@ -59796,7 +59819,15 @@ macro_rules! raw_persistence_surface {
     /// before the refusal is returned.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     $visibility fn open_existing_only(path: &Path) -> Result<Self> {
-        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant()?;
+        // This raw constructor declares its own default open budget at entry
+        // when it has no enclosing operation. Decode never chooses a payer.
+        let accountant = match crate::read_image_memory::active_owner() {
+            Ok(owner) => owner.accountant.clone(),
+            Err(_) => crate::memory_accounting::AccountantHandle::standalone(
+                crate::read_session::DatabaseOpenOptions::default().memory_limit,
+                true,
+            )?,
+        };
         let _decode_scope = if let Ok(owner) = crate::read_image_memory::active_owner() {
             owner.enter()
         } else {
@@ -59809,7 +59840,15 @@ macro_rules! raw_persistence_surface {
 
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     $visibility fn open(path: &Path) -> Result<Self> {
-        let accountant = crate::read_image_memory::ImageMemory::default_decode_accountant()?;
+        // This raw constructor declares its own default open budget at entry
+        // when it has no enclosing operation. Decode never chooses a payer.
+        let accountant = match crate::read_image_memory::active_owner() {
+            Ok(owner) => owner.accountant.clone(),
+            Err(_) => crate::memory_accounting::AccountantHandle::standalone(
+                crate::read_session::DatabaseOpenOptions::default().memory_limit,
+                true,
+            )?,
+        };
         let _decode_scope = if let Ok(owner) = crate::read_image_memory::active_owner() {
             owner.enter()
         } else {

@@ -287,6 +287,12 @@ fn borrowed_foreign_key_frontier_preserves_protected_fixed_point_and_sync_delive
 
 #[test]
 fn reclamation_admits_vector_and_edge_identities_without_payload_copies() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wide-auxiliary.db");
     let _clock = Wallclock::test_clock_guard(|| 1_000_000);
@@ -557,6 +563,12 @@ fn reader_deferred_edges_remain_charged_and_carry_only_retries_are_admitted() {
 
 #[test]
 fn surviving_wide_index_rebuild_is_admitted_before_durable_reclamation() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("indexed-retention.db");
     let _clock = Wallclock::test_clock_guard(|| 1_000_000);

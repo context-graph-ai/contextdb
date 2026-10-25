@@ -102,6 +102,12 @@ fn insert_journal(persistence: &RedbPersistence, record: &VectorPartitionJournal
 
 #[test]
 fn cold_publication_and_cleanup_exclude_unrelated_singleton_extents() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("cold-catalog.db");
     let database = crate::Database::open(&path).unwrap();
@@ -234,6 +240,12 @@ fn cold_publication_and_cleanup_exclude_unrelated_singleton_extents() {
 
 #[test]
 fn miskeyed_catalog_attribution_still_authenticates_the_complete_record() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("miskeyed-catalog.db");
     let database = crate::Database::open(&path).unwrap();
@@ -294,6 +306,12 @@ fn miskeyed_catalog_attribution_still_authenticates_the_complete_record() {
 
 #[test]
 fn journal_cleanup_scan_cancellation_aborts_validation_collection_and_deletion() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("cancel-long-journal.db");
     let database = crate::Database::open_with_options(

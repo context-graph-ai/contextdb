@@ -202,6 +202,12 @@ fn unusable_publication_fence_refuses_recovery_and_cursor_registration_with_type
 
 #[test]
 fn provider_inventory_refusal_preserves_owner_cursor_operation_runtime_and_cause() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     const CHILD: &str = "CONTEXTDB_OWNER_PIN_PROVIDER_COORDINATION_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let directory = tempfile::tempdir().expect("task-scoped platform runtime");

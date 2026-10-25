@@ -245,6 +245,13 @@ fn raw_entry(dimension: usize, quantization: VectorQuantization) -> PersistedVec
 
 #[test]
 fn raw_vector_encoded_width_accepts_all_quantizations_and_extreme_scalar_framing() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence) = writer();
     for dimension in [0, 1, 2, 251, 768, 65_536] {
         for quantization in [

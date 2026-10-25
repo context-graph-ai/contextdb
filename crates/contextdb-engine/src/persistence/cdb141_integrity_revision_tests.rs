@@ -81,6 +81,12 @@ fn bypass(path: &Path, index: bool) {
 }
 #[test]
 fn empty_index_and_maintained_groups_refuse_both_roots_on_both_public_routes() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let queries = [
         "SELECT id, body FROM integrity_rows WHERE bucket = 99",
         "SELECT id, body FROM integrity_rows WHERE bucket IN (98, 99) ORDER BY bucket",
@@ -182,6 +188,12 @@ fn physical_flip(path: &Path, marker: &[u8]) {
 }
 #[test]
 fn owner_consumed_cold_body_checksums_are_typed_and_unvisited_damage_is_irrelevant() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     for owner_route in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("physical.db");
@@ -506,6 +518,12 @@ fn export_rebuild_prune_and_drop_recreate_keep_producer_witnesses() {
 
 #[test]
 fn consumed_index_and_witness_pages_refuse_with_public_typed_corruption() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     for target in [0, 1, 2] {
         for owner_route in [false, true] {
             let dir = tempfile::tempdir().unwrap();

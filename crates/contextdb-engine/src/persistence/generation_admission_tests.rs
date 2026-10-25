@@ -3,6 +3,12 @@ use crate::{Database, MaintenancePolicy};
 
 #[test]
 fn authenticated_graph_page_records_fit_the_fixed_64_kib_extent() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let graph = VectorPartitionGraphBytes::verified(vec![7; 128 * 1024]);
     let prepared = RedbPersistence::prepare_vector_partition_graph_pages(
         &VectorIndexRef::new("items", "embedding"),
@@ -45,6 +51,12 @@ const CATALOG_DECLARED_RESIDENT_BYTES: usize = 1;
 
 #[test]
 fn an_older_catalog_charge_is_recomputed_before_graph_decode() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("older-charge.db");
     let db = Database::open(&path).unwrap();
@@ -156,6 +168,12 @@ fn an_older_catalog_charge_is_recomputed_before_graph_decode() {
 
 #[test]
 fn near_extent_sized_page_roots_are_streamed_and_every_disk_key_is_counted() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let graph = VectorPartitionGraphBytes::verified(vec![7; 128 * 1024]);
     let generation_key = vec![9; 65_400];
     let prepared = RedbPersistence::prepare_vector_partition_graph_pages(

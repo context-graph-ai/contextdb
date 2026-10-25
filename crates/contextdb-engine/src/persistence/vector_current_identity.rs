@@ -532,6 +532,12 @@ mod tests {
 
     #[test]
     fn repeated_current_probes_release_transient_decode_before_the_next_row() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let (_directory, persistence, writer, record) = fixture(1);
         let root = persistence
             .initialize_writer_snapshot(SnapshotId(1), Lsn(1))
@@ -563,6 +569,12 @@ mod tests {
 
     #[test]
     fn current_identity_probe_work_is_independent_of_retained_history() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         for history in [1, 256, 4096] {
             let (_directory, persistence, writer, record) = fixture(history);
             eprintln!("CURRENT retained history H={history}");
@@ -597,6 +609,12 @@ mod tests {
 
     #[test]
     fn signed_duplicates_are_counted_atomically_and_do_not_change_old_captures() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         for variant in 0..4 {
             let (directory, mut persistence, mut writer, clean) = fixture(2);
             let old = persistence
@@ -712,6 +730,12 @@ mod tests {
 
     #[test]
     fn current_moves_replay_and_refusals_preserve_exact_owner_and_captured_roots() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let (directory, persistence, writer, current) = fixture(256);
         let old = persistence
             .initialize_writer_snapshot(SnapshotId(256), Lsn(256))
@@ -814,6 +838,12 @@ mod tests {
 
     #[test]
     fn missing_and_mismatched_current_witnesses_refuse_without_reconstruction() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         for mode in 0..3 {
             let (directory, persistence, writer, clean) = fixture(1);
             persistence
@@ -914,6 +944,12 @@ mod tests {
 
     #[test]
     fn cancelled_current_identity_refuses_before_probes_and_refunds_its_owner() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let (_directory, persistence, _writer, clean) = fixture(1);
         let root = persistence
             .initialize_writer_snapshot(SnapshotId(1), Lsn(1))

@@ -239,5 +239,11 @@ fn missing_catalog_inventory_admits_cold_oversized_source_after_construction() {
 
 #[test]
 fn corrupt_catalog_inventory_admits_cold_oversized_source_after_construction() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     quarantined_inventory_refuses_cold_oversized_source(false);
 }

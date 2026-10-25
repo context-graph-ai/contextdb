@@ -2424,6 +2424,17 @@ impl PagedGenerationBuilder {
         self._partition_charge.bytes + self.progress._charge.bytes
     }
 
+    pub(crate) fn retained_control_bytes_for(
+        &self,
+        accountant: &dyn crate::memory_budget::MemoryBudget,
+    ) -> usize {
+        if crate::memory_budget::same_funder(self.accountant.as_ref(), accountant) {
+            self.retained_control_bytes()
+        } else {
+            0
+        }
+    }
+
     /// Perform one admitted insertion/encoding batch. Publishing and reclaiming
     /// have separate explicit calls because only the engine knows their floors.
     #[expect(

@@ -57,6 +57,13 @@ fn next(persistence: &RedbPersistence) -> u64 {
 }
 #[test]
 fn native_and_legacy_allocations_are_disjoint_and_sql_integer_bounded() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let (_root, persistence, partition, declaration) = fixture();
     let binding = persistence.vector_schema_binding(&partition.index).unwrap();

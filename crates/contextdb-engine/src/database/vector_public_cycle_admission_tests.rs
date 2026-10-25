@@ -364,6 +364,12 @@ fn public_cold_metadata_refusal(metadata: ColdMetadata) {
 
 #[test]
 fn public_cycle_cold_catalog_refusal_keeps_serving_and_closes() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     public_cold_metadata_refusal(ColdMetadata::Catalog);
 }
 #[test]
@@ -372,6 +378,12 @@ fn public_cycle_cold_journal_refusal_keeps_serving_and_closes() {
 }
 #[test]
 fn public_cycle_cold_covered_cleanup_refusal_keeps_serving_and_closes() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     public_cold_metadata_refusal(ColdMetadata::CoveredJournal);
 }
 
@@ -890,6 +902,12 @@ fn public_cycle_giant_before_healthy_catalog_continues() {
 }
 #[test]
 fn public_cycle_giant_after_healthy_catalog_continues() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     public_unknown_catalog_preserves_healthy_work(false, UnknownCatalog::Giant);
 }
 #[test]
@@ -902,6 +920,12 @@ fn public_cycle_miskey_before_valid_catalog_quarantines_canonical_route() {
 }
 #[test]
 fn public_cycle_miskey_after_valid_catalog_quarantines_canonical_route() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     public_unknown_catalog_preserves_healthy_work(false, UnknownCatalog::Miskey);
 }
 
@@ -928,6 +952,12 @@ fn public_cycle_valid_durable_only_catalog_after_refused_giant_is_discovered() {
 
 #[test]
 fn public_cycle_incomplete_container_sample_preserves_serving_and_closes() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     public_unknown_catalog_preserves_healthy_work(true, UnknownCatalog::Incomplete);
 }
 
@@ -1504,6 +1534,12 @@ fn public_cycle_candidate_sort_heap_refusal_releases_and_retries_stably() {
 
 #[test]
 fn public_cycle_repeated_failed_saved_publications_release_unreachable_owners() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     public_cold_metadata_refusal(ColdMetadata::SavedPublicationFailure);
 }
 

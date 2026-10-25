@@ -717,6 +717,12 @@ fn replaying_displaced_purged_history_never_lowers_named_or_global_maxima() {
 #[test]
 #[serial_test::serial]
 fn authorization_funds_each_native_control_before_allocation_and_until_free() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("native-funding.db");
     let db = seed(&path);
@@ -946,11 +952,23 @@ fn retained_reader_lifecycle(first_finishes_first: bool, grow: bool) {
 #[test]
 #[serial_test::serial]
 fn shared_root_backing_is_freed_when_the_first_reader_finishes_first() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     retained_reader_lifecycle(true, false);
 }
 #[test]
 #[serial_test::serial]
 fn shared_root_backing_is_freed_when_the_first_reader_finishes_last() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     retained_reader_lifecycle(false, false);
 }
 #[test]
@@ -971,6 +989,12 @@ fn registry_growth_preserves_the_floor_when_the_first_reader_finishes_last() {
 // source-review obligation.
 #[test]
 fn concurrent_native_capture_keeps_each_returned_root_stable_across_commits() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("concurrent-native-capture.db");
     let db = seed(&path);
@@ -1177,6 +1201,12 @@ impl ReadMemoryBudget for RefusingAdmission {
 
 #[test]
 fn native_guard_admission_refusal_rolls_back_count_and_floor_without_stranding_funding() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     use super::content_identity::proof_allocation_oracle_tests as oracle;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("admission-rollback.db");
@@ -1324,6 +1354,12 @@ fn native_guard_admission_refusal_rolls_back_count_and_floor_without_stranding_f
 
 #[test]
 fn configuration_u8_records_and_summary_fingerprints_authorize_the_same_committed_root() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("configuration-key.db");
     let db = seed(&path);
@@ -1378,6 +1414,12 @@ fn configuration_u8_records_and_summary_fingerprints_authorize_the_same_committe
 
 #[test]
 fn missing_and_malformed_configuration_bindings_refuse_before_scope_probes() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     for damage in 0..2 {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("configuration-damage.db");
@@ -1433,6 +1475,12 @@ fn missing_and_malformed_configuration_bindings_refuse_before_scope_probes() {
 // accepts a changed content-size root before probing the requested scope.
 #[test]
 fn a_changed_configuration_content_size_root_is_precise_corruption_before_scope_probes() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory
         .path()

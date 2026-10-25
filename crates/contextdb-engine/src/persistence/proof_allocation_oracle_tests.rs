@@ -4899,6 +4899,12 @@ mod original_failure_contract {
     #[test]
     #[serial]
     fn overlapping_storage_failures_keep_original_diagnosis_and_paid_last_release() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         use crate::funded_error::OriginalStoragePhase;
         use crate::persistence::native_storage_admission::StorageAdmissionScope;
         for inner_first in [true, false] {

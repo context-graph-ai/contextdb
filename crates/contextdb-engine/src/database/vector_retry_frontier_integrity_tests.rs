@@ -35,6 +35,12 @@ fn insert(db: &Database, id: i64, scope: i64) {
 
 #[test]
 fn cleanup_refusal_skips_its_build_while_sibling_and_complete_query_frontiers_progress() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     use contextdb_vector::mem::VectorPartitionSearchRoute;
 
     let directory = tempfile::tempdir().unwrap();

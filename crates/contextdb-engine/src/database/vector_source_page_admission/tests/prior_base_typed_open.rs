@@ -64,6 +64,12 @@ fn prior_base_fixture() -> (
 
 #[test]
 fn prior_base_loader_cold_root_preserves_source_refusal_and_releases_charge() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, record) = prior_base_fixture();
     let accountant = Arc::new(MemoryAccountant::with_budget(128 * 1024 * 1024));
     accountant.set_budget(Some(CACHE_BYTES + 1024)).unwrap();

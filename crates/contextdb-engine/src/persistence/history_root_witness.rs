@@ -485,6 +485,12 @@ mod tests {
     }
     #[test]
     fn committed_bypass_is_refused_and_later_producer_cannot_bless_it() {
+        // This raw history fixture declares the owner for its codec calls.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let db = seeded(&dir.path().join("witness.db"));
         {
@@ -541,6 +547,12 @@ mod tests {
     }
     #[test]
     fn aborted_publication_keeps_old_root_and_recreation_changes_incarnation() {
+        // This raw history fixture declares the owner for its codec calls.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let db = seeded(&dir.path().join("witness.db"));
         let inserts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -607,6 +619,12 @@ mod tests {
     }
     #[test]
     fn absent_or_malformed_witness_is_never_bootstrapped() {
+        // This raw history fixture declares the owner for its codec calls.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let db = seeded(&dir.path().join("witness.db"));
         for malformed in [None, Some(&b"bad"[..])] {
@@ -894,6 +912,13 @@ mod tests {
     }
     #[test]
     fn close_hook_failure_refuses_commit_and_reopen_keeps_complete_old_state() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("close-failure.db");
         let db = seeded(&path);
@@ -1005,6 +1030,13 @@ mod tests {
 
     #[test]
     fn canonical_zero_incarnation_witness_is_typed_malformed() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
             bytes[2..18].fill(0);
@@ -1015,6 +1047,13 @@ mod tests {
 
     #[test]
     fn canonical_invalid_presence_witness_is_typed_malformed() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
             bytes[1] = 2;
@@ -1025,6 +1064,13 @@ mod tests {
 
     #[test]
     fn canonical_absent_flag_nonzero_tail_is_typed_malformed() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
             bytes[1] = 0;
@@ -1036,6 +1082,13 @@ mod tests {
 
     #[test]
     fn canonical_present_zero_page_mismatch_stays_disclosed_false() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let _operation = crate::read_image_memory::ImageMemory::enter_decode_call().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
@@ -1091,6 +1144,13 @@ mod tests {
 
     #[test]
     fn canonical_present_all_zero_descriptor_is_typed_malformed() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
             bytes[18..].fill(0);
@@ -1101,6 +1161,13 @@ mod tests {
 
     #[test]
     fn canonical_truncated_witness_is_typed_malformed() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let db = seeded(&dir.path().join("witness.db"));
         let mut bytes = generated_present_record(&db);
@@ -1117,6 +1184,13 @@ mod tests {
 
     #[test]
     fn canonical_present_zero_length_witness_is_typed_malformed() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let (db, original, bytes) = plant(&dir.path().join("witness.db"), |bytes| {
             bytes[42..50].fill(0);

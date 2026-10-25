@@ -203,6 +203,13 @@ fn capacity_eviction_resumes_both_cached_delivery_paths_in_both_directions() {
 
 #[test]
 fn canonical_run_rejects_missing_extra_changed_and_hidden_physical_postings() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     // Historical point and identity batches prove the complete addressed
     // version group before exposing values or absence. The private historical
     // variants have no public older-snapshot entry.
@@ -617,6 +624,13 @@ fn canonical_run_rejects_missing_extra_changed_and_hidden_physical_postings() {
 
 #[test]
 fn canonical_range_reconciles_retired_postings_without_decoding_row_bodies() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     use crate::direct_file_reader::test_seams::{ReadWorkObservationScope, ReadWorkPhase};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retired.db");

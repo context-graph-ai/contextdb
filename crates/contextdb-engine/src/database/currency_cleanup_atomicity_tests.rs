@@ -340,6 +340,13 @@ fn currency_cleanup_crashes_keep_both_removal_gaps_atomic_and_retryable() {
 
 #[test]
 fn currency_cleanup_storage_errors_keep_memory_and_disk_available_for_retry() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     for boundary in [1, 2] {
         let directory = TempDir::new().unwrap();
         let db = open(&directory.path().join("currency-error.redb"));

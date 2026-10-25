@@ -524,6 +524,12 @@ fn a_read_is_answered_although_a_full_resident_set_is_holding_the_last_declared_
 /// existing typed corruption error and no row body is delivered.
 #[test]
 fn a_changed_row_body_is_typed_corruption_although_its_proof_chunks_are_resident() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let root = tempfile::tempdir().expect("fixture directory");
     let path = root.path().join("changed-body.db");
     seed(&path, 128);

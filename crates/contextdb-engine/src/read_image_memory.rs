@@ -1023,21 +1023,6 @@ impl ImageMemory {
         self.per_call.is_some() || self.query_per_call.is_some()
     }
 
-    /// A standalone call uses the engine's default open ceiling and keeps
-    /// its accountant private, outside the registered Database writer domain.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(crate) fn default_decode_accountant() -> Result<crate::memory_accounting::AccountantHandle>
-    {
-        if let Ok(owner) = active_owner() {
-            return Ok(owner.accountant.clone());
-        }
-        let limit = crate::read_session::DatabaseOpenOptions::default().memory_limit;
-        crate::memory_accounting::AccountantHandle::standalone(limit, true)
-    }
-
     /// Re-enter the owner installed by the operation. Decoding never selects
     /// a budget or manufactures a payer for an unscoped caller.
     #[expect(
@@ -1155,7 +1140,9 @@ impl ImageMemory {
                 // A read capability may forward to the writer's original
                 // accountant. Attribute the actual payer, not the trait door.
                 #[cfg(feature = "test-seams")]
-                let writer_funded = self.reader_budget.as_ref()
+                let writer_funded = self
+                    .reader_budget
+                    .as_ref()
                     .and_then(|reader| reader.funding_accountant_identity_for_test())
                     == Some(writer as *const MemoryAccountant as usize);
                 #[cfg(not(feature = "test-seams"))]
@@ -3686,7 +3673,7 @@ mod admitted_reader_tests {
     }
     fn reader(budget: &Arc<Counted>) -> Result<ImageMemoryHandle> {
         ImageMemory::admitted_reader_for(
-            ImageMemory::default_decode_accountant()?,
+            crate::memory_accounting::AccountantHandle::standalone(None, true)?,
             budget.clone(),
             "reader",
             "decode_custody_metadata",

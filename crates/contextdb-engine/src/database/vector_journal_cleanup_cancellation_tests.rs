@@ -406,6 +406,12 @@ pub(super) fn before_published_cleanup_for_test(catalog: &VectorPartitionGenerat
 #[cfg(feature = "test-seams")]
 #[test]
 fn publication_interruption_at_normal_t2_is_terminal_and_preserves_the_restart_frontier() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("published-cleanup-interruption.db");
     let db = Arc::new(

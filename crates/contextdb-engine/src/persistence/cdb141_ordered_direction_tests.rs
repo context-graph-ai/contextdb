@@ -78,6 +78,13 @@ fn pull(load: &ReadPersistenceLoad, cursor: &mut BoundedOrderedRowCursor) -> Res
 #[test]
 #[allow(clippy::single_element_loop)] // Preserve the fixture loop surrounding unchanged assertions.
 fn independent_forward_canonical_oracle() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     for damage in ["missing", "extra", "changed", "hidden"] {
         for reverse in [false] {
             let dir = tempfile::tempdir().unwrap();
@@ -138,6 +145,13 @@ fn independent_forward_canonical_oracle() {
 #[test]
 #[allow(clippy::single_element_loop)] // Preserve the fixture loop surrounding unchanged assertions.
 fn independent_reverse_canonical_oracle() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     for damage in ["missing", "extra", "changed", "hidden"] {
         for reverse in [true] {
             let dir = tempfile::tempdir().unwrap();

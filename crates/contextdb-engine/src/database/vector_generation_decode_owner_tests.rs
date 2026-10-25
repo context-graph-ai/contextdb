@@ -192,6 +192,12 @@ fn direct_cold_and_delete_carrier_generations_keep_the_decode_floor() {
 
 #[test]
 fn dormant_partition_loader_admits_its_decode_floor_before_reads_and_releases() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     for quantization in [
         VectorQuantization::F32,
         VectorQuantization::SQ8,

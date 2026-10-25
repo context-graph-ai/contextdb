@@ -170,6 +170,13 @@ fn reopen(db: Database, path: &std::path::Path) -> Database {
 
 #[test]
 fn locally_bootstrapped_schema_reaches_zero_outbound_after_identical_full_history_pull() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().join("bootstrap-echo-identical.redb");
     let db = Database::open(&path).unwrap();
@@ -205,6 +212,13 @@ fn locally_bootstrapped_schema_reaches_zero_outbound_after_identical_full_histor
 
 #[test]
 fn divergent_local_schema_stays_pending_after_identical_full_history_pull() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().join("bootstrap-echo-divergent.redb");
     let db = Database::open(&path).unwrap();
@@ -246,6 +260,13 @@ fn divergent_local_schema_stays_pending_after_identical_full_history_pull() {
 
 #[test]
 fn mixed_local_schema_commit_stays_fully_pending() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().join("bootstrap-echo-mixed-commit.redb");
     let db = Database::open(&path).unwrap();
@@ -309,6 +330,13 @@ fn mixed_local_schema_commit_stays_fully_pending() {
 
 #[test]
 fn a_hub_serves_the_foreign_keys_and_composite_keys_its_author_wrote() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().join("bootstrap-echo-exact-shape.redb");
     let db = Database::open(&path).unwrap();

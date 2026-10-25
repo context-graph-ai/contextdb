@@ -1907,6 +1907,13 @@ mod received_schema_stage_tests {
 
     #[test]
     fn received_schema_source_order_preserves_mixed_lsn_marker_identities_and_digests() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let ddl = vec![create_table(), create_trigger()];
         let received = crate::protocol::ReceivedDdlContext {
             tenant_id: TenantId::from("tenant-a"),
@@ -3570,6 +3577,12 @@ mod received_schema_stage_tests {
 
     #[test]
     fn staged_publication_moves_complete_replacements_across_derived_handles() {
+        // The raw codec fixture owns this explicitly declared operation.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let db = Database::open_memory();
         let params = HashMap::new();
         db.execute("CREATE TABLE kept (id INTEGER PRIMARY KEY)", &params)
@@ -6884,10 +6897,17 @@ mod received_schema_stage_tests {
 
     #[test]
     fn staged_receipt_watermarks_keep_other_keys_and_relay_preserves_creator() {
+        // This raw codec fixture declares its own writer operation; it has no
+        // database request whose ambient owner it may borrow.
+        let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+        )
+        .unwrap();
+
         let db = Database::open_memory();
-        let _memory = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            db.accountant.clone(),
-        ).unwrap();
+        let _memory =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(db.accountant.clone())
+                .unwrap();
         let tenant_watermark_key = "tenant-a".to_string();
         let watermark_key = Database::applied_push_watermark_node_incarnation_key(
             &TenantId::from("tenant-a"),
@@ -12192,7 +12212,6 @@ pub struct VectorMemoryOwnershipReceiptForTest {
     pub combined_writer_envelope: usize,
 }
 
-
 #[cfg(any(test, feature = "test-seams"))]
 struct WriterReceiptContentionObserver {
     identity: usize,
@@ -12200,7 +12219,11 @@ struct WriterReceiptContentionObserver {
     fired: bool,
 }
 #[cfg(any(test, feature = "test-seams"))]
-static WRITER_RECEIPT_CONTENTION_OBSERVERS: parking_lot::Mutex<WriterReceiptContentionState> = parking_lot::Mutex::new(WriterReceiptContentionState { observers: Vec::new(), samples: Vec::new() });
+static WRITER_RECEIPT_CONTENTION_OBSERVERS: parking_lot::Mutex<WriterReceiptContentionState> =
+    parking_lot::Mutex::new(WriterReceiptContentionState {
+        observers: Vec::new(),
+        samples: Vec::new(),
+    });
 #[cfg(any(test, feature = "test-seams"))]
 struct WriterReceiptContentionState {
     observers: Vec<WriterReceiptContentionObserver>,
@@ -12211,7 +12234,10 @@ struct WriterReceiptSampleHeld(usize);
 #[cfg(any(test, feature = "test-seams"))]
 impl WriterReceiptSampleHeld {
     fn enter(identity: usize) -> Self {
-        WRITER_RECEIPT_CONTENTION_OBSERVERS.lock().samples.push(identity);
+        WRITER_RECEIPT_CONTENTION_OBSERVERS
+            .lock()
+            .samples
+            .push(identity);
         Self(identity)
     }
 }
@@ -12219,7 +12245,10 @@ impl WriterReceiptSampleHeld {
 impl Drop for WriterReceiptSampleHeld {
     fn drop(&mut self) {
         let mut state = WRITER_RECEIPT_CONTENTION_OBSERVERS.lock();
-        let at = state.samples.iter().rposition(|identity| *identity == self.0)
+        let at = state
+            .samples
+            .iter()
+            .rposition(|identity| *identity == self.0)
             .expect("a memory sample retains its actual exclusion");
         state.samples.remove(at);
     }
@@ -12228,15 +12257,25 @@ impl Drop for WriterReceiptSampleHeld {
 fn note_writer_receipt_contention(identity: usize) {
     let callbacks = {
         let mut state = WRITER_RECEIPT_CONTENTION_OBSERVERS.lock();
-        if !state.samples.contains(&identity) { return; }
-        state.observers.iter_mut().filter_map(|entry| {
-            if entry.identity == identity && !entry.fired {
-                entry.fired = true;
-                Some(entry.observer.clone())
-            } else { None }
-        }).collect::<Vec<_>>()
+        if !state.samples.contains(&identity) {
+            return;
+        }
+        state
+            .observers
+            .iter_mut()
+            .filter_map(|entry| {
+                if entry.identity == identity && !entry.fired {
+                    entry.fired = true;
+                    Some(entry.observer.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
     };
-    for callback in callbacks { callback(); }
+    for callback in callbacks {
+        callback();
+    }
 }
 
 // The identity is installed only after acquiring the actual maintenance lock.
@@ -12264,17 +12303,23 @@ impl<'a> MaintenanceReceiptGuard<'a> {
         let guard = mutex.lock();
         #[cfg(any(test, feature = "test-seams"))]
         HELD_MAINTENANCE_RECEIPT_GUARDS.with(|held| held.borrow_mut().push(identity));
-        Self { _guard: guard, #[cfg(any(test, feature = "test-seams"))] identity }
+        Self {
+            _guard: guard,
+            #[cfg(any(test, feature = "test-seams"))]
+            identity,
+        }
     }
     #[cfg(any(test, feature = "test-seams"))]
     fn held_for(mutex: &Arc<parking_lot::Mutex<()>>) -> bool {
-        HELD_MAINTENANCE_RECEIPT_GUARDS.with(|held| held.borrow().contains(&(Arc::as_ptr(mutex) as usize)))
+        HELD_MAINTENANCE_RECEIPT_GUARDS
+            .with(|held| held.borrow().contains(&(Arc::as_ptr(mutex) as usize)))
     }
 }
 #[cfg(any(test, feature = "test-seams"))]
 impl Drop for MaintenanceReceiptGuard<'_> {
     fn drop(&mut self) {
-        HELD_MAINTENANCE_RECEIPT_GUARDS.with(|held| assert_eq!(held.borrow_mut().pop(), Some(self.identity)));
+        HELD_MAINTENANCE_RECEIPT_GUARDS
+            .with(|held| assert_eq!(held.borrow_mut().pop(), Some(self.identity)));
     }
 }
 
@@ -33213,12 +33258,12 @@ impl Database {
             Some(bytes) => MemoryAccountant::writer_budget(bytes)?,
             None => MemoryAccountant::writer_no_limit()?,
         };
-        let _operation = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            writer.accountant(),
-        )?;
+        let _operation =
+            crate::read_image_memory::ImageMemory::enter_writer_operation(writer.accountant())?;
         let canonical_path = canonical_database_path(path.as_ref())?;
         let registry_reservation = OpenRegistryReservation::acquire(canonical_path.clone())?;
-        let persistence = RedbPersistence::recreate_with_owner(&canonical_path, writer.accountant())?;
+        let persistence =
+            RedbPersistence::recreate_with_owner(&canonical_path, writer.accountant())?;
         persistence.close();
         drop(registry_reservation);
         Ok(())
@@ -44677,6 +44722,7 @@ impl Database {
     /// generation.
     #[cfg(test)]
     fn authoritative_table_generations_for_detached_working(&self) -> Result<HashMap<String, u64>> {
+        let _operation = self.open_operation()?;
         let Some(persistence) = &self.persistence else {
             return Ok(self.in_memory_table_generations.lock().clone());
         };
@@ -46370,6 +46416,11 @@ impl Database {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<(MetadataCopyCharges, Database)> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        let _decode_scope = crate::read_image_memory::ImageMemory::operation_reader(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+            read_memory.clone(),
+        )?
+        .enter();
 
         // The copy this worker makes is the widest point a receiver ever
         // reaches -- for a moment it holds the old image and the arriving one
@@ -77503,14 +77554,16 @@ impl Database {
         let _guard = MaintenanceReceiptGuard::lock(&self.pruning_guard);
         #[cfg(any(test, feature = "test-seams"))]
         let _held = crate::persistence::PruningGuardHeldForTest::enter();
-        let result = self.maintenance_context()
+        let result = self
+            .maintenance_context()
             .run_cycle(CurrencyGate::Always, read_memory);
         // The operation root can retain decoded source windows until exit.
         // Retire those physical holders before the closing observation, while
         // this caller still holds maintenance exclusion.
         drop(operation);
         #[cfg(any(test, feature = "test-seams"))]
-        let emission = result.is_ok()
+        let emission = result
+            .is_ok()
             .then(|| self.prepare_writer_memory_ownership_receipt_for_test("maintenance"))
             .flatten();
         #[cfg(any(test, feature = "test-seams"))]
@@ -79470,7 +79523,8 @@ impl Database {
                         log_maintenance_cycle(&report);
                         #[cfg(any(test, feature = "test-seams"))]
                         if let Some(observer) = &context.writer_receipt_observer {
-                            emission = observer.prepare_writer_memory_ownership_receipt_for_test("maintenance");
+                            emission = observer
+                                .prepare_writer_memory_ownership_receipt_for_test("maintenance");
                         }
                     }
                     Err(err) => log_pruning_error(&err),
@@ -81145,7 +81199,9 @@ impl Database {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub(crate) fn vector_memory_ownership_receipt(&self) -> Result<VectorMemoryOwnershipReceipt> {
-        let sampled = self.vector_store.memory_ownership_snapshot_for_test();
+        let sampled = self
+            .vector_store
+            .memory_ownership_snapshot_for_funder(self.finalization.vector_accountant.as_ref());
         let (source_metadata, reader_source_metadata) = {
             let mut count = 0usize;
             self.visit_source_copy_credits(&mut |_, _, _| count += 1);
@@ -81210,9 +81266,13 @@ impl Database {
                 let mut slot = slot.borrow_mut();
                 if slot.as_ref().is_some_and(|(owner, _)| *owner == identity) {
                     slot.take().map(|(_, hook)| hook)
-                } else { None }
+                } else {
+                    None
+                }
             });
-            if let Some(hook) = hook { hook(); }
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         let (accountant_total, process_native_bytes, combined_writer_envelope) =
             self.finalization.accountant.writer_envelope_usage()?;
@@ -81309,19 +81369,36 @@ impl Database {
         observer: Arc<dyn Fn() + Send + Sync>,
         operation: impl FnOnce() -> R,
     ) -> R {
-        struct Remove { identity: usize, observer: Arc<dyn Fn() + Send + Sync> }
+        struct Remove {
+            identity: usize,
+            observer: Arc<dyn Fn() + Send + Sync>,
+        }
         impl Drop for Remove {
             fn drop(&mut self) {
-                WRITER_RECEIPT_CONTENTION_OBSERVERS.lock().observers.retain(|entry|
-                    !(entry.identity == self.identity && Arc::ptr_eq(&entry.observer, &self.observer)));
+                WRITER_RECEIPT_CONTENTION_OBSERVERS
+                    .lock()
+                    .observers
+                    .retain(|entry| {
+                        !(entry.identity == self.identity
+                            && Arc::ptr_eq(&entry.observer, &self.observer))
+                    });
             }
         }
         let identity = Arc::as_ptr(&self.pruning_guard) as usize;
         // Wrap each registration to give nested registrations distinct identities,
         // even when the caller reuses its Arc callback.
         let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || observer());
-        let _remove = Remove { identity, observer: observer.clone() };
-        WRITER_RECEIPT_CONTENTION_OBSERVERS.lock().observers.push(WriterReceiptContentionObserver { identity, observer, fired: false });
+        let _remove = Remove {
+            identity,
+            observer: observer.clone(),
+        };
+        WRITER_RECEIPT_CONTENTION_OBSERVERS.lock().observers.push(
+            WriterReceiptContentionObserver {
+                identity,
+                observer,
+                fired: false,
+            },
+        );
         operation()
     }
 
@@ -81339,9 +81416,12 @@ impl Database {
                 drop(displaced);
             }
         }
-        let _restore = Restore(WRITER_COLLECTION_HOOK.with(|slot| slot.replace(Some((
-            Arc::as_ptr(&self.pruning_guard) as usize, Box::new(hook),
-        )))));
+        let _restore = Restore(WRITER_COLLECTION_HOOK.with(|slot| {
+            slot.replace(Some((
+                Arc::as_ptr(&self.pruning_guard) as usize,
+                Box::new(hook),
+            )))
+        }));
         sample()
     }
 
@@ -81362,7 +81442,8 @@ impl Database {
     ) -> R {
         let _maintenance = (!MaintenanceReceiptGuard::held_for(&self.pruning_guard))
             .then(|| MaintenanceReceiptGuard::lock(&self.pruning_guard));
-        let _sample_held = WriterReceiptSampleHeld::enter(Arc::as_ptr(&self.pruning_guard) as usize);
+        let _sample_held =
+            WriterReceiptSampleHeld::enter(Arc::as_ptr(&self.pruning_guard) as usize);
         self.with_commit_lock(|| {
             let mut receipt = WriterMemoryOwnershipReceiptForTest {
                 vector: self.vector_memory_ownership_receipt_for_test(),
@@ -81486,7 +81567,10 @@ impl Database {
             receipt.persistence_cache = self.persistence.as_ref().map_or(0, |p| {
                 let cache = p.cache_charge();
                 #[cfg(feature = "test-seams")]
-                let cache = cache + p.reader_registry_charge_for_test(self.finalization.accountant.as_ptr() as usize);
+                let cache = cache
+                    + p.reader_registry_charge_for_test(
+                        self.finalization.accountant.as_ptr() as usize
+                    );
                 cache
             });
             receipt.custody_companion_memo = self
@@ -83169,7 +83253,10 @@ impl Database {
         &self,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<crate::read_image_memory::ImageMemoryHandle> {
-        crate::read_image_memory::ImageMemory::operation_reader(self.accountant.clone(), read_memory)
+        crate::read_image_memory::ImageMemory::operation_reader(
+            self.accountant.clone(),
+            read_memory,
+        )
     }
 
     /// Memory for sync work the engine does on its own store, such as reading
@@ -83251,7 +83338,8 @@ impl Database {
         &self,
         operation: impl FnOnce() -> R,
     ) -> (R, crate::vector_read_memory::ReaderMemoryHighWaterForTest) {
-        self.declared_read_memory.observe_high_water_for_test(operation)
+        self.declared_read_memory
+            .observe_high_water_for_test(operation)
     }
 
     /// Peak successfully admitted writer bytes for journey observation.

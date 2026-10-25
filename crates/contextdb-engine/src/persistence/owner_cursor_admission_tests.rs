@@ -83,6 +83,12 @@ fn snapshot_paths(runtime: &Path, identity: (u64, u64)) -> Vec<PathBuf> {
 // Exclusive guards intentionally force contention with the admission read locks.
 #[allow(clippy::readonly_write_lock)]
 fn owner_cursor_persistence_guard_contention_refuses_before_lock_release() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     {
@@ -132,6 +138,12 @@ fn owner_cursor_persistence_guard_contention_refuses_before_lock_release() {
 
 #[test]
 fn owner_cursor_refresh_contention_refuses_before_refresh_release() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     persistence
@@ -181,6 +193,12 @@ fn owner_cursor_refresh_contention_refuses_before_refresh_release() {
 
 #[test]
 fn owner_cursor_registry_contention_is_retryable_before_lock_release() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     let mut held = ReaderSnapshotRegistryLock::create(&runtime, identity).unwrap();
@@ -210,6 +228,12 @@ fn owner_cursor_registry_contention_is_retryable_before_lock_release() {
 
 #[test]
 fn owner_cursor_fence_contention_refuses_before_either_lock_release() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     let (database_identity, _, _, _) = published_writer_identity(persistence.path()).unwrap();
@@ -243,6 +267,12 @@ fn owner_cursor_fence_contention_refuses_before_either_lock_release() {
 
 #[test]
 fn owner_cursor_provider_contention_retains_and_admits() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     let held = Rc::new(RefCell::new(None));
@@ -366,6 +396,12 @@ fn newer_registered_root_is_protected_by_an_older_admitted_reader(native_floor: 
 
 #[test]
 fn untrusted_provider_scan_registry_is_a_terminal_typed_refusal() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     let hook_runtime = runtime.clone();
@@ -386,6 +422,12 @@ fn untrusted_provider_scan_registry_is_a_terminal_typed_refusal() {
 
 #[test]
 fn reader_departing_during_registry_scan_releases_its_stale_registration() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     let earlier = persistence.owner_cursor_pin().unwrap();
@@ -419,6 +461,12 @@ fn reader_departing_during_registry_scan_releases_its_stale_registration() {
 
 #[test]
 fn locked_registry_snapshot_without_its_data_descriptor_refuses_terminally() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, _runtime) = writer();
     let earlier = persistence.owner_cursor_pin().unwrap();
     let registration = earlier._registration.registration.as_ref().unwrap();
@@ -448,6 +496,12 @@ fn locked_registry_snapshot_without_its_data_descriptor_refuses_terminally() {
 #[cfg(feature = "test-seams")]
 #[test]
 fn replaced_provider_scan_registry_is_a_terminal_typed_refusal() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     use read_persistence_test_scaffold::pause_reader_snapshot_registry_scan_for_test;
 
     let (_directory, persistence, runtime) = writer();
@@ -493,6 +547,12 @@ fn replaced_provider_scan_registry_is_a_terminal_typed_refusal() {
 
 #[test]
 fn poisoned_owner_cursor_refresh_is_a_terminal_typed_coordination_refusal() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     let poisoned = catch_unwind(AssertUnwindSafe(|| {
@@ -521,6 +581,12 @@ fn poisoned_owner_cursor_refresh_is_a_terminal_typed_coordination_refusal() {
 
 #[test]
 fn untrusted_owner_cursor_registry_is_a_terminal_typed_refusal() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     let registry = ReaderSnapshotRegistryLock::create(&runtime, identity).unwrap();
@@ -546,6 +612,12 @@ fn untrusted_owner_cursor_registry_is_a_terminal_typed_refusal() {
 
 #[test]
 fn a_still_linked_replaced_registry_lock_is_not_temporary_contention() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     let mut registry = ReaderSnapshotRegistryLock::create(&runtime, identity).unwrap();
@@ -564,6 +636,12 @@ fn a_still_linked_replaced_registry_lock_is_not_temporary_contention() {
 #[cfg(feature = "test-seams")]
 #[test]
 fn a_registry_replaced_before_validation_is_a_terminal_typed_admission_refusal() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     use read_persistence_test_scaffold::{
         ReaderRegistrationLockPhase, pause_reader_registration_lock_for_test,
     };
@@ -927,6 +1005,12 @@ pub(super) fn before_physical_presence_probe() {
 #[cfg(target_os = "linux")]
 #[test]
 fn inventory_excludes_publication_until_its_physical_probe_finishes() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let persistence = Arc::new(persistence);
     let identity = persistence.physical_identity().unwrap();
@@ -968,6 +1052,12 @@ fn inventory_excludes_publication_until_its_physical_probe_finishes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn purge_without_registered_readers_keeps_physical_custody() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
     assert!(
@@ -1029,6 +1119,12 @@ fn purge_without_registered_readers_keeps_physical_custody() {
 #[cfg(target_os = "linux")]
 #[test]
 fn audited_reader_snapshots_under_hold_succeeds_under_unrelated_root_contention() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let owner = persistence
         .writer_file
@@ -1091,6 +1187,12 @@ fn audited_reader_snapshots_under_hold_succeeds_under_unrelated_root_contention(
 /// is released, it returns Complete with own registered reader present.
 #[test]
 fn generic_reader_registry_scanner_fails_closed_under_root_serializer_contention() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let (_directory, persistence, runtime) = writer();
     let identity = persistence.physical_identity().unwrap();
 

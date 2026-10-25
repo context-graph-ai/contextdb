@@ -3644,6 +3644,7 @@ fn decode_node(family: LogicalFamily, bytes: &[u8]) -> Result<Node> {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg(test)]
 fn read_node(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -8012,6 +8013,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn initialize_content_identity_in_write(
         write_txn: &redb::WriteTransaction,
     ) -> Result<()> {

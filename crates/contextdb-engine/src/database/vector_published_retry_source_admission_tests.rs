@@ -3,6 +3,12 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 #[test]
 fn published_retry_admits_cold_sources_and_keeps_cleanup_pending_on_refusal() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("retry-owner.db");
     let copy = directory.path().join("retry-cold.db");

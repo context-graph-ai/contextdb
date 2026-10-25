@@ -1060,6 +1060,12 @@ fn vector_clear_after_partition_move_preserves_null_and_reader_snapshot() {
 // Acceptance: quantized live bodies remain readable, while a committed clear is NULL.
 #[test]
 fn sq8_live_vector_hydrates_but_cleared_vector_remains_null() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("quantized-clear.redb");

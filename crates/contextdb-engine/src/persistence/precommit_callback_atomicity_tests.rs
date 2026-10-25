@@ -62,6 +62,12 @@ fn durable_state(store: &RedbPersistence, key: &str) -> (Option<Vec<u8>>, Vec<(u
 
 #[test]
 fn callback_refusal_after_real_identity_proof_aborts_durable_state_and_retries() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("callback.db");
     let database = crate::Database::open(&path).unwrap();

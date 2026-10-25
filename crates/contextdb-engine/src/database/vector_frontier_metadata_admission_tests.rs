@@ -290,6 +290,12 @@ fn cold_oversized_metadata_refuses_before_decode(metadata: ColdMetadata) {
 
 #[test]
 fn cold_oversized_catalog_extent_refuses_during_preparation_before_decode() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     cold_oversized_metadata_refuses_before_decode(ColdMetadata::Catalog);
 }
 
@@ -305,6 +311,12 @@ fn cold_oversized_membership_extent_refuses_before_fallback_count_decode() {
 
 #[test]
 fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serving() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("covered-retry-owner.db");
     let copy = directory.path().join("covered-retry-cold.db");
@@ -530,6 +542,12 @@ fn cold_oversized_covered_journal_retry_probe_refuses_before_read_and_keeps_serv
 
 #[test]
 fn wide_text_partition_metadata_refuses_before_cold_catalog_lookup() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     const CATALOGS: TableDefinition<&[u8], &[u8]> =
         TableDefinition::new("vector_partition_generation_catalog");
     let directory = tempfile::tempdir().unwrap();

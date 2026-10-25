@@ -167,6 +167,13 @@ fn a_self_consistent_chunk_with_a_changed_direction_is_typed_corruption() {
 
 #[test]
 fn the_proof_comparator_never_ties_or_panics_on_a_mixed_key() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let ascending = mutation_tree_key(&posting(7, false)).unwrap();
     let descending = mutation_tree_key(&posting(7, true)).unwrap();
     let direction = identity_key_cmp(&ascending, &descending)

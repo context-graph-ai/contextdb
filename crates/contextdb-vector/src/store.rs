@@ -25814,6 +25814,21 @@ impl VectorStore {
     /// reconciliation path.
     #[doc(hidden)]
     pub fn memory_ownership_snapshot_for_test(&self) -> VectorMemoryOwnershipSnapshot {
+        self.memory_ownership_snapshot(None)
+    }
+
+    #[doc(hidden)]
+    pub fn memory_ownership_snapshot_for_funder(
+        &self,
+        accountant: &dyn crate::memory_budget::MemoryBudget,
+    ) -> VectorMemoryOwnershipSnapshot {
+        self.memory_ownership_snapshot(Some(accountant))
+    }
+
+    fn memory_ownership_snapshot(
+        &self,
+        accountant: Option<&dyn crate::memory_budget::MemoryBudget>,
+    ) -> VectorMemoryOwnershipSnapshot {
         let registry = self.registry.read();
         let components = Self::partition_vector_components(&registry);
         let mut receipt = VectorMemoryOwnershipSnapshot {
@@ -25864,7 +25879,10 @@ impl VectorStore {
                     if let Some((builder, _)) = slot.pending.as_ref() {
                         receipt.vector_partition_controls = receipt
                             .vector_partition_controls
-                            .saturating_add(builder.retained_control_bytes());
+                            .saturating_add(accountant.map_or_else(
+                                || builder.retained_control_bytes(),
+                                |accountant| builder.retained_control_bytes_for(accountant),
+                            ));
                     }
                 }
                 receipt.mutable_tail = receipt

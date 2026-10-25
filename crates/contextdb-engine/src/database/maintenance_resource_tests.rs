@@ -154,6 +154,12 @@ fn a_retained_raw_body_has_decode_scratch_even_without_live_graph_points() {
 
 #[test]
 fn streamed_state_digest_preserves_the_canonical_live_entry_encoding() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     // A complete native build must commit its final publication batch under
     // the existing outer maintenance boundary, then become an indexed route.
     // The registered gate nextest configuration bounds the pre-fix self-wait;
@@ -932,6 +938,12 @@ fn cancellation_after_durable_repair_publication_preserves_repair_and_skips_cycl
 
 #[test]
 fn retention_cleanup_commits_generation_catalog_and_eligible_commit_index_removals_together() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     // Repair survives process exit after retirement and build registration,
     // before any insertion batch (maintenance intent line 41; policy 22).
     {
@@ -2372,6 +2384,13 @@ fn canonical_retained_selection_digest(
 
 #[test]
 fn resident_generation_selection_preserves_retained_canonical_digests() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     for quantization in ["F32", "SQ8", "SQ4"] {
         let directory = tempfile::tempdir().unwrap();
         let db = seed_retained_generation_selection(
@@ -2605,6 +2624,12 @@ fn resident_generation_selection_preserves_retained_canonical_digests() {
 
 #[test]
 fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_writes() {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     // Maintenance completes within the declared writer budget, and old reads
     // keep their generation (maintenance intent line 41; root policy 22).
     {
@@ -3040,6 +3065,12 @@ fn resident_generation_selection_keeps_the_pinned_frontier_during_concurrent_wri
 #[serial]
 fn resident_generation_selection_admits_history_below_the_full_copy_bound_and_refuses_before_bodies()
  {
+    // The raw codec fixture owns this explicitly declared operation.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     const HEADROOM: usize = 2 * 1024 * 1024;
     let directory = tempfile::tempdir().unwrap();
     let db = seed_retained_generation_selection(

@@ -23,6 +23,13 @@ fn corruption(reason: contextdb_core::error::DiagnosticText) -> Error {
 
 #[test]
 fn retained_raw_body_guard_accepts_each_quantization_and_preserves_identity() {
+    // This raw codec fixture declares its own writer operation; it has no
+    // database request whose ambient owner it may borrow.
+    let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+        crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
+    )
+    .unwrap();
+
     let membership = membership();
     for quantization in [
         VectorQuantization::F32,

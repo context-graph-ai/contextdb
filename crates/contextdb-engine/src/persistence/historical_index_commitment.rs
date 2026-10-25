@@ -1927,7 +1927,7 @@ mod interval_invariant_tests {
             .create(directory.path().join("intervals.redb"))
             .unwrap();
         let _scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
-            crate::read_image_memory::ImageMemory::default_decode_accountant()?,
+            crate::memory_accounting::AccountantHandle::standalone(None, true)?,
         )?;
         let write = database.begin_write().unwrap();
         let mut batch = CommitmentBatch::for_writer()?;
