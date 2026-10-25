@@ -26,8 +26,12 @@ mod database_routes;
 mod fixture;
 #[path = "every_public_route_installs_its_own_memory_owner/listed_routes.rs"]
 mod listed_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/network_routes.rs"]
+mod network_routes;
 #[path = "every_public_route_installs_its_own_memory_owner/persistence_routes.rs"]
 mod persistence_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/readback.rs"]
+mod readback;
 #[path = "every_public_route_installs_its_own_memory_owner/read_session_routes.rs"]
 mod read_session_routes;
 #[path = "every_public_route_installs_its_own_memory_owner/server_routes.rs"]
@@ -113,6 +117,103 @@ where
             .expect("a runtime for the calling thread")
             .block_on(route())
     })
+}
+
+/// Call an async route on a fresh thread and check the value it answered
+/// with: a route that answers with the wrong thing (a claim it did not
+/// sync, a poll that found none of the hub's work) fails the row.
+pub fn call_async_expecting<T, E: Debug, F>(
+    route: impl FnOnce() -> F + Send,
+    expect: impl FnOnce(T) -> Result<(), String> + Send,
+) -> Outcome
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    std::thread::scope(|scope| {
+        let joined = scope
+            .spawn(move || {
+                let answered = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the calling thread")
+                    .block_on(route());
+                match answered {
+                    Err(error) => Outcome::Refused(format!("{error:?}")),
+                    Ok(value) => match expect(value) {
+                        Ok(()) => Outcome::Answered,
+                        Err(why) => Outcome::Unexplained(why),
+                    },
+                }
+            })
+            .join();
+        match joined {
+            Ok(outcome) => outcome,
+            Err(payload) => Outcome::Panicked(panic_text(payload)),
+        }
+    })
+}
+
+/// Every tracing event at `floor` or above emitted on the thread that
+/// installs it, as text.
+#[derive(Clone)]
+pub struct EventLog {
+    floor: tracing::Level,
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl EventLog {
+    pub fn at(floor: tracing::Level) -> Self {
+        Self {
+            floor,
+            events: Default::default(),
+        }
+    }
+
+    /// Install for the calling thread until the guard drops.
+    pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+    }
+
+    pub fn first(&self) -> Option<String> {
+        self.events.lock().expect("event log").first().cloned()
+    }
+
+    pub fn find(&self, needle: &str) -> Option<String> {
+        self.events
+            .lock()
+            .expect("event log")
+            .iter()
+            .find(|event| event.contains(needle))
+            .cloned()
+    }
+
+    /// Record a note of the test's own beside the captured events.
+    pub fn note(&self, text: &str) {
+        self.events.lock().expect("event log").push(text.to_string());
+    }
+
+    pub fn text(&self) -> String {
+        self.events.lock().expect("event log").join(" | ")
+    }
+}
+
+struct EventText(String);
+
+impl tracing::field::Visit for EventText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn Debug) {
+        self.0.push_str(&format!("{}={value:?} ", field.name()));
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLog {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() <= self.floor {
+            let mut text = EventText(String::new());
+            event.record(&mut text);
+            self.events.lock().expect("event log").push(text.0);
+        }
+    }
 }
 
 fn fails(outcome: &Outcome) -> bool {
@@ -420,33 +521,6 @@ const CANNOT_REACH_EITHER_REFUSAL: &[(&str, &str)] = &[
     ("hnsw_rs::hnswio::HnswIo::load_hnsw_owned_with_dist", "contextdb-hnsw depends on no workspace crate"),
 ];
 
-/// Consumer routes this table does not drive yet, with the precondition the
-/// fixtures above do not provide. Each is a reachable route; none counts as
-/// proven.
-const NOT_YET_DRIVEN: &[(&str, &str)] = &[
-    ("contextdb_engine::SyncClient::new", "needs a bound Iroh hub endpoint and dial ticket; the sync rows use the in-process authenticated transport"),
-    ("contextdb_engine::SyncClient::new_with_read_memory", "needs a bound Iroh hub endpoint and dial ticket"),
-    ("contextdb_engine::SyncClient::change_destination", "needs a client built from an Iroh dial specification"),
-    ("contextdb_engine::SyncServer::new", "needs a bound Iroh endpoint"),
-    ("contextdb_engine::SyncServer::new_with_read_budget_provider", "needs a bound Iroh endpoint"),
-    ("contextdb_engine::SyncServer::run", "serves until the process ends; `SyncServer::run_until` is driven through a served pull"),
-    ("contextdb_engine::SyncServer::run_until_stopped", "needs the native stop handle of an Iroh-bound server"),
-    ("contextdb_engine::SyncServer::native_stop", "needs an Iroh-bound server"),
-    ("contextdb_engine::BlobStore::serve_on", "needs a bound Iroh endpoint"),
-    ("contextdb_engine::BlobStore::serve_on_with_read_budget_provider", "needs a bound Iroh endpoint"),
-    ("contextdb_engine::BlobStore::resolve_blob_ref", "needs a second node serving the blob over Iroh"),
-    ("contextdb_engine::BlobStore::resolve_blob_ref_with_read_memory", "needs a second node serving the blob over Iroh"),
-    ("contextdb_engine::BlobStore::spawn_reclaim_driver", "a background loop whose sweep failures are only logged; `BlobStore::reclaim_unreferenced` is the sweep and is driven"),
-    ("contextdb_engine::BlobStore::spawn_reclaim_driver_with_read_budget_provider", "a background loop whose sweep failures are only logged; `BlobStore::reclaim_unreferenced_with_read_memory` is the sweep and is driven"),
-    ("contextdb_server::work_ledger::claim_job", "needs a sync client connected to a hub holding a ledger"),
-    ("contextdb_server::work_ledger::claim_job_with_read_memory", "needs a sync client connected to a hub holding a ledger"),
-    ("contextdb_server::work_ledger::poll_and_execute_once", "needs a sync client connected to a hub holding a ledger and a work executor"),
-    ("contextdb_server::work_ledger::poll_and_execute_once_with_read_memory", "needs a sync client connected to a hub holding a ledger and a work executor"),
-    ("contextdb_server::work_ledger::run_worker_loop", "needs a sync client connected to a hub holding a ledger and a work executor"),
-    ("contextdb_server::work_ledger::run_worker_loop_with_read_budget_provider", "needs a sync client connected to a hub holding a ledger and a work executor"),
-    ("contextdb_cli::run", "reads its statements from the process's standard input"),
-];
-
 fn driven_rows() -> Vec<Row> {
     let mut rows = Vec::new();
     rows.extend(database_routes::rows());
@@ -455,6 +529,7 @@ fn driven_rows() -> Vec<Row> {
     rows.extend(read_session_routes::rows());
     rows.extend(sync_routes::rows());
     rows.extend(blob_routes::rows());
+    rows.extend(network_routes::rows());
     rows.extend(server_routes::rows());
     rows.extend(cli_routes::rows());
     rows
@@ -473,7 +548,6 @@ fn the_route_table_names_every_refusal_reachable_route_once() {
     accounted.extend(UNREACHABLE_BY_CONSUMERS.iter().map(|(route, _)| *route));
     accounted.extend(VECTOR_STORE_ROUTES.iter().copied());
     accounted.extend(CANNOT_REACH_EITHER_REFUSAL.iter().map(|(route, _)| *route));
-    accounted.extend(NOT_YET_DRIVEN.iter().map(|(route, _)| *route));
     let unique: BTreeSet<&str> = accounted.iter().copied().collect();
     let repeated: Vec<&str> = {
         let mut seen = BTreeSet::new();
@@ -520,6 +594,11 @@ fn sync_routes_answer_without_an_ambient_owner() {
 #[test]
 fn blob_routes_answer_without_an_ambient_owner() {
     assert_routes_answer(&blob_routes::rows());
+}
+
+#[test]
+fn endpoint_routes_answer_without_an_ambient_owner() {
+    assert_routes_answer(&network_routes::rows());
 }
 
 #[test]

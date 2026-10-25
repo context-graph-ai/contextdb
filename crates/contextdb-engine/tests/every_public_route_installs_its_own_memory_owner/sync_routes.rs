@@ -22,7 +22,8 @@ pub struct Pair {
 }
 
 impl Pair {
-    /// `edge_population` declares and fills the edge's own tables first.
+    /// File-backed stores; `edge_population` declares and fills the edge's
+    /// own tables first.
     pub fn serve(edge_population: bool) -> Self {
         let hub = Store::open();
         let edge = if edge_population {
@@ -38,6 +39,25 @@ impl Pair {
                 db: Arc::new(db),
             }
         };
+        Self::serving(hub, edge)
+    }
+
+    /// The same pair with both stores in memory.
+    pub fn serve_memory() -> Self {
+        let edge = Database::open_memory();
+        edge.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+        let in_memory = |db: Arc<Database>| Store {
+            dir: tempfile::tempdir().expect("fixture directory"),
+            path: std::path::PathBuf::new(),
+            db,
+        };
+        Self::serving(
+            in_memory(super::fixture::memory_store()),
+            in_memory(Arc::new(edge)),
+        )
+    }
+
+    fn serving(hub: Store, edge: Store) -> Self {
         let broker = InProcessBroker::new();
         let identity = Arc::new(FabricIdentity::generate());
         let node = identity.node_id();
@@ -102,12 +122,17 @@ pub fn rows() -> Vec<Row> {
         Row {
             route: "contextdb_engine::SyncClient::pull_default",
             drive: || {
+                // A file-backed pair, then the same journey in memory.
                 let pair = Pair::serve(false);
+                let memory = Pair::serve_memory();
                 call_async(|| async {
-                    let client = pair.client()?;
-                    client.pull_default().await?;
-                    run(&pair.hub.db, "INSERT INTO notes (id, bucket, body) VALUES (60, 0, 'later')");
-                    client.pull_default().await
+                    for pair in [&pair, &memory] {
+                        let client = pair.client()?;
+                        client.pull_default().await?;
+                        run(&pair.hub.db, "INSERT INTO notes (id, bucket, body) VALUES (60, 0, 'later')");
+                        client.pull_default().await?;
+                    }
+                    Ok::<_, contextdb_core::Error>(())
                 })
             },
         },
@@ -149,6 +174,13 @@ pub fn rows() -> Vec<Row> {
                         .push_with_read_memory(pair.edge.db.declared_reader_memory()?)
                         .await
                 })
+            },
+        },
+        Row {
+            route: "contextdb_engine::SyncClient::change_destination",
+            drive: || {
+                let pair = Pair::serve(true);
+                call(|| pair.client()?.change_destination("another-hub"))
             },
         },
         Row {
