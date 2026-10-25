@@ -9,7 +9,7 @@
 //! duration, its visited work, the change-layer sizes around every publication, and the achieved
 //! commits/second are written to the JSON receipt at `CONTEXTDB_CW_RECEIPT`; the 200 ms warm p95
 //! and 5 commits/second bars, and the "change layer shrinks across the last two publications"
-//! comparison, are evaluated from that receipt by the campaign cell.
+//! comparison, are evaluated from that receipt by the measurement driver.
 //!
 //! Full-size parameters are the defaults; the CONTEXTDB_CW_* variables shrink them for a smoke run:
 //! SEED_VECTORS (100000), UNRELATED_VECTORS (20000), DIMENSIONS (768), COMMITS (10000),
@@ -153,6 +153,7 @@ struct ReaderLog {
     durations_ns: Vec<u64>,
     visited: Vec<u64>,
     off_route_queries: u64,
+    committed_frontiers: Vec<u64>,
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -179,6 +180,7 @@ fn distribution(log: &ReaderLog) -> serde_json::Value {
         "visited_work_max": visited.last().copied().unwrap_or(0),
         "durations_ns": log.durations_ns,
         "visited_work": log.visited,
+        "committed_frontiers": log.committed_frontiers,
     })
 }
 
@@ -248,11 +250,33 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
     let hot_log = Mutex::new(ReaderLog::default());
     let quiet_log = Mutex::new(ReaderLog::default());
     let publications = Mutex::new(Vec::<serde_json::Value>::new());
+    let maximum_commit = Mutex::new(serde_json::json!({"elapsed_ns":0}));
+    let maximum_during_maintenance = Mutex::new(serde_json::json!({"elapsed_ns":0}));
+    let maintenance_active = AtomicBool::new(false);
+    let maintenance_cycles = AtomicU64::new(0);
     let started = Instant::now();
 
     std::thread::scope(|scope| {
         for writer in 0..WRITERS {
-            let (db, done, commits, mine) = (&db, &done, &commits, &writer_changes[writer]);
+            let (
+                db,
+                done,
+                commits,
+                mine,
+                maximum_commit,
+                maximum_during_maintenance,
+                maintenance_active,
+                maintenance_cycles,
+            ) = (
+                &db,
+                &done,
+                &commits,
+                &writer_changes[writer],
+                &maximum_commit,
+                &maximum_during_maintenance,
+                &maintenance_active,
+                &maintenance_cycles,
+            );
             scope.spawn(move || {
                 // Each writer owns the seed ids congruent to its index plus its own inserts.
                 let mut owned: Vec<i64> = (1..=seed_vectors as i64)
@@ -263,7 +287,15 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
                 let mut replace_cursor = 0_usize;
                 while !done.load(Ordering::Acquire) {
                     let slot = step % 10;
-                    let outcome = match slot {
+                    let commit_started = Instant::now();
+                    let active_at_start = maintenance_active.load(Ordering::Acquire);
+                    let cycle_at_start = maintenance_cycles.load(Ordering::Acquire);
+                    let marks = Arc::new(Mutex::new(Vec::new()));
+                    let observer_marks = marks.clone();
+                    let outcome = contextdb_engine::writer_commit_test_seams::observe(
+                        Arc::new(move |boundary| {
+                            observer_marks.lock().unwrap().push((format!("{boundary:?}"), commit_started.elapsed().as_nanos() as u64));
+                        }), || match slot {
                         0..=5 => {
                             next_insert += 1;
                             owned.push(next_insert);
@@ -300,10 +332,49 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
                                 &params([("id", Value::Int64(id))]),
                             )
                         }
-                    };
+                    });
+                    let elapsed_ns = commit_started.elapsed().as_nanos() as u64;
+                    let active_at_end = maintenance_active.load(Ordering::Acquire);
+                    let cycle_at_end = maintenance_cycles.load(Ordering::Acquire);
                     outcome.unwrap_or_else(|error| {
                         panic!("writer {writer} step {step}: a refused or failed commit fails the run: {error:?}")
                     });
+                    {
+                        let mut maximum = maximum_commit.lock().unwrap();
+                        let mut overlapping_maximum = maximum_during_maintenance.lock().unwrap();
+                        let overlaps_maintenance = active_at_start || active_at_end || cycle_at_start != cycle_at_end;
+                        if elapsed_ns > maximum["elapsed_ns"].as_u64().unwrap()
+                            || (overlaps_maintenance && elapsed_ns > overlapping_maximum["elapsed_ns"].as_u64().unwrap()) {
+                            let boundaries = marks.lock().unwrap();
+                            let mut previous = 0;
+                            let mut phase = "before_first_observed_boundary".to_string();
+                            let mut slowest = (phase.clone(), 0);
+                            for (name, at) in boundaries.iter() {
+                                if at.saturating_sub(previous) > slowest.1 {
+                                    slowest = (phase.clone(), at.saturating_sub(previous));
+                                }
+                                phase = format!("after_{name}");
+                                previous = *at;
+                            }
+                            if elapsed_ns.saturating_sub(previous) > slowest.1 {
+                                slowest = (phase, elapsed_ns.saturating_sub(previous));
+                            }
+                            let sample = serde_json::json!({
+                                "elapsed_ns":elapsed_ns,"writer":writer,"step":step,
+                                "operation":match slot {0..=5=>"insert",6..=8=>"replace",_=>"delete"},
+                                "maintenance_active_at_start":active_at_start,
+                                "maintenance_active_at_end":active_at_end,
+                                "maintenance_cycles_before":cycle_at_start,
+                                "maintenance_cycles_after":cycle_at_end,
+                                "committed_frontier":db.current_lsn().0,
+                                "observed_boundaries_ns":*boundaries,
+                                "longest_observed_phase":slowest.0,"longest_observed_phase_ns":slowest.1,
+                                "cause_scope":"Observed commit phase and maintenance overlap; no inferred causal attribution beyond these events."
+                            });
+                            if elapsed_ns > maximum["elapsed_ns"].as_u64().unwrap() { *maximum = sample.clone(); }
+                            if overlaps_maintenance && elapsed_ns > overlapping_maximum["elapsed_ns"].as_u64().unwrap() { *overlapping_maximum = sample; }
+                        }
+                    }
                     step += 1;
                     mine.fetch_add(1, Ordering::AcqRel);
                     if commits.fetch_add(1, Ordering::AcqRel) + 1 >= hard_cap {
@@ -315,11 +386,15 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
 
         // Maintenance is driven closed-loop for the whole run: publication is the real engine path.
         {
-            let (db, done) = (&db, &done);
+            let (db, done, maintenance_active, maintenance_cycles) =
+                (&db, &done, &maintenance_active, &maintenance_cycles);
             scope.spawn(move || {
                 while !done.load(Ordering::Acquire) {
+                    maintenance_active.store(true, Ordering::Release);
                     db.run_maintenance_cycle()
                         .expect("maintenance cycle during the run");
+                    maintenance_cycles.fetch_add(1, Ordering::AcqRel);
+                    maintenance_active.store(false, Ordering::Release);
                 }
             });
         }
@@ -331,17 +406,15 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
             scope.spawn(move || {
                 let mut seen = layer_sample(db, hot_context());
                 let mut interval_peak = seen;
-                let mut query_ordinal = 0_u64;
+                let query = vector(7, 0, dimensions);
                 while !done.load(Ordering::Acquire) {
-                    let query = vector(7, query_ordinal % 997, dimensions);
-                    query_ordinal += 1;
                     let begun = Instant::now();
                     let result = db
                         .execute(
                             search_sql(),
                             &params([
                                 ("context", Value::Uuid(hot_context())),
-                                ("query", Value::Vector(query)),
+                                ("query", Value::Vector(query.clone())),
                             ]),
                         )
                         .expect("the hot-partition search succeeds");
@@ -350,6 +423,7 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
                         let mut log = hot_log.lock().unwrap();
                         log.durations_ns.push(elapsed);
                         log.visited.push(visited_work(&result));
+                        log.committed_frontiers.push(db.current_lsn().0);
                         if !is_maintained_route(&result) {
                             log.off_route_queries += 1;
                         }
@@ -396,17 +470,15 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
         {
             let (db, done, quiet_log) = (&db, &done, &quiet_log);
             scope.spawn(move || {
-                let mut query_ordinal = 0_u64;
+                let query = vector(8, 0, dimensions);
                 while !done.load(Ordering::Acquire) {
-                    let query = vector(8, query_ordinal % 997, dimensions);
-                    query_ordinal += 1;
                     let begun = Instant::now();
                     let result = db
                         .execute(
                             search_sql(),
                             &params([
                                 ("context", Value::Uuid(quiet_context())),
-                                ("query", Value::Vector(query)),
+                                ("query", Value::Vector(query.clone())),
                             ]),
                         )
                         .expect("the unrelated-partition search succeeds");
@@ -414,6 +486,7 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
                     let mut log = quiet_log.lock().unwrap();
                     log.durations_ns.push(elapsed);
                     log.visited.push(visited_work(&result));
+                    log.committed_frontiers.push(db.current_lsn().0);
                     if !is_maintained_route(&result) {
                         log.off_route_queries += 1;
                     }
@@ -442,6 +515,10 @@ fn continuous_writers_hold_throughput_and_reader_latency() {
             "writers": WRITERS, "mix": "6 insert, 3 replace, 1 delete",
         },
         "successful_commits": total_commits,
+        "maximum_single_commit": maximum_commit.into_inner().unwrap(),
+        "maximum_single_commit_during_maintenance": maximum_during_maintenance.into_inner().unwrap(),
+        "maintenance_cycles": maintenance_cycles.load(Ordering::Acquire),
+        "reader_query_policy":"One fixed INDEXED vector per reader for the whole run; frontier sampled immediately after each query.",
         "per_writer_changes": per_writer,
         "elapsed_ns": elapsed_ns,
         "commits_per_second": total_commits as f64 / (elapsed_ns as f64 / 1e9),
