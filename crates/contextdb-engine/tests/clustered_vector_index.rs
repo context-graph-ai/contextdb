@@ -1,13 +1,16 @@
-//! User outcomes of the clustered on-disk vector index: bounded writes, crash
-//! atomicity, typed cancellation, the disk ceiling, snapshot isolation,
-//! deletes and PURGE, per-Context cost, exact and indexed work, reader memory,
-//! and the SQL declaration surface.
+//! User outcomes of the clustered on-disk vector index: bounded writes, writes
+//! across the codebook lifecycle, crash atomicity, typed cancellation, the
+//! disk ceiling, snapshot isolation, deletes and PURGE, per-Context cost,
+//! exact and indexed work, reader memory, small partitions, and the SQL
+//! declaration surface.
 
 #[path = "clustered_vector_index/support.rs"]
 mod support;
 
 #[path = "clustered_vector_index/cancellation.rs"]
 mod cancellation;
+#[path = "clustered_vector_index/codebook_lifecycle.rs"]
+mod codebook_lifecycle;
 #[path = "clustered_vector_index/crash_cut_points.rs"]
 mod crash_cut_points;
 #[path = "clustered_vector_index/deletes_and_purge.rs"]
@@ -22,6 +25,8 @@ mod parse_surface;
 mod per_context_cost;
 #[path = "clustered_vector_index/reader_memory.rs"]
 mod reader_memory;
+#[path = "clustered_vector_index/small_partitions.rs"]
+mod small_partitions;
 #[path = "clustered_vector_index/snapshot_isolation.rs"]
 mod snapshot_isolation;
 #[path = "clustered_vector_index/write_buffer.rs"]

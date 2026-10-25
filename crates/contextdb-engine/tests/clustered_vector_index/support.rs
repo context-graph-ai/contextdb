@@ -183,6 +183,37 @@ pub struct SearchWork {
     /// search read, each tuple once. An unpartitioned column reports one empty
     /// tuple.
     pub contexts_read: Vec<Vec<Value>>,
+    /// The terminal outcome the search's route record reports.
+    pub outcome: Option<SearchOutcome>,
+    /// Lists the route record reports as actually probed, summed over the
+    /// searched Contexts.
+    pub lists_probed: u64,
+    /// The published generation the search served from, for a one-Context
+    /// search on the clustered route.
+    pub served_generation: Option<u64>,
+    /// The approximation-quality status the route record reports.
+    pub objective_status: Option<ObjectiveStatus>,
+}
+
+/// The terminal outcome of an indexed search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchOutcome {
+    /// The selected route finished its declared work.
+    Complete,
+    /// An existing request deadline or work limit stopped it.
+    RanOut,
+    /// A typed admission or resource refusal.
+    Refused,
+}
+
+/// Approximation-quality metadata on a COMPLETE answer, from the serving
+/// generation's calibration receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectiveStatus {
+    Met,
+    Unmet,
+    Unqualified,
+    Pending,
 }
 
 impl SearchWork {
@@ -568,4 +599,59 @@ pub fn declare_ceiling_at_next_admission(
     _choose: Box<dyn FnOnce(&AdmissionBoundary) -> u64 + Send>,
 ) -> CeilingAtAdmission {
     unimplemented!("{UNBOUND}: declaring a ceiling at a write's admission boundary")
+}
+
+/// Store-wide test settings for the clustered index, all optional.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IndexTestOptions {
+    /// The byte threshold at which a write buffer seals a run.
+    pub write_buffer_cap_bytes: Option<u64>,
+    /// The most source rows or entries any one build, replacement,
+    /// assignment or remap step handles per maintenance cycle.
+    pub build_batch_rows: Option<u64>,
+}
+
+/// Opens a caller-driven store with the given clustered index test settings.
+pub fn open_with_index_test_options(_path: &Path, _options: IndexTestOptions) -> Database {
+    unimplemented!("{UNBOUND}: store-wide clustered index test settings")
+}
+
+/// One sealed delta run of one Context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeltaRun {
+    /// The codebook the run was sealed under and is searched through; `None`
+    /// for an unclustered run sealed before the Context's first codebook.
+    pub codebook: Option<u64>,
+    /// Vectors in the run.
+    pub entries: u64,
+}
+
+/// Every sealed delta run of one Context, oldest first.
+pub fn delta_runs(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> Vec<DeltaRun> {
+    unimplemented!("{UNBOUND}: sealed delta runs")
+}
+
+/// Progress of assigning or remapping one Context's sealed runs to its
+/// serving codebook.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RemapProgress {
+    /// Run entries not yet assigned to the serving codebook.
+    pub entries_remaining: u64,
+    /// The persisted position the next remap step resumes from; `None` when
+    /// no remap is pending.
+    pub cursor: Option<u64>,
+}
+
+pub fn remap_progress(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> RemapProgress {
+    unimplemented!("{UNBOUND}: remap progress")
 }
