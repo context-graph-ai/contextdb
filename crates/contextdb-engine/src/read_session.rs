@@ -1559,20 +1559,18 @@ fn attempt_route_once(
         let channel_clock = resources.expiry.clock.clone();
         let channel_owner = match handover {
             Some(handover) => handover.owner.clone(),
-            None => {
-                crate::local_transport::query_funding::QueryMemory::new(
-                    options
-                        .limits
-                        .memory
-                        .min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)),
-                )
-                .map_err(|error| RouteOpenRefusal {
-                    failure: ReadRouteOpenFailure::OwnerAuthentication,
-                    error,
-                })?
-                .image()
-                .owner()
-            }
+            None => crate::local_transport::query_funding::QueryMemory::new(
+                options
+                    .limits
+                    .memory
+                    .min(options.memory_limit.map_or(u64::MAX, |bytes| bytes as u64)),
+            )
+            .map_err(|error| RouteOpenRefusal {
+                failure: ReadRouteOpenFailure::OwnerAuthentication,
+                error,
+            })?
+            .image()
+            .owner(),
         };
         match wait_for_local_answer(
             crate::owner_read::OwnerClient::connect(
@@ -2348,7 +2346,9 @@ impl ReadSession {
                 let identity = reader.database_identity();
                 let observed = crate::persistence::observed_writer_state(path);
                 if let Some(observed) = &observed {
-                    if Some(observed.identity) != identity {
+                    // A readable clean copy may have no companion yet. Its first
+                    // authenticated writer establishes the store identity.
+                    if identity.is_some_and(|identity| observed.identity != identity) {
                         return Err(mismatch());
                     }
                     if !observed.held && Some(observed.run) == file_writer_run {
@@ -2399,13 +2399,13 @@ impl ReadSession {
         }
         let (state, snapshot_at) = match selected {
             SelectedRoute::Owner(selected) => {
-                if Some(selected.identity) != identity {
+                if identity.is_some_and(|identity| selected.identity != identity) {
                     return Err(mismatch());
                 }
                 (ReadSessionState::OwnerChannel(selected), None)
             }
             SelectedRoute::File(reader) => {
-                if reader.database_identity() != identity {
+                if identity.is_some() && reader.database_identity() != identity {
                     return Err(mismatch());
                 }
                 (
@@ -3279,7 +3279,7 @@ impl ReadSession {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut status = self.options().read_cache_share_status();
-        if let ReadSessionState::DirectFile(reader) = &*self.state {
+        if let ReadSessionState::DirectFile(reader) = self.selected_state().as_ref() {
             status.prepaid_index_bytes = Some(reader.prepaid_cache_index_bytes());
             status.held_page_bytes = Some(reader.held_cache_page_bytes());
         }
@@ -3304,7 +3304,7 @@ impl ReadSession {
             .cache_policy_mutation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let ReadSessionState::DirectFile(reader) = &*self.state {
+        if let ReadSessionState::DirectFile(reader) = self.selected_state().as_ref() {
             let mut options = self.options();
             options.read_cache_share = percent;
             reader.select_cache_capacity(options.read_cache_share_status().effective_bytes)?;
