@@ -96,8 +96,10 @@ pub struct NativeStorageAdmission {
     admit: unsafe fn(NonNull<()>, Layout) -> Result<NativeStorageCredit, NativeStorageRefused>,
     inspect_failure: Option<NativeFailureInspector>,
     #[cfg(feature = "test-seams")]
-    allocation_funding: Option<unsafe fn(NonNull<()>) -> Option<(usize, usize)>>,
+    allocation_funding: Option<NativeAllocationFundingInspector>,
 }
+#[cfg(feature = "test-seams")]
+type NativeAllocationFundingInspector = unsafe fn(NonNull<()>) -> Option<(usize, usize)>;
 type NativeFailureInspector = unsafe fn(
     NonNull<()>,
     &mut dyn FnMut(Option<&(dyn std::error::Error + Send + Sync + 'static)>),
@@ -114,9 +116,10 @@ impl NativeStorageAdmission {
     /// The callback must borrow this same concrete scope and report only the
     /// payer and receipt layout used by its successful allocation callback.
     #[cfg(feature = "test-seams")]
+    #[must_use]
     pub unsafe fn with_allocation_funding_inspector(
         mut self,
-        inspect: unsafe fn(NonNull<()>) -> Option<(usize, usize)>,
+        inspect: NativeAllocationFundingInspector,
     ) -> Self {
         self.allocation_funding = Some(inspect);
         self
@@ -773,9 +776,9 @@ impl PendingName {
                 let (full, offset) =
                     PendingAlloc::layout(Layout::array::<u8>(name.0.len()).unwrap());
                 // The name owns this initialized combined allocation throughout the callback.
-                let raw = unsafe { name.0.as_ptr().sub(offset) };
-                let invoice = unsafe { &*raw.cast::<Option<NativeStorageCredit>>() };
-                observe(name.as_str(), raw as usize, full, invoice.as_ref());
+                let raw = unsafe { NonNull::new_unchecked(name.0.as_ptr().sub(offset).cast_mut()) };
+                let invoice = unsafe { raw.cast::<Option<NativeStorageCredit>>().as_ref() };
+                observe(name.as_str(), raw.as_ptr() as usize, full, invoice.as_ref());
             }
         });
         Ok(name)
