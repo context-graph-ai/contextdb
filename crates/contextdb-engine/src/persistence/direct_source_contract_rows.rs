@@ -543,18 +543,45 @@ fn direct_session_source_constructor_refusals_and_native_nulls_leave_no_original
     let base = page_cap + fixed;
     // Exact original-owner cuts on its actual producer. A public memory limit
     // also changes the cache cap, so it cannot isolate P/I/R by subtraction.
-    for phase in [0, 1] {
+    // The image owner's own control invoice stands for as long as its handle
+    // lives, so each cut is one byte short of the reservation's layout, or of
+    // that layout plus the base, ON TOP of that standing charge; a refusal
+    // leaves exactly the standing charge. Only the handle's last physical
+    // owner settles it, leaving the standalone accountant's own controls,
+    // which this test's observation handle still retains.
+    let m = SourceShared::<SourceMemoryReservation>::layout().size();
+    for headroom in [m - 1, m + base - 1, m + base] {
         let memory = crate::read_image_memory::ImageMemory::new(None)
             .expect("unlimited direct-source fixture image owner");
-        let m = SourceShared::<SourceMemoryReservation>::layout().size();
-        memory
-            .accountant
-            .set_budget(Some(if phase == 0 { m - 1 } else { m + base - 1 }))
-            .unwrap();
+        let accountant = memory.accountant.clone();
+        let standing = accountant.usage().used;
+        assert!(standing > 0, "the image owner's control invoice is charged");
+        accountant.set_budget(Some(standing + headroom)).unwrap();
         let result = SourceMemoryReservation::new(memory.clone(), base);
-        assert!(result.is_err());
+        assert_eq!(
+            result.is_ok(),
+            headroom == m + base,
+            "the reservation fits exactly its layout plus the base, and not one byte less"
+        );
         drop(result);
-        assert_eq!(memory.accountant.usage().used, 0);
+        assert_eq!(
+            accountant.usage().used,
+            standing,
+            "a refused or released reservation leaves only the standing control invoice"
+        );
+        let (_, controls) = accountant.native_backing_for_test();
+        let accountant_backing: usize = controls.iter().map(|(_, layout)| layout.size()).sum();
+        assert!(
+            standing > accountant_backing,
+            "the image control is charged beside the accountant's own"
+        );
+        drop(memory);
+        assert_eq!(
+            accountant.usage().used,
+            accountant_backing,
+            "the image control invoice settles when the handle's last owner drops; only the retained accountant's own controls remain"
+        );
+        drop(accountant);
     }
     for denied in 0..=source.allocation_count {
         let observation = Observation::begin();
