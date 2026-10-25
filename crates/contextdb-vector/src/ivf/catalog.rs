@@ -51,8 +51,8 @@ impl Catalog {
             };
         }
         let mut w = [0u64; WORDS];
-        for (dst, src) in w.iter_mut().zip(raw.chunks_exact(8)) {
-            *dst = u64::from_le_bytes(src.try_into().map_err(|_| corrupt())?);
+        for (dst, src) in w.iter_mut().zip(raw.as_chunks::<8>().0) {
+            *dst = u64::from_le_bytes(*src);
         }
         if w[0] != MAGIC || w[1] == 0 || w[9] > 1 {
             return Err(corrupt());
@@ -142,7 +142,7 @@ impl Catalog {
             0,
         ];
         let mut raw = [0; super::storage::PAGE_BYTES];
-        for (dst, word) in raw.chunks_exact_mut(8).zip(w) {
+        for (dst, word) in raw.as_chunks_mut::<8>().0.iter_mut().zip(w) {
             dst.copy_from_slice(&word.to_le_bytes());
         }
         if let Some(old) = old {
@@ -207,10 +207,13 @@ impl Run {
     }
     pub fn store(self, tx: &mut impl WritePages, m: Manifest, id: u64) -> Result<()> {
         let mut raw = [0; super::storage::PAGE_BYTES];
-        for (dst, word) in
-            raw.chunks_exact_mut(8)
-                .zip([MAGIC, self.first, self.last, self.entries, self.next])
-        {
+        for (dst, word) in raw.as_chunks_mut::<8>().0.iter_mut().zip([
+            MAGIC,
+            self.first,
+            self.last,
+            self.entries,
+            self.next,
+        ]) {
             dst.copy_from_slice(&word.to_le_bytes());
         }
         super::storage::put_page(tx, m.key(PageKind::Catalog, 1, id), &raw)
@@ -267,7 +270,7 @@ impl Entry {
     }
     pub fn store(self, tx: &mut impl WritePages, m: Manifest, slot: u64) -> Result<()> {
         let mut raw = [0; 40];
-        for (dst, word) in raw.chunks_exact_mut(8).zip([
+        for (dst, word) in raw.as_chunks_mut::<8>().0.iter_mut().zip([
             self.lsn,
             self.next,
             self.run,

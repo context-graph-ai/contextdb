@@ -153,18 +153,18 @@ impl<S: PageStore> ClusteredIndex<S> {
     }
     pub fn begin_build(&mut self, partition: u64) -> Result<BuildState> {
         self.seal()?;
-        if let Some(current) = self.store.manifest(partition)? {
-            if Catalog::load(&self.store, current)?.legacy.is_some() {
-                return Err(phase("clustered replacement deferred during Remap phase"));
-            }
+        if let Some(current) = self.store.manifest(partition)?
+            && Catalog::load(&self.store, current)?.legacy.is_some()
+        {
+            return Err(phase("clustered replacement deferred during Remap phase"));
         }
-        if let Some(build) = self.store.build_state(partition)? {
-            if build.phase != BuildPhase::Ready {
-                return Err(phase(format!(
-                    "clustered begin during {:?} phase",
-                    build.phase
-                )));
-            }
+        if let Some(build) = self.store.build_state(partition)?
+            && build.phase != BuildPhase::Ready
+        {
+            return Err(phase(format!(
+                "clustered begin during {:?} phase",
+                build.phase
+            )));
         }
         let source_lsn = self.store.snapshot_lsn()?;
         let serving_at_start = self.store.manifest(partition)?;
@@ -448,12 +448,10 @@ impl<S: PageStore> ClusteredIndex<S> {
         if let Some(old) = self.store.manifest(partition)? {
             let c = Catalog::load(&self.store, old)?;
             if c.coalesce_output != 0 {
-                // The integration constructor supplies COALESCE_PAGES_PER_STEP.
-                // Standalone callers resolve their existing phase allowance in pages.
-                let pages = self
-                    .policy
-                    .coalesce_pages_per_step
-                    .unwrap_or(self.training.phase_batch_entries);
+                // The adapter supplies the resolved declared maintenance page allowance.
+                // Training entry counts never become an implicit page-policy default.
+                let pages = self.policy.coalesce_pages_per_step.ok_or_else(||
+                    phase("clustered Coalesce requires the resolved declared maintenance page allowance"))?;
                 self.advance_coalescing(partition, pages)?;
                 return Ok(false);
             }

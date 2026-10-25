@@ -102,7 +102,12 @@ pub(crate) fn set_directory(
     d: Directory,
 ) -> Result<()> {
     let mut raw = [0; 24];
-    for (dst, word) in raw.chunks_exact_mut(8).zip([d.count, d.head, d.tail]) {
+    for (dst, word) in raw
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip([d.count, d.head, d.tail])
+    {
         dst.copy_from_slice(&word.to_le_bytes());
     }
     write(tx, m, PageKind::Directory, 0, directory_offset(list), &raw)

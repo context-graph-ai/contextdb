@@ -59,7 +59,7 @@ impl Version {
         let flags = u64::from(self.current.is_some())
             | u64::from(self.other.is_some()) << 1
             | u64::from(self.deleted) << 2;
-        for (dst, w) in page[at..at + BYTES].chunks_exact_mut(8).zip([
+        for (dst, w) in page[at..at + BYTES].as_chunks_mut::<8>().0.iter_mut().zip([
             self.lsn,
             self.current.map_or(0, |x| x.0),
             self.current.map_or(0, |x| x.1),
