@@ -26143,8 +26143,9 @@ pub(crate) struct ReceivedSchemaPersistenceProjection {
     pub(crate) dropped_row_graph: Vec<contextdb_tx::OwnedAdjEntry>,
     /// The optional SAME public write opened during native received preparation.
     pub(crate) working_write: parking_lot::Mutex<Option<received_working::ReceivedWorkingWrite>>,
-    /// A canonically identical, data-empty received schema carries only
-    /// protocol bookkeeping. It must not reconstruct any logical store image.
+    /// A data-empty received declaration whose row/column projection stays
+    /// unchanged carries metadata and protocol bookkeeping only. It must not
+    /// reconstruct any row, index, graph or vector population.
     pub(crate) schema_noop: bool,
     pub(crate) affected_tables: HashSet<String>,
     pub(crate) replace_graph: bool,
@@ -32906,6 +32907,17 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     as u64,
             );
         }
+        let mut schema = if stage.table_meta.is_empty() {
+            None
+        } else {
+            self.prepare_writer_schema_change(
+                std::iter::empty(),
+                stage
+                    .table_meta
+                    .iter()
+                    .map(|(name, meta)| (name.as_str(), meta)),
+            )?
+        };
         self.with_db(|db| {
             #[cfg(any(test, feature = "test-seams"))]
             let begin_started = std::time::Instant::now();
@@ -32931,6 +32943,27 @@ graph_commit_result }.map_err(Self::storage_error)?;
             );
             let (operational_index_identity_mutations, _operational_commitment_credits) =
                 self.flush_received_schema_operational_rows_in_write(&write_txn, stage)?;
+            if !stage.table_meta.is_empty() {
+                let mut metadata = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (table, meta) in &stage.table_meta {
+                    let encoded = self.schema_update_in_table(
+                        &metadata,
+                        table,
+                        meta,
+                        stage.ddl_log.iter().map(|(_, ddl)| ddl),
+                    )?;
+                    metadata
+                        .insert(Self::meta_key(table).as_str(), encoded.bytes.as_slice())
+                        .map_err(Self::storage_error)?;
+                    Self::raise_table_read_lsn_in_write(
+                        &write_txn,
+                        table,
+                        ws.commit_lsn.unwrap_or(Lsn(0)),
+                    )?;
+                }
+            }
             if !stage.ddl_log.is_empty() {
                 let mut ddl = write_txn
                     .open_table(DDL_LOG_TABLE)
@@ -33011,6 +33044,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 }
             }
             let mut identity_mutations = operational_index_identity_mutations;
+            for (table, meta) in &stage.table_meta {
+                identity_mutations.extend(content_identity::schema_mutations(table, meta)?);
+            }
             for key in &ws.config_deletes {
                 identity_mutations.extend(content_identity::config_mutations(key, None));
             }
@@ -33087,6 +33123,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 #[cfg(any(test, feature = "test-seams"))]
                 graph_observation_checkpoint(10)?;
                 let graph_commit_result = write_txn.commit();
+                if graph_commit_result.is_ok() {
+                    self.complete_writer_schema_change(schema.take());
+                }
                 #[cfg(any(test, feature = "test-seams"))]
                 if graph_commit_result.is_ok() {
                     graph_publication_attempt.committed();
@@ -67812,6 +67851,17 @@ graph_commit_result }.map_err(Self::storage_error)?;
             original_schema_config_values(&stage.config_values, schema_config, config_cut)?
                 .chain(&ws.config_writes),
         )?;
+        let mut schema = if stage.table_meta.is_empty() {
+            None
+        } else {
+            self.prepare_writer_schema_change(
+                std::iter::empty(),
+                stage
+                    .table_meta
+                    .iter()
+                    .map(|(name, meta)| (name.as_str(), meta)),
+            )?
+        };
         self.with_db(|db| {
             #[cfg(any(test, feature = "test-seams"))]
             let begin_started = std::time::Instant::now();
@@ -67842,6 +67892,27 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 .flush_received_schema_operational_rows_in_write_original(
                     &frame, &write_txn, stage,
                 )?;
+            if !stage.table_meta.is_empty() {
+                let mut metadata = write_txn
+                    .open_table(META_TABLE)
+                    .map_err(Self::storage_error)?;
+                for (table, meta) in &stage.table_meta {
+                    let encoded = self.schema_update_in_table(
+                        &metadata,
+                        table,
+                        meta,
+                        stage.ddl_log.iter().map(|(_, ddl)| ddl),
+                    )?;
+                    metadata
+                        .insert(Self::meta_key(table).as_str(), encoded.bytes.as_slice())
+                        .map_err(Self::storage_error)?;
+                    Self::raise_table_read_lsn_in_write(
+                        &write_txn,
+                        table,
+                        ws.commit_lsn.unwrap_or(Lsn(0)),
+                    )?;
+                }
+            }
             if !stage.ddl_log.is_empty() {
                 let mut ddl = write_txn
                     .open_table(DDL_LOG_TABLE)
@@ -67926,6 +67997,11 @@ graph_commit_result }.map_err(Self::storage_error)?;
             }
             let mut identity_mutations =
                 OriginalMutationVector::from_vec(&frame, operational_index_identity_mutations);
+            for (table, meta) in &stage.table_meta {
+                identity_mutations.extend(
+                    content_identity::original_producers::schema_mutations(&frame, table, meta)?,
+                )?;
+            }
             for key in &ws.config_deletes {
                 identity_mutations.extend(
                     content_identity::original_producers::config_mutations(&frame, key, None)?,
@@ -68024,6 +68100,9 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 #[cfg(any(test, feature = "test-seams"))]
                 graph_observation_checkpoint(10)?;
                 let graph_commit_result = write_txn.commit();
+                if graph_commit_result.is_ok() {
+                    self.complete_writer_schema_change(schema.take());
+                }
                 #[cfg(any(test, feature = "test-seams"))]
                 if graph_commit_result.is_ok() {
                     graph_publication_attempt.committed();

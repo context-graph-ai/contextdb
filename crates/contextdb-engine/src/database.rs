@@ -48257,6 +48257,65 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    fn received_schema_unit_changes_only_vector_policy(
+        changes: &ChangeSet,
+        live_tables: &HashMap<String, TableMeta>,
+        owner: &mut contextdb_vector::VectorCopyAdmission,
+    ) -> Result<bool> {
+        for ddl in &changes.ddl {
+            let DdlChange::AlterTable {
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            } = ddl
+            else {
+                return Ok(false);
+            };
+            let Some(old) = live_tables.get(name) else {
+                return Ok(false);
+            };
+            if !sync_column_drops_from_constraints(constraints).is_empty()
+                || !sync_column_renames_from_constraints(constraints).is_empty()
+            {
+                return Ok(false);
+            }
+            let mut scratch = owner.scratch();
+            scratch.reserve(
+                old.estimated_bytes().saturating_mul(8).saturating_add(
+                    columns
+                        .iter()
+                        .map(|(name, ty)| name.len().saturating_add(ty.len()))
+                        .sum::<usize>()
+                        .saturating_mul(8),
+                ),
+            )?;
+            let incoming = rough_sync_table_meta(
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            );
+            let mut next = old.clone();
+            Self::apply_sync_alter_to_projected_table_meta(name, &mut next, incoming, constraints);
+            // The existing exhaustive comparator checks every remaining field.
+            for (before, after) in old.columns.iter().zip(&mut next.columns) {
+                after.hnsw_ef_search = before.hnsw_ef_search;
+            }
+            if !crate::executor::metadata_equal_except_consolidation(old, &next) {
+                return Ok(false);
+            }
+        }
+        Ok(!changes.ddl.is_empty())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn prepare_received_schema_stage_with_delivery(
         &self,
         local_lsn: Lsn,
@@ -48446,7 +48505,17 @@ impl Database {
             "received-unit-vectors",
             changes.vectors.len() as u64,
         );
-        let schema_noop = schema_projection_noop
+        let policy_only = !schema_projection_noop
+            && changes.rows.is_empty()
+            && changes.edges.is_empty()
+            && changes.vectors.is_empty()
+            && delivery_prepare.is_none()
+            && Self::received_schema_unit_changes_only_vector_policy(
+                changes,
+                &live_tables,
+                vector_copy_owner,
+            )?;
+        let schema_noop = (schema_projection_noop || policy_only)
             && changes.rows.is_empty()
             && changes.edges.is_empty()
             && changes.vectors.is_empty()
@@ -48457,6 +48526,53 @@ impl Database {
             // new occurrence still owns its DDL and exact arrival evidence.
             // Keep this path free of row/index/vector replacement work.
             let ddl_append = persistence.ddl_log_replacement.clone();
+            let policy_tables = changes
+                .ddl
+                .iter()
+                .filter_map(Self::ddl_affected_table)
+                .filter(|_| policy_only)
+                .collect::<HashSet<_>>();
+            let old_metadata_bytes = policy_tables
+                .iter()
+                .map(|table| {
+                    retained_table_metadata_bytes(&self.relational_store, &live_tables[*table])
+                })
+                .sum();
+            let new_metadata_bytes = policy_tables
+                .iter()
+                .map(|table| {
+                    retained_table_metadata_bytes(
+                        &self.relational_store,
+                        &side_semantic.tables[*table],
+                    )
+                })
+                .sum();
+            let policy_columns = policy_tables
+                .iter()
+                .map(|table| {
+                    side_semantic.tables[*table]
+                        .columns
+                        .iter()
+                        .filter(|column| matches!(column.column_type, ColumnType::Vector(_)))
+                        .count()
+                })
+                .sum::<usize>();
+            vector_copy_owner.reserve(policy_columns.saturating_mul(std::mem::size_of::<
+                contextdb_vector::PreparedVectorPolicyLayout,
+            >()))?;
+            let mut vector_policy_layouts = Vec::with_capacity(policy_columns);
+            for (index, layout) in vector_layouts_from_meta(&side_semantic.tables) {
+                if !policy_tables.contains(index.table.as_str()) {
+                    continue;
+                }
+                if let Some(prepared) = self.vector_store.prepare_policy_layout_update(
+                    &index,
+                    layout,
+                    vector_copy_owner,
+                )? {
+                    vector_policy_layouts.push(prepared);
+                }
+            }
             let apply_result = ApplyResult {
                 applied_rows: 0,
                 skipped_rows: 0,
@@ -48539,41 +48655,48 @@ impl Database {
                         Some(original) => {
                             crate::memory_accounting::reserve_preparation_from_original(
                                 original,
-                                0,
+                                new_metadata_bytes,
                                 "sync",
                                 "prepare_received_schema_noop",
                                 STAGE_RECEIVED_UNIT_COPY_HINT,
                             )?
                         }
                         None => self.reserve_original_preparation_for(
-                            0,
+                            new_metadata_bytes,
                             "sync",
                             "prepare_received_schema_noop",
                             STAGE_RECEIVED_UNIT_COPY_HINT,
                         )?,
                     };
-                    PreparedMemorySwap::from_original_preparation(&mut original, 0, 0, 0)?
+                    PreparedMemorySwap::from_original_preparation(
+                        &mut original,
+                        old_metadata_bytes,
+                        new_metadata_bytes,
+                        0,
+                    )?
                 }
                 DatabaseTransactionHost::Legacy(_) => PreparedMemorySwap::prepare(
                     crate::memory_accounting::AccountantHandle::clone(
                         &self.finalization.accountant,
                     ),
-                    0,
-                    0,
+                    old_metadata_bytes,
+                    new_metadata_bytes,
                     0,
                 )?,
             };
             let memory_history = if self.persistence.is_none() {
-                Some(self.prepare_memory_history_entries(
-                    persistence
-                        .ddl_log_replacement
-                        .iter()
-                        .map(|(lsn, change)| (*lsn, change)),
-                    mirrors
-                        .ddl_generations
-                        .iter()
-                        .map(|(key, (table, generation))| (*key, (table, *generation))),
-                )?)
+                Some(
+                    self.prepare_memory_history_entries(
+                        persistence
+                            .ddl_log_replacement
+                            .iter()
+                            .map(|(lsn, change)| (*lsn, change)),
+                        mirrors
+                            .ddl_generations
+                            .iter()
+                            .map(|(key, (table, generation))| (*key, (table, *generation))),
+                    )?,
+                )
             } else {
                 None
             };
@@ -48603,7 +48726,7 @@ impl Database {
                 dag_edge_types: None,
                 rank_formulas: None,
                 vector: None,
-                vector_policy_layouts: Vec::new(),
+                vector_policy_layouts,
                 vector_policy_tables: HashSet::new(),
                 event_bus: None,
                 queue_mutation_lease: None,
@@ -48644,7 +48767,12 @@ impl Database {
                         STAGE_RECEIVED_UNIT_COPY_HINT,
                     ),
                     retired_vector_construction: Mutex::new(Vec::new()),
-                    table_meta: HashMap::new(),
+                    table_meta: side_semantic
+                        .tables
+                        .iter()
+                        .filter(|(table, _)| policy_tables.contains(table.as_str()))
+                        .map(|(table, meta)| (table.clone(), meta.clone()))
+                        .collect(),
                     row_changed_tables: HashSet::new(),
                     authored_pending_rows: Vec::new(),
                     rows: HashMap::new(),
@@ -51074,6 +51202,15 @@ impl Database {
                     );
                 }
                 manifests.manifests.insert(key.clone(), manifest.clone());
+            }
+        }
+        if stage.durable_projection.schema_noop {
+            let mut metadata = self.relational_store.table_meta.write();
+            for (table, replacement) in std::mem::take(&mut stage.durable_projection.table_meta) {
+                let current = metadata
+                    .get_mut(&table)
+                    .expect("validated received policy table");
+                *current = replacement;
             }
         }
         self.relational_store

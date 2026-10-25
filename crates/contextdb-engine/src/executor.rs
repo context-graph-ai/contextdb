@@ -5286,7 +5286,7 @@ fn metadata_equal_except_ef_search(old: &TableMeta, new: &TableMeta) -> bool {
     metadata_equal_by_column(old, new, column_equal_except_ef_search)
 }
 
-fn metadata_equal_except_consolidation(old: &TableMeta, new: &TableMeta) -> bool {
+pub(crate) fn metadata_equal_except_consolidation(old: &TableMeta, new: &TableMeta) -> bool {
     metadata_equal_by_column(old, new, column_equal_except_consolidation)
 }
 
