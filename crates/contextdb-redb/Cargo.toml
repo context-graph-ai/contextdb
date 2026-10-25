@@ -105,3 +105,8 @@ required-features = ["contextdb-internal"]
 [[test]]
 name = "scan_working_set_stays_cached"
 path = "tests/scan_working_set_stays_cached.rs"
+
+[[test]]
+name = "cache_residency"
+path = "tests/cache_residency.rs"
+required-features = ["contextdb-internal"]

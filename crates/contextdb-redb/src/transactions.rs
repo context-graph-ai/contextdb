@@ -5247,6 +5247,12 @@ impl std::fmt::Debug for NativeReadView {
 }
 #[cfg(feature = "contextdb-internal")]
 impl NativeReadView {
+    /// See [`crate::ReadOnlyDatabase::read_cache_resident_fraction`].
+    /// This production estimate does not require native admission or load pages.
+    pub fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
+        self.mem.read_cache_resident_fraction(page_ids)
+    }
+
     pub(crate) fn new(
         mem: Arc<TransactionalMemory>,
         root: Option<BtreeHeader>,

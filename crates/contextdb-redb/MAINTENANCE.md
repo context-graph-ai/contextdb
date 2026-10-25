@@ -1055,3 +1055,25 @@ its assertions and test bodies are unchanged.
 |---|---|
 | `src/atomic_compat.rs` (added), `src/lib.rs`, `src/db.rs`, `src/read_admission.rs`, `src/native_storage_admission.rs`, `src/tree_store/page_store/page_allocation.rs` | Preserve conditional atomic update semantics on the minimum supported Rust version, preserve typed error custody and actual allocation-pointer provenance, and remove unused private construction methods. |
 | `src/transaction_tracker.rs`, `src/transactions.rs`, `src/tree_store/{bounded_bytes,btree,table_tree,random_state_override}.rs`, `src/tree_store/page_store/{allocator_pager,cache_owner_contract_rows,cached_file,lru_cache,page_manager}.rs` | Equivalent fixed-array iteration, const-safe invariants, explicit absent-versus-empty root semantics, allocation-free observer capability requirements, feature-accurate passive accessors, and source formatting. |
+
+
+## Advisory shared-read-cache residency
+
+With `contextdb-internal`, `NativeReadView`, `ReadOnlyDatabase`, and `Database`
+expose `read_cache_resident_fraction(&[[u8; 8]]) -> f64`. Inputs are the existing
+opaque eight-byte page identifiers from root identities or table-root headers.
+Each identifier contributes one observation, including repeated identifiers;
+invalid identifiers count as absent and empty input returns zero. The fraction is
+an advisory observation under concurrent reads and eviction, never a snapshot
+validity check. Only shared read-cache entries count, excluding dirty write cells
+and detached holders.
+
+The observer performs one indexed lookup per requested identifier, holding only
+that cache stripe and entry's read locks. It allocates nothing, performs no I/O,
+and leaves the CLOCK second-chance bit unchanged. Native root/page admission is
+not required to inspect this existing state. No cache capacity, page invoice,
+route default, or persisted format changes.
+
+| Changed source | Reason |
+|---|---|
+| `src/db.rs`, `src/transactions.rs`, `src/tree_store/page_store/{page_manager,cached_file,lru_cache}.rs` | Production planner access to an allocation-free per-page residency estimate; validate opaque page geometry and inspect exact cached extents without changing eviction priority. |

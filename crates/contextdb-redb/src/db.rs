@@ -694,6 +694,21 @@ impl ReadableDatabase for ReadOnlyDatabase {
 }
 
 impl ReadOnlyDatabase {
+    /// Fraction of the supplied opaque page identifiers currently in the shared read cache.
+    /// Identifiers use the existing eight-byte root-page encoding. Each supplied
+    /// identifier contributes one observation; invalid identifiers count as absent,
+    /// and an empty input returns zero. This advisory observation may change during
+    /// concurrent reads/eviction and cannot establish snapshot validity.
+    ///
+    /// Performs one indexed lookup per identifier, locks only its stripe, allocates
+    /// nothing, performs no I/O, and does not change eviction priority. Dirty write
+    /// pages and detached page holders are not entries in the shared read cache.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
+        self.mem.read_cache_resident_fraction(page_ids)
+    }
+
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn write_control_for_test(&self) -> crate::CacheWriteControlForTest {
@@ -1358,6 +1373,21 @@ impl Database {
     pub fn reader_registry_charge_for_test(&self, accountant: usize) -> usize {
         self.transaction_tracker
             .reader_registry_charge_for_test(accountant)
+    }
+
+    /// Fraction of the supplied opaque page identifiers currently in the shared read cache.
+    /// Identifiers use the existing eight-byte root-page encoding. Each supplied
+    /// identifier contributes one observation; invalid identifiers count as absent,
+    /// and an empty input returns zero. This advisory observation may change during
+    /// concurrent reads/eviction and cannot establish snapshot validity.
+    ///
+    /// Performs one indexed lookup per identifier, locks only its stripe, allocates
+    /// nothing, performs no I/O, and does not change eviction priority. Dirty write
+    /// pages and detached page holders are not entries in the shared read cache.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
+        self.mem.read_cache_resident_fraction(page_ids)
     }
 
     #[cfg(feature = "test-seams")]

@@ -803,6 +803,53 @@ impl TransactionalMemory {
         self.storage.stripe_control_bytes()
     }
 
+    #[cfg(feature = "contextdb-internal")]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "An advisory fraction permits rounding for very large input slices."
+    )]
+    pub(crate) fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
+        if page_ids.is_empty() {
+            return 0.0;
+        }
+        let resident = page_ids
+            .iter()
+            .filter(|id| {
+                let Some(page) = PageNumber::validated_from_le_bytes(**id) else {
+                    return false;
+                };
+                if page.to_le_bytes() != **id {
+                    return false;
+                }
+                let len = page.page_size_bytes(self.page_size);
+                let Some(regional_start) = u64::from(page.page_index)
+                    .checked_mul(len)
+                    .and_then(|offset| offset.checked_add(self.region_header_with_padding_size))
+                else {
+                    return false;
+                };
+                if regional_start
+                    .checked_add(len)
+                    .is_none_or(|end| end > self.region_size)
+                {
+                    return false;
+                }
+                let Some(offset) = u64::from(page.region)
+                    .checked_mul(self.region_size)
+                    .and_then(|offset| offset.checked_add(u64::from(self.page_size)))
+                    .and_then(|offset| offset.checked_add(regional_start))
+                else {
+                    return false;
+                };
+                let Ok(len) = usize::try_from(len) else {
+                    return false;
+                };
+                self.storage.read_cache_contains(offset, len)
+            })
+            .count();
+        resident as f64 / page_ids.len() as f64
+    }
+
     pub(crate) fn cache_stats(&self) -> CacheStats {
         self.storage.cache_stats()
     }

@@ -285,6 +285,13 @@ impl<T> LRUCache<T> {
         Some(value)
     }
 
+    /// Inspect an entry without giving it a second eviction chance.
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn peek(&self, key: u64) -> Option<ValueRef<'_, T>> {
+        let entry = &self.arena.entries[self.find(key)? as usize];
+        Some(ValueRef(entry.value.read().unwrap()))
+    }
+
     pub(crate) fn get(&self, key: u64) -> Option<ValueRef<'_, T>> {
         let entry = &self.arena.entries[self.find(key)? as usize];
         entry.second_chance.store(true, Ordering::Release);
@@ -948,5 +955,19 @@ pub(crate) mod arena_index_tests {
                 *self = Self::new();
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "contextdb-internal"))]
+mod residency_tests {
+    #[test]
+    fn residency_peek_preserves_the_clock_victim() {
+        let mut cache = super::LRUCache::new(super::EntryArena::new(2), 8);
+        assert_eq!(cache.insert(1, 10), None);
+        assert_eq!(cache.insert(2, 20), None);
+        assert_eq!(cache.peek(1).as_deref(), Some(&10));
+        assert!(cache.peek(3).is_none());
+        assert_eq!(cache.pop_lowest_priority(), Some((1, 10)));
+        assert_eq!(cache.pop_lowest_priority(), Some((2, 20)));
     }
 }

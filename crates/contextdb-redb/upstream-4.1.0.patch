@@ -772,10 +772,25 @@
              return;
          }
          if let Some(transaction_id) = self.transaction_id {
-@@ -419,9 +694,252 @@
+@@ -419,9 +694,267 @@
  }
  
  impl ReadOnlyDatabase {
++    /// Fraction of the supplied opaque page identifiers currently in the shared read cache.
++    /// Identifiers use the existing eight-byte root-page encoding. Each supplied
++    /// identifier contributes one observation; invalid identifiers count as absent,
++    /// and an empty input returns zero. This advisory observation may change during
++    /// concurrent reads/eviction and cannot establish snapshot validity.
++    ///
++    /// Performs one indexed lookup per identifier, locks only its stripe, allocates
++    /// nothing, performs no I/O, and does not change eviction priority. Dirty write
++    /// pages and detached page holders are not entries in the shared read cache.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
++        self.mem.read_cache_resident_fraction(page_ids)
++    }
++
 +    #[cfg(feature = "test-seams")]
 +    #[doc(hidden)]
 +    pub fn write_control_for_test(&self) -> crate::CacheWriteControlForTest {
@@ -1025,7 +1040,7 @@
      }
  
      fn new(
-@@ -429,6 +947,17 @@
+@@ -429,6 +962,17 @@
          page_size: usize,
          region_size: Option<u64>,
          cache_size: usize,
@@ -1043,7 +1058,7 @@
      ) -> Result<Self, DatabaseError> {
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
-@@ -441,21 +970,26 @@
+@@ -441,21 +985,26 @@
              region_size,
              cache_size,
              true,
@@ -1083,7 +1098,7 @@
          let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
          let db = Self {
              mem,
-@@ -464,6 +998,303 @@
+@@ -464,6 +1013,303 @@
  
          Ok(db)
      }
@@ -1387,7 +1402,7 @@
  }
  
  /// Opened redb database file
-@@ -502,6 +1333,9 @@
+@@ -502,6 +1348,9 @@
  pub struct Database {
      mem: Arc<TransactionalMemory>,
      transaction_tracker: Arc<TransactionTracker>,
@@ -1397,7 +1412,7 @@
  }
  
  impl ReadableDatabase for Database {
-@@ -518,6 +1352,150 @@
+@@ -518,6 +1367,165 @@
  }
  
  impl Database {
@@ -1407,6 +1422,21 @@
 +    pub fn reader_registry_charge_for_test(&self, accountant: usize) -> usize {
 +        self.transaction_tracker
 +            .reader_registry_charge_for_test(accountant)
++    }
++
++    /// Fraction of the supplied opaque page identifiers currently in the shared read cache.
++    /// Identifiers use the existing eight-byte root-page encoding. Each supplied
++    /// identifier contributes one observation; invalid identifiers count as absent,
++    /// and an empty input returns zero. This advisory observation may change during
++    /// concurrent reads/eviction and cannot establish snapshot validity.
++    ///
++    /// Performs one indexed lookup per identifier, locks only its stripe, allocates
++    /// nothing, performs no I/O, and does not change eviction priority. Dirty write
++    /// pages and detached page holders are not entries in the shared read cache.
++    #[cfg(feature = "contextdb-internal")]
++    #[doc(hidden)]
++    pub fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
++        self.mem.read_cache_resident_fraction(page_ids)
 +    }
 +
 +    #[cfg(feature = "test-seams")]
@@ -1548,7 +1578,7 @@
      /// Opens the specified file as a redb database.
      /// * if the file does not exist, or is an empty file, a new database will be initialized in it
      /// * if the file is a valid redb database, it will be opened
-@@ -571,9 +1549,17 @@
+@@ -571,9 +1579,17 @@
      /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
      /// alive when this method is called.
      pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
@@ -1567,7 +1597,7 @@
  
          let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
  
-@@ -619,6 +1605,7 @@
+@@ -619,6 +1635,7 @@
          // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
          // can cancel the compaction without requiring a full repair afterwards
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1575,7 +1605,7 @@
          if txn.list_persistent_savepoints()?.next().is_some() {
              return Err(CompactionError::PersistentSavepointExists);
          }
-@@ -629,6 +1616,7 @@
+@@ -629,6 +1646,7 @@
          txn.commit().map_err(|e| e.into_storage_error())?;
          // Repeat, just in case executing list_persistent_savepoints() created a new table
          let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1583,7 +1613,7 @@
          txn.set_two_phase_commit(true);
          txn.commit().map_err(|e| e.into_storage_error())?;
          // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-@@ -643,6 +1631,7 @@
+@@ -643,6 +1661,7 @@
              let mut progress = false;
  
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1591,7 +1621,7 @@
              if txn.compact_pages()? {
                  progress = true;
                  txn.commit().map_err(|e| e.into_storage_error())?;
-@@ -652,6 +1641,7 @@
+@@ -652,6 +1671,7 @@
  
              // Double commit to free up the relocated pages for reuse
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1599,7 +1629,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -660,6 +1650,7 @@
+@@ -660,6 +1680,7 @@
              // TODO: this really shouldn't be necessary, but the data freed tree is a system table
              // and so free'ing up its pages causes more deletes from the system tree
              let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
@@ -1607,7 +1637,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -676,6 +1667,310 @@
+@@ -676,6 +1697,310 @@
          }
  
          Ok(compacted)
@@ -1918,7 +1948,7 @@
      }
  
      #[cfg_attr(not(debug_assertions), expect(dead_code))]
-@@ -891,14 +2186,19 @@
+@@ -891,14 +2216,19 @@
          Ok([data_root, system_root])
      }
  
@@ -1939,7 +1969,7 @@
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
          #[cfg(feature = "logging")]
-@@ -910,6 +2210,8 @@
+@@ -910,6 +2240,8 @@
              region_size,
              cache_size,
              false,
@@ -1948,7 +1978,7 @@
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +2221,12 @@
+@@ -919,7 +2251,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -1962,7 +1992,7 @@
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,8 +2251,21 @@
+@@ -944,8 +2281,21 @@
  
          let db = Database {
              mem,
@@ -1985,7 +2015,7 @@
  
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
-@@ -1035,16 +2355,35 @@
+@@ -1035,16 +2385,35 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -2021,7 +2051,7 @@
      fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
          // Make a new quick-repair commit to update the allocator state table
          #[cfg(feature = "logging")]
-@@ -1056,16 +2395,183 @@
+@@ -1056,16 +2425,183 @@
  
          Ok(())
      }
@@ -2207,7 +2237,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +2612,8 @@
+@@ -1106,6 +2642,8 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -2216,7 +2246,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +2633,8 @@
+@@ -1125,6 +2663,8 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -2225,7 +2255,7 @@
          }
      }
  
-@@ -1157,13 +2667,37 @@
+@@ -1157,13 +2697,37 @@
          self
      }
  
@@ -2264,7 +2294,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +2709,7 @@
+@@ -1175,6 +2739,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -2272,7 +2302,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +2718,75 @@
+@@ -1183,26 +2748,75 @@
              .open(path)?;
  
          Database::new(
@@ -2350,7 +2380,7 @@
          )
      }
  
-@@ -1222,6 +2806,58 @@
+@@ -1222,6 +2836,58 @@
              self.page_size,
              None,
              self.cache_size,
@@ -2409,7 +2439,7 @@
          )
      }
  
-@@ -1236,6 +2872,70 @@
+@@ -1236,6 +2902,70 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2480,7 +2510,7 @@
          )
      }
  
-@@ -1251,6 +2951,9 @@
+@@ -1251,6 +2981,9 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2490,7 +2520,7 @@
          )
      }
  }
-@@ -1262,16 +2965,214 @@
+@@ -1262,16 +2995,214 @@
  }
  
  #[cfg(test)]
@@ -2707,7 +2737,7 @@
  
      #[derive(Debug)]
      struct FailingBackend {
-@@ -1298,7 +3199,7 @@
+@@ -1298,7 +3229,7 @@
          fn decrement_countdown(&self) -> Result<(), std::io::Error> {
              if self
                  .countdown
@@ -8606,7 +8636,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +4228,1138 @@
+@@ -2284,4 +4228,1144 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -9630,6 +9660,12 @@
 +}
 +#[cfg(feature = "contextdb-internal")]
 +impl NativeReadView {
++    /// See [`crate::ReadOnlyDatabase::read_cache_resident_fraction`].
++    /// This production estimate does not require native admission or load pages.
++    pub fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
++        self.mem.read_cache_resident_fraction(page_ids)
++    }
++
 +    pub(crate) fn new(
 +        mem: Arc<TransactionalMemory>,
 +        root: Option<BtreeHeader>,
@@ -16641,7 +16677,7 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -266,8 +535,105 @@
+@@ -266,8 +535,115 @@
              #[cfg(feature = "cache_metrics")]
              evictions: Default::default(),
              read_cache,
@@ -16745,10 +16781,20 @@
 +            + read.arena_index_bytes()
 +            + read.index_bytes() * self.read_cache.len()
 +            + self.read_cache.len() * size_of::<RwLock<LRUCache<PageAllocation>>>()
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    pub(crate) fn read_cache_contains(&self, offset: u64, len: usize) -> bool {
++        let stripe = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
++        self.read_cache[stripe]
++            .read()
++            .unwrap()
++            .peek(offset)
++            .is_some_and(|page| page.len() == len)
      }
  
      #[allow(clippy::unused_self)]
-@@ -303,6 +669,55 @@
+@@ -303,6 +679,55 @@
          }
      }
  
@@ -16804,7 +16850,7 @@
      pub(crate) fn close(&self) -> Result {
          self.file.close()
      }
-@@ -329,27 +744,43 @@
+@@ -329,27 +754,43 @@
          bytes_needed: usize,
          _write_lock: &MutexGuard<'_, LRUWriteCache>,
      ) {
@@ -16852,7 +16898,7 @@
          }
      }
  
-@@ -364,25 +795,49 @@
+@@ -364,25 +805,49 @@
          // drained, so the total check only considers the read cache size.
          for (offset, buffer) in write_buffer.cache.iter_mut() {
              let buffer = buffer.take().unwrap();
@@ -16914,7 +16960,7 @@
          write_buffer.clear();
  
          Ok(())
-@@ -390,10 +845,28 @@
+@@ -390,10 +855,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -16945,7 +16991,7 @@
      }
  
      pub(super) fn flush(&self) -> Result {
-@@ -409,6 +882,20 @@
+@@ -409,6 +892,20 @@
          self.flush_write_buffer()
      }
  
@@ -16966,7 +17012,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +903,28 @@
+@@ -416,18 +913,28 @@
          Ok(buffer)
      }
  
@@ -17003,7 +17049,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +935,7 @@
+@@ -438,7 +945,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17012,7 +17058,7 @@
              }
          }
  
-@@ -449,54 +946,141 @@
+@@ -449,54 +956,141 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17194,7 +17240,7 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1091,172 @@
+@@ -507,104 +1101,172 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -17453,7 +17499,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1266,383 @@
+@@ -614,13 +1276,383 @@
  }
  
  #[cfg(test)]
@@ -17839,7 +17885,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1675,840 @@
+@@ -653,4 +1685,840 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
@@ -18909,7 +18955,7 @@
  
 --- a/src/tree_store/page_store/lru_cache.rs
 +++ b/src/tree_store/page_store/lru_cache.rs
-@@ -1,19 +1,397 @@
+@@ -1,19 +1,404 @@
 +use super::page_allocation::{CacheShared, cache_array_prepaid};
  use crate::tree_store::page_store::fast_hash::FastHashMapU64;
 -use std::collections::VecDeque;
@@ -19204,6 +19250,13 @@
 +        Some(value)
 +    }
 +
++    /// Inspect an entry without giving it a second eviction chance.
++    #[cfg(feature = "contextdb-internal")]
++    pub(crate) fn peek(&self, key: u64) -> Option<ValueRef<'_, T>> {
++        let entry = &self.arena.entries[self.find(key)? as usize];
++        Some(ValueRef(entry.value.read().unwrap()))
++    }
++
 +    pub(crate) fn get(&self, key: u64) -> Option<ValueRef<'_, T>> {
 +        let entry = &self.arena.entries[self.find(key)? as usize];
 +        entry.second_chance.store(true, Ordering::Release);
@@ -19315,7 +19368,7 @@
          }
      }
  
-@@ -21,83 +399,554 @@
+@@ -21,83 +406,568 @@
          self.cache.len()
      }
  
@@ -19940,6 +19993,20 @@
 +                *self = Self::new();
 +            }
 +        }
++    }
++}
++
++#[cfg(all(test, feature = "contextdb-internal"))]
++mod residency_tests {
++    #[test]
++    fn residency_peek_preserves_the_clock_victim() {
++        let mut cache = super::LRUCache::new(super::EntryArena::new(2), 8);
++        assert_eq!(cache.insert(1, 10), None);
++        assert_eq!(cache.insert(2, 20), None);
++        assert_eq!(cache.peek(1).as_deref(), Some(&10));
++        assert!(cache.peek(3).is_none());
++        assert_eq!(cache.pop_lowest_priority(), Some((1, 10)));
++        assert_eq!(cache.pop_lowest_priority(), Some((2, 20)));
 +    }
 +}
 --- a/src/tree_store/page_store/mod.rs
@@ -21358,7 +21425,7 @@
              storage,
              state: Mutex::new(state),
              #[cfg(debug_assertions)]
-@@ -277,7 +761,46 @@
+@@ -277,7 +761,93 @@
              page_size: page_size.try_into().unwrap(),
              region_size,
              region_header_with_padding_size: region_header_size,
@@ -21402,10 +21469,57 @@
 +
 +    pub(crate) fn cache_stripe_control_bytes(&self) -> usize {
 +        self.storage.stripe_control_bytes()
++    }
++
++    #[cfg(feature = "contextdb-internal")]
++    #[allow(
++        clippy::cast_precision_loss,
++        reason = "An advisory fraction permits rounding for very large input slices."
++    )]
++    pub(crate) fn read_cache_resident_fraction(&self, page_ids: &[[u8; 8]]) -> f64 {
++        if page_ids.is_empty() {
++            return 0.0;
++        }
++        let resident = page_ids
++            .iter()
++            .filter(|id| {
++                let Some(page) = PageNumber::validated_from_le_bytes(**id) else {
++                    return false;
++                };
++                if page.to_le_bytes() != **id {
++                    return false;
++                }
++                let len = page.page_size_bytes(self.page_size);
++                let Some(regional_start) = u64::from(page.page_index)
++                    .checked_mul(len)
++                    .and_then(|offset| offset.checked_add(self.region_header_with_padding_size))
++                else {
++                    return false;
++                };
++                if regional_start
++                    .checked_add(len)
++                    .is_none_or(|end| end > self.region_size)
++                {
++                    return false;
++                }
++                let Some(offset) = u64::from(page.region)
++                    .checked_mul(self.region_size)
++                    .and_then(|offset| offset.checked_add(u64::from(self.page_size)))
++                    .and_then(|offset| offset.checked_add(regional_start))
++                else {
++                    return false;
++                };
++                let Ok(len) = usize::try_from(len) else {
++                    return false;
++                };
++                self.storage.read_cache_contains(offset, len)
++            })
++            .count();
++        resident as f64 / page_ids.len() as f64
      }
  
      pub(crate) fn cache_stats(&self) -> CacheStats {
-@@ -285,7 +808,52 @@
+@@ -285,7 +855,52 @@
      }
  
      pub(crate) fn check_io_errors(&self) -> Result {
@@ -21458,7 +21572,7 @@
      }
  
      #[cfg(debug_assertions)]
-@@ -295,23 +863,30 @@
+@@ -295,23 +910,30 @@
  
      #[cfg(debug_assertions)]
      pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
@@ -21495,7 +21609,7 @@
          }
      }
  
-@@ -346,7 +921,9 @@
+@@ -346,7 +968,9 @@
  
          self.needs_recovery
              .store(header.recovery_required, Ordering::Release);
@@ -21506,7 +21620,7 @@
  
          Ok(was_clean)
      }
-@@ -363,6 +940,44 @@
+@@ -363,6 +987,44 @@
          self.state.lock().unwrap().header.two_phase_commit
      }
  
@@ -21551,7 +21665,7 @@
      pub(crate) fn allocator_hash(&self) -> u128 {
          self.state.lock().unwrap().allocators.xxh3_hash()
      }
-@@ -379,7 +994,8 @@
+@@ -379,7 +1041,8 @@
  
      pub(crate) fn begin_repair(&self) -> Result<()> {
          let mut state = self.state.lock().unwrap();
@@ -21561,7 +21675,7 @@
          #[cfg(debug_assertions)]
          self.allocated_pages.lock().unwrap().clear();
  
-@@ -392,20 +1008,42 @@
+@@ -392,20 +1055,42 @@
          let allocator = state.get_region_mut(region_index);
          allocator.record_alloc(page_number.page_index, page_number.page_order);
          #[cfg(debug_assertions)]
@@ -21605,7 +21719,7 @@
          state.header.recovery_required = false;
          self.write_header(&state.header)?;
          let result = self.storage.flush();
-@@ -419,30 +1057,37 @@
+@@ -419,30 +1104,37 @@
          tree: &mut AllocatorStateTreeMut,
          transaction_id: TransactionId,
      ) -> Result<u32> {
@@ -21661,7 +21775,7 @@
  
          tree.insert(
              &AllocatorStateKey::TransactionId,
-@@ -458,43 +1103,83 @@
+@@ -458,43 +1150,83 @@
          tree: &mut AllocatorStateTreeMut,
          num_regions: u32,
      ) -> Result<bool> {
@@ -21771,7 +21885,7 @@
          Ok(true)
      }
  
-@@ -516,15 +1201,216 @@
+@@ -516,15 +1248,216 @@
          Ok(transaction_id == self.get_last_committed_transaction_id()?)
      }
  
@@ -21990,7 +22104,7 @@
          }
  
          let region_tracker = RegionTracker::from_bytes(
-@@ -533,15 +1419,19 @@
+@@ -533,15 +1466,19 @@
                  .value(),
          );
  
@@ -22012,7 +22126,7 @@
          drop(state);
  
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -554,8 +1444,15 @@
+@@ -554,8 +1491,15 @@
      pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
          #[cfg(debug_assertions)]
          {
@@ -22030,7 +22144,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -586,6 +1483,32 @@
+@@ -586,6 +1530,32 @@
          result
      }
  
@@ -22063,7 +22177,7 @@
      #[allow(clippy::too_many_arguments)]
      fn commit_inner(
          &self,
-@@ -612,7 +1535,13 @@
+@@ -612,7 +1582,13 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
@@ -22078,7 +22192,7 @@
          let old_transaction_id = header.secondary_slot().transaction_id;
          let secondary = header.secondary_slot_mut();
          secondary.transaction_id = transaction_id;
-@@ -658,6 +1587,101 @@
+@@ -658,6 +1634,101 @@
          );
          state.header = header;
          self.read_from_secondary.store(false, Ordering::Release);
@@ -22180,7 +22294,7 @@
          // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
          // TODO: maybe we can remove the whole read_from_secondary flag?
          drop(state);
-@@ -678,6 +1702,7 @@
+@@ -678,6 +1749,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -22188,7 +22302,7 @@
  
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -725,8 +1750,11 @@
+@@ -725,8 +1797,11 @@
              state
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
@@ -22201,7 +22315,7 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -751,6 +1779,10 @@
+@@ -751,6 +1826,10 @@
              self.region_header_with_padding_size,
              self.page_size,
          );
@@ -22212,7 +22326,7 @@
          let len: usize = (range.end - range.start).try_into().unwrap();
          let mem = self.storage.read(range.start, len, hint)?;
  
-@@ -776,6 +1808,31 @@
+@@ -776,6 +1855,31 @@
          })
      }
  
@@ -22244,7 +22358,7 @@
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
      pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
          #[cfg(debug_assertions)]
-@@ -824,6 +1881,44 @@
+@@ -824,6 +1928,44 @@
          }
      }
  
@@ -22289,7 +22403,7 @@
      pub(crate) fn get_data_root(&self) -> Option<BtreeHeader> {
          let state = self.state.lock().unwrap();
          if self.read_from_secondary.load(Ordering::Acquire) {
-@@ -871,7 +1966,9 @@
+@@ -871,7 +2013,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -22300,7 +22414,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -881,6 +1978,7 @@
+@@ -881,6 +2025,7 @@
          state
              .get_region_mut(region_index)
              .free(page.page_index, page.page_order);
@@ -22308,7 +22422,7 @@
          // Ensure that the region is marked as having free space
          state
              .get_region_tracker_mut()
-@@ -953,12 +2051,32 @@
+@@ -953,12 +2098,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -22343,7 +22457,7 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -1024,7 +2142,28 @@
+@@ -1024,7 +2189,28 @@
              } else {
                  region.alloc(required_order)
              };
@@ -22372,7 +22486,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +2200,7 @@
+@@ -1061,7 +2247,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -22381,7 +22495,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1093,27 +2232,52 @@
+@@ -1093,27 +2279,52 @@
                  layout.usable_bytes() + required_growth * 2,
              )
          };
@@ -22446,7 +22560,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1123,7 +2287,12 @@
+@@ -1123,7 +2334,12 @@
          allocation_size: usize,
          allocated: &mut PageTrackerPolicy,
      ) -> Result<PageMut<'txn>> {
@@ -22460,7 +22574,7 @@
          if let Ok(ref page) = result {
              allocated.insert(page.get_page_number());
          }
-@@ -1135,7 +2304,7 @@
+@@ -1135,7 +2351,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -22469,7 +22583,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +2314,7 @@
+@@ -1145,7 +2361,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -22478,7 +22592,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +2327,41 @@
+@@ -1158,8 +2374,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -22521,7 +22635,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +2430,467 @@
+@@ -1228,4 +2477,467 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }

@@ -636,6 +636,16 @@ impl PagedCachedFile {
             + self.read_cache.len() * size_of::<RwLock<LRUCache<PageAllocation>>>()
     }
 
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn read_cache_contains(&self, offset: u64, len: usize) -> bool {
+        let stripe = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
+        self.read_cache[stripe]
+            .read()
+            .unwrap()
+            .peek(offset)
+            .is_some_and(|page| page.len() == len)
+    }
+
     #[allow(clippy::unused_self)]
     pub(crate) fn cache_stats(&self) -> CacheStats {
         #[cfg(not(feature = "cache_metrics"))]
