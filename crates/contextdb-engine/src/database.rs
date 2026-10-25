@@ -7573,6 +7573,8 @@ mod received_schema_stage_tests {
                 .contains_key(&matching_marker_key)
         );
     }
+
+    include!("database/authored_occurrence_delivery_tests.rs");
 }
 
 #[cfg(test)]
