@@ -273,3 +273,6 @@ mod primitive_work_support;
 mod saved_search_and_append_work_ceiling;
 #[path = "engine_seams/every_writer_checkpoint_names_every_charged_byte.rs"]
 mod every_writer_checkpoint_names_every_charged_byte;
+
+#[path = "engine_seams/a_census_sample_is_one_coherent_observation.rs"]
+mod a_census_sample_is_one_coherent_observation;
