@@ -829,6 +829,11 @@ required-features = ["test-seams", "iroh"]
 name = "exact_vector_cursor_releases_only_its_reader_credit"
 path = "tests/exact_vector_cursor_releases_only_its_reader_credit.rs"
 
+[[test]]
+name = "clustered_vector_index"
+path = "tests/clustered_vector_index.rs"
+required-features = ["test-seams"]
+
 [[bin]]
 name = "memory-census"
 path = "src/bin/memory-census.rs"
