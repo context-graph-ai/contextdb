@@ -99,6 +99,9 @@ fn a_maintenance_step_planted_inside_census_collection_waits_until_the_sample_is
         .expect("the collection hook fired and planted one maintenance step");
     let report = step.join().expect("planted maintenance step");
     let first = observed.lock().unwrap().take();
+    let accountant_total = sample.vector.accountant_total;
+    let named_owner_total = sample.named_owner_total;
+    let reconciliation_gap = sample.reconciliation_gap;
 
     assert_eq!(
         first,
@@ -106,7 +109,9 @@ fn a_maintenance_step_planted_inside_census_collection_waits_until_the_sample_is
         "the maintenance step planted inside census collection must first find the \
          sample's maintenance exclusion held (CommitLockHeld: it met only the commit lock; \
          Finished: nothing held it off; None: it reported neither contention nor completion \
-         within the failsafe)"
+         within the failsafe); that sample: writer accountant total {accountant_total}, \
+         named writer owners {named_owner_total}, reconciliation gap {reconciliation_gap}, \
+         step finished inside the sample {finished_inside_sample}"
     );
     assert!(
         !finished_inside_sample,
