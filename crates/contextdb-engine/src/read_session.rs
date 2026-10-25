@@ -5775,6 +5775,7 @@ impl OwnerCursorContinuation {
                     cancellation,
                 )
                 .map_err(|error| direct_error(&self.path, error))?;
+            let admitted_memory = reader.admitted_memory();
             let (opened, examined, open_observation) =
                 crate::executor::bounded::with_cursor_open_work(|| {
                     reader.open_cursor_with_cancellation(
@@ -5808,6 +5809,8 @@ impl OwnerCursorContinuation {
                 }
             };
             let mut first_page = ObservedCursorPage::from(opened.first_page);
+            self.config.limits.memory = admitted_memory;
+            self.config.memory_limit = Some(usize::try_from(admitted_memory).unwrap_or(usize::MAX));
             self.cursor = Some(opened.cursor);
             if self.delivered == 0 {
                 return Ok(first_page);
@@ -6069,6 +6072,14 @@ impl OwnerCursorExecution {
 }
 
 impl OwnedCursorExecution for OwnerCursorExecution {
+    #[cfg(any(test, feature = "test-seams"))]
+    fn continued_file_limits_for_test(&self) -> Option<(Option<usize>, ReadLimits)> {
+        self.continuation
+            .as_ref()
+            .filter(|continuation| continuation.cursor.is_some())
+            .map(|continuation| (continuation.config.memory_limit, continuation.config.limits))
+    }
+
     fn refuse_expiry_watch(&mut self, error: Error) {
         if self.closed {
             return;
@@ -6441,6 +6452,11 @@ type CursorExpiryWatch = (
 );
 
 trait OwnedCursorExecution: Send {
+    #[cfg(any(test, feature = "test-seams"))]
+    fn continued_file_limits_for_test(&self) -> Option<(Option<usize>, ReadLimits)> {
+        None
+    }
+
     fn take_work_trace_charge(&mut self) -> Option<Arc<OwnerTraceCharge>> {
         None
     }
@@ -6702,6 +6718,17 @@ impl Drop for OwnerCursorExecution {
 }
 
 impl ReadCursor {
+    /// Inspect the limits actually admitted by this cursor's lazy file reader.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn continued_file_limits_for_test(&self) -> Option<(Option<usize>, ReadLimits)> {
+        self.state
+            .execution
+            .lock()
+            .expect("read cursor state")
+            .continued_file_limits_for_test()
+    }
+
     /// Observe the existing file cursor's privately owned retention resources.
     /// A remote owner cursor has no locally inspectable file-resource witness.
     #[cfg(any(test, feature = "test-seams"))]

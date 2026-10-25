@@ -1377,6 +1377,10 @@ fn fetch_backend_neutral_cursor(
 }
 
 impl DirectFileReader {
+    pub(crate) fn admitted_memory(&self) -> u64 {
+        self.limits.memory
+    }
+
     pub(crate) fn expiry_memory_owner(&self) -> contextdb_core::read_memory::ReadMemoryOwner {
         self.declared_read_memory.original_owner()
     }
