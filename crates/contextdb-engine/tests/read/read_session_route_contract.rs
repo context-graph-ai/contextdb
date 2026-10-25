@@ -606,6 +606,7 @@ fn spawn_startup_race_owner(
             "writer_winning_the_direct_open_boundary_retries_once_into_the_real_owner",
         ))
         .arg("--nocapture")
+        .args(["--format", "terse"])
         .env(STARTUP_RACE_OWNER_CHILD, "1")
         .env(STARTUP_RACE_OWNER_PATH, path)
         .env(STARTUP_RACE_OWNER_RUNTIME, runtime_root)

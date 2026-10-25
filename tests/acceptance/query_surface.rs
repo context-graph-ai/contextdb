@@ -1,7 +1,9 @@
 use super::common::*;
 use contextdb_core::{Error, Value};
 use contextdb_core::{Lsn, RowId};
-use contextdb_engine::{Database, MaintenancePolicy};
+use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::MaintenancePolicy;
 use contextdb_parser::parse;
 use std::fs;
 use tempfile::TempDir;
@@ -1198,6 +1200,7 @@ fn f113_explain_shows_graph_bfs_operator_for_graph_traversal() {
 
 /// I inserted 1000+ vectors and ran EXPLAIN on a vector query, and the plan showed HNSWSearch instead of brute-force.
 #[test]
+#[cfg(feature = "test-seams")]
 fn f114_explain_shows_hnsw_search_operator_for_vector_ann_query() {
     let db = Database::open_memory();
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);

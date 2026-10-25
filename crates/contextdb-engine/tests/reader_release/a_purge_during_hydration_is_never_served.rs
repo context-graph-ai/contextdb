@@ -96,7 +96,7 @@ fn assert_a_purge_during_decode_is_never_served(strip_companion: bool, fallback:
             Ok(answer) => assert!(
                 !purged,
                 "a reader that began before a committed purge served the erased table: {:?}",
-                answer.rows
+                answer.rows()
             ),
         },
     }
@@ -179,7 +179,7 @@ fn a_purge_during_the_decode_of_a_reader_publishing_in_two_roots_is_never_served
             Ok(answer) => assert!(
                 !purged,
                 "a two-root reader served the erased table after a committed purge: {:?}",
-                answer.rows
+                answer.rows()
             ),
         },
     }
@@ -271,7 +271,7 @@ fn a_purge_after_an_owner_drain_is_never_served_to_the_owner_route_reader() {
         ),
         Ok(answer) => panic!(
             "the reader served the erased table after a committed purge across a drain: {:?}",
-            answer.rows
+            answer.rows()
         ),
     }
     second.close().expect("close the second writer");

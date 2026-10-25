@@ -162,7 +162,8 @@ fn assert_the_walk_of_a_crashed_store_is_outside_admission(rows: i64, role: &str
         session
             .execute("SELECT id FROM crash_rows ORDER BY id", &HashMap::new())
             .expect("the reader reads the commit the repair kept")
-            .rows,
+            .rows()
+            .to_vec(),
     );
     assert_eq!(
         reader_rows, expected,
@@ -172,7 +173,8 @@ fn assert_the_walk_of_a_crashed_store_is_outside_admission(rows: i64, role: &str
         database
             .execute("SELECT id FROM crash_rows ORDER BY id", &HashMap::new())
             .expect("the repaired writer reads")
-            .rows,
+            .rows()
+            .to_vec(),
     );
     assert_eq!(
         writer_rows, expected,

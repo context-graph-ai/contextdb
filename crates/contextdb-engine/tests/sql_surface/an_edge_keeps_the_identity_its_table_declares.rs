@@ -82,16 +82,16 @@ fn insert_autocommit(database: &Database, edge: &Edge) -> u64 {
     database
         .execute(INSERT, &edge.row(Value::TxId(contextdb_core::TxId(1))))
         .expect("insert an edge")
-        .rows_affected
+        .rows_affected()
 }
 
 fn ids_of(database: &Database, edge: &Edge) -> Vec<Value> {
     database
         .execute(EXACT, &edge.key())
         .expect("read an edge by its declared key")
-        .rows
-        .into_iter()
-        .map(|row| row.into_iter().next().expect("an id column"))
+        .rows()
+        .iter()
+        .map(|row| row.first().expect("an id column").clone())
         .collect()
 }
 
@@ -109,7 +109,7 @@ fn count(database: &Database) -> usize {
     database
         .execute("SELECT id FROM edges", &HashMap::new())
         .expect("scan the edges")
-        .rows
+        .rows()
         .len()
 }
 
@@ -163,12 +163,12 @@ fn an_edge_differing_only_by_an_extra_declared_key_column_is_inserted_in_a_trans
         let inserted = database
             .execute_in_tx(tx, INSERT, &edge.row(Value::TxId(tx)))
             .expect("insert in the transaction");
-        assert_eq!(inserted.rows_affected, 1, "{subtype} is inserted");
+        assert_eq!(inserted.rows_affected(), 1, "{subtype} is inserted");
         assert_eq!(
             database
                 .execute_in_tx(tx, EXACT, &edge.key())
                 .expect("read inside the transaction")
-                .rows
+                .rows()
                 .len(),
             1,
             "{subtype} is readable inside its transaction"

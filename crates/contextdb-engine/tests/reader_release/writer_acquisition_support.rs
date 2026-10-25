@@ -52,7 +52,7 @@ pub fn count_rows(session: &ReadSession) -> i64 {
     let answer = session
         .execute("SELECT COUNT(*) FROM held", &HashMap::new())
         .expect("a held-table count");
-    match &answer.rows[0][0] {
+    match &answer.rows()[0][0] {
         Value::Int64(count) => *count,
         other => panic!("a count is an integer, got {other:?}"),
     }
@@ -62,7 +62,7 @@ pub fn count_rows_in_writer(database: &Database) -> i64 {
     let answer = database
         .execute("SELECT COUNT(*) FROM held", &HashMap::new())
         .expect("a held-table count");
-    match &answer.rows[0][0] {
+    match &answer.rows()[0][0] {
         Value::Int64(count) => *count,
         other => panic!("a count is an integer, got {other:?}"),
     }

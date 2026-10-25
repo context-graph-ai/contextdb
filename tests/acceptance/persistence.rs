@@ -1,9 +1,16 @@
 use super::common::*;
-use contextdb_core::{Error, Value, VectorIndexRef};
+#[cfg(feature = "test-seams")]
+use contextdb_core::VectorIndexRef;
+use contextdb_core::{Error, Value};
+use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
 use contextdb_engine::memory_accounting::MemoryAccountant;
-use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
+#[cfg(feature = "test-seams")]
+use contextdb_engine::{DatabaseOpenOptions, MaintenancePolicy};
 use std::fs;
+#[cfg(feature = "test-seams")]
 use std::path::Path;
+#[cfg(feature = "test-seams")]
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -668,6 +675,7 @@ fn single_database_txid_causal_order_under_backward_wallclock() {
 
 // Named vector index tests: naming, isolation, and lifecycle coverage.
 
+#[cfg(feature = "test-seams")]
 fn persist_vector_rows_for_footprint(
     path: &Path,
     table: &str,
@@ -716,6 +724,7 @@ fn persist_vector_rows_for_footprint(
     reopened.close().expect("close reopened footprint db");
 }
 
+#[cfg(feature = "test-seams")]
 fn file_len(path: &Path) -> u64 {
     fs::metadata(path).expect("stat footprint db").len()
 }
@@ -980,6 +989,7 @@ fn f112c_corrupt_one_dot_zero_store_returns_distinct_error() {
 /// reopened the database, and probing each inserted vector recovered its own row at top-1 — recall@1 stayed
 /// ≥ 95/100, proving SQ8 storage preserves identity after fsync + reopen.
 #[test]
+#[cfg(feature = "test-seams")]
 fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
     // Engine-owned maintenance races the one-row-per-commit inserts, so two
     // stores are only comparable at quiescence: both fixtures drive their own
@@ -1207,6 +1217,7 @@ fn f113_per_index_sq8_quantization_preserves_recall_after_reopen() {
 /// scale strategy that achieves this (per-vector min/max, per-shard, lazy rescale, etc.) is implementation
 /// choice; the product contract this test pins is "ANN recall remains correct after diverse batches arrive."
 #[test]
+#[cfg(feature = "test-seams")]
 fn f113b_sq8_cross_batch_recall_stability() {
     // The accountant charges two costs this fixture's table incurs: the PK's
     // exact-probe filter, reserved at
@@ -1390,6 +1401,7 @@ fn f113b_sq8_cross_batch_recall_stability() {
 /// ranges, and self-probes recovered each row at top-1. SQ4 packs two 4-bit values per byte and is the
 /// most memory-aggressive quantization; recall is more sensitive to scale strategy than SQ8.
 #[test]
+#[cfg(feature = "test-seams")]
 fn f113c_sq4_cross_batch_recall_stability() {
     // The accountant charges two costs this fixture's table incurs: the PK's
     // exact-probe filter, reserved at

@@ -118,7 +118,6 @@ required-features = ["test-seams"]
 [[test]]
 name = "acceptance"
 path = "../../tests/acceptance.rs"
-required-features = ["test-seams"]
 
 [[test]]
 name = "cdb120_partition_insert_cost"
@@ -194,7 +193,6 @@ required-features = ["test-seams"]
 [[test]]
 name = "sql_surface"
 path = "tests/sql_surface.rs"
-required-features = ["test-seams"]
 
 [[test]]
 name = "sync"

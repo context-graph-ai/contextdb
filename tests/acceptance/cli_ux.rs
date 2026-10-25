@@ -672,6 +672,7 @@ fn f118_cli_renders_unknown_vector_index_error() {
     );
 }
 
+#[cfg(feature = "test-seams")]
 fn vector_insert_refusal_limit(extra_table: bool) -> usize {
     use contextdb_engine::memory_accounting::{
         MemoryAccountant, take_budget_ledger_for_test, watch_budget_ledger_for_test,
@@ -730,6 +731,7 @@ fn vector_insert_refusal_limit(extra_table: bool) -> usize {
     limit
 }
 
+#[cfg(feature = "test-seams")]
 fn attributed_vector_memory_refusal(message: &str) -> bool {
     message.to_lowercase().contains("memory")
         && message.contains("vector_insert@audio_clips.vector_audio")
@@ -737,6 +739,7 @@ fn attributed_vector_memory_refusal(message: &str) -> bool {
 
 /// A vector refusal names its real table and column, after setup fits.
 #[test]
+#[cfg(feature = "test-seams")]
 fn f117b_cli_renders_memory_budget_exceeded_with_index_tag() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("budget.db");
