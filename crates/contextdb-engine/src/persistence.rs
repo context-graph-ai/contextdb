@@ -31835,6 +31835,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 let table_name = Self::rel_table_name(&table);
                 let table_def: TableDefinition<&[u8], &[u8]> =
                     TableDefinition::new(table_name.as_str());
+                self.retain_received_authored_rows_in_write(&write_txn, &table, stage)?;
                 self.retire_relational_manifests_in_write(&write_txn, &table)?;
                 content_size::reset_rows(&write_txn, &table)?;
                 match write_txn.delete_table(table_def) {
@@ -66765,7 +66766,7 @@ graph_commit_result }.map_err(Self::storage_error)?;
                     let table_name = Self::rel_table_name(&table);
                     let table_def: TableDefinition<&[u8], &[u8]> =
                         TableDefinition::new(table_name.as_str());
-                    self.retain_authored_rows_in_write(&write_txn, &table)?;
+                    self.retain_received_authored_rows_in_write(&write_txn, &table, stage)?;
                     self.retire_relational_manifests_in_write(&write_txn, &table)?;
                     content_size::reset_rows(&write_txn, &table)?;
                     match write_txn.delete_table(table_def) {

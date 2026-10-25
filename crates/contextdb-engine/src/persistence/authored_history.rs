@@ -19,6 +19,81 @@ pub(super) fn body_key(table: &str, key: &[u8]) -> String {
 }
 
 impl RedbPersistence {
+    /// A policy declaration does not replace an authored body. Inspect only
+    /// schema metadata, including intermediate declarations in source order,
+    /// before deciding whether the outgoing population needs archival.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(super) fn retain_received_authored_rows_in_write(
+        &self,
+        write: &redb::WriteTransaction,
+        table: &str,
+        stage: &ReceivedSchemaPersistenceProjection,
+    ) -> Result<()> {
+        let Some((mut previous, _credit)) = self.schema_projection_metadata_point(table)? else {
+            return Ok(());
+        };
+        let same_body_shape = |before: &TableMeta, after: &TableMeta| {
+            before
+                .columns
+                .iter()
+                .map(|column| {
+                    (
+                        &column.name,
+                        &column.column_type,
+                        column.quantization,
+                        &column.partition_key_columns,
+                    )
+                })
+                .eq(after.columns.iter().map(|column| {
+                    (
+                        &column.name,
+                        &column.column_type,
+                        column.quantization,
+                        &column.partition_key_columns,
+                    )
+                }))
+        };
+        for (_, ddl) in &stage.ddl_log {
+            match ddl {
+                DdlChange::DropTable { name } if name == table => {
+                    return self.retain_authored_rows_in_write(write, table);
+                }
+                DdlChange::AlterTable {
+                    name,
+                    columns,
+                    constraints,
+                    foreign_keys,
+                    composite_foreign_keys,
+                    composite_unique,
+                } if name == table => {
+                    let incoming = crate::database::rough_sync_table_meta(
+                        columns,
+                        constraints,
+                        foreign_keys,
+                        composite_foreign_keys,
+                        composite_unique,
+                    );
+                    let mut next = previous.clone();
+                    crate::database::Database::apply_sync_alter_to_projected_table_meta(
+                        table,
+                        &mut next,
+                        incoming,
+                        constraints,
+                    );
+                    if !same_body_shape(&previous, &next) {
+                        return self.retain_authored_rows_in_write(write, table);
+                    }
+                    previous = next;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
