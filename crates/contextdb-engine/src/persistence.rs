@@ -4733,11 +4733,11 @@ impl ReadSnapshotRegistrationGuard {
     ) -> std::result::Result<(), LoadReadImageError> {
         let refuse = |reason: &str| {
             Err(direct_read_requires_writer(format!(
-                "the store's writer died and {reason}; a writable open must recover it first"
+                "this store has an unclean image whose consistency cannot be verified because {reason}; a byte-copy taken while a writer is live can be inconsistent. Create a consistent copy with Database::export_snapshot, or close the writer cleanly before copying. A writable open must recover this file before it can be read"
             )))
         };
         let Some(boot) = current_boot_id() else {
-            return refuse("this platform cannot tell which boot it died on");
+            return refuse("this platform cannot identify its last writer's boot");
         };
         if !data_file_on_trusted_local_filesystem(&self.descriptor) {
             return refuse(
@@ -4754,7 +4754,7 @@ impl ReadSnapshotRegistrationGuard {
             return refuse("its last writer never finished opening it");
         };
         if binding.boot_id != boot {
-            return refuse("the machine has restarted since");
+            return refuse("the machine has restarted since its last writer opened it");
         }
         if (binding.data_dev, binding.data_ino, binding.data_birth_nanos) != (dev, ino, birth) {
             return refuse("its companion names a different data file");
