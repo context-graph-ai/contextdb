@@ -1334,3 +1334,10 @@ pub(crate) fn note_owning_row_proof_setup() {
             .fetch_add(1, Ordering::Relaxed);
     });
 }
+
+#[cfg(feature = "test-seams")]
+mod billing;
+#[cfg(feature = "test-seams")]
+pub use billing::{BillingWork, observe_billing_work_for_test};
+#[cfg(feature = "test-seams")]
+pub(crate) use billing::{note_metadata_reservation, note_native_child_identity};

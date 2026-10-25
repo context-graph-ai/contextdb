@@ -2395,6 +2395,8 @@ impl RequestContext {
         source: BoundedWorkSource,
         requested: usize,
     ) -> std::result::Result<(), BoundedExecutionError> {
+        #[cfg(feature = "test-seams")]
+        crate::read_work_probe::note_metadata_reservation();
         let requested_u64 = u64::try_from(requested)
             .map_err(|_| Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory))?;
         #[allow(

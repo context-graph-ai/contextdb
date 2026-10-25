@@ -1798,6 +1798,8 @@ fn native_child_identity(
     counter: &std::sync::atomic::AtomicU64,
     fallback: usize,
 ) -> usize {
+    #[cfg(feature = "test-seams")]
+    crate::read_work_probe::note_native_child_identity();
     let address = counter as *const _ as usize;
     let mut registry = native_child_observers()
         .lock()

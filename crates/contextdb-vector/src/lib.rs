@@ -55,3 +55,7 @@ pub use store::{VectorMemoryOwnershipSnapshot, WriterVectorTail};
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
 pub mod observations;
+
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use memory_budget::observe_copy_reservations_for_test;

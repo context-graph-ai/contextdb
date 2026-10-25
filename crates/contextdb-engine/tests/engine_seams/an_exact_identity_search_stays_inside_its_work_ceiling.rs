@@ -17,6 +17,7 @@ use contextdb_engine::direct_file_reader::test_seams::{ReadWorkObservationScope,
 use contextdb_engine::memory_accounting::{
     take_budget_ledger_for_test, watch_budget_ledger_for_test,
 };
+use contextdb_engine::read_work_probe::{BillingWork, observe_billing_work_for_test};
 use contextdb_engine::vector_read_memory::{
     take_native_admissions_for_test, watch_native_admissions_for_test,
 };
@@ -41,6 +42,7 @@ struct SearchWork {
     vectors_scored: u64,
     reader_admissions: u64,
     writer_budget_charges: u64,
+    billing: BillingWork,
 }
 
 /// Measured on the engine as it stands: 1,024 live memberships plus the 512
@@ -56,6 +58,11 @@ const CEILING: SearchWork = SearchWork {
     vectors_scored: 1_024,
     reader_admissions: 1,
     writer_budget_charges: 0,
+    billing: BillingWork {
+        native_child_identities: 9_775,
+        metadata_reservations: 1_202,
+        copy_reservations: 10,
+    },
 };
 
 struct CountScores(AtomicU64);
@@ -74,9 +81,11 @@ fn measure(db: &contextdb_engine::Database, id: usize) -> SearchWork {
     let scope = ReadWorkObservationScope::enter(ReadWorkPhase::Query);
     watch_native_admissions_for_test();
     watch_budget_ledger_for_test();
-    let (answer, resident) = observe_resident(|| {
-        with_native_vector_score_observer_for_test(scored.clone(), || {
-            query_vector(db, "building", id, DIM, "EXACT")
+    let ((answer, resident), billing) = observe_billing_work_for_test(|| {
+        observe_resident(|| {
+            with_native_vector_score_observer_for_test(scored.clone(), || {
+                query_vector(db, "building", id, DIM, "EXACT")
+            })
         })
     });
     let ledger = take_budget_ledger_for_test();
@@ -100,6 +109,7 @@ fn measure(db: &contextdb_engine::Database, id: usize) -> SearchWork {
             .iter()
             .filter(|witness| witness.parent == reader && witness.admitted)
             .count() as u64,
+        billing,
         writer_budget_charges: ledger
             .iter()
             .filter(|entry| entry.what != "release")
@@ -158,5 +168,11 @@ fn an_exact_identity_search_over_a_maintained_partition_stays_inside_its_work_ce
         first.reader_admissions <= CEILING.reader_admissions
             && first.writer_budget_charges <= CEILING.writer_budget_charges,
         "admissions per exact search grew: {first:?}, ceiling {CEILING:?}"
+    );
+    assert!(
+        first.billing.native_child_identities <= CEILING.billing.native_child_identities
+            && first.billing.metadata_reservations <= CEILING.billing.metadata_reservations
+            && first.billing.copy_reservations <= CEILING.billing.copy_reservations,
+        "billing calls per exact search grew: {first:?}, ceiling {CEILING:?}"
     );
 }

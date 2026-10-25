@@ -645,6 +645,8 @@ impl VectorCopyAdmission {
         operation: &str,
         hint: &str,
     ) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        copy_reservation_observation::note();
         let used_bytes = self
             .used_bytes
             .checked_add(bytes)
@@ -677,6 +679,8 @@ impl VectorCopyAdmission {
         operation: &'static str,
         hint: &'static str,
     ) -> Result<()> {
+        #[cfg(feature = "test-seams")]
+        copy_reservation_observation::note();
         let used_bytes = self
             .used_bytes
             .checked_add(bytes)
@@ -1329,3 +1333,9 @@ pub(crate) fn require_copy_capacity(capacity: usize, bytes: usize) -> Result<()>
     }
     Ok(())
 }
+
+#[cfg(feature = "test-seams")]
+mod copy_reservation_observation;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub use copy_reservation_observation::observe_copy_reservations_for_test;
