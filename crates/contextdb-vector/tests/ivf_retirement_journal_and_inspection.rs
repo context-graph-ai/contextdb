@@ -5,12 +5,14 @@
 )]
 //! A replacement always finishes, deletions live in the row journal, and
 //! inspection and stored counters never mislead:
-//! - with a seal before every maintenance call, a completed remap retires its
-//!   legacy run within a bounded number of calls at a run cap of one and of
-//!   two; state B ends, a rebuild is accepted, and a partition whose new
-//!   codebook was damaged in state B reaches state C and rebuilds;
-//! - a deletion is recorded in the row journal only, with no per-row
-//!   tombstone page, and stays in force after the generation it was made
+//! - with a seal before every maintenance call, the remap examines each of the
+//!   L legacy entries once and retires every legacy run within
+//!   ceil(L / B) + R + 1 remap calls, B entries per call over R legacy runs,
+//!   at a run cap of one and of two; state B ends, a rebuild is accepted, and
+//!   a partition whose new codebook was damaged in state B reaches state C
+//!   and rebuilds;
+//! - a deletion writes only the row journal (row versions and row copies) and
+//!   visibility pages, and stays in force after the generation it was made
 //!   under retires and its pages are reclaimed, through reopen;
 //! - catalog inspection reads no codebook or directory page, healthy or
 //!   damaged, and still reports the rebuild recovery action once a write has
@@ -19,7 +21,8 @@
 //!   seal: writes commit, EXACT answers, and inspection shows the rebuild
 //!   action; a stored remap cursor past its run's entries is store
 //!   corruption with the rebuild action, never a remap that silently never
-//!   progresses.
+//!   progresses, and maintenance then still reaches state C so the rebuild it
+//!   advertises is accepted and serves every row.
 #[path = "support/hiding_pages.rs"]
 mod hiding_pages;
 #[path = "support/ivf_pages.rs"]
@@ -36,8 +39,9 @@ use std::sync::Arc;
 
 const BASE: u64 = 16;
 /// Rows committed and sealed between the source frontier and publication:
-/// the legacy entries a remap must carry over.
+/// the legacy entries a remap must carry over, one entry each.
 const LATE: std::ops::Range<u64> = 16..28;
+const LEGACY_ENTRIES: u64 = LATE.end - LATE.start;
 const REMAP_ENTRIES_PER_CALL: usize = 2;
 const COALESCE_PAGES: usize = 32;
 
@@ -134,16 +138,29 @@ fn in_state_b<S: PageStore>(index: &mut ClusteredIndex<S>, cap: u64) {
     );
 }
 
+/// The bound on remap calls from the fixture's own population: every legacy
+/// entry needs one examination at `REMAP_ENTRIES_PER_CALL` per call, each of
+/// the `legacy_runs` runs may end its last call short of a full batch, and
+/// one call more covers a retirement commit on its own.
+fn remap_call_bound(legacy_runs: u64) -> usize {
+    (LEGACY_ENTRIES as usize).div_ceil(REMAP_ENTRIES_PER_CALL) + legacy_runs as usize + 1
+}
+
 /// Drives the remap with one seal before every maintenance call (each
 /// `advance_remap` and each `advance_coalescing`) and returns the rows
-/// committed, after requiring the remap to complete within the calls its
-/// entries need plus two.
+/// committed, after requiring every legacy entry to be examined exactly once
+/// and the remap to complete within `remap_call_bound`.
 fn remap_under_continuous_sealing<S: PageStore>(
     index: &mut ClusteredIndex<S>,
     cap: u64,
     mut next: u64,
     when: &str,
 ) -> u64 {
+    let legacy_runs = inspect_catalog(index.storage(), 0, cap)
+        .unwrap()
+        .unwrap()
+        .legacy_runs;
+    let bound = remap_call_bound(legacy_runs);
     let mut remap_calls = 0usize;
     let mut examined = 0u64;
     let mut complete = false;
@@ -165,12 +182,15 @@ fn remap_under_continuous_sealing<S: PageStore>(
         next += 1;
         index.advance_coalescing(0, COALESCE_PAGES).unwrap();
     }
-    let bound = (examined as usize).div_ceil(REMAP_ENTRIES_PER_CALL) + 2;
     assert!(
         complete && remap_calls <= bound,
-        "{when}, cap {cap}: the remap retires its legacy run within {bound} remap calls though a \
-         seal lands before every maintenance call; remap calls: {remap_calls}, complete: \
-         {complete}, entries examined: {examined}"
+        "{when}, cap {cap}: the remap of {LEGACY_ENTRIES} legacy entries in {legacy_runs} runs \
+         retires within {bound} remap calls though a seal lands before every maintenance call; \
+         remap calls: {remap_calls}, complete: {complete}, entries examined: {examined}"
+    );
+    assert_eq!(
+        examined, LEGACY_ENTRIES,
+        "{when}, cap {cap}: each legacy entry is examined exactly once"
     );
     assert_eq!(
         inspect_catalog(index.storage(), 0, cap)
@@ -274,18 +294,8 @@ fn a_deletion_lives_in_the_journal_through_its_generations_retirement_and_reclam
     let mut source = (0..BASE).map(|row| (row, vector(row)));
     while index.ingest_batch(&mut state, &mut source).unwrap() > 0 {}
     // Deleted under the old generation, after the build captured the row.
-    let tombstone_writes = |index: &ClusteredIndex<Hiding>| {
-        index
-            .storage()
-            .inner
-            .writes
-            .borrow()
-            .iter()
-            .filter(|(kind, _)| format!("{kind:?}") == "Tombstones")
-            .map(|(_, writes)| *writes)
-            .sum::<u64>()
-    };
-    let tombstones_before = tombstone_writes(&index);
+    let writes = |index: &ClusteredIndex<Hiding>| index.storage().inner.writes.borrow().clone();
+    let before = writes(&index);
     index
         .delete_row(
             0,
@@ -295,10 +305,17 @@ fn a_deletion_lives_in_the_journal_through_its_generations_retirement_and_reclam
             },
         )
         .expect("the genesis identity deletes the row");
-    assert_eq!(
-        tombstone_writes(&index),
-        tombstones_before,
-        "a deletion writes no per-row tombstone page; the journal records it"
+    let written = writes(&index)
+        .into_iter()
+        .filter(|(kind, count)| before.get(kind).copied().unwrap_or(0) < *count)
+        .map(|(kind, _)| kind)
+        .collect::<Vec<_>>();
+    assert!(
+        written.iter().all(|kind| matches!(
+            kind,
+            PageKind::RowVersions | PageKind::RowCopies | PageKind::Visibility
+        )),
+        "a deletion writes only the row journal and visibility pages: {written:?}"
     );
     for row in LATE {
         commit(&mut index, row);
@@ -501,13 +518,9 @@ fn a_stored_remap_cursor_past_its_run_is_corruption_never_a_silent_stall() {
     tx.put_page(key, &page).unwrap();
     tx.commit().unwrap();
     let mut index = ClusteredIndex::new(store, policy, training(), budget.clone().into()).unwrap();
-    for call in 0..2 {
-        match index.advance_remap(0, 1) {
-            Err(Error::StoreCorrupted { .. }) => {}
-            other => panic!(
-                "remap call {call} over a cursor past its run is store corruption, got {other:?}"
-            ),
-        }
+    match index.advance_remap(0, 1) {
+        Err(Error::StoreCorrupted { .. }) => {}
+        other => panic!("a remap over a cursor past its run is store corruption, got {other:?}"),
     }
     assert_eq!(
         inspect_catalog(index.storage(), 0, cap)
@@ -522,4 +535,41 @@ fn a_stored_remap_cursor_past_its_run_is_corruption_never_a_silent_stall() {
         (0..LATE.end).collect::<Vec<_>>(),
         "EXACT still answers every committed row"
     );
+    // The advertised recovery is carried out: later maintenance calls may
+    // still report the damage, but they reach state C, whether by remapping
+    // the run again from its start or by retiring it from canonical rows.
+    let legacy_runs = inspect_catalog(index.storage(), 0, cap)
+        .unwrap()
+        .unwrap()
+        .legacy_runs;
+    let bound = remap_call_bound(legacy_runs) + 2;
+    let mut reached_c = false;
+    for _ in 0..bound {
+        match index.advance_remap(0, REMAP_ENTRIES_PER_CALL) {
+            Ok(progress) if progress.complete => {
+                reached_c = true;
+                break;
+            }
+            Ok(_) | Err(Error::StoreCorrupted { .. }) => {}
+            other => panic!("a recovering remap call proceeds or reports the damage: {other:?}"),
+        }
+        index.advance_coalescing(0, COALESCE_PAGES).unwrap();
+    }
+    assert!(
+        reached_c
+            && inspect_catalog(index.storage(), 0, cap)
+                .unwrap()
+                .unwrap()
+                .legacy_runs
+                == 0,
+        "maintenance reaches state C within {bound} remap calls after the damage"
+    );
+    rebuild(&mut index, LATE.end, "after the damaged remap cursor");
+    for mode in [Mode::Exact, Mode::Indexed] {
+        assert_eq!(
+            answered(index.storage(), policy, &budget, mode).unwrap(),
+            (0..LATE.end).collect::<Vec<_>>(),
+            "{mode:?} serves every committed row after the rebuild"
+        );
+    }
 }
