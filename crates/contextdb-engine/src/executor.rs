@@ -772,7 +772,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     )]
     fn bounded_read_snapshot_registration(
         &self,
-        needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
@@ -784,7 +783,6 @@ pub(crate) trait ReadExecutionTarget: Send + Sync {
     )]
     fn bounded_cursor_snapshot_registration(
         &self,
-        needs_vector_graph: bool,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
@@ -2200,23 +2198,15 @@ impl ReadExecutionTarget for Database {
 
     fn bounded_read_snapshot_registration(
         &self,
-        needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<BoundedReadSnapshotPin>> {
-        Database::bounded_read_snapshot_registration_with_root(
-            self,
-            needs_vector_graph,
-            budget,
-            withdrawn,
-            read_memory,
-        )
+        Database::bounded_read_snapshot_registration_with_root(self, budget, withdrawn, read_memory)
     }
 
     fn bounded_cursor_snapshot_registration(
         &self,
-        needs_vector_graph: bool,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
@@ -2225,7 +2215,6 @@ impl ReadExecutionTarget for Database {
     ) -> Result<Option<BoundedCursorSnapshotPin>> {
         Database::bounded_cursor_snapshot_registration_with_root(
             self,
-            needs_vector_graph,
             clock,
             idle_ms,
             budget,
@@ -23653,22 +23642,16 @@ impl ReadExecutionTarget for BoundedCursorTarget {
 
     fn bounded_read_snapshot_registration(
         &self,
-        needs_vector_graph: bool,
         budget: &crate::database::ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<BoundedReadSnapshotPin>> {
-        self.store.bounded_read_snapshot_registration(
-            needs_vector_graph,
-            budget,
-            withdrawn,
-            read_memory,
-        )
+        self.store
+            .bounded_read_snapshot_registration(budget, withdrawn, read_memory)
     }
 
     fn bounded_cursor_snapshot_registration(
         &self,
-        needs_vector_graph: bool,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
         budget: &crate::database::ReadRegistrationBudget,
@@ -23676,7 +23659,6 @@ impl ReadExecutionTarget for BoundedCursorTarget {
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<BoundedCursorSnapshotPin>> {
         self.store.bounded_cursor_snapshot_registration(
-            needs_vector_graph,
             clock,
             idle_ms,
             budget,

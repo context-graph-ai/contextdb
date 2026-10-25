@@ -19406,66 +19406,6 @@ fn publication_tables(plan: &PhysicalPlan) -> BTreeSet<String> {
     tables
 }
 
-/// Scalar DATA reads need no mutable vector graph. Vector ORDER BY may use
-/// an indexed graph unless EXACT was selected explicitly, including in CTEs
-/// and scalar subqueries. This follows the planner's vector-order predicate.
-fn statement_needs_vector_graph(statement: &contextdb_parser::ast::Statement) -> bool {
-    use contextdb_parser::ast::{
-        Cte, Expr, SelectBody, SortDirection, Statement, VectorSearchMode,
-    };
-    fn expr(value: &Expr) -> bool {
-        match value {
-            Expr::InSubquery {
-                expr: input,
-                subquery,
-                ..
-            } => expr(input) || body(subquery),
-            Expr::BinaryOp { left, right, .. }
-            | Expr::CosineDistance { left, right }
-            | Expr::Like {
-                expr: left,
-                pattern: right,
-                ..
-            } => expr(left) || expr(right),
-            Expr::UnaryOp { operand, .. }
-            | Expr::IsNull { expr: operand, .. }
-            | Expr::RowVectorSource { key: operand, .. } => expr(operand),
-            Expr::FunctionCall { args, .. } | Expr::Row(args) => args.iter().any(expr),
-            Expr::InList {
-                expr: input, list, ..
-            } => expr(input) || list.iter().any(expr),
-            _ => false,
-        }
-    }
-    fn body(select: &SelectBody) -> bool {
-        (select
-            .order_by
-            .first()
-            .is_some_and(|item| item.direction == SortDirection::CosineDistance)
-            && !matches!(select.use_vector, Some(VectorSearchMode::Exact)))
-            || select.columns.iter().any(|column| expr(&column.expr))
-            || select.where_clause.as_ref().is_some_and(expr)
-            || select.order_by.iter().any(|item| expr(&item.expr))
-            || select.joins.iter().any(|join| expr(&join.on))
-    }
-    match statement {
-        Statement::Select(select) => {
-            body(&select.body)
-                || select.ctes.iter().any(|cte| match cte {
-                    Cte::SqlCte { query, .. } => body(query),
-                    Cte::MatchCte { match_clause, .. } => {
-                        match_clause.where_clause.as_ref().is_some_and(expr)
-                            || match_clause
-                                .return_cols
-                                .iter()
-                                .any(|column| expr(&column.expr))
-                    }
-                })
-        }
-        _ => false,
-    }
-}
-
 fn statement_needs_vector_read(statement: &contextdb_parser::ast::Statement) -> bool {
     use contextdb_parser::ast::{Cte, Expr, SelectBody, SortDirection, Statement};
     fn expr(value: &Expr) -> bool {
@@ -19596,7 +19536,6 @@ pub(super) fn execute_with_native_trace_refund(
             .then(|| db.relational_membership_store().begin_membership_capture());
         let Some((snapshot, publication_lsn, _snapshot_registration, writer_root)) = db
             .bounded_read_snapshot_registration(
-                statement_needs_vector_graph(&statement),
                 &context.registration_budget(),
                 &withdrawn,
                 context
@@ -20999,7 +20938,6 @@ pub(super) fn open_cursor_with_native_trace_refund(
             snapshot_registration,
             writer_root,
         )) = db.bounded_cursor_snapshot_registration(
-            statement_needs_vector_graph(&statement),
             Arc::clone(&clock),
             limits.cursor_idle_ms,
             &context.registration_budget(),

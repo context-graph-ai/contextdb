@@ -74153,12 +74153,7 @@ impl Database {
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,
     ) -> Result<Option<(SnapshotId, Lsn, Box<dyn Send + Sync>)>> {
         Ok(self
-            .bounded_read_snapshot_registration_with_root(
-                false,
-                budget,
-                withdrawn,
-                read_memory.clone(),
-            )?
+            .bounded_read_snapshot_registration_with_root(budget, withdrawn, read_memory.clone())?
             .map(|(snapshot, lsn, registration, root)| {
                 (
                     snapshot,
@@ -74186,7 +74181,6 @@ impl Database {
     > {
         Ok(self
             .bounded_cursor_snapshot_registration_with_root(
-                false,
                 clock,
                 idle_ms,
                 budget,
@@ -74210,7 +74204,6 @@ impl Database {
     )]
     pub(crate) fn bounded_read_snapshot_registration_with_root(
         &self,
-        _needs_vector_graph: bool,
         budget: &ReadRegistrationBudget,
         withdrawn: &OwnerReadCancellation,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -74299,7 +74292,6 @@ impl Database {
     )]
     pub(crate) fn bounded_cursor_snapshot_registration_with_root(
         &self,
-        _needs_vector_graph: bool,
         clock: Arc<dyn DeadlineClock>,
         idle_ms: u64,
         budget: &ReadRegistrationBudget,

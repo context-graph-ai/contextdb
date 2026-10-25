@@ -38,7 +38,6 @@ fn captured_read_survives_compaction(cursor: bool) {
 
             let (snapshot, _, _, storage, registration, root) = reader_db
                 .bounded_cursor_snapshot_registration_with_root(
-                    false,
                     clock,
                     10_000,
                     &budget,
@@ -60,7 +59,6 @@ fn captured_read_survives_compaction(cursor: bool) {
 
             let (snapshot, _, registration, root) = reader_db
                 .bounded_read_snapshot_registration_with_root(
-                    false,
                     &budget,
                     &withdrawn,
                     fixture_operation_reader_2.clone(),
