@@ -1329,6 +1329,57 @@ fn claim_window_budget(timeouts: ReadClientTimeouts) -> u64 {
     timeouts.routing_retry_ms
 }
 
+/// Initial selection and writer turnover share one retry when a writer
+/// wins physical admission after the direct route was selected. Both attempts
+/// borrow the same handover, so its deadline, token and owner never restart.
+#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+fn select_route_with_ownership_retry(
+    path: &Path,
+    options: &ReadSessionOptions,
+    runtime_dir: Option<&Path>,
+    requirement: RouteRequirement,
+    resources: &Arc<RouteResources>,
+    mismatch: Option<OwnerHandshakeMismatchForTest>,
+    handover: Option<&RouteHandover<'_>>,
+    observe: &dyn Fn(ReadSessionEvent),
+) -> Result<SelectedRoute> {
+    let mut attempt = 1u64;
+    loop {
+        match attempt_route(
+            path,
+            options,
+            runtime_dir,
+            requirement,
+            attempt,
+            resources,
+            mismatch,
+            handover,
+            observe,
+        ) {
+            Ok(selected) => return Ok(selected),
+            Err(refusal) => {
+                observe(ReadSessionEvent::RouteOpenFailed {
+                    attempt,
+                    failure: refusal.failure,
+                });
+                if refusal.failure != ReadRouteOpenFailure::WriterBecameOwner || attempt > 1 {
+                    return Err(refusal.error);
+                }
+                let retry_attempt = attempt.saturating_add(1);
+                observe(ReadSessionEvent::OwnershipRaceRetry {
+                    failed_attempt: attempt,
+                    retry_attempt,
+                });
+                attempt = retry_attempt;
+            }
+        }
+    }
+}
+
 /// Select an already-serving owner first. A verified opening claim settles
 /// through its actual publication event within the caller's existing routing
 /// allowance, including when the companion still names the previous writer.
@@ -2281,18 +2332,16 @@ impl ReadSession {
             #[cfg(not(any(test, feature = "test-seams")))]
             let _ = event;
         };
-        let selected = attempt_route(
+        let selected = select_route_with_ownership_retry(
             &owner.path,
             &self.options,
             Some(&owner.runtime_dir),
             self.requirement,
-            1,
             &self.resources,
             None,
             Some(&handover),
             &observe,
-        )
-        .map_err(|refusal| refusal.error)?;
+        )?;
         if cancellation.is_cancelled() {
             return Err(Error::ReadCancelled);
         }
@@ -2972,38 +3021,16 @@ impl ReadSession {
         // observer is in force for the whole of it: a caller opening a large
         // store hears about the load rather than waiting in silence.
         let selected = with_progress_observer(progress.as_ref(), || {
-            let mut attempt = 1u64;
-            loop {
-                match attempt_route(
-                    &canonical_path,
-                    &options,
-                    runtime_dir.as_deref(),
-                    requirement,
-                    attempt,
-                    &resources,
-                    mismatch,
-                    None,
-                    &observe,
-                ) {
-                    Ok(selected) => break Ok(selected),
-                    Err(refusal) => {
-                        observe(ReadSessionEvent::RouteOpenFailed {
-                            attempt,
-                            failure: refusal.failure,
-                        });
-                        if refusal.failure != ReadRouteOpenFailure::WriterBecameOwner || attempt > 1
-                        {
-                            return Err(refusal.error);
-                        }
-                        let retry_attempt = attempt.saturating_add(1);
-                        observe(ReadSessionEvent::OwnershipRaceRetry {
-                            failed_attempt: attempt,
-                            retry_attempt,
-                        });
-                        attempt = retry_attempt;
-                    }
-                }
-            }
+            select_route_with_ownership_retry(
+                &canonical_path,
+                &options,
+                runtime_dir.as_deref(),
+                requirement,
+                &resources,
+                mismatch,
+                None,
+                &observe,
+            )
         })?;
         let (route, state, snapshot_at) = match selected {
             SelectedRoute::Owner(owner) => (
