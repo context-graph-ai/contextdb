@@ -193,6 +193,11 @@ impl Version {
     pub fn current_lsn(self) -> Option<u64> {
         if self.deleted { None } else { self.lsn }
     }
+    /// In state B the serving generation is newest; a live copy there means
+    /// this version was already prepared (or a newer write superseded legacy).
+    pub fn has_serving_copy(self, generation: u64) -> bool {
+        self.head.is_some_and(|head| head.generation == generation)
+    }
     pub fn invalidate(&mut self, t: &mut impl WritePages, m: Manifest) -> Result<()> {
         let active = Active::load(t, m)?;
         let mut node = self.head;

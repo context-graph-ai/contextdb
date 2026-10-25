@@ -68,7 +68,7 @@ impl<S: ReadPages> ReadPages for Tracked<'_, S> {
             PageKind::ListLinks | PageKind::ListUsed => Some(&mut p.list_link_pages_read),
             PageKind::RowVersions => Some(&mut p.row_version_pages_read),
             PageKind::RowCopies => Some(&mut p.row_copy_pages_read),
-            PageKind::ListAllocator | PageKind::Reservoir | PageKind::Tombstones => None,
+            PageKind::ListAllocator | PageKind::Reservoir => None,
         };
         if let Some(f) = field {
             *f = f.checked_add(1).ok_or_else(corrupt)?;

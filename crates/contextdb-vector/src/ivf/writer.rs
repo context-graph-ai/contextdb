@@ -834,20 +834,6 @@ impl<S: PageStore> ClusteredIndex<S> {
         version.invalidate(&mut tx, manifest)?;
         version.reset(tx.commit_lsn()?, true);
         version.store(&mut tx, manifest, expected.row)?;
-        // Journal tombstones are keyed by row identity, independent of generation slots.
-        let mut page = [0; super::storage::PAGE_BYTES];
-        let per = (super::storage::PAGE_BYTES / 24) as u64;
-        let key = manifest.key(PageKind::Tombstones, 0, expected.row / per);
-        super::storage::read_page(&tx, key, &mut page)?;
-        let at = (expected.row % per) as usize * 24;
-        for (dst, w) in page[at..at + 24].as_chunks_mut::<8>().0.iter_mut().zip([
-            expected.row,
-            expected.commit_lsn,
-            tx.commit_lsn()?,
-        ]) {
-            dst.copy_from_slice(&w.to_le_bytes());
-        }
-        super::storage::put_page(&mut tx, key, &page)?;
         tx.commit()
     }
 }
@@ -862,7 +848,7 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 }
 
 fn start_coalesce(tx: &mut impl WritePages, m: Manifest, c: &mut Catalog) -> Result<()> {
-    if c.coalesce_output != 0 || c.runs < 2 {
+    if c.coalesce_output != 0 || c.runs < 2 || c.remap_join_target != 0 {
         return Ok(());
     }
     c.coalesce_left = c.first;
@@ -944,6 +930,25 @@ pub struct RemapProgress {
 }
 
 impl<S: PageStore> ClusteredIndex<S> {
+    /// Verify unmarked derived objects and persist the first corruption verdict.
+    /// Subsequent inspections read that flag; read-only SHOW never re-verifies.
+    pub fn inspect_catalog(&mut self, partition: u64) -> Result<Option<catalog::CatalogState>> {
+        self.store.check_cancel()?;
+        let Some(m) = self.store.manifest(partition)? else {
+            return Ok(None);
+        };
+        let mut c = Catalog::load(&self.store, m)?;
+        if c.unserviceable.is_none() {
+            c.unserviceable = super::recovery::inspect_damage(&self.store, m, c)?;
+            if c.unserviceable.is_some() {
+                let mut tx = self.store.begin()?;
+                c.store(&mut tx, m)?;
+                tx.commit()?;
+            }
+        }
+        catalog::inspect(&self.store, partition, self.policy.max_delta_runs)
+    }
+
     /// At most entry_limit source entries, with a durable entry cursor. Prepared
     /// output remains invisible until one atomic catalog retirement commit.
     pub fn advance_remap(&mut self, partition: u64, entry_limit: usize) -> Result<RemapProgress> {
@@ -964,6 +969,22 @@ impl<S: PageStore> ClusteredIndex<S> {
             });
         };
         let source_run = Run::load(&self.store, old, c.legacy_first)?;
+        if c.remap_examined > source_run.entries {
+            let key = m.key(PageKind::Catalog, 0, 0);
+            c.unserviceable = Some(key);
+            if c.remap_join_target != 0 {
+                // Joining proves the source pass completed; retain its list cursor.
+                c.remap_examined = source_run.entries;
+            } else {
+                // Keep prepared output masked and replay only the finite source run.
+                c.remap_examined = 0;
+                c.remap_slot = source_run.first;
+            }
+            let mut tx = self.store.begin()?;
+            c.store(&mut tx, m)?;
+            tx.commit()?;
+            return Err(super::memory::corrupt_page(key));
+        }
         let book = load_seal_book(&self.owner, &self.store, m, &mut c)?;
         let mut tx = self.store.begin()?;
         if c.remap_output == 0 {
@@ -992,6 +1013,20 @@ impl<S: PageStore> ClusteredIndex<S> {
                 && codec::visible(&tx, old, slot, &mut visibility, &mut loaded)?
             {
                 let row = read_vector(&tx, old, slot, &mut self.raw, &mut self.values)?;
+                let mut version = Version::load(&tx, m, row)?;
+                // Invalidation also reaches prepared copies when a row changes before retirement.
+                if version.current_lsn() != Some(e.lsn)
+                    || version.deleted
+                    || version.has_serving_copy(m.generation)
+                {
+                    c.remap_slot = e.next;
+                    c.remap_examined = c.remap_examined.checked_add(1).ok_or_else(corrupt)?;
+                    progress.entries_examined = progress
+                        .entries_examined
+                        .checked_add(1)
+                        .ok_or_else(corrupt)?;
+                    continue;
+                }
                 let target_slot = m.slots;
                 codec::write(
                     &mut tx,
@@ -1003,17 +1038,6 @@ impl<S: PageStore> ClusteredIndex<S> {
                         .ok_or_else(overflow)?,
                     &self.raw,
                 )?;
-                let mut version = Version::load(&tx, m, row)?;
-                // Invalidation also reaches prepared copies when a row changes before retirement.
-                if version.current_lsn() != Some(e.lsn) || version.deleted {
-                    c.remap_slot = e.next;
-                    c.remap_examined = c.remap_examined.checked_add(1).ok_or_else(corrupt)?;
-                    progress.entries_examined = progress
-                        .entries_examined
-                        .checked_add(1)
-                        .ok_or_else(corrupt)?;
-                    continue;
-                }
                 version.add_copy(&mut tx, m, m.generation, target_slot)?;
                 version.store(&mut tx, m, row)?;
                 codec::set_visible(&mut tx, m, target_slot, true)?;
@@ -1056,14 +1080,60 @@ impl<S: PageStore> ClusteredIndex<S> {
                 .ok_or_else(corrupt)?;
         }
         prepared.store(&mut tx, m, c.remap_output)?;
-        if c.remap_examined == source_run.entries
-            && (prepared.entries == 0 || c.runs <= self.policy.max_delta_runs)
-        {
-            if prepared.entries != 0 {
-                c.attach(&mut tx, m, c.remap_output, prepared)?;
-                if c.runs > self.policy.max_delta_runs {
-                    start_coalesce(&mut tx, m, &mut c)?;
+        if c.remap_examined == source_run.entries {
+            let bound = self
+                .policy
+                .max_delta_runs
+                .checked_add(1)
+                .ok_or_else(corrupt)?
+                .max(3);
+            if prepared.entries != 0 && (c.runs >= bound || c.remap_join_target != 0) {
+                if c.remap_join_target == 0 {
+                    if c.last == 0 || c.last == c.coalesce_left || c.last == c.coalesce_right {
+                        return Err(corrupt());
+                    }
+                    // This attached appendable run cannot become a coalesce input
+                    // until the bounded joins and atomic retirement have finished.
+                    c.remap_join_target = c.last;
+                    c.remap_slot = 0;
                 }
+                let mut target_view = m;
+                target_view.run = c.remap_join_target;
+                let lists = u64::from(m.active_lists.max(1));
+                let end = super::memory::stored_end(c.remap_slot, lists, entry_limit as u64)?;
+                for list in c.remap_slot..end {
+                    tx.check_cancel()?;
+                    if c.unserviceable.is_none() {
+                        join_list(&mut tx, m, target_view, view, list as u32)?;
+                    }
+                }
+                c.remap_slot = end;
+                if end < lists {
+                    c.store(&mut tx, m)?;
+                    tx.publish_manifest(m)?;
+                    tx.commit()?;
+                    return Ok(progress);
+                }
+                let mut target = Run::load(&tx, m, c.remap_join_target)?;
+                if target.entries != 0 {
+                    let mut last = Entry::load(&tx, m, target.last)?;
+                    last.next = prepared.first;
+                    last.store(&mut tx, m, target.last)?;
+                } else {
+                    target.first = prepared.first;
+                }
+                target.last = prepared.last;
+                target.entries = target
+                    .entries
+                    .checked_add(prepared.entries)
+                    .ok_or_else(corrupt)?;
+                target.store(&mut tx, m, c.remap_join_target)?;
+                c.remap_join_target = 0;
+            } else if prepared.entries != 0 {
+                c.attach(&mut tx, m, c.remap_output, prepared)?;
+            }
+            if c.runs > self.policy.max_delta_runs {
+                start_coalesce(&mut tx, m, &mut c)?;
             }
             c.legacy_first = source_run.next;
             c.legacy_runs = c.legacy_runs.checked_sub(1).ok_or_else(corrupt)?;
@@ -1097,8 +1167,8 @@ impl<S: PageStore> ClusteredIndex<S> {
         if c.coalesce_output == 0 {
             return Ok(true);
         }
-        // Four descriptor/control reads, three control writes and one checked
-        // directory/link unit (<=six reads/writes) fit this format-derived bound.
+        // The control allowance plus ten actual payload reads/writes per joined
+        // directory/link unit bounds this operation, including repeated reads.
         let control = coalesce_control_pages(m)?;
         let units = page_limit.saturating_sub(control) / DIRECTORY_PAGES;
         if units == 0 {
@@ -1127,17 +1197,7 @@ impl<S: PageStore> ClusteredIndex<S> {
             if c.unserviceable.is_some() {
                 continue;
             }
-            let x = codec::directory(&tx, a, list)?;
-            let y = codec::directory(&tx, b, list)?;
-            if x.count != 0 && y.count != 0 {
-                codec::set_next_list_page(&mut tx, m, list, x.tail, y.head)?;
-            }
-            let joined = codec::Directory {
-                count: x.count.checked_add(y.count).ok_or_else(corrupt)?,
-                head: if x.count == 0 { y.head } else { x.head },
-                tail: if y.count == 0 { x.tail } else { y.tail },
-            };
-            codec::set_directory(&mut tx, out, list, joined)?;
+            join_directories(&mut tx, m, out, a, b, list)?;
         }
         c.coalesce_list = end;
         let complete = end == lists;
@@ -1209,4 +1269,39 @@ fn load_seal_book(
         return Ok(None);
     }
     Ok(Some(book))
+}
+
+/// Join fixed list boundaries without copying existing payloads or population metadata.
+fn join_directories(
+    tx: &mut impl WritePages,
+    m: Manifest,
+    out: Manifest,
+    a: Manifest,
+    b: Manifest,
+    list: u32,
+) -> Result<()> {
+    let x = codec::directory(tx, a, list)?;
+    let y = codec::directory(tx, b, list)?;
+    if x.count != 0 && y.count != 0 {
+        codec::set_next_list_page(tx, m, list, x.tail, y.head)?;
+    }
+    codec::set_directory(
+        tx,
+        out,
+        list,
+        codec::Directory {
+            count: x.count.checked_add(y.count).ok_or_else(corrupt)?,
+            head: if x.count == 0 { y.head } else { x.head },
+            tail: if y.count == 0 { x.tail } else { y.tail },
+        },
+    )
+}
+fn join_list(
+    tx: &mut impl WritePages,
+    m: Manifest,
+    target: Manifest,
+    prepared: Manifest,
+    list: u32,
+) -> Result<()> {
+    join_directories(tx, m, target, target, prepared, list)
 }

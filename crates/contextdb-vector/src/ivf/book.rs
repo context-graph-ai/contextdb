@@ -317,7 +317,26 @@ pub(crate) fn list_page_used(
             .ok_or_else(corrupt)?,
         &mut raw,
     )?;
-    usize::try_from(u64::from_le_bytes(raw)).map_err(|_| corrupt())
+    let capacity = m
+        .dimensions
+        .checked_add(16)
+        .filter(|n| *n != 0)
+        .map(|stride| PAGE_BYTES / stride)
+        .ok_or_else(corrupt)?;
+    let used = usize::try_from(u64::from_le_bytes(raw)).map_err(|_| corrupt())?;
+    if used > capacity {
+        let ordinal = id
+            .checked_sub(1)
+            .and_then(|n| n.checked_mul(8))
+            .ok_or_else(corrupt)?
+            / PAGE_BYTES as u64;
+        return Err(super::memory::corrupt_page(m.key(
+            PageKind::ListUsed,
+            list,
+            ordinal,
+        )));
+    }
+    Ok(used)
 }
 fn set_list_page_used(
     tx: &mut impl WritePages,

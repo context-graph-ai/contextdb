@@ -14,7 +14,6 @@ pub enum PageKind {
     Codebook,
     Accumulators,
     Reservoir,
-    Tombstones,
     Catalog,
     SlotMetadata,
     Tail,
@@ -141,6 +140,10 @@ pub trait WritePages: ReadPages {
 /// deletes, build, remap and coalescing. Separate handles may not allocate slots
 /// concurrently in one partition. After an outer native transaction aborts, its
 /// staged writer window is discarded/reopened before that handle is reused.
+/// Maintenance may call remap and coalescing in either order, with writes between
+/// calls; no adjacency is required. It invokes ClusteredIndex::inspect_catalog to
+/// persist the damage verdict before driving partition work, so read-only SHOW
+/// observes that verdict after the maintenance commit.
 pub trait PageStore: ReadPages {
     type Transaction<'a>: WritePages
     where

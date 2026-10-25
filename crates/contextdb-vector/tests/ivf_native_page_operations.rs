@@ -109,16 +109,7 @@ fn an_unsealed_insert_replays_and_a_committed_delete_survives_seal_and_reopen() 
     i.seal().unwrap();
     let storage = i.into_storage();
     let i = ClusteredIndex::new(storage, policy, training, budget.clone().into()).unwrap();
-    let m = i.storage().manifest(0).unwrap().unwrap();
-    let mut page = [0; PAGE_BYTES];
-    assert!(
-        i.storage()
-            .read_admitted_page(
-                m.key(PageKind::Tombstones, 0, 900 / (PAGE_BYTES / 24) as u64),
-                &mut page
-            )
-            .unwrap()
-    );
+    assert_eq!(i.current_row_identity(0, 900).unwrap(), None);
     for mode in [Mode::Exact, Mode::Indexed] {
         let (_, w) = search(
             i.storage(),

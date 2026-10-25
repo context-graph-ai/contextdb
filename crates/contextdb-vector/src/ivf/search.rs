@@ -297,6 +297,12 @@ fn search_impl(
                                     if e.lsn <= c.frontier || e.lsn > c.switch_lsn {
                                         continue;
                                     }
+                                } else if c.remap_join_target != 0 {
+                                    // Joined pages stay masked until the one retirement commit.
+                                    let e = metadata.entry(slot)?;
+                                    if e.prepared && e.run == c.remap_output {
+                                        continue;
+                                    }
                                 }
                                 if !is_visible(
                                     source,

@@ -26,6 +26,17 @@ pub(crate) fn directory_damage(
             }
             return Err(error);
         }
+        for list in 0..m.active_lists {
+            let d = codec::directory(source, view, list)?;
+            if d.tail != 0
+                && let Err(error) = super::book::list_page_used(source, m, list, d.tail)
+            {
+                if damaged_page(&error) {
+                    return Ok(Some(m.key(PageKind::ListUsed, list, 0)));
+                }
+                return Err(error);
+            }
+        }
         id = if root == 0 {
             c.first
         } else {

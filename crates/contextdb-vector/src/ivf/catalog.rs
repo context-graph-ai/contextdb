@@ -28,6 +28,7 @@ pub(crate) struct Catalog {
     pub remap_slot: u64,
     pub remap_examined: u64,
     pub remap_output: u64,
+    pub remap_join_target: u64,
     pub coalesce_left: u64,
     pub coalesce_right: u64,
     pub coalesce_output: u64,
@@ -65,8 +66,9 @@ impl Catalog {
             || (w[4] == 0) != (w[3] == 0)
             || w[4] >= w[1]
             || w[4] > m.slots
-            || w[8] != 0
-            || w[27] > 2
+            || (w[8] != 0
+                && (w[22] == 0 || w[8] >= w[1] || w[20] > u64::from(m.active_lists.max(1))))
+            || w[27] > 4
             || w[31] > 1
             || w[26] > u64::from(m.active_lists.max(1))
             || ((w[25] == 0) != (w[23] == 0))
@@ -107,6 +109,7 @@ impl Catalog {
             remap_slot: w[20],
             remap_examined: w[21],
             remap_output: w[22],
+            remap_join_target: w[8],
             coalesce_left: w[23],
             coalesce_right: w[24],
             coalesce_output: w[25],
@@ -117,10 +120,11 @@ impl Catalog {
                 Some(super::storage::PageKey {
                     partition: m.partition,
                     generation: m.generation,
-                    kind: if w[27] == 1 {
-                        PageKind::Codebook
-                    } else {
-                        PageKind::Directory
+                    kind: match w[27] {
+                        1 => PageKind::Codebook,
+                        2 => PageKind::Directory,
+                        3 => PageKind::ListUsed,
+                        _ => PageKind::Catalog,
                     },
                     list: u32::try_from(w[28]).map_err(|_| corrupt())?,
                     run: w[29],
@@ -141,7 +145,7 @@ impl Catalog {
             self.base_slots,
             self.tail_head,
             self.tail_end,
-            0,
+            self.remap_join_target,
             u64::from(old.is_some()),
             old.map_or(0, |x| x.generation),
             old.map_or(0, |x| x.dimensions as u64),
@@ -160,8 +164,12 @@ impl Catalog {
             self.coalesce_right,
             self.coalesce_output,
             u64::from(self.coalesce_list),
-            self.unserviceable
-                .map_or(0, |k| if k.kind == PageKind::Codebook { 1 } else { 2 }),
+            self.unserviceable.map_or(0, |k| match k.kind {
+                PageKind::Codebook => 1,
+                PageKind::Directory => 2,
+                PageKind::ListUsed => 3,
+                _ => 4,
+            }),
             self.unserviceable.map_or(0, |k| u64::from(k.list)),
             self.unserviceable.map_or(0, |k| k.run),
             self.unserviceable.map_or(0, |k| k.ordinal),
@@ -371,7 +379,8 @@ pub fn inspect(
         return Ok(None);
     };
     let c = Catalog::load(source, m)?;
-    let damage = super::recovery::inspect_damage(source, m, c)?;
+    // Read-only inspection never repeats derived-page verification or writes.
+    let damage = c.unserviceable;
     Ok(Some(CatalogState {
         delta_runs: c.runs,
         runs_over_cap: c.runs.saturating_sub(max_delta_runs),
