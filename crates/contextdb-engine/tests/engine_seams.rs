@@ -8,6 +8,8 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
     }
 }
 
+#[path = "engine_seams/a_bounded_search_waiting_for_a_commit_keeps_its_active_time.rs"]
+mod a_bounded_search_waiting_for_a_commit_keeps_its_active_time;
 #[path = "engine_seams/a_count_a_constraint_already_bounds_is_not_maintained.rs"]
 mod a_count_a_constraint_already_bounds_is_not_maintained;
 #[path = "engine_seams/a_declared_count_is_the_only_count_an_append_writes.rs"]
