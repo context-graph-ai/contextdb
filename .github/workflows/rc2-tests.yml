@@ -104,12 +104,21 @@ jobs:
           if [[ -n "${{ matrix.features }}" ]]; then
             args+=(--features "${{ matrix.features }}")
           fi
+          maintenance=()
+          if [[ "${{ matrix.crate }}" == contextdb-engine && "${{ matrix.features }}" == *test-seams* ]]; then
+            maintenance=(--skip paged_initial_replacement_and_reclamation_progress_under_writes::paged_initial_replacement_and_reclamation_progress_under_writes)
+          fi
           set +e
           # Test-harness targets get the one-thread flag. Benches are run
           # separately without it: a `harness = false` (criterion) bench
           # rejects libtest arguments such as `--test-threads`.
-          cargo test --locked "${args[@]}" --lib --bins --tests --examples -- --test-threads=1 2>&1 | tee "shard-out/${{ matrix.shard }}.log"
+          cargo test --locked "${args[@]}" --lib --bins --tests --examples -- --test-threads=1 "${maintenance[@]}" 2>&1 | tee "shard-out/${{ matrix.shard }}.log"
           status=${PIPESTATUS[0]}
+          if [[ "${#maintenance[@]}" -gt 0 ]]; then
+            bash scripts/ci-maintenance-journey.sh "shard-out/${{ matrix.shard }}-maintenance" "${args[@]}"
+            maintenance_status=$?
+            if [[ "$status" -eq 0 ]]; then status=$maintenance_status; fi
+          fi
           cargo test --locked "${args[@]}" --benches 2>&1 | tee -a "shard-out/${{ matrix.shard }}.log"
           bench_status=${PIPESTATUS[0]}
           if [[ "$status" -eq 0 ]]; then status=$bench_status; fi

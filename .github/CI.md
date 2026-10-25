@@ -141,7 +141,7 @@ CARGO_PROFILE_TEST_OPT_LEVEL, CARGO_PROFILE_TEST_DEBUG_ASSERTIONS or
 CARGO_PROFILE_TEST_OVERFLOW_CHECKS. The manifest-binding test checks manifest
 text; external Cargo configuration and environment can still override a local build.
 
-The engine-seams shard runs the initial-build/replacement/reclamation journey
+The PR/integration engine-seams shard and the rc2 engine test-seams shard run the initial-build/replacement/reclamation journey
 once through `scripts/ci-maintenance-journey.sh`, outside the ordinary libtest
 invocation. The helper compiles first, then applies a 600-second process limit
 with a five-second forced-cleanup grace to that exact case. Both logs and the helper’s exact
