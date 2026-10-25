@@ -288,31 +288,43 @@ pub enum BuildWriteClass {
 /// write boundaries.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BuildWriteEvent {
-    /// The disk admission decision for one write of `class`, taken before any
-    /// byte of that write reaches the store.
+    /// The disk admission decision for one write operation of `class`, taken
+    /// before any byte of that operation may reach the store.
     Admission {
+        /// Identifies this write operation; its executions carry the same id.
+        operation: u64,
         class: BuildWriteClass,
         context: Vec<Value>,
-        /// Bytes the write asks the store to grow by.
+        /// Bytes the write asks the store for.
         requested_bytes: u64,
+        /// The smallest store growth with which any valid layout, including a
+        /// smaller retry, could satisfy this write after reusing every free
+        /// block it is allowed to reuse.
+        minimum_growth_bytes: u64,
         /// The store's size when the decision was taken.
         current_store_bytes: u64,
-        /// The store's size if the write were admitted.
+        /// The store's size if the write is admitted with the layout chosen.
         projected_store_bytes: u64,
         /// The declared disk ceiling at the decision, if any.
         ceiling: Option<u64>,
         admitted: bool,
     },
-    /// An admitted write of `class` was executed against the store.
+    /// Bytes of a persisted build write of `class` actually reached the
+    /// store. Every execution is reported, whether or not an admission
+    /// admitted it.
     Written {
+        /// The admission operation this execution ran under; `None` when it
+        /// ran under no admission decision at all.
+        operation: Option<u64>,
         class: BuildWriteClass,
         context: Vec<Value>,
         bytes: u64,
     },
 }
 
-/// Calls `observer` for every persisted build write admission and execution
-/// that `operation` performs on the calling thread.
+/// Calls `observer` for every persisted build write admission decision and
+/// every actual build write execution that `operation` performs on the
+/// calling thread, in the order they happen.
 pub fn observe_build_writes<T>(
     _observer: Arc<dyn Fn(&BuildWriteEvent) + Send + Sync>,
     _operation: impl FnOnce() -> T,
@@ -509,4 +521,18 @@ pub fn last_build_refusal(
     _context: &[Value],
 ) -> Option<contextdb_core::Error> {
     unimplemented!("{UNBOUND}: the last build refusal")
+}
+
+/// While it lives, writes of the named build class are never satisfied from
+/// reusable free space: each one can only be placed by growing the store.
+/// Every other write reuses free space as usual.
+pub struct ReusableSpaceWithheld {
+    _private: (),
+}
+
+pub fn withhold_reusable_space_from(
+    _db: &Database,
+    _class: BuildWriteClass,
+) -> ReusableSpaceWithheld {
+    unimplemented!("{UNBOUND}: withholding reusable space from one build class")
 }
