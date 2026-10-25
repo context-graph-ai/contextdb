@@ -14,9 +14,9 @@
 //! - a deletion writes only the row journal (row versions and row copies) and
 //!   visibility pages, and stays in force after the generation it was made
 //!   under retires and its pages are reclaimed, through reopen;
-//! - catalog inspection reads no codebook or directory page, healthy or
-//!   damaged, and still reports the rebuild recovery action once a write has
-//!   met the damage;
+//! - a repeated catalog inspection, and any inspection over a recorded
+//!   verdict, reads no codebook or directory page, and inspection reports
+//!   the rebuild recovery action once a write has met the damage;
 //! - a stored list-page used count above what a page holds never panics a
 //!   seal: writes commit, EXACT answers, and inspection shows the rebuild
 //!   action; a stored remap cursor past its run's entries is store
@@ -395,12 +395,18 @@ fn catalog_inspection_reads_no_codebook_or_directory_page_and_reports_known_dama
         PageKind::Directory,
         PageKind::DirectoryPresence,
     ];
-    let inspect_twice = |index: &ClusteredIndex<Hiding>, when: &str| {
+    // The first inspection in an admitted manifest window may verify an
+    // unrecorded partition; a repeated one, or any over a recorded verdict,
+    // reads none of these pages.
+    let inspect_twice = |index: &ClusteredIndex<Hiding>, when: &str, first_may_verify: bool| {
         let mut states = Vec::new();
         for call in 0..2 {
             index.storage().reads.borrow_mut().clear();
             states.push(inspect_catalog(index.storage(), 0, cap).unwrap().unwrap());
             let reads = index.storage().reads.borrow();
+            if call == 0 && first_may_verify {
+                continue;
+            }
             for kind in derived {
                 assert_eq!(
                     reads.get(&kind).copied().unwrap_or(0),
@@ -413,7 +419,7 @@ fn catalog_inspection_reads_no_codebook_or_directory_page_and_reports_known_dama
         states[0]
     };
     assert_eq!(
-        inspect_twice(&index, "healthy").recovery_action,
+        inspect_twice(&index, "healthy", true).recovery_action,
         None,
         "a healthy partition shows no recovery action"
     );
@@ -427,7 +433,7 @@ fn catalog_inspection_reads_no_codebook_or_directory_page_and_reports_known_dama
         .seal()
         .expect("a seal over the damaged codebook commits");
     assert_eq!(
-        inspect_twice(&index, "after a seal met the damage").recovery_action,
+        inspect_twice(&index, "after a seal met the damage", false).recovery_action,
         Some("rebuild"),
         "the damage the seal met is reported without re-reading the codebook"
     );

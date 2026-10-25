@@ -11,7 +11,9 @@
 //! they wrap, and `port_identity` returns `port.index_identity().clone()`;
 //! those are the only edits this file is meant to receive. The page port's
 //! LSN accessors, `snapshot_lsn` (the pinned frontier) and `commit_lsn` (the
-//! committing transaction's LSN), are forwarded the same way, unchanged.
+//! committing transaction's LSN), are forwarded the same way, unchanged, as
+//! are the inspection-verdict cache accessors (`inspection_verdict` and
+//! `record_inspection_verdict`) when the port gains them.
 #![allow(dead_code)]
 use super::ivf_pages;
 use contextdb_core::{Result, VectorIndexRef};
