@@ -261,6 +261,31 @@ fn incoming_purge_atomically_destroys_present_rows_and_adopts_absent_roots() {
 
 #[test]
 fn purge_commits_row_blob_roles_and_delivery_together_or_not_at_all() {
+    const PRIVATE_RUNTIME: &str = "CONTEXTDB_BLOB_PURGE_PRIVATE_RUNTIME";
+    if std::env::var_os(PRIVATE_RUNTIME).is_none() {
+        let runtime = tempfile::tempdir().expect("private purge runtime root");
+        let filter = format!(
+            "{}::purge_commits_row_blob_roles_and_delivery_together_or_not_at_all",
+            module_path!()
+                .split_once("::")
+                .expect("crate-qualified module")
+                .1
+        );
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
+            .env(PRIVATE_RUNTIME, "1")
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("CONTEXTDB_OWNER_READ_RUNTIME_DIR", runtime.path())
+            .output()
+            .expect("run purge proof with its private runtime root");
+        assert!(
+            output.status.success(),
+            "isolated purge proof failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let (root, db) = open_ledger();
     let path = root.path().join("engine-held-blobs.redb");
     let complete_bytes = b"complete-engine-held-detection-media";
