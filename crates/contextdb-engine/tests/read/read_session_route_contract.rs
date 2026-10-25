@@ -734,21 +734,25 @@ fn writer_winning_the_direct_open_boundary_retries_once_into_the_real_owner() {
 
     owner.kill().expect("stop the selected startup-race owner");
     owner.wait().expect("reap the selected startup-race owner");
-    assert!(matches!(
-        session.request_owner("startup-race", &challenge),
-        Err(Error::ReadFailure(failure)) if failure.kind() == ReadFailureKind::OwnerDisconnected
-    ));
+    let after_owner_exit = session.request_owner("startup-race", &challenge);
+    assert!(
+        matches!(&after_owner_exit,
+            Err(Error::ReadFailure(failure)) if failure.kind() == ReadFailureKind::OwnerNotRunning
+        ),
+        "an administrative request resolves the current owner after exit: {after_owner_exit:?}"
+    );
+    assert_eq!(session.route(), ReadRoute::File);
     let after_disconnect = session
         .route_resources_for_test()
-        .expect("inspect the fixed route after selected-owner disconnect");
+        .expect("inspect the current file route after selected-owner exit");
     assert_eq!(after_disconnect.channel_identity, selected.channel_identity);
     assert_eq!(
         after_disconnect.direct_backend_opens,
-        selected.direct_backend_opens
+        selected.direct_backend_opens.saturating_add(1)
     );
     assert_eq!(
         after_disconnect.local_channel_operations,
-        selected.local_channel_operations.saturating_add(1),
+        selected.local_channel_operations,
     );
     let final_events = route_resolution_events(&observer.events());
     assert_eq!(
@@ -765,9 +769,9 @@ fn writer_winning_the_direct_open_boundary_retries_once_into_the_real_owner() {
                 **event == (ReadSessionEvent::BeforeDirectBackendOpen { attempt: 1 })
             })
             .count(),
-        1,
+        2,
     );
-    assert!(!final_events.contains(&ReadSessionEvent::RouteSelected(ReadRoute::File)));
+    assert!(final_events.contains(&ReadSessionEvent::RouteSelected(ReadRoute::File)));
 }
 
 #[test]
