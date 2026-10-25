@@ -1,6 +1,7 @@
 //! Page-port adapters for the clustered kernel guards. `Hiding` wraps the
-//! native page fixture: it can hide one page kind or one exact page (a
-//! missing page, as a lost or unreachable native page reads), and it counts
+//! native page fixture: it can hide one page kind, one exact page (a
+//! missing page, as a lost or unreachable native page reads) or every page of
+//! one generation (as after that generation is reclaimed), and it counts
 //! reads by kind,
 //! for reads through the store and through every transaction the store
 //! begins alike, so a guard pins what the kernel sees, not the path it reads
@@ -26,6 +27,9 @@ pub struct Hiding {
     pub inner: ivf_pages::Pages,
     pub hide: Cell<Option<PageKind>>,
     pub hide_key: Cell<Option<PageKey>>,
+    /// Every page of this generation reads as missing, as after the
+    /// generation's pages are reclaimed.
+    pub hide_generation: Cell<Option<u64>>,
     pub reads: RefCell<BTreeMap<PageKind, u64>>,
 }
 impl ReadPages for Hiding {
@@ -52,7 +56,10 @@ impl ReadPages for Hiding {
     }
     fn read_admitted_page(&self, key: PageKey, output: &mut [u8; PAGE_BYTES]) -> Result<bool> {
         *self.reads.borrow_mut().entry(key.kind).or_default() += 1;
-        if self.hide.get() == Some(key.kind) || self.hide_key.get() == Some(key) {
+        if self.hide.get() == Some(key.kind)
+            || self.hide_key.get() == Some(key)
+            || self.hide_generation.get() == Some(key.generation)
+        {
             return Ok(false);
         }
         self.inner.read_admitted_page(key, output)
@@ -68,12 +75,14 @@ impl PageStore for Hiding {
             inner,
             hide,
             hide_key,
+            hide_generation,
             reads,
         } = self;
         Ok(HidingTransaction {
             inner: inner.begin()?,
             hide: hide.get(),
             hide_key: hide_key.get(),
+            hide_generation: hide_generation.get(),
             reads,
         })
     }
@@ -85,6 +94,7 @@ pub struct HidingTransaction<'a> {
     inner: ivf_pages::Transaction<'a>,
     hide: Option<PageKind>,
     hide_key: Option<PageKey>,
+    hide_generation: Option<u64>,
     reads: &'a RefCell<BTreeMap<PageKind, u64>>,
 }
 impl ReadPages for HidingTransaction<'_> {
@@ -111,7 +121,10 @@ impl ReadPages for HidingTransaction<'_> {
     }
     fn read_admitted_page(&self, key: PageKey, output: &mut [u8; PAGE_BYTES]) -> Result<bool> {
         *self.reads.borrow_mut().entry(key.kind).or_default() += 1;
-        if self.hide == Some(key.kind) || self.hide_key == Some(key) {
+        if self.hide == Some(key.kind)
+            || self.hide_key == Some(key)
+            || self.hide_generation == Some(key.generation)
+        {
             return Ok(false);
         }
         self.inner.read_admitted_page(key, output)
