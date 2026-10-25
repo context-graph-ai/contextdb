@@ -113,7 +113,13 @@ fn seeded() -> Raw {
         .flush_commit_index_entries(&BTreeMap::from([(Lsn(1), TxId(1))]))
         .expect("seed one commit-index entry");
     raw.store
-        .update_sink_queue_entry("note_sink", None, Some((1, &"queued".to_string())), false, 1)
+        .update_sink_queue_entry(
+            "note_sink",
+            None,
+            Some((1, &"queued".to_string())),
+            false,
+            1,
+        )
         .expect("seed one sink-queue entry");
     raw.store
         .append_trigger_audit(0, &audit())
@@ -211,7 +217,10 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::persistence::RedbPersistence::flush_data_with_logs",
             drive: || {
                 let raw = seeded();
-                call(|| raw.store.flush_data_with_logs(&write_set(2), &[insert_entry(2)]))
+                call(|| {
+                    raw.store
+                        .flush_data_with_logs(&write_set(2), &[insert_entry(2)])
+                })
             },
         },
         Row {
@@ -314,7 +323,10 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::persistence::RedbPersistence::rewrite_commit_index",
             drive: || {
                 let raw = seeded();
-                call(|| raw.store.rewrite_commit_index(&BTreeMap::from([(Lsn(1), TxId(1))])))
+                call(|| {
+                    raw.store
+                        .rewrite_commit_index(&BTreeMap::from([(Lsn(1), TxId(1))]))
+                })
             },
         },
         Row {
@@ -426,7 +438,10 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::persistence::RedbPersistence::prune_vectors_and_edges_scoped",
             drive: || {
                 let raw = seeded();
-                call(|| raw.store.prune_vectors_and_edges_scoped(&[vector()], &[edge()]))
+                call(|| {
+                    raw.store
+                        .prune_vectors_and_edges_scoped(&[vector()], &[edge()])
+                })
             },
         },
         Row {

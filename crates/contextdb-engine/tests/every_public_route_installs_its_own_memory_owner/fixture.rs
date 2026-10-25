@@ -90,7 +90,10 @@ pub fn populate(db: &Database) {
         )
         .unwrap_or_else(|error| panic!("fixture breadth row {id} failed: {error:?}"));
     }
-    run(db, "UPDATE breadth_rows SET body = 'replacement' WHERE id = 1");
+    run(
+        db,
+        "UPDATE breadth_rows SET body = 'replacement' WHERE id = 1",
+    );
     for _ in 0..8 {
         if ["embedding", "compressed"].iter().all(|column| {
             db.__debug_vector_hnsw_build_serial_for_test(VectorIndexRef::new(

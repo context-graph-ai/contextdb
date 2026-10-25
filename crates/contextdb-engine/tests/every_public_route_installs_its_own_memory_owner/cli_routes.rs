@@ -2,9 +2,9 @@
 //! on a healthy store with well-formed arguments each must exit 0.
 
 use super::fixture::Store;
-use std::io::Write;
 use super::{Outcome, Row, call};
 use contextdb_engine::vector_read_memory::DeclaredReadMemory;
+use std::io::Write;
 
 const READER_LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -45,7 +45,11 @@ pub fn rows() -> Vec<Row> {
             drive: || -> Outcome {
                 let (dir, path) = Store::closed();
                 let args = snapshot_args(dir.path(), &path);
-                strict(call(|| exit(contextdb_cli::ops::run_operational("snapshot", &args, factory))))
+                strict(call(|| {
+                    exit(contextdb_cli::ops::run_operational(
+                        "snapshot", &args, factory,
+                    ))
+                }))
             },
         },
         Row {
@@ -58,7 +62,9 @@ pub fn rows() -> Vec<Row> {
                     "sync-apply-state".to_string(),
                     path.display().to_string(),
                 ];
-                strict(call(|| exit(contextdb_cli::ops::dispatch_if_subcommand(&args, factory))))
+                strict(call(|| {
+                    exit(contextdb_cli::ops::dispatch_if_subcommand(&args, factory))
+                }))
             },
         },
         Row {
@@ -105,8 +111,7 @@ impl StdinFrom {
         // SAFETY: `fds` is a valid two-element array for pipe(2).
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "fixture pipe");
         // SAFETY: the write end was just created and is owned here.
-        let mut writer =
-            unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]) };
+        let mut writer = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]) };
         writer
             .write_all(script)
             .expect("fixture script fits the pipe");
@@ -115,7 +120,11 @@ impl StdinFrom {
         // end of the pipe this function owns.
         let saved = unsafe { libc::dup(0) };
         assert!(saved >= 0, "fixture saves stdin");
-        assert_eq!(unsafe { libc::dup2(fds[0], 0) }, 0, "fixture redirects stdin");
+        assert_eq!(
+            unsafe { libc::dup2(fds[0], 0) },
+            0,
+            "fixture redirects stdin"
+        );
         unsafe { libc::close(fds[0]) };
         Self { saved }
     }

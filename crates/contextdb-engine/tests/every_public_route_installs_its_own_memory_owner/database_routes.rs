@@ -221,7 +221,10 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 call(|| {
                     let db = Database::open_memory_with_contexts(contexts());
-                    db.execute("CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)", &none())
+                    db.execute(
+                        "CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)",
+                        &none(),
+                    )
                 })
             },
         },
@@ -230,7 +233,10 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 call(|| {
                     let db = Database::open_memory_with_scope_labels(labels());
-                    db.execute("CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)", &none())
+                    db.execute(
+                        "CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)",
+                        &none(),
+                    )
                 })
             },
         },
@@ -239,7 +245,10 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 call(|| {
                     let db = Database::open_memory_as_principal(Principal::Agent("route".into()));
-                    db.execute("CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)", &none())
+                    db.execute(
+                        "CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)",
+                        &none(),
+                    )
                 })
             },
         },
@@ -252,7 +261,10 @@ pub fn rows() -> Vec<Row> {
                         Some(labels()),
                         Some(Principal::Agent("route".into())),
                     );
-                    db.execute("CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)", &none())
+                    db.execute(
+                        "CREATE TABLE plain (id INTEGER PRIMARY KEY, body TEXT)",
+                        &none(),
+                    )
                 })
             },
         },
@@ -279,8 +291,13 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = Store::open();
                 call(|| {
-                    store.db.execute("SELECT id, body FROM notes ORDER BY id", &none())?;
-                    store.db.execute("SELECT id, bucket, embedding FROM breadth_rows ORDER BY id", &none())?;
+                    store
+                        .db
+                        .execute("SELECT id, body FROM notes ORDER BY id", &none())?;
+                    store.db.execute(
+                        "SELECT id, bucket, embedding FROM breadth_rows ORDER BY id",
+                        &none(),
+                    )?;
                     store.db.execute(
                         "SELECT id FROM notes ORDER BY embedding <=> $query LIMIT 2",
                         &params(&[("query", Value::Vector(vec![1.0, 1.0, 0.5]))]),
@@ -348,7 +365,11 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::Database::explain_output",
             drive: || {
                 let store = Store::open();
-                call(|| store.db.explain_output("SELECT id FROM notes WHERE bucket = 1"))
+                call(|| {
+                    store
+                        .db
+                        .explain_output("SELECT id FROM notes WHERE bucket = 1")
+                })
             },
         },
         // Transactions and rows.
@@ -357,7 +378,10 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = Store::open();
                 let tx = store.db.begin().expect("fixture transaction");
-                store.db.insert_row(tx, "notes", note(42)).expect("fixture staged row");
+                store
+                    .db
+                    .insert_row(tx, "notes", note(42))
+                    .expect("fixture staged row");
                 call(|| store.db.commit(tx))
             },
         },
@@ -366,7 +390,10 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = Store::open();
                 let tx = store.db.begin().expect("fixture transaction");
-                store.db.insert_row(tx, "notes", note(43)).expect("fixture staged row");
+                store
+                    .db
+                    .insert_row(tx, "notes", note(43))
+                    .expect("fixture staged row");
                 call(|| store.db.commit_returning_txid(tx))
             },
         },
@@ -432,7 +459,11 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = Store::open();
                 let snapshot = store.db.snapshot();
-                call(|| store.db.point_lookup("notes", "id", &Value::Int64(2), snapshot))
+                call(|| {
+                    store
+                        .db
+                        .point_lookup("notes", "id", &Value::Int64(2), snapshot)
+                })
             },
         },
         Row {
@@ -442,7 +473,9 @@ pub fn rows() -> Vec<Row> {
                 let lsn = store.db.current_lsn();
                 call(|| {
                     let snapshot = store.db.snapshot_at(lsn);
-                    store.db.execute_at_snapshot("SELECT id FROM notes", &none(), snapshot)
+                    store
+                        .db
+                        .execute_at_snapshot("SELECT id FROM notes", &none(), snapshot)
                 })
             },
         },
@@ -468,7 +501,11 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = Store::open();
                 let tx = store.db.begin().expect("fixture transaction");
-                call(|| store.db.delete_edge(tx, source_node(), target_node(), EDGE_TYPE))
+                call(|| {
+                    store
+                        .db
+                        .delete_edge(tx, source_node(), target_node(), EDGE_TYPE)
+                })
             },
         },
         Row {
@@ -501,7 +538,11 @@ pub fn rows() -> Vec<Row> {
                     .db
                     .insert_row(tx, "notes", note(45))
                     .expect("fixture staged row");
-                call(|| store.db.insert_vector(tx, notes_index(), row, vec![4.0, 1.0, 0.5]))
+                call(|| {
+                    store
+                        .db
+                        .insert_vector(tx, notes_index(), row, vec![4.0, 1.0, 0.5])
+                })
             },
         },
         Row {
@@ -518,7 +559,11 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = Store::open();
                 let snapshot = store.db.snapshot();
-                call(|| store.db.query_vector(notes_index(), &[1.0, 1.0, 0.5], 2, None, snapshot))
+                call(|| {
+                    store
+                        .db
+                        .query_vector(notes_index(), &[1.0, 1.0, 0.5], 2, None, snapshot)
+                })
             },
         },
         Row {
@@ -526,9 +571,12 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = Store::open();
                 call(|| {
-                    store
-                        .db
-                        .semantic_search(SemanticQuery::new("notes", "embedding", vec![1.0, 1.0, 0.5], 2))
+                    store.db.semantic_search(SemanticQuery::new(
+                        "notes",
+                        "embedding",
+                        vec![1.0, 1.0, 0.5],
+                        2,
+                    ))
                 })
             },
         },
@@ -561,8 +609,12 @@ pub fn rows() -> Vec<Row> {
                     &session,
                 )
                 .expect("fixture session open");
-                run(&db, "INSERT INTO notes (id, bucket, body, embedding) VALUES (46, 0, 'tail', [5.0, 1.0, 0.5])");
-                let route = VectorPartitionRef::new(notes_index(), VectorPartitionKey::unpartitioned());
+                run(
+                    &db,
+                    "INSERT INTO notes (id, bucket, body, embedding) VALUES (46, 0, 'tail', [5.0, 1.0, 0.5])",
+                );
+                let route =
+                    VectorPartitionRef::new(notes_index(), VectorPartitionKey::unpartitioned());
                 call_unit(|| db.detach_writer_vector_session(&session, &route))
             },
         },
@@ -577,7 +629,8 @@ pub fn rows() -> Vec<Row> {
                     &session,
                 )
                 .expect("fixture session open");
-                let route = VectorPartitionRef::new(notes_index(), VectorPartitionKey::unpartitioned());
+                let route =
+                    VectorPartitionRef::new(notes_index(), VectorPartitionKey::unpartitioned());
                 db.detach_writer_vector_session(&session, &route);
                 call_unit(|| db.reattach_writer_vector_session(&session))
             },
@@ -639,7 +692,11 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = Store::open();
                 let changes = store.db.changes_since(Lsn(0)).expect("fixture change set");
-                let vector = changes.vectors.first().cloned().expect("fixture vector change");
+                let vector = changes
+                    .vectors
+                    .first()
+                    .cloned()
+                    .expect("fixture vector change");
                 call(|| store.db.vector_change_arrived_by_sync(&vector))
             },
         },
@@ -704,7 +761,11 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::Database::set_maintenance_poll_interval",
             drive: || {
                 let store = Store::open();
-                call(|| store.db.set_maintenance_poll_interval(Duration::from_secs(3600)))
+                call(|| {
+                    store
+                        .db
+                        .set_maintenance_poll_interval(Duration::from_secs(3600))
+                })
             },
         },
         Row {
@@ -719,9 +780,9 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = Store::open();
                 call(|| {
-                    store
-                        .db
-                        .set_storage_compaction(&contextdb_parser::StorageCompactionSetting::Default)
+                    store.db.set_storage_compaction(
+                        &contextdb_parser::StorageCompactionSetting::Default,
+                    )
                 })
             },
         },
@@ -729,7 +790,11 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::Database::set_vector_serving_cache_bytes",
             drive: || {
                 let store = Store::open();
-                call(|| store.db.set_vector_serving_cache_bytes(Some(4 * 1024 * 1024)))
+                call(|| {
+                    store
+                        .db
+                        .set_vector_serving_cache_bytes(Some(4 * 1024 * 1024))
+                })
             },
         },
         Row {
@@ -783,7 +848,11 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::Database::memory_held_received_schema_units",
             drive: || {
                 let store = Store::open();
-                call(|| store.db.memory_held_received_schema_units(&TenantId::from(TENANT)))
+                call(|| {
+                    store
+                        .db
+                        .memory_held_received_schema_units(&TenantId::from(TENANT))
+                })
             },
         },
         Row {
@@ -924,7 +993,10 @@ pub fn rows() -> Vec<Row> {
                     .db
                     .register_trigger_callback("notes_written", |_, _| Ok(()))
                     .expect("fixture trigger callback");
-                run(&store.db, "INSERT INTO notes (id, bucket, body) VALUES (49, 1, 'audited')");
+                run(
+                    &store.db,
+                    "INSERT INTO notes (id, bucket, body) VALUES (49, 1, 'audited')",
+                );
                 call(|| {
                     store.db.trigger_audit_history(TriggerAuditFilter {
                         trigger_name: None,
@@ -1008,12 +1080,7 @@ pub fn rows() -> Vec<Row> {
                 )
                 .expect("fixture inspector");
                 call(|| {
-                    inspector.inspect_key(
-                        "notes",
-                        &key(2),
-                        &["body".to_string()],
-                        root.child()?,
-                    )
+                    inspector.inspect_key("notes", &key(2), &["body".to_string()], root.child()?)
                 })
             },
         },
@@ -1023,12 +1090,9 @@ pub fn rows() -> Vec<Row> {
                 let (_dir, path) = Store::closed();
                 let root = DeclaredReadMemory::from_reader_limit(READER_LIMIT)
                     .expect("fixture reader root");
-                let inspector = SnapshotInspector::open(
-                    &path,
-                    root.child().expect("fixture reader"),
-                    root,
-                )
-                .expect("fixture inspector");
+                let inspector =
+                    SnapshotInspector::open(&path, root.child().expect("fixture reader"), root)
+                        .expect("fixture inspector");
                 call(|| inspector.inspect_blob([7; 32]))
             },
         },
@@ -1038,12 +1102,9 @@ pub fn rows() -> Vec<Row> {
                 let (_dir, path) = Store::closed();
                 let root = DeclaredReadMemory::from_reader_limit(READER_LIMIT)
                     .expect("fixture reader root");
-                let inspector = SnapshotInspector::open(
-                    &path,
-                    root.child().expect("fixture reader"),
-                    root,
-                )
-                .expect("fixture inspector");
+                let inspector =
+                    SnapshotInspector::open(&path, root.child().expect("fixture reader"), root)
+                        .expect("fixture inspector");
                 call(|| inspector.inspect_sync_apply_state())
             },
         },

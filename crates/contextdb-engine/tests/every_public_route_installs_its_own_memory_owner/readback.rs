@@ -50,7 +50,11 @@ fn a_checkpoint_export_reopens_with_every_seeded_row() {
     for (name, source) in [("file-backed", file.db.clone()), ("in-memory", memory)] {
         let expected = contents(&source);
         assert_eq!(expected.0[0].len(), 3, "the fixture seeds three notes");
-        assert_eq!(expected.0[1].len(), 4, "the fixture seeds four breadth rows");
+        assert_eq!(
+            expected.0[1].len(),
+            4,
+            "the fixture seeds four breadth rows"
+        );
         let artifact = file.sibling(&format!("{name}-export.db"));
         on_fresh_thread(|| source.export_snapshot(&artifact))
             .unwrap_or_else(|error| panic!("a {name} store exports its checkpoint: {error:?}"));

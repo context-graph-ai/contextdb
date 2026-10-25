@@ -92,8 +92,7 @@ fn edge_with_own_work() -> Pair {
     let pair = Pair::serve(true);
     install_work_ledger_schema(&pair.hub.db).expect("fixture hub ledger");
     install_work_ledger_schema(&pair.edge.db).expect("fixture edge ledger");
-    submit_job(&pair.edge.db, &job(WORKER), &[b"work input".as_slice()])
-        .expect("fixture edge job");
+    submit_job(&pair.edge.db, &job(WORKER), &[b"work input".as_slice()]).expect("fixture edge job");
     pair
 }
 
@@ -187,9 +186,13 @@ pub fn rows() -> Vec<Row> {
                     || async {
                         let log = EventLog::at(tracing::Level::DEBUG);
                         let _events = log.install();
-                        let polled =
-                            poll_and_execute_once(&pair.client()?, &config(), executor(&done), now_ms())
-                                .await?;
+                        let polled = poll_and_execute_once(
+                            &pair.client()?,
+                            &config(),
+                            executor(&done),
+                            now_ms(),
+                        )
+                        .await?;
                         Ok::<_, contextdb_core::Error>((polled, log.text()))
                     },
                     executed_the_hub_job,

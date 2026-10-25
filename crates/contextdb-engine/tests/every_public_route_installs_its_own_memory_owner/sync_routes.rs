@@ -129,7 +129,10 @@ pub fn rows() -> Vec<Row> {
                     for pair in [&pair, &memory] {
                         let client = pair.client()?;
                         client.pull_default().await?;
-                        run(&pair.hub.db, "INSERT INTO notes (id, bucket, body) VALUES (60, 0, 'later')");
+                        run(
+                            &pair.hub.db,
+                            "INSERT INTO notes (id, bucket, body) VALUES (60, 0, 'later')",
+                        );
                         client.pull_default().await?;
                     }
                     Ok::<_, contextdb_core::Error>(())
@@ -160,7 +163,10 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::SyncClient::push",
             drive: || {
                 let pair = Pair::serve(true);
-                run(&pair.edge.db, "INSERT INTO notes (id, bucket, body) VALUES (61, 1, 'pushed')");
+                run(
+                    &pair.edge.db,
+                    "INSERT INTO notes (id, bucket, body) VALUES (61, 1, 'pushed')",
+                );
                 call_async(|| async { pair.client()?.push().await })
             },
         },
@@ -168,7 +174,10 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::SyncClient::push_with_read_memory",
             drive: || {
                 let pair = Pair::serve(true);
-                run(&pair.edge.db, "INSERT INTO notes (id, bucket, body) VALUES (62, 0, 'pushed')");
+                run(
+                    &pair.edge.db,
+                    "INSERT INTO notes (id, bucket, body) VALUES (62, 0, 'pushed')",
+                );
                 call_async(|| async {
                     pair.client()?
                         .push_with_read_memory(pair.edge.db.declared_reader_memory()?)
@@ -201,11 +210,7 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::SyncClient::fetch_delivery_outcomes",
             drive: || {
                 let pair = Pair::serve(true);
-                call_async(|| async {
-                    pair.client()?
-                        .fetch_delivery_outcomes(None)
-                        .await
-                })
+                call_async(|| async { pair.client()?.fetch_delivery_outcomes(None).await })
             },
         },
         Row {

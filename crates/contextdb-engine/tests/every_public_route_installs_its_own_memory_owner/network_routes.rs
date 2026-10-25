@@ -16,8 +16,8 @@ use contextdb_engine::{BlobStore, FabricIdentity, SyncClient, SyncServer};
 use contextdb_server::transport::iroh::IrohServer;
 use contextdb_server::{peer_bind_spec, peer_dial_spec};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A read budget a host supplies for its own requests: it admits every
 /// reservation and keeps a count.
@@ -188,7 +188,9 @@ fn blob_pair() -> BlobPair {
     holder.ingest_bytes(PAYLOAD).expect("fixture holder blob");
     {
         let _context = hub.runtime.enter();
-        holder.serve_on(hub.endpoint()).expect("fixture holder serving");
+        holder
+            .serve_on(hub.endpoint())
+            .expect("fixture holder serving");
     }
     let consumer = BlobStore::new(hub.edge.db.clone(), policy, consumer_key);
     let ticket = hub.endpoint().ticket();
@@ -297,7 +299,9 @@ pub fn rows() -> Vec<Row> {
                 let flag = Arc::new(AtomicBool::new(false));
                 let stop = {
                     let _context = hub.runtime.enter();
-                    server.native_stop(flag.clone()).expect("fixture native stop")
+                    server
+                        .native_stop(flag.clone())
+                        .expect("fixture native stop")
                 };
                 hub.runtime
                     .spawn(async move { server.run_until_stopped(stop).await });
@@ -379,7 +383,12 @@ pub fn rows() -> Vec<Row> {
                         .map_err(|error| format!("{error:?}"))?;
                     let mut sink = Vec::new();
                     pair.consumer
-                        .resolve_blob_ref_with_read_memory(memory, &pair.hash, &pair.ticket, &mut sink)
+                        .resolve_blob_ref_with_read_memory(
+                            memory,
+                            &pair.hash,
+                            &pair.ticket,
+                            &mut sink,
+                        )
                         .await
                         .map_err(|error| format!("{error:?}"))
                 })

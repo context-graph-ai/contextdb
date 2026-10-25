@@ -30,10 +30,10 @@ mod listed_routes;
 mod network_routes;
 #[path = "every_public_route_installs_its_own_memory_owner/persistence_routes.rs"]
 mod persistence_routes;
-#[path = "every_public_route_installs_its_own_memory_owner/readback.rs"]
-mod readback;
 #[path = "every_public_route_installs_its_own_memory_owner/read_session_routes.rs"]
 mod read_session_routes;
+#[path = "every_public_route_installs_its_own_memory_owner/readback.rs"]
+mod readback;
 #[path = "every_public_route_installs_its_own_memory_owner/server_routes.rs"]
 mod server_routes;
 #[path = "every_public_route_installs_its_own_memory_owner/sync_routes.rs"]
@@ -80,7 +80,11 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
     payload
         .downcast_ref::<String>()
         .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_string()))
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+        })
         .unwrap_or_else(|| "a panic without a message".to_string())
 }
 
@@ -530,11 +534,26 @@ const VECTOR_STORE_ROUTES: &[&str] = &[
 /// depends on no other workspace crate; its traced call chain is a name
 /// match of `std::fs::metadata` against the engine's custody `metadata`.
 const CANNOT_REACH_EITHER_REFUSAL: &[(&str, &str)] = &[
-    ("hnsw_rs::datamap::DataMap::from_hnswdump", "contextdb-hnsw depends on no workspace crate"),
-    ("hnsw_rs::hnswio::DumpInit::new", "contextdb-hnsw depends on no workspace crate"),
-    ("hnsw_rs::hnswio::HnswIo::load_hnsw", "contextdb-hnsw depends on no workspace crate"),
-    ("hnsw_rs::hnswio::HnswIo::load_hnsw_owned", "contextdb-hnsw depends on no workspace crate"),
-    ("hnsw_rs::hnswio::HnswIo::load_hnsw_owned_with_dist", "contextdb-hnsw depends on no workspace crate"),
+    (
+        "hnsw_rs::datamap::DataMap::from_hnswdump",
+        "contextdb-hnsw depends on no workspace crate",
+    ),
+    (
+        "hnsw_rs::hnswio::DumpInit::new",
+        "contextdb-hnsw depends on no workspace crate",
+    ),
+    (
+        "hnsw_rs::hnswio::HnswIo::load_hnsw",
+        "contextdb-hnsw depends on no workspace crate",
+    ),
+    (
+        "hnsw_rs::hnswio::HnswIo::load_hnsw_owned",
+        "contextdb-hnsw depends on no workspace crate",
+    ),
+    (
+        "hnsw_rs::hnswio::HnswIo::load_hnsw_owned_with_dist",
+        "contextdb-hnsw depends on no workspace crate",
+    ),
 ];
 
 fn driven_rows() -> Vec<Row> {
@@ -573,7 +592,10 @@ fn the_route_table_names_every_refusal_reachable_route_once() {
             .filter(|route| !seen.insert(*route))
             .collect()
     };
-    assert!(repeated.is_empty(), "routes accounted for twice: {repeated:?}");
+    assert!(
+        repeated.is_empty(),
+        "routes accounted for twice: {repeated:?}"
+    );
     let missing: Vec<&&str> = listed.difference(&unique).collect();
     let extra: Vec<&&str> = unique.difference(&listed).collect();
     assert!(
@@ -599,14 +621,18 @@ fn a_positive_expectation_fails_every_refusal_and_every_wrong_answer() {
         contextdb_core::Error::ReadCancelled,
         contextdb_core::Error::Other("an unrelated refusal".into()),
     ] {
-        let outcome = call_async_expecting(
-            move || async move { Err::<u32, _>(refusal) },
-            |_| Ok(()),
+        let outcome =
+            call_async_expecting(move || async move { Err::<u32, _>(refusal) }, |_| Ok(()));
+        assert!(
+            fails(&outcome),
+            "a refusal without the owner text fails: {outcome:?}"
         );
-        assert!(fails(&outcome), "a refusal without the owner text fails: {outcome:?}");
     }
     assert!(
-        !fails(&Outcome::Refused(format!("{:?}", contextdb_core::Error::ReadCancelled))),
+        !fails(&Outcome::Refused(format!(
+            "{:?}",
+            contextdb_core::Error::ReadCancelled
+        ))),
         "the general table still accepts a typed refusal that is not the owner refusal"
     );
 }

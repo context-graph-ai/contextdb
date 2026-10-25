@@ -25,9 +25,7 @@ fn bucket() -> std::collections::HashMap<String, Value> {
 
 /// Open a session over a store whose writer is still open, and over the
 /// same population with no writer, and hand both to `read`.
-fn on_both_backings(
-    read: fn(&ReadSession) -> contextdb_core::Result<()>,
-) -> super::Outcome {
+fn on_both_backings(read: fn(&ReadSession) -> contextdb_core::Result<()>) -> super::Outcome {
     let live = Store::open();
     let (_dir, closed) = Store::closed();
     call(|| {
@@ -55,7 +53,9 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::ReadSession::open_in_runtime_dir",
             drive: || {
                 let (_dir, path) = Store::closed();
-                call(|| ReadSession::open_in_runtime_dir(&path, ReadSessionOptions::default(), None))
+                call(|| {
+                    ReadSession::open_in_runtime_dir(&path, ReadSessionOptions::default(), None)
+                })
             },
         },
         Row {

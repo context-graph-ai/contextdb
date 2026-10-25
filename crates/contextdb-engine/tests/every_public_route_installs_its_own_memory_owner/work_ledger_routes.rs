@@ -179,7 +179,11 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = ledger();
                 call(|| {
-                    advertised_tags_with_read_memory(&store.db, NODE, store.db.declared_reader_memory()?)
+                    advertised_tags_with_read_memory(
+                        &store.db,
+                        NODE,
+                        store.db.declared_reader_memory()?,
+                    )
                 })
             },
         },
@@ -217,7 +221,13 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::work_ledger::next_attempt_with_read_memory",
             drive: || {
                 let store = ledger();
-                call(|| next_attempt_with_read_memory(&store.db, JOB, store.db.declared_reader_memory()?))
+                call(|| {
+                    next_attempt_with_read_memory(
+                        &store.db,
+                        JOB,
+                        store.db.declared_reader_memory()?,
+                    )
+                })
             },
         },
         Row {
@@ -255,7 +265,14 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::work_ledger::claim_holder_with_read_memory",
             drive: || {
                 let store = ledger();
-                call(|| claim_holder_with_read_memory(&store.db, JOB, 1, store.db.declared_reader_memory()?))
+                call(|| {
+                    claim_holder_with_read_memory(
+                        &store.db,
+                        JOB,
+                        1,
+                        store.db.declared_reader_memory()?,
+                    )
+                })
             },
         },
         Row {
@@ -407,8 +424,16 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::work_ledger::job_result",
             drive: || {
                 let store = ledger();
-                record_result(&store.db, JOB, 1, NODE, b"output", serde_json::json!({}), NOW)
-                    .expect("fixture result");
+                record_result(
+                    &store.db,
+                    JOB,
+                    1,
+                    NODE,
+                    b"output",
+                    serde_json::json!({}),
+                    NOW,
+                )
+                .expect("fixture result");
                 call(|| job_result(&store.db, JOB))
             },
         },
@@ -416,9 +441,19 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::work_ledger::job_result_with_read_memory",
             drive: || {
                 let store = ledger();
-                record_result(&store.db, JOB, 1, NODE, b"output", serde_json::json!({}), NOW)
-                    .expect("fixture result");
-                call(|| job_result_with_read_memory(&store.db, JOB, store.db.declared_reader_memory()?))
+                record_result(
+                    &store.db,
+                    JOB,
+                    1,
+                    NODE,
+                    b"output",
+                    serde_json::json!({}),
+                    NOW,
+                )
+                .expect("fixture result");
+                call(|| {
+                    job_result_with_read_memory(&store.db, JOB, store.db.declared_reader_memory()?)
+                })
             },
         },
         Row {
@@ -495,8 +530,16 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::work_ledger::run_input_retention",
             drive: || {
                 let store = ledger();
-                record_result(&store.db, JOB, 1, NODE, b"output", serde_json::json!({}), NOW)
-                    .expect("fixture result");
+                record_result(
+                    &store.db,
+                    JOB,
+                    1,
+                    NODE,
+                    b"output",
+                    serde_json::json!({}),
+                    NOW,
+                )
+                .expect("fixture result");
                 call(|| run_input_retention(&store.db, NOW + 1_000, 0))
             },
         },
@@ -504,8 +547,16 @@ pub fn rows() -> Vec<Row> {
             route: "contextdb_engine::work_ledger::run_input_retention_with_read_memory",
             drive: || {
                 let store = ledger();
-                record_result(&store.db, JOB, 1, NODE, b"output", serde_json::json!({}), NOW)
-                    .expect("fixture result");
+                record_result(
+                    &store.db,
+                    JOB,
+                    1,
+                    NODE,
+                    b"output",
+                    serde_json::json!({}),
+                    NOW,
+                )
+                .expect("fixture result");
                 call(|| {
                     run_input_retention_with_read_memory(
                         &store.db,
@@ -584,7 +635,11 @@ pub fn rows() -> Vec<Row> {
             drive: || {
                 let store = ledger();
                 call(|| {
-                    lookup_peer_ticket_with_read_memory(&store.db, NODE, store.db.declared_reader_memory()?)
+                    lookup_peer_ticket_with_read_memory(
+                        &store.db,
+                        NODE,
+                        store.db.declared_reader_memory()?,
+                    )
                 })
             },
         },
