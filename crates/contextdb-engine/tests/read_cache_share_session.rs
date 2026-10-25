@@ -10,7 +10,9 @@
 //! reads nothing from the file and the session still reports what it declared.
 //!
 //! The oracle is the bytes the storage backend returns on the calling thread
-//! while the file reader answers. Nothing here measures time.
+//! while the file reader answers. Byte counts are compared only between
+//! byte-identical copies of one seeded store, because two stores built
+//! separately lay their pages out a few pages apart. Nothing here measures time.
 
 #![cfg(unix)]
 
@@ -36,7 +38,8 @@ const CURSOR_ROWS: usize = 1_000;
 const CURSOR_PAGE_ROWS: u64 = 100;
 /// Rows behind the turnover guard's repeated query.
 const TURNOVER_ROWS: usize = 2_000;
-const ROWS_PER_QUERY: usize = 1_000;
+/// The owner route answers at most 500 rows per statement.
+const ROWS_PER_QUERY: usize = 500;
 const SELECT_ALL: &str = "SELECT id, payload FROM cache_share ORDER BY id";
 
 fn payload(row: usize) -> String {
@@ -77,6 +80,29 @@ fn seeded_writer(path: &Path, rows: usize) -> Database {
         writer.commit(tx).unwrap();
     }
     writer
+}
+
+/// Seed one store under `directory` and close its writer; every configuration
+/// of a test reads a byte-identical copy of it.
+fn seeded_store(directory: &Path, rows: usize) {
+    seeded_writer(&directory.join("owner-cursor.db"), rows)
+        .close()
+        .unwrap();
+}
+
+/// Copy every file of the seeded store, so each configuration starts from the
+/// same bytes and the same page layout.
+fn copy_store(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_store(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }
 
 fn session_beside_the_writer(path: &Path, read_cache_share: Option<u8>) -> ReadSession {
@@ -122,18 +148,21 @@ fn declared_bytes(percent: usize) -> usize {
     (READER_BUDGET - fixed) * percent / 100
 }
 
-/// What an owner-route cursor's file continuation reads: the cursor opens
-/// beside the writer at `opened_at`, the session then declares `changed_to`
-/// if given, the writer closes, and the cursor is read to its end through the
-/// file. Returns the continuation's backend bytes, every row in order, and the
-/// session's reported effective cache size afterwards.
+/// What an owner-route cursor's file continuation reads on a fresh copy of the
+/// seeded store: a writer opens the copy, the cursor opens beside it at
+/// `opened_at`, the session then declares `changed_to` if given, the writer
+/// closes, and the cursor is read to its end through the file. Returns the
+/// continuation's backend bytes, every row in order, and the session's
+/// reported effective cache size afterwards.
 fn owner_cursor_continuation(
+    seeded: &Path,
     opened_at: u8,
     changed_to: Option<u8>,
 ) -> (u64, Vec<Vec<Value>>, usize) {
     let directory = tempfile::tempdir().unwrap();
+    copy_store(seeded, directory.path());
     let path = directory.path().join("owner-cursor.db");
-    let writer = seeded_writer(&path, CURSOR_ROWS);
+    let writer = Database::open(&path).unwrap();
     let session = session_beside_the_writer(&path, Some(opened_at));
     let mut cursor = session
         .open_cursor(SELECT_ALL, &HashMap::new())
@@ -173,12 +202,15 @@ fn all_rows(rows: usize) -> Vec<Vec<Value>> {
 
 /// An owner cursor opened at 40% whose session then turns its file cache off
 /// continues through the file with no cache: its continuation reads exactly
-/// what a continuation opened at 0% reads, not what one at 40% reads.
+/// what a continuation opened at 0% on the same store reads, not what one at
+/// 40% reads.
 #[test]
 fn an_owner_cursor_continues_without_a_file_cache_after_its_session_turns_it_off() {
-    let (opened_at_40, _, _) = owner_cursor_continuation(40, None);
-    let (opened_at_0, _, _) = owner_cursor_continuation(0, None);
-    let (turned_off, rows, effective) = owner_cursor_continuation(40, Some(0));
+    let seeded = tempfile::tempdir().unwrap();
+    seeded_store(seeded.path(), CURSOR_ROWS);
+    let (opened_at_40, _, _) = owner_cursor_continuation(seeded.path(), 40, None);
+    let (opened_at_0, _, _) = owner_cursor_continuation(seeded.path(), 0, None);
+    let (turned_off, rows, effective) = owner_cursor_continuation(seeded.path(), 40, Some(0));
     assert_eq!(
         rows,
         all_rows(CURSOR_ROWS),
@@ -199,13 +231,15 @@ fn an_owner_cursor_continues_without_a_file_cache_after_its_session_turns_it_off
 }
 
 /// An owner cursor opened at 40% whose session then shrinks to 2% continues
-/// at 2%: its continuation reads exactly what a continuation opened at 2%
-/// reads.
+/// at 2%: its continuation reads exactly what a continuation opened at 2% on
+/// the same store reads.
 #[test]
 fn an_owner_cursor_continues_at_the_smaller_share_after_its_session_shrinks() {
-    let (opened_at_40, _, _) = owner_cursor_continuation(40, None);
-    let (opened_at_2, _, _) = owner_cursor_continuation(2, None);
-    let (shrunk, rows, effective) = owner_cursor_continuation(40, Some(2));
+    let seeded = tempfile::tempdir().unwrap();
+    seeded_store(seeded.path(), CURSOR_ROWS);
+    let (opened_at_40, _, _) = owner_cursor_continuation(seeded.path(), 40, None);
+    let (opened_at_2, _, _) = owner_cursor_continuation(seeded.path(), 2, None);
+    let (shrunk, rows, effective) = owner_cursor_continuation(seeded.path(), 40, Some(2));
     assert_eq!(
         rows,
         all_rows(CURSOR_ROWS),
