@@ -3,18 +3,19 @@
 //! the snapshot already published, so commits in progress neither delay it
 //! nor spend its active time, and it still reads one committed snapshot.
 //!
-//! The read must not block on anything a committing writer holds. It reads
-//! one whole committed snapshot wherever the writer is in its commit: before
-//! storage, while storage syncs, after storage and before the commit is
-//! published in memory, and while a new index generation is published. The
-//! answer and the registered snapshot are wholly the published state before
-//! the commit or wholly the state after it, never a mix.
+//! The read must not block on anything a committing writer holds. Until a
+//! writer's commit is published in memory, the read sees exactly the state
+//! published before it, whether the commit is before storage, while storage
+//! syncs, or durable in storage but unpublished; the commit's rows there are
+//! not yet published, and reading them would be a dirty or ahead-of-publication
+//! read. While a new index generation is published, which changes no row, the
+//! read sees the snapshot published before or after it, wholly one of them.
 //!
 //! A committer is held inside its commit (later committers queue behind it)
 //! while a bounded vector search runs; the engine's commit-wait hook reports
-//! any failed attempt by the read to take the commit boundary, and a read
-//! that blocks on anything else the held writer owns is failed by a watchdog
-//! instead of being left to hang.
+//! any failed attempt by the read to take the commit boundary. A read that
+//! blocks on anything else the held writer owns does not finish, and the
+//! test runner's terminate limit ends it.
 
 use contextdb_core::read_contract::ReadLimits;
 use contextdb_core::{SnapshotId, Value};
@@ -24,14 +25,10 @@ use contextdb_engine::writer_commit_test_seams::{CommitBoundary, observe as obse
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
 
 /// The read's own active time: shorter than the wait in the first test.
 const ACTIVE_MS: u64 = 200;
 const SEARCH: &str = "SELECT id FROM items ORDER BY embedding <=> $probe LIMIT 2";
-/// Fails a read that blocks behind a held writer instead of hanging; never
-/// reached by a read that behaves.
-const WATCHDOG: Duration = Duration::from_secs(60);
 
 fn search(clock: &ManualDeadlineClock) -> bounded::BoundedReadRequest {
     bounded::BoundedReadRequest::new(
@@ -209,9 +206,7 @@ fn a_bounded_search_waiting_for_a_commit_is_answered_without_spending_its_active
         // A read that waits is released by letting the committer finish; a
         // read that never waits answers on its own.
         let outcome = loop {
-            match progress_rx.recv_timeout(WATCHDOG).unwrap_or_else(|_| {
-                panic!("the read blocked behind the held writer without reporting a wait")
-            }) {
+            match progress_rx.recv().expect("the reader reports its progress") {
                 Progress::WaitingForCommit => drop(resume.take()),
                 Progress::Finished(outcome) => break outcome,
             }
@@ -299,10 +294,7 @@ fn a_bounded_search_under_back_to_back_committers_never_waits_and_reads_one_comm
             });
             let _ = progress.send(Progress::Finished(outcome));
         });
-        let outcome = match progress_rx
-            .recv_timeout(WATCHDOG)
-            .unwrap_or_else(|_| panic!("the read blocked on something the held committer owns"))
-        {
+        let outcome = match progress_rx.recv().expect("the reader reports its progress") {
             Progress::WaitingForCommit => panic!(
                 "a bounded search must register the published snapshot without waiting for the \
                  commit boundary; it tried to take the boundary while committers held it"
@@ -335,8 +327,9 @@ fn a_bounded_search_under_back_to_back_committers_never_waits_and_reads_one_comm
     );
 }
 
-/// A store whose vectors are served by an HNSW index, so a read that paired
-/// new rows with an old index generation, or the reverse, could see a mix.
+/// A store whose vectors are served by a maintained index, so a read that
+/// paired new rows with an old index generation, or the reverse, could see a
+/// mix.
 fn indexed_store(path: &std::path::Path) -> Database {
     let database = Database::open_with_options(
         path,
@@ -348,8 +341,7 @@ fn indexed_store(path: &std::path::Path) -> Database {
     .expect("open the store");
     database
         .execute(
-            "CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED \
-             HNSW (M = 8, EF_CONSTRUCTION = 32))",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(3) SEARCH_MODE INDEXED)",
             &HashMap::new(),
         )
         .expect("create table");
@@ -398,15 +390,16 @@ fn move_row_one(database: &Database) -> contextdb_core::Result<()> {
 
 /// Hold `operation` at `boundary`, run the search beside it, then release
 /// it. The search must make no attempt on the commit boundary, must not
-/// block, and must read wholly the state published before the operation
-/// (answer `before`, snapshot published before) or wholly the state after it
+/// block, and must read exactly the state published before the operation
+/// (answer `before`, snapshot published before). Only when `after` is given
+/// may it instead read wholly the state published after the operation
 /// (answer `after`, snapshot published after).
 fn read_beside_an_operation_held_at(
     boundary: CommitBoundary,
     database: &Database,
     operation: impl FnOnce() -> contextdb_core::Result<()> + Send,
     before: Vec<Vec<Value>>,
-    after: Vec<Vec<Value>>,
+    after: Option<Vec<Vec<Value>>>,
 ) {
     let published_before = database.snapshot();
     let registrations = Arc::new(Registrations::default());
@@ -420,7 +413,7 @@ fn read_beside_an_operation_held_at(
         let (resume, resume_rx) = mpsc::channel::<()>();
         let held = scope.spawn(move || held_at(boundary, reached, resume_rx, operation));
         reached_rx
-            .recv_timeout(WATCHDOG)
+            .recv()
             .unwrap_or_else(|_| panic!("the operation never reached {boundary:?}"));
 
         let (progress, progress_rx) = mpsc::channel();
@@ -431,9 +424,7 @@ fn read_beside_an_operation_held_at(
             });
             let _ = progress.send(Progress::Finished(outcome));
         });
-        let outcome = match progress_rx.recv_timeout(WATCHDOG).unwrap_or_else(|_| {
-            panic!("the read blocked on something the writer held at {boundary:?} owns")
-        }) {
+        let outcome = match progress_rx.recv().expect("the reader reports its progress") {
             Progress::WaitingForCommit => panic!(
                 "a bounded search must not try to take the commit boundary while a writer is \
                  held at {boundary:?}"
@@ -456,14 +447,19 @@ fn read_beside_an_operation_held_at(
     if rows == before && registered == [published_before] {
         return;
     }
-    if rows == after && registered == [published_after] {
-        return;
+    match after {
+        Some(after) if rows == after && registered == [published_after] => {}
+        Some(after) => panic!(
+            "beside a writer held at {boundary:?} the search must read one whole snapshot: \
+             either {before:?} at {published_before:?} or {after:?} at {published_after:?}; it \
+             answered {rows:?} having registered {registered:?}"
+        ),
+        None => panic!(
+            "beside a writer held at {boundary:?}, whose commit is not yet published, the search \
+             must read exactly the published state {before:?} at {published_before:?}; it \
+             answered {rows:?} having registered {registered:?}"
+        ),
     }
-    panic!(
-        "beside a writer held at {boundary:?} the search must read one whole snapshot: either \
-         {before:?} at {published_before:?} or {after:?} at {published_after:?}; it answered \
-         {rows:?} having registered {registered:?}"
-    );
 }
 
 fn read_beside_a_commit_held_at(boundary: CommitBoundary) {
@@ -477,7 +473,7 @@ fn read_beside_a_commit_held_at(boundary: CommitBoundary) {
         &database,
         || move_row_one(&database),
         before,
-        after.clone(),
+        None,
     );
     assert_eq!(
         uncontended_answer(&database),
@@ -487,17 +483,17 @@ fn read_beside_a_commit_held_at(boundary: CommitBoundary) {
 }
 
 #[test]
-fn a_bounded_search_while_storage_syncs_a_commit_reads_one_whole_snapshot() {
+fn a_bounded_search_while_storage_syncs_a_commit_reads_only_the_published_snapshot() {
     read_beside_a_commit_held_at(CommitBoundary::DuringRedbSync);
 }
 
 #[test]
-fn a_bounded_search_after_a_commit_reaches_storage_reads_one_whole_snapshot() {
+fn a_bounded_search_after_a_commit_reaches_storage_reads_only_the_published_snapshot() {
     read_beside_a_commit_held_at(CommitBoundary::AfterRedb);
 }
 
 #[test]
-fn a_bounded_search_before_a_durable_commit_is_published_reads_one_whole_snapshot() {
+fn a_bounded_search_before_a_durable_commit_is_published_reads_only_the_published_snapshot() {
     read_beside_a_commit_held_at(CommitBoundary::BeforeMemoryPublication);
 }
 
@@ -518,6 +514,6 @@ fn a_bounded_search_while_an_index_generation_is_published_reads_one_whole_snaps
         &database,
         || database.run_maintenance_cycle().map(|_| ()),
         committed.clone(),
-        committed,
+        Some(committed),
     );
 }
