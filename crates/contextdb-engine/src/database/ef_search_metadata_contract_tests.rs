@@ -1152,3 +1152,196 @@ fn received_history_policy_alter_starts_no_worker_and_preserves_rows_on_rollback
         source.close().unwrap();
     }
 }
+
+// One authenticated pull leg from a hub to a file-backed edge, through the
+// real server and client doors.
+#[cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
+struct AuthenticatedPull {
+    client: crate::SyncClient,
+    server: Arc<crate::SyncServer>,
+    shutdown: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
+impl AuthenticatedPull {
+    fn start(source: &Arc<Database>, edge: &Arc<Database>, tenant: &str) -> Self {
+        use crate::transport::in_process::InProcessBroker;
+        use crate::{FabricIdentity, SyncClient, SyncServer};
+        use contextdb_core::TenantId;
+        let broker = InProcessBroker::new();
+        let identity = Arc::new(FabricIdentity::generate());
+        let node = identity.node_id();
+        let server = Arc::new(
+            SyncServer::with_authenticated_transport_and_identity_for_test(
+                source.clone(),
+                broker.server_as(&node),
+                TenantId::from(tenant),
+                node,
+                identity,
+            )
+            .unwrap(),
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let server = server.clone();
+            let shutdown = shutdown.clone();
+            async move { server.run_until(shutdown).await }
+        });
+        let identity = Arc::new(FabricIdentity::generate());
+        let client = SyncClient::with_authenticated_transport_and_identity_for_test(
+            edge.clone(),
+            broker.client_as(&identity.node_id()),
+            TenantId::from(tenant),
+            identity,
+        )
+        .unwrap();
+        Self {
+            client,
+            server,
+            shutdown,
+            task,
+        }
+    }
+
+    async fn pull(&self) {
+        self.client.pull_default().await.unwrap();
+    }
+
+    async fn stop(self) {
+        drop(self.client);
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.task.await.unwrap();
+        drop(self.server);
+    }
+}
+
+#[cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
+fn archived_body_count(db: &Database) -> u64 {
+    let Some(persistence) = &db.persistence else {
+        return 0;
+    };
+    persistence
+        .with_db(|store| {
+            use redb::ReadableTableMetadata;
+            let read = store.begin_read().unwrap();
+            match read.open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                "__authored_row_bodies",
+            )) {
+                Ok(table) => Ok(table.len().unwrap()),
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+                Err(error) => panic!("read the authored body archive: {error:?}"),
+            }
+        })
+        .unwrap()
+}
+
+#[cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
+fn writes_to(work: &ReceivedSchemaApplyObservationForTest, table: &str) -> u64 {
+    work.artifact_writes
+        .iter()
+        .filter(|(write, _)| write.table == table)
+        .map(|(_, count)| *count)
+        .sum()
+}
+
+// A received search-breadth or consolidation declaration changes metadata
+// only. Applying it must neither copy the relation's rows into the authored
+// body archive nor rewrite the relation: the received-apply observer counts
+// the actual durable writes of each delivered statement.
+#[cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
+#[tokio::test]
+async fn received_metadata_only_alters_archive_and_rewrite_no_row_population() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Arc::new(Database::open_memory());
+    source.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    run(
+        &source,
+        "CREATE TABLE breadth_rows (id INTEGER PRIMARY KEY, bucket INTEGER, body TEXT, embedding VECTOR(3) SEARCH_MODE INDEXED HNSW (EF_SEARCH = 7), compressed VECTOR(3) WITH (quantization = 'SQ8') SEARCH_MODE INDEXED HNSW (EF_SEARCH = 7)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+    );
+    for id in 1..=24i64 {
+        let x = id as f32;
+        source
+            .execute(
+                "INSERT INTO breadth_rows (id, bucket, body, embedding, compressed) VALUES ($id, $bucket, $body, $vector, $vector)",
+                &HashMap::from([
+                    ("id".into(), Value::Int64(id)),
+                    ("bucket".into(), Value::Int64(id % 2)),
+                    ("body".into(), Value::Text(format!("authored-{id}"))),
+                    ("vector".into(), Value::Vector(vec![x, 25.0 - x, 1.0])),
+                ]),
+            )
+            .unwrap();
+    }
+    run(
+        &source,
+        "UPDATE breadth_rows SET body = 'replacement' WHERE id = 1",
+    );
+    let edge = Arc::new(Database::open(dir.path().join("edge.db")).unwrap());
+    edge.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+    let pull = AuthenticatedPull::start(&source, &edge, "metadata-only-archive");
+    pull.pull().await;
+    let authored = authored_rows(&edge);
+    assert_eq!(authored.len(), 25, "24 inserts and one replacement arrived");
+    for statement in [
+        "ALTER TABLE breadth_rows ALTER COLUMN embedding SET HNSW (EF_SEARCH = 11)",
+        "ALTER TABLE breadth_rows ALTER COLUMN compressed SET HNSW (EF_SEARCH = 11)",
+        "ALTER TABLE breadth_rows ALTER COLUMN embedding SET CONSOLIDATION (CHANGE_PERCENT = 11)",
+    ] {
+        let archived = archived_body_count(&edge);
+        let roots = physical_roots(&edge);
+        let held = edge.ddl_log_since(Lsn(0)).unwrap().len();
+        run(&source, statement);
+        let observer = ReceivedSchemaApplyObserverForTest::new();
+        let scope = edge.observe_received_schema_applies_for_test(&observer);
+        pull.pull().await;
+        drop(scope);
+        let work = observer
+            .observation()
+            .unwrap_or_else(|| panic!("`{statement}` reached the real received-schema stage"));
+        assert_eq!(
+            edge.ddl_log_since(Lsn(0)).unwrap().len(),
+            held + 1,
+            "`{statement}` was delivered as one authored occurrence"
+        );
+        assert_eq!(
+            writes_to(&work, "__authored_row_bodies"),
+            0,
+            "`{statement}` must not archive the row population"
+        );
+        assert_eq!(archived_body_count(&edge), archived);
+        assert_eq!(
+            writes_to(&work, "rel_breadth_rows"),
+            0,
+            "`{statement}` must not rewrite stored rows"
+        );
+        assert_eq!(
+            (
+                work.durable_table_rewrites,
+                work.durable_rows_rewritten,
+                work.staged_rows_copied
+            ),
+            (0, 0, 0),
+            "`{statement}` must not replace or copy the relation: {work:?}"
+        );
+        assert_eq!(physical_roots(&edge), roots);
+        assert_eq!(authored_rows(&edge), authored);
+    }
+    // Control: the same observer does see a received shape change replace
+    // the stored rows, so the zeros above are measurements, not blind spots.
+    run(&source, "ALTER TABLE breadth_rows DROP COLUMN bucket");
+    let observer = ReceivedSchemaApplyObserverForTest::new();
+    let scope = edge.observe_received_schema_applies_for_test(&observer);
+    pull.pull().await;
+    drop(scope);
+    let work = observer
+        .observation()
+        .expect("the received DROP reached the real received-schema stage");
+    assert!(
+        writes_to(&work, "rel_breadth_rows") > 0,
+        "a received DROP COLUMN rewrites the stored rows: {work:?}"
+    );
+    pull.stop().await;
+    edge.close().unwrap();
+    source.close().unwrap();
+}
