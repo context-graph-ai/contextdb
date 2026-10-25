@@ -49,6 +49,12 @@ mod a_reopened_session_keeps_its_selected_route_and_time;
 #[path = "read/a_reopened_store_never_reuses_a_committed_transaction.rs"]
 mod a_reopened_store_never_reuses_a_committed_transaction;
 #[cfg(unix)]
+#[path = "read/a_session_follows_the_stores_writers.rs"]
+mod a_session_follows_the_stores_writers;
+#[cfg(unix)]
+#[path = "read/continuation_support.rs"]
+mod continuation_support;
+#[cfg(unix)]
 #[path = "read/a_session_reselecting_after_a_reopen_is_served_when_the_new_writer_wins.rs"]
 mod a_session_reselecting_after_a_reopen_is_served_when_the_new_writer_wins;
 #[cfg(unix)]

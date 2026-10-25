@@ -1,14 +1,21 @@
 //! After a writer reopen, a read session selects its route once and then
 //! reads like any other session: later statements do not select a route
 //! again, and the wait for the new writer is bounded by the session's routing
-//! allowance, never charged to a statement's active time.
+//! allowance, never charged to a statement's active time. Every session
+//! operation goes through that same selection after a reopen: asking what the
+//! session has charged, or sending the owner a request, reaches the new route
+//! and never the departed writer's channel.
 
 use contextdb_core::Value;
-use contextdb_core::read_contract::{ReadClientTimeouts, ReadLimits, ReadRoute};
+use contextdb_core::read_contract::{
+    OwnerReadCancellation, OwnerRequestHandler, ReadClientTimeouts, ReadLimits, ReadRoute,
+};
 use contextdb_engine::local_transport::ManualDeadlineClock;
 use contextdb_engine::persistence::read_persistence_test_scaffold::observe_writer_reader_snapshots_for_test;
 use contextdb_engine::read_session::{ReadSessionEvent, ReadSessionTestObserver};
-use contextdb_engine::{Database, ReadSession, ReadSessionOptions};
+use contextdb_engine::{
+    Database, DatabaseOpenOptions, OwnerReadConfig, ReadSession, ReadSessionOptions,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,6 +116,9 @@ fn assert_steady_statements_select_nothing(
         rows(session, &format!("the second statement {after}")),
         committed
     );
+    session.charged_bytes().unwrap_or_else(|refusal| {
+        panic!("the session's charge {after} must be answered: {refusal}")
+    });
     assert_eq!(
         rows(session, &format!("the third statement {after}")),
         committed
@@ -137,6 +147,12 @@ fn after_a_writer_reopen_later_statements_use_the_route_the_session_selected_to_
 
     first.close().expect("close the first writer");
     let replacement = Database::open(&path).expect("reopen the store for writing");
+    let charged = session.charged_bytes();
+    assert!(
+        charged.is_ok(),
+        "after the reopen, the session's charge is answered through its new route, not the \
+         departed writer's channel: {charged:?}"
+    );
     assert_eq!(
         rows(&session, "the first statement after the reopen"),
         committed
@@ -344,4 +360,51 @@ fn describe(progress: &ReaderProgress) -> String {
         ReaderProgress::WaitingForWriter => "a claim-window wait".to_owned(),
         ReaderProgress::Finished(answer) => format!("an answer: {answer:?}"),
     }
+}
+
+struct Echo;
+
+impl OwnerRequestHandler for Echo {
+    fn handle(
+        &self,
+        _namespace: &str,
+        request: &[u8],
+        _cancellation: &OwnerReadCancellation,
+    ) -> contextdb_core::Result<Vec<u8>> {
+        Ok(request.to_vec())
+    }
+}
+
+#[test]
+fn after_a_writer_reopen_an_owner_request_reaches_the_new_writer() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let path = directory.path().join("store.db");
+    let (first, committed) = seeded_writer(&path);
+    let session = ReadSession::open(&path).expect("open a session beside the first writer");
+    assert_eq!(session.route(), ReadRoute::Owner);
+    assert_eq!(rows(&session, "the first statement"), committed);
+
+    first.close().expect("close the first writer");
+    let replacement = Database::open_with_options(
+        &path,
+        DatabaseOpenOptions {
+            owner_reads: OwnerReadConfig {
+                handler: Some(Arc::new(Echo)),
+                ..OwnerReadConfig::default()
+            },
+            ..DatabaseOpenOptions::default()
+        },
+    )
+    .expect("reopen the store for writing with a request handler");
+    let reply = session
+        .request_owner("echo", b"after the reopen")
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "after the reopen, an owner request reaches the new writer, not the departed \
+                 writer's channel: {refusal}"
+            )
+        });
+    assert_eq!(reply, b"after the reopen".to_vec());
+    drop(session);
+    replacement.close().expect("close the replacement writer");
 }
