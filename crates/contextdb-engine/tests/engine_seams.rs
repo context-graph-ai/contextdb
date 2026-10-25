@@ -263,3 +263,6 @@ mod allocator_foreign_events;
 
 #[path = "engine_seams/an_exact_identity_search_stays_inside_its_work_ceiling.rs"]
 mod an_exact_identity_search_stays_inside_its_work_ceiling;
+
+#[path = "engine_seams/storage_journeys_keep_the_measured_test_profile.rs"]
+mod storage_journeys_keep_the_measured_test_profile;

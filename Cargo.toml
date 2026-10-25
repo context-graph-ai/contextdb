@@ -71,3 +71,17 @@ opt-level = 3
 
 [profile.test.package.anndists]
 opt-level = 3
+
+# Exercise the engine and its storage dependencies with assertions enabled.
+[profile.test]
+debug-assertions = true
+overflow-checks = true
+
+[profile.test.package.contextdb-engine]
+opt-level = 1
+
+[profile.test.package.contextdb-redb]
+opt-level = 1
+
+[profile.test.package.contextdb-core]
+opt-level = 1
