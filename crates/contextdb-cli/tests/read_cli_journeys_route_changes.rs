@@ -181,8 +181,17 @@ fn a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_return
     );
     let first_image = file_image(&route_of(&notices[1]), "after the first writer exits");
     assert_eq!(phase_ids(&session, "p2"), vec![1, 2]);
+    read_phase(&mut session, "p2again");
+    assert_eq!(
+        route_notices(&session).len(),
+        2,
+        "a second statement on the same file image adds no notice. transcript:\n{}",
+        session.transcript()
+    );
 
-    // A second writer opens and commits row 3.
+    // A second writer opens and commits row 3. `live_owner` sends its setup
+    // SQL before asking for the owner's status and returns only on that reply,
+    // so row 3 is committed before p3 reads.
     let mut second_writer = live_owner(
         &store.path,
         "INSERT INTO shared (id, label) VALUES (3, 'row-000003');\n",
@@ -210,7 +219,9 @@ fn a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_return
     };
     assert_eq!(phase_ids(&session, "p3"), vec![1, 2, 3]);
 
-    // The second writer commits row 4, then exits.
+    // The second writer commits row 4, then exits: the insert is sent before
+    // its input closes, so it is committed before the writer is gone and p4
+    // reads it.
     second_writer.send_line("INSERT INTO shared (id, label) VALUES (4, 'row-000004');");
     let (code, transcript) = second_writer.finish();
     assert_eq!(
@@ -234,4 +245,11 @@ fn a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_return
         "after the second writer committed row 4",
     );
     assert_eq!(phase_ids(&session, "p4"), vec![1, 2, 3, 4]);
+    read_phase(&mut session, "p4again");
+    assert_eq!(
+        route_notices(&session).len(),
+        4,
+        "a second statement on the same newer file image adds no notice. transcript:\n{}",
+        session.transcript()
+    );
 }
