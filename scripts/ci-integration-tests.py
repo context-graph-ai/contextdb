@@ -276,17 +276,14 @@ class IntegrationControls(unittest.TestCase):
         jobs = c.load(text)['jobs']
         self.assertEqual(set(jobs), {'plan','slice','result'})
         self.assertEqual(jobs['slice']['strategy']['fail-fast'], False)
-        test_profile = {'CARGO_PROFILE_TEST_OPT_LEVEL': '1',
-                        'CARGO_PROFILE_TEST_DEBUG_ASSERTIONS': 'true',
-                        'CARGO_PROFILE_TEST_OVERFLOW_CHECKS': 'true'}
-        self.assertEqual(jobs['slice']['env'], test_profile)
+        self.assertNotIn('env', jobs['slice'])
         self.assertEqual(jobs['result']['if'], 'always()')
         validator = doc['jobs']['integration']
         self.assertEqual(validator['needs'], ['impact', 'test-bundles'])
         self.assertEqual(validator['if'], 'always()')
         bundle_job = doc['jobs']['test-bundles']
         self.assertEqual(bundle_job['needs'], 'impact')
-        self.assertEqual(bundle_job['env'], test_profile)
+        self.assertNotIn('env', bundle_job)
         self.assertEqual(bundle_job['strategy']['matrix'],
                          '${{ fromJSON(needs.impact.outputs.bundle_matrix) }}')
         self.assertNotIn('max-parallel', bundle_job['strategy'])

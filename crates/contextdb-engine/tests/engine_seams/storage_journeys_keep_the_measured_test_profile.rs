@@ -1,4 +1,8 @@
 //! Acceptance journeys retain the measured optimisation and checked arithmetic.
+//!
+//! This reads the manifest, not the effective Cargo configuration. It cannot see
+//! .cargo/config.toml or CARGO_PROFILE_TEST_* overrides; debug_assertions is the
+//! only compiled-in check. Artifact receipts and the timed journey bind the build.
 #[test]
 fn storage_journeys_keep_the_measured_test_profile() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

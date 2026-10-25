@@ -142,14 +142,13 @@ if '--dedup-only' in sys.argv:
             unrelated.write_text('const X: bool = cfg!(feature = "nightly-tests");')
             assert not i.normal_dedup_certificate(root)['targets']; controls += 1
             unrelated.unlink()
-            test_profile = {'CARGO_PROFILE_TEST_OPT_LEVEL': '1',
-                            'CARGO_PROFILE_TEST_DEBUG_ASSERTIONS': 'true',
-                            'CARGO_PROFILE_TEST_OVERFLOW_CHECKS': 'true'}
-            with patch.dict(os.environ, test_profile):
+            with patch.dict(os.environ, {'CARGO_PROFILE_TEST_DEBUG': '0'}):
                 assert i.normal_dedup_certificate(root)['targets']
             for flags in [{'RUSTFLAGS': '--cfg other'},
                           {'CARGO_PROFILE_TEST_OPT_LEVEL': '1'},
-                          dict(test_profile, CARGO_PROFILE_TEST_OPT_LEVEL='3')]:
+                          {'CARGO_PROFILE_TEST_OPT_LEVEL': '3'},
+                          {'CARGO_PROFILE_TEST_DEBUG_ASSERTIONS': 'true'},
+                          {'CARGO_PROFILE_TEST_OVERFLOW_CHECKS': 'true'}]:
                 with patch.dict(os.environ, flags): assert not i.normal_dedup_certificate(root)['targets']
                 controls += 1
             # Local-only regeneration refuses unequal case and ignored inventories.

@@ -64,6 +64,9 @@ fi
 # A split shard runs only its listed targets (scripts/ci-shard-targets.txt);
 # examples and doctests run once, in the shard that lists `lib`.
 run_extras=true
+run_maintenance=false
+if [[ "$crate" == contextdb-engine && "$features" == *test-seams* ]]; then run_maintenance=true; fi
+maintenance_case=paged_initial_replacement_and_reclamation_progress_under_writes::paged_initial_replacement_and_reclamation_progress_under_writes
 skip_case=""
 aggregate_names=()
 manifest="$(dirname -- "${BASH_SOURCE[0]}")/ci-shard-targets.txt"
@@ -71,10 +74,12 @@ while read -r name items; do
   [[ "$name" == "$shard:" ]] || continue
   targets=()
   run_extras=false
+  run_maintenance=false
   routing=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" shard-plan "$shard")
   items=${routing%%|*}
   skip_case=${routing#*|}
   for item in $items; do
+    if [[ "$item" == engine_seams ]]; then run_maintenance=true; fi
     if [[ "$item" == custody || "$item" == vector || ( "$item" == custody_schema_replay_bounded_contract && "${CI_GATE_MODE:-full}" == full ) ]]; then
       aggregate_names+=("$item")
       continue
@@ -147,6 +152,7 @@ fi
 threads=()
 if [[ "$features" == *test-seams* ]]; then threads=(--test-threads=1); fi
 if [[ -n "$skip_case" ]]; then threads+=(--skip "$skip_case"); fi
+if [[ "$run_maintenance" == true ]]; then threads+=(--skip "$maintenance_case"); fi
 set +e
 # Explicit libtest targets avoid forwarding libtest flags to Criterion benches.
 # Keep ignored tests ignored. Ordinary elapsed time is a receipt, not a threshold.
@@ -160,6 +166,14 @@ fi
 statuses=("${PIPESTATUS[@]}")
 status=${statuses[0]}
 if [[ "$status" == 0 ]]; then status=${statuses[1]}; fi
+# The maintenance journey has its own runner limit; its body remains unchanged.
+if [[ "$run_maintenance" == true ]]; then
+  env "CARGO_BIN_EXE_contextdb=$target_dir/debug/contextdb" \
+      "CARGO_BIN_EXE_contextdb-server=$target_dir/debug/contextdb-server" \
+    bash "$(dirname -- "${BASH_SOURCE[0]}")/ci-maintenance-journey.sh" "$receipt_dir" "${args[@]}"
+  maintenance_status=$?
+  if [[ "$status" == 0 ]]; then status=$maintenance_status; fi
+fi
 # Each filter belongs only to its isolated binary, never its execution owner.
 for aggregate_name in "${aggregate_names[@]}"; do
   if ! aggregate_plan=$(python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/ci-integration.py" aggregate-skips "$aggregate_name" --aggregate-features "$features"); then

@@ -320,5 +320,121 @@ for suffix in ['profile','tests','targets.json','time']:
                 self.assertEqual('--test-threads=1' in calls[0], bool(features))
 
 
+class MaintenanceJourneyRunner(unittest.TestCase):
+    def test_shard_runs_the_journey_once_under_its_own_limit(self):
+        case = ('paged_initial_replacement_and_reclamation_progress_under_writes::'
+                'paged_initial_replacement_and_reclamation_progress_under_writes')
+        for test_exit, matched, expected in [(0, 1, 0), (124, 1, 124), (0, 0, 2)]:
+            with self.subTest(test_exit=test_exit), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                cargo = root/'cargo'
+                cargo.write_text('''#!/usr/bin/env python3
+import os,sys,json
+args=sys.argv[1:]
+if args==['--version']: print('cargo synthetic'); sys.exit(0)
+with open(os.environ['CALLS'],'a') as out: out.write(json.dumps(args)+'\\n')
+if args[0]=='build' or '--no-run' in args: sys.exit(0)
+print('     Running tests/engine_seams.rs (target/debug/deps/engine_seams-123)')
+print('running 1 test')
+case=os.environ['MAINTENANCE_CASE']
+matched=os.environ['MATCHED'] if case in args and '--skip' not in args else '1'
+print('test result: ok. '+matched+' passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')
+sys.exit(int(os.environ['TEST_EXIT']) if case in args and '--skip' not in args else 0)
+''')
+                cargo.chmod(0o755)
+                timeout = root/'timeout'
+                timeout.write_text('''#!/usr/bin/env python3
+import os,sys,json
+args=sys.argv[1:]
+with open(os.environ['DEADLINES'],'a') as out: out.write(json.dumps(args)+'\\n')
+if args[0] in ['30m','300m']: args=args[1:]
+elif args[:2]==['--kill-after=5s','600s']: args=args[2:]
+else: sys.exit(98)
+os.execvp(args[0],args)
+''')
+                timeout.chmod(0o755)
+                # Cleanup is irrelevant to routing and must not delete real directories here.
+                cleanup = root/'rm'; cleanup.write_text('#!/bin/sh\nexit 0\n'); cleanup.chmod(0o755)
+                env = dict(os.environ, PATH=str(root)+':'+os.environ['PATH'],
+                           CARGO_TARGET_DIR=str(root/'target'), CALLS=str(root/'calls'),
+                           DEADLINES=str(root/'deadlines'), MAINTENANCE_CASE=case,
+                           TEST_EXIT=str(test_exit), MATCHED=str(matched), CI_CRATE='contextdb-engine',
+                           CI_SHARD='contextdb-engine-test-seams-7', CI_FEATURES='test-seams,iroh',
+                           CI_BUNDLE='', CI_GATE_MODE='full')
+                run = subprocess.run(['/bin/bash', 'scripts/ci-test-shard.sh'], cwd=i.ROOT,
+                                     env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(run.returncode, expected, run.stderr)
+                calls = [json.loads(line) for line in (root/'calls').read_text().splitlines()]
+                runs = [args for args in calls if args[0]=='test' and '--no-run' not in args]
+                self.assertEqual(len(runs), 2)
+                ordinary, journey = runs
+                self.assertIn('--skip', ordinary)
+                self.assertEqual(ordinary[ordinary.index('--skip')+1], case)
+                self.assertEqual(journey.count(case), 1)
+                self.assertNotIn('--skip', journey)
+                deadlines = [json.loads(line) for line in (root/'deadlines').read_text().splitlines()]
+                timed = [args for args in deadlines if args[:2]==['--kill-after=5s','600s']]
+                self.assertEqual(len(timed), 1)
+                self.assertIn(case, timed[0])
+                receipt = root/'target/ci-shard-out/contextdb-engine-test-seams-7'
+                self.assertIn('exit='+str(expected), (receipt/'contextdb-engine-test-seams-7.time').read_text())
+                self.assertEqual((receipt/'maintenance.exit').read_text().strip(), str(expected))
+
+    def test_compile_is_outside_deadline_and_failures_are_preserved(self):
+        runner = i.ROOT / 'scripts/ci-maintenance-journey.sh'
+        case = ('paged_initial_replacement_and_reclamation_progress_under_writes::'
+                'paged_initial_replacement_and_reclamation_progress_under_writes')
+        for build_exit, test_exit, expected, count, matched in [(0, 0, 0, 2, 1),
+                                                               (42, 0, 42, 1, 1),
+                                                               (0, 124, 124, 2, 1),
+                                                               (0, 7, 7, 2, 1),
+                                                               (0, 0, 2, 2, 0)]:
+            with self.subTest(build_exit=build_exit, test_exit=test_exit), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                cargo = root / 'cargo'
+                cargo.write_text('''#!/usr/bin/env python3
+import os,sys,json
+with open(os.environ['CARGO_CALLS'],'a') as out:
+    out.write(json.dumps(sys.argv[1:])+'\\n')
+if '--no-run' not in sys.argv:
+    print('test result: ok. '+os.environ['MATCHED']+' passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s')
+sys.exit(int(os.environ['BUILD_EXIT'] if '--no-run' in sys.argv else os.environ['TEST_EXIT']))
+''')
+                cargo.chmod(0o755)
+                timeout = root / 'timeout'
+                timeout.write_text('''#!/usr/bin/env python3
+import os,sys,json
+args=sys.argv[1:]
+with open(os.environ['TIMEOUT_CALLS'],'a') as out:
+    out.write(json.dumps(args)+'\\n')
+if args[0]=='30m': args=args[1:]
+elif args[:2]==['--kill-after=5s','600s']: args=args[2:]
+else: sys.exit(98)
+os.execvp(args[0],args)
+''')
+                timeout.chmod(0o755)
+                env = dict(os.environ, PATH=str(root)+':'+os.environ['PATH'],
+                           CARGO_CALLS=str(root/'cargo-calls'), TIMEOUT_CALLS=str(root/'timeouts'),
+                           BUILD_EXIT=str(build_exit), TEST_EXIT=str(test_exit), MATCHED=str(matched))
+                result = subprocess.run(['bash', str(runner), str(root/'receipts'),
+                                         '-p', 'contextdb-engine', '--features', 'test-seams,iroh'],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual((root/'receipts/maintenance.exit').read_text().strip(), str(expected))
+                calls = [json.loads(line) for line in (root/'cargo-calls').read_text().splitlines()]
+                deadlines = [json.loads(line) for line in (root/'timeouts').read_text().splitlines()]
+                self.assertEqual(len(calls), count)
+                self.assertIn('--no-run', calls[0])
+                self.assertEqual(deadlines[0][0], '30m')
+                if count == 2:
+                    self.assertNotIn('--no-run', calls[1])
+                    self.assertIn(case, calls[1])
+                    self.assertEqual(calls[1][-2:], ['--exact', '--test-threads=1'])
+                    self.assertEqual(deadlines[1][:2], ['--kill-after=5s', '600s'])
+                    self.assertTrue((root/'receipts/maintenance.log').exists())
+                else:
+                    self.assertFalse((root/'receipts/maintenance.log').exists())
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -243,18 +243,9 @@ def normal_dedup_certificate(root=ROOT, check_source=True):
         if check_source:
             if os.environ.get('RUSTFLAGS', '') not in {'', '-D warnings'}:
                 raise ValueError('unqualified RUSTFLAGS')
-            test_profile = {
-                'CARGO_PROFILE_TEST_OPT_LEVEL': '1',
-                'CARGO_PROFILE_TEST_DEBUG_ASSERTIONS': 'true',
-                'CARGO_PROFILE_TEST_OVERFLOW_CHECKS': 'true',
-            }
-            present_test_profile = {k: os.environ[k] for k in test_profile if k in os.environ}
-            if present_test_profile and present_test_profile != test_profile:
-                raise ValueError('unqualified test profile tuple')
             allowed_profiles = {
                 'CARGO_PROFILE_DEV_DEBUG': '0',
                 'CARGO_PROFILE_TEST_DEBUG': '0',
-                **test_profile,
             }
             for k, v in os.environ.items():
                 if (k.startswith('CARGO_PROFILE_') and allowed_profiles.get(k) != v
@@ -844,6 +835,10 @@ def required(needs, rows, enabled, run_default, mode=None):
 def workflow_contract(root=ROOT):
     """Narrow reviewed YAML shape; offline controls independently parse and mutate it."""
     text = (root / '.github/workflows/integration.yml').read_text()
+    for workflow in ['ci.yml', 'integration.yml', 'rc2-tests.yml']:
+        workflow_text = (root / '.github/workflows' / workflow).read_text()
+        if re.search(r'^\s+CARGO_PROFILE_TEST_(OPT_LEVEL|DEBUG_ASSERTIONS|OVERFLOW_CHECKS):', workflow_text, re.M):
+            raise ValueError('test profile must come from Cargo.toml: ' + workflow)
     expected_jobs = ['plan', 'slice', 'result']
     if re.findall(r'^  ([\w-]+):$', text.split('\njobs:\n', 1)[1], re.M) != expected_jobs:
         raise ValueError('integration workflow job inventory changed')
@@ -851,7 +846,6 @@ def workflow_contract(root=ROOT):
         '    needs: plan\n    if: needs.plan.outputs.enabled == \'true\'\n',
         '      fail-fast: false\n      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}',
         '    name: ${{ matrix.name }}', "    timeout-minutes: ${{ needs.plan.outputs.gate_mode == 'normal' && 30 || 330 }}",
-        '    env:\n      CARGO_PROFILE_TEST_OPT_LEVEL: "1"\n      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: "true"\n      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: "true"\n',
         '          CI_INTEGRATION_SLICE: ${{ matrix.id }}',
         "  CI_INTEGRATION_ENABLED: ${{ github.event_name == 'workflow_dispatch' || inputs.enabled }}",
         '  CI_INTEGRATION_DEFAULT: ${{ inputs.run_default }}',
@@ -886,7 +880,7 @@ def workflow_contract(root=ROOT):
     if top_permissions is None or guard.block_fields(top_permissions[1], 2) != {'contents': 'read\n'}:
         raise ValueError('integration must remain read-only')
     fields = {'plan': {'name', 'runs-on', 'timeout-minutes', 'outputs', 'steps'},
-              'slice': {'needs', 'if', 'name', 'runs-on', 'timeout-minutes', 'env', 'strategy', 'steps'},
+              'slice': {'needs', 'if', 'name', 'runs-on', 'timeout-minutes', 'strategy', 'steps'},
               'result': {'name', 'needs', 'if', 'runs-on', 'timeout-minutes', 'steps'}}
     for name in expected_jobs:
         block = re.search(r'^  ' + name + r':\n(.*?)(?=^  [\w-]+:|\Z)', text, re.M | re.S)[1]

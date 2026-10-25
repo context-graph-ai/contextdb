@@ -135,6 +135,20 @@ flaky-test issue. It is diagnostic, not a gate.
 
 ## PR checks (`ci.yml`)
 
+Cargo.toml owns the test optimisation and checked-arithmetic settings for local,
+PR, rc2 and integration builds. CI does not override them with
+CARGO_PROFILE_TEST_OPT_LEVEL, CARGO_PROFILE_TEST_DEBUG_ASSERTIONS or
+CARGO_PROFILE_TEST_OVERFLOW_CHECKS. The manifest-binding test checks manifest
+text; external Cargo configuration and environment can still override a local build.
+
+The engine-seams shard runs the initial-build/replacement/reclamation journey
+once through `scripts/ci-maintenance-journey.sh`, outside the ordinary libtest
+invocation. The helper compiles first, then applies a 600-second process limit
+with a five-second forced-cleanup grace to that exact case. Both logs and the helper’s exact
+exit status (`maintenance.exit`) are retained in the shard receipt. The ordinary invocation skips
+only that same case. This CI runner limit detects regressions; hosted duration
+is not controlled-hardware performance qualification.
+
 Every job uses `ubuntu-latest`. The shared
 environment is all runner cores, no debug info, no incremental builds and an
 empty `RUSTFLAGS`; jobs that compile with warnings-as-errors set it per command.
