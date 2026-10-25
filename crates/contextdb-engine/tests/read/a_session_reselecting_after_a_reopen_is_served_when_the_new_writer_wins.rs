@@ -119,11 +119,24 @@ fn a_session_reselecting_after_its_writer_closed_is_served_when_the_replacement_
         let resume = resume;
         let finished = progress;
         let reading = &session;
+        // The observer keeps its own progress sender alive, so the reader
+        // reports every outcome, a panic included, as its answer; otherwise
+        // a panicking statement would leave the receives below waiting.
         scope.spawn(move || {
-            let answer = reading
-                .execute("SELECT id FROM items ORDER BY id", &HashMap::new())
-                .map(|result| result.rows().to_vec())
-                .map_err(|error| error.to_string());
+            let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reading
+                    .execute("SELECT id FROM items ORDER BY id", &HashMap::new())
+                    .map(|result| result.rows().to_vec())
+                    .map_err(|error| error.to_string())
+            }))
+            .unwrap_or_else(|panic| {
+                let text = panic
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a non-text panic".to_owned());
+                Err(format!("the statement panicked: {text}"))
+            });
             let _ = finished.send(ReaderProgress::Finished(answer));
         });
 
