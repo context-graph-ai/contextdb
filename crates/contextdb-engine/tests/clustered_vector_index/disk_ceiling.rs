@@ -3,35 +3,31 @@
 //! reservoir, build accumulator, unpublished list run, prepared replacement)
 //! passes disk admission before any byte of it reaches the store, and every
 //! byte that does reach the store does so under an admission that admitted
-//! it. Writes may reuse free space and may retry with a smaller layout that
-//! fits; a write whose smallest possible growth would pass the ceiling is
-//! refused and never executed. The refusal surfaces as the existing typed
+//! it. Writes may reuse free space, may retry with a smaller layout that
+//! fits, and may take smaller admitted steps; a write whose smallest valid
+//! growth would pass the ceiling is refused and never executed. The refusal surfaces as the existing typed
 //! disk-budget error naming the ceiling; every index reservation is
 //! returned; the old generation keeps serving every committed row; and once
 //! the ceiling is lifted the build finishes and the store reopens cleanly.
 
 use super::support::{
-    BuildWriteClass, BuildWriteEvent, MAX_MAINTENANCE_CYCLES, PhysicalPage, build_progress, count,
-    drive_until_serving, empty, int_ids, ivf, last_build_refusal, observe_build_writes,
-    observe_search, open_caller_driven, open_with_build_batch_rows, outstanding_index_reservations,
-    params, physical_pages, serving, unit_vector, withhold_reusable_space_from,
+    AdmissionBoundary, BuildWriteClass, BuildWriteEvent, MAX_MAINTENANCE_CYCLES, PhysicalPage,
+    build_progress, count, declare_ceiling_at_next_admission, drive_until_serving, empty, int_ids,
+    ivf, last_build_refusal, observe_build_writes, observe_search, open_caller_driven,
+    open_with_build_batch_rows, outstanding_index_reservations, params, physical_pages, serving,
+    unit_vector, withhold_reusable_space_from,
 };
 use contextdb_core::{Error, Value, Wallclock};
 use contextdb_engine::Database;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// Wide vectors and large batches make every build phase's per-cycle writes
-/// far larger than the headroom below.
-const DIMENSIONS: usize = 768;
-const LISTS: u32 = 16;
+const DIMENSIONS: usize = 64;
+const LISTS: u32 = 4;
 const FIRST_ROWS: std::ops::Range<i64> = 0..120;
 const SECOND_ROWS: std::ops::Range<i64> = 1_000..1_240;
-const BUILD_BATCH_ROWS: u64 = 128;
+const BUILD_BATCH_ROWS: u64 = 16;
 const REFUSED_CYCLES: usize = 3;
-/// Room above the current store size that ordinary small writes may grow
-/// into: two 4 KiB pages.
-const HEADROOM_BYTES: u64 = 8 * 1024;
 
 fn insert_rows(db: &Database, ids: std::ops::Range<i64>) {
     let tx = db.begin_or_panic();
@@ -290,81 +286,104 @@ fn drive_until_next_write(db: &Database, class: BuildWriteClass) {
     panic!("the replacement never reached a {class:?} write");
 }
 
-/// From a store inside its ceiling, with the targeted phase's writes barred
-/// from reusing free space so that each can only grow the store, a ceiling
-/// a few pages above the current size makes the phase's per-cycle writes
-/// genuinely unfulfillable: the phase is refused once even the smallest
-/// growth of one of its writes would pass the ceiling, and nothing it was
-/// refused reaches the store.
+/// At the targeted phase's own admission boundary, after the cycle's earlier
+/// writes were admitted with no ceiling, a ceiling is declared that leaves
+/// one byte less headroom than that write's smallest valid growth, computed
+/// before the decision. The phase's writes are barred from reusing free
+/// space, so that growth is positive and genuinely unavoidable. The store is
+/// inside the ceiling when it is declared, and the real disk admission
+/// decides: no layout of that write can fit, so it must be refused and never
+/// execute. Smaller layouts and smaller admitted steps elsewhere stay
+/// allowed: earlier cycles and earlier writes are unconstrained.
 fn refused_at(class: BuildWriteClass) {
     let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let root = tempfile::tempdir().expect("temporary store directory");
     let path = root.path().join("constrained.db");
     let (db, first) = store_with_due_replacement(&path);
     drive_until_next_write(&db, class);
-    let size = db.disk_file_size().expect("a file-backed store has a size");
-    let ceiling = size + HEADROOM_BYTES;
-    db.set_disk_limit(Some(ceiling))
-        .expect("declare a ceiling the store is inside");
 
+    let boundary = Arc::new(Mutex::new(None::<(AdmissionBoundary, u64)>));
     let (result, events) = {
         let _withheld = withhold_reusable_space_from(&db, class);
+        let seen = Arc::clone(&boundary);
+        let _ceiling = declare_ceiling_at_next_admission(
+            &db,
+            class,
+            Box::new(move |at: &AdmissionBoundary| {
+                let ceiling = (at.current_store_bytes + at.minimum_growth_bytes).saturating_sub(1);
+                *seen.lock().unwrap() = Some((*at, ceiling));
+                ceiling
+            }),
+        );
         observed_cycle(&db)
     };
-    let stage = format!("{class:?} under the ceiling");
+    let stage = format!("{class:?} at its admission boundary");
+    let (at, ceiling) = boundary
+        .lock()
+        .unwrap()
+        .unwrap_or_else(|| panic!("{stage}: the cycle reached a {class:?} admission: {events:?}"));
+    assert_eq!(at.class, class);
+    assert!(
+        at.minimum_growth_bytes > 0,
+        "{stage}: with reuse withheld, the write can only grow the store: {at:?}"
+    );
+    assert!(
+        at.current_store_bytes <= ceiling,
+        "{stage}: the store is inside the ceiling when it is declared: {at:?}, ceiling {ceiling}"
+    );
     assert_writes_follow_admission(&events, &stage);
 
-    let mut reached = false;
-    let mut refused = false;
-    for event in &events {
-        if let BuildWriteEvent::Admission {
-            class: seen,
+    let decision = events
+        .iter()
+        .find(|event| {
+            matches!(event, BuildWriteEvent::Admission { operation, .. } if *operation == at.operation)
+        })
+        .unwrap_or_else(|| panic!("{stage}: the real admission decided the targeted write: {events:?}"));
+    match decision {
+        BuildWriteEvent::Admission {
+            class: decided,
             current_store_bytes,
             minimum_growth_bytes,
-            projected_store_bytes,
             ceiling: declared,
             admitted,
             ..
-        } = event
-        {
-            if *seen != class {
-                continue;
-            }
-            reached = true;
+        } => {
+            assert_eq!(
+                *decided, class,
+                "{stage}: the decision is for the targeted class"
+            );
             assert_eq!(
                 *declared,
                 Some(ceiling),
                 "{stage}: admission saw the declared ceiling"
             );
-            assert!(
-                *minimum_growth_bytes > 0,
-                "{stage}: with reuse withheld, a {class:?} write can only grow the store: {event:?}"
+            assert_eq!(
+                (*current_store_bytes, *minimum_growth_bytes),
+                (at.current_store_bytes, at.minimum_growth_bytes),
+                "{stage}: the decision saw the boundary that was measured"
             );
-            if *admitted {
-                assert!(
-                    *projected_store_bytes <= ceiling,
-                    "{stage}: an admitted write, including a smaller retry, fits under the \
-                     ceiling: {event:?}"
-                );
-            } else {
-                refused = true;
-                assert!(
-                    current_store_bytes + minimum_growth_bytes > ceiling,
-                    "{stage}: a write is refused only when even its smallest growth passes the \
-                     ceiling: {event:?}"
-                );
-            }
+            assert!(
+                !admitted,
+                "{stage}: no valid layout fits one byte short of the smallest growth, so the \
+                 write is refused: {decision:?}"
+            );
+        }
+        BuildWriteEvent::Written { .. } => unreachable!(),
+    }
+    for event in &events {
+        if let BuildWriteEvent::Admission {
+            admitted: true,
+            projected_store_bytes,
+            ceiling: Some(declared),
+            ..
+        } = event
+        {
+            assert!(
+                projected_store_bytes <= declared,
+                "{stage}: every write admitted under the ceiling fits it: {event:?}"
+            );
         }
     }
-    assert!(
-        reached,
-        "{stage}: the cycle reached a {class:?} write: {events:?}"
-    );
-    assert!(
-        refused,
-        "{stage}: the phase's writes need more new space than the headroom, so one is \
-         refused: {events:?}"
-    );
     assert_disk_refusal(&surfaced_refusal(&db, result, &stage), ceiling, &stage);
     assert!(
         db.disk_file_size().expect("a file-backed store has a size") <= ceiling,
@@ -373,7 +392,7 @@ fn refused_at(class: BuildWriteClass) {
     assert_eq!(
         build_progress(&db, "ceiling_items", "embedding", &[]).next_write,
         Some(class),
-        "{stage}: the build did not advance past the refused phase"
+        "{stage}: the build did not advance past the refused write"
     );
     assert_still_serving(&db, first, &stage);
     assert_every_row_is_served(&db, &stage);

@@ -536,3 +536,36 @@ pub fn withhold_reusable_space_from(
 ) -> ReusableSpaceWithheld {
     unimplemented!("{UNBOUND}: withholding reusable space from one build class")
 }
+
+/// A targeted write at its disk admission boundary, described before the
+/// admission decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionBoundary {
+    /// The write operation about to be decided; its `Admission` event and
+    /// any execution carry the same id.
+    pub operation: u64,
+    pub class: BuildWriteClass,
+    /// The store's size at the boundary.
+    pub current_store_bytes: u64,
+    /// The smallest store growth with which any valid layout, including a
+    /// smaller retry, could satisfy this write after reusing every free block
+    /// it is allowed to reuse, computed by the allocator's own layout rules
+    /// before the decision.
+    pub minimum_growth_bytes: u64,
+}
+
+/// While it lives, the first write of the named class to reach its disk
+/// admission calls the chooser with that write's boundary; the ceiling the
+/// chooser returns is declared through the ordinary disk-limit path, and then
+/// the real admission decides the write against it.
+pub struct CeilingAtAdmission {
+    _private: (),
+}
+
+pub fn declare_ceiling_at_next_admission(
+    _db: &Database,
+    _class: BuildWriteClass,
+    _choose: Box<dyn FnOnce(&AdmissionBoundary) -> u64 + Send>,
+) -> CeilingAtAdmission {
+    unimplemented!("{UNBOUND}: declaring a ceiling at a write's admission boundary")
+}
