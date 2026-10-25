@@ -646,6 +646,18 @@ mod purge_page_identity_tests {
 
     #[test]
     fn repeated_node_local_instruction_is_refused_by_its_receipt() {
+        // A pull validates its page inside the reader owner it installs for
+        // the whole operation; decoding the node-local instruction is paid
+        // there. Install that same declared reader owner around this
+        // direct call.
+        let db = crate::database::Database::open_memory();
+        let reader = crate::read_image_memory::ImageMemory::operation_reader(
+            db.bounded_read_accountant(),
+            db.declared_reader_memory()
+                .expect("admit the declared reader for this operation"),
+        )
+        .expect("install the operation's reader owner");
+        let _operation = reader.enter();
         let predicate =
             crate::database::purge_predicate::NodeLocalPredicate::capture(None, &HashMap::new())
                 .expect("encode a node-local instruction");
