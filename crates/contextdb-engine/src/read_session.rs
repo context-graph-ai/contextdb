@@ -2077,7 +2077,6 @@ pub(crate) fn session_kernel_probe_for_test()
 /// New operations reselect their route after a writer run ends; existing
 /// cursors retain their selected snapshot and continuation.
 pub struct ReadSession {
-    route: ReadRoute,
     requirement: RouteRequirement,
     options: ReadSessionOptions,
     cache_policy_mutation: Mutex<()>,
@@ -2086,7 +2085,7 @@ pub struct ReadSession {
     /// deployment questions -- `.owner status` reaches the same owner the
     /// reads do -- and both must look in the one place the operator named.
     runtime_dir: Option<PathBuf>,
-    state: Arc<ReadSessionState>,
+    state: std::sync::RwLock<SelectedSessionState>,
     resources: Arc<RouteResources>,
     // External custody stays outside callback-upgraded suspended state.
     expiry_driver: Mutex<Option<SessionExpiryDriver>>,
@@ -2101,7 +2100,6 @@ pub struct ReadSession {
     /// not one of them -- and because the question is about this session's
     /// view, which is exactly what route selection has just finished
     /// producing.
-    snapshot_at: Option<contextdb_core::Wallclock>,
     #[cfg(any(test, feature = "test-seams"))]
     observer: Option<Arc<dyn ReadSessionTestObserver>>,
     #[cfg(any(test, feature = "test-seams"))]
@@ -2112,6 +2110,11 @@ pub struct ReadSession {
     /// which left its deadline behaviour unreachable from a test.
     #[cfg(any(test, feature = "test-seams"))]
     clock: Option<Arc<dyn contextdb_core::read_contract::DeadlineClock>>,
+}
+
+struct SelectedSessionState {
+    state: Arc<ReadSessionState>,
+    snapshot_at: Option<contextdb_core::Wallclock>,
 }
 
 enum ReadSessionState {
@@ -2168,7 +2171,20 @@ fn observed_kernel_probe(
     ))
 }
 
+impl ReadSessionState {
+    fn route(&self) -> ReadRoute {
+        match self {
+            Self::DirectFile(_) => ReadRoute::File,
+            Self::LiveDatabase(_) | Self::OwnerChannel(_) => ReadRoute::Owner,
+        }
+    }
+}
+
 impl ReadSession {
+    fn selected_state(&self) -> Arc<ReadSessionState> {
+        Arc::clone(&self.state.read().expect("selected read route").state)
+    }
+
     /// The clock this session deadlines against: whatever a test installed,
     /// otherwise the monotonic one every live read has always used.
     fn session_clock(&self) -> Arc<dyn contextdb_core::read_contract::DeadlineClock> {
@@ -2277,14 +2293,14 @@ impl ReadSession {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn after_writer_turnover(&self, cancellation: &OwnerReadCancellation) -> Result<Option<Self>> {
-        let ReadSessionState::OwnerChannel(owner) = self.state.as_ref() else {
-            return Ok(None);
+    fn after_writer_turnover(&self, cancellation: &OwnerReadCancellation) -> Result<()> {
+        let previous = self.selected_state();
+        let ReadSessionState::OwnerChannel(owner) = previous.as_ref() else {
+            return Ok(());
         };
         if cancellation.is_cancelled() {
             return Err(Error::ReadCancelled);
         }
-        let published = crate::persistence::published_writer_identity(&owner.path);
         let mismatch = || {
             Error::ReadFailure(
                 contextdb_core::read_contract::ReadFailure::new(
@@ -2294,15 +2310,16 @@ impl ReadSession {
                 .expect("owner mismatch has no detail"),
             )
         };
-        if let Some((identity, run, _, _)) = published {
-            if identity != owner.identity {
+        if let Some(observed) = crate::persistence::observed_writer_state(&owner.path) {
+            if observed.identity != owner.identity {
                 return Err(mismatch());
             }
-            if run == owner.writer_run
-                && crate::persistence::observed_writer_hold(&owner.path) == Some(true)
-                && !owner_is_quiescent(&owner.path)
-            {
-                return Ok(None);
+            let draining = observed.status.state
+                == contextdb_core::read_contract::OwnerServingState::NotServing
+                && observed.status.reason
+                    == Some(contextdb_core::read_contract::OwnerServingReason::ShutdownDraining);
+            if observed.run == owner.writer_run && observed.held && !draining {
+                return Ok(());
             }
         }
         let clock = self.session_clock();
@@ -2317,13 +2334,6 @@ impl ReadSession {
                 .expect("owner client")
                 .original_connection_owner(),
         };
-        // Custody belongs to the public session before a temporary selected
-        // view or its first cursor can start using this shared clock. A view
-        // must never become the sole driver owner and stop the session clock
-        // when that operation or cursor finishes.
-        self.resources
-            .expiry
-            .ensure_driver(&self.expiry_driver, &clock, || Ok(handover.owner.clone()))?;
         let observe = |event| {
             #[cfg(any(test, feature = "test-seams"))]
             if let Some(observer) = self.observer.as_ref() {
@@ -2345,68 +2355,41 @@ impl ReadSession {
         if cancellation.is_cancelled() {
             return Err(Error::ReadCancelled);
         }
-        let (route, state, snapshot_at) = match selected {
+        let (state, snapshot_at) = match selected {
             SelectedRoute::Owner(selected) => {
                 if selected.identity != owner.identity {
                     return Err(mismatch());
                 }
-                (
-                    ReadRoute::Owner,
-                    ReadSessionState::OwnerChannel(selected),
-                    None,
-                )
+                (ReadSessionState::OwnerChannel(selected), None)
             }
             SelectedRoute::File(reader) => {
                 if reader.database_identity() != Some(owner.identity) {
                     return Err(mismatch());
                 }
                 (
-                    ReadRoute::File,
                     ReadSessionState::DirectFile(reader),
                     Some(contextdb_core::Wallclock::now()),
                 )
             }
         };
-        let mut options = self.options.clone();
-        options.limits.active_ms = options
-            .limits
-            .active_ms
-            .saturating_sub(clock.now_ms().saturating_sub(started_ms));
-        if options.limits.active_ms == 0 {
-            return Err(Error::ReadFailure(
-                contextdb_core::read_contract::ReadFailure::owner_limit_exceeded(
-                    contextdb_core::read_contract::OwnerLimitExceededDetail {
-                        limit: contextdb_core::read_contract::ReadFailureLimit::ActiveMs,
-                        value: self.options.limits.active_ms,
-                        required: None,
-                        statement: None,
-                    },
-                ),
-            ));
+        let route = state.route();
+        let installed = {
+            let mut selected = self.state.write().expect("selected read route");
+            // A concurrent re-selection must never overwrite a newer state.
+            if Arc::ptr_eq(&selected.state, &previous) {
+                *selected = SelectedSessionState {
+                    state: Arc::new(state),
+                    snapshot_at,
+                };
+                true
+            } else {
+                false
+            }
+        };
+        if installed {
+            observe(ReadSessionEvent::RouteSelected(route));
         }
-        observe(ReadSessionEvent::RouteSelected(route));
-        Ok(Some(Self {
-            route,
-            requirement: self.requirement,
-            options,
-            runtime_dir: self.runtime_dir.clone(),
-            state: Arc::new(state),
-            resources: Arc::clone(&self.resources),
-            expiry_driver: Mutex::new(
-                self.expiry_driver
-                    .lock()
-                    .expect("session expiry worker")
-                    .clone(),
-            ),
-            progress: self.progress.clone(),
-            snapshot_at,
-            #[cfg(any(test, feature = "test-seams"))]
-            observer: self.observer.clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            kernel_observer: self.kernel_observer.clone(),
-            #[cfg(any(test, feature = "test-seams"))]
-            clock: Some(clock),
-        }))
+        Ok(())
     }
 
     /// Open a read-only session by selecting its initial owner or file route.
@@ -2778,7 +2761,7 @@ impl ReadSession {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_snapshot_for_test(&self) -> Option<crate::direct_file_reader::DirectSnapshot> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => Some(
                 crate::direct_file_reader::test_seams::snapshot_for_test(reader),
             ),
@@ -2791,7 +2774,7 @@ impl ReadSession {
     pub fn file_storage_registration_for_test(
         &self,
     ) -> Option<crate::direct_file_reader::DirectStorageRegistrationObservation> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 Some(crate::direct_file_reader::test_seams::storage_registration_for_test(reader))
             }
@@ -2809,7 +2792,7 @@ impl ReadSession {
         usize,
         crate::read_image_memory::ImageMemoryObservation,
     )> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 let (usage, held, witness) =
                     crate::direct_file_reader::test_seams::image_memory_for_test(reader);
@@ -2829,7 +2812,7 @@ impl ReadSession {
     /// see `a_read_only_session_pays_nothing_at_the_writers_retention_door`.
     #[cfg(test)]
     pub(crate) fn file_write_control_for_test(&self) -> redb::CacheWriteControlForTest {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 crate::direct_file_reader::test_seams::write_control_for_test(reader)
             }
@@ -2839,7 +2822,7 @@ impl ReadSession {
 
     #[cfg(test)]
     pub(crate) fn file_cached_header_for_test(&self) -> redb::CachePageForTest {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 crate::direct_file_reader::test_seams::cached_header_for_test(reader)
             }
@@ -2852,7 +2835,7 @@ impl ReadSession {
     pub fn file_cache_index_charge_for_test(
         &self,
     ) -> Option<crate::persistence::SourceCacheChargeForTest> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 Some(crate::direct_file_reader::test_seams::cache_index_charge_for_test(reader))
             }
@@ -2863,7 +2846,7 @@ impl ReadSession {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_retained_charge_bytes_for_test(&self) -> Option<usize> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 Some(crate::direct_file_reader::test_seams::retained_charge_bytes_for_test(reader))
             }
@@ -2874,7 +2857,7 @@ impl ReadSession {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_admitted_bytes_for_test(&self) -> Option<usize> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 Some(crate::direct_file_reader::test_seams::charged_admissions_for_test(reader))
             }
@@ -2889,7 +2872,7 @@ impl ReadSession {
     pub fn file_vector_passive_activity_for_test(
         &self,
     ) -> Option<contextdb_vector::VectorPassiveActivityCounters> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => Some(
                 crate::direct_file_reader::test_seams::vector_passive_activity_for_test(reader),
             ),
@@ -2902,7 +2885,7 @@ impl ReadSession {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_vector_store_for_test(&self) -> Option<Arc<contextdb_vector::VectorStore>> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => {
                 Some(crate::direct_file_reader::test_seams::vector_store_for_test(reader))
             }
@@ -2918,7 +2901,7 @@ impl ReadSession {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_retained_content_proof_bytes_for_test(&self) -> Option<(usize, usize)> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => Some(
                 crate::direct_file_reader::test_seams::retained_content_proof_bytes_for_test(
                     reader,
@@ -2936,7 +2919,7 @@ impl ReadSession {
     #[cfg(any(test, feature = "test-seams"))]
     #[doc(hidden)]
     pub fn file_evict_resident_proof_chunks_only_for_test(&self) -> Option<usize> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::DirectFile(reader) => Some(
                 crate::direct_file_reader::test_seams::evict_resident_proof_chunks_only_for_test(
                     reader,
@@ -3047,16 +3030,17 @@ impl ReadSession {
         };
         observe(ReadSessionEvent::RouteSelected(route));
         Ok(Self {
-            route,
             cache_policy_mutation: Mutex::new(()),
             requirement,
             options,
             runtime_dir,
-            state: Arc::new(state),
+            state: std::sync::RwLock::new(SelectedSessionState {
+                state: Arc::new(state),
+                snapshot_at,
+            }),
             resources,
             expiry_driver: Mutex::new(None),
             progress,
-            snapshot_at,
             #[cfg(any(test, feature = "test-seams"))]
             observer: session_observer,
             #[cfg(any(test, feature = "test-seams"))]
@@ -3068,7 +3052,6 @@ impl ReadSession {
 
     pub(crate) fn from_live_database(database: Database, limits: ReadLimits) -> Self {
         Self {
-            route: ReadRoute::Owner,
             cache_policy_mutation: Mutex::new(()),
             requirement: RouteRequirement::OwnerOnly,
             options: ReadSessionOptions {
@@ -3077,11 +3060,13 @@ impl ReadSession {
                 ..ReadSessionOptions::default()
             },
             runtime_dir: None,
-            state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+            state: std::sync::RwLock::new(SelectedSessionState {
+                state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+                snapshot_at: None,
+            }),
             resources: Arc::new(RouteResources::default()),
             expiry_driver: Mutex::new(None),
             progress: None,
-            snapshot_at: None,
             #[cfg(any(test, feature = "test-seams"))]
             observer: None,
             #[cfg(any(test, feature = "test-seams"))]
@@ -3113,7 +3098,6 @@ impl ReadSession {
     ) -> Self {
         observer.observe_event(ReadSessionEvent::RouteSelected(ReadRoute::Owner));
         Self {
-            route: ReadRoute::Owner,
             cache_policy_mutation: Mutex::new(()),
             requirement: RouteRequirement::OwnerOnly,
             options: ReadSessionOptions {
@@ -3122,11 +3106,13 @@ impl ReadSession {
                 ..ReadSessionOptions::default()
             },
             runtime_dir: None,
-            state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+            state: std::sync::RwLock::new(SelectedSessionState {
+                state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+                snapshot_at: None,
+            }),
             resources: Arc::new(RouteResources::default()),
             expiry_driver: Mutex::new(None),
             progress: None,
-            snapshot_at: None,
             observer: Some(observer),
             kernel_observer: None,
             #[cfg(any(test, feature = "test-seams"))]
@@ -3156,7 +3142,6 @@ impl ReadSession {
         observer: Arc<dyn ReadKernelTestObserver>,
     ) -> Self {
         Self {
-            route: ReadRoute::Owner,
             cache_policy_mutation: Mutex::new(()),
             requirement: RouteRequirement::OwnerOnly,
             options: ReadSessionOptions {
@@ -3165,11 +3150,13 @@ impl ReadSession {
                 ..ReadSessionOptions::default()
             },
             runtime_dir: None,
-            state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+            state: std::sync::RwLock::new(SelectedSessionState {
+                state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
+                snapshot_at: None,
+            }),
             resources: Arc::new(RouteResources::default()),
             expiry_driver: Mutex::new(None),
             progress: None,
-            snapshot_at: None,
             observer: None,
             kernel_observer: Some(observer),
             #[cfg(any(test, feature = "test-seams"))]
@@ -3177,9 +3164,9 @@ impl ReadSession {
         }
     }
 
-    /// The initial route selected when this session opened.
-    pub const fn route(&self) -> ReadRoute {
-        self.route
+    /// The route currently selected by this session.
+    pub fn route(&self) -> ReadRoute {
+        self.selected_state().route()
     }
 
     /// Current bytes charged to the reads this route serves.
@@ -3197,7 +3184,7 @@ impl ReadSession {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn charged_bytes(&self) -> Result<u64> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::LiveDatabase(database) => Ok(database.declared_read_charged_bytes()),
             ReadSessionState::DirectFile(reader) => Ok(reader.charged_bytes()),
             ReadSessionState::OwnerChannel(owner) => {
@@ -3297,14 +3284,19 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<QueryResult> {
-        if matches!(self.state.as_ref(), ReadSessionState::OwnerChannel(_))
-            && cancellation.is_cancelled()
+        if matches!(
+            self.selected_state().as_ref(),
+            ReadSessionState::OwnerChannel(_)
+        ) && cancellation.is_cancelled()
         {
             return Err(Error::ReadCancelled);
         }
         // The keeper is outside all query allocations and survives BOTH
         // success conversion and final error conversion at this public door.
-        let query_memory = if matches!(self.state.as_ref(), ReadSessionState::OwnerChannel(_)) {
+        let query_memory = if matches!(
+            self.selected_state().as_ref(),
+            ReadSessionState::OwnerChannel(_)
+        ) {
             Some(crate::local_transport::query_funding::QueryMemory::new(
                 self.options.limits.memory.min(
                     self.options
@@ -3346,12 +3338,8 @@ impl ReadSession {
         cancellation: &OwnerReadCancellation,
         query_memory: Option<&crate::local_transport::query_funding::QueryMemory>,
     ) -> Result<OwnedQueryResult> {
-        match self.after_writer_turnover(cancellation)? {
-            Some(selected) => {
-                selected.execute_on_selected_route(sql, params, cancellation, query_memory)
-            }
-            None => self.execute_on_selected_route(sql, params, cancellation, query_memory),
-        }
+        self.after_writer_turnover(cancellation)?;
+        self.execute_on_selected_route(sql, params, cancellation, query_memory)
     }
 
     #[expect(
@@ -3365,7 +3353,7 @@ impl ReadSession {
         cancellation: &OwnerReadCancellation,
         query_memory: Option<&crate::local_transport::query_funding::QueryMemory>,
     ) -> Result<OwnedQueryResult> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::LiveDatabase(database) => {
                 let child = database.ordinary_read_child()?;
                 crate::executor::bounded::with_native_read_memory(
@@ -3453,8 +3441,8 @@ impl ReadSession {
     /// owner has no such moment: the owner's state is still moving, and every
     /// answer is as current as the instant it was asked, which is why there is
     /// no instant to report rather than a made-up one.
-    pub const fn snapshot_at(&self) -> Option<contextdb_core::Wallclock> {
-        self.snapshot_at
+    pub fn snapshot_at(&self) -> Option<contextdb_core::Wallclock> {
+        self.state.read().expect("selected read route").snapshot_at
     }
 
     /// Ask this store a question about itself.
@@ -3511,12 +3499,8 @@ impl ReadSession {
         continuation: Option<&str>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<MetadataAnswer> {
-        match self.after_writer_turnover(cancellation)? {
-            Some(selected) => {
-                selected.metadata_on_selected_route(request, continuation, cancellation)
-            }
-            None => self.metadata_on_selected_route(request, continuation, cancellation),
-        }
+        self.after_writer_turnover(cancellation)?;
+        self.metadata_on_selected_route(request, continuation, cancellation)
     }
 
     #[expect(
@@ -3529,7 +3513,7 @@ impl ReadSession {
         continuation: Option<&str>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<MetadataAnswer> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::LiveDatabase(database) => {
                 if matches!(request, MetadataRequest::ImageState { .. }) {
                     return Err(crate::read_image::image_state_is_a_file_question());
@@ -3730,7 +3714,7 @@ impl ReadSession {
     ) -> Option<Arc<dyn crate::executor::BoundedExecutionProbe>> {
         self.kernel_observer
             .as_ref()
-            .map(|observer| observed_kernel_probe(observer, operation, self.route, cancellation))
+            .map(|observer| observed_kernel_probe(observer, operation, self.route(), cancellation))
     }
 
     /// Open a bounded cursor with a fresh cancellation token.
@@ -3773,10 +3757,8 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<ReadCursor> {
-        match self.after_writer_turnover(cancellation)? {
-            Some(selected) => selected.open_cursor_on_selected_route(sql, params, cancellation),
-            None => self.open_cursor_on_selected_route(sql, params, cancellation),
-        }
+        self.after_writer_turnover(cancellation)?;
+        self.open_cursor_on_selected_route(sql, params, cancellation)
     }
 
     #[expect(
@@ -3789,7 +3771,9 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<ReadCursor> {
-        match self.state.as_ref() {
+        let selected_state = self.selected_state();
+        let route = selected_state.route();
+        match selected_state.as_ref() {
             ReadSessionState::OwnerChannel(owner) => {
                 let clock = self.session_clock();
                 let now = clock.now_ms();
@@ -4041,13 +4025,13 @@ impl ReadSession {
                     observation,
                     owner_trace_charge: Some(owner_trace_charge),
                     state: Arc::new(SuspendedReadCursorState {
-                        route: self.route,
-                        session: Arc::clone(&self.state),
+                        route,
+                        session: Arc::clone(&selected_state),
                         resources: Arc::clone(&self.resources),
                         progress: self.progress.as_ref().map(Arc::clone),
                         first_page: first_page.into_public()?,
                         execution: Mutex::new(Box::new(OwnerCursorExecution {
-                            session: Arc::clone(&self.state),
+                            session: Arc::clone(&selected_state),
                             resources: Arc::clone(&self.resources),
                             limits,
                             cursor_id,
@@ -4121,8 +4105,8 @@ impl ReadSession {
                     observation,
                     owner_trace_charge: None,
                     state: Arc::new(SuspendedReadCursorState {
-                        route: self.route,
-                        session: Arc::clone(&self.state),
+                        route,
+                        session: Arc::clone(&selected_state),
                         resources: Arc::clone(&self.resources),
                         progress: self.progress.as_ref().map(Arc::clone),
                         first_page: opened.first_page.page.into_public()?,
@@ -4198,8 +4182,8 @@ impl ReadSession {
                             observation,
                             owner_trace_charge: None,
                             state: Arc::new(SuspendedReadCursorState {
-                                route: self.route,
-                                session: Arc::clone(&self.state),
+                                route,
+                                session: Arc::clone(&selected_state),
                                 resources: Arc::clone(&self.resources),
                                 progress: self.progress.as_ref().map(Arc::clone),
                                 first_page: opened.first_page.into_public()?,
@@ -4227,7 +4211,7 @@ impl ReadSession {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn request_owner(&self, namespace: &str, request: &[u8]) -> Result<Vec<u8>> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             // The embedded caller already holds the owner, so it asks the
             // handler directly rather than dialling its own channel.
             ReadSessionState::LiveDatabase(database) => {
@@ -6960,7 +6944,7 @@ impl ReadSession {
             Option<(usize, usize, u64)>,
         ) -> Result<T>,
     ) -> Result<T> {
-        let ReadSessionState::DirectFile(reader) = self.state.as_ref() else {
+        let ReadSessionState::DirectFile(reader) = self.selected_state().as_ref() else {
             return Err(Error::PlanError(
                 "physical fixture requires the direct-file route".into(),
             ));
@@ -6980,7 +6964,7 @@ impl ReadSession {
         &self,
         operation: impl FnOnce(&Database) -> Result<T>,
     ) -> Result<T> {
-        match self.state.as_ref() {
+        match self.selected_state().as_ref() {
             ReadSessionState::LiveDatabase(database) => operation(database.as_ref()),
             ReadSessionState::DirectFile(reader) => {
                 let target = reader.execution_target();

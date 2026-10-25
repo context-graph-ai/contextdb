@@ -1321,7 +1321,14 @@ pub(crate) fn observed_writer_hold(database_path: &Path) -> Option<bool> {
 /// gone. The advisory companion lock is what says the recorded owner is STILL
 /// there, and probing it touches neither the store file nor a single byte of
 /// its contents.
-pub(crate) fn recorded_held_owner_status(database_path: &Path) -> Option<OwnerReadStatus> {
+pub(crate) struct ObservedWriterState {
+    pub(crate) identity: DatabaseIdentity,
+    pub(crate) run: WriterRunNumber,
+    pub(crate) held: bool,
+    pub(crate) status: OwnerReadStatus,
+}
+
+pub(crate) fn observed_writer_state(database_path: &Path) -> Option<ObservedWriterState> {
     // ONE open. The record and the lock that proves the record is still THIS
     // writer's are observed through the same companion file, and the writer's
     // own run identity is read on both sides of the lock probe. Two separate
@@ -1352,9 +1359,7 @@ pub(crate) fn recorded_held_owner_status(database_path: &Path) -> Option<OwnerRe
             RangeLockOutcome::HeldByAnother => return None,
         }
         let before = active_companion_record(&mut file)?;
-        if writer_holds_companion(&file, database_path) != Some(true) {
-            return None;
-        }
+        let held = writer_holds_companion(&file, database_path)?;
         let after = active_companion_record(&mut file)?;
         validate_companion_metadata(&companion, &file, &before_probe, CompanionUse::Reading)
             .ok()?;
@@ -1370,9 +1375,19 @@ pub(crate) fn recorded_held_owner_status(database_path: &Path) -> Option<OwnerRe
             // reported.
             continue;
         }
-        return Some(after.fields.owner_read_status);
+        return Some(ObservedWriterState {
+            identity: after.fields.database_identity,
+            run: after.fields.writer_run_number,
+            held,
+            status: after.fields.owner_read_status,
+        });
     }
     None
+}
+
+pub(crate) fn recorded_held_owner_status(database_path: &Path) -> Option<OwnerReadStatus> {
+    let observed = observed_writer_state(database_path)?;
+    observed.held.then_some(observed.status)
 }
 
 /// What a live holder recorded when it decided not to serve inspection.
