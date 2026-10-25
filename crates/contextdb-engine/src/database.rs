@@ -48452,19 +48452,11 @@ impl Database {
             && changes.vectors.is_empty()
             && delivery_prepare.is_none();
         if schema_noop {
-            // The authenticated entries still acquire durable replay identity
-            // and advance the sender receipt. Their structured projection is
-            // already the live projection, so no table/index/vector/graph or
-            // content-identity image is staged or published. Keep the existing
-            // local DDL occurrences as the sole log representation; appending
-            // the equivalent received vector would create a duplicate prefix.
-            // The matching local commits still need their complete
-            // supersession evidence, however: it is what prevents outbound
-            // sync from echoing those already-authoritative occurrences.
-            let ddl_append = Vec::new();
-            persistence.ddl_log_replacement.clear();
-            persistence.generation_values.clear();
-            persistence.received_arrival_values.clear();
+            // Metadata equality does not identify a delivery. The manifest
+            // rejects duplicate authenticated units before preparation; each
+            // new occurrence still owns its DDL and exact arrival evidence.
+            // Keep this path free of row/index/vector replacement work.
+            let ddl_append = persistence.ddl_log_replacement.clone();
             let apply_result = ApplyResult {
                 applied_rows: 0,
                 skipped_rows: 0,
@@ -48517,7 +48509,8 @@ impl Database {
             } else {
                 InMemoryLineageDelta::default()
             };
-            let mut mirrors = self.received_schema_memory_mirrors(local_lsn, &[], HashMap::new());
+            let mut mirrors =
+                self.received_schema_memory_mirrors(local_lsn, &source_order, HashMap::new());
             mirrors
                 .superseded_ddl_occurrences
                 .extend(std::mem::take(&mut superseded_occurrences));
@@ -48570,8 +48563,22 @@ impl Database {
                     0,
                 )?,
             };
+            let memory_history = if self.persistence.is_none() {
+                Some(self.prepare_memory_history_entries(
+                    persistence
+                        .ddl_log_replacement
+                        .iter()
+                        .map(|(lsn, change)| (*lsn, change)),
+                    mirrors
+                        .ddl_generations
+                        .iter()
+                        .map(|(key, (table, generation))| (*key, (table, *generation))),
+                )?)
+            } else {
+                None
+            };
             return Ok(ReceivedSchemaStage {
-                memory_history: None,
+                memory_history,
                 _working_row_owner: None,
                 operational_copy_admission: None,
                 _vector_copy_owner: publication_vector_copy_owner
@@ -48774,10 +48781,6 @@ impl Database {
             if schema_projection_noop {
                 stage_shape_changes.ddl.clear();
                 stage_shape_changes.ddl_lsn.clear();
-                persistence.generation_values.clear();
-                persistence.received_arrival_values.clear();
-                persistence.superseded_occurrence_values.clear();
-                persistence.ddl_log_replacement.clear();
             }
             let affected_tables = Self::received_schema_dependency_closure(
                 &stage_shape_changes,
@@ -49386,7 +49389,7 @@ impl Database {
                 // this received unit.  The per-DDL generation sidecars establish
                 // provenance for the source vector; the table key is the ordinary
                 // local DML lookup used by later grant-table deletes/updates.
-                for entry in source_order.iter().filter(|_| !schema_projection_noop) {
+                for entry in &source_order {
                     if let (Some(table), Some(generation)) =
                         (&entry.generation.table, entry.generation.table_generation)
                     {
@@ -50168,21 +50171,14 @@ impl Database {
                         .config_values
                         .extend(publication.publication.config_values.iter().cloned());
                 }
-                let mirror_source_order = if schema_projection_noop {
-                    &[][..]
-                } else {
-                    source_order.as_slice()
-                };
                 let mut mirrors = self.received_schema_memory_mirrors(
                     local_lsn,
-                    mirror_source_order,
+                    &source_order,
                     working.accepted_sync_row_authors.read().clone(),
                 );
-                if !schema_projection_noop {
-                    mirrors
-                        .superseded_ddl_occurrences
-                        .extend(std::mem::take(&mut superseded_occurrences));
-                }
+                mirrors
+                    .superseded_ddl_occurrences
+                    .extend(std::mem::take(&mut superseded_occurrences));
                 // Only records actually finalized by this acceptance enter the delta.
                 // The working map owns each admitted payload; publication shares that
                 // root instead of cloning the full receiver map or refunding live data.
@@ -50577,14 +50573,10 @@ impl Database {
                         .into_iter()
                         .filter(|membership| affected_tables.contains(&membership.index.table))
                         .collect(),
-                    ddl_log: if schema_projection_noop {
-                        Vec::new()
-                    } else {
-                        source_order
-                            .iter()
-                            .map(|entry| (entry.local_arrival.local_lsn, entry.change.clone()))
-                            .collect()
-                    },
+                    ddl_log: source_order
+                        .iter()
+                        .map(|entry| (entry.local_arrival.local_lsn, entry.change.clone()))
+                        .collect(),
                     config_values: durable_config_values,
                     config_max_u64_keys: persistence.config_max_u64_keys.clone(),
                     operational_write_set: WriteSet::default(),
@@ -51413,6 +51405,12 @@ impl Database {
             && receipt.is_none()
             && push_outcome_key.is_none()
             && delivery_prepare.is_none()
+            // An unattested ALTER still represents an authored instruction;
+            // matching metadata does not erase its occurrence in ordered replay.
+            && !changes
+                .ddl
+                .iter()
+                .any(|ddl| matches!(ddl, DdlChange::AlterTable { .. }))
             && self.unattested_schema_unit_changes_nothing(changes, vector_copy_owner)?
         {
             return Ok(ApplyResult {
@@ -95012,6 +95010,31 @@ impl Database {
             && let Some(result) = self.replay_sync_push_outcome(key)?
         {
             return Ok(result);
+        }
+        // The last-request slot can belong to a later push. A data-empty
+        // schema occurrence already has its own durable manifest result, so
+        // redelivery needs no slot rebind or new receiver commit. A later
+        // frontier or an explicit contact update still follows the receipt path.
+        if changes.rows.is_empty()
+            && changes.edges.is_empty()
+            && changes.vectors.is_empty()
+            && receipt.hub_contact_ms.is_none()
+            && received_ddl.is_some()
+        {
+            let _manifest_lock = self.received_schema_manifest_lock.lock();
+            if let ReceivedSchemaManifestClassification::Replay(result) =
+                self.classify_received_schema_manifest(received_ddl)?
+                && self
+                    .persisted_sync_applied_push_watermark_for_node_incarnation_with_read_memory(
+                        &receipt.tenant_id,
+                        &receipt.node_id,
+                        receipt.incarnation,
+                        read_memory.clone(),
+                    )?
+                    .is_some_and(|watermark| watermark >= receipt.source_lsn)
+            {
+                return Ok(result.into());
+            }
         }
         let original_changes = changes.clone();
         let PurgedLineageRefusal {
