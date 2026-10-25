@@ -33,6 +33,7 @@ impl<S: PageStore> ClusteredIndex<S> {
         training: TrainingPolicy,
         owner: MemoryBudgetOwner,
     ) -> Result<Self> {
+        store.check_cancel()?;
         for (member, value) in [
             ("TRAINING_SAMPLES", training.reservoir_samples as u64),
             ("TRAINING_ITERATIONS", u64::from(training.iterations)),
@@ -581,6 +582,7 @@ impl<S: PageStore> ClusteredIndex<S> {
         Ok(())
     }
     pub fn seal(&mut self) -> Result<()> {
+        self.store.check_cancel()?;
         if self.buffer.is_empty() {
             return Ok(());
         }
@@ -798,6 +800,7 @@ impl<S: PageStore> ClusteredIndex<S> {
     /// At most entry_limit source entries, with a durable entry cursor. Prepared
     /// output remains invisible until one atomic catalog retirement commit.
     pub fn advance_remap(&mut self, partition: u64, entry_limit: usize) -> Result<RemapProgress> {
+        self.store.check_cancel()?;
         if entry_limit == 0 {
             return Err(phase(
                 "clustered Remap requires a positive admitted entry batch",
@@ -929,6 +932,7 @@ impl<S: PageStore> ClusteredIndex<S> {
     /// page_limit includes conservative control-page overlap. A call too small
     /// for one atomic directory unit is refused before beginning a transaction.
     pub fn advance_coalescing(&mut self, partition: u64, page_limit: usize) -> Result<bool> {
+        self.store.check_cancel()?;
         let Some(m) = self.store.manifest(partition)? else {
             return Ok(true);
         };
