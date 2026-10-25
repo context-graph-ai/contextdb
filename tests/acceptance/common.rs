@@ -175,22 +175,85 @@ pub(crate) fn spawn_cli(db_path: &Path, extra_args: &[&str]) -> Child {
         .expect("CLI should spawn")
 }
 
-pub(crate) fn spawn_server(db_path: &Path, tenant_id: &str, bind_spec: &str) -> Child {
+/// Own a server until it is reaped, including readiness assertion unwinds.
+pub(crate) struct ServerChild {
+    child: Option<Child>,
+}
+
+impl ServerChild {
+    pub(crate) fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+}
+
+impl std::ops::Deref for ServerChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        self.child.as_ref().expect("server child is still owned")
+    }
+}
+
+impl std::ops::DerefMut for ServerChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("server child is still owned")
+    }
+}
+
+impl Drop for ServerChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The kernel also kills the server if nextest terminates its parent test:
+/// destructors cannot run after a killed or timed-out test process.
+pub(crate) fn server_command() -> Command {
+    with_parent_death(Command::new(server_bin()))
+}
+
+fn with_parent_death(mut command: Command) -> Command {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent = std::process::id() as libc::pid_t;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Cover a parent exit between fork and installing the signal.
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                Ok(())
+            });
+        }
+    }
+    command
+}
+
+pub(crate) fn spawn_server(db_path: &Path, tenant_id: &str, bind_spec: &str) -> ServerChild {
     ensure_release_binaries();
-    let mut child = Command::new(server_bin())
-        .args([
-            "--db-path",
-            db_path.to_str().expect("utf-8 db path"),
-            "--tenant-id",
-            tenant_id,
-            "--sync-endpoint",
-            bind_spec,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("server should spawn");
+    let mut child = ServerChild::new(
+        server_command()
+            .args([
+                "--db-path",
+                db_path.to_str().expect("utf-8 db path"),
+                "--tenant-id",
+                tenant_id,
+                "--sync-endpoint",
+                bind_spec,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("server should spawn"),
+    );
     let ready =
         wait_for_child_stdout_contains(&mut child, "enrollment ticket:", Duration::from_secs(15));
     assert!(
@@ -300,22 +363,41 @@ pub(crate) fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool)
     false
 }
 
-pub(crate) fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
+fn wait_for_child_exit(child: &mut Child, timeout: Duration, context: &str) {
     let start = Instant::now();
     loop {
-        match child.try_wait().expect("CLI status poll") {
-            Some(_) => return child.wait_with_output().expect(context),
+        match child.try_wait().expect(context) {
+            Some(_) => return,
             None => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
-                    return child
-                        .wait_with_output()
-                        .expect("CLI should finish after timeout kill");
+                    child.wait().expect("child exits after timeout kill");
+                    return;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
         }
     }
+}
+
+pub(crate) fn wait_for_child_output(mut child: Child, timeout: Duration, context: &str) -> Output {
+    wait_for_child_exit(&mut child, timeout, context);
+    child.wait_with_output().expect(context)
+}
+
+pub(crate) fn wait_for_server_output(
+    mut child: ServerChild,
+    timeout: Duration,
+    context: &str,
+) -> Output {
+    wait_for_child_exit(&mut child, timeout, context);
+    // Only transfer the process out of its guard after it is already reaped.
+    child
+        .child
+        .take()
+        .expect("server child")
+        .wait_with_output()
+        .expect(context)
 }
 
 async fn wait_for_path(path: &Path, timeout: Duration) {
@@ -569,4 +651,133 @@ pub(crate) fn bfs_ids(db: &Database, start: Uuid) -> Vec<Uuid> {
         .iter()
         .map(|node| node.id)
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_fixture_cannot_survive_an_unwinding_or_killed_test() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    const CHILD: &str = "CONTEXTDB_SERVER_FIXTURE_LIFETIME_CHILD";
+    fn spawn(mode: &str) -> ServerChild {
+        ServerChild::new(
+            with_parent_death(Command::new(
+                std::env::current_exe().expect("test executable"),
+            ))
+            .args([
+                "--exact",
+                "common::a_server_fixture_cannot_survive_an_unwinding_or_killed_test",
+                "--nocapture",
+            ])
+            .env(CHILD, mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn guarded fixture child"),
+        )
+    }
+    match std::env::var(CHILD).ok().as_deref() {
+        Some("child") => {
+            println!("server fixture child ready");
+            std::io::stdout().flush().expect("publish readiness");
+            loop {
+                std::thread::park();
+            }
+        }
+        Some("parent") => {
+            let mut child = spawn("child");
+            let ready = wait_for_child_stdout_contains(
+                &mut child,
+                "server fixture child ready",
+                Duration::from_secs(15),
+            );
+            assert!(ready.contains("server fixture child ready"));
+            println!("server fixture descendant={}", child.id());
+            std::io::stdout()
+                .flush()
+                .expect("publish descendant identity");
+            // The test process will be killed while this child remains live.
+            loop {
+                std::thread::park();
+            }
+        }
+        None => {}
+        Some(mode) => panic!("unknown fixture mode {mode}"),
+    }
+    let mut child = spawn("child");
+    let ready = wait_for_child_stdout_contains(
+        &mut child,
+        "server fixture child ready",
+        Duration::from_secs(15),
+    );
+    assert!(ready.contains("server fixture child ready"));
+    let pid = child.id() as libc::pid_t;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _child = child;
+        panic!("exercise fixture cleanup during unwind");
+    }));
+    assert!(unwound.is_err());
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD),
+        "the guard killed and reaped the child during unwind"
+    );
+
+    // Adopt the descendant so this test also reaps it after its parent dies.
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    let mut parent = spawn("parent");
+    let ready = wait_for_child_stdout_contains(
+        &mut parent,
+        "server fixture descendant=",
+        Duration::from_secs(15),
+    );
+    let descendant: libc::pid_t = ready
+        .lines()
+        .find_map(|line| {
+            line.split_once("server fixture descendant=")
+                .map(|(_, pid)| pid)
+        })
+        .expect("parent reported its live descendant")
+        .parse()
+        .expect("descendant pid");
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, descendant, 0) } as i32;
+    assert!(
+        fd >= 0,
+        "open the exact live descendant: {}",
+        std::io::Error::last_os_error()
+    );
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    parent.kill().expect("simulate a killed test process");
+    parent.wait().expect("reap the killed test process");
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let exited = unsafe { libc::poll(&mut poll, 1, 15_000) };
+    // Even a failed assertion cannot leave this fixture running on the host.
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        );
+    }
+    assert_eq!(
+        unsafe { libc::waitpid(descendant, &mut status, 0) },
+        descendant
+    );
+    assert_eq!(
+        exited, 1,
+        "the kernel ended the child when its test parent died"
+    );
+    assert!(libc::WIFSIGNALED(status));
+    assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
 }

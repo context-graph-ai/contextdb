@@ -868,27 +868,29 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
     ensure_release_binaries();
     let stderr_path = tmp.path().join("server.stderr");
     let stderr_file = std::fs::File::create(&stderr_path).expect("server stderr");
-    let mut child = Command::new(server_bin())
-        .args([
-            "--db-path",
-            db_path.to_str().expect("utf-8 db path"),
-            "--tenant-id",
-            "f121",
-            "--sync-endpoint",
-            &sync.bind_spec,
-        ])
-        .env("CONTEXTDB_TEST_PUSH_BARRIER_MIN_ROWS", "100")
-        .env("CONTEXTDB_TEST_PUSH_BARRIER_FILE", &barrier_path)
-        .env("CONTEXTDB_TEST_PUSH_RELEASE_FILE", &release_path)
-        .env(
-            "CONTEXTDB_TEST_SHUTDOWN_QUIESCED_FILE",
-            &shutdown_quiesced_path,
-        )
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::from(stderr_file))
-        .spawn()
-        .expect("server should spawn");
+    let mut child = ServerChild::new(
+        server_command()
+            .args([
+                "--db-path",
+                db_path.to_str().expect("utf-8 db path"),
+                "--tenant-id",
+                "f121",
+                "--sync-endpoint",
+                &sync.bind_spec,
+            ])
+            .env("CONTEXTDB_TEST_PUSH_BARRIER_MIN_ROWS", "100")
+            .env("CONTEXTDB_TEST_PUSH_BARRIER_FILE", &barrier_path)
+            .env("CONTEXTDB_TEST_PUSH_RELEASE_FILE", &release_path)
+            .env(
+                "CONTEXTDB_TEST_SHUTDOWN_QUIESCED_FILE",
+                &shutdown_quiesced_path,
+            )
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::from(stderr_file))
+            .spawn()
+            .expect("server should spawn"),
+    );
 
     struct ServerStderrDump<'a> {
         path: &'a std::path::Path,
@@ -1028,7 +1030,7 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
         .await
         .expect("in-flight push must complete during graceful drain")
         .expect("in-flight push task must not panic");
-    let exit = wait_for_child_output(child, Duration::from_secs(30), "graceful drain").status;
+    let exit = wait_for_server_output(child, Duration::from_secs(30), "graceful drain").status;
     let completed_shutdown_state =
         std::fs::read_to_string(&shutdown_quiesced_path).expect("read completed shutdown marker");
     let reply_position = completed_shutdown_state
@@ -1096,7 +1098,7 @@ async fn f121_contextdb_server_drains_on_sigterm_and_persists_in_flight_commits(
 #[test]
 fn f120_contextdb_server_version_prints_binary_and_protocol_version() {
     ensure_release_binaries();
-    let output = std::process::Command::new(server_bin())
+    let output = server_command()
         .arg("--version")
         .output()
         .expect("spawn contextdb-server --version");
