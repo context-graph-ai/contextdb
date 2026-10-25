@@ -312,6 +312,20 @@ pub struct BuildProgress {
     /// The class of persisted build object the build's next maintenance step
     /// writes, when a build is due or in flight.
     pub next_write: Option<BuildWriteClass>,
+    /// A replacement fell due while another switch was still remapping and
+    /// waits to start; inspection shows it with its trigger.
+    pub replacement_pending: bool,
+    /// What made the pending replacement due.
+    pub pending_trigger: Option<ReplacementTrigger>,
+}
+
+/// What made a replacement due.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplacementTrigger {
+    ChangePercent,
+    TombstonePercent,
+    PolicyRevision,
+    Requalification,
 }
 
 /// The persisted object classes a build or replacement writes before it
@@ -668,34 +682,78 @@ pub fn remap_progress(
     unimplemented!("{UNBOUND}: remap progress")
 }
 
-/// One depth of a serving generation's persisted coverage summary.
+/// How one calibrated depth of a serving generation qualified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DepthSummary {
+pub struct DepthQualification {
+    /// A depth from the CALIBRATION_DEPTHS policy.
     pub depth: u32,
-    /// The fewest exact top-`depth` identities any sample query's answer
-    /// prefix of length `depth` contained.
-    pub minimum_hits: u32,
-    /// Sample queries whose prefix recall at this depth is below the
-    /// declared RECALL.
+    /// This depth's own shortlist: ceil(depth x the generation's refine
+    /// factor), at least `depth`.
+    pub shortlist: u64,
+    /// Candidates this depth's own run actually rescored at full precision,
+    /// persisted with the result: its shortlist, or fewer when fewer were
+    /// eligible.
+    pub effective_candidates: u64,
+    /// Sample queries calibrated at this depth.
+    pub sample_queries: u32,
+    /// Sample queries whose answer at this depth missed the target.
     pub queries_below: u32,
+    /// This depth's own run met the target on every sample query, below
+    /// EXACT's work.
+    pub qualified: bool,
 }
 
-/// The per-depth coverage summary persisted with one Context's serving
-/// generation, for depths 1 through its maximum k, in depth order.
-pub fn coverage_summary(
+/// Where a generation's calibration samples came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalibrationBasis {
+    /// Held-out stored vectors of the partition.
+    StoredVectors,
+    /// A declared CALIBRATION_QUERIES source, pinned at its identity and
+    /// commit frontier when calibration read it.
+    Queries {
+        source_identity: u64,
+        source_frontier: u64,
+    },
+}
+
+/// The qualification receipt of one Context's serving generation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalibrationReceipt {
+    pub generation: u64,
+    pub probes: u64,
+    pub refine_factor: f64,
+    pub basis: CalibrationBasis,
+    /// Every calibrated depth, in ascending order.
+    pub depths: Vec<DepthQualification>,
+}
+
+pub fn calibration_receipt(
     _db: &Database,
     _table: &str,
     _column: &str,
     _context: &[Value],
-) -> Vec<DepthSummary> {
-    unimplemented!("{UNBOUND}: the per-depth coverage summary")
+) -> Option<CalibrationReceipt> {
+    unimplemented!("{UNBOUND}: the calibration receipt")
 }
 
-/// While it lives, the next calibration of the named Context computes each
-/// sample query's exact ranking as usual, then scores, in place of the chosen
-/// setting's own ranked answer for sample query `i`, the identities that
-/// `answer(i, exact)` returns. `exact` holds the sample query's exact ranking
-/// to the calibration's maximum depth, as canonical row identities.
+/// The Context's serving generation must be requalified (its target or its
+/// calibration-query source changed since it was qualified).
+pub fn requalification_pending(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> bool {
+    unimplemented!("{UNBOUND}: requalification pending")
+}
+
+/// While it lives, the next calibration of the named Context computes, for
+/// every sample query and every calibrated depth, the exact top-`depth`
+/// ranking as usual, runs that depth's own production search, and then
+/// scores, in place of that run's answer, the identities that
+/// `answer(query, depth, exact)` returns. `exact` holds the exact top-`depth`
+/// canonical row identities. It is called once for each (sample query,
+/// calibrated depth) the calibration actually runs.
 pub struct CalibrationAnswersRewritten {
     _private: (),
 }
@@ -705,9 +763,37 @@ pub fn rewrite_next_calibration_answers(
     _table: &str,
     _column: &str,
     _context: &[Value],
-    _answer: Box<dyn Fn(usize, &[u64]) -> Vec<u64> + Send + Sync>,
+    _answer: Box<dyn Fn(usize, u32, &[u64]) -> Vec<u64> + Send + Sync>,
 ) -> CalibrationAnswersRewritten {
     unimplemented!("{UNBOUND}: rewriting calibration answers")
+}
+
+/// Installs on the Context's serving generation a qualification receipt
+/// stating that every listed depth qualified, with the given mean complete
+/// work for the indexed route and for EXACT, as if calibration had measured
+/// them. Nothing else about the generation changes.
+pub fn plant_qualification(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _depths: &[u32],
+    _indexed_mean_work: u64,
+    _exact_mean_work: u64,
+) {
+    unimplemented!("{UNBOUND}: planting a qualification")
+}
+
+/// Declares `source_table.source_column` as the CALIBRATION_QUERIES source of
+/// the indexed column, through the column's policy.
+pub fn declare_calibration_queries(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _source_table: &str,
+    _source_column: &str,
+) {
+    unimplemented!("{UNBOUND}: declaring a calibration-query source")
 }
 
 /// The durable replacement-switch state of one Context.
@@ -795,4 +881,17 @@ pub fn legacy_entries_prepared_total(
     _context: &[Value],
 ) -> u64 {
     unimplemented!("{UNBOUND}: cumulative legacy remap preparation")
+}
+
+/// The Context's rows ordered by the serving generation's own quantized score
+/// for `query`, best first, as primary keys: the order a shortlist is cut
+/// from.
+pub fn quantized_order(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _query: &[f32],
+) -> Vec<Value> {
+    unimplemented!("{UNBOUND}: the quantized candidate order")
 }

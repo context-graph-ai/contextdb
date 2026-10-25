@@ -13,10 +13,10 @@
 //! with the same property.
 
 use super::support::{
-    IndexTestOptions, LegacyEntries, MAX_MAINTENANCE_CYCLES, PublicationCut, SwitchPhase,
-    SwitchState, build_progress, delta_entries, drive_until_serving, empty, int_ids, ivf,
-    legacy_entries_prepared_total, observe_publication_cuts, open_with_index_test_options, params,
-    serving, switch_state, unit_vector, write_buffer,
+    IndexTestOptions, LegacyEntries, MAX_MAINTENANCE_CYCLES, PublicationCut, ReplacementTrigger,
+    SwitchPhase, SwitchState, build_progress, delta_entries, drive_until_serving, empty, int_ids,
+    ivf, legacy_entries_prepared_total, observe_publication_cuts, open_with_index_test_options,
+    params, serving, switch_state, unit_vector, write_buffer,
 };
 use contextdb_core::{Value, Wallclock};
 use contextdb_engine::Database;
@@ -469,4 +469,84 @@ fn a_crash_inside_a_remap_batch_recovers_and_finishes_with_each_row_exactly_once
     );
     remap_to_completion(&db, &mut fixture, "after recovery");
     db.close().unwrap();
+}
+
+#[test]
+fn a_replacement_due_while_legacy_entries_are_remapped_waits_for_the_remap_to_finish() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let root = tempfile::tempdir().expect("temporary store directory");
+    let db = open_with_index_test_options(&root.path().join("deferred.db"), OPTIONS);
+    let mut fixture = reach_state_b(&db);
+    let remapping_generation = serving(&db, "switch_items", "embedding", &[])
+        .expect("the replacement serves")
+        .generation;
+    // Far more than the declared change percent: another replacement is due.
+    insert_all(&db, 4_000..4_300);
+    fixture.committed.extend(4_000..4_300);
+
+    let mut deferred = false;
+    for _ in 0..MAX_MAINTENANCE_CYCLES {
+        bounded_cycle(&db, "with a replacement due during the remap");
+        if state(&db).phase == SwitchPhase::Serving {
+            break;
+        }
+        let progress = build_progress(&db, "switch_items", "embedding", &[]);
+        assert!(
+            !progress.in_flight,
+            "no second replacement starts while legacy entries are remapped: {progress:?}"
+        );
+        assert_eq!(
+            (progress.replacement_pending, progress.pending_trigger),
+            (true, Some(ReplacementTrigger::ChangePercent)),
+            "inspection shows the deferred replacement and its trigger: {progress:?}"
+        );
+        assert_eq!(
+            serving(&db, "switch_items", "embedding", &[])
+                .unwrap()
+                .generation,
+            remapping_generation,
+            "the remapping generation keeps serving"
+        );
+        assert_legacy_membership(&db, &fixture, "with a replacement pending");
+        assert_each_row_exactly_once(&db, &fixture.committed, "with a replacement pending");
+        deferred = true;
+    }
+    assert!(
+        deferred,
+        "the replacement fell due while the remap was still running"
+    );
+    assert_eq!(state(&db).phase, SwitchPhase::Serving, "the remap finished");
+    let waiting = build_progress(&db, "switch_items", "embedding", &[]);
+    assert!(
+        !waiting.in_flight && waiting.replacement_pending,
+        "at the end of the remap the replacement is still pending, not yet started: {waiting:?}"
+    );
+
+    bounded_cycle(&db, "the first call after the remap");
+    let started = build_progress(&db, "switch_items", "embedding", &[]);
+    assert!(
+        started.in_flight && !started.replacement_pending,
+        "the deferred replacement starts at the next maintenance call: {started:?}"
+    );
+
+    let mut finished = false;
+    for _ in 0..MAX_MAINTENANCE_CYCLES * 2 {
+        bounded_cycle(&db, "the deferred replacement");
+        let now = state(&db);
+        if now.phase == SwitchPhase::Serving
+            && serving(&db, "switch_items", "embedding", &[])
+                .unwrap()
+                .generation
+                != remapping_generation
+        {
+            finished = true;
+            break;
+        }
+    }
+    assert!(
+        finished,
+        "the deferred replacement publishes and its own remap finishes"
+    );
+    assert_each_row_exactly_once(&db, &fixture.committed, "after the deferred replacement");
+    db.close().expect("close the store");
 }
