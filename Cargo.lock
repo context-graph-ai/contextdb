@@ -941,6 +941,7 @@ name = "contextdb-vector"
 version = "1.0.0"
 dependencies = [
  "anndists",
+ "blake3",
  "contextdb-core",
  "contextdb-hnsw",
  "contextdb-tx",

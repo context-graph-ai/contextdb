@@ -1,0 +1,142 @@
+use super::storage::PAGE_BYTES;
+
+/// Already resolved engine policy. SQL validation/default resolution lives above this layer.
+#[derive(Clone, Copy, Debug)]
+pub struct Policy {
+    pub dimensions: usize,
+    pub lists: u32,
+    pub probes: u32,
+    pub rerank: usize,
+    pub buffer_cap_bytes: usize,
+    pub extend_to_k: bool,
+}
+impl Policy {
+    /// Reject a policy before any allocation; the declaring layer supplies its typed diagnostic.
+    pub fn checked(
+        dimensions: usize,
+        lists: u32,
+        probes: u32,
+        rerank: usize,
+        buffer_cap_bytes: usize,
+        extend_to_k: bool,
+    ) -> Option<Self> {
+        let record = dimensions.checked_mul(4)?.checked_add(24)?;
+        if dimensions == 0
+            || lists == 0
+            || probes == 0
+            || probes > lists
+            || rerank == 0
+            || record > buffer_cap_bytes
+        {
+            return None;
+        }
+        dimensions.checked_add(16).filter(|n| *n <= PAGE_BYTES)?;
+        dimensions.checked_mul(lists as usize)?.checked_mul(4)?;
+        Some(Self {
+            dimensions,
+            lists,
+            probes,
+            rerank,
+            buffer_cap_bytes,
+            extend_to_k,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Vector<'a> {
+    pub partition: u64,
+    pub row: u64,
+    pub values: &'a [f32],
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Exact,
+    Indexed,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Hit {
+    pub row: u64,
+    pub distance: f64,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Work {
+    pub centroid_evaluations: u64,
+    pub quantized_evaluations: u64,
+    pub full_precision_evaluations: u64,
+    pub buffer_evaluations: u64,
+    pub list_pages_read: u64,
+    pub canonical_pages_read: u64,
+    pub visibility_pages_read: u64,
+    pub lists_probed: u64,
+    /// Actual scores on selected EXACT routes, never inferred from an oracle.
+    pub exact_score_count: u64,
+}
+impl Work {
+    pub fn distance_evaluations(self) -> u64 {
+        self.centroid_evaluations
+            + self.quantized_evaluations
+            + self.full_precision_evaluations
+            + self.buffer_evaluations
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BufferState {
+    pub cap_bytes: usize,
+    pub high_water_bytes: usize,
+    pub sealed_runs: u64,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Candidate {
+    pub slot: u64,
+    pub row: u64,
+    pub distance: f64,
+}
+
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let mut dot = 0.0;
+    let mut aa = 0.0;
+    let mut bb = 0.0;
+    for (&x, &y) in a.iter().zip(b) {
+        let x = f64::from(x);
+        let y = f64::from(y);
+        dot += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    if aa == 0.0 || bb == 0.0 {
+        1.0
+    } else {
+        1.0 - dot / (aa.sqrt() * bb.sqrt())
+    }
+}
+pub(crate) fn order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    a.distance
+        .total_cmp(&b.distance)
+        .then_with(|| a.row.cmp(&b.row))
+}
+pub(crate) fn retain_best(candidates: &mut Vec<Candidate>, capacity: usize, item: Candidate) {
+    if capacity == 0 {
+        return;
+    }
+    let at = candidates
+        .binary_search_by(|x| order(x, &item))
+        .unwrap_or_else(|i| i);
+    if at >= capacity {
+        return;
+    }
+    if candidates.len() == capacity {
+        candidates.pop();
+    }
+    candidates.insert(at, item);
+}
+
+/// Resolved declared maintenance policy. No training or phase-size default is hidden here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrainingPolicy {
+    pub iterations: u32,
+    pub reservoir_samples: usize,
+    pub seed: u64,
+    pub ingest_batch_keys: usize,
+    pub phase_batch_entries: usize,
+}

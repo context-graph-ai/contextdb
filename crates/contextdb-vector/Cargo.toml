@@ -22,3 +22,5 @@ roaring.workspace = true
 parking_lot.workspace = true
 hnsw_rs = { package = "contextdb-hnsw", path = "../contextdb-hnsw", version = "1.0" }
 anndists.workspace = true
+
+blake3 = "1"

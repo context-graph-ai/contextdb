@@ -9,12 +9,10 @@
 //!
 //! The guards read the index through [`ClusteredLists`]. Each method states
 //! what it must do; the index binds each one to its own surface, and a method
-//! that still panics with [`UNBOUND`] means the surface is not there yet. The
+//! must delegate to the production surface rather than duplicate its algorithm. The
 //! guard bodies do not change when a binding is made.
 
 use std::collections::BTreeSet;
-
-const UNBOUND: &str = "the vector crate does not expose this clustered list index surface";
 
 /// One stored row: its Context, its canonical row identity and its vector.
 #[derive(Clone, Debug)]
@@ -82,35 +80,98 @@ struct Buffer {
     sealed_runs: u64,
 }
 
-/// The clustered list index under guard.
-struct ClusteredLists;
+#[path = "support/ivf_pages.rs"]
+mod ivf_pages;
 
+/// The native page fixture supplies storage only; the production clustered index
+/// executes every build, commit, search and buffer observation below.
+struct ClusteredLists {
+    index: contextdb_vector::ivf::ClusteredIndex<ivf_pages::Pages>,
+    budget: std::sync::Arc<ivf_pages::Budget>,
+}
 impl ClusteredLists {
-    /// Builds and publishes one generation per Context over `rows`, cosine
-    /// distance, each with the declared list count.
-    fn build(_declared: Declared, _rows: &[Row]) -> Self {
-        unimplemented!("{UNBOUND}: build a published generation")
+    fn build(declared: Declared, rows: &[Row]) -> Self {
+        use contextdb_vector::ivf::{ClusteredIndex, Policy, TrainingPolicy};
+        let budget = std::sync::Arc::new(ivf_pages::Budget::default());
+        let policy = Policy::checked(
+            declared.dimensions,
+            declared.lists as u32,
+            declared.probes as u32,
+            declared.rerank,
+            declared.buffer_cap_bytes,
+            true,
+        )
+        .unwrap();
+        let training = TrainingPolicy {
+            iterations: 10,
+            reservoir_samples: 300000,
+            seed: 11,
+            ingest_batch_keys: 64,
+            phase_batch_entries: 256,
+        };
+        let mut index = ClusteredIndex::new(
+            ivf_pages::Pages::default(),
+            policy,
+            training,
+            budget.clone().into(),
+        )
+        .unwrap();
+        for context in rows.iter().map(|r| r.context).collect::<BTreeSet<_>>() {
+            index
+                .build_partition(
+                    context,
+                    rows.iter()
+                        .filter(|r| r.context == context)
+                        .map(|r| (r.row, r.vector.as_slice())),
+                )
+                .unwrap();
+        }
+        Self { index, budget }
     }
-
-    /// Commits one insert. When this returns the row is searchable.
-    fn commit_insert(&mut self, _row: Row) {
-        unimplemented!("{UNBOUND}: commit one insert")
+    fn commit_insert(&mut self, row: Row) {
+        self.index
+            .commit_insert(contextdb_vector::ivf::Vector {
+                partition: row.context,
+                row: row.row,
+                values: &row.vector,
+            })
+            .unwrap();
     }
-
-    /// Searches the named Contexts (`None`: every Context) for the `k`
-    /// nearest rows.
-    fn search(
-        &self,
-        _query: &[f32],
-        _k: usize,
-        _contexts: Option<&[u64]>,
-        _mode: Mode,
-    ) -> Searched {
-        unimplemented!("{UNBOUND}: search")
+    fn search(&self, query: &[f32], k: usize, contexts: Option<&[u64]>, mode: Mode) -> Searched {
+        use contextdb_vector::ivf;
+        self.index.storage().contexts.borrow_mut().clear();
+        let mut hits = vec![ivf::Hit::default(); k];
+        let mode = match mode {
+            Mode::Exact => ivf::Mode::Exact,
+            Mode::Indexed => ivf::Mode::Indexed,
+        };
+        let (count, work) = ivf::search(
+            self.index.storage(),
+            self.index.policy(),
+            &self.budget.clone().into(),
+            query,
+            contexts,
+            mode,
+            &mut hits,
+        )
+        .unwrap();
+        Searched {
+            rows: hits[..count].iter().map(|h| h.row).collect(),
+            list_pages_read: work.list_pages_read,
+            contexts_read: self.index.storage().contexts.borrow().clone(),
+            centroid_evaluations: work.centroid_evaluations,
+            quantized_evaluations: work.quantized_evaluations,
+            full_precision_evaluations: work.full_precision_evaluations,
+            buffer_evaluations: work.buffer_evaluations,
+        }
     }
-
     fn buffer(&self) -> Buffer {
-        unimplemented!("{UNBOUND}: write-buffer state")
+        let b = self.index.buffer();
+        Buffer {
+            cap_bytes: b.cap_bytes,
+            high_water_bytes: b.high_water_bytes,
+            sealed_runs: b.sealed_runs,
+        }
     }
 }
 
