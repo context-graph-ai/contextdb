@@ -1345,3 +1345,156 @@ async fn received_metadata_only_alters_archive_and_rewrite_no_row_population() {
     edge.close().unwrap();
     source.close().unwrap();
 }
+
+// Every authored row occurrence of `table`, addressed through the history
+// exporter's own lookup: (row id, creating transaction, LSN, scalar values).
+#[cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
+fn authored_images(
+    db: &Database,
+    table_name: &str,
+    columns: &[&str],
+) -> Vec<(u64, u64, u64, BTreeMap<String, Value>)> {
+    let memory = db.declared_reader_memory().unwrap();
+    let decode = crate::read_image_memory::ImageMemory::operation_reader(
+        db.accountant.clone(),
+        memory.clone(),
+    )
+    .unwrap();
+    let _decode = decode.enter();
+    db.change_log_since(Lsn(0))
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| {
+            let ChangeLogEntry::RowInsert { table, row_id, lsn } = entry else {
+                return None;
+            };
+            if table != table_name {
+                return None;
+            }
+            let row = db
+                .row_for_change(&table, row_id, lsn, memory.clone(), &|| Ok(()), None)
+                .unwrap()
+                .expect("an authored row occurrence stays addressable in history");
+            let values = columns
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_owned(),
+                        row.values.get(*name).cloned().unwrap_or(Value::Null),
+                    )
+                })
+                .collect();
+            Some((row_id.0, row.created_tx.0, lsn.0, values))
+        })
+        .collect()
+}
+
+// HISTORY ALL is the default: a received DROP COLUMN changes the live shape,
+// never rows already authored. Every earlier occurrence still reads back with
+// its original body bytes under the same row id, creating transaction and LSN,
+// after the pull and after the edge restarts. Covered for a plain relation and
+// for one whose quantized vector column is stored as a placement.
+#[cfg(all(feature = "sync-orchestration", feature = "test-seams"))]
+#[tokio::test]
+async fn received_drop_column_keeps_each_earlier_row_body_under_its_exact_identity() {
+    for quantized in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Arc::new(Database::open_memory());
+        source.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        let vector_column = if quantized {
+            ", compressed VECTOR(3) WITH (quantization = 'SQ8') SEARCH_MODE INDEXED"
+        } else {
+            ""
+        };
+        run(
+            &source,
+            &format!(
+                "CREATE TABLE history_rows (id INTEGER PRIMARY KEY, body TEXT, note TEXT{vector_column}) SYNC TWO WAY SYNC CONFLICT KEEP LATEST"
+            ),
+        );
+        let body = |id: i64| format!("original body {id} \u{00fc}\u{2603}");
+        let mut expected = Vec::new();
+        for id in 1..=6i64 {
+            let mut params = HashMap::from([
+                ("id".into(), Value::Int64(id)),
+                ("body".into(), Value::Text(body(id))),
+                ("note".into(), Value::Text(format!("note-{id}"))),
+            ]);
+            let sql = if quantized {
+                params.insert(
+                    "vector".into(),
+                    Value::Vector(vec![id as f32, 7.0 - id as f32, 1.0]),
+                );
+                "INSERT INTO history_rows (id, body, note, compressed) VALUES ($id, $body, $note, $vector)"
+            } else {
+                "INSERT INTO history_rows (id, body, note) VALUES ($id, $body, $note)"
+            };
+            source.execute(sql, &params).unwrap();
+            expected.push((id, body(id)));
+        }
+        run(
+            &source,
+            "UPDATE history_rows SET body = 'second version of 2' WHERE id = 2",
+        );
+        expected.push((2, "second version of 2".into()));
+        let edge_path = dir.path().join("edge.db");
+        let edge = Arc::new(Database::open(&edge_path).unwrap());
+        edge.set_maintenance_policy(MaintenancePolicy::CallerDriven);
+        let pull = AuthenticatedPull::start(&source, &edge, "drop-keeps-history");
+        pull.pull().await;
+        let meta = edge.table_meta("history_rows").unwrap();
+        assert_eq!(
+            meta.history_policy, None,
+            "the table declares no history policy"
+        );
+        assert_eq!(
+            contextdb_core::DEFAULT_HISTORY_POLICY,
+            contextdb_core::HistoryPolicy::All
+        );
+        let before = authored_images(&edge, "history_rows", &["id", "body"]);
+        assert_eq!(
+            before
+                .iter()
+                .map(|(_, _, _, values)| (values["id"].clone(), values["body"].clone()))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(id, body)| (Value::Int64(*id), Value::Text(body.clone())))
+                .collect::<Vec<_>>(),
+            "the edge holds every authored occurrence, both versions of id 2 included"
+        );
+        run(&source, "ALTER TABLE history_rows DROP COLUMN body");
+        pull.pull().await;
+        assert!(
+            edge.table_meta("history_rows")
+                .unwrap()
+                .columns
+                .iter()
+                .all(|column| column.name != "body"),
+            "the received DROP changed the live shape"
+        );
+        assert_eq!(
+            edge.execute("SELECT id, note FROM history_rows ORDER BY id", &empty())
+                .unwrap()
+                .rows()
+                .len(),
+            6
+        );
+        assert_eq!(
+            authored_images(&edge, "history_rows", &["id", "body"]),
+            before,
+            "each earlier occurrence keeps its original body under the same row, transaction and LSN (quantized={quantized})"
+        );
+        pull.stop().await;
+        edge.close().unwrap();
+        drop(edge);
+        let reopened = Database::open(&edge_path).unwrap();
+        assert_eq!(
+            authored_images(&reopened, "history_rows", &["id", "body"]),
+            before,
+            "the original bodies survive the edge restart (quantized={quantized})"
+        );
+        reopened.close().unwrap();
+        source.close().unwrap();
+    }
+}
