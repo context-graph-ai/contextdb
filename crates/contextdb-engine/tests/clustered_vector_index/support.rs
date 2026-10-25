@@ -444,3 +444,14 @@ pub fn run_maintenance_cycle_cancellable(
 pub fn outstanding_index_reservations(_db: &Database) -> u64 {
     unimplemented!("{UNBOUND}: outstanding index reservations")
 }
+
+/// The typed error that last stopped one Context's build or replacement,
+/// kept until that build next makes progress. `None` when nothing stopped it.
+pub fn last_build_refusal(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> Option<contextdb_core::Error> {
+    unimplemented!("{UNBOUND}: the last build refusal")
+}

@@ -1,6 +1,7 @@
 //! User outcomes of the clustered on-disk vector index: bounded writes, crash
-//! atomicity, typed cancellation, snapshot isolation, deletes and PURGE, per-Context cost, exact
-//! and indexed work, reader memory, and the SQL declaration surface.
+//! atomicity, typed cancellation, the disk ceiling, snapshot isolation,
+//! deletes and PURGE, per-Context cost, exact and indexed work, reader memory,
+//! and the SQL declaration surface.
 
 #[path = "clustered_vector_index/support.rs"]
 mod support;
@@ -11,6 +12,8 @@ mod cancellation;
 mod crash_cut_points;
 #[path = "clustered_vector_index/deletes_and_purge.rs"]
 mod deletes_and_purge;
+#[path = "clustered_vector_index/disk_ceiling.rs"]
+mod disk_ceiling;
 #[path = "clustered_vector_index/exact_and_indexed_work.rs"]
 mod exact_and_indexed_work;
 #[path = "clustered_vector_index/parse_surface.rs"]
