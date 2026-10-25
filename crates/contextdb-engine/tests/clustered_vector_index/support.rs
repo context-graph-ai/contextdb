@@ -683,12 +683,16 @@ pub fn remap_progress(
 }
 
 /// How one calibrated depth of a serving generation qualified.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DepthQualification {
     /// A depth from the CALIBRATION_DEPTHS policy.
     pub depth: u32,
-    /// This depth's own shortlist: ceil(depth x the generation's refine
-    /// factor), at least `depth`.
+    /// This depth's own qualified PROBES.
+    pub probes: u64,
+    /// This depth's own qualified REFINE_FACTOR.
+    pub refine_factor: f64,
+    /// This depth's own shortlist: ceil(depth x its own refine factor), at
+    /// least `depth`.
     pub shortlist: u64,
     /// Candidates this depth's own run actually rescored at full precision,
     /// persisted with the result: its shortlist, or fewer when fewer were
@@ -720,10 +724,9 @@ pub enum CalibrationBasis {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalibrationReceipt {
     pub generation: u64,
-    pub probes: u64,
-    pub refine_factor: f64,
     pub basis: CalibrationBasis,
-    /// Every calibrated depth, in ascending order.
+    /// Every calibrated depth with its own qualified (PROBES, REFINE_FACTOR)
+    /// pair, in ascending depth order.
     pub depths: Vec<DepthQualification>,
 }
 
@@ -747,6 +750,10 @@ pub fn requalification_pending(
     unimplemented!("{UNBOUND}: requalification pending")
 }
 
+/// Supplies the answer scored for one (sample query, calibrated depth) from
+/// that depth's exact ranking.
+pub type CalibrationAnswer = Box<dyn Fn(usize, u32, &[u64]) -> Vec<u64> + Send + Sync>;
+
 /// While it lives, the next calibration of the named Context computes, for
 /// every sample query and every calibrated depth, the exact top-`depth`
 /// ranking as usual, runs that depth's own production search, and then
@@ -754,10 +761,6 @@ pub fn requalification_pending(
 /// `answer(query, depth, exact)` returns. `exact` holds the exact top-`depth`
 /// canonical row identities. It is called once for each (sample query,
 /// calibrated depth) the calibration actually runs.
-/// Supplies the answer scored for one (sample query, calibrated depth) from
-/// that depth's exact ranking.
-pub type CalibrationAnswer = Box<dyn Fn(usize, u32, &[u64]) -> Vec<u64> + Send + Sync>;
-
 pub struct CalibrationAnswersRewritten {
     _private: (),
 }
@@ -903,9 +906,9 @@ pub fn quantized_order(
 
 /// While it lives, the next calibration of the named Context evaluates only
 /// this (PROBES, REFINE_FACTOR) point, PROBES clamped to the active list
-/// count: every calibrated depth runs its own search with its own shortlist
-/// at this point, each depth is qualified or not from its own runs, and the
-/// selector does not move to another point. The generation then serves at
+/// count, at every calibrated depth: each depth runs its own search with its
+/// own shortlist at this point, is qualified or not from its own runs, and
+/// the selector moves no depth to another point. Every depth's pair is then
 /// this point.
 pub struct CalibrationSettingPlanted {
     _private: (),
@@ -1025,4 +1028,25 @@ pub fn inspected_training(
     _context: &[Value],
 ) -> InspectedTraining {
     unimplemented!("{UNBOUND}: the inspected training policy")
+}
+
+/// One depth's search setting, as inspection lists it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DepthSetting {
+    pub depth: u32,
+    pub probes: u64,
+    pub refine_factor: f64,
+}
+
+/// The per-depth (PROBES, REFINE_FACTOR) pairs inspection lists for one
+/// Context's serving generation, in ascending depth order: each calibrated
+/// depth's qualified pair, or, under an explicit IVF declaration, the declared
+/// pair at every depth.
+pub fn inspected_search_settings(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> Vec<DepthSetting> {
+    unimplemented!("{UNBOUND}: the inspected per-depth search settings")
 }

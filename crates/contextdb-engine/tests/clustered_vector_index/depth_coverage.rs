@@ -8,6 +8,8 @@
 //! calibrated set. An implementation that infers a shallow depth from a
 //! deeper run's prefix, instead of running it, fails. On a partition whose
 //! receipt qualifies a depth below EXACT's work, AUTO takes the index there.
+//! Each calibrated depth carries its own qualified (PROBES, REFINE_FACTOR)
+//! pair, listed by inspection, and its shortlist follows its own factor.
 
 use super::support::{
     MAX_MAINTENANCE_CYCLES, ObjectiveStatus, SearchOutcome, SearchRoute, SearchWork,
@@ -158,8 +160,8 @@ fn only_calibrated_depths_are_covered_each_by_its_own_run() {
         "calibration runs exactly the calibrated depths and no others: {runs:?}"
     );
     for row in &receipt.depths {
-        let own = ((f64::from(row.depth) * receipt.refine_factor).ceil() as u64)
-            .max(u64::from(row.depth));
+        let own =
+            ((f64::from(row.depth) * row.refine_factor).ceil() as u64).max(u64::from(row.depth));
         assert_eq!(
             row.shortlist, own,
             "depth {} uses its own shortlist: {receipt:?}",
@@ -167,6 +169,19 @@ fn only_calibrated_depths_are_covered_each_by_its_own_run() {
         );
         assert_eq!(row.sample_queries as usize, queries.len());
     }
+    let listed = super::support::inspected_search_settings(&db, "covered_items", "embedding", &[]);
+    assert_eq!(
+        listed
+            .iter()
+            .map(|setting| (setting.depth, setting.probes, setting.refine_factor))
+            .collect::<Vec<_>>(),
+        receipt
+            .depths
+            .iter()
+            .map(|row| (row.depth, row.probes, row.refine_factor))
+            .collect::<Vec<_>>(),
+        "inspection lists each calibrated depth with its own qualified pair"
+    );
     let at = |depth: u32| {
         *receipt
             .depths
@@ -469,10 +484,13 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
     );
     let receipt = calibration_receipt(&db, "near_items", "embedding", &[])
         .expect("the serving generation has a calibration receipt");
-    assert_eq!(
-        receipt.refine_factor, PINNED_FACTOR,
-        "the pinned factor serves: {receipt:?}"
-    );
+    for row in &receipt.depths {
+        assert_eq!(
+            (row.probes, row.refine_factor),
+            (PINNED_PROBES, PINNED_FACTOR),
+            "the pinned point is every depth's pair: {receipt:?}"
+        );
+    }
     let at = |depth: u32| {
         *receipt
             .depths

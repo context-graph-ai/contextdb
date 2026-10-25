@@ -369,7 +369,7 @@ fn caller_mistakes_are_typed_refusals_not_store_corruption() {
         ),
         (
             "phase_batch_entries",
-            "phase",
+            "batch_entries",
             TrainingPolicy {
                 phase_batch_entries: 0,
                 ..training()

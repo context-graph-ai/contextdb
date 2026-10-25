@@ -2,11 +2,12 @@
 //! `IVF (LISTS, PROBES, REFINE_FACTOR)`, every searched Context probes exactly
 //! PROBES of its lists, reads exactly those lists' pages, and rescores exactly
 //! ceil(LIMIT x REFINE_FACTOR) candidates at full precision, the same per
-//! Context over one, three or eight Contexts and never a multiple of it.
+//! Context over one, three or eight Contexts and never a multiple of it; and
+//! inspection lists the declared pair at every depth.
 
 use super::support::{
-    SearchRoute, drive_until_serving, empty, list_pages, nearest_lists, observe_search,
-    open_caller_driven, params, unit_vector,
+    SearchRoute, drive_until_serving, empty, inspected_search_settings, list_pages, nearest_lists,
+    observe_search, open_caller_driven, params, unit_vector,
 };
 use contextdb_core::Value;
 use std::collections::HashMap;
@@ -53,6 +54,27 @@ fn explicit_probes_and_refine_factor_bound_list_pages_and_rescores_exactly() {
     }
     db.commit(tx).expect("commit every Context");
     drive_until_serving(&db);
+
+    for ordinal in 0..CONTEXTS {
+        let settings = inspected_search_settings(
+            &db,
+            "breadth_items",
+            "embedding",
+            &[Value::Uuid(context(ordinal))],
+        );
+        assert!(
+            !settings.is_empty(),
+            "Context {ordinal}: inspection lists its search settings"
+        );
+        for setting in &settings {
+            assert_eq!(
+                (setting.probes, setting.refine_factor),
+                (PROBES, f64::from(REFINE_FACTOR)),
+                "Context {ordinal}: the explicit declaration replaces the pair at every depth: \
+                 {settings:?}"
+            );
+        }
+    }
 
     let query = unit_vector(31_337, DIMENSIONS);
     let rescored_per_context = LIMIT * u64::from(REFINE_FACTOR);

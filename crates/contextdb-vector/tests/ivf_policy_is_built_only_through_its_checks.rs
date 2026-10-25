@@ -2,7 +2,10 @@
 //! crate, a struct literal that would skip its checks (here a dimension no
 //! list page can hold) does not compile, while the checked constructor does.
 //! The probe is a small crate written to a temporary directory and checked
-//! by the same Cargo that runs this test, offline.
+//! by the same Cargo that runs this test, offline, resolving through a copy
+//! of the workspace lockfile so it builds the same dependency versions.
+//! `CONTEXTDB_IVF_POLICY_PROBE_TARGET` names a different build directory for
+//! the probe; by default it is `ivf-policy-probe` under the test's target.
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -37,10 +40,16 @@ fn check(literal: bool) -> std::process::Output {
     )
     .expect("write the probe manifest");
     std::fs::write(probe.join("src/main.rs"), MAIN).expect("write the probe source");
-    let target = std::env::var_os("CARGO_TARGET_DIR")
+    std::fs::copy(crate_dir.join("../../Cargo.lock"), probe.join("Cargo.lock"))
+        .expect("copy the workspace lockfile into the probe");
+    let target = std::env::var_os("CONTEXTDB_IVF_POLICY_PROBE_TARGET")
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate_dir.join("../../target"))
-        .join("ivf-policy-probe");
+        .unwrap_or_else(|| {
+            std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| crate_dir.join("../../target"))
+                .join("ivf-policy-probe")
+        });
     let mut cargo = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cargo
         .args(["check", "--offline", "--quiet", "--target-dir"])
