@@ -102,22 +102,18 @@ explicitly unqualified for their own Box-control funding. No legacy Box is
 promoted to the concrete owner. These changes are source-only and require
 independent allocator/unwind proof before physical-funding qualification.
 
-The internal scan producer uses a genuinely admitted weakless native shared
-remaining counter and a separate exact-layout node for each distinct active
-thread entry. Both are prepaid from the operation's original reader child using
-the existing native credit protocol; their complete allocations are physically
-freed before their invoices settle. The thread-local scan slot is only a scalar
-tail pointer, with no retained vector capacity. A node's links and guard count
-are thread-bound; the cross-thread allowance holds only an atomic counter and
-immutable owned admission. Nested `scan_reads`/`with_scan_reads` helpers retain
-the same active node without allocation. Last-guard release unlinks the exact
-node, including an interior node, before physical free. Fallible native creation
-and entry preserve actual admission and allocator-null causes. Public legacy
-`new`/`default`/`enter` signatures remain infallible and explicitly unqualified;
-native engine operations use the internal fallible methods. Declared scans now retain revisited pages under their original reader admission.
-Unscoped legacy scans keep the 16 KiB fallback allowance. These source mechanisms
-still require independent allocation, concurrent continuation, out-of-order guard,
-null and unwind verification; no compiler or runtime clearance is implied.
+Native scan values retain only the captured original admission. Each distinct
+active thread entry owns a separate exact-layout node prepaid from that original
+reader child through the existing native credit protocol. Scan-value construction
+and cloning allocate no counter. The thread-local scan slot is only a scalar tail
+pointer, with no retained vector capacity. Links and guard counts are thread-bound;
+only immutable owned admission crosses threads. Nested `scan_reads` and
+`with_scan_reads` helpers retain the same active node without allocation. The last
+guard unlinks its exact node, including an interior node, and physically frees it
+before settling its original invoice. Native construction refuses missing original
+admission; node entry preserves actual admission and allocator-null causes. Public
+legacy `new`/`default`/`enter` signatures remain infallible and explicitly unqualified
+for native funding; unscoped legacy scans keep their live 16 KiB fallback allowance.
 
 These are source mechanisms, UNCOMPILED / RUNTIME_UNRUN. Initial bootstrap before
 the engine installs this preparation/fixed owner, direct-read Vecs, growing dirty
@@ -130,7 +126,7 @@ private cache tests still require the independently owned real-handle adoption.
 | Changed source | Reason |
 |---|---|
 | `src/native_storage_admission.rs`, `src/lib.rs` | The test-seams-only pending-name observer borrows the real combined allocation Layout and native invoice after name construction. It admits or retains nothing and lets the engine allocator witness bind the exact original invoice to physical key teardown. |
-| `src/read_admission.rs` | Feature-internal prepaid native scan counter and thread-bound per-entry linked scope nodes, using the existing original native credit ownership protocol. Same-node nested helper guards allocate nothing; exact last-owner unlink/free precedes refund. Preserve the public legacy signatures and the unscoped fallback allowance; declared scans retain their working set under the original reader admission. Upstream proposal remains unsubmitted under the existing thread-scoped read-admission proposal. |
+| `src/read_admission.rs` | Feature-internal captured native admission and prepaid thread-bound per-entry linked scope nodes, using the existing original native credit ownership protocol. Same-node nested helper guards allocate nothing; exact last-owner unlink/free precedes refund. Preserve the public legacy signatures and the unscoped fallback allowance; declared scans retain their working set under the original reader admission. Upstream proposal remains unsubmitted under the existing thread-scoped read-admission proposal. |
 | `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/tree_store/bounded_bytes.rs` | Feature-internal concrete movable source-credit owner and a distinct internal legacy/owned carrier. Preserve authentic credit through actual control deallocation, source-page/counter teardown and cache handoff. Keep legacy Box wrappers and the public backend trait unchanged; exact actual Layout prepayment remains with the engine factory. Upstream proposal remains unsubmitted. |
 | `src/tree_store/page_store/cache_owner_contract_rows.rs` (added), `src/tree_store/page_store/lru_cache.rs`, `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/base.rs`, `src/tree_store/btree_base.rs`, `src/tree_store/page_store/page_manager.rs`, `src/db.rs` | Independent rows extend the existing immutable-page lifetime test with exact cached-identity displacement, a no-invalidation pinned negative, multiple clones, source-paid windows/unwind, retained dirty and COW aliases, flush/cancellation, refusal and real backend error/unwind. The existing test allocator observes one actual backing pointer and its real counter immediately before and after System deallocation. A test-seams-only borrowed guard adapter finds its actual Cached identity and file coordinate, calls existing exact invalidation and requires that identity absent. Ordinary holds, eviction policy and all byte caps stay unchanged. Private Arc-specific tests adopt actual PageAllocation handles and Layout-derived prices/full capacity; there is no Arc compatibility shim. These source tests remain uncompiled and unrun; fixed writer-reserve close/recycle custody is not certified. |
 | `src/lib.rs`, `src/db.rs`, `src/read_admission.rs`, `src/native_storage_admission.rs`, `src/tree_store/mod.rs`, `src/tree_store/page_store/{mod,page_allocation,page_manager,cached_file,lru_cache,allocator_pager,region}.rs` | Feature-internal original cache-reserve custody and shared real occupancy across handle recycling; exact preallocation quotes for index/window/control reconstruction, separate from source-page admission. Physical cache/allocator destruction precedes final parent refund. Private allocator-window settlement propagates existing typed storage errors rather than boxing an admission refusal as I/O. No cache capacity, pinned-victim rule, public backend API, default or storage format changes. Upstream proposal remains unsubmitted. |
@@ -1005,8 +1001,8 @@ operation page index or a fixed tiny scan-growth allowance. A working set that
 fits that cache reads each page once; a larger stream recycles unpinned pages.
 No operation owns a growing collection of every visited page. The previous
 operation slot-array implementation is removed, so there is no `ScanCache::Table`
-allocation and no operation index retained by a cached page. Native scan state
-retains its original exact-layout counter and thread-bound linked nodes.
+allocation and no operation index retained by a cached page. Native scan values
+retain only their original admission; thread-bound nodes remain independently prepaid.
 
 Every page carries its original source invoice until physical free or transfer
 to a genuine fixed cache reserve. Insertion checks read/write occupancy against
@@ -1098,3 +1094,18 @@ route default, or persisted format changes.
 | Changed source | Reason |
 |---|---|
 | `src/db.rs`, `src/transactions.rs`, `src/tree_store/page_store/{page_manager,cached_file,lru_cache}.rs` | Production planner access to an allocation-free per-page residency estimate; validate opaque page geometry and inspect exact cached extents without changing eviction priority. |
+
+
+## Native scan state without a growth counter
+
+Declared native scans use the shared cache capacity and allocate no shared growth
+counter. `ScanAllowance::try_new_native` only retains the original admission;
+`try_enter_native` still admits the complete concrete linked-node Layout before
+allocation and reinstates that captured admission on the target thread. The last
+entry unlinks and physically frees its node before settling its original invoice.
+Legacy unscoped scans retain their live finite allowance. Counter-only observers
+and the private shared-payload getter are removed with the obsolete object.
+
+| Changed source | Reason |
+|---|---|
+| `src/read_admission.rs`, `src/native_storage_admission.rs` | Remove the unused native growth-counter allocation and its test-only observers; retain original-admission custody, funded thread-local nodes, and the live legacy allowance. |

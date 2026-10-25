@@ -209,24 +209,22 @@ thread_local! {
 pub(crate) const SCAN_GROWTH_ALLOWANCE: usize = 16 * 1024;
 
 #[derive(Clone)]
-enum ScanRemaining {
+enum ScanState {
     // Public legacy constructors retain their unqualified allocation behavior.
     Legacy(Arc<std::sync::atomic::AtomicUsize>),
     #[cfg(feature = "contextdb-internal")]
     Native {
-        remaining:
-            crate::native_storage_admission::NativeStorageShared<std::sync::atomic::AtomicUsize>,
         // Only immutable owned admission crosses threads. Scope links never do.
         admission: crate::NativeStorageAdmission,
     },
 }
 
-/// The cache growth one scan may still take for pages it installs into free
-/// room. A statement that scans in several resumed steps keeps one allowance
-/// across them by re-entering with the same value.
+/// Shared scan state across resumed steps. Legacy scans retain their finite
+/// growth allowance; native scans retain only the original admission used to
+/// fund each thread-bound entry. Shared-cache capacity bounds native page reuse.
 #[doc(hidden)]
 #[derive(Clone)]
-pub struct ScanAllowance(ScanRemaining);
+pub struct ScanAllowance(ScanState);
 
 impl Default for ScanAllowance {
     fn default() -> Self {
@@ -238,26 +236,18 @@ impl ScanAllowance {
     /// A fresh legacy allowance of `SCAN_GROWTH_ALLOWANCE` (16 KiB).
     /// Its public infallible allocation remains unqualified for native funding.
     pub fn new() -> Self {
-        Self(ScanRemaining::Legacy(Arc::new(
+        Self(ScanState::Legacy(Arc::new(
             std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
         )))
     }
 
-    /// Native engine constructor. The active original reader admission prepays
-    /// the exact shared-block Layout, including its receipt field. The block's
-    /// last owner physically frees it before returning that original invoice.
+    /// Retain the active original reader admission without allocating scan state.
+    /// Each later native entry separately prepays its concrete linked-node Layout.
     #[cfg(feature = "contextdb-internal")]
     #[doc(hidden)]
     pub fn try_new_native() -> Result<Self, StorageError> {
         let admission = crate::NativeStorageAdmission::retain_current()?;
-        let remaining = crate::native_storage_admission::NativeStorageShared::new(
-            std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
-        )
-        .map_err(crate::native_storage_admission::native_storage_error)?;
-        Ok(Self(ScanRemaining::Native {
-            remaining,
-            admission,
-        }))
+        Ok(Self(ScanState::Native { admission }))
     }
 
     /// Enter one-pass scan reads on this thread until the guard drops.
@@ -280,7 +270,7 @@ impl ScanAllowance {
     #[doc(hidden)]
     pub fn try_enter_native(&self) -> Result<ScanReads, StorageError> {
         use crate::native_storage_admission::{admit_native_storage, native_storage_error};
-        let ScanRemaining::Native { admission, .. } = &self.0 else {
+        let ScanState::Native { admission } = &self.0 else {
             return Err(native_storage_error(
                 crate::NativeColdReadError::AdmissionRefused,
             ));
@@ -335,14 +325,6 @@ impl ScanAllowance {
         ScanReads {
             node: pointer,
             _thread: PhantomData,
-        }
-    }
-
-    fn remaining(&self) -> &std::sync::atomic::AtomicUsize {
-        match &self.0 {
-            ScanRemaining::Legacy(remaining) => remaining,
-            #[cfg(feature = "contextdb-internal")]
-            ScanRemaining::Native { remaining, .. } => remaining.get(),
         }
     }
 }
@@ -460,7 +442,7 @@ pub(crate) fn declared_scan_reads_active() -> bool {
         tail.get().is_some_and(|node| {
             matches!(
                 &unsafe { node.as_ref() }.allowance.0,
-                ScanRemaining::Native { .. }
+                ScanState::Native { .. }
             )
         })
     });
@@ -472,14 +454,21 @@ pub(crate) fn scan_reads_active() -> bool {
     SCAN_TAIL.with(|tail| tail.get().is_some())
 }
 
-/// Take `bytes` of the innermost scan's growth allowance, if that much remains.
+/// Take `bytes` of the innermost legacy scan's finite fallback allowance.
 pub(crate) fn take_scan_growth(bytes: usize) -> bool {
     use std::sync::atomic::Ordering;
     SCAN_TAIL.with(|tail| {
         tail.get().is_some_and(|node| {
-            unsafe { node.as_ref() }
-                .allowance
-                .remaining()
+            #[allow(
+                clippy::infallible_destructuring_match,
+                reason = "Internal builds also match native admission without a legacy counter."
+            )]
+            let remaining = match &unsafe { node.as_ref() }.allowance.0 {
+                ScanState::Legacy(remaining) => remaining,
+                #[cfg(feature = "contextdb-internal")]
+                ScanState::Native { .. } => return false,
+            };
+            remaining
                 .fetch_update_compat(Ordering::AcqRel, Ordering::Acquire, |left| {
                     left.checked_sub(bytes)
                 })
@@ -593,17 +582,10 @@ pub(crate) fn prepare_cache_allocation(layout: std::alloc::Layout) -> Result<(),
     Ok(())
 }
 
-/// Passive scan identities and the actual production allowance debit, confined
+/// Passive node identities and the actual production legacy allowance debit, confined
 /// to test-seams. These methods allocate nothing and retain no owner or TLS slot.
 #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
 impl ScanAllowance {
-    #[doc(hidden)]
-    pub fn allocation_observation_for_test(&self) -> (usize, std::alloc::Layout, usize) {
-        match &self.0 {
-            ScanRemaining::Native { remaining, .. } => remaining.allocation_observation_for_test(),
-            ScanRemaining::Legacy(_) => panic!("legacy allowance has no native certificate"),
-        }
-    }
     #[doc(hidden)]
     pub fn node_layout_for_test() -> std::alloc::Layout {
         std::alloc::Layout::new::<ScanScopeNode>()
@@ -615,10 +597,6 @@ impl ScanAllowance {
     #[doc(hidden)]
     pub fn take_current_growth_for_test(bytes: usize) -> bool {
         take_scan_growth(bytes)
-    }
-    #[doc(hidden)]
-    pub fn remaining_for_test(&self) -> usize {
-        self.remaining().load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]

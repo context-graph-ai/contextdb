@@ -468,9 +468,6 @@ impl<T> NativeStorageShared<T> {
         }
         Ok(Self { block })
     }
-    pub(crate) fn get(&self) -> &T {
-        unsafe { &self.block.as_ref().payload }
-    }
 }
 impl<T> Clone for NativeStorageShared<T> {
     fn clone(&self) -> Self {
@@ -1013,23 +1010,6 @@ impl std::error::Error for PreparedTableDefinitionError {
     }
 }
 
-// Passive identities for the existing engine allocator oracle. No owner escapes.
-#[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
-impl<T> NativeStorageShared<T> {
-    pub(crate) fn allocation_observation_for_test(&self) -> (usize, Layout, usize) {
-        let block = unsafe { self.block.as_ref() };
-        let invoice = block.ownership.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            self.block.as_ptr() as usize,
-            Self::layout(),
-            invoice
-                .as_ref()
-                .expect("live shared invoice")
-                .receipt
-                .as_ptr() as usize,
-        )
-    }
-}
 #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
 impl NativeStorageCredit {
     pub(crate) fn receipt_identity_for_test(&self) -> usize {
