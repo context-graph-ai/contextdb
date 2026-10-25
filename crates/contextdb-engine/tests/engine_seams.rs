@@ -161,6 +161,8 @@ mod history_sync_and_commit_cursors_reload_without_full_directories;
 mod identity_preparation_refusal_leaves_the_store_unchanged;
 #[path = "engine_seams/native_delivery_is_served_after_transaction_repair_and_reopen.rs"]
 mod native_delivery_is_served_after_transaction_repair_and_reopen;
+#[path = "engine_seams/native_membership_parent_peak_guard.rs"]
+mod native_membership_parent_peak_guard;
 #[path = "engine_seams/paged_initial_replacement_and_reclamation_progress_under_writes.rs"]
 mod paged_initial_replacement_and_reclamation_progress_under_writes;
 #[path = "engine_seams/pending_delivery_pages_resume_without_gaps.rs"]
@@ -176,8 +178,6 @@ mod retired_custody_keys_stay_funded_until_the_write_set_drops;
 mod the_closure_memo_frees_its_entries_before_refunding_them;
 #[path = "engine_seams/unpartitioned_vector_membership_pages_reload_at_constant_residency.rs"]
 mod unpartitioned_vector_membership_pages_reload_at_constant_residency;
-#[path = "engine_seams/native_membership_parent_peak_guard.rs"]
-mod native_membership_parent_peak_guard;
 #[path = "engine_seams/version_pruning_and_compaction_resume_finite_safe_batches.rs"]
 mod version_pruning_and_compaction_resume_finite_safe_batches;
 #[cfg(target_os = "linux")]
@@ -267,6 +267,8 @@ mod an_exact_identity_search_stays_inside_its_work_ceiling;
 #[path = "engine_seams/storage_journeys_keep_the_measured_test_profile.rs"]
 mod storage_journeys_keep_the_measured_test_profile;
 
+#[path = "engine_seams/every_writer_checkpoint_names_every_charged_byte.rs"]
+mod every_writer_checkpoint_names_every_charged_byte;
 #[path = "engine_seams/primitive_work_support.rs"]
 mod primitive_work_support;
 #[path = "engine_seams/saved_search_and_append_work_ceiling.rs"]

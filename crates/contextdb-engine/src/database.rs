@@ -29967,6 +29967,12 @@ impl MaintenanceContext {
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     ) -> Result<MaintenanceReport> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
+        // Background cycles carry this context's writer; thread-local state
+        // from the spawning caller does not transfer to the worker.
+        let _decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
+            crate::memory_accounting::AccountantHandle::clone(&self.finalization.accountant),
+        )?;
+
 
         // Every maintenance cycle -- the background worker's and an explicit
         // one -- is a boundary: it observes the process ceiling once, before

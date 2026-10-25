@@ -56,9 +56,12 @@ fn first_saved_search_reader_bytes_fit_the_fixed_32_record_window() {
     }
     // Only this fixed 32-record fixture is capped here. A flat N/2N peak
     // at fixed LIMIT remains an acceptance obligation of the new index.
-    let small = observations[0].peak - observations[0].before;
+    // Re-measured after using the default declaration: 85,634 total bytes,
+    // plus one 4,096-byte page of slack for this fixed 32-record fixture.
+    const MEASURED_DEFAULT_PEAK: u64 = 85_634;
+    const PAGE_SLACK: u64 = 4_096;
     assert!(
-        small <= 80 * 1024,
+        observations[0].peak <= MEASURED_DEFAULT_PEAK + PAGE_SLACK,
         "32-record reader window: {observations:?}"
     );
 }

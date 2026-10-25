@@ -77,6 +77,28 @@ pub(crate) fn with_request_read_memory<T, E>(
     }
 }
 
+/// The worker or resumed cursor uses its supplied request payer. A caller
+/// that already installed its operation keeps that scope through this entry.
+#[expect(
+    clippy::result_large_err,
+    reason = "The existing inline native refusal is preserved without allocating an error."
+)]
+fn request_decode_scope(
+    target: &dyn ReadExecutionTarget,
+    read_memory: contextdb_core::read_memory::ReadMemoryOwner,
+) -> std::result::Result<Option<crate::read_image_memory::ImageMemoryScope>, BoundedExecutionError>
+{
+    if crate::read_image_memory::active_owner().is_ok() {
+        return Ok(None);
+    }
+    let image = crate::read_image_memory::ImageMemory::operation_reader(
+        target.bounded_read_accountant(),
+        read_memory,
+    )
+    .map_err(BoundedExecutionError::Engine)?;
+    Ok(Some(image.enter()))
+}
+
 // One public continuation fetch may replay several internal kernel pages.
 // Their work and deadlines belong to the same caller request.
 struct CursorReplayBudget {
@@ -19561,6 +19583,10 @@ pub(super) fn execute_with_native_trace_refund(
             probe,
             native_trace_refund,
         )?;
+        let _decode = request_decode_scope(
+            db,
+            context.source_read_memory(BoundedWorkSource::TableScan)?,
+        )?;
         let schema_capture = db.capture_read_schema();
         let membership_capture = (!db.retained_relational_membership_source())
             .then(|| db.relational_membership_store().begin_membership_capture());
@@ -20436,6 +20462,11 @@ impl CursorState {
         rows: NonZeroUsize,
         public_page: bool,
     ) -> std::result::Result<BoundedCursorFetch, BoundedExecutionError> {
+        let _decode = request_decode_scope(
+            self.database.as_ref(),
+            self.context
+                .source_read_memory(BoundedWorkSource::TableScan)?,
+        )?;
         self.context.prepare_final_observation_work()?;
         let publication_context = self.context.clone();
         let _group_attempt = GroupPublicationAttempt(&publication_context);
@@ -20949,6 +20980,10 @@ pub(super) fn open_cursor_with_native_trace_refund(
         if CAPTURE_CURSOR_OPEN_CONTEXT.with(Cell::get) {
             CURSOR_OPEN_CONTEXT.with(|slot| *slot.borrow_mut() = Some(context.clone()));
         }
+        let _decode = request_decode_scope(
+            db.as_ref(),
+            context.source_read_memory(BoundedWorkSource::TableScan)?,
+        )?;
         let schema_capture = db.capture_read_schema();
         let membership_capture = (!db.retained_relational_membership_source())
             .then(|| db.relational_membership_store().begin_membership_capture());
