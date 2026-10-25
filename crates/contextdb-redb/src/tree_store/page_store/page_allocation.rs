@@ -6,7 +6,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 fn allocation_failed(site: &'static str, layout: Layout) -> StorageError {
     crate::native_storage_admission::native_storage_error(
@@ -27,6 +27,7 @@ fn retain(owners: &AtomicUsize) {
 struct CounterBlock {
     owners: AtomicUsize,
     value: AtomicUsize,
+    release_generation: AtomicU64,
     invoice: Option<ReadMemoryCharge>,
     preparation: Option<crate::native_storage_admission::NativeStorageCredit>,
     reserve: Mutex<Option<crate::native_storage_admission::NativeStorageCredit>>,
@@ -54,6 +55,14 @@ impl CacheCounter {
         (self.block.as_ptr() as usize, self.load(Ordering::SeqCst))
     }
 
+    pub(super) fn release_generation(&self) -> u64 {
+        unsafe { self.block.as_ref() }.release_generation.load(Ordering::Acquire)
+    }
+    fn note_external_release(&self) {
+        unsafe { self.block.as_ref() }.release_generation
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |generation| generation.checked_add(1))
+            .expect("cache release generation exhausted");
+    }
     pub(super) fn has_fixed_reserve(&self) -> bool {
         unsafe { self.block.as_ref() }.reserve.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
@@ -78,6 +87,7 @@ impl CacheCounter {
             block.as_ptr().write(CounterBlock {
                 owners: AtomicUsize::new(1),
                 value: AtomicUsize::new(0),
+                release_generation: AtomicU64::new(1),
                 invoice,
                 preparation,
                 reserve: Mutex::new(None),
@@ -418,13 +428,22 @@ impl Drop for PageFree {
 }
 impl Drop for PageAllocation {
     fn drop(&mut self) {
-        if unsafe { self.block.as_ref() }
-            .owners
-            .fetch_sub(1, Ordering::Release)
-            != 1
-        {
-            return;
+        // Retain the actual occupancy control while this page handle is
+        // still owned. After decrement another thread may free the page, so
+        // no page field may be touched while publishing the release notice.
+        let counter = {
+            let payer = unsafe { self.block.as_ref() }.payer.lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match &*payer {
+                Some(PagePayer::Cache(payment) | PagePayer::SourceCounted { occupancy: payment, .. }) => Some(payment.counter.clone()),
+                _ => None,
+            }
+        };
+        let previous = unsafe { self.block.as_ref() }.owners.fetch_sub(1, Ordering::Release);
+        if previous == 2 {
+            if let Some(counter) = &counter { counter.note_external_release(); }
         }
+        if previous != 1 { return; }
         fence(Ordering::Acquire);
         let block = unsafe { self.block.as_mut() };
         let (layout, _) = Self::layout(block.len()).expect("live page has a valid Layout");

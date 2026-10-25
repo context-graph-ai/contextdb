@@ -46,16 +46,6 @@ thread_local! {
 }
 
 impl PageMemory {
-    fn allocation(&self) -> &PageAllocation {
-        match self {
-            Self::Cached(page) | Self::Charged(page) | Self::Plain(page) => page,
-            #[cfg(feature = "contextdb-internal")]
-            Self::Native(page) => page,
-        }
-    }
-    pub(crate) fn same_backing(&self, other: &Self) -> bool {
-        PageAllocation::ptr_eq(self.allocation(), other.allocation())
-    }
     #[cfg(all(test, feature = "contextdb-internal"))]
     pub(crate) fn admitted_bytes_for_test(len: usize) -> usize {
         admitted_page_bytes(len)
@@ -334,11 +324,10 @@ impl CheckedBackend {
     }
 }
 
-static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
-
 pub(super) struct PagedCachedFile {
-    file_id: u64,
-    cache_epoch: AtomicU64,
+    no_victim_generation: AtomicU64,
+    #[cfg(test)]
+    eviction_visits: AtomicUsize,
     file: CheckedBackend,
     page_size: u64,
     // Dynamic cache partitioning.  Three invariants:
@@ -492,8 +481,9 @@ impl PagedCachedFile {
 
         Ok(Self {
             file: CheckedBackend::new(file),
-            file_id: NEXT_FILE_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1)).expect("cache file identity exhausted"),
-            cache_epoch: AtomicU64::new(0),
+            no_victim_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            eviction_visits: AtomicUsize::new(0),
             page_size,
             read_cache_bytes,
             write_buffer_bytes,
@@ -717,6 +707,8 @@ impl PagedCachedFile {
         bytes_needed: usize,
         _write_lock: &MutexGuard<'_, LRUWriteCache>,
     ) {
+        let generation = self.read_cache_bytes.release_generation();
+        if self.no_victim_generation.load(Ordering::Acquire) == generation { return; }
         let num_stripes = self.read_cache.len();
         let start = self.next_eviction_stripe.load(Ordering::Relaxed) % num_stripes;
         let mut freed = 0;
@@ -729,7 +721,11 @@ impl PagedCachedFile {
             let mut lock = self.read_cache[stripe].write().unwrap();
             while freed < bytes_needed {
                 if let Some((_, v)) =
-                    lock.pop_lowest_priority_where(|page| PageAllocation::strong_count(page) == 1)
+                    lock.pop_lowest_priority_where(|page| {
+                        #[cfg(test)]
+                        self.eviction_visits.fetch_add(1, Ordering::Relaxed);
+                        PageAllocation::strong_count(page) == 1
+                    })
                 {
                     #[cfg(feature = "cache_metrics")]
                     {
@@ -743,6 +739,9 @@ impl PagedCachedFile {
                     break;
                 }
             }
+        }
+        if freed < bytes_needed {
+            self.no_victim_generation.store(generation, Ordering::Release);
         }
     }
 
@@ -816,7 +815,6 @@ impl PagedCachedFile {
     }
 
     fn invalidate_cache_beyond(&self, len: u64) {
-        self.advance_cache_epoch();
         for stripe in &self.read_cache {
             let mut lock = stripe.write().unwrap();
             loop {
@@ -869,33 +867,19 @@ impl PagedCachedFile {
     // Admit the concrete complete allocation before allocation and backend I/O.
     fn read_direct_into_page(&self, offset: u64, len: usize) -> Result<PageAllocation> {
         PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
+        #[cfg(feature = "contextdb-internal")]
+        if !crate::read_admission::has_read_memory_admission()
+            && crate::native_storage_admission::native_storage_active()
+        {
+            let mut page = PageAllocation::zeroed_native(len).map_err(StorageError::Native)?;
+            self.file.read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
+            return Ok(page);
+        }
         let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
         let mut page = PageAllocation::zeroed(len, charge)?;
         self.file
             .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
         Ok(page)
-    }
-
-    fn shared_page_bytes(&self, page: &PageMemory) -> usize {
-        if page.allocation().counted_by(&self.read_cache_bytes) { cached_page_bytes(page.len()) } else { 0 }
-    }
-    fn scan_has_pinned_shared_cache(&self, scan: &crate::read_admission::ScanAllowance, key: crate::scan_cache::ScanKey, len: usize) -> bool {
-        let read = self.read_cache_bytes.load(Ordering::Acquire);
-        let write = self.write_buffer_bytes.load(Ordering::Acquire);
-        // Every byte counted here has a real page holder in this operation.
-        // Such holders cannot become evictable before this scope releases.
-        // This avoids a full unsuccessful victim walk on every later miss.
-        scan.pinned_shared_bytes(key) >= read && read.saturating_add(write)
-            .saturating_add(cached_page_bytes(len)) > self.max_cache_size.load(Ordering::Acquire)
-    }
-    fn scan_key(&self, offset: u64, len: usize, native: bool) -> crate::scan_cache::ScanKey {
-        let epoch = self.cache_epoch.load(Ordering::Acquire);
-        crate::scan_cache::ScanKey([self.file_id, epoch * 2 + u64::from(native), offset, len as u64])
-    }
-    fn advance_cache_epoch(&self) {
-        self.cache_epoch.fetch_update(Ordering::AcqRel, Ordering::Acquire,
-            |epoch| epoch.checked_add(1).filter(|next| *next <= u64::MAX / 2))
-            .expect("cache mutation identity exhausted");
     }
 
     // Read with caching. Caller must not read overlapping ranges without first calling invalidate_cache().
@@ -915,40 +899,20 @@ impl PagedCachedFile {
             }
         }
 
-        let working_set = crate::read_admission::scan_working_set();
-        let key = self.scan_key(offset, len, false);
-        if let Some(scan) = &working_set {
-            if let Some(page) = scan.cached_page(key) { return Ok(page); }
-            scan.reserve_page()?;
-        }
         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
-        let cached = {
+        {
             let read_lock = self.read_cache[cache_slot].read().unwrap();
-            let cached = read_lock.get(offset).map(|page| page.clone());
-            cached
-        };
-        if let Some(cached) = cached {
-            #[cfg(feature = "cache_metrics")]
-            self.reads_hits.fetch_add(1, Ordering::Release);
-            debug_assert_eq!(cached.len(), len);
-            let page = PageMemory::Cached(cached);
-            if let Some(scan) = &working_set {
-                scan.cache_page(key, page.clone(), self.shared_page_bytes(&page))?;
+            if let Some(cached) = read_lock.get(offset) {
+                #[cfg(feature = "cache_metrics")]
+                self.reads_hits.fetch_add(1, Ordering::Release);
+                debug_assert_eq!(cached.len(), len);
+                return Ok(PageMemory::Cached(cached.clone()));
             }
-            return Ok(page);
         }
 
         let buffer = self.read_direct_into_page(offset, len)?;
-        if let Some(scan) = &working_set {
-            // The cache retains the same original source invoice until a genuine
-            // fixed reserve takes it over or the final physical page is freed.
-            let page = if !self.scan_has_pinned_shared_cache(scan, key, len) {
-                self.cache_loaded_page(offset, len, buffer, false)?
-            } else { Self::uncached(buffer) };
-            scan.cache_page(key, page.clone(), self.shared_page_bytes(&page))?;
-            return Ok(page);
-        }
         let scan_replace = crate::read_admission::scan_reads_active()
+            && !crate::read_admission::declared_scan_reads_active()
             && !crate::read_admission::take_scan_growth(cached_page_bytes(len));
         self.cache_loaded_page(offset, len, buffer, scan_replace)
     }
@@ -1077,7 +1041,6 @@ impl PagedCachedFile {
     //
     // NOTE: Invalidating a cached region in subsections is permitted, as long as all subsections are invalidated
     pub(super) fn invalidate_cache(&self, offset: u64, len: usize) {
-        self.advance_cache_epoch();
         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
         let mut lock = self.read_cache[cache_slot].write().unwrap();
         if let Some(removed) = lock.remove(offset) {
@@ -1109,7 +1072,6 @@ impl PagedCachedFile {
     }
 
     pub(super) fn invalidate_cache_all(&self) {
-        self.advance_cache_epoch();
         for cache_slot in 0..self.read_cache.len() {
             let mut lock = self.read_cache[cache_slot].write().unwrap();
             while lock.pop_lowest_priority().is_some() {}
@@ -1161,7 +1123,6 @@ impl PagedCachedFile {
 
     // If overwrite is true, the page is initialized to zero.
     pub(super) fn write(&self, offset: u64, len: usize, overwrite: bool) -> Result<WritablePage> {
-        self.advance_cache_epoch();
         assert_eq!(0, offset % self.page_size);
         // Reject an impossible complete Layout before reserving or unlinking.
         PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
@@ -1266,12 +1227,6 @@ impl PagedCachedFile {
             return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
                 "native read requires an available backend")));
         }
-        let working_set = crate::read_admission::native_scan_working_set();
-        let key = self.scan_key(offset, len, true);
-        if let Some(scan) = &working_set {
-            if let Some(page) = scan.cached_page(key) { return Ok(page); }
-            scan.reserve_native_page()?;
-        }
         let stripe = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
         let cached = self.read_cache[stripe].read().unwrap().get(offset).map(|page| page.clone());
         if let Some(cached) = &cached {
@@ -1282,7 +1237,6 @@ impl PagedCachedFile {
             }
             if cached.is_native() {
                 let page = PageMemory::Native(cached.clone());
-                if let Some(scan) = &working_set { scan.cache_native_page(key, page.clone(), self.shared_page_bytes(&page))?; }
                 return Ok(page);
             }
         }
@@ -1298,16 +1252,16 @@ impl PagedCachedFile {
         }
         // The shared cache takes custody under its actual fixed reserve; if
         // it cannot, the page keeps its genuine original source invoice.
-        let page = if working_set.as_ref().is_some_and(|scan| self.scan_has_pinned_shared_cache(scan, key, len)) {
-            Self::uncached(page)
-        } else {
-            self.cache_loaded_page(offset, len, page, false)
-                .map_err(crate::read_admission::ScanAllowance::native_index_error)?
-        };
+        let page = self.cache_loaded_page(offset, len, page, false)
+            .map_err(|error| match error {
+                StorageError::Native(error) => error,
+                StorageError::ValueTooLarge(_) => NativeColdReadError::Corrupt(
+                    NativeColdFault::new("native cache capacity overflow")),
+                _ => unreachable!("cache insertion retains native allocation failures"),
+            })?;
         let page = match page {
             PageMemory::Cached(page) | PageMemory::Charged(page) | PageMemory::Plain(page) | PageMemory::Native(page) => PageMemory::Native(page),
         };
-        if let Some(scan) = &working_set { scan.cache_native_page(key, page.clone(), self.shared_page_bytes(&page))?; }
         Ok(page)
     }
 
@@ -1410,6 +1364,95 @@ mod test {
         fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
             self.inner.write(offset, data)
         }
+    }
+
+    struct ReaderCharge {
+        held: Arc<AtomicUsize>,
+        bytes: usize,
+    }
+    impl Drop for ReaderCharge {
+        fn drop(&mut self) { self.held.fetch_sub(self.bytes, Ordering::SeqCst); }
+    }
+    fn charged_reader(limit: usize, held: &Arc<AtomicUsize>) -> Arc<dyn Fn(usize) -> io::Result<crate::ReadPageCharge> + Send + Sync> {
+        let held = held.clone();
+        Arc::new(move |bytes| {
+            let previous = held.fetch_add(bytes, Ordering::SeqCst);
+            if previous.saturating_add(bytes) > limit {
+                held.fetch_sub(bytes, Ordering::SeqCst);
+                return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+            }
+            Ok(Box::new(ReaderCharge { held: held.clone(), bytes }))
+        })
+    }
+
+    #[test]
+    fn declared_stream_recycles_pages_larger_than_its_cache_capacity() {
+        let backend = InMemoryBackend::new();
+        backend.set_len(128 * 4096).unwrap();
+        let page_bytes = super::cached_page_bytes(4096);
+        let source_bytes = super::admitted_page_bytes(4096);
+        let file = PagedCachedFile::new(Box::new(backend), 4096, 4 * page_bytes).unwrap();
+        let held = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        let _observe = crate::observe_backend_reads(Arc::new(move |_| { observed.fetch_add(1, Ordering::SeqCst); }));
+        crate::with_read_page_charge(charged_reader(5 * source_bytes, &held), || {
+            crate::with_scan_reads(|| {
+                for ordinal in 0..128 {
+                    let page = file.read(ordinal * 4096, 4096, PageHint::Clean).unwrap();
+                    assert!(matches!(page, super::PageMemory::Cached(_)));
+                    drop(page);
+                    assert!(held.load(Ordering::SeqCst) <= 4 * source_bytes);
+                    assert!(file.read_cache_bytes.load(Ordering::SeqCst) <= 4 * page_bytes);
+                }
+            });
+            assert_eq!(reads.load(Ordering::SeqCst), 128);
+            assert!(file.eviction_visits.load(Ordering::SeqCst) <= 2 * 128);
+        });
+        // Shared pages keep their original invoice after statement exit.
+        assert_eq!(held.load(Ordering::SeqCst), 4 * source_bytes);
+        drop(file);
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pinned_cache_skips_repeated_victim_walks_and_resumes_after_cross_thread_release() {
+        let backend = InMemoryBackend::new();
+        backend.set_len(32 * 4096).unwrap();
+        let page_bytes = super::cached_page_bytes(4096);
+        let source_bytes = super::admitted_page_bytes(4096);
+        let file = Arc::new(PagedCachedFile::new(Box::new(backend), 4096, 2 * page_bytes).unwrap());
+        let held = Arc::new(AtomicUsize::new(0));
+        crate::with_read_page_charge(charged_reader(3 * source_bytes, &held), || {
+            let first = file.read(0, 4096, PageHint::Clean).unwrap();
+            let second = file.read(4096, 4096, PageHint::Clean).unwrap();
+            drop(file.read(8192, 4096, PageHint::Clean).unwrap());
+            let initial_visits = file.eviction_visits.load(Ordering::SeqCst);
+            assert!(initial_visits > 0);
+            for ordinal in 3..24 {
+                let miss = file.read(ordinal * 4096, 4096, PageHint::Clean).unwrap();
+                assert!(!matches!(miss, super::PageMemory::Cached(_)));
+                drop(miss);
+            }
+            assert_eq!(file.eviction_visits.load(Ordering::SeqCst), initial_visits);
+            assert_eq!(held.load(Ordering::SeqCst), 2 * source_bytes);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let released = barrier.clone();
+            let reader = std::thread::spawn(move || { released.wait(); drop(first); });
+            barrier.wait();
+            reader.join().unwrap();
+            // Unpinning did not free or refund the still-cached original page.
+            assert_eq!(held.load(Ordering::SeqCst), 2 * source_bytes);
+            let replacement = file.read(8192, 4096, PageHint::Clean).unwrap();
+            assert!(matches!(replacement, super::PageMemory::Cached(_)));
+            assert!(file.eviction_visits.load(Ordering::SeqCst) > initial_visits);
+            assert_eq!(held.load(Ordering::SeqCst), 2 * source_bytes);
+            assert!(second.iter().all(|byte| *byte == 0));
+            drop(replacement);
+            drop(second);
+        });
+        drop(file);
+        assert_eq!(held.load(Ordering::SeqCst), 0);
     }
 
     #[test]

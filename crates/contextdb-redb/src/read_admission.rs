@@ -171,6 +171,11 @@ pub fn with_owned_read_page_charge_storage<R>(
     operation()
 }
 
+#[cfg(feature = "contextdb-internal")]
+pub(crate) fn has_read_memory_admission() -> bool {
+    ACTIVE.with(|active| !active.borrow().is_empty())
+}
+
 pub(crate) fn admit_read_memory(bytes: usize) -> Result<Option<ReadMemoryCharge>, StorageError> {
     ACTIVE.with(|active| match active.borrow().last() {
         #[cfg(feature = "contextdb-internal")]
@@ -193,31 +198,18 @@ thread_local! {
     static SCAN_TAIL: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>> = const { std::cell::Cell::new(None) };
 }
 
-/// Fallback shared-cache growth for an unscoped legacy scan. Declared readers
-/// retain their working sets through original reader admission instead.
+/// Fallback growth for a legacy scan without declared admission. Declared
+/// readers instead use the capacity-limited shared page cache.
 pub(crate) const SCAN_GROWTH_ALLOWANCE: usize = 16 * 1024;
-
-struct ScanState {
-    remaining: std::sync::atomic::AtomicUsize,
-    pages: std::sync::Mutex<crate::scan_cache::ScanCache>,
-}
-impl ScanState {
-    fn new() -> Self {
-        Self {
-            remaining: std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
-            pages: std::sync::Mutex::new(crate::scan_cache::ScanCache::default()),
-        }
-    }
-}
 
 #[derive(Clone)]
 enum ScanRemaining {
     // Public legacy constructors retain their unqualified allocation behavior.
-    Legacy(Arc<ScanState>),
+    Legacy(Arc<std::sync::atomic::AtomicUsize>),
     #[cfg(feature = "contextdb-internal")]
     Native {
         remaining:
-            crate::native_storage_admission::NativeStorageShared<ScanState>,
+            crate::native_storage_admission::NativeStorageShared<std::sync::atomic::AtomicUsize>,
         // Only immutable owned admission crosses threads. Scope links never do.
         admission: crate::NativeStorageAdmission,
     },
@@ -241,7 +233,7 @@ impl ScanAllowance {
     /// Its public infallible allocation remains unqualified for native funding.
     pub fn new() -> Self {
         Self(ScanRemaining::Legacy(Arc::new(
-            ScanState::new(),
+            std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
         )))
     }
 
@@ -253,7 +245,7 @@ impl ScanAllowance {
     pub fn try_new_native() -> Result<Self, StorageError> {
         let admission = crate::NativeStorageAdmission::retain_current()?;
         let remaining = crate::native_storage_admission::NativeStorageShared::new(
-            ScanState::new(),
+            std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
         )
         .map_err(crate::native_storage_admission::native_storage_error)?;
         Ok(Self(ScanRemaining::Native {
@@ -338,66 +330,11 @@ impl ScanAllowance {
         }
     }
 
-    fn state(&self) -> &ScanState {
-        match &self.0 {
-            ScanRemaining::Legacy(state) => state,
-            #[cfg(feature = "contextdb-internal")]
-            ScanRemaining::Native { remaining, .. } => remaining.get(),
-        }
-    }
-    pub(crate) fn cached_page(&self, key: crate::scan_cache::ScanKey) -> Option<crate::tree_store::PageMemory> {
-        self.state().pages.lock().unwrap().get(key)
-    }
-    pub(crate) fn pinned_shared_bytes(&self, key: crate::scan_cache::ScanKey) -> usize {
-        self.state().pages.lock().unwrap().pinned_bytes(key)
-    }
-    pub(crate) fn reserve_page(&self) -> Result<(), StorageError> {
-        let reserve = |native| self.state().pages.lock().unwrap().reserve(native);
-        match &self.0 {
-            #[cfg(feature = "contextdb-internal")]
-            ScanRemaining::Native { admission, .. } =>
-                crate::with_native_storage_admission(admission.clone(), || reserve(true)),
-            ScanRemaining::Legacy(_) => reserve(false),
-        }
-    }
-    pub(crate) fn cache_page(&self, key: crate::scan_cache::ScanKey, page: crate::tree_store::PageMemory, shared_bytes: usize) -> Result<(), StorageError> {
-        let insert = |native| {
-            let mut pages = self.state().pages.lock().unwrap();
-            // A simultaneous continuation may have consumed the reserved slot.
-            pages.reserve(native)?;
-            pages.insert(key, page, shared_bytes);
-            Ok(())
-        };
-        match &self.0 {
-            #[cfg(feature = "contextdb-internal")]
-            ScanRemaining::Native { admission, .. } =>
-                crate::with_native_storage_admission(admission.clone(), || insert(true)),
-            ScanRemaining::Legacy(_) => insert(false),
-        }
-    }
-    #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn native_index_error(error: StorageError) -> crate::NativeColdReadError {
-        match error {
-            StorageError::Native(error) => error,
-            StorageError::ValueTooLarge(_) => crate::NativeColdReadError::Corrupt(
-                crate::native_storage_admission::NativeColdFault::new("scan index capacity overflow")),
-            _ => unreachable!("native scan index uses only native admission"),
-        }
-    }
-    #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn reserve_native_page(&self) -> Result<(), crate::NativeColdReadError> {
-        self.reserve_page().map_err(Self::native_index_error)
-    }
-    #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn cache_native_page(&self, key: crate::scan_cache::ScanKey, page: crate::tree_store::PageMemory, shared_bytes: usize) -> Result<(), crate::NativeColdReadError> {
-        self.cache_page(key, page, shared_bytes).map_err(Self::native_index_error)
-    }
-
     fn remaining(&self) -> &std::sync::atomic::AtomicUsize {
         match &self.0 {
-            ScanRemaining::Legacy(remaining) => &remaining.remaining,
+            ScanRemaining::Legacy(remaining) => remaining,
             #[cfg(feature = "contextdb-internal")]
-            ScanRemaining::Native { remaining, .. } => &remaining.get().remaining,
+            ScanRemaining::Native { remaining, .. } => remaining.get(),
         }
     }
 }
@@ -417,8 +354,8 @@ struct ScanScopeNode {
     _invoice: ScanNodeInvoice,
 }
 
-/// While held, declared reads retain their working set under original reader
-/// admission; unscoped reads use the fallback allowance. A node stays linked
+/// Declared reads use the shared cache capacity; unscoped reads use the
+/// fallback allowance (see [`with_scan_reads`]). A node stays linked
 /// until its last guard drops; dropping an older guard cannot pop a newer entry.
 #[doc(hidden)]
 pub struct ScanReads {
@@ -490,33 +427,25 @@ pub fn scan_reads() -> ScanReads {
     }
 }
 
-/// Execute a scan under its declared reader admission. Revisited pages stay
-/// held until the operation ends; the shared cache may retain original page
-/// invoices for later queries. A reader without admission keeps only the
-/// finite fallback cache allowance and replaces evictable pages thereafter.
+/// Execute a scan using the shared cache under its declared admission and
+/// capacity. Unpinned pages can be recycled by a larger stream. Without
+/// declared admission the existing finite fallback growth allowance applies.
 #[doc(hidden)]
 pub fn with_scan_reads<R>(operation: impl FnOnce() -> R) -> R {
     let _scan = scan_reads();
     operation()
 }
 
-// A declared operation keeps a source-funded working set. Unscoped legacy
-// scans retain their finite shared-cache footprint instead of growing a heap.
-pub(crate) fn scan_working_set() -> Option<ScanAllowance> {
-    let allowance = SCAN_TAIL.with(|tail| tail.get().map(|node|
-        unsafe { node.as_ref() }.allowance.clone()))?;
-    let declared = match &allowance.0 {
-        #[cfg(feature = "contextdb-internal")]
-        ScanRemaining::Native { .. } => true,
-        ScanRemaining::Legacy(_) => ACTIVE.with(|active| !active.borrow().is_empty()),
-    };
-    declared.then_some(allowance)
-}
-
-#[cfg(feature = "contextdb-internal")]
-pub(crate) fn native_scan_working_set() -> Option<ScanAllowance> {
-    let allowance = scan_working_set()?;
-    matches!(&allowance.0, ScanRemaining::Native { .. }).then_some(allowance)
+// Declared readers already admit source pages and the shared cache enforces
+// its own capacity. Reuse that bounded cache instead of imposing an unrelated
+// per-scan growth constant or retaining a second set of pinned page handles.
+pub(crate) fn declared_scan_reads_active() -> bool {
+    if ACTIVE.with(|active| !active.borrow().is_empty()) { return true; }
+    #[cfg(feature = "contextdb-internal")]
+    return SCAN_TAIL.with(|tail| tail.get().is_some_and(|node|
+        matches!(&unsafe { node.as_ref() }.allowance.0, ScanRemaining::Native { .. })));
+    #[cfg(not(feature = "contextdb-internal"))]
+    false
 }
 
 pub(crate) fn scan_reads_active() -> bool {

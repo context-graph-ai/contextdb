@@ -1000,35 +1000,38 @@ The test-seams reader-registry census records the successfully allocated combine
 
 ## Reader working sets and warm native pages
 
-Declared scans retain original immutable page handles in one shared operation
-state. A fallible open-addressed page index admits each complete replacement
-Layout before allocating, including old/new overlap. Its original receipt is
-held outside array destruction and physical free. Page handles keep their same
-source invoice until physical free or transfer to a genuine fixed cache reserve.
-Ending the operation releases its index and page holds; the shared read cache
-may retain pages and their original invoices for subsequent queries. Unscoped
-legacy scans retain the existing finite allowance rather than growing an
-unfunded operation index. No declared memory limit or cache share changes.
+Declared scans use the existing shared read cache rather than a separate
+operation page index or a fixed tiny scan-growth allowance. A working set that
+fits that cache reads each page once; a larger stream recycles unpinned pages.
+No operation owns a growing collection of every visited page. The previous
+operation slot-array implementation is removed, so there is no `ScanCache::Table`
+allocation and no operation index retained by a cached page. Native scan state
+retains its original exact-layout counter and thread-bound linked nodes.
 
-The operation records bytes it itself pins in the shared cache. When those holds
-cover all occupied read-cache bytes, no victim can be reclaimed before scope
-release, so subsequent misses avoid another unsuccessful stripe walk. A victim
-search resumes after the actual last stripe visited. Ordinary eligible pages
-remain reclaimable; held pages retain their original physical occupancy.
+Every page carries its original source invoice until physical free or transfer
+to a genuine fixed cache reserve. Insertion checks read/write occupancy against
+`max_cache_size`; `CachePayment::reserve` only records occupancy. Its tally is
+not another source invoice. Transfer requires the actual installed fixed reserve.
+Ending a statement releases its own handles; shared and detached holders can
+outlive it without refunding still-live backing. Cache counter controls keep an
+inline release generation under their existing exact-layout funding arrangement.
+A last external page release publishes to its retained original control, never
+through a freed page pointer. A previously unsuccessful eviction is reused only
+until that generation changes, and the clock resumes after its actual last stripe.
 
 Native clean reads install natively admitted immutable pages in that same shared
-cache and reuse them across operations. An existing legacy page is copied under
-native admission before publication, preserving separate provenance. The native
-page uses the complete weakless page allocation and its original native receipt;
-moving the receipt into single-owner custody needs no new allocation or retain.
-The allocation Layout bounds its length to isize::MAX, leaving the high length
-bit available to record native construction without increasing the header.
-Every byte slice and final-free Layout uses the masked actual length. Prepared
-reads retain their separate dirty-source copying route and never install pages.
-File identities and mutation generations prevent stale operation hits after a
-write, invalidation or file-handle replacement. No persisted format changes.
+cache and reuse them across operations. A legacy hit is copied under native
+admission before publication, preserving separate provenance. The native page
+uses the complete weakless page allocation and its original native receipt;
+moving the receipt into single-owner custody needs no allocation or new retain.
+The valid allocation Layout leaves the high length bit available to record
+native construction without increasing the header. Byte slices and final-free
+Layouts always use the masked actual length. Prepared reads retain their separate
+dirty-source copying route and do not install pages. Ordinary reads without a
+legacy callback use their installed native admission before allocation. No
+persisted format, declared memory limit, cache share or query route changes.
 
 | Changed source | Reason |
 |---|---|
-| `src/scan_cache.rs` (added), `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/mod.rs` | Operation-owned, fallibly admitted page index; retain exact page handles and original invoices across scan continuations, with bounded shared-cache pin accounting. Upstream proposal: operation-scoped working-set retention under caller admission. |
-| `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/native_storage_admission.rs` | Shared warm-page retention for declared scans and native clean reads; concrete native page construction and same-original single-owner receipt custody, with physical-free-before-refund ordering. Continue eviction from the last visited stripe and skip futile walks only when this operation holds all occupied read-cache bytes. |
+| `src/read_admission.rs`, `src/lib.rs`, `src/tree_store/mod.rs` | Declared-scan detection under the original caller admission; remove the redundant operation page index. Upstream proposal: retain scan working sets within the admitted shared cache rather than impose an unrelated scan-growth constant. |
+| `src/tree_store/page_store/cached_file.rs`, `src/tree_store/page_store/page_allocation.rs`, `src/native_storage_admission.rs` | Shared warm-page retention for declared and native clean reads; retain original native invoices through physical free. Preserve caller capacity checks and genuine fixed-reserve transfer. Continue the clock from the last visited stripe and cache an unsuccessful victim search only until an actual external holder releases a page. |

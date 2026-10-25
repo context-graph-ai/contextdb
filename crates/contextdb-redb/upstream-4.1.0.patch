@@ -2750,7 +2750,7 @@
  mod transaction_tracker;
  mod transactions;
  mod tree_store;
-@@ -106,3 +158,62 @@
+@@ -106,3 +158,61 @@
          tempfile::NamedTempFile::new().unwrap()
      }
  }
@@ -2764,7 +2764,6 @@
 +};
 +
 +mod read_admission;
-+mod scan_cache;
 +#[cfg(feature = "contextdb-internal")]
 +#[doc(hidden)]
 +pub use read_admission::ReadCacheRequest;
@@ -3893,7 +3892,7 @@
 +}
 --- /dev/null
 +++ b/src/read_admission.rs
-@@ -0,0 +1,724 @@
+@@ -0,0 +1,653 @@
 +//! Operation-scoped admission before allocating a source page. The caller
 +//! keeps admitted bytes owned until its read handles have been released.
 +use crate::StorageError;
@@ -4067,6 +4066,11 @@
 +    operation()
 +}
 +
++#[cfg(feature = "contextdb-internal")]
++pub(crate) fn has_read_memory_admission() -> bool {
++    ACTIVE.with(|active| !active.borrow().is_empty())
++}
++
 +pub(crate) fn admit_read_memory(bytes: usize) -> Result<Option<ReadMemoryCharge>, StorageError> {
 +    ACTIVE.with(|active| match active.borrow().last() {
 +        #[cfg(feature = "contextdb-internal")]
@@ -4089,31 +4093,18 @@
 +    static SCAN_TAIL: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>> = const { std::cell::Cell::new(None) };
 +}
 +
-+/// Fallback shared-cache growth for an unscoped legacy scan. Declared readers
-+/// retain their working sets through original reader admission instead.
++/// Fallback growth for a legacy scan without declared admission. Declared
++/// readers instead use the capacity-limited shared page cache.
 +pub(crate) const SCAN_GROWTH_ALLOWANCE: usize = 16 * 1024;
-+
-+struct ScanState {
-+    remaining: std::sync::atomic::AtomicUsize,
-+    pages: std::sync::Mutex<crate::scan_cache::ScanCache>,
-+}
-+impl ScanState {
-+    fn new() -> Self {
-+        Self {
-+            remaining: std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
-+            pages: std::sync::Mutex::new(crate::scan_cache::ScanCache::default()),
-+        }
-+    }
-+}
 +
 +#[derive(Clone)]
 +enum ScanRemaining {
 +    // Public legacy constructors retain their unqualified allocation behavior.
-+    Legacy(Arc<ScanState>),
++    Legacy(Arc<std::sync::atomic::AtomicUsize>),
 +    #[cfg(feature = "contextdb-internal")]
 +    Native {
 +        remaining:
-+            crate::native_storage_admission::NativeStorageShared<ScanState>,
++            crate::native_storage_admission::NativeStorageShared<std::sync::atomic::AtomicUsize>,
 +        // Only immutable owned admission crosses threads. Scope links never do.
 +        admission: crate::NativeStorageAdmission,
 +    },
@@ -4137,7 +4128,7 @@
 +    /// Its public infallible allocation remains unqualified for native funding.
 +    pub fn new() -> Self {
 +        Self(ScanRemaining::Legacy(Arc::new(
-+            ScanState::new(),
++            std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
 +        )))
 +    }
 +
@@ -4149,7 +4140,7 @@
 +    pub fn try_new_native() -> Result<Self, StorageError> {
 +        let admission = crate::NativeStorageAdmission::retain_current()?;
 +        let remaining = crate::native_storage_admission::NativeStorageShared::new(
-+            ScanState::new(),
++            std::sync::atomic::AtomicUsize::new(SCAN_GROWTH_ALLOWANCE),
 +        )
 +        .map_err(crate::native_storage_admission::native_storage_error)?;
 +        Ok(Self(ScanRemaining::Native {
@@ -4234,66 +4225,11 @@
 +        }
 +    }
 +
-+    fn state(&self) -> &ScanState {
-+        match &self.0 {
-+            ScanRemaining::Legacy(state) => state,
-+            #[cfg(feature = "contextdb-internal")]
-+            ScanRemaining::Native { remaining, .. } => remaining.get(),
-+        }
-+    }
-+    pub(crate) fn cached_page(&self, key: crate::scan_cache::ScanKey) -> Option<crate::tree_store::PageMemory> {
-+        self.state().pages.lock().unwrap().get(key)
-+    }
-+    pub(crate) fn pinned_shared_bytes(&self, key: crate::scan_cache::ScanKey) -> usize {
-+        self.state().pages.lock().unwrap().pinned_bytes(key)
-+    }
-+    pub(crate) fn reserve_page(&self) -> Result<(), StorageError> {
-+        let reserve = |native| self.state().pages.lock().unwrap().reserve(native);
-+        match &self.0 {
-+            #[cfg(feature = "contextdb-internal")]
-+            ScanRemaining::Native { admission, .. } =>
-+                crate::with_native_storage_admission(admission.clone(), || reserve(true)),
-+            ScanRemaining::Legacy(_) => reserve(false),
-+        }
-+    }
-+    pub(crate) fn cache_page(&self, key: crate::scan_cache::ScanKey, page: crate::tree_store::PageMemory, shared_bytes: usize) -> Result<(), StorageError> {
-+        let insert = |native| {
-+            let mut pages = self.state().pages.lock().unwrap();
-+            // A simultaneous continuation may have consumed the reserved slot.
-+            pages.reserve(native)?;
-+            pages.insert(key, page, shared_bytes);
-+            Ok(())
-+        };
-+        match &self.0 {
-+            #[cfg(feature = "contextdb-internal")]
-+            ScanRemaining::Native { admission, .. } =>
-+                crate::with_native_storage_admission(admission.clone(), || insert(true)),
-+            ScanRemaining::Legacy(_) => insert(false),
-+        }
-+    }
-+    #[cfg(feature = "contextdb-internal")]
-+    pub(crate) fn native_index_error(error: StorageError) -> crate::NativeColdReadError {
-+        match error {
-+            StorageError::Native(error) => error,
-+            StorageError::ValueTooLarge(_) => crate::NativeColdReadError::Corrupt(
-+                crate::native_storage_admission::NativeColdFault::new("scan index capacity overflow")),
-+            _ => unreachable!("native scan index uses only native admission"),
-+        }
-+    }
-+    #[cfg(feature = "contextdb-internal")]
-+    pub(crate) fn reserve_native_page(&self) -> Result<(), crate::NativeColdReadError> {
-+        self.reserve_page().map_err(Self::native_index_error)
-+    }
-+    #[cfg(feature = "contextdb-internal")]
-+    pub(crate) fn cache_native_page(&self, key: crate::scan_cache::ScanKey, page: crate::tree_store::PageMemory, shared_bytes: usize) -> Result<(), crate::NativeColdReadError> {
-+        self.cache_page(key, page, shared_bytes).map_err(Self::native_index_error)
-+    }
-+
 +    fn remaining(&self) -> &std::sync::atomic::AtomicUsize {
 +        match &self.0 {
-+            ScanRemaining::Legacy(remaining) => &remaining.remaining,
++            ScanRemaining::Legacy(remaining) => remaining,
 +            #[cfg(feature = "contextdb-internal")]
-+            ScanRemaining::Native { remaining, .. } => &remaining.get().remaining,
++            ScanRemaining::Native { remaining, .. } => remaining.get(),
 +        }
 +    }
 +}
@@ -4313,8 +4249,8 @@
 +    _invoice: ScanNodeInvoice,
 +}
 +
-+/// While held, declared reads retain their working set under original reader
-+/// admission; unscoped reads use the fallback allowance. A node stays linked
++/// Declared reads use the shared cache capacity; unscoped reads use the
++/// fallback allowance (see [`with_scan_reads`]). A node stays linked
 +/// until its last guard drops; dropping an older guard cannot pop a newer entry.
 +#[doc(hidden)]
 +pub struct ScanReads {
@@ -4386,33 +4322,25 @@
 +    }
 +}
 +
-+/// Execute a scan under its declared reader admission. Revisited pages stay
-+/// held until the operation ends; the shared cache may retain original page
-+/// invoices for later queries. A reader without admission keeps only the
-+/// finite fallback cache allowance and replaces evictable pages thereafter.
++/// Execute a scan using the shared cache under its declared admission and
++/// capacity. Unpinned pages can be recycled by a larger stream. Without
++/// declared admission the existing finite fallback growth allowance applies.
 +#[doc(hidden)]
 +pub fn with_scan_reads<R>(operation: impl FnOnce() -> R) -> R {
 +    let _scan = scan_reads();
 +    operation()
 +}
 +
-+// A declared operation keeps a source-funded working set. Unscoped legacy
-+// scans retain their finite shared-cache footprint instead of growing a heap.
-+pub(crate) fn scan_working_set() -> Option<ScanAllowance> {
-+    let allowance = SCAN_TAIL.with(|tail| tail.get().map(|node|
-+        unsafe { node.as_ref() }.allowance.clone()))?;
-+    let declared = match &allowance.0 {
-+        #[cfg(feature = "contextdb-internal")]
-+        ScanRemaining::Native { .. } => true,
-+        ScanRemaining::Legacy(_) => ACTIVE.with(|active| !active.borrow().is_empty()),
-+    };
-+    declared.then_some(allowance)
-+}
-+
-+#[cfg(feature = "contextdb-internal")]
-+pub(crate) fn native_scan_working_set() -> Option<ScanAllowance> {
-+    let allowance = scan_working_set()?;
-+    matches!(&allowance.0, ScanRemaining::Native { .. }).then_some(allowance)
++// Declared readers already admit source pages and the shared cache enforces
++// its own capacity. Reuse that bounded cache instead of imposing an unrelated
++// per-scan growth constant or retaining a second set of pinned page handles.
++pub(crate) fn declared_scan_reads_active() -> bool {
++    if ACTIVE.with(|active| !active.borrow().is_empty()) { return true; }
++    #[cfg(feature = "contextdb-internal")]
++    return SCAN_TAIL.with(|tail| tail.get().is_some_and(|node|
++        matches!(&unsafe { node.as_ref() }.allowance.0, ScanRemaining::Native { .. })));
++    #[cfg(not(feature = "contextdb-internal"))]
++    false
 +}
 +
 +pub(crate) fn scan_reads_active() -> bool {
@@ -4618,151 +4546,6 @@
 +}
 +#[cfg(feature = "contextdb-internal")]
 +pub(crate) fn cache_request() -> u64 { CACHE_REQUEST.with(std::cell::Cell::get) }
---- /dev/null
-+++ b/src/scan_cache.rs
-@@ -0,0 +1,142 @@
-+//! An operation owns its revisited pages and the exact index backing.
-+//! Neither the shared file cache nor a subsequent reader inherits its invoice.
-+use crate::{Result, StorageError};
-+use crate::read_admission::{ReadMemoryCharge, admit_read_memory};
-+use crate::tree_store::PageMemory;
-+use std::alloc::{Layout, alloc, dealloc};
-+use std::ptr::NonNull;
-+
-+#[derive(Clone, Copy, PartialEq, Eq)]
-+pub(crate) struct ScanKey(pub(crate) [u64; 4]);
-+impl ScanKey {
-+    fn bucket(self, capacity: usize) -> usize {
-+        let mut hash = 0x9e3779b97f4a7c15_u64;
-+        for word in self.0 {
-+            hash ^= word.wrapping_add(0x9e3779b97f4a7c15);
-+            hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-+            hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d049bb133111eb);
-+            hash ^= hash >> 31;
-+        }
-+        (hash as usize) & (capacity - 1)
-+    }
-+}
-+struct Entry { key: ScanKey, page: PageMemory }
-+#[allow(dead_code)] // Receipts settle only after the array is physically freed.
-+enum Invoice {
-+    Legacy(Option<ReadMemoryCharge>),
-+    #[cfg(feature = "contextdb-internal")]
-+    Native(crate::NativeStorageCredit),
-+}
-+struct Table {
-+    slots: NonNull<Option<Entry>>,
-+    capacity: usize,
-+    invoice: Option<Invoice>,
-+}
-+// Slots are accessed only through the scan state mutex. Entries and invoices
-+// are Send; no pointer or reference escapes that lock.
-+unsafe impl Send for Table {}
-+impl Table {
-+    fn slot(&self, index: usize) -> &Option<Entry> {
-+        unsafe { &*self.slots.as_ptr().add(index) }
-+    }
-+    fn slot_mut(&mut self, index: usize) -> &mut Option<Entry> {
-+        unsafe { &mut *self.slots.as_ptr().add(index) }
-+    }
-+    fn insert(&mut self, entry: Entry) {
-+        let mut bucket = entry.key.bucket(self.capacity);
-+        while self.slot(bucket).is_some() { bucket = (bucket + 1) & (self.capacity - 1); }
-+        *self.slot_mut(bucket) = Some(entry);
-+    }
-+    fn new(capacity: usize, native: bool) -> Result<Self> {
-+        let layout = Layout::array::<Option<Entry>>(capacity)
-+            .map_err(|_| StorageError::ValueTooLarge(capacity))?;
-+        #[cfg(feature = "contextdb-internal")]
-+        let invoice = if native {
-+            Invoice::Native(crate::native_storage_admission::admit_native_storage(layout)
-+                .map_err(StorageError::Native)?)
-+        } else { Invoice::Legacy(admit_read_memory(layout.size())?) };
-+        #[cfg(not(feature = "contextdb-internal"))]
-+        let invoice = { let _ = native; Invoice::Legacy(admit_read_memory(layout.size())?) };
-+        let Some(slots) = NonNull::new(unsafe { alloc(layout) }.cast::<Option<Entry>>()) else {
-+            return Err(crate::native_storage_admission::native_storage_error(
-+                crate::native_storage_admission::NativeColdReadError::AllocatorFailed {
-+                    site: "scan page index", layout,
-+                }));
-+        };
-+        for index in 0..capacity { unsafe { slots.as_ptr().add(index).write(None) }; }
-+        Ok(Self { slots, capacity, invoice: Some(invoice) })
-+    }
-+}
-+struct FreeTable {
-+    slots: NonNull<Option<Entry>>,
-+    layout: Layout,
-+    _invoice: Option<Invoice>,
-+}
-+impl Drop for FreeTable {
-+    fn drop(&mut self) { unsafe { dealloc(self.slots.as_ptr().cast(), self.layout) }; }
-+}
-+impl Drop for Table {
-+    fn drop(&mut self) {
-+        let _free = FreeTable {
-+            slots: self.slots,
-+            layout: Layout::array::<Option<Entry>>(self.capacity).expect("allocated layout"),
-+            _invoice: self.invoice.take(),
-+        };
-+        // Array drop glue finishes other elements and frees backing on unwind.
-+        unsafe { std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
-+            self.slots.as_ptr(), self.capacity)) };
-+    }
-+}
-+#[derive(Default)]
-+pub(crate) struct ScanCache {
-+    table: Option<Table>, len: usize,
-+    counted_file: Option<(u64, u64)>, pinned_bytes: usize,
-+}
-+impl ScanCache {
-+    pub(crate) fn get(&self, key: ScanKey) -> Option<PageMemory> {
-+        let table = self.table.as_ref()?;
-+        let mut bucket = key.bucket(table.capacity);
-+        loop {
-+            let entry = table.slot(bucket).as_ref()?;
-+            if entry.key == key { return Some(entry.page.clone()); }
-+            bucket = (bucket + 1) & (table.capacity - 1);
-+        }
-+    }
-+    pub(crate) fn reserve(&mut self, native: bool) -> Result<()> {
-+        let capacity = self.table.as_ref().map_or(0, |table| table.capacity);
-+        if self.len < capacity / 2 { return Ok(()); }
-+        let next_capacity = capacity.checked_mul(2).filter(|n| *n != 0)
-+            .or_else(|| (capacity == 0).then_some(64))
-+            .ok_or(StorageError::ValueTooLarge(capacity))?;
-+        // The replacement is admitted before allocating while the old table
-+        // and every original page remain paid. Refusal leaves them untouched.
-+        let mut next = Table::new(next_capacity, native)?;
-+        if let Some(old) = &mut self.table {
-+            for index in 0..old.capacity {
-+                if let Some(entry) = old.slot_mut(index).take() { next.insert(entry); }
-+            }
-+        }
-+        self.table = Some(next);
-+        Ok(())
-+    }
-+    pub(crate) fn pinned_bytes(&self, key: ScanKey) -> usize {
-+        if self.counted_file == Some((key.0[0], key.0[1] & !1)) { self.pinned_bytes } else { 0 }
-+    }
-+    pub(crate) fn insert(&mut self, key: ScanKey, page: PageMemory, shared_bytes: usize) {
-+        let file = (key.0[0], key.0[1] & !1);
-+        if self.counted_file != Some(file) { self.counted_file = Some(file); self.pinned_bytes = 0; }
-+        let mut twin = key; twin.0[1] ^= 1;
-+        let already_counted = self.get(key).is_some() || self.get(twin)
-+            .is_some_and(|other| other.same_backing(&page));
-+        if !already_counted { self.pinned_bytes = self.pinned_bytes.saturating_add(shared_bytes); }
-+        let table = self.table.as_mut().expect("reserved scan index");
-+        let mut bucket = key.bucket(table.capacity);
-+        loop {
-+            match table.slot_mut(bucket) {
-+                Some(entry) if entry.key == key => { entry.page = page; return; }
-+                slot @ None => { *slot = Some(Entry { key, page }); self.len += 1; return; }
-+                Some(_) => bucket = (bucket + 1) & (table.capacity - 1),
-+            }
-+        }
-+    }
-+}
 --- a/src/table.rs
 +++ b/src/table.rs
 @@ -60,7 +60,7 @@
@@ -13711,15 +13494,7 @@
  mod table_tree;
  mod table_tree_base;
  
-@@ -15,11 +23,29 @@
-     LeafMutator, RawLeafBuilder,
- };
- pub(crate) use btree_iters::{AllPageNumbersBtreeIter, BtreeExtractIf, BtreeRangeIter};
--pub(crate) use page_store::ReadOnlyBackend;
-+pub(crate) use page_store::{ReadOnlyBackend, PageMemory};
- pub(crate) use page_store::{
-     FILE_FORMAT_VERSION3, MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, PAGE_SIZE, Page, PageHint, PageNumber,
-     PageTrackerPolicy, SerializedSavepoint, ShrinkPolicy, TransactionalMemory,
+@@ -22,4 +30,22 @@
  };
  pub use page_store::{InMemoryBackend, Savepoint, file_backend};
  pub(crate) use table_tree::{PageListMut, TableTree, TableTreeMut};
@@ -15818,7 +15593,7 @@
 +}
 --- a/src/tree_store/page_store/cached_file.rs
 +++ b/src/tree_store/page_store/cached_file.rs
-@@ -1,24 +1,153 @@
+@@ -1,24 +1,143 @@
  use crate::tree_store::page_store::base::PageHint;
 -use crate::tree_store::page_store::lru_cache::LRUCache;
 -use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
@@ -15877,16 +15652,6 @@
 +}
 +
 +impl PageMemory {
-+    fn allocation(&self) -> &PageAllocation {
-+        match self {
-+            Self::Cached(page) | Self::Charged(page) | Self::Plain(page) => page,
-+            #[cfg(feature = "contextdb-internal")]
-+            Self::Native(page) => page,
-+        }
-+    }
-+    pub(crate) fn same_backing(&self, other: &Self) -> bool {
-+        PageAllocation::ptr_eq(self.allocation(), other.allocation())
-+    }
 +    #[cfg(all(test, feature = "contextdb-internal"))]
 +    pub(crate) fn admitted_bytes_for_test(len: usize) -> usize {
 +        admitted_page_bytes(len)
@@ -15984,7 +15749,7 @@
  }
  
  impl WritablePage {
-@@ -27,7 +156,7 @@
+@@ -27,7 +146,7 @@
      }
  
      pub(super) fn mem_mut(&mut self) -> &mut [u8] {
@@ -15993,7 +15758,7 @@
      }
  }
  
-@@ -56,7 +185,7 @@
+@@ -56,7 +175,7 @@
  
  #[derive(Default)]
  struct LRUWriteCache {
@@ -16002,7 +15767,7 @@
  }
  
  impl LRUWriteCache {
-@@ -66,15 +195,15 @@
+@@ -66,15 +185,15 @@
          }
      }
  
@@ -16021,7 +15786,7 @@
          if let Some(value) = self.cache.remove(key) {
              assert!(value.is_some());
              return value;
-@@ -82,11 +211,11 @@
+@@ -82,11 +201,11 @@
          None
      }
  
@@ -16035,7 +15800,7 @@
          if let Some(value) = self.cache.get_mut(key) {
              let result = value.take().unwrap();
              return Some(result);
-@@ -94,7 +223,7 @@
+@@ -94,7 +213,7 @@
          None
      }
  
@@ -16044,7 +15809,7 @@
          for _ in 0..self.cache.len() {
              if let Some((k, v)) = self.cache.pop_lowest_priority() {
                  if let Some(v_inner) = v {
-@@ -117,15 +246,15 @@
+@@ -117,15 +236,15 @@
  
  #[derive(Debug)]
  struct CheckedBackend {
@@ -16063,7 +15828,7 @@
              io_failed: AtomicBool::new(false),
              closed: AtomicBool::new(false),
          }
-@@ -157,7 +286,7 @@
+@@ -157,7 +276,7 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -16072,7 +15837,7 @@
      }
  
      fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
-@@ -165,17 +294,25 @@
+@@ -165,17 +284,25 @@
          let result = self.file.read(offset, out);
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
@@ -16102,7 +15867,7 @@
      }
  
      fn sync_data(&self) -> Result<()> {
-@@ -184,7 +321,7 @@
+@@ -184,7 +311,7 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -16111,26 +15876,23 @@
      }
  
      fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
-@@ -193,11 +330,15 @@
+@@ -193,11 +320,14 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
 -        result.map_err(StorageError::from)
--    }
--}
 +        result
-+    }
-+}
-+
-+static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
+     }
+ }
  
  pub(super) struct PagedCachedFile {
-+    file_id: u64,
-+    cache_epoch: AtomicU64,
++    no_victim_generation: AtomicU64,
++    #[cfg(test)]
++    eviction_visits: AtomicUsize,
      file: CheckedBackend,
      page_size: u64,
      // Dynamic cache partitioning.  Three invariants:
-@@ -218,9 +359,7 @@
+@@ -218,9 +348,7 @@
      // soft limit and momentary over-/under-counting by one page is harmless.
      // A third "total" counter would add contention on every insert/remove for
      // negligible accuracy gain.
@@ -16141,7 +15903,7 @@
      // Rotates the starting stripe for read-cache eviction
      next_eviction_stripe: AtomicUsize,
      #[cfg(feature = "cache_metrics")]
-@@ -233,27 +372,132 @@
+@@ -233,27 +361,133 @@
      writes_hits: AtomicU64,
      #[cfg(feature = "cache_metrics")]
      evictions: AtomicU64,
@@ -16271,8 +16033,9 @@
  
          Ok(Self {
              file: CheckedBackend::new(file),
-+            file_id: NEXT_FILE_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1)).expect("cache file identity exhausted"),
-+            cache_epoch: AtomicU64::new(0),
++            no_victim_generation: AtomicU64::new(0),
++            #[cfg(test)]
++            eviction_visits: AtomicUsize::new(0),
              page_size,
 -            read_cache_bytes: AtomicUsize::new(0),
 -            write_buffer_bytes: AtomicUsize::new(0),
@@ -16283,7 +16046,7 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -266,8 +510,103 @@
+@@ -266,8 +500,103 @@
              #[cfg(feature = "cache_metrics")]
              evictions: Default::default(),
              read_cache,
@@ -16388,7 +16151,7 @@
      }
  
      #[allow(clippy::unused_self)]
-@@ -303,6 +642,55 @@
+@@ -303,6 +632,55 @@
          }
      }
  
@@ -16444,9 +16207,12 @@
      pub(crate) fn close(&self) -> Result {
          self.file.close()
      }
-@@ -330,22 +718,27 @@
+@@ -329,27 +707,41 @@
+         bytes_needed: usize,
          _write_lock: &MutexGuard<'_, LRUWriteCache>,
      ) {
++        let generation = self.read_cache_bytes.release_generation();
++        if self.no_victim_generation.load(Ordering::Acquire) == generation { return; }
          let num_stripes = self.read_cache.len();
 -        let start = self.next_eviction_stripe.fetch_add(1, Ordering::Relaxed) % num_stripes;
 +        let start = self.next_eviction_stripe.load(Ordering::Relaxed) % num_stripes;
@@ -16461,7 +16227,11 @@
              while freed < bytes_needed {
 -                if let Some((_, v)) = lock.pop_lowest_priority() {
 +                if let Some((_, v)) =
-+                    lock.pop_lowest_priority_where(|page| PageAllocation::strong_count(page) == 1)
++                    lock.pop_lowest_priority_where(|page| {
++                        #[cfg(test)]
++                        self.eviction_visits.fetch_add(1, Ordering::Relaxed);
++                        PageAllocation::strong_count(page) == 1
++                    })
 +                {
                      #[cfg(feature = "cache_metrics")]
                      {
@@ -16476,7 +16246,14 @@
                  } else {
                      break;
                  }
-@@ -364,25 +757,49 @@
+             }
++        }
++        if freed < bytes_needed {
++            self.no_victim_generation.store(generation, Ordering::Release);
+         }
+     }
+ 
+@@ -364,25 +756,49 @@
          // drained, so the total check only considers the read cache size.
          for (offset, buffer) in write_buffer.cache.iter_mut() {
              let buffer = buffer.take().unwrap();
@@ -16538,7 +16315,7 @@
          write_buffer.clear();
  
          Ok(())
-@@ -390,10 +807,29 @@
+@@ -390,10 +806,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -16553,7 +16330,6 @@
 +    }
 +
 +    fn invalidate_cache_beyond(&self, len: u64) {
-+        self.advance_cache_epoch();
 +        for stripe in &self.read_cache {
 +            let mut lock = stripe.write().unwrap();
 +            loop {
@@ -16570,7 +16346,7 @@
      }
  
      pub(super) fn flush(&self) -> Result {
-@@ -409,6 +845,20 @@
+@@ -409,6 +843,20 @@
          self.flush_write_buffer()
      }
  
@@ -16591,7 +16367,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +866,41 @@
+@@ -416,18 +864,27 @@
          Ok(buffer)
      }
  
@@ -16605,33 +16381,19 @@
 +    // Admit the concrete complete allocation before allocation and backend I/O.
 +    fn read_direct_into_page(&self, offset: u64, len: usize) -> Result<PageAllocation> {
 +        PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
++        #[cfg(feature = "contextdb-internal")]
++        if !crate::read_admission::has_read_memory_admission()
++            && crate::native_storage_admission::native_storage_active()
++        {
++            let mut page = PageAllocation::zeroed_native(len).map_err(StorageError::Native)?;
++            self.file.read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
++            return Ok(page);
++        }
 +        let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
 +        let mut page = PageAllocation::zeroed(len, charge)?;
 +        self.file
 +            .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
 +        Ok(page)
-+    }
-+
-+    fn shared_page_bytes(&self, page: &PageMemory) -> usize {
-+        if page.allocation().counted_by(&self.read_cache_bytes) { cached_page_bytes(page.len()) } else { 0 }
-+    }
-+    fn scan_has_pinned_shared_cache(&self, scan: &crate::read_admission::ScanAllowance, key: crate::scan_cache::ScanKey, len: usize) -> bool {
-+        let read = self.read_cache_bytes.load(Ordering::Acquire);
-+        let write = self.write_buffer_bytes.load(Ordering::Acquire);
-+        // Every byte counted here has a real page holder in this operation.
-+        // Such holders cannot become evictable before this scope releases.
-+        // This avoids a full unsuccessful victim walk on every later miss.
-+        scan.pinned_shared_bytes(key) >= read && read.saturating_add(write)
-+            .saturating_add(cached_page_bytes(len)) > self.max_cache_size.load(Ordering::Acquire)
-+    }
-+    fn scan_key(&self, offset: u64, len: usize, native: bool) -> crate::scan_cache::ScanKey {
-+        let epoch = self.cache_epoch.load(Ordering::Acquire);
-+        crate::scan_cache::ScanKey([self.file_id, epoch * 2 + u64::from(native), offset, len as u64])
-+    }
-+    fn advance_cache_epoch(&self) {
-+        self.cache_epoch.fetch_update(Ordering::AcqRel, Ordering::Acquire,
-+            |epoch| epoch.checked_add(1).filter(|next| *next <= u64::MAX / 2))
-+            .expect("cache mutation identity exhausted");
      }
  
      // Read with caching. Caller must not read overlapping ranges without first calling invalidate_cache().
@@ -16641,7 +16403,16 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,173 +911,329 @@
+@@ -438,7 +895,7 @@
+                 #[cfg(feature = "cache_metrics")]
+                 self.reads_hits.fetch_add(1, Ordering::Release);
+                 debug_assert_eq!(cached.len(), len);
+-                return Ok(cached.clone());
++                return Ok(PageMemory::Plain(cached.clone()));
+             }
+         }
+ 
+@@ -449,54 +906,135 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -16649,44 +16420,15 @@
 -            }
 -        }
 -
-+                return Ok(PageMemory::Plain(cached.clone()));
+-        let buffer = self.read_direct_into_arc(offset, len)?;
+-        let cache_size = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
++                return Ok(PageMemory::Cached(cached.clone()));
 +            }
-+        }
-+
-+        let working_set = crate::read_admission::scan_working_set();
-+        let key = self.scan_key(offset, len, false);
-+        if let Some(scan) = &working_set {
-+            if let Some(page) = scan.cached_page(key) { return Ok(page); }
-+            scan.reserve_page()?;
-+        }
-         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
-+        let cached = {
-+            let read_lock = self.read_cache[cache_slot].read().unwrap();
-+            let cached = read_lock.get(offset).map(|page| page.clone());
-+            cached
-+        };
-+        if let Some(cached) = cached {
-+            #[cfg(feature = "cache_metrics")]
-+            self.reads_hits.fetch_add(1, Ordering::Release);
-+            debug_assert_eq!(cached.len(), len);
-+            let page = PageMemory::Cached(cached);
-+            if let Some(scan) = &working_set {
-+                scan.cache_page(key, page.clone(), self.shared_page_bytes(&page))?;
-+            }
-+            return Ok(page);
 +        }
 +
 +        let buffer = self.read_direct_into_page(offset, len)?;
-+        if let Some(scan) = &working_set {
-+            // The cache retains the same original source invoice until a genuine
-+            // fixed reserve takes it over or the final physical page is freed.
-+            let page = if !self.scan_has_pinned_shared_cache(scan, key, len) {
-+                self.cache_loaded_page(offset, len, buffer, false)?
-+            } else { Self::uncached(buffer) };
-+            scan.cache_page(key, page.clone(), self.shared_page_bytes(&page))?;
-+            return Ok(page);
-+        }
 +        let scan_replace = crate::read_admission::scan_reads_active()
++            && !crate::read_admission::declared_scan_reads_active()
 +            && !crate::read_admission::take_scan_growth(cached_page_bytes(len));
 +        self.cache_loaded_page(offset, len, buffer, scan_replace)
 +    }
@@ -16731,18 +16473,7 @@
 +            .saturating_add(page_bytes)
 +            .saturating_add(write_bytes)
 +            > self.max_cache_size.load(Ordering::Acquire)
-         {
--            let read_lock = self.read_cache[cache_slot].read().unwrap();
--            if let Some(cached) = read_lock.get(offset) {
--                #[cfg(feature = "cache_metrics")]
--                self.reads_hits.fetch_add(1, Ordering::Release);
--                debug_assert_eq!(cached.len(), len);
--                return Ok(cached.clone());
--            }
--        }
--
--        let buffer = self.read_direct_into_arc(offset, len)?;
--        let cache_size = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
++        {
 +            drop(payment);
 +            return Ok(Self::uncached(buffer));
 +        }
@@ -16857,11 +16588,7 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-     //
-     // NOTE: Invalidating a cached region in subsections is permitted, as long as all subsections are invalidated
-     pub(super) fn invalidate_cache(&self, offset: u64, len: usize) {
-+        self.advance_cache_epoch();
-         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
+@@ -507,104 +1045,156 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -16895,7 +16622,6 @@
      }
  
      pub(super) fn invalidate_cache_all(&self) {
-+        self.advance_cache_epoch();
          for cache_slot in 0..self.read_cache.len() {
              let mut lock = self.read_cache[cache_slot].write().unwrap();
 -            while let Some((_, removed)) = lock.pop_lowest_priority() {
@@ -16956,7 +16682,6 @@
 +
 +    // If overwrite is true, the page is initialized to zero.
      pub(super) fn write(&self, offset: u64, len: usize, overwrite: bool) -> Result<WritablePage> {
-+        self.advance_cache_epoch();
          assert_eq!(0, offset % self.page_size);
 +        // Reject an impossible complete Layout before reserving or unlinking.
 +        PageAllocation::layout(len).map_err(|_| StorageError::ValueTooLarge(len))?;
@@ -17106,7 +16831,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1243,236 @@
+@@ -614,13 +1204,318 @@
  }
  
  #[cfg(test)]
@@ -17133,12 +16858,6 @@
 +            return Err(NativeColdReadError::Corrupt(NativeColdFault::new(
 +                "native read requires an available backend")));
 +        }
-+        let working_set = crate::read_admission::native_scan_working_set();
-+        let key = self.scan_key(offset, len, true);
-+        if let Some(scan) = &working_set {
-+            if let Some(page) = scan.cached_page(key) { return Ok(page); }
-+            scan.reserve_native_page()?;
-+        }
 +        let stripe = usize::try_from(offset % Self::lock_stripes()).expect("stripe fits usize");
 +        let cached = self.read_cache[stripe].read().unwrap().get(offset).map(|page| page.clone());
 +        if let Some(cached) = &cached {
@@ -17149,7 +16868,6 @@
 +            }
 +            if cached.is_native() {
 +                let page = PageMemory::Native(cached.clone());
-+                if let Some(scan) = &working_set { scan.cache_native_page(key, page.clone(), self.shared_page_bytes(&page))?; }
 +                return Ok(page);
 +            }
 +        }
@@ -17165,16 +16883,16 @@
 +        }
 +        // The shared cache takes custody under its actual fixed reserve; if
 +        // it cannot, the page keeps its genuine original source invoice.
-+        let page = if working_set.as_ref().is_some_and(|scan| self.scan_has_pinned_shared_cache(scan, key, len)) {
-+            Self::uncached(page)
-+        } else {
-+            self.cache_loaded_page(offset, len, page, false)
-+                .map_err(crate::read_admission::ScanAllowance::native_index_error)?
-+        };
++        let page = self.cache_loaded_page(offset, len, page, false)
++            .map_err(|error| match error {
++                StorageError::Native(error) => error,
++                StorageError::ValueTooLarge(_) => NativeColdReadError::Corrupt(
++                    NativeColdFault::new("native cache capacity overflow")),
++                _ => unreachable!("cache insertion retains native allocation failures"),
++            })?;
 +        let page = match page {
 +            PageMemory::Cached(page) | PageMemory::Charged(page) | PageMemory::Plain(page) | PageMemory::Native(page) => PageMemory::Native(page),
 +        };
-+        if let Some(scan) = &working_set { scan.cache_native_page(key, page.clone(), self.shared_page_bytes(&page))?; }
 +        Ok(page)
 +    }
 +
@@ -17282,6 +17000,95 @@
 +        }
 +    }
 +
++    struct ReaderCharge {
++        held: Arc<AtomicUsize>,
++        bytes: usize,
++    }
++    impl Drop for ReaderCharge {
++        fn drop(&mut self) { self.held.fetch_sub(self.bytes, Ordering::SeqCst); }
++    }
++    fn charged_reader(limit: usize, held: &Arc<AtomicUsize>) -> Arc<dyn Fn(usize) -> io::Result<crate::ReadPageCharge> + Send + Sync> {
++        let held = held.clone();
++        Arc::new(move |bytes| {
++            let previous = held.fetch_add(bytes, Ordering::SeqCst);
++            if previous.saturating_add(bytes) > limit {
++                held.fetch_sub(bytes, Ordering::SeqCst);
++                return Err(io::Error::from(io::ErrorKind::OutOfMemory));
++            }
++            Ok(Box::new(ReaderCharge { held: held.clone(), bytes }))
++        })
++    }
++
++    #[test]
++    fn declared_stream_recycles_pages_larger_than_its_cache_capacity() {
++        let backend = InMemoryBackend::new();
++        backend.set_len(128 * 4096).unwrap();
++        let page_bytes = super::cached_page_bytes(4096);
++        let source_bytes = super::admitted_page_bytes(4096);
++        let file = PagedCachedFile::new(Box::new(backend), 4096, 4 * page_bytes).unwrap();
++        let held = Arc::new(AtomicUsize::new(0));
++        let reads = Arc::new(AtomicUsize::new(0));
++        let observed = reads.clone();
++        let _observe = crate::observe_backend_reads(Arc::new(move |_| { observed.fetch_add(1, Ordering::SeqCst); }));
++        crate::with_read_page_charge(charged_reader(5 * source_bytes, &held), || {
++            crate::with_scan_reads(|| {
++                for ordinal in 0..128 {
++                    let page = file.read(ordinal * 4096, 4096, PageHint::Clean).unwrap();
++                    assert!(matches!(page, super::PageMemory::Cached(_)));
++                    drop(page);
++                    assert!(held.load(Ordering::SeqCst) <= 4 * source_bytes);
++                    assert!(file.read_cache_bytes.load(Ordering::SeqCst) <= 4 * page_bytes);
++                }
++            });
++            assert_eq!(reads.load(Ordering::SeqCst), 128);
++            assert!(file.eviction_visits.load(Ordering::SeqCst) <= 2 * 128);
++        });
++        // Shared pages keep their original invoice after statement exit.
++        assert_eq!(held.load(Ordering::SeqCst), 4 * source_bytes);
++        drop(file);
++        assert_eq!(held.load(Ordering::SeqCst), 0);
++    }
++
++    #[test]
++    fn pinned_cache_skips_repeated_victim_walks_and_resumes_after_cross_thread_release() {
++        let backend = InMemoryBackend::new();
++        backend.set_len(32 * 4096).unwrap();
++        let page_bytes = super::cached_page_bytes(4096);
++        let source_bytes = super::admitted_page_bytes(4096);
++        let file = Arc::new(PagedCachedFile::new(Box::new(backend), 4096, 2 * page_bytes).unwrap());
++        let held = Arc::new(AtomicUsize::new(0));
++        crate::with_read_page_charge(charged_reader(3 * source_bytes, &held), || {
++            let first = file.read(0, 4096, PageHint::Clean).unwrap();
++            let second = file.read(4096, 4096, PageHint::Clean).unwrap();
++            drop(file.read(8192, 4096, PageHint::Clean).unwrap());
++            let initial_visits = file.eviction_visits.load(Ordering::SeqCst);
++            assert!(initial_visits > 0);
++            for ordinal in 3..24 {
++                let miss = file.read(ordinal * 4096, 4096, PageHint::Clean).unwrap();
++                assert!(!matches!(miss, super::PageMemory::Cached(_)));
++                drop(miss);
++            }
++            assert_eq!(file.eviction_visits.load(Ordering::SeqCst), initial_visits);
++            assert_eq!(held.load(Ordering::SeqCst), 2 * source_bytes);
++            let barrier = Arc::new(std::sync::Barrier::new(2));
++            let released = barrier.clone();
++            let reader = std::thread::spawn(move || { released.wait(); drop(first); });
++            barrier.wait();
++            reader.join().unwrap();
++            // Unpinning did not free or refund the still-cached original page.
++            assert_eq!(held.load(Ordering::SeqCst), 2 * source_bytes);
++            let replacement = file.read(8192, 4096, PageHint::Clean).unwrap();
++            assert!(matches!(replacement, super::PageMemory::Cached(_)));
++            assert!(file.eviction_visits.load(Ordering::SeqCst) > initial_visits);
++            assert_eq!(held.load(Ordering::SeqCst), 2 * source_bytes);
++            assert!(second.iter().all(|byte| *byte == 0));
++            drop(replacement);
++            drop(second);
++        });
++        drop(file);
++        assert_eq!(held.load(Ordering::SeqCst), 0);
++    }
++
 +    #[test]
 +    fn quota_refusal_does_not_poison_the_checked_backend() {
 +        let backend = CheckedBackend::new(Box::new(RefuseOneGrowth::default()));
@@ -17346,7 +17153,7 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1505,810 @@
+@@ -653,4 +1548,810 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
@@ -19436,7 +19243,7 @@
 +pub use cached_file::CheckedWriterBackendForTest;
 --- /dev/null
 +++ b/src/tree_store/page_store/page_allocation.rs
-@@ -0,0 +1,660 @@
+@@ -0,0 +1,679 @@
 +//! Concrete, weakless owners for the legacy page cache. No byte/control Arc can
 +//! escape independently of the payer. Native copies retain their separate owner.
 +use crate::read_admission::{ReadMemoryCharge, admit_read_memory};
@@ -19445,7 +19252,7 @@
 +use std::ops::Deref;
 +use std::ptr::NonNull;
 +use std::sync::Mutex;
-+use std::sync::atomic::{AtomicUsize, Ordering, fence};
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 +
 +fn allocation_failed(site: &'static str, layout: Layout) -> StorageError {
 +    crate::native_storage_admission::native_storage_error(
@@ -19466,6 +19273,7 @@
 +struct CounterBlock {
 +    owners: AtomicUsize,
 +    value: AtomicUsize,
++    release_generation: AtomicU64,
 +    invoice: Option<ReadMemoryCharge>,
 +    preparation: Option<crate::native_storage_admission::NativeStorageCredit>,
 +    reserve: Mutex<Option<crate::native_storage_admission::NativeStorageCredit>>,
@@ -19493,6 +19301,14 @@
 +        (self.block.as_ptr() as usize, self.load(Ordering::SeqCst))
 +    }
 +
++    pub(super) fn release_generation(&self) -> u64 {
++        unsafe { self.block.as_ref() }.release_generation.load(Ordering::Acquire)
++    }
++    fn note_external_release(&self) {
++        unsafe { self.block.as_ref() }.release_generation
++            .fetch_update(Ordering::Release, Ordering::Relaxed, |generation| generation.checked_add(1))
++            .expect("cache release generation exhausted");
++    }
 +    pub(super) fn has_fixed_reserve(&self) -> bool {
 +        unsafe { self.block.as_ref() }.reserve.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 +    }
@@ -19517,6 +19333,7 @@
 +            block.as_ptr().write(CounterBlock {
 +                owners: AtomicUsize::new(1),
 +                value: AtomicUsize::new(0),
++                release_generation: AtomicU64::new(1),
 +                invoice,
 +                preparation,
 +                reserve: Mutex::new(None),
@@ -19857,13 +19674,22 @@
 +}
 +impl Drop for PageAllocation {
 +    fn drop(&mut self) {
-+        if unsafe { self.block.as_ref() }
-+            .owners
-+            .fetch_sub(1, Ordering::Release)
-+            != 1
-+        {
-+            return;
++        // Retain the actual occupancy control while this page handle is
++        // still owned. After decrement another thread may free the page, so
++        // no page field may be touched while publishing the release notice.
++        let counter = {
++            let payer = unsafe { self.block.as_ref() }.payer.lock()
++                .unwrap_or_else(|error| error.into_inner());
++            match &*payer {
++                Some(PagePayer::Cache(payment) | PagePayer::SourceCounted { occupancy: payment, .. }) => Some(payment.counter.clone()),
++                _ => None,
++            }
++        };
++        let previous = unsafe { self.block.as_ref() }.owners.fetch_sub(1, Ordering::Release);
++        if previous == 2 {
++            if let Some(counter) = &counter { counter.note_external_release(); }
 +        }
++        if previous != 1 { return; }
 +        fence(Ordering::Acquire);
 +        let block = unsafe { self.block.as_mut() };
 +        let (layout, _) = Self::layout(block.len()).expect("live page has a valid Layout");
