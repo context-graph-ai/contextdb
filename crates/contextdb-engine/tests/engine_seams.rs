@@ -279,3 +279,6 @@ mod census_samples_around_maintenance_name_every_writer_byte;
 
 #[path = "engine_seams/a_census_sample_holds_off_maintenance_planted_inside_its_collection.rs"]
 mod a_census_sample_holds_off_maintenance_planted_inside_its_collection;
+
+#[path = "engine_seams/reader_peak_covers_the_complete_query.rs"]
+mod reader_peak_covers_the_complete_query;
