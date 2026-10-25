@@ -505,6 +505,16 @@ impl Drop for EventBusCallbackGuard {
 }
 
 impl EventBusState {
+    /// Each registration binds its immutable access declaration to a fresh
+    /// callback control. Replacements take effect before the next delivery,
+    /// including entries already checked out by an earlier batch.
+    fn sink_registration_is_current(&self, sink: &str, selected: &SinkRegistration) -> bool {
+        self.callbacks
+            .read()
+            .get(sink)
+            .is_some_and(|current| Arc::ptr_eq(&current.callback, &selected.callback))
+    }
+
     pub(super) fn callback_active_on_current_thread(&self) -> bool {
         EVENT_BUS_CALLBACK_OWNER.with(|owner| owner.get() == self as *const Self as usize)
     }
@@ -3691,7 +3701,7 @@ impl EventBusWorker {
             if _iteration.is_none() {
                 break;
             }
-            let Some(registration) = self.event_bus.callbacks.read().get(&self.sink).cloned()
+            let Some(mut registration) = self.event_bus.callbacks.read().get(&self.sink).cloned()
             else {
                 self.wait(&shutdown, Duration::from_millis(100));
                 continue;
@@ -3845,6 +3855,26 @@ impl EventBusWorker {
                             .finish_checked_out_entry(&self.sink, pending.id);
                     }
                     break;
+                }
+                if !self
+                    .event_bus
+                    .sink_registration_is_current(&self.sink, &registration)
+                {
+                    let current = self.event_bus.callbacks.read().get(&self.sink).cloned();
+                    let Some(current) = current else {
+                        for pending in entries.iter().skip(entry_position) {
+                            self.event_bus
+                                .finish_checked_out_entry(&self.sink, pending.id);
+                        }
+                        break;
+                    };
+                    registration = current;
+                }
+                if !event_visible_for_access(&registration.access, entry) {
+                    examined_count = examined_count.saturating_add(1);
+                    self.event_bus
+                        .finish_checked_out_entry(&self.sink, entry.id);
+                    continue;
                 }
                 if entry.attempts & UNCONFIRMED_ATTEMPT != 0 {
                     if let Err(error) = self.transition_attempt(entry.id, false, true) {
@@ -8982,7 +9012,7 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
             if _iteration.is_none() {
                 break;
             }
-            let registration = match self.events.copy_owned_sink_registration(&self.sink.body) {
+            let mut registration = match self.events.copy_owned_sink_registration(&self.sink.body) {
                 Ok(Some(registration)) => registration,
                 Ok(None) => {
                     self.wait(&shutdown, Duration::from_millis(100));
@@ -9052,6 +9082,35 @@ impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
                         self.events.finish_owned_checked_out(lookup);
                     }
                     break;
+                }
+                if !self
+                    .events
+                    .data()
+                    .common
+                    .sink_registration_is_current(&self.sink.body, &registration.registration)
+                {
+                    // Return the prior copy's original invoice before admitting
+                    // its replacement on the same native supplier.
+                    drop(registration);
+                    registration = match self.events.copy_owned_sink_registration(&self.sink.body) {
+                        Ok(Some(current)) => current,
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot admit updated owning sink registration");
+                            drop(batch);
+                            self.wait(&shutdown, Duration::from_millis(50));
+                            continue 'dispatch;
+                        }
+                    };
+                }
+                if !owned_event_visible(
+                    &registration.registration.access,
+                    &batch.entries[position].entry,
+                ) {
+                    examined = examined.saturating_add(1);
+                    self.events
+                        .finish_owned_checked_out(&batch.lookups[position]);
+                    continue;
                 }
                 let entry = &batch.entries[position].entry;
                 if entry.attempts & UNCONFIRMED_ATTEMPT != 0
