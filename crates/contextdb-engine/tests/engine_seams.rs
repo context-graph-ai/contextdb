@@ -271,3 +271,5 @@ mod storage_journeys_keep_the_measured_test_profile;
 mod primitive_work_support;
 #[path = "engine_seams/saved_search_and_append_work_ceiling.rs"]
 mod saved_search_and_append_work_ceiling;
+#[path = "engine_seams/every_writer_checkpoint_names_every_charged_byte.rs"]
+mod every_writer_checkpoint_names_every_charged_byte;
