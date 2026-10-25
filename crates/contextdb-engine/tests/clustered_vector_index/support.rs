@@ -771,7 +771,8 @@ pub fn rewrite_next_calibration_answers(
 /// Installs on the Context's serving generation a qualification receipt
 /// stating that every listed depth qualified, with the given mean complete
 /// work for the indexed route and for EXACT, as if calibration had measured
-/// them. Nothing else about the generation changes.
+/// them. The receipt keeps the generation's calibration basis; nothing else
+/// about the generation changes.
 pub fn plant_qualification(
     _db: &Database,
     _table: &str,
@@ -894,4 +895,48 @@ pub fn quantized_order(
     _query: &[f32],
 ) -> Vec<Value> {
     unimplemented!("{UNBOUND}: the quantized candidate order")
+}
+
+/// While it lives, the next calibration of the named Context evaluates only
+/// this (PROBES, REFINE_FACTOR) point, PROBES clamped to the active list
+/// count: every calibrated depth runs its own search with its own shortlist
+/// at this point, each depth is qualified or not from its own runs, and the
+/// selector does not move to another point. The generation then serves at
+/// this point.
+pub struct CalibrationSettingPlanted {
+    _private: (),
+}
+
+pub fn plant_calibration_setting(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _probes: u64,
+    _refine_factor: f64,
+) -> CalibrationSettingPlanted {
+    unimplemented!("{UNBOUND}: planting a calibration setting")
+}
+
+/// The quantization step of each dimension of the serving generation's
+/// codec: the full-precision width one code step spans.
+pub fn quantizer_steps(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> Vec<f32> {
+    unimplemented!("{UNBOUND}: the codec's quantization steps")
+}
+
+/// The per-dimension codes the serving generation's codec writes for
+/// `vector` in the list it is assigned to.
+pub fn quantized_codes(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _vector: &[f32],
+) -> Vec<i32> {
+    unimplemented!("{UNBOUND}: the codec's codes for a vector")
 }

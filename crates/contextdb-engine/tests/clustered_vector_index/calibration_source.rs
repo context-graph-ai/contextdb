@@ -1,14 +1,15 @@
 //! A declared CALIBRATION_QUERIES source is read when calibration runs, and
 //! its identity and frontier are pinned in the qualification receipt. A later
 //! change to the source never flips the served generation's basis or route:
-//! it marks the Context as pending requalification, and the receipt, the
-//! AUTO route and the objective status stay as qualified until
-//! requalification replaces them with a receipt pinned at the new frontier.
+//! it marks the Context as pending requalification, and a qualified indexed
+//! route (AUTO on the index, INDEXED meeting its objective) and its receipt
+//! stay exactly as qualified until requalification replaces the receipt with
+//! one pinned at the new frontier.
 
 use super::support::{
-    CalibrationBasis, MAX_MAINTENANCE_CYCLES, calibration_receipt, declare_calibration_queries,
-    drive_until_serving, empty, observe_search, open_caller_driven, params,
-    requalification_pending, serving, unit_vector,
+    CalibrationBasis, MAX_MAINTENANCE_CYCLES, ObjectiveStatus, SearchRoute, calibration_receipt,
+    declare_calibration_queries, drive_until_serving, empty, observe_search, open_caller_driven,
+    params, plant_qualification, requalification_pending, serving, unit_vector,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -81,6 +82,9 @@ fn a_calibration_source_change_marks_requalification_pending_without_flipping_th
         "embedding",
     );
     drive_until_serving(&db);
+    // A deterministic qualified baseline: depth 10 qualified on the
+    // source-calibrated generation at a twentieth of EXACT's work.
+    plant_qualification(&db, "sourced_items", "embedding", &[], &[10], 100, 2_000);
 
     let qualified = calibration_receipt(&db, "sourced_items", "embedding", &[])
         .expect("the serving generation has a receipt");
@@ -100,7 +104,11 @@ fn a_calibration_source_change_marks_requalification_pending_without_flipping_th
     let generation = serving(&db, "sourced_items", "embedding", &[])
         .unwrap()
         .generation;
-    let served_routes = routes(&db);
+    assert_eq!(
+        routes(&db),
+        (Some(SearchRoute::Indexed), Some(ObjectiveStatus::Met)),
+        "before the source changes, AUTO takes the index and INDEXED meets its objective"
+    );
 
     insert(&db, "sourced_questions", 50..70, 900_000);
     assert!(
@@ -127,8 +135,8 @@ fn a_calibration_source_change_marks_requalification_pending_without_flipping_th
         );
         assert_eq!(
             routes(&db),
-            served_routes,
-            "the source change does not flip the AUTO route or the objective status"
+            (Some(SearchRoute::Indexed), Some(ObjectiveStatus::Met)),
+            "while requalification is pending, AUTO keeps the index and INDEXED keeps Met"
         );
         db.run_maintenance_cycle().expect("one maintenance cycle");
     }

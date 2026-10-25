@@ -258,16 +258,22 @@ fn auto_takes_the_index_on_a_qualified_partition() {
 }
 
 const AXES: usize = 16;
-/// Above half of one 8-bit step over a [-1, 1] range: the true nearest's
-/// quantized code moves one step away from the query's.
-const NEAREST_OFFSET: f32 = 0.0045;
-/// Below half a step: each decoy's quantized code equals the query's, yet at
-/// full precision two such offsets put it farther than the true nearest.
-const DECOY_OFFSET: f32 = 0.0035;
 const DECOYS: usize = 99;
 const BACKGROUND: i64 = 5_000;
 const NEAREST_ID: i64 = 1_000_000;
 const FIRST_DECOY_ID: i64 = 2_000_000;
+/// Every evaluated depth runs at this pinned point; depth 1 rescores
+/// ceil(1 x 2) = 2 candidates and depth 100 rescores 200.
+const PINNED_PROBES: u64 = 1_024;
+const PINNED_FACTOR: f64 = 2.0;
+/// Offsets as fractions of a dimension's quantization step. A decoy's offset
+/// stays a margin below half a step, so it can keep the query's code; the true
+/// nearest's offset is a margin above half a step, so it moves one code.
+const DECOY_FRACTION: f32 = 0.35;
+const NEAREST_FRACTION: f32 = 0.8;
+/// Axes each decoy is offset on: enough that, at full precision, every decoy
+/// is farther from the query than the true nearest.
+const DECOY_AXES: usize = 8;
 
 fn axis_query() -> Vec<f32> {
     let mut query = vec![0.0; AXES];
@@ -275,20 +281,15 @@ fn axis_query() -> Vec<f32> {
     query
 }
 
-#[test]
-fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
-    let root = tempfile::tempdir().expect("temporary store directory");
-    let db = open_caller_driven(&root.path().join("distinguishing.db"));
-    db.execute(
-        &format!("CREATE TABLE near_items (id INTEGER PRIMARY KEY, embedding VECTOR({AXES}))"),
-        &empty(),
-    )
-    .expect("declare the searched column with the derived policy");
-    db.execute(
-        &format!("CREATE TABLE near_questions (id INTEGER PRIMARY KEY, embedding VECTOR({AXES}))"),
-        &empty(),
-    )
-    .expect("declare the calibration questions");
+fn near_store(path: &std::path::Path, rows: &[(i64, Vec<f32>)]) -> Database {
+    let db = open_caller_driven(path);
+    for table in ["near_items", "near_questions"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, embedding VECTOR({AXES}))"),
+            &empty(),
+        )
+        .expect("declare the table");
+    }
     db.execute(
         "INSERT INTO near_questions (id, embedding) VALUES (1, $embedding)",
         &params([("embedding", Value::Vector(axis_query()))]),
@@ -301,44 +302,146 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
         "near_questions",
         "embedding",
     );
-
-    let mut nearest = axis_query();
-    nearest[1] = NEAREST_OFFSET;
-    let decoys = (1..AXES)
-        .flat_map(|i| (i + 1..AXES).map(move |j| (i, j)))
-        .take(DECOYS)
-        .map(|(i, j)| {
-            let mut decoy = axis_query();
-            decoy[i] = DECOY_OFFSET;
-            decoy[j] = DECOY_OFFSET;
-            decoy
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(decoys.len(), DECOYS);
     let tx = db.begin_or_panic();
-    let insert = |id: i64, vector: Vec<f32>| {
+    for id in 0..BACKGROUND {
         db.execute_in_tx(
             tx,
             "INSERT INTO near_items (id, embedding) VALUES ($id, $embedding)",
             &params([
                 ("id", Value::Int64(id)),
-                ("embedding", Value::Vector(vector)),
+                ("embedding", Value::Vector(unit_vector(id as u64, AXES))),
             ]),
         )
-        .expect("stage one row");
-    };
-    for id in 0..BACKGROUND {
-        insert(id, unit_vector(id as u64, AXES));
+        .expect("stage one background row");
     }
-    insert(NEAREST_ID, nearest.clone());
-    for (offset, decoy) in decoys.iter().enumerate() {
-        insert(FIRST_DECOY_ID + offset as i64, decoy.clone());
+    for (id, vector) in rows {
+        db.execute_in_tx(
+            tx,
+            "INSERT INTO near_items (id, embedding) VALUES ($id, $embedding)",
+            &params([
+                ("id", Value::Int64(*id)),
+                ("embedding", Value::Vector(vector.clone())),
+            ]),
+        )
+        .expect("stage one fixture row");
     }
     db.commit(tx).expect("commit the fixture");
-    drive_until_serving(&db);
+    {
+        let _pinned = super::support::plant_calibration_setting(
+            &db,
+            "near_items",
+            "embedding",
+            &[],
+            PINNED_PROBES,
+            PINNED_FACTOR,
+        );
+        drive_until_serving(&db);
+    }
+    db
+}
 
-    // The fixture's own premise, at full precision: the true nearest is the
-    // single nearest row, and the decoys are the next 99.
+fn codes(db: &Database, vector: &[f32]) -> Vec<i32> {
+    super::support::quantized_codes(db, "near_items", "embedding", &[], vector)
+}
+
+#[test]
+fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
+    let root = tempfile::tempdir().expect("temporary store directory");
+
+    // Probe store: the same background and the query's own direction, to read
+    // the production codec's steps over the fixture's real value range.
+    let probe = near_store(&root.path().join("probe.db"), &[(NEAREST_ID, axis_query())]);
+    let steps = super::support::quantizer_steps(&probe, "near_items", "embedding", &[]);
+    assert_eq!(steps.len(), AXES, "the codec reports a step per dimension");
+    assert!(
+        steps.iter().all(|step| *step > 0.0),
+        "every step is positive: {steps:?}"
+    );
+    let query_codes = codes(&probe, &axis_query());
+    // For each off-query axis, the signed offset that keeps the query's code
+    // (decoys) and the one that moves it (the true nearest), checked against
+    // the codec itself rather than assumed from the step alone.
+    let keeps = |axis: usize| {
+        [1.0_f32, -1.0].into_iter().find_map(|sign| {
+            let mut vector = axis_query();
+            vector[axis] = sign * DECOY_FRACTION * steps[axis];
+            (codes(&probe, &vector) == query_codes).then_some(vector[axis])
+        })
+    };
+    let moves = |axis: usize| {
+        [1.0_f32, -1.0].into_iter().find_map(|sign| {
+            let mut vector = axis_query();
+            vector[axis] = sign * NEAREST_FRACTION * steps[axis];
+            (codes(&probe, &vector) != query_codes).then_some(vector[axis])
+        })
+    };
+    let nearest_axis = (1..AXES)
+        .find(|axis| moves(*axis).is_some())
+        .expect("some axis moves the query's code one step at the nearest's offset");
+    let decoy_offsets = (1..AXES)
+        .filter(|axis| *axis != nearest_axis)
+        .filter_map(|axis| keeps(axis).map(|offset| (axis, offset)))
+        .collect::<Vec<_>>();
+    assert!(
+        decoy_offsets.len() >= DECOY_AXES + 3,
+        "enough axes keep the query's code at the decoy offset for 99 distinct decoys: \
+         {decoy_offsets:?}"
+    );
+    probe.close().expect("close the probe store");
+
+    let mut nearest = axis_query();
+    nearest[nearest_axis] = moves(nearest_axis).unwrap_or(NEAREST_FRACTION * steps[nearest_axis]);
+    // Distinct decoys: the first 99 subsets of DECOY_AXES code-keeping axes.
+    let mut decoys = Vec::with_capacity(DECOYS);
+    let mut chosen = (0..DECOY_AXES).collect::<Vec<_>>();
+    while decoys.len() < DECOYS {
+        let mut decoy = axis_query();
+        for index in &chosen {
+            let (axis, offset) = decoy_offsets[*index];
+            decoy[axis] = offset;
+        }
+        decoys.push(decoy);
+        // Next combination in lexicographic order.
+        let Some(position) = (0..DECOY_AXES)
+            .rev()
+            .find(|position| chosen[*position] < decoy_offsets.len() - DECOY_AXES + position)
+        else {
+            break;
+        };
+        chosen[position] += 1;
+        for later in position + 1..DECOY_AXES {
+            chosen[later] = chosen[later - 1] + 1;
+        }
+    }
+    assert_eq!(decoys.len(), DECOYS, "enough distinct decoys");
+    let mut rows = vec![(NEAREST_ID, nearest.clone())];
+    rows.extend(
+        decoys
+            .iter()
+            .enumerate()
+            .map(|(i, decoy)| (FIRST_DECOY_ID + i as i64, decoy.clone())),
+    );
+    let db = near_store(&root.path().join("distinguishing.db"), &rows);
+
+    // Preconditions against the store that is judged.
+    assert_eq!(
+        super::support::quantizer_steps(&db, "near_items", "embedding", &[]),
+        steps,
+        "the judged store's codec has the probe store's steps"
+    );
+    let query_codes = codes(&db, &axis_query());
+    assert_ne!(
+        codes(&db, &nearest),
+        query_codes,
+        "the true nearest's code moved one step"
+    );
+    for decoy in &decoys {
+        assert_eq!(
+            codes(&db, decoy),
+            query_codes,
+            "every decoy keeps the query's code"
+        );
+    }
     let exact = |limit: usize| {
         int_ids(
             &db.execute(
@@ -353,7 +456,7 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
     assert_eq!(
         exact(1),
         vec![NEAREST_ID],
-        "the true nearest is nearest at full precision"
+        "at full precision the true nearest is nearest"
     );
     let top = exact(DECOYS + 1).into_iter().collect::<BTreeSet<_>>();
     assert!(
@@ -361,9 +464,12 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
             && (0..DECOYS as i64).all(|offset| top.contains(&(FIRST_DECOY_ID + offset))),
         "the exact top 100 is the true nearest and the 99 decoys"
     );
-
     let receipt = calibration_receipt(&db, "near_items", "embedding", &[])
         .expect("the serving generation has a calibration receipt");
+    assert_eq!(
+        receipt.refine_factor, PINNED_FACTOR,
+        "the pinned factor serves: {receipt:?}"
+    );
     let at = |depth: u32| {
         *receipt
             .depths
@@ -372,22 +478,15 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
             .unwrap_or_else(|| panic!("depth {depth} is calibrated: {receipt:?}"))
     };
     let (one, hundred) = (at(1), at(100));
-    assert!(
-        one.effective_candidates >= 1 && one.effective_candidates <= one.shortlist,
-        "depth 1 persists the candidates its own run rescored: {one:?}"
-    );
-    assert!(
-        hundred.effective_candidates >= 100,
-        "depth 100 persists the candidates its own run rescored: {hundred:?}"
-    );
     assert_eq!(
-        (hundred.queries_below, hundred.qualified),
-        (0, true),
-        "the depth-100 run finds the whole exact top 100 and qualifies: {receipt:?}"
+        one.shortlist, 2,
+        "depth 1 rescores its own ceil(1 x 2) candidates"
     );
-
-    // The fixture separates the depths in the generation's own quantized
-    // order: the true nearest is past depth 1's candidates, within depth 100's.
+    assert!(
+        (1..=2).contains(&one.effective_candidates),
+        "depth 1 persists the candidates it rescored: {one:?}"
+    );
+    assert!(hundred.effective_candidates >= 100, "{hundred:?}");
     let order = super::support::quantized_order(&db, "near_items", "embedding", &[], &axis_query());
     let rank = order
         .iter()
@@ -395,19 +494,56 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
         .expect("the true nearest has a quantized score") as u64;
     assert!(
         rank >= one.effective_candidates && rank < hundred.effective_candidates,
-        "fixture: the true nearest is quantized-rank {rank}, outside depth 1's {} candidates and \
-         inside depth 100's {}",
-        one.effective_candidates,
-        hundred.effective_candidates
+        "precondition: the true nearest is quantized-rank {rank}, outside depth 1's candidates \
+         and inside depth 100's ({one:?}, {hundred:?})"
     );
 
+    // Both outcomes, observed directly at the pinned point. The depth-1 run
+    // with its own shortlist misses the true nearest, while the first row of
+    // the depth-100 answer is the true nearest: prefix inference would call
+    // depth 1 covered.
+    let indexed = |limit: usize| {
+        let (result, work) = observe_search(&db, || {
+            db.execute(
+                &format!(
+                    "SELECT id FROM near_items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT {limit}"
+                ),
+                &params([("query", Value::Vector(axis_query()))]),
+            )
+            .unwrap()
+        });
+        (int_ids(&result), work)
+    };
+    let (depth_one, depth_one_work) = indexed(1);
+    assert_ne!(
+        depth_one,
+        vec![NEAREST_ID],
+        "the depth-1 run misses under its own shortlist"
+    );
+    let (depth_hundred, _) = indexed(100);
+    assert_eq!(
+        depth_hundred.first(),
+        Some(&NEAREST_ID),
+        "the depth-100 answer's first row is the true nearest, which a prefix reading would credit to depth 1"
+    );
+
+    // The per-depth verdict: depth 1 uncovered, depth 100 qualified.
+    assert_eq!(
+        (hundred.queries_below, hundred.qualified),
+        (0, true),
+        "{receipt:?}"
+    );
     assert_eq!(
         (one.queries_below, one.qualified),
         (1, false),
-        "the depth-1 run misses the true nearest under its own shortlist, though the top of the \
-         depth-100 answer is that row: {receipt:?}"
+        "the per-depth calibration reports depth 1 uncovered, not the prefix's covered: {receipt:?}"
     );
-    let (auto_ids, auto) = observe_search(&db, || {
+    assert_eq!(
+        depth_one_work.objective_status,
+        Some(ObjectiveStatus::Unqualified),
+        "explicit INDEXED at the uncovered depth 1 is unqualified: {depth_one_work:?}"
+    );
+    let (auto_result, auto) = observe_search(&db, || {
         db.execute(
             "SELECT id FROM near_items ORDER BY embedding <=> $query USE VECTOR AUTO LIMIT 1",
             &params([("query", Value::Vector(axis_query()))]),
@@ -419,17 +555,5 @@ fn a_depth_one_run_misses_what_a_depth_one_hundred_prefix_would_find() {
         Some(SearchRoute::Exact),
         "depth 1 is uncovered: AUTO takes EXACT"
     );
-    assert_eq!(int_ids(&auto_ids), vec![NEAREST_ID]);
-    let (_, indexed) = observe_search(&db, || {
-        db.execute(
-            "SELECT id FROM near_items ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 1",
-            &params([("query", Value::Vector(axis_query()))]),
-        )
-        .unwrap()
-    });
-    assert_eq!(
-        indexed.objective_status,
-        Some(ObjectiveStatus::Unqualified),
-        "explicit INDEXED at the uncovered depth 1 is unqualified: {indexed:?}"
-    );
+    assert_eq!(int_ids(&auto_result), vec![NEAREST_ID]);
 }
