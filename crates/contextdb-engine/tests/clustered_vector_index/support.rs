@@ -754,6 +754,10 @@ pub fn requalification_pending(
 /// `answer(query, depth, exact)` returns. `exact` holds the exact top-`depth`
 /// canonical row identities. It is called once for each (sample query,
 /// calibrated depth) the calibration actually runs.
+/// Supplies the answer scored for one (sample query, calibrated depth) from
+/// that depth's exact ranking.
+pub type CalibrationAnswer = Box<dyn Fn(usize, u32, &[u64]) -> Vec<u64> + Send + Sync>;
+
 pub struct CalibrationAnswersRewritten {
     _private: (),
 }
@@ -763,7 +767,7 @@ pub fn rewrite_next_calibration_answers(
     _table: &str,
     _column: &str,
     _context: &[Value],
-    _answer: Box<dyn Fn(usize, u32, &[u64]) -> Vec<u64> + Send + Sync>,
+    _answer: CalibrationAnswer,
 ) -> CalibrationAnswersRewritten {
     unimplemented!("{UNBOUND}: rewriting calibration answers")
 }
@@ -1003,4 +1007,22 @@ pub fn list_pages(
     _list: u64,
 ) -> u64 {
     unimplemented!("{UNBOUND}: a list's page count")
+}
+
+/// The training policy one Context's serving generation was built under, as
+/// inspection reports it: the resolved TRAINING_ITERATIONS and the resolved
+/// TRAINING_SAMPLES cap (the declared value or the engine default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InspectedTraining {
+    pub iterations: u64,
+    pub sample_cap: u64,
+}
+
+pub fn inspected_training(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> InspectedTraining {
+    unimplemented!("{UNBOUND}: the inspected training policy")
 }

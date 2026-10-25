@@ -1,14 +1,16 @@
 //! Rebuilding a clustered generation from the same rows under one declared
-//! TRAINING_SEED gives the same index: the same codec steps, the same build
-//! work and the same answers, including under the seed zero. A build's work
-//! is deterministic for a fixed population, and bounded by its own declared
-//! numbers: training never does more distance work than its iterations times
-//! its reservoir times its lists, and assignment never more than its rows
-//! times its lists.
+//! TRAINING_SEED gives the same index: the same codebook, codec steps, build
+//! work and answers, including under the seed zero; and the declared seed is
+//! honoured, since another seed over the same rows trains a different
+//! codebook. A build's work is deterministic for a fixed population, and
+//! bounded by the training policy inspection reports, not by numbers the
+//! build reports about itself: training never does more distance work than
+//! TRAINING_ITERATIONS x min(N, TRAINING_SAMPLES) x lists, and assignment
+//! never more than N x lists.
 
 use super::support::{
-    BuildWork, build_work, declare_training_seed, drive_until_serving, empty, int_ids,
-    observe_search, open_caller_driven, params, quantizer_steps, serving, unit_vector,
+    BuildWork, build_work, declare_training_seed, drive_until_serving, empty, inspected_training,
+    int_ids, observe_search, open_caller_driven, params, quantizer_steps, serving, unit_vector,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -70,14 +72,23 @@ fn work(db: &Database) -> BuildWork {
 #[test]
 fn rebuilding_from_the_same_rows_under_one_training_seed_gives_the_same_index_and_answers() {
     let root = tempfile::tempdir().expect("temporary store directory");
+    let mut codebooks = Vec::new();
     for seed in [0_u64, 7] {
         let first = built(&root.path().join(format!("first-{seed}.db")), 1_500, seed);
         let second = built(&root.path().join(format!("second-{seed}.db")), 1_500, seed);
+        let (first_serving, second_serving) = (
+            serving(&first, "seeded_items", "embedding", &[]).expect("the first build serves"),
+            serving(&second, "seeded_items", "embedding", &[]).expect("the second build serves"),
+        );
         assert_eq!(
-            serving(&first, "seeded_items", "embedding", &[]).map(|serving| serving.lists),
-            serving(&second, "seeded_items", "embedding", &[]).map(|serving| serving.lists),
+            first_serving.lists, second_serving.lists,
             "seed {seed}: the same list count"
         );
+        assert_eq!(
+            first_serving.codebook, second_serving.codebook,
+            "seed {seed}: the same trained codebook"
+        );
+        codebooks.push(first_serving.codebook);
         assert_eq!(
             quantizer_steps(&first, "seeded_items", "embedding", &[]),
             quantizer_steps(&second, "seeded_items", "embedding", &[]),
@@ -94,6 +105,10 @@ fn rebuilding_from_the_same_rows_under_one_training_seed_gives_the_same_index_an
             "seed {seed}: the same answers to every query"
         );
     }
+    assert_ne!(
+        codebooks[0], codebooks[1],
+        "the declared seed is honoured: seeds 0 and 7 over the same rows train different codebooks"
+    );
 }
 
 #[test]
@@ -112,26 +127,36 @@ fn a_build_does_deterministic_work_bounded_by_its_declared_numbers() {
             measured.assigned_rows, rows as u64,
             "{rows} rows: every row is assigned"
         );
+        // The bounds come from the policy inspection reports and the serving
+        // generation's list count, never from the numbers the build reports.
+        let policy = inspected_training(&first, "seeded_items", "embedding", &[]);
+        let lists = serving(&first, "seeded_items", "embedding", &[])
+            .expect("the build serves")
+            .lists;
+        let samples = (rows as u64).min(policy.sample_cap);
         assert!(
-            measured.lists >= 1 && measured.training_iterations >= 1,
-            "{rows} rows: {measured:?}"
+            policy.iterations >= 1 && samples >= 1 && lists >= 1,
+            "{rows} rows: {policy:?}"
         );
-        assert!(
-            measured.training_samples >= 1 && measured.training_samples <= rows as u64,
-            "{rows} rows: the reservoir is drawn from the population: {measured:?}"
+        assert_eq!(
+            (
+                measured.training_iterations,
+                measured.training_samples,
+                measured.lists
+            ),
+            (policy.iterations, samples, lists),
+            "{rows} rows: the build ran the inspected policy: {measured:?}, {policy:?}"
         );
         assert!(
             measured.training_distance_evaluations > 0
-                && measured.training_distance_evaluations
-                    <= measured.training_iterations * measured.training_samples * measured.lists,
-            "{rows} rows: training does no more distance work than iterations x reservoir x lists: \
-             {measured:?}"
+                && measured.training_distance_evaluations <= policy.iterations * samples * lists,
+            "{rows} rows: training does no more distance work than TRAINING_ITERATIONS x \
+             min(N, TRAINING_SAMPLES) x lists: {measured:?}, {policy:?}"
         );
         assert!(
             measured.assignment_distance_evaluations > 0
-                && measured.assignment_distance_evaluations
-                    <= measured.assigned_rows * measured.lists,
-            "{rows} rows: assignment does no more distance work than rows x lists: {measured:?}"
+                && measured.assignment_distance_evaluations <= rows as u64 * lists,
+            "{rows} rows: assignment does no more distance work than N x lists: {measured:?}"
         );
     }
 }
