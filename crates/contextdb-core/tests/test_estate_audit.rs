@@ -722,7 +722,8 @@ const DEFAULT_TIER_TEST_RATCHET: &[(&str, usize, &str)] = &[
     // diagnosis and paid storage through final release (3).
     // Inventory (+1): historical vector public queries reject damaged selected-root
     // companions and global controls while retained healthy roots still answer.
-    ("contextdb-engine", 4959, RSN_TEST_COUNT),
+    // Arriving readers wait for an opening writer; a serving owner answers route selection.
+    ("contextdb-engine", 4962, RSN_TEST_COUNT),
     //  - Inventory (+6): an oversized pending unit pushes from a reopened source whose read
     //    limit is smaller than the unit, the hub refuses a unit its writer can never fit before
     //    it transfers, a transiently refused unit stays pending and lands on retry, and a second

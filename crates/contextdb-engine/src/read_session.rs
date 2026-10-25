@@ -339,7 +339,7 @@ mod route_observation {
         BeforeDirectBackendOpen {
             attempt: u64,
         },
-        /// Emitted by an owner-only selection that found a live claim on
+        /// Emitted by a route selection that found a live claim on
         /// this store whose holder has not published a serving decision
         /// yet, immediately before the caller waits for that decision
         /// inside its own declared `routing_retry_ms`. `attempt` is the
@@ -1322,15 +1322,9 @@ fn claim_window_budget(timeouts: ReadClientTimeouts) -> u64 {
     timeouts.routing_retry_ms
 }
 
-/// Try one route, and — for a caller that asked for the owner alone — wait out
-/// a writer that is holding the store with its decision unpublished.
-///
-/// A store nobody owns still answers owner-absent here, immediately. What
-/// changes is a store somebody DOES own: a claim that has said nothing yet is
-/// re-observed once, through the caller's own declared budget, and the answer
-/// is the writer's own — or, if the budget runs out with the claim still held,
-/// the not-serving answer a live holder deserves. Never owner-absent, because
-/// that answer is a consumer's licence to take a store this one is holding.
+/// Select an already-serving owner first. A verified opening claim settles
+/// through its actual publication event within the caller's existing routing
+/// allowance, including when the companion still names the previous writer.
 #[allow(clippy::too_many_arguments)]
 #[expect(
     clippy::result_large_err,
@@ -1346,13 +1340,7 @@ fn attempt_route(
     mismatch: Option<OwnerHandshakeMismatchForTest>,
     observe: &dyn Fn(ReadSessionEvent),
 ) -> std::result::Result<SelectedRoute, RouteOpenRefusal> {
-    // The holder has finished all writes and reclamation before publishing
-    // this state. Its trusted companion record and live lock jointly attest
-    // that a direct snapshot is safe even while accepted channel reads drain.
-    if requirement == RouteRequirement::OwnerOrFile && owner_is_quiescent(path) {
-        return open_direct_route(path, options, runtime_dir, resources, attempt, observe);
-    }
-    let mut waited = false;
+    let mut claim_wait: Option<(Arc<dyn contextdb_core::read_contract::DeadlineClock>, u64)> = None;
     loop {
         let refusal = match attempt_route_once(
             path,
@@ -1367,7 +1355,13 @@ fn attempt_route(
             Ok(selected) => return Ok(selected),
             Err(refusal) => refusal,
         };
-        if refusal.failure != ReadRouteOpenFailure::OwnerRequired {
+        let opening_transition = requirement == RouteRequirement::OwnerOrFile
+            && (refusal.failure == ReadRouteOpenFailure::WriterBecameOwner
+                || matches!(&refusal.error, Error::ReadFailure(failure)
+                    if matches!(failure.kind(),
+                        contextdb_core::read_contract::ReadFailureKind::OwnerNotServing
+                        | contextdb_core::read_contract::ReadFailureKind::OwnerNotRunning)));
+        if refusal.failure != ReadRouteOpenFailure::OwnerRequired && !opening_transition {
             return Err(refusal);
         }
         // Nothing in the record named an owner that could be asked. Whether
@@ -1376,19 +1370,16 @@ fn attempt_route(
         let Some(claim) = crate::persistence::observe_unsettled_claim(path) else {
             return Err(refusal);
         };
-        if waited {
-            return Err(RouteOpenRefusal {
-                failure: ReadRouteOpenFailure::OwnerHeldWithoutDecision,
-                error: Error::ReadFailure(owner_holding_without_a_decision()),
-            });
-        }
-        waited = true;
         observe(ReadSessionEvent::ClaimWindowWait { attempt });
-        match crate::persistence::wait_for_claim_settlement(
-            claim,
-            claim_window_budget(options.timeouts),
-            claim_window_clock().as_ref(),
-        ) {
+        let (clock, deadline_ms) = claim_wait.get_or_insert_with(|| {
+            let clock = claim_window_clock();
+            let deadline_ms = clock
+                .now_ms()
+                .saturating_add(claim_window_budget(options.timeouts));
+            (clock, deadline_ms)
+        });
+        let remaining_ms = deadline_ms.saturating_sub(clock.now_ms());
+        match crate::persistence::wait_for_claim_settlement(claim, remaining_ms, clock.as_ref()) {
             crate::persistence::ClaimSettlement::Settled => continue,
             crate::persistence::ClaimSettlement::StillHeld => {
                 return Err(RouteOpenRefusal {
@@ -1602,10 +1593,9 @@ fn attempt_route_once(
                             });
                         }
                         // This is the placeholder a writer publishes while
-                        // its claim window is still open. The owner-only door
-                        // below re-observes that window through the caller's
-                        // declared budget; an ordinary read retains its
-                        // existing direct-lock race path.
+                        // its claim window is still open. Route selection
+                        // settles the verified claim through this caller's
+                        // existing allowance before selecting its route.
                         OwnerServingState::NotApplicable => {}
                     }
                 }
