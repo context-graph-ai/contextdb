@@ -1,6 +1,4 @@
-//! Test support for observing a cursor continued into the file after its
-//! owner exits. Bound to the engine once the engine offers the observation it
-//! names, observing the actual admitted limits through the live cursor.
+//! Observe the admitted limits of the file reader behind a continued cursor.
 
 use contextdb_core::read_contract::ReadLimits;
 use contextdb_engine::ReadCursor;

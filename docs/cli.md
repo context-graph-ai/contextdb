@@ -281,19 +281,29 @@ document whose detail names `result_bytes`, `required_bytes`, and `required_sett
 `effective result_bytes >= <required_bytes>`. A single `.tables`/`.events status` item that
 cannot fit even an empty page refuses the same way — never a partial or oversized page. Both
 routes have identical shapes, continuation mechanics, and refusal fields. Consistency across
-pages differs by route: reading an idle file, your whole session is one fixed snapshot, so pages
-are always mutually consistent; reading through a live owner, each page reads current committed
+pages differs by route: reading an idle file, metadata pages use the selected committed snapshot and
+are mutually consistent while that committed file is unchanged; reading through a live owner, each page reads current committed
 state in stable item order — an item never appears on two pages, an item that existed unchanged
 throughout is never skipped, and an item created or dropped between pages may or may not appear
 (as psql's catalog listings behave under concurrent DDL).
 <!-- enforced by: read_cli_journeys_metadata::tables_under_json_is_a_namespaced_page_document, read_cli_journeys_metadata::events_status_pages_under_its_own_namespaced_key, read_cli_journeys_metadata::tables_resumes_through_its_own_continuation_until_exhausted, read_cli_journeys_metadata::a_human_metadata_page_prints_the_exact_follow_up_command, read_cli_journeys_metadata::a_continuation_is_refused_by_a_command_that_did_not_issue_it, read_cli_journeys_metadata::a_complete_metadata_response_that_does_not_fit_refuses_with_the_setting_that_would -->
+
+A read session spans writer reopens within the same store incarnation. New operations
+follow the current writer. If an operation selects the file while no writer is serving,
+later operations re-select when a writer appears or its published run changes; the
+reported file snapshot time advances when a fresh file image is selected. Unchanged
+idle files keep their selected image. A cursor already in progress keeps its captured
+snapshot and continues that same read, independently of later session route changes.
 
 ### Declared limits
 
 Every read threshold is declared configuration. A direct reader spends its own process resources
 and uses its requested values; on the owner route the effective value is, field by field, the
 stricter of your request and the owner's advertised maximum — you can lower owner policy, never
-raise it. <!-- enforced by: read_cli_journeys_invocation::a_valid_lowered_configuration_is_accepted, read_cli_journeys_live_owner::the_owners_ceiling_applies_and_a_caller_cannot_raise_it --> The writer/server side declares its policy
+raise it. Once that owner has exited and its cursor continues through a direct file
+reader, MEMORY uses the reader session's own declared limit, capped by its explicit
+memory limit and less the resources it already retains. Every other negotiated cursor
+limit stays in force. <!-- enforced by: read_cli_journeys_invocation::a_valid_lowered_configuration_is_accepted, read_cli_journeys_live_owner::the_owners_ceiling_applies_and_a_caller_cannot_raise_it --> The writer/server side declares its policy
 with the mirrored `--owner-read-*` flags plus `--owner-read-concurrency` (default 4),
 `--owner-read-request-ms` (10,000), `--owner-read-shutdown-drain-ms` (10,000),
 `--no-owner-reads`, and `--owner-read-runtime-dir <absolute-path>`.

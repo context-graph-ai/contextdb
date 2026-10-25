@@ -288,3 +288,6 @@ mod a_census_sample_holds_off_maintenance_planted_inside_its_collection;
 
 #[path = "engine_seams/reader_peak_covers_the_complete_query.rs"]
 mod reader_peak_covers_the_complete_query;
+
+#[path = "engine_seams/a_captured_file_root_survives_partition_retirement.rs"]
+mod a_captured_file_root_survives_partition_retirement;

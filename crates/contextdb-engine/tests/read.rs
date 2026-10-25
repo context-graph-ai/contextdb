@@ -211,3 +211,6 @@ mod read_cache_share_inspection;
 #[cfg(target_os = "linux")]
 #[path = "read/a_reselected_reader_keeps_its_deadline_driver.rs"]
 mod a_reselected_reader_keeps_its_deadline_driver;
+
+#[path = "read/a_file_session_observes_a_writer_that_already_closed.rs"]
+mod a_file_session_observes_a_writer_that_already_closed;

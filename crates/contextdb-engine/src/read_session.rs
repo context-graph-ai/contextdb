@@ -2113,6 +2113,9 @@ pub struct ReadSession {
 }
 
 struct SelectedSessionState {
+    /// Sampled before opening a file image, so a writer completing between
+    /// operations cannot leave the session on its predecessor forever.
+    file_writer_run: Option<contextdb_core::read_contract::WriterRunNumber>,
     state: Arc<ReadSessionState>,
     snapshot_at: Option<contextdb_core::Wallclock>,
 }
@@ -2294,9 +2297,9 @@ impl ReadSession {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     fn after_writer_turnover(&self, cancellation: &OwnerReadCancellation) -> Result<()> {
-        let previous = self.selected_state();
-        let ReadSessionState::OwnerChannel(owner) = previous.as_ref() else {
-            return Ok(());
+        let (previous, file_writer_run) = {
+            let selected = self.state.read().expect("selected read route");
+            (Arc::clone(&selected.state), selected.file_writer_run)
         };
         if cancellation.is_cancelled() {
             return Err(Error::ReadCancelled);
@@ -2310,29 +2313,68 @@ impl ReadSession {
                 .expect("owner mismatch has no detail"),
             )
         };
-        if let Some(observed) = crate::persistence::observed_writer_state(&owner.path) {
-            if observed.identity != owner.identity {
-                return Err(mismatch());
+        let (path, identity, runtime_dir, observed, memory) = match previous.as_ref() {
+            ReadSessionState::LiveDatabase(_) => return Ok(()),
+            ReadSessionState::OwnerChannel(owner) => {
+                let observed = crate::persistence::observed_writer_state(&owner.path);
+                if let Some(observed) = &observed {
+                    if observed.identity != owner.identity {
+                        return Err(mismatch());
+                    }
+                    let draining = observed.status.state
+                        == contextdb_core::read_contract::OwnerServingState::NotServing
+                        && observed.status.reason
+                            == Some(
+                                contextdb_core::read_contract::OwnerServingReason::ShutdownDraining,
+                            );
+                    if observed.run == owner.writer_run && observed.held && !draining {
+                        return Ok(());
+                    }
+                }
+                (
+                    owner.path.as_path(),
+                    Some(owner.identity),
+                    Some(owner.runtime_dir.as_path()),
+                    observed,
+                    owner
+                        .client
+                        .lock()
+                        .expect("owner client")
+                        .original_connection_owner(),
+                )
             }
-            let draining = observed.status.state
-                == contextdb_core::read_contract::OwnerServingState::NotServing
-                && observed.status.reason
-                    == Some(contextdb_core::read_contract::OwnerServingReason::ShutdownDraining);
-            if observed.run == owner.writer_run && observed.held && !draining {
-                return Ok(());
+            ReadSessionState::DirectFile(reader) => {
+                let path = reader.database_path();
+                let identity = reader.database_identity();
+                let observed = crate::persistence::observed_writer_state(path);
+                if let Some(observed) = &observed {
+                    if Some(observed.identity) != identity {
+                        return Err(mismatch());
+                    }
+                    if !observed.held && Some(observed.run) == file_writer_run {
+                        return Ok(());
+                    }
+                } else if crate::persistence::observe_unsettled_claim(path).is_none() {
+                    // An unchanged idle image needs no new backend. A verified
+                    // opening claim instead enters the selector's bounded wait.
+                    return Ok(());
+                }
+                (
+                    path,
+                    identity,
+                    self.runtime_dir.as_deref(),
+                    observed,
+                    reader.expiry_memory_owner(),
+                )
             }
-        }
+        };
         let clock = self.session_clock();
         let started_ms = clock.now_ms();
         let handover = RouteHandover {
             deadline_ms: started_ms.saturating_add(self.options.timeouts.routing_retry_ms),
             clock: Arc::clone(&clock),
             cancellation,
-            owner: owner
-                .client
-                .lock()
-                .expect("owner client")
-                .original_connection_owner(),
+            owner: memory,
         };
         let observe = |event| {
             #[cfg(any(test, feature = "test-seams"))]
@@ -2343,9 +2385,9 @@ impl ReadSession {
             let _ = event;
         };
         let selected = select_route_with_ownership_retry(
-            &owner.path,
+            path,
             &self.options(),
-            Some(&owner.runtime_dir),
+            runtime_dir,
             self.requirement,
             &self.resources,
             None,
@@ -2357,13 +2399,13 @@ impl ReadSession {
         }
         let (state, snapshot_at) = match selected {
             SelectedRoute::Owner(selected) => {
-                if selected.identity != owner.identity {
+                if Some(selected.identity) != identity {
                     return Err(mismatch());
                 }
                 (ReadSessionState::OwnerChannel(selected), None)
             }
             SelectedRoute::File(reader) => {
-                if reader.database_identity() != Some(owner.identity) {
+                if reader.database_identity() != identity {
                     return Err(mismatch());
                 }
                 (
@@ -2375,11 +2417,11 @@ impl ReadSession {
         let route = state.route();
         let installed = {
             let mut selected = self.state.write().expect("selected read route");
-            // A concurrent re-selection must never overwrite a newer state.
             if Arc::ptr_eq(&selected.state, &previous) {
                 *selected = SelectedSessionState {
                     state: Arc::new(state),
                     snapshot_at,
+                    file_writer_run: observed.map(|writer| writer.run),
                 };
                 true
             } else {
@@ -3003,6 +3045,8 @@ impl ReadSession {
         // Loading the committed image happens inside route selection, so the
         // observer is in force for the whole of it: a caller opening a large
         // store hears about the load rather than waiting in silence.
+        let file_writer_run =
+            crate::persistence::observed_writer_state(&canonical_path).map(|writer| writer.run);
         let selected = with_progress_observer(progress.as_ref(), || {
             select_route_with_ownership_retry(
                 &canonical_path,
@@ -3037,6 +3081,7 @@ impl ReadSession {
             state: std::sync::RwLock::new(SelectedSessionState {
                 state: Arc::new(state),
                 snapshot_at,
+                file_writer_run,
             }),
             resources,
             expiry_driver: Mutex::new(None),
@@ -3063,6 +3108,7 @@ impl ReadSession {
             state: std::sync::RwLock::new(SelectedSessionState {
                 state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
                 snapshot_at: None,
+                file_writer_run: None,
             }),
             resources: Arc::new(RouteResources::default()),
             expiry_driver: Mutex::new(None),
@@ -3109,6 +3155,7 @@ impl ReadSession {
             state: std::sync::RwLock::new(SelectedSessionState {
                 state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
                 snapshot_at: None,
+                file_writer_run: None,
             }),
             resources: Arc::new(RouteResources::default()),
             expiry_driver: Mutex::new(None),
@@ -3153,6 +3200,7 @@ impl ReadSession {
             state: std::sync::RwLock::new(SelectedSessionState {
                 state: Arc::new(ReadSessionState::LiveDatabase(Arc::new(database))),
                 snapshot_at: None,
+                file_writer_run: None,
             }),
             resources: Arc::new(RouteResources::default()),
             expiry_driver: Mutex::new(None),
@@ -3184,6 +3232,7 @@ impl ReadSession {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn charged_bytes(&self) -> Result<u64> {
+        self.after_writer_turnover(&OwnerReadCancellation::new())?;
         match self.selected_state().as_ref() {
             ReadSessionState::LiveDatabase(database) => Ok(database.declared_read_charged_bytes()),
             ReadSessionState::DirectFile(reader) => Ok(reader.charged_bytes()),
@@ -3284,19 +3333,18 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<QueryResult> {
-        if matches!(
-            self.selected_state().as_ref(),
-            ReadSessionState::OwnerChannel(_)
-        ) && cancellation.is_cancelled()
+        with_progress_observer(self.progress.as_ref(), || {
+            with_route_source_counter(&self.resources, || self.after_writer_turnover(cancellation))
+        })?;
+        let selected = self.selected_state();
+        if matches!(selected.as_ref(), ReadSessionState::OwnerChannel(_))
+            && cancellation.is_cancelled()
         {
             return Err(Error::ReadCancelled);
         }
         // The keeper is outside all query allocations and survives BOTH
         // success conversion and final error conversion at this public door.
-        let query_memory = if matches!(
-            self.selected_state().as_ref(),
-            ReadSessionState::OwnerChannel(_)
-        ) {
+        let query_memory = if matches!(selected.as_ref(), ReadSessionState::OwnerChannel(_)) {
             Some(crate::local_transport::query_funding::QueryMemory::new(
                 self.options.limits.memory.min(
                     self.options
@@ -3310,7 +3358,13 @@ impl ReadSession {
         contextdb_core::find_attribution::begin(sql);
         let executed = with_progress_observer(self.progress.as_ref(), || {
             with_route_source_counter(&self.resources, || {
-                self.execute_within_route(sql, params, cancellation, query_memory.as_ref())
+                self.execute_on_selected_route(
+                    selected.as_ref(),
+                    sql,
+                    params,
+                    cancellation,
+                    query_memory.as_ref(),
+                )
             })
         });
         contextdb_core::find_attribution::finish();
@@ -3331,29 +3385,15 @@ impl ReadSession {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn execute_within_route(
-        &self,
-        sql: &str,
-        params: &HashMap<String, Value>,
-        cancellation: &OwnerReadCancellation,
-        query_memory: Option<&crate::local_transport::query_funding::QueryMemory>,
-    ) -> Result<OwnedQueryResult> {
-        self.after_writer_turnover(cancellation)?;
-        self.execute_on_selected_route(sql, params, cancellation, query_memory)
-    }
-
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     fn execute_on_selected_route(
         &self,
+        selected: &ReadSessionState,
         sql: &str,
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
         query_memory: Option<&crate::local_transport::query_funding::QueryMemory>,
     ) -> Result<OwnedQueryResult> {
-        match self.selected_state().as_ref() {
+        match selected {
             ReadSessionState::LiveDatabase(database) => {
                 let child = database.ordinary_read_child()?;
                 crate::executor::bounded::with_native_read_memory(
@@ -3943,6 +3983,7 @@ impl ReadSession {
                             Some(OwnerCursorContinuation {
                                 retained_memory: retained_memory.clone(),
                                 retained_statement_bytes: actual_statement_bytes,
+                                declared_memory: self.options.limits.memory,
                                 discarded_rows_examined: 0,
                                 failed_open_observation: None,
                                 path: owner.path.clone(),
@@ -4211,14 +4252,14 @@ impl ReadSession {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn request_owner(&self, namespace: &str, request: &[u8]) -> Result<Vec<u8>> {
+        self.after_writer_turnover(&OwnerReadCancellation::new())?;
         match self.selected_state().as_ref() {
             // The embedded caller already holds the owner, so it asks the
             // handler directly rather than dialling its own channel.
             ReadSessionState::LiveDatabase(database) => {
                 database.request_owner_in_process(namespace, request)
             }
-            // There is no owner on this route and this session will not go
-            // looking for one; the caller is told so plainly.
+            // Re-selection found no current owner for this store.
             ReadSessionState::DirectFile(_) => Err(Error::ReadFailure(owner_not_running())),
             ReadSessionState::OwnerChannel(owner) => {
                 let responses = owner.ask(
@@ -5705,6 +5746,7 @@ struct OwnerCursorExecution {
 struct OwnerCursorContinuation {
     retained_memory: crate::read_image_memory::ImageMemoryHandle,
     retained_statement_bytes: usize,
+    declared_memory: u64,
     discarded_rows_examined: u64,
     failed_open_observation: Option<crate::executor::CursorObservation>,
     path: PathBuf,
@@ -5757,12 +5799,12 @@ impl OwnerCursorContinuation {
             // The cursor may have opened before the session changed its share.
             // Resolve the live declaration only when this reader is created.
             config.read_cache_share = resources.current_read_cache_share();
-            let available = usize::try_from(config.limits.memory)
+            let available = usize::try_from(self.declared_memory)
                 .unwrap_or(usize::MAX)
                 .min(config.memory_limit.unwrap_or(usize::MAX))
                 .saturating_sub(self.retained_memory.held());
             config.memory_limit = Some(config.memory_limit.unwrap_or(available).min(available));
-            config.limits.memory = config.limits.memory.min(available as u64);
+            config.limits.memory = available as u64;
             config.limits.cursor_page_rows = config
                 .limits
                 .cursor_page_rows
