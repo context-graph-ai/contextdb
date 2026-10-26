@@ -1593,7 +1593,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 type DynStore = Box<dyn WriteSetApplicator>;
-type GatedGraphNeighbor = (NodeId, EdgeType, HashMap<String, Value>, NodeId, NodeId);
 /// The visited ceiling a gated (context- or ACL-scoped) traversal keeps.
 /// The unrestricted one is `contextdb_graph::mem::MAX_VISITED`; this is the
 /// number the established gated walk refuses with.
