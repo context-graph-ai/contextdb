@@ -42,14 +42,6 @@ impl MemoryAccountant {
         }
     }
 
-    #[cfg(feature = "test-seams")]
-    fn with_budget(limit: usize) -> Self {
-        Self {
-            limit,
-            used: AtomicUsize::new(0),
-        }
-    }
-
     fn usage(&self) -> MemoryUsage {
         let used = self.used.load(Ordering::SeqCst);
         let limit = (self.limit != 0).then_some(self.limit);
