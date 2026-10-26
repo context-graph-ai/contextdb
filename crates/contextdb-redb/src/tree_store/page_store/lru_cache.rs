@@ -61,13 +61,13 @@ struct QueryPageWriter<'a, T> {
 #[cfg(feature = "contextdb-internal")]
 impl<T> Drop for QueryPageWriter<'_, T> {
     fn drop(&mut self) {
-        let current = self.arena.query_epoch.load(Ordering::Acquire);
+        let current = self.arena.query_epoch.load(Ordering::SeqCst);
         if current != self.epoch {
             self.arena
                 .query_invalid_through
                 .fetch_max(current, Ordering::AcqRel);
         }
-        self.arena.query_writers.fetch_sub(1, Ordering::AcqRel);
+        self.arena.query_writers.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -144,14 +144,14 @@ impl<T> EntryArena<T> {
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn begin_page_window(&self, limit: usize) -> u64 {
         let _begin = self.query_begin.lock().unwrap();
-        let Some(epoch) = self.query_epoch.load(Ordering::Acquire).checked_add(1) else {
+        let Some(epoch) = self.query_epoch.load(Ordering::SeqCst).checked_add(1) else {
             // Never reuse an epoch and mistake historical entries for current
             // pages. Exhaustion disables measurement without scanning the arena.
             self.query_limit.store(0, Ordering::Release);
             return 0;
         };
-        self.query_epoch.store(epoch, Ordering::Release);
-        if self.query_writers.load(Ordering::Acquire) != 0 {
+        self.query_epoch.store(epoch, Ordering::SeqCst);
+        if self.query_writers.load(Ordering::SeqCst) != 0 {
             self.query_invalid_through
                 .fetch_max(epoch, Ordering::AcqRel);
         }
@@ -170,16 +170,19 @@ impl<T> EntryArena<T> {
         reason = "The hash is reduced modulo the arena length, whose slots are u32 indexed."
     )]
     pub(crate) fn record_page(&self, epoch: u64, id: [u8; 8]) {
-        if epoch == 0 || self.query_epoch.load(Ordering::Acquire) != epoch {
+        // The epoch/reset and writer-admission handshake is sequentially
+        // consistent across both atomics. Either a reset sees an admitted
+        // writer, or that writer sees the newer epoch before changing slots.
+        if epoch == 0 || self.query_epoch.load(Ordering::SeqCst) != epoch {
             return;
         }
         let limit = self.query_limit.load(Ordering::Acquire);
         if limit == 0 || self.query_count.load(Ordering::Acquire) >= limit {
             return;
         }
-        self.query_writers.fetch_add(1, Ordering::AcqRel);
+        self.query_writers.fetch_add(1, Ordering::SeqCst);
         let _writer = QueryPageWriter { arena: self, epoch };
-        if self.query_epoch.load(Ordering::Acquire) != epoch {
+        if self.query_epoch.load(Ordering::SeqCst) != epoch {
             return;
         }
         let key = u64::from_le_bytes(id);
@@ -188,7 +191,7 @@ impl<T> EntryArena<T> {
         let modulus = self.entries.len();
         let start = (hasher.finish() % modulus as u64) as usize;
         for offset in 0..modulus {
-            if self.query_epoch.load(Ordering::Acquire) != epoch {
+            if self.query_epoch.load(Ordering::SeqCst) != epoch {
                 return;
             }
             let index = (start + offset) % modulus;
@@ -218,9 +221,9 @@ impl<T> EntryArena<T> {
     #[cfg(feature = "contextdb-internal")]
     fn page_window_is_current(&self, epoch: u64) -> bool {
         epoch != 0
-            && self.query_epoch.load(Ordering::Acquire) == epoch
+            && self.query_writers.load(Ordering::SeqCst) == 0
+            && self.query_epoch.load(Ordering::SeqCst) == epoch
             && self.query_invalid_through.load(Ordering::Acquire) < epoch
-            && self.query_writers.load(Ordering::Acquire) == 0
     }
 
     #[cfg(feature = "contextdb-internal")]
