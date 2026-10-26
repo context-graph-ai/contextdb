@@ -3,14 +3,19 @@
 //! Promise: `SET READ_CACHE_SHARE = <percent>` declares, for this session
 //! only, the percent of the reader's memory budget, after its fixed source
 //! reservations, that its page cache takes. 0 turns the file cache off for a
-//! streaming reader and 100 gives it everything after those reservations.
+//! streaming reader. A high share whose cache still leaves room for the
+//! reader's own prepaid index and decoded state is accepted; 100 asks for the
+//! whole remaining budget, which total admission refuses with the typed
+//! memory-budget refusal. A share above 100 is refused as out of range. Either
+//! refusal keeps the previous declaration, and inspection reports it.
 //! `SET READ_CACHE_SHARE = DEFAULT` returns to the cache derived from the
 //! budget. `SHOW READ_CACHE_SHARE` reports the declared value (`default` when
-//! none is declared) beside the effective cache size in bytes and as a
-//! percent. A declaration takes effect immediately, in both directions: every
-//! statement after it reads under the new share. It is not persisted and is
-//! not seen by any other session. A share above 100 is refused and leaves the
-//! previous declaration in place. Shrinking the share while a cursor is open
+//! none is declared) beside the effective cache size in bytes and as a percent
+//! (`Float64`), and the session's last refused declaration (`last_refusal`,
+//! `Null` when there has been none). A declaration takes effect immediately,
+//! in both directions: every statement after it reads under the new share. It
+//! is not persisted and is not seen by any other session. Shrinking the share
+//! while a cursor is open
 //! does not disturb the cursor: it keeps the pages it holds and finishes every
 //! row at the snapshot it opened on.
 
@@ -97,6 +102,7 @@ struct Share {
     declared: Value,
     effective_bytes: i64,
     effective_percent: f64,
+    last_refusal: Value,
 }
 
 fn show(reader: &ReadSession) -> Share {
@@ -122,14 +128,30 @@ fn show(reader: &ReadSession) -> Share {
         ref other => panic!("effective_bytes is a byte count, got {other:?}"),
     };
     let effective_percent = match row[column("effective_percent")] {
-        Value::Int64(percent) => percent as f64,
         Value::Float64(percent) => percent,
-        ref other => panic!("effective_percent is a number, got {other:?}"),
+        ref other => panic!("effective_percent is a Float64 percent, got {other:?}"),
     };
     Share {
         declared: row[column("declared")].clone(),
         effective_bytes,
         effective_percent,
+        last_refusal: row[column("last_refusal")].clone(),
+    }
+}
+
+/// A declaration the session must refuse; the refusal comes back as itself.
+fn refused(reader: &ReadSession, value: &str) -> contextdb_core::Error {
+    reader
+        .execute(&format!("SET READ_CACHE_SHARE = {value}"), &HashMap::new())
+        .map(drop)
+        .expect_err("this declaration is refused")
+}
+
+/// The text of the session's last refused declaration, as inspection reports it.
+fn last_refusal(share: &Share) -> &str {
+    match &share.last_refusal {
+        Value::Text(text) => text,
+        other => panic!("SHOW READ_CACHE_SHARE reports the last refusal as text, got {other:?}"),
     }
 }
 
@@ -176,9 +198,17 @@ fn a_declared_read_cache_share_is_inspected_as_declared_and_effective() {
     let reader = open(&path);
     let undeclared = show(&reader);
     assert_eq!(
-        (undeclared.declared, undeclared.effective_bytes),
-        (Value::Text("default".to_owned()), derived_default()),
-        "an undeclared session reports the default share and the derived cache size"
+        (
+            undeclared.declared,
+            undeclared.effective_bytes,
+            undeclared.last_refusal
+        ),
+        (
+            Value::Text("default".to_owned()),
+            derived_default(),
+            Value::Null
+        ),
+        "an undeclared session reports the default share, the derived cache size and no refusal"
     );
     set(&reader, "40").expect("a session declares a 40% read cache share");
     assert_eq!(
@@ -187,6 +217,7 @@ fn a_declared_read_cache_share_is_inspected_as_declared_and_effective() {
             declared: Value::Int64(40),
             effective_bytes: declared_bytes(40) as i64,
             effective_percent: 40.0,
+            last_refusal: Value::Null,
         },
         "a declared share is reported with the cache size it gives under this budget"
     );
@@ -223,11 +254,14 @@ fn a_read_cache_share_is_scoped_to_its_session_and_not_persisted() {
     );
 }
 
-/// The whole range 0-100 is accepted, 0 giving no file cache and 100 the
-/// whole budget after the fixed reservations; a share above 100 is refused
-/// and the session keeps what it had declared before.
+/// 0 is accepted with no file cache and a high share of 90 with its exact
+/// cache size. 100 asks for the whole budget left after the fixed reservations
+/// and is refused by total admission with the typed memory-budget refusal,
+/// because nothing would remain for the reader's prepaid index and decoded
+/// state. 101 is refused as out of range. Each refusal keeps the previous
+/// declaration, and inspection reports the refused value.
 #[test]
-fn read_cache_shares_from_0_to_100_are_accepted_and_above_100_refused() {
+fn read_cache_shares_up_to_the_budget_are_accepted_and_100_and_above_refused() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("range.db");
     seed(&path, 500);
@@ -235,21 +269,57 @@ fn read_cache_shares_from_0_to_100_are_accepted_and_above_100_refused() {
     set(&reader, "0").expect("a streaming session declares no file cache");
     let off = show(&reader);
     assert_eq!((off.declared, off.effective_bytes), (Value::Int64(0), 0));
-    set(&reader, "100").expect("a session declares its whole remaining budget");
-    let whole = show(&reader);
+    set(&reader, "90").expect("a session declares a 90% read cache share");
+    let high = show(&reader);
     assert_eq!(
-        (whole.declared, whole.effective_bytes),
-        (Value::Int64(100), declared_bytes(100) as i64)
+        (high.declared, high.effective_bytes),
+        (Value::Int64(90), declared_bytes(90) as i64),
+        "a 90% share is accepted with the cache size it gives under this budget"
     );
     set(&reader, "40").expect("a session declares a 40% read cache share");
+
+    let whole_budget = refused(&reader, "100");
     assert!(
-        set(&reader, "101").is_err(),
-        "a share above 100% is refused"
+        matches!(
+            whole_budget,
+            contextdb_core::Error::MemoryBudgetExceeded { .. }
+        ),
+        "a 100% share leaves nothing for the reader's prepaid index and decoded state, so \
+         total admission refuses it with the typed memory-budget refusal: {whole_budget:?}"
     );
+    let after_budget_refusal = show(&reader);
     assert_eq!(
-        show(&reader).declared,
+        after_budget_refusal.declared,
         Value::Int64(40),
-        "a refused declaration leaves the previous one in place"
+        "a refused 100% declaration leaves the previous one in place"
+    );
+    assert!(
+        last_refusal(&after_budget_refusal).contains("100"),
+        "inspection reports the refused 100% declaration: {:?}",
+        after_budget_refusal.last_refusal
+    );
+
+    let out_of_range = refused(&reader, "101");
+    assert!(
+        !matches!(out_of_range, contextdb_core::Error::ParseError(_)),
+        "SET READ_CACHE_SHARE = 101 is a statement the session understands and refuses, \
+         not one it cannot parse: {out_of_range:?}"
+    );
+    let message = out_of_range.to_string();
+    assert!(
+        message.contains("READ_CACHE_SHARE") && message.contains("100"),
+        "the out-of-range refusal names READ_CACHE_SHARE and its 0 to 100 range: {message}"
+    );
+    let after_range_refusal = show(&reader);
+    assert_eq!(
+        after_range_refusal.declared,
+        Value::Int64(40),
+        "a refused 101% declaration leaves the previous one in place"
+    );
+    assert!(
+        last_refusal(&after_range_refusal).contains("101"),
+        "inspection reports the refused 101% declaration: {:?}",
+        after_range_refusal.last_refusal
     );
 }
 
