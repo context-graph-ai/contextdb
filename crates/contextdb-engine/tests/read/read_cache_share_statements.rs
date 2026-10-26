@@ -14,7 +14,8 @@
 //! (`Float64`), the session's last refused declaration (`last_refusal`,
 //! `Null` when there has been none), and how much of the last statement's
 //! pages are resident in the cache (`last_query_resident_percent`, a `Float64`
-//! percent, `Null` before any statement; advisory). A declaration takes effect immediately,
+//! percent; `Null` before any statement and whenever nothing was measured,
+//! such as with no file cache; advisory). A declaration takes effect immediately,
 //! in both directions: every statement after it reads under the new share. It
 //! is not persisted and is not seen by any other session. Shrinking the share
 //! while a cursor is open
@@ -252,6 +253,37 @@ fn a_declared_read_cache_share_is_inspected_as_declared_and_effective() {
     );
 }
 
+/// The residency reported is the last data statement's. Inspecting another
+/// setting, or a statement that fails, measures nothing, so it leaves the
+/// figure from the last data statement unchanged.
+#[test]
+fn inspection_and_failed_statements_leave_the_last_query_residency_unchanged() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("residency-kept.db");
+    seed(&path, 500);
+    let reader = open(&path);
+    set(&reader, "40").expect("a session declares a 40% read cache share");
+    round(&reader, 500);
+    let measured = last_query_resident_percent(&reader);
+    let _ = reader.execute("SHOW MEMORY_LIMIT", &HashMap::new());
+    assert_eq!(
+        last_query_resident_percent(&reader),
+        measured,
+        "inspecting another setting leaves the last data statement's residency unchanged"
+    );
+    assert!(
+        reader
+            .execute("SELECT id FROM no_such_table", &HashMap::new())
+            .is_err(),
+        "a statement over a missing table fails"
+    );
+    assert_eq!(
+        last_query_resident_percent(&reader),
+        measured,
+        "a failed statement leaves the last data statement's residency unchanged"
+    );
+}
+
 /// A declaration belongs to the session that made it: another session on
 /// the same store, and a reopened session, start at the default.
 #[test]
@@ -358,6 +390,7 @@ fn a_read_cache_share_declared_mid_session_is_honoured_by_the_statements_after_i
     set(&reader, "0").expect("a streaming session declares no file cache");
     round(&reader, ROWS);
     let off = round(&reader, ROWS);
+    let off_residency = show(&reader).last_query_resident_percent;
     set(&reader, "2").expect("a session declares a 2% read cache share");
     round(&reader, ROWS);
     let small = round(&reader, ROWS);
@@ -372,6 +405,12 @@ fn a_read_cache_share_declared_mid_session_is_honoured_by_the_statements_after_i
     assert!(
         off as usize >= ROWS * PAYLOAD_BYTES,
         "with no file cache every round reads the rows from the file again (read {off})"
+    );
+    assert_eq!(
+        off_residency,
+        Value::Null,
+        "with no file cache nothing is measured, so the last statement reports no residency \
+         rather than a measured 0%"
     );
     assert!(
         small as usize >= ROWS * PAYLOAD_BYTES / 2,

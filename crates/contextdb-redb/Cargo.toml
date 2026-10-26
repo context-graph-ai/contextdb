@@ -103,6 +103,11 @@ path = "tests/growth_after_compaction_contract.rs"
 required-features = ["contextdb-internal"]
 
 [[test]]
+name = "page_window_contract"
+path = "tests/page_window_contract.rs"
+required-features = ["contextdb-internal", "test-seams"]
+
+[[test]]
 name = "scan_working_set_stays_cached"
 path = "tests/scan_working_set_stays_cached.rs"
 
