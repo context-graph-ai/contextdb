@@ -22,8 +22,8 @@ fn refusal_reason(error: &Error, path: &std::path::Path) -> String {
             reason,
         } => {
             assert_eq!(
-                named,
-                &path.display().to_string(),
+                named.to_string(),
+                path.display().to_string(),
                 "the refusal names the file it is about"
             );
             reason.to_string()
