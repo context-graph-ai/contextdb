@@ -1301,6 +1301,7 @@ pub(super) fn register_vector_layouts(
 
 // Proof-only recovery coverage retains this helper in test builds.
 #[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn supplement_loaded_vectors_from_table_rows(
     tables: &HashMap<String, Vec<VersionedRow>>,
     table_meta: &HashMap<String, TableMeta>,

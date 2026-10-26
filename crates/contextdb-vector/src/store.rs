@@ -6794,6 +6794,7 @@ impl IndexState {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn score_visible_candidate(
         &self,
         index: &VectorIndexRef,

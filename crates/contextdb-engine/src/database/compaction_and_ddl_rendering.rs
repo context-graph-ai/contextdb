@@ -1060,6 +1060,7 @@ pub(super) fn max_lsn_across_all(relational: &RelationalStore, graph: &GraphStor
 /// `filter(lsn < threshold).max_by_key(lsn).deleted_tx` semantics exactly,
 /// including its tie-break: `max_by_key` returns the LAST of several equal
 /// maxima, which is the highest-index (last-stored) equal-`lsn` entry here.
+#[cfg(test)]
 pub(super) fn resolve_tombstone(versions: &[(Lsn, TxId)], threshold: Lsn) -> Option<TxId> {
     let boundary = versions.partition_point(|(lsn, _)| *lsn < threshold);
     if boundary == 0 {

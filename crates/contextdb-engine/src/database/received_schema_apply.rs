@@ -2745,6 +2745,7 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn prepare_received_schema_stage(
         &self,
         local_lsn: Lsn,
@@ -2783,6 +2784,7 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn prepare_received_schema_stage_with_adjudication(
         &self,
         local_lsn: Lsn,
@@ -3173,6 +3175,7 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn prepare_received_schema_stage_with_delivery(
         &self,
         local_lsn: Lsn,
@@ -6023,6 +6026,7 @@ impl Database {
     /// table projections and event/trigger definitions were prepared before
     /// the matching Redb transaction started.
     #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn publish_received_schema_stage(&self, mut stage: ReceivedSchemaStage) {
         self.publish_received_schema_stage_retaining(&mut stage);
     }

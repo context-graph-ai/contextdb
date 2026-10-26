@@ -635,6 +635,7 @@ impl MaintenanceContext {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn retry_one_vector_journal_truncation(
         &self,
         persistence: &RedbPersistence,
@@ -663,6 +664,7 @@ impl MaintenanceContext {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn retry_one_vector_journal_truncation_with_source_admission(
         &self,
         persistence: &RedbPersistence,

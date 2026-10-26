@@ -961,6 +961,7 @@ impl MemoryBudget for UnlimitedMemoryBudget {
 }
 
 #[allow(dead_code)] // Preserve the no-op budget constructor for explicit fallback routes.
+#[cfg(test)]
 pub(crate) fn unlimited_memory_budget() -> Arc<dyn MemoryBudget> {
     Arc::new(UnlimitedMemoryBudget)
 }

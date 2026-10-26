@@ -10677,10 +10677,13 @@ enum RetentionPreparation {
 }
 
 /// Per-(table, row_id) tombstone lookup borrowed from the relational store.
+#[cfg(test)]
 type RowTombstoneIndex<'a> = HashMap<&'a str, HashMap<RowId, Vec<(Lsn, TxId)>>>;
 /// Per-(source, edge_type, target) tombstone lookup borrowed from the graph store.
+#[cfg(test)]
 type EdgeTombstoneIndex<'a> = HashMap<(NodeId, &'a str, NodeId), Vec<(Lsn, TxId)>>;
 /// Per-(index, row_id) tombstone lookup borrowed from the materialized vectors.
+#[cfg(test)]
 type VectorTombstoneIndex = HashMap<(VectorIndexRef, RowId), Vec<(Lsn, TxId)>>;
 
 #[cfg(test)]

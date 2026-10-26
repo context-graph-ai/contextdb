@@ -1889,6 +1889,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn refuse_unknown_reader_presence(
         &self,
         owner: &Arc<LockedWriterFile>,

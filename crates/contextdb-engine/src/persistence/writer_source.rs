@@ -1854,6 +1854,7 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn row_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1887,6 +1888,7 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn graph_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1902,6 +1904,7 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn index_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -2887,6 +2890,7 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn change_log_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -3103,6 +3107,7 @@ impl WriterReadCursor {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn next_index(
         &mut self,
         current: bool,
@@ -3113,6 +3118,7 @@ impl WriterReadCursor {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn next_index_before(
         &mut self,
         current: bool,
@@ -3216,6 +3222,7 @@ impl WriterReadCursor {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn next_edge(&mut self) -> Result<Option<WriterWindow<AdjEntry>>> {
         self.next_edge_handoff(Ok)
     }
@@ -3530,6 +3537,7 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn table_change_cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,

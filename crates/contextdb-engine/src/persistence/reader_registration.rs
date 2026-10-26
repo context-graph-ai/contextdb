@@ -519,6 +519,7 @@ impl OwnerCursorStoragePin {
 }
 
 impl OwnerCursorPinAdmissionError {
+    #[cfg(test)]
     pub(super) fn into_error(self) -> Error {
         match self {
             Self::Busy(error) | Self::Refused(error) => error,
@@ -1926,6 +1927,7 @@ impl ReadPersistenceLoad {
 
 #[allow(dead_code)]
 impl LoadReadImageError {
+    #[cfg(test)]
     pub(crate) fn kind(&self) -> LoadReadImageErrorKind {
         match self {
             Self::Funded(diagnostic) => diagnostic.kind(),

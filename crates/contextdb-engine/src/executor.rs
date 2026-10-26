@@ -17270,6 +17270,7 @@ fn resolve_in_subqueries(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg(test)]
 fn resolve_graph_filter_at_snapshot(
     db: &Database,
     expr: &Expr,

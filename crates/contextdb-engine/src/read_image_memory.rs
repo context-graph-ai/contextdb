@@ -219,6 +219,7 @@ impl ImageMemoryHandle {
     fn arc_new(image: ImageMemory) -> Self {
         Self::Arc(Arc::new(image))
     }
+    #[cfg(test)]
     fn get_mut(image: &mut Self) -> Option<&mut ImageMemory> {
         match image {
             Self::Arc(image) => Arc::get_mut(image),
@@ -319,6 +320,7 @@ impl ImageMemory {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn preparation_original(
         &self,
     ) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
@@ -604,6 +606,7 @@ impl ImageMemory {
     /// reader, and the previous call's charge is returned when the next call
     /// begins or this owner drops, so a streamed scan holds one value's
     /// decode at a time instead of every value it has already freed.
+    #[cfg(test)]
     pub(crate) fn charging_reader_per_call(
         accountant: crate::memory_accounting::AccountantHandle,
         reader_budget: impl Into<ReadMemoryOwner>,
@@ -1700,6 +1703,7 @@ impl QueryAnswerCharge {
             Self::None => None,
         }
     }
+    #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         match self {
             Self::None => 0,

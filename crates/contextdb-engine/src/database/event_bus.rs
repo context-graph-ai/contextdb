@@ -5258,6 +5258,7 @@ impl OwnedEventBusHandle {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn try_new_for_writer(
         common: Arc<EventBusState>,
         writer: &WriterBudget,
@@ -5271,6 +5272,7 @@ impl OwnedEventBusHandle {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn try_new(
         common: Arc<EventBusState>,
         original: OwnedMemoryReservation,

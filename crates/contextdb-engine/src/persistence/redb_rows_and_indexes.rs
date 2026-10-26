@@ -69,6 +69,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn dump_config_raw(&self) -> Result<Vec<(String, Vec<u8>)>> {
         self.dump_str_keyed_table_raw(CONFIG_TABLE)
     }
@@ -824,6 +825,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn checkpoint_read_source(&self) -> Result<CheckpointReadSource> {
         let _decode_scope = self.writer_decode_scope()?;
         let decode_memory = crate::read_image_memory::active_owner()?.row_owner()?;
@@ -7108,6 +7110,7 @@ impl RedbPersistence {
         self.with_db_handle(f)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_db_original_funded<T>(
         &self,
         original: &crate::memory_accounting::OwnedMemoryReservation,

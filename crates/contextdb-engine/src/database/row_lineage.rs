@@ -2866,6 +2866,7 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn drop_accepted_lineage_replays_against_generation_projection(
         &self,
         tenant_id: &TenantId,
@@ -2909,6 +2910,7 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn reject_dependency_complete_accepted_lineage_replays_against_generation_projection(
         &self,
         tenant_id: &TenantId,

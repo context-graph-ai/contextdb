@@ -3501,6 +3501,7 @@ fn node_storage_key(family: LogicalFamily, id: &[u8; 32]) -> [u8; 33] {
     stored
 }
 
+#[cfg(test)]
 fn node_hash(family: LogicalFamily, level: u32, entries: &[PageEntry]) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(b"contextdb-prolly-chunk");
@@ -4128,6 +4129,7 @@ impl ProofAdmission {
         self.accountant.is_some() || self.reader_budget.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn peak(&self) -> usize {
         self.peak.get()
     }
@@ -5544,6 +5546,7 @@ impl ProofMemory {
 
     /// A walk that admits what it holds itself, for a caller that reserved
     /// nothing up front.
+    #[cfg(test)]
     pub(super) fn admitted(
         accountant: Option<crate::memory_accounting::AccountantHandle>,
         limit: usize,
@@ -6965,6 +6968,7 @@ impl ContentIdentityReadVerifier {
         Ok(verified)
     }
 
+    #[cfg(test)]
     pub(super) fn visit_relational_index_postings<E>(
         &self,
         table: &str,

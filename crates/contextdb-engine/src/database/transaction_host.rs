@@ -176,6 +176,7 @@ impl ReceivedSchemaStageRegistration {
         stage
     }
 
+    #[cfg(test)]
     pub(super) fn leave_registered(mut self) {
         self.armed = false;
     }
@@ -1133,6 +1134,7 @@ impl Drop for PreparedMemorySwap {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg(test)]
 pub(super) fn plan_received_schema_source_order(
     local_lsn: Lsn,
     ddl: &[DdlChange],
@@ -3018,6 +3020,7 @@ impl OwnedHostAssembly {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(super) fn prepare(common: Arc<EventBusState>, writer: &WriterBudget) -> Result<Self> {
         let funder = writer.prepare_source_funder()?;
         let events = event_bus::OwnedEventBusHandle::try_new_for_writer(common, writer, &funder)?;
@@ -3513,6 +3516,7 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn try_with_commit_lock_for<F, R>(
         &self,
         duration: std::time::Duration,

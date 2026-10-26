@@ -814,6 +814,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn load_vector_partition_memberships_for(
         &self,
         index: &VectorIndexRef,
@@ -3934,6 +3935,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn vector_partition_has_uncovered_journal_records(
         &self,
         index: &VectorIndexRef,
@@ -4504,6 +4506,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn prepare_vector_partition_generation_candidate(
         &self,
         candidate: &VectorPartitionGenerationCandidate,
@@ -4801,6 +4804,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn truncate_vector_partition_journal_through_catalog(
         &self,
         expected_catalog: &VectorPartitionGenerationCatalogRecord,
@@ -4824,6 +4828,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn truncate_vector_partition_journal_through_catalog_with_checkpoint(
         &self,
         expected_catalog: &VectorPartitionGenerationCatalogRecord,

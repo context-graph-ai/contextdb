@@ -197,6 +197,7 @@ impl OriginalError {
             CompactDiagnostic::Prepared(owner) => owner.payload().is_memory_refusal(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn source_is_qualified(&self) -> bool {
         self.storage
             .as_ref()

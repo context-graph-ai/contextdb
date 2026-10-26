@@ -175,6 +175,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn owner_cursor_pin(&self) -> Result<OwnerCursorStoragePin> {
         self.owner_cursor_pin_for_admission()
             .map_err(OwnerCursorPinAdmissionError::into_error)
@@ -184,6 +185,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn owner_cursor_pin_for_admission(
         &self,
     ) -> std::result::Result<OwnerCursorStoragePin, OwnerCursorPinAdmissionError> {

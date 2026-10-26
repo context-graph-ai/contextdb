@@ -388,6 +388,7 @@ impl Database {
     /// lands in the narrow window between their own earlier `already_closed`
     /// check and this call must still surface as the typed closed-handle
     /// error, never a panic.
+    #[cfg(test)]
     pub(crate) fn try_snapshot_for_read(&self) -> Option<SnapshotId> {
         SNAPSHOT_OVERRIDE.with(|cell| {
             if let Some(snapshot) = *cell.borrow() {

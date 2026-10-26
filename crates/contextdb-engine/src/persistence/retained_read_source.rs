@@ -372,6 +372,7 @@ pub(super) fn capture_reader_snapshot_registry_under_admission_hold(
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 pub(super) fn capture_reader_snapshot_registry(
     identity: (u64, u64),
     runtime_dir: Option<&Path>,
@@ -4741,6 +4742,7 @@ impl RetainedReadSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn relational_row_by_id_lsn(
         &self,
         table: &str,
@@ -4758,6 +4760,7 @@ impl RetainedReadSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg(test)]
     pub(crate) fn relational_row_by_id_lsn_with_read_memory(
         &self,
         table: &str,
@@ -5834,6 +5837,7 @@ impl RetainedReadSource {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn bounded_relational_physical_next<E>(
         &self,
         table: &str,

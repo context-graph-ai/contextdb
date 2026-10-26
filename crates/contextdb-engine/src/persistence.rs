@@ -783,6 +783,7 @@ pub(crate) enum ReadImageCorruptionCause {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
+#[cfg(test)]
 pub(crate) enum LoadReadImageErrorKind {
     NotImplemented,
     RequiresWriter(ReadImageRequiresWriterCause),

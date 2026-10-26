@@ -266,6 +266,7 @@ pub(super) fn key_row_from_body(body: &[u8], declaration: &IndexDecl) -> Result<
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg(test)]
 pub(super) fn key_row_from_body_with(
     body: &[u8],
     declaration: &IndexDecl,
