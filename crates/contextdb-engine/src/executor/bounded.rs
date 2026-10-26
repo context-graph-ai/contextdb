@@ -20231,6 +20231,7 @@ impl CursorState {
         &mut self,
         anchor: CursorPageAnchor,
         page_base_bytes: usize,
+        decoder_bytes: usize,
     ) -> std::result::Result<(), BoundedExecutionError> {
         let continuation_now = pull_continuation_bytes(&self.root)?;
         let carried_now = self.carried_replay_bytes()?;
@@ -20247,7 +20248,11 @@ impl CursorState {
             )?
         };
         let target = checked_size_add(
-            checked_size_add(fixed, continuation_now, "cursor retained charge")?,
+            checked_size_add(
+                checked_size_add(fixed, decoder_bytes, "cursor decoder charge")?,
+                continuation_now,
+                "cursor retained charge",
+            )?,
             checked_size_add(carried_now, observed_membership, "cursor membership")?,
             "cursor retained charge",
         )?;
@@ -20267,7 +20272,10 @@ impl CursorState {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn page_anchor(&self) -> std::result::Result<CursorPageAnchor, BoundedExecutionError> {
+    fn page_anchor(
+        &self,
+        decoder_bytes: usize,
+    ) -> std::result::Result<CursorPageAnchor, BoundedExecutionError> {
         let continuation = pull_continuation_bytes(&self.root)?;
         let carried = self.carried_replay_bytes()?;
         let observed_membership = {
@@ -20282,6 +20290,11 @@ impl CursorState {
             fixed_bytes: self
                 .context
                 .held_bytes()
+                // The fetch's decoder can grow while the page is assembled.
+                // Its actual invoice is measured again at settlement, then
+                // returned only when the decoder's final holder drops.
+                .checked_sub(decoder_bytes)
+                .ok_or_else(|| bounded_size_error("cursor decoder credit"))?
                 .saturating_sub(continuation)
                 .saturating_sub(carried)
                 .saturating_sub(observed_membership),
@@ -20456,7 +20469,12 @@ impl CursorState {
         };
         // Anchor the cursor before its page scaffolding is exchanged. A
         // cancelled assembly restores all unpublished rows to the replay.
-        let mut anchor = self.page_anchor()?;
+        let decoder_bytes = || {
+            _decode
+                .as_ref()
+                .map_or(0, crate::read_image_memory::ImageMemoryScope::held_bytes)
+        };
+        let mut anchor = self.page_anchor(decoder_bytes())?;
         // This page's scaffolding replaces the last page's rather than adding
         // to it: a cursor that is handing back equally-shaped pages costs the
         // same while it builds one as it does while it holds one.
@@ -20722,7 +20740,7 @@ impl CursorState {
                 // so all of those rows stay charged.
                 self.restore_page_rows(&mut page, &mut retained)?;
                 self.held_page_base = page_base_bytes;
-                self.settle_retained_charge(anchor, page_base_bytes)?;
+                self.settle_retained_charge(anchor, page_base_bytes, decoder_bytes())?;
                 return Err(BoundedExecutionError::Cancelled);
             }
             Err(error) => return Err(error),
@@ -20758,7 +20776,7 @@ impl CursorState {
                 // fetch touched anything.
                 self.restore_page_rows(&mut page, &mut retained)?;
                 self.held_page_base = page_base_bytes;
-                self.settle_retained_charge(anchor, page_base_bytes)?;
+                self.settle_retained_charge(anchor, page_base_bytes, decoder_bytes())?;
                 return Err(BoundedExecutionError::Cancelled);
             }
             Err(error) => return Err(error),
@@ -20794,7 +20812,7 @@ impl CursorState {
         self.context.publish_group_returns()?;
         drop(retained);
         self.held_page_base = 0;
-        self.settle_retained_charge(anchor, 0)?;
+        self.settle_retained_charge(anchor, 0, decoder_bytes())?;
         self.published_rows = self.published_rows.checked_add(published).ok_or_else(|| {
             Error::Other(("bounded cursor row counter overflow".to_string()).into())
         })?;

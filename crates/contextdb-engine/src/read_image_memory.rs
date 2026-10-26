@@ -1962,6 +1962,11 @@ pub(crate) struct ImageMemoryScope {
     _same_thread: PhantomData<std::rc::Rc<()>>,
 }
 impl ImageMemoryScope {
+    /// The installed decoder's live invoice, including a retained call.
+    pub(crate) fn held_bytes(&self) -> usize {
+        self._owner.held_with_call()
+    }
+
     /// Re-enter only this already installed, retained operation owner.
     pub(crate) fn reenter(&self) -> Self {
         self._owner.enter()
