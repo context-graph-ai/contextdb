@@ -47,7 +47,6 @@ const PROTECTED_ROOT_EVENT_ALLOWANCE: u64 = 64;
 
 #[derive(Debug, Clone, Copy)]
 struct CommitWork {
-    rows: usize,
     overlay_comparisons: u64,
     protected_root_events: u64,
 }
@@ -91,9 +90,8 @@ impl Measured {
     }
 }
 
-fn take_work(rows: usize) -> CommitWork {
+fn take_work() -> CommitWork {
     CommitWork {
-        rows,
         overlay_comparisons: commit_row_work::take_overlay_comparisons(),
         protected_root_events: commit_row_work::take_protected_root_events(),
     }
@@ -140,11 +138,11 @@ fn commit_one_transaction(rows: usize, measured: Measured) -> CommitWork {
         )
         .expect("stage one imported row");
     }
-    take_work(rows);
+    take_work();
     let started = std::time::Instant::now();
     db.commit(tx).expect("commit the import");
     let mut wall = started.elapsed();
-    let mut work = take_work(rows);
+    let mut work = take_work();
     let committed: usize = TABLES
         .iter()
         .map(|table| {
@@ -159,11 +157,11 @@ fn commit_one_transaction(rows: usize, measured: Measured) -> CommitWork {
         let tx = db.begin().expect("one transaction for the whole delete");
         db.execute_in_tx(tx, "DELETE FROM imported", &HashMap::new())
             .expect("stage the bulk delete");
-        take_work(rows);
+        take_work();
         let started = std::time::Instant::now();
         db.commit(tx).expect("commit the bulk delete");
         wall = started.elapsed();
-        work = take_work(rows);
+        work = take_work();
         let remaining = db
             .execute("SELECT id FROM imported", &HashMap::new())
             .expect("read the remaining rows");
@@ -188,11 +186,11 @@ fn commit_one_transaction(rows: usize, measured: Measured) -> CommitWork {
             )
             .expect("stage one row update");
         }
-        take_work(rows);
+        take_work();
         let started = std::time::Instant::now();
         db.commit(tx).expect("commit the update");
         wall = started.elapsed();
-        work = take_work(rows);
+        work = take_work();
         let updated: usize = TABLES
             .iter()
             .map(|table| {
@@ -207,35 +205,36 @@ fn commit_one_transaction(rows: usize, measured: Measured) -> CommitWork {
             .sum();
         assert_eq!(updated, rows, "every staged update is committed");
     }
-    eprintln!("commit_row_scaling {measured:?} {work:?} wall={wall:?}");
+    eprintln!("commit_row_scaling {measured:?} rows={rows} {work:?} wall={wall:?}");
     db.close().expect("close the database");
     work
 }
 
 fn assert_linear(measured: Measured) {
-    let mut previous: Option<CommitWork> = None;
+    let mut previous: Option<(usize, CommitWork)> = None;
     for rows in measured.row_counts() {
         let work = commit_one_transaction(rows, measured);
         assert!(
             work.overlay_comparisons >= rows as u64,
-            "every committed row consults the pending manifest overlay: {work:?}"
+            "every committed row consults the pending manifest overlay: {rows} rows {work:?}"
         );
         let allowed = OVERLAY_COMPARISONS_PER_ROW_AND_LEVEL * rows as u64 * u64::from(rows.ilog2());
         assert!(
             work.overlay_comparisons <= allowed,
             "overlay comparisons exceed {OVERLAY_COMPARISONS_PER_ROW_AND_LEVEL} N log2 N: \
-             {work:?}, allowed {allowed}"
+             {rows} rows {work:?}, allowed {allowed}"
         );
-        if let Some(previous) = previous {
+        if let Some((previous_rows, previous)) = previous {
             assert!(
                 work.protected_root_events
                     <= previous
                         .protected_root_events
                         .saturating_add(PROTECTED_ROOT_EVENT_ALLOWANCE),
-                "protected-table root events grew with the rows: {previous:?} -> {work:?}"
+                "protected-table root events grew with the rows: {previous_rows} rows \
+                 {previous:?} -> {rows} rows {work:?}"
             );
         }
-        previous = Some(work);
+        previous = Some((rows, work));
     }
 }
 
