@@ -127,3 +127,43 @@ fn two_readers_share_the_declared_cache_through_capacity_changes() {
         assert!(worker.join().unwrap().into_iter().all(|correct| correct));
     }
 }
+
+#[test]
+fn direct_registration_refuses_an_invalid_cache_share_before_opening_storage() {
+    let directory = tempfile::tempdir().unwrap();
+    for percent in [101, 255] {
+        let budget = 64 * 1024 * 1024;
+        let declared =
+            crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(budget).unwrap();
+        let context = crate::executor::bounded::ReadOpenContext::new(
+            declared.child().unwrap(),
+            ReadSessionOptions::default().limits,
+            crate::read_session::read_clock(),
+            contextdb_core::read_contract::OwnerReadCancellation::new(),
+        )
+        .unwrap();
+        let result = crate::persistence::load_read_image_at_registration_with_cache_share(
+            &directory.path().join("not-created.db"),
+            Some(budget as usize),
+            Some(percent),
+            None,
+            None,
+            context,
+        );
+        let Err(crate::persistence::LoadReadImageError::Memory(
+            contextdb_core::Error::InvalidSetting {
+                name,
+                value,
+                allowed,
+            },
+        )) = result
+        else {
+            panic!(
+                "direct registration must return the typed setting refusal before opening storage"
+            );
+        };
+        assert_eq!(name, "READ_CACHE_SHARE");
+        assert_eq!(value, percent.to_string());
+        assert_eq!(allowed, "0..=100, an integer percent");
+    }
+}
