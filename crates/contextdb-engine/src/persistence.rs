@@ -2861,7 +2861,12 @@ pub(crate) fn load_read_image_with_memory(
     limit: Option<usize>,
 ) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
     let limits = crate::read_session::ReadSessionOptions::default().limits;
-    let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(limits.memory)
+    // Match the file reader: a declared image limit owns its parent budget;
+    // the default statement limit applies only when no image limit is supplied.
+    let budget = limit.map_or(limits.memory, |bytes| {
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    });
+    let declared = crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(budget)
         .map_err(LoadReadImageError::Memory)?;
     let open_context = crate::executor::bounded::ReadOpenContext::new(
         declared.child().map_err(LoadReadImageError::Memory)?,
