@@ -681,6 +681,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn short_index_declarations_are_funded_before_native_allocation() {
+        short_declarations_are_funded_before_native_allocation(1000);
+    }
+
+    /// The same promise over 128 declarations: every declaration container
+    /// and overlapping schema clone is still admitted before allocation.
+    #[test]
+    #[serial_test::serial]
+    fn short_index_declarations_are_funded_before_native_allocation_at_128_declarations() {
+        short_declarations_are_funded_before_native_allocation(128);
+    }
+
+    fn short_declarations_are_funded_before_native_allocation(declarations: usize) {
         use crate::persistence::content_identity::proof_allocation_oracle_tests as oracle;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("short-declarations.db");
@@ -694,7 +706,7 @@ mod tests {
             &HashMap::new(),
         )
         .unwrap();
-        for index in 0..1000 {
+        for index in 0..declarations {
             let columns = ('a'..='z')
                 .enumerate()
                 .map(|(position, name)| {
@@ -730,7 +742,7 @@ mod tests {
         let meta = db.table_meta("short").unwrap();
         assert_eq!(
             meta.indexes.len(),
-            1000,
+            declarations,
             "all declarations passed the production DDL path"
         );
         db.close().unwrap();
