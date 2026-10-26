@@ -41,57 +41,40 @@ pub fn search_with_work(
     output: &mut [Hit],
     work: &mut Work,
 ) -> Result<usize> {
-    *work = Work::default();
-    let tracked = super::page_work::Tracked::new(source);
-    let attempted = search_impl(
-        &tracked,
+    let mut accept_all = |_: CandidateIdentity<'_>| Ok::<bool, contextdb_core::Error>(true);
+    search_with_eligibility(
+        source,
         policy,
         owner,
         query,
         contexts,
-        if mode == Mode::Auto {
-            Mode::Indexed
-        } else {
-            mode
-        },
+        mode,
+        &mut accept_all,
         output,
         work,
-    );
-    let result = match attempted {
-        Err(contextdb_core::Error::StoreCorrupted { .. }) if mode == Mode::Auto => search_impl(
-            &tracked,
-            policy,
-            owner,
-            query,
-            contexts,
-            Mode::Exact,
-            output,
-            work,
-        ),
-        result => result,
-    };
-    tracked.apply(work);
-    result
+    )
 }
 #[allow(clippy::too_many_arguments)]
-fn search_impl(
+fn search_impl<E>(
     source: &impl ReadPages,
     policy: Policy,
     owner: &MemoryBudgetOwner,
     query: &[f32],
     contexts: Option<&[u64]>,
     mode: Mode,
+    eligible: &mut dyn FnMut(CandidateIdentity<'_>) -> std::result::Result<bool, E>,
     output: &mut [Hit],
     work: &mut Work,
-) -> Result<usize> {
+) -> QueryResult<usize, E> {
     if query.len() != policy.dimensions {
-        return Err(dimension(source, policy.dimensions, query.len()));
+        return Err(dimension(source, policy.dimensions, query.len()).into());
     }
     source.check_cancel()?;
     let k = output.len();
     if k == 0 {
         return Ok(0);
     }
+    let snapshot_lsn = contextdb_core::Lsn(source.snapshot_lsn()?);
     let depth = policy.rerank.max(k);
     let raw_bytes = policy
         .dimensions
@@ -133,7 +116,7 @@ fn search_impl(
                 .clamp(-127.0, 127.0) as i8
         };
     }
-    let mut visit = |partition| -> Result<()> {
+    let mut visit = |partition| -> QueryResult<(), E> {
         let Some(m) = source.manifest(partition)? else {
             return Ok(());
         };
@@ -142,7 +125,7 @@ fn search_impl(
         if mode == Mode::Indexed
             && let Some(key) = c.unserviceable
         {
-            return Err(super::memory::corrupt_page(key));
+            return Err(super::memory::corrupt_page(key).into());
         }
         // At most two codebooks in state B, visited sequentially under whole-object funding.
         for old in [false, true] {
@@ -170,11 +153,16 @@ fn search_impl(
                     &mut metadata,
                     &mut visibility,
                     &mut vis_loaded,
-                    |slot, _entry, tail| {
+                    |slot, entry, tail| {
                         score_exact(
                             source,
                             query,
                             slot,
+                            manifest,
+                            entry,
+                            old,
+                            snapshot_lsn,
+                            eligible,
                             tail,
                             mode,
                             &mut canonical,
@@ -232,12 +220,12 @@ fn search_impl(
                                     &mut page,
                                 )?
                             {
-                                return Err(corrupt());
+                                return Err(corrupt().into());
                             }
                             let used = list_page_used(source, manifest, *list, page_id)?;
                             let stride = 16 + policy.dimensions;
                             if used == 0 || used > PAGE_BYTES / stride || used as u64 > remaining {
-                                return Err(corrupt());
+                                return Err(corrupt().into());
                             }
                             for record in page.chunks_exact(stride).take(used) {
                                 let slot = u64::from_le_bytes(
@@ -247,16 +235,15 @@ fn search_impl(
                                     record[8..16].try_into().map_err(|_| corrupt())?,
                                 );
                                 if slot >= manifest.slots {
-                                    return Err(corrupt());
+                                    return Err(corrupt().into());
                                 }
+                                let e = metadata.entry(slot)?;
                                 if old {
-                                    let e = metadata.entry(slot)?;
                                     if e.lsn <= c.frontier || e.lsn > c.switch_lsn {
                                         continue;
                                     }
                                 } else if c.remap_join_target != 0 {
                                     // Joined pages stay masked until the one retirement commit.
-                                    let e = metadata.entry(slot)?;
                                     if e.prepared && e.run == c.remap_output {
                                         continue;
                                     }
@@ -268,6 +255,19 @@ fn search_impl(
                                     &mut visibility,
                                     &mut vis_loaded,
                                 )? {
+                                    continue;
+                                }
+                                let identity = candidate_identity(
+                                    source,
+                                    manifest,
+                                    slot,
+                                    e,
+                                    old,
+                                    false,
+                                    snapshot_lsn,
+                                    row,
+                                );
+                                if !eligible(identity).map_err(QueryError::Consumer)? {
                                     continue;
                                 }
                                 source.before_distance(DistanceKind::Quantized)?;
@@ -309,16 +309,17 @@ fn search_impl(
                         };
                     }
                     if id != 0 {
-                        return Err(corrupt());
+                        return Err(corrupt().into());
                     }
                 }
                 candidates.sort_unstable_by_key(|x| x.slot);
                 for candidate in &mut candidates {
                     source.check_cancel()?;
-                    let row = canonical.vector(candidate.slot, &mut raw, &mut values)?;
+                    let row = canonical.row(candidate.slot, raw.len())?;
                     if row != candidate.row {
-                        return Err(corrupt());
+                        return Err(corrupt().into());
                     }
+                    canonical.vector(candidate.slot, row, &mut raw, &mut values)?;
                     source.before_distance(DistanceKind::Canonical)?;
                     candidate.distance = cosine(query, &values);
                     work.full_precision_evaluations += 1;
@@ -327,6 +328,7 @@ fn search_impl(
                 if !old {
                     for seq in c.tail_head..c.tail_end {
                         let slot = tail_slot(source, manifest, seq)?;
+                        let entry = metadata.entry(slot)?;
                         if !is_visible(source, manifest, slot, &mut visibility, &mut vis_loaded)? {
                             continue;
                         }
@@ -334,6 +336,11 @@ fn search_impl(
                             source,
                             query,
                             slot,
+                            manifest,
+                            entry,
+                            old,
+                            snapshot_lsn,
+                            eligible,
                             true,
                             mode,
                             &mut canonical,
@@ -388,10 +395,15 @@ fn validate(source: &impl ReadPages, m: Manifest, p: Policy) -> Result<()> {
     Ok(())
 }
 #[allow(clippy::too_many_arguments)]
-fn score_exact<S: ReadPages>(
+fn score_exact<S: ReadPages, E>(
     s: &S,
     q: &[f32],
     slot: u64,
+    manifest: Manifest,
+    entry: Entry,
+    old: bool,
+    snapshot_lsn: contextdb_core::Lsn,
+    eligible: &mut dyn FnMut(CandidateIdentity<'_>) -> std::result::Result<bool, E>,
     tail: bool,
     mode: Mode,
     canonical: &mut CanonicalWindow<'_, S>,
@@ -400,8 +412,13 @@ fn score_exact<S: ReadPages>(
     out: &mut Vec<Candidate>,
     capacity: usize,
     work: &mut Work,
-) -> Result<()> {
-    let row = canonical.vector(slot, raw, values)?;
+) -> QueryResult<(), E> {
+    let row = canonical.row(slot, raw.len())?;
+    let identity = candidate_identity(s, manifest, slot, entry, old, tail, snapshot_lsn, row);
+    if !eligible(identity).map_err(QueryError::Consumer)? {
+        return Ok(());
+    }
+    canonical.vector(slot, row, raw, values)?;
     s.before_distance(if tail {
         DistanceKind::Buffer
     } else {
@@ -409,9 +426,9 @@ fn score_exact<S: ReadPages>(
     })?;
     let distance = cosine(q, values);
     if tail {
-        work.buffer_evaluations += 1
+        work.buffer_evaluations += 1;
     } else {
-        work.full_precision_evaluations += 1
+        work.full_precision_evaluations += 1;
     }
     if mode == Mode::Exact {
         work.exact_score_count += 1;
@@ -427,6 +444,7 @@ fn score_exact<S: ReadPages>(
     );
     Ok(())
 }
+
 fn is_visible(
     s: &impl ReadPages,
     m: Manifest,
@@ -507,9 +525,7 @@ impl<'a, S: ReadPages> CanonicalWindow<'a, S> {
             loaded: None,
         }
     }
-    fn vector(&mut self, slot: u64, raw: &mut [u8], values: &mut [f32]) -> Result<u64> {
-        let mut offset = slot.checked_mul(raw.len() as u64).ok_or_else(corrupt)?;
-        let mut out = &mut *raw;
+    fn read_range(&mut self, mut offset: u64, mut out: &mut [u8]) -> Result<()> {
         while !out.is_empty() {
             let ordinal = offset / PAGE_BYTES as u64;
             if self.loaded != Some(ordinal) {
@@ -525,20 +541,37 @@ impl<'a, S: ReadPages> CanonicalWindow<'a, S> {
                 self.loaded = Some(ordinal);
             }
             let at = (offset % PAGE_BYTES as u64) as usize;
-            let n = out.len().min(PAGE_BYTES - at);
-            out[..n].copy_from_slice(&self.page[at..at + n]);
-            out = &mut out[n..];
-            offset = offset.checked_add(n as u64).ok_or_else(corrupt)?;
+            let count = out.len().min(PAGE_BYTES - at);
+            out[..count].copy_from_slice(&self.page[at..at + count]);
+            out = &mut out[count..];
+            offset = offset.checked_add(count as u64).ok_or_else(corrupt)?;
         }
-        let row = u64::from_le_bytes(raw[..8].try_into().map_err(|_| corrupt())?);
-        for (i, v) in values.iter_mut().enumerate() {
-            *v = f32::from_le_bytes(
-                raw[8 + i * 4..12 + i * 4]
+        Ok(())
+    }
+    fn row(&mut self, slot: u64, stride: usize) -> Result<u64> {
+        let offset = slot.checked_mul(stride as u64).ok_or_else(corrupt)?;
+        let mut prefix = [0; 8];
+        self.read_range(offset, &mut prefix)?;
+        Ok(u64::from_le_bytes(prefix))
+    }
+    fn vector(&mut self, slot: u64, row: u64, raw: &mut [u8], values: &mut [f32]) -> Result<()> {
+        if values.len().checked_mul(4).and_then(|n| n.checked_add(8)) != Some(raw.len()) {
+            return Err(corrupt());
+        }
+        let offset = slot
+            .checked_mul(raw.len() as u64)
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(corrupt)?;
+        raw[..8].copy_from_slice(&row.to_le_bytes());
+        self.read_range(offset, &mut raw[8..])?;
+        for (at, value) in values.iter_mut().enumerate() {
+            *value = f32::from_le_bytes(
+                raw[8 + at * 4..12 + at * 4]
                     .try_into()
                     .map_err(|_| corrupt())?,
             );
         }
-        Ok(row)
+        Ok(())
     }
 }
 
@@ -551,11 +584,95 @@ pub fn search_with_eligibility<E: From<contextdb_core::Error>>(
     query: &[f32],
     partitions: Option<&[u64]>,
     mode: Mode,
-    _eligible: &mut dyn FnMut(CandidateIdentity<'_>) -> std::result::Result<bool, E>,
+    eligible: &mut dyn FnMut(CandidateIdentity<'_>) -> std::result::Result<bool, E>,
     output: &mut [Hit],
     work: &mut Work,
 ) -> std::result::Result<usize, E> {
-    search_with_work(source, policy, owner, query, partitions, mode, output, work).map_err(E::from)
+    *work = Work::default();
+    let tracked = super::page_work::Tracked::new(source);
+    let attempted = search_impl(
+        &tracked,
+        policy,
+        owner,
+        query,
+        partitions,
+        if mode == Mode::Auto {
+            Mode::Indexed
+        } else {
+            mode
+        },
+        eligible,
+        output,
+        work,
+    );
+    let result = match attempted {
+        Err(QueryError::Storage(contextdb_core::Error::StoreCorrupted { .. }))
+            if mode == Mode::Auto =>
+        {
+            search_impl(
+                &tracked,
+                policy,
+                owner,
+                query,
+                partitions,
+                Mode::Exact,
+                eligible,
+                output,
+                work,
+            )
+        }
+        other => other,
+    };
+    tracked.apply(work);
+    result.map_err(|error| match error {
+        QueryError::Storage(error) => E::from(error),
+        QueryError::Consumer(error) => error,
+    })
+}
+
+enum QueryError<E> {
+    Storage(contextdb_core::Error),
+    Consumer(E),
+}
+impl<E> From<contextdb_core::Error> for QueryError<E> {
+    fn from(error: contextdb_core::Error) -> Self {
+        Self::Storage(error)
+    }
+}
+type QueryResult<T, E> = std::result::Result<T, QueryError<E>>;
+
+#[allow(clippy::too_many_arguments)]
+fn candidate_identity<'a, S: ReadPages>(
+    source: &'a S,
+    manifest: Manifest,
+    slot: u64,
+    entry: Entry,
+    old: bool,
+    tail: bool,
+    snapshot_lsn: contextdb_core::Lsn,
+    row: u64,
+) -> CandidateIdentity<'a> {
+    CandidateIdentity {
+        index: source.index_identity(),
+        partition: manifest.partition,
+        generation: manifest.generation,
+        run: entry.run,
+        slot,
+        row: RowIdentity {
+            row,
+            commit_lsn: entry.lsn,
+        },
+        snapshot_lsn,
+        source: if old {
+            CandidateSource::LegacyRun
+        } else if tail {
+            CandidateSource::UnsealedTail
+        } else if entry.run == 0 {
+            CandidateSource::ServingBase
+        } else {
+            CandidateSource::CommittedRun
+        },
+    }
 }
 
 /// Iterate the same visible slot set used by exhaustive distance search.
@@ -664,7 +781,7 @@ pub fn visit_visible_canonical<E: From<contextdb_core::Error>>(
                     &mut visibility,
                     &mut loaded,
                     |slot, entry, tail| {
-                        let row = canonical.vector(slot, &mut raw, &mut values)?;
+                        let row = canonical.row(slot, raw.len())?;
                         let identity = CandidateIdentity {
                             index: tracked.index_identity(),
                             partition: manifest.partition,
@@ -689,6 +806,7 @@ pub fn visit_visible_canonical<E: From<contextdb_core::Error>>(
                         if !eligible(identity)? {
                             return Ok(());
                         }
+                        canonical.vector(slot, row, &mut raw, &mut values)?;
                         tracked.before_distance(if tail {
                             DistanceKind::Buffer
                         } else {
