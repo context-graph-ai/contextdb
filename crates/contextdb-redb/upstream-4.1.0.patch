@@ -826,7 +826,7 @@
 +    }
 +
 +    /// Observe a bounded set of this statement's distinct page identifiers.
-+    /// The original prepaid cache arena stores at most capacity/page_size IDs.
++    /// The live prepaid arena stores at most min(capacity/page_size, arena_slots/2) IDs.
 +    /// Larger statements keep the first such set; the estimate is advisory.
 +    /// No I/O or allocation is performed by observation or the final probe.
 +    #[cfg(feature = "contextdb-internal")]
@@ -835,10 +835,10 @@
 +        &self,
 +        operation: impl FnOnce() -> R,
 +    ) -> (R, Option<f64>) {
-+        let (result, epoch) = self.mem.with_page_window(operation);
++        let (result, window) = self.mem.with_page_window(operation);
 +        let mut resident = 0.0;
 +        let mut count = 0.0;
-+        let measured = self.mem.visit_page_window(epoch, |id| {
++        let measured = window.visit(|id| {
 +            resident += self.read_cache_resident_fraction(&[id]);
 +            count += 1.0;
 +        });
@@ -16246,8 +16246,8 @@
 +    Plain(PageAllocation),
 +    #[cfg(feature = "contextdb-internal")]
 +    Native(PageAllocation),
- }
- 
++}
++
 +// Private representation names retained for source-adoption diagnostics.
 +#[allow(dead_code)]
 +type CachedPage = PageAllocation;
@@ -16357,8 +16357,8 @@
 +            PageMemory::Native(page) => page,
 +        }
 +    }
-+}
-+
+ }
+
  pub(super) struct WritablePage {
 -    buffer: Arc<Mutex<LRUWriteCache>>,
 +    buffer: CacheShared<Mutex<LRUWriteCache>>,
@@ -16495,12 +16495,32 @@
      }
  
      fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
-@@ -193,11 +320,14 @@
+@@ -193,11 +320,34 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
 -        result.map_err(StorageError::from)
 +        result
++    }
++}
++
++// A statement borrows the live index arena, never the arena from file startup.
++// Cloning this handle only retains its existing prepaid control block.
++#[cfg(feature = "contextdb-internal")]
++#[derive(Clone)]
++pub(crate) struct ReadCachePageWindow {
++    arena: CacheShared<EntryArena<PageAllocation>>,
++    epoch: u64,
++}
++
++#[cfg(feature = "contextdb-internal")]
++impl ReadCachePageWindow {
++    pub(crate) fn record_page(&self, id: [u8; 8]) {
++        self.arena.record_page(self.epoch, id);
++    }
++
++    pub(crate) fn visit(&self, visit: impl FnMut([u8; 8])) -> bool {
++        self.arena.visit_page_window(self.epoch, visit)
      }
  }
  
@@ -16511,7 +16531,7 @@
      file: CheckedBackend,
      page_size: u64,
      // Dynamic cache partitioning.  Three invariants:
-@@ -218,9 +348,7 @@
+@@ -218,9 +368,7 @@
      // soft limit and momentary over-/under-counting by one page is harmless.
      // A third "total" counter would add contention on every insert/remove for
      // negligible accuracy gain.
@@ -16522,13 +16542,11 @@
      // Rotates the starting stripe for read-cache eviction
      next_eviction_stripe: AtomicUsize,
      #[cfg(feature = "cache_metrics")]
-@@ -233,27 +361,172 @@
+@@ -233,27 +381,168 @@
      writes_hits: AtomicU64,
      #[cfg(feature = "cache_metrics")]
      evictions: AtomicU64,
 -    read_cache: Vec<RwLock<LRUCache<Arc<[u8]>>>>,
-+    #[cfg(feature = "contextdb-internal")]
-+    page_window_arena: CacheShared<EntryArena<PageAllocation>>,
 +    read_cache: Box<[RwLock<LRUCache<PageAllocation>>]>,
      // TODO: maybe move this cache to WriteTransaction?
 -    write_buffer: Arc<Mutex<LRUWriteCache>>,
@@ -16541,8 +16559,8 @@
 +    // frees. Detached page and WritablePage aliases retain these same controls.
 +    read_cache_bytes: CacheCounter,
 +    write_buffer_bytes: CacheCounter,
- }
- 
++}
++
 +// Opaque aliases expose only real backing identity/readability to engine tests.
 +#[cfg(feature = "test-seams")]
 +#[doc(hidden)]
@@ -16598,8 +16616,8 @@
 +    pub fn allocation(&self) -> (usize, usize, usize) {
 +        self.0.allocation_for_test()
 +    }
-+}
-+
+ }
+
  impl PagedCachedFile {
 +    #[cfg(feature = "test-seams")]
 +    pub(crate) fn write_control_for_test(&self) -> CacheWriteControlForTest {
@@ -16682,14 +16700,11 @@
 -        let read_cache = (0..Self::lock_stripes())
 -            .map(|_| RwLock::new(LRUCache::new()))
 -            .collect();
--
 +        let (read_cache_bytes, write_buffer_bytes) = super::page_allocation::cache_counters()?;
 +        crate::read_admission::prepare_cache_allocation(Self::write_buffer_control_layout())?;
 +        let read_cache =
 +            Self::prepare_read_index(max_cache_size, usize::try_from(page_size).unwrap(), 0)?;
-+
-+        #[cfg(feature = "contextdb-internal")]
-+        let page_window_arena = read_cache[0].read().unwrap().page_window_arena();
+
          Ok(Self {
              file: CheckedBackend::new(file),
 +            no_victim_generation: AtomicU64::new(0),
@@ -16705,12 +16720,9 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -265,9 +538,139 @@
-             writes_hits: Default::default(),
+@@ -266,8 +555,130 @@
              #[cfg(feature = "cache_metrics")]
              evictions: Default::default(),
-+            #[cfg(feature = "contextdb-internal")]
-+            page_window_arena,
              read_cache,
 -            write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
 +            write_buffer: CacheShared::new_prepaid(Mutex::new(LRUWriteCache::new()))?,
@@ -16792,24 +16804,18 @@
 +    }
 +
 +    #[cfg(feature = "contextdb-internal")]
-+    pub(crate) fn begin_page_window(&self) -> u64 {
++    pub(crate) fn begin_page_window(&self) -> ReadCachePageWindow {
++        let arena = self.read_cache[0].read().unwrap().page_window_arena();
 +        let limit =
 +            self.max_cache_size.load(Ordering::Acquire) / usize::try_from(self.page_size).unwrap();
-+        self.page_window_arena.begin_page_window(limit)
-+    }
-+    #[cfg(feature = "contextdb-internal")]
-+    pub(crate) fn record_query_page(&self, epoch: u64, id: [u8; 8]) {
-+        self.page_window_arena.record_page(epoch, id);
-+    }
-+    #[cfg(feature = "contextdb-internal")]
-+    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) -> bool {
-+        self.page_window_arena.visit_page_window(epoch, visit)
++        let epoch = arena.begin_page_window(limit);
++        ReadCachePageWindow { arena, epoch }
 +    }
 +
 +    #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
 +    pub(crate) fn page_window_entries_visited_for_test(&self) -> usize {
-+        self.page_window_arena
-+            .page_window_entries_visited_for_test()
++        let arena = self.read_cache[0].read().unwrap().page_window_arena();
++        arena.page_window_entries_visited_for_test()
 +    }
 +
 +    fn uncached(buffer: PageAllocation) -> PageMemory {
@@ -16846,7 +16852,7 @@
      }
  
      #[allow(clippy::unused_self)]
-@@ -303,6 +706,110 @@
+@@ -303,6 +714,110 @@
          }
      }
  
@@ -16957,7 +16963,7 @@
      pub(crate) fn close(&self) -> Result {
          self.file.close()
      }
-@@ -329,27 +836,43 @@
+@@ -329,27 +844,43 @@
          bytes_needed: usize,
          _write_lock: &MutexGuard<'_, LRUWriteCache>,
      ) {
@@ -17005,7 +17011,7 @@
          }
      }
  
-@@ -364,25 +887,49 @@
+@@ -364,25 +895,49 @@
          // drained, so the total check only considers the read cache size.
          for (offset, buffer) in write_buffer.cache.iter_mut() {
              let buffer = buffer.take().unwrap();
@@ -17067,7 +17073,7 @@
          write_buffer.clear();
  
          Ok(())
-@@ -390,10 +937,28 @@
+@@ -390,10 +945,28 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -17098,7 +17104,7 @@
      }
  
      pub(super) fn flush(&self) -> Result {
-@@ -409,6 +974,20 @@
+@@ -409,6 +982,20 @@
          self.flush_write_buffer()
      }
  
@@ -17119,7 +17125,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +995,28 @@
+@@ -416,18 +1003,28 @@
          Ok(buffer)
      }
  
@@ -17156,7 +17162,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +1027,7 @@
+@@ -438,7 +1035,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17165,7 +17171,7 @@
              }
          }
  
-@@ -449,54 +1038,141 @@
+@@ -449,54 +1046,141 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17347,7 +17353,7 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1183,172 @@
+@@ -507,104 +1191,172 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
@@ -17606,7 +17612,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1358,383 @@
+@@ -614,13 +1366,383 @@
  }
  
  #[cfg(test)]
@@ -17992,10 +17998,11 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1767,840 @@
+@@ -653,4 +1775,840 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
+-}
 +    #[test]
 +    fn immutable_byte_checksum_owners_are_charged_and_release_at_final_holder() {
 +        struct Charge(Arc<std::sync::atomic::AtomicUsize>, usize);
@@ -18832,7 +18839,7 @@
 +            }
 +        }
 +    }
- }
++}
 --- a/src/tree_store/page_store/file_backend/fallback.rs
 +++ b/src/tree_store/page_store/file_backend/fallback.rs
 @@ -1,13 +1,15 @@
@@ -21201,17 +21208,17 @@
 +}
 --- a/src/tree_store/page_store/page_manager.rs
 +++ b/src/tree_store/page_store/page_manager.rs
-@@ -1,16 +1,37 @@
+@@ -1,16 +1,39 @@
 +#[cfg(feature = "contextdb-internal")]
 +thread_local! {
-+    static QUERY_PAGE_WINDOW: std::cell::Cell<Option<(usize, u64)>> = const { std::cell::Cell::new(None) };
++    static QUERY_PAGE_WINDOW: std::cell::RefCell<Option<(usize, ReadCachePageWindow)>> = const { std::cell::RefCell::new(None) };
 +}
 +#[cfg(feature = "contextdb-internal")]
-+struct QueryPageWindowReset(Option<(usize, u64)>);
++struct QueryPageWindowReset(Option<(usize, ReadCachePageWindow)>);
 +#[cfg(feature = "contextdb-internal")]
 +impl Drop for QueryPageWindowReset {
 +    fn drop(&mut self) {
-+        QUERY_PAGE_WINDOW.with(|slot| slot.set(self.0));
++        QUERY_PAGE_WINDOW.with(|slot| drop(slot.replace(self.0.take())));
 +    }
 +}
 +
@@ -21226,6 +21233,8 @@
  use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
  use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
  use crate::tree_store::page_store::cached_file::PagedCachedFile;
++#[cfg(feature = "contextdb-internal")]
++use crate::tree_store::page_store::cached_file::ReadCachePageWindow;
  use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
 +#[cfg(feature = "contextdb-internal")]
 +use crate::tree_store::page_store::header::TransactionHeader;
@@ -21241,7 +21250,7 @@
  use crate::{DatabaseError, Result, StorageError};
  use std::cmp::{max, min};
  #[cfg(debug_assertions)]
-@@ -18,11 +39,119 @@
+@@ -18,11 +41,119 @@
  #[cfg(debug_assertions)]
  use std::collections::HashSet;
  use std::convert::TryInto;
@@ -21361,7 +21370,7 @@
  use std::sync::atomic::{AtomicBool, Ordering};
  use std::thread;
  
-@@ -75,6 +204,25 @@
+@@ -75,6 +206,25 @@
      hash128_with_seed(data, 0)
  }
  
@@ -21387,7 +21396,7 @@
  struct InMemoryState {
      header: DatabaseHeader,
      // TODO: we should make this an Option because it is only valid after the Database initializes it
-@@ -82,22 +230,95 @@
+@@ -82,22 +232,95 @@
  }
  
  impl InMemoryState {
@@ -21491,7 +21500,7 @@
  }
  
  pub(crate) struct TransactionalMemory {
-@@ -108,7 +329,14 @@
+@@ -108,7 +331,14 @@
      // True if the allocator state was corrupted when the file was opened
      // TODO: maybe we can remove this flag now that CheckedBackend exists?
      needs_recovery: AtomicBool,
@@ -21507,7 +21516,7 @@
      state: Mutex<InMemoryState>,
      // The number of PageMut which are outstanding
      #[cfg(debug_assertions)]
-@@ -126,20 +354,248 @@
+@@ -126,20 +356,248 @@
      // code path where there is no locking
      region_size: u64,
      region_header_with_padding_size: u64,
@@ -21758,7 +21767,7 @@
          let region_size = requested_region_size.unwrap_or(MAX_USABLE_REGION_SPACE);
          let region_size = min(
              region_size,
-@@ -147,7 +603,19 @@
+@@ -147,7 +605,19 @@
          );
          assert!(region_size.is_power_of_two());
  
@@ -21779,7 +21788,7 @@
  
          let initial_storage_len = storage.raw_file_len()?;
  
-@@ -226,12 +694,17 @@
+@@ -226,12 +696,17 @@
          }
          let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
          let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
@@ -21800,7 +21809,7 @@
              if read_only {
                  return Err(DatabaseError::RepairAborted);
              }
-@@ -252,12 +725,32 @@
+@@ -252,12 +727,32 @@
                  .copy_from_slice(&header.to_bytes(true));
              storage.flush()?;
          }
@@ -21836,7 +21845,7 @@
  
          assert!(page_size >= DB_HEADER_SIZE);
  
-@@ -265,6 +758,10 @@
+@@ -265,6 +760,10 @@
              allocated_since_commit: Mutex::new(Default::default()),
              unpersisted: Mutex::new(Default::default()),
              needs_recovery: AtomicBool::new(needs_recovery),
@@ -21847,7 +21856,7 @@
              storage,
              state: Mutex::new(state),
              #[cfg(debug_assertions)]
-@@ -277,7 +774,140 @@
+@@ -277,7 +776,141 @@
              page_size: page_size.try_into().unwrap(),
              region_size,
              region_header_with_padding_size: region_header_size,
@@ -21913,26 +21922,27 @@
 +    }
 +
 +    #[cfg(feature = "contextdb-internal")]
-+    pub(crate) fn with_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, u64) {
-+        let epoch = self.storage.begin_page_window();
++    pub(crate) fn with_page_window<R>(
++        &self,
++        operation: impl FnOnce() -> R,
++    ) -> (R, ReadCachePageWindow) {
++        let window = self.storage.begin_page_window();
 +        let previous = QUERY_PAGE_WINDOW
-+            .with(|slot| slot.replace(Some((std::ptr::from_ref(self) as usize, epoch))));
++            .with(|slot| slot.replace(Some((std::ptr::from_ref(self) as usize, window.clone()))));
 +        let _reset = QueryPageWindowReset(previous);
-+        (operation(), epoch)
++        (operation(), window)
 +    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    fn record_query_page(&self, page: PageNumber) {
 +        QUERY_PAGE_WINDOW.with(|slot| {
-+            if let Some((identity, epoch)) = slot.get()
-+                && identity == std::ptr::from_ref(self) as usize
++            let current = slot.borrow();
++            if let Some((identity, window)) = current.as_ref()
++                && *identity == std::ptr::from_ref(self) as usize
 +            {
-+                self.storage.record_query_page(epoch, page.to_le_bytes());
++                window.record_page(page.to_le_bytes());
 +            }
 +        });
-+    }
-+    #[cfg(feature = "contextdb-internal")]
-+    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) -> bool {
-+        self.storage.visit_page_window(epoch, visit)
 +    }
 +
 +    #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
@@ -21988,7 +21998,7 @@
      }
  
      pub(crate) fn cache_stats(&self) -> CacheStats {
-@@ -285,7 +915,52 @@
+@@ -285,7 +918,52 @@
      }
  
      pub(crate) fn check_io_errors(&self) -> Result {
@@ -22041,7 +22051,7 @@
      }
  
      #[cfg(debug_assertions)]
-@@ -295,23 +970,30 @@
+@@ -295,23 +973,30 @@
  
      #[cfg(debug_assertions)]
      pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
@@ -22078,7 +22088,7 @@
          }
      }
  
-@@ -346,7 +1028,9 @@
+@@ -346,7 +1031,9 @@
  
          self.needs_recovery
              .store(header.recovery_required, Ordering::Release);
@@ -22089,7 +22099,7 @@
  
          Ok(was_clean)
      }
-@@ -363,6 +1047,44 @@
+@@ -363,6 +1050,44 @@
          self.state.lock().unwrap().header.two_phase_commit
      }
  
@@ -22134,7 +22144,7 @@
      pub(crate) fn allocator_hash(&self) -> u128 {
          self.state.lock().unwrap().allocators.xxh3_hash()
      }
-@@ -379,7 +1101,8 @@
+@@ -379,7 +1104,8 @@
  
      pub(crate) fn begin_repair(&self) -> Result<()> {
          let mut state = self.state.lock().unwrap();
@@ -22144,7 +22154,7 @@
          #[cfg(debug_assertions)]
          self.allocated_pages.lock().unwrap().clear();
  
-@@ -392,20 +1115,42 @@
+@@ -392,20 +1118,42 @@
          let allocator = state.get_region_mut(region_index);
          allocator.record_alloc(page_number.page_index, page_number.page_order);
          #[cfg(debug_assertions)]
@@ -22188,7 +22198,7 @@
          state.header.recovery_required = false;
          self.write_header(&state.header)?;
          let result = self.storage.flush();
-@@ -419,30 +1164,37 @@
+@@ -419,30 +1167,37 @@
          tree: &mut AllocatorStateTreeMut,
          transaction_id: TransactionId,
      ) -> Result<u32> {
@@ -22244,7 +22254,7 @@
  
          tree.insert(
              &AllocatorStateKey::TransactionId,
-@@ -458,43 +1210,83 @@
+@@ -458,43 +1213,83 @@
          tree: &mut AllocatorStateTreeMut,
          num_regions: u32,
      ) -> Result<bool> {
@@ -22354,7 +22364,7 @@
          Ok(true)
      }
  
-@@ -516,15 +1308,216 @@
+@@ -516,15 +1311,216 @@
          Ok(transaction_id == self.get_last_committed_transaction_id()?)
      }
  
@@ -22573,7 +22583,7 @@
          }
  
          let region_tracker = RegionTracker::from_bytes(
-@@ -533,15 +1526,19 @@
+@@ -533,15 +1529,19 @@
                  .value(),
          );
  
@@ -22595,7 +22605,7 @@
          drop(state);
  
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -554,8 +1551,15 @@
+@@ -554,8 +1554,15 @@
      pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
          #[cfg(debug_assertions)]
          {
@@ -22613,7 +22623,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -586,6 +1590,32 @@
+@@ -586,6 +1593,32 @@
          result
      }
  
@@ -22646,7 +22656,7 @@
      #[allow(clippy::too_many_arguments)]
      fn commit_inner(
          &self,
-@@ -612,7 +1642,13 @@
+@@ -612,7 +1645,13 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
@@ -22661,7 +22671,7 @@
          let old_transaction_id = header.secondary_slot().transaction_id;
          let secondary = header.secondary_slot_mut();
          secondary.transaction_id = transaction_id;
-@@ -658,6 +1694,101 @@
+@@ -658,6 +1697,101 @@
          );
          state.header = header;
          self.read_from_secondary.store(false, Ordering::Release);
@@ -22763,7 +22773,7 @@
          // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
          // TODO: maybe we can remove the whole read_from_secondary flag?
          drop(state);
-@@ -678,6 +1809,7 @@
+@@ -678,6 +1812,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -22771,7 +22781,7 @@
  
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -725,8 +1857,11 @@
+@@ -725,8 +1860,11 @@
              state
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
@@ -22784,7 +22794,7 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -745,12 +1880,18 @@
+@@ -745,12 +1883,18 @@
      }
  
      pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
@@ -22803,7 +22813,7 @@
          let len: usize = (range.end - range.start).try_into().unwrap();
          let mem = self.storage.read(range.start, len, hint)?;
  
-@@ -776,6 +1917,33 @@
+@@ -776,6 +1920,33 @@
          })
      }
  
@@ -22837,7 +22847,7 @@
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
      pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
          #[cfg(debug_assertions)]
-@@ -824,6 +1992,44 @@
+@@ -824,6 +1995,44 @@
          }
      }
  
@@ -22882,7 +22892,7 @@
      pub(crate) fn get_data_root(&self) -> Option<BtreeHeader> {
          let state = self.state.lock().unwrap();
          if self.read_from_secondary.load(Ordering::Acquire) {
-@@ -871,7 +2077,9 @@
+@@ -871,7 +2080,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -22893,7 +22903,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -881,6 +2089,7 @@
+@@ -881,6 +2092,7 @@
          state
              .get_region_mut(region_index)
              .free(page.page_index, page.page_order);
@@ -22901,7 +22911,7 @@
          // Ensure that the region is marked as having free space
          state
              .get_region_tracker_mut()
-@@ -953,12 +2162,32 @@
+@@ -953,12 +2165,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -22936,7 +22946,7 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -1024,7 +2253,28 @@
+@@ -1024,7 +2256,28 @@
              } else {
                  region.alloc(required_order)
              };
@@ -22965,7 +22975,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +2311,7 @@
+@@ -1061,7 +2314,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -22974,7 +22984,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1093,27 +2343,52 @@
+@@ -1093,27 +2346,52 @@
                  layout.usable_bytes() + required_growth * 2,
              )
          };
@@ -23039,7 +23049,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1123,7 +2398,12 @@
+@@ -1123,7 +2401,12 @@
          allocation_size: usize,
          allocated: &mut PageTrackerPolicy,
      ) -> Result<PageMut<'txn>> {
@@ -23053,7 +23063,7 @@
          if let Ok(ref page) = result {
              allocated.insert(page.get_page_number());
          }
-@@ -1135,7 +2415,7 @@
+@@ -1135,7 +2418,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -23062,7 +23072,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +2425,7 @@
+@@ -1145,7 +2428,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -23071,7 +23081,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +2438,41 @@
+@@ -1158,8 +2441,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -23114,7 +23124,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +2541,469 @@
+@@ -1228,4 +2544,469 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }

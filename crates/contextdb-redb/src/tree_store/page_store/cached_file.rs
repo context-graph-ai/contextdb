@@ -324,6 +324,26 @@ impl CheckedBackend {
     }
 }
 
+// A statement borrows the live index arena, never the arena from file startup.
+// Cloning this handle only retains its existing prepaid control block.
+#[cfg(feature = "contextdb-internal")]
+#[derive(Clone)]
+pub(crate) struct ReadCachePageWindow {
+    arena: CacheShared<EntryArena<PageAllocation>>,
+    epoch: u64,
+}
+
+#[cfg(feature = "contextdb-internal")]
+impl ReadCachePageWindow {
+    pub(crate) fn record_page(&self, id: [u8; 8]) {
+        self.arena.record_page(self.epoch, id);
+    }
+
+    pub(crate) fn visit(&self, visit: impl FnMut([u8; 8])) -> bool {
+        self.arena.visit_page_window(self.epoch, visit)
+    }
+}
+
 pub(super) struct PagedCachedFile {
     no_victim_generation: AtomicU64,
     #[cfg(test)]
@@ -361,8 +381,6 @@ pub(super) struct PagedCachedFile {
     writes_hits: AtomicU64,
     #[cfg(feature = "cache_metrics")]
     evictions: AtomicU64,
-    #[cfg(feature = "contextdb-internal")]
-    page_window_arena: CacheShared<EntryArena<PageAllocation>>,
     read_cache: Box<[RwLock<LRUCache<PageAllocation>>]>,
     // TODO: maybe move this cache to WriteTransaction?
     write_buffer: CacheShared<Mutex<LRUWriteCache>>,
@@ -516,8 +534,6 @@ impl PagedCachedFile {
         let read_cache =
             Self::prepare_read_index(max_cache_size, usize::try_from(page_size).unwrap(), 0)?;
 
-        #[cfg(feature = "contextdb-internal")]
-        let page_window_arena = read_cache[0].read().unwrap().page_window_arena();
         Ok(Self {
             file: CheckedBackend::new(file),
             no_victim_generation: AtomicU64::new(0),
@@ -538,8 +554,6 @@ impl PagedCachedFile {
             writes_hits: Default::default(),
             #[cfg(feature = "cache_metrics")]
             evictions: Default::default(),
-            #[cfg(feature = "contextdb-internal")]
-            page_window_arena,
             read_cache,
             write_buffer: CacheShared::new_prepaid(Mutex::new(LRUWriteCache::new()))?,
         })
@@ -620,24 +634,18 @@ impl PagedCachedFile {
     }
 
     #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn begin_page_window(&self) -> u64 {
+    pub(crate) fn begin_page_window(&self) -> ReadCachePageWindow {
+        let arena = self.read_cache[0].read().unwrap().page_window_arena();
         let limit =
             self.max_cache_size.load(Ordering::Acquire) / usize::try_from(self.page_size).unwrap();
-        self.page_window_arena.begin_page_window(limit)
-    }
-    #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn record_query_page(&self, epoch: u64, id: [u8; 8]) {
-        self.page_window_arena.record_page(epoch, id);
-    }
-    #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) -> bool {
-        self.page_window_arena.visit_page_window(epoch, visit)
+        let epoch = arena.begin_page_window(limit);
+        ReadCachePageWindow { arena, epoch }
     }
 
     #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
     pub(crate) fn page_window_entries_visited_for_test(&self) -> usize {
-        self.page_window_arena
-            .page_window_entries_visited_for_test()
+        let arena = self.read_cache[0].read().unwrap().page_window_arena();
+        arena.page_window_entries_visited_for_test()
     }
 
     fn uncached(buffer: PageAllocation) -> PageMemory {

@@ -1114,8 +1114,12 @@ The file reader observes statements through `ReadOnlyDatabase::with_read_cache_p
 returning `Option<f64>`: an empty or superseded window returns None. Ordinary, native and
 byte-window hits contribute opaque page identifiers. Atomics record identifiers and intrusive
 links in the existing prepaid EntryArena; no separate array, map or owner is created. A single
-retained arena handle avoids acquiring a cache stripe lock per recorded page. Recording takes no
-arena mutex, stays within the selected page capacity and caps hash-table occupancy at 50%.
+statement-scoped arena handle is captured from the live read index at window start, avoiding a
+cache stripe lock per recorded page. The same handle supplies recording and the final probe, then
+is released; the file retains no construction-time alias that could outlive startup index replacement.
+The test observer reads the visited-entry counter from the live arena. Recording takes no arena
+mutex and stores at most min(selected cache capacity / page size, arena slots / 2) identifiers,
+capping hash-table occupancy at 50%.
 Only window initialization serializes resets. In-flight writers crossing an epoch invalidate
 measurement; the final walk follows recorded links and rechecks the epoch after probing.
 Residency uses the production read_cache_resident_fraction probe shared with NativeReadView,

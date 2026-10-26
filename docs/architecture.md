@@ -346,8 +346,10 @@ Null means no pages were measured. Owner and in-memory routes also have no sessi
 cache to measure.
 
 Identifiers and their intrusive list links live in the existing prepaid native index arena;
-its original exact Layout invoice covers the metadata through physical free. Recording uses
-atomic controls, without the free-slot mutex or cache stripe locks. The hash table stays at most
+its original exact Layout invoice covers the metadata through physical free. A statement captures
+its arena from the live read index and retains that existing control only until its final probe;
+the file keeps no stale alias after writer startup replaces the index. Recording uses atomic
+controls, without the free-slot mutex or cache stripe locks. The hash table stays at most
 half full; the sample is also bounded by selected cache capacity divided by page size. The final
 residency walk follows recorded links only, never the capacity array, and probes production cache
 residency without I/O or CLOCK changes. A superseding epoch or an in-flight writer invalidates the

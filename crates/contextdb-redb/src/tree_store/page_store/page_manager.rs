@@ -1,13 +1,13 @@
 #[cfg(feature = "contextdb-internal")]
 thread_local! {
-    static QUERY_PAGE_WINDOW: std::cell::Cell<Option<(usize, u64)>> = const { std::cell::Cell::new(None) };
+    static QUERY_PAGE_WINDOW: std::cell::RefCell<Option<(usize, ReadCachePageWindow)>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(feature = "contextdb-internal")]
-struct QueryPageWindowReset(Option<(usize, u64)>);
+struct QueryPageWindowReset(Option<(usize, ReadCachePageWindow)>);
 #[cfg(feature = "contextdb-internal")]
 impl Drop for QueryPageWindowReset {
     fn drop(&mut self) {
-        QUERY_PAGE_WINDOW.with(|slot| slot.set(self.0));
+        QUERY_PAGE_WINDOW.with(|slot| drop(slot.replace(self.0.take())));
     }
 }
 
@@ -22,6 +22,8 @@ use crate::tree_store::page_store::allocator_pager::AllocatorPager;
 use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
 use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
 use crate::tree_store::page_store::cached_file::PagedCachedFile;
+#[cfg(feature = "contextdb-internal")]
+use crate::tree_store::page_store::cached_file::ReadCachePageWindow;
 use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
 #[cfg(feature = "contextdb-internal")]
 use crate::tree_store::page_store::header::TransactionHeader;
@@ -836,26 +838,27 @@ impl TransactionalMemory {
     }
 
     #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn with_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, u64) {
-        let epoch = self.storage.begin_page_window();
+    pub(crate) fn with_page_window<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> (R, ReadCachePageWindow) {
+        let window = self.storage.begin_page_window();
         let previous = QUERY_PAGE_WINDOW
-            .with(|slot| slot.replace(Some((std::ptr::from_ref(self) as usize, epoch))));
+            .with(|slot| slot.replace(Some((std::ptr::from_ref(self) as usize, window.clone()))));
         let _reset = QueryPageWindowReset(previous);
-        (operation(), epoch)
+        (operation(), window)
     }
+
     #[cfg(feature = "contextdb-internal")]
     fn record_query_page(&self, page: PageNumber) {
         QUERY_PAGE_WINDOW.with(|slot| {
-            if let Some((identity, epoch)) = slot.get()
-                && identity == std::ptr::from_ref(self) as usize
+            let current = slot.borrow();
+            if let Some((identity, window)) = current.as_ref()
+                && *identity == std::ptr::from_ref(self) as usize
             {
-                self.storage.record_query_page(epoch, page.to_le_bytes());
+                window.record_page(page.to_le_bytes());
             }
         });
-    }
-    #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) -> bool {
-        self.storage.visit_page_window(epoch, visit)
     }
 
     #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]

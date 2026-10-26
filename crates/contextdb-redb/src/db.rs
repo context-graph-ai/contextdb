@@ -744,7 +744,7 @@ impl ReadOnlyDatabase {
     }
 
     /// Observe a bounded set of this statement's distinct page identifiers.
-    /// The original prepaid cache arena stores at most capacity/page_size IDs.
+    /// The live prepaid arena stores at most min(capacity/page_size, arena_slots/2) IDs.
     /// Larger statements keep the first such set; the estimate is advisory.
     /// No I/O or allocation is performed by observation or the final probe.
     #[cfg(feature = "contextdb-internal")]
@@ -753,10 +753,10 @@ impl ReadOnlyDatabase {
         &self,
         operation: impl FnOnce() -> R,
     ) -> (R, Option<f64>) {
-        let (result, epoch) = self.mem.with_page_window(operation);
+        let (result, window) = self.mem.with_page_window(operation);
         let mut resident = 0.0;
         let mut count = 0.0;
-        let measured = self.mem.visit_page_window(epoch, |id| {
+        let measured = window.visit(|id| {
             resident += self.read_cache_resident_fraction(&[id]);
             count += 1.0;
         });
