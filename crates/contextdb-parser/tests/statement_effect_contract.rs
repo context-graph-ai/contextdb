@@ -324,8 +324,8 @@ fn statement_effect_marks_only_the_inspection_variants_as_reads() {
         .filter(|(_, expected_effect, _)| *expected_effect == StatementEffect::Read)
         .count();
     assert_eq!(
-        declared_read_count, 13,
-        "exactly thirteen current Statement variants are declared reads"
+        declared_read_count, 15,
+        "exactly fifteen current Statement variants need no writable store"
     );
     assert_eq!(
         parsed_cases.len() - declared_read_count,
