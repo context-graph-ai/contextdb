@@ -204,3 +204,32 @@ pub struct TrainingPolicy {
     pub ingest_batch_keys: usize,
     pub phase_batch_entries: usize,
 }
+
+/// A committed candidate's physical serving role in its captured generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateSource {
+    ServingBase,
+    CommittedRun,
+    LegacyRun,
+    UnsealedTail,
+}
+
+/// Identity supplied by the captured native scope, independent of current rows.
+#[derive(Clone, Copy, Debug)]
+pub struct CandidateIdentity<'a> {
+    pub index: &'a contextdb_core::VectorIndexRef,
+    pub partition: u64,
+    pub generation: u64,
+    pub run: u64,
+    pub slot: u64,
+    pub row: RowIdentity,
+    pub snapshot_lsn: contextdb_core::Lsn,
+    pub source: CandidateSource,
+}
+
+/// A stored-precision vector borrowed for one fallible canonical visit.
+pub struct CanonicalCandidate<'a> {
+    pub identity: CandidateIdentity<'a>,
+    pub values: &'a [f32],
+    pub distance: f64,
+}

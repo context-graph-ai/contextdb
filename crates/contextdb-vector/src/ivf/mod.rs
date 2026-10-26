@@ -16,7 +16,10 @@ mod types;
 mod versions;
 mod writer;
 pub use catalog::{CatalogState, inspect as inspect_catalog};
-pub use search::{search, search_with_work};
+pub use search::{search, search_with_eligibility, search_with_work, visit_visible_canonical};
 pub use storage::Verdict;
-pub use types::{BufferState, Hit, Mode, Policy, RowIdentity, TrainingPolicy, Vector, Work};
+pub use types::{
+    BufferState, CandidateIdentity, CandidateSource, CanonicalCandidate, Hit, Mode, Policy,
+    RowIdentity, TrainingPolicy, Vector, Work,
+};
 pub use writer::{ClusteredIndex, RemapProgress};

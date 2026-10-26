@@ -4,7 +4,10 @@ use super::{
     codec,
     memory::{Invoice, bytes, corrupt, dimension, overflow},
     storage::{DistanceKind, Manifest, PAGE_BYTES, PageKind, ReadPages},
-    types::{Candidate, Hit, Mode, Policy, Work, cosine, retain_best},
+    types::{
+        Candidate, CandidateIdentity, CandidateSource, CanonicalCandidate, Hit, Mode, Policy,
+        RowIdentity, Work, cosine, retain_best,
+    },
 };
 use crate::MemoryBudgetOwner;
 use contextdb_core::Result;
@@ -159,61 +162,15 @@ fn search_impl(
             let mut canonical = CanonicalWindow::new(source, manifest);
             if mode == Mode::Exact || manifest.active_lists == 0 || (old && c.legacy_unserviceable)
             {
-                if old {
-                    let mut id = c.legacy_first;
-                    for _ in 0..c.legacy_runs {
-                        let run = Run::load(source, manifest, id)?;
-                        let mut slot = run.first;
-                        for _ in 0..run.entries {
-                            source.check_cancel()?;
-                            let e = metadata.entry(slot)?;
-                            if e.lsn > c.frontier
-                                && e.lsn <= c.switch_lsn
-                                && is_visible(
-                                    source,
-                                    manifest,
-                                    slot,
-                                    &mut visibility,
-                                    &mut vis_loaded,
-                                )?
-                            {
-                                score_exact(
-                                    source,
-                                    query,
-                                    slot,
-                                    false,
-                                    mode,
-                                    &mut canonical,
-                                    &mut raw,
-                                    &mut values,
-                                    &mut candidates,
-                                    depth,
-                                    work,
-                                )?;
-                            }
-                            slot = e.next;
-                        }
-                        id = run.next;
-                    }
-                    if id != 0 {
-                        return Err(corrupt());
-                    }
-                } else {
-                    for slot in 0..manifest.slots {
-                        source.check_cancel()?;
-                        let e = metadata.entry(slot)?;
-                        if (e.prepared && e.run == c.remap_output)
-                            || !is_visible(
-                                source,
-                                manifest,
-                                slot,
-                                &mut visibility,
-                                &mut vis_loaded,
-                            )?
-                        {
-                            continue;
-                        }
-                        let tail = e.tail >= c.tail_head && e.tail < c.tail_end;
+                for_each_visible_slot(
+                    source,
+                    manifest,
+                    c,
+                    old,
+                    &mut metadata,
+                    &mut visibility,
+                    &mut vis_loaded,
+                    |slot, _entry, tail| {
                         score_exact(
                             source,
                             query,
@@ -226,9 +183,9 @@ fn search_impl(
                             &mut candidates,
                             depth,
                             work,
-                        )?;
-                    }
-                }
+                        )
+                    },
+                )?;
             } else {
                 let book = Codebook::load_values(owner, source, manifest)?;
                 for list in 0..manifest.active_lists {
@@ -583,4 +540,218 @@ impl<'a, S: ReadPages> CanonicalWindow<'a, S> {
         }
         Ok(row)
     }
+}
+
+/// Search the captured scope with the caller's fallible query callback.
+#[allow(clippy::too_many_arguments)]
+pub fn search_with_eligibility<E: From<contextdb_core::Error>>(
+    source: &impl ReadPages,
+    policy: Policy,
+    owner: &MemoryBudgetOwner,
+    query: &[f32],
+    partitions: Option<&[u64]>,
+    mode: Mode,
+    _eligible: &mut dyn FnMut(CandidateIdentity<'_>) -> std::result::Result<bool, E>,
+    output: &mut [Hit],
+    work: &mut Work,
+) -> std::result::Result<usize, E> {
+    search_with_work(source, policy, owner, query, partitions, mode, output, work).map_err(E::from)
+}
+
+/// Iterate the same visible slot set used by exhaustive distance search.
+#[allow(clippy::too_many_arguments)]
+fn for_each_visible_slot<S: ReadPages, E: From<contextdb_core::Error>>(
+    source: &S,
+    manifest: Manifest,
+    c: Catalog,
+    old: bool,
+    metadata: &mut MetadataWindow<'_, S>,
+    visibility: &mut [u8; PAGE_BYTES],
+    vis_loaded: &mut Option<u64>,
+    mut visit: impl FnMut(u64, Entry, bool) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
+    if old {
+        let mut id = c.legacy_first;
+        for _ in 0..c.legacy_runs {
+            let run = Run::load(source, manifest, id)?;
+            let mut slot = run.first;
+            for _ in 0..run.entries {
+                source.check_cancel()?;
+                let e = metadata.entry(slot)?;
+                if e.lsn > c.frontier
+                    && e.lsn <= c.switch_lsn
+                    && is_visible(source, manifest, slot, visibility, vis_loaded)?
+                {
+                    visit(slot, e, false)?;
+                }
+                slot = e.next;
+            }
+            id = run.next;
+        }
+        if id != 0 {
+            return Err(corrupt().into());
+        }
+    } else {
+        for slot in 0..manifest.slots {
+            source.check_cancel()?;
+            let e = metadata.entry(slot)?;
+            if (e.prepared && e.run == c.remap_output)
+                || !is_visible(source, manifest, slot, visibility, vis_loaded)?
+            {
+                continue;
+            }
+            let tail = e.tail >= c.tail_head && e.tail < c.tail_end;
+            visit(slot, e, tail)?;
+        }
+    }
+    Ok(())
+}
+
+/// Visit every visible stored-precision vector without a distance shortlist.
+pub fn visit_visible_canonical<E: From<contextdb_core::Error>>(
+    source: &impl ReadPages,
+    owner: &MemoryBudgetOwner,
+    query: &[f32],
+    partitions: Option<&[u64]>,
+    eligible: &mut dyn FnMut(CandidateIdentity<'_>) -> std::result::Result<bool, E>,
+    visitor: &mut dyn FnMut(CanonicalCandidate<'_>) -> std::result::Result<(), E>,
+    work: &mut Work,
+) -> std::result::Result<(), E> {
+    *work = Work::default();
+    let tracked = super::page_work::Tracked::new(source);
+    let result = (|| -> std::result::Result<(), E> {
+        let raw_bytes = query
+            .len()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(overflow)?;
+        let charge = canonical_visit_layout(&tracked, query.len())?;
+        let _scratch = Invoice::reserve(owner, charge, "clustered_canonical_visit")?;
+        let mut raw = vec![0; raw_bytes];
+        let mut values = vec![0.0; query.len()];
+        let snapshot_lsn = contextdb_core::Lsn(tracked.snapshot_lsn()?);
+        let mut partition = |partition| -> std::result::Result<(), E> {
+            let Some(m) = tracked.manifest(partition)? else {
+                return Ok(());
+            };
+            if m.dimensions != query.len() {
+                return Err(dimension(&tracked, m.dimensions, query.len()).into());
+            }
+            if m.active_lists > m.lists || m.sealed_slots > m.slots {
+                return Err(corrupt().into());
+            }
+            let c = Catalog::load(&tracked, m)?;
+            for old in [false, true] {
+                let manifest = if old {
+                    let Some(m) = c.legacy else { continue };
+                    m
+                } else {
+                    m
+                };
+                if manifest.dimensions != query.len() {
+                    return Err(dimension(&tracked, manifest.dimensions, query.len()).into());
+                }
+                let mut metadata = MetadataWindow::new(&tracked, manifest);
+                let mut canonical = CanonicalWindow::new(&tracked, manifest);
+                let mut visibility = [0; PAGE_BYTES];
+                let mut loaded = None;
+                for_each_visible_slot(
+                    &tracked,
+                    manifest,
+                    c,
+                    old,
+                    &mut metadata,
+                    &mut visibility,
+                    &mut loaded,
+                    |slot, entry, tail| {
+                        let row = canonical.vector(slot, &mut raw, &mut values)?;
+                        let identity = CandidateIdentity {
+                            index: tracked.index_identity(),
+                            partition: manifest.partition,
+                            generation: manifest.generation,
+                            run: entry.run,
+                            slot,
+                            row: RowIdentity {
+                                row,
+                                commit_lsn: entry.lsn,
+                            },
+                            snapshot_lsn,
+                            source: if old {
+                                CandidateSource::LegacyRun
+                            } else if tail {
+                                CandidateSource::UnsealedTail
+                            } else if entry.run == 0 {
+                                CandidateSource::ServingBase
+                            } else {
+                                CandidateSource::CommittedRun
+                            },
+                        };
+                        if !eligible(identity)? {
+                            return Ok(());
+                        }
+                        tracked.before_distance(if tail {
+                            DistanceKind::Buffer
+                        } else {
+                            DistanceKind::Canonical
+                        })?;
+                        let distance = cosine(query, &values);
+                        if tail {
+                            work.buffer_evaluations += 1;
+                        } else {
+                            work.full_precision_evaluations += 1;
+                        }
+                        work.exact_score_count += 1;
+                        visitor(CanonicalCandidate {
+                            identity,
+                            values: &values,
+                            distance,
+                        })
+                    },
+                )?;
+            }
+            Ok(())
+        };
+        if let Some(partitions) = partitions {
+            for (at, p) in partitions.iter().enumerate() {
+                if !partitions[..at].contains(p) {
+                    partition(*p)?;
+                }
+            }
+        } else {
+            let mut after = None;
+            while let Some(p) = tracked.next_partition(after)? {
+                partition(p)?;
+                after = Some(p);
+            }
+        }
+        Ok(())
+    })();
+    tracked.apply(work);
+    result
+}
+
+fn canonical_visit_layout<S: ReadPages>(_: &S, dimensions: usize) -> Result<usize> {
+    let raw = dimensions
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(overflow)?;
+    let mut layout = std::alloc::Layout::new::<(
+        MetadataWindow<'_, S>,
+        CanonicalWindow<'_, S>,
+        [u8; PAGE_BYTES],
+        Catalog,
+        Manifest,
+        Vec<u8>,
+        Vec<f32>,
+    )>();
+    for part in [
+        std::alloc::Layout::array::<u8>(raw),
+        std::alloc::Layout::array::<f32>(dimensions),
+    ] {
+        layout = layout
+            .extend(part.map_err(|_| overflow())?)
+            .map_err(|_| overflow())?
+            .0;
+    }
+    Ok(layout.pad_to_align().size())
 }
