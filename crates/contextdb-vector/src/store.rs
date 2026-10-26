@@ -5265,21 +5265,6 @@ impl IndexState {
         Ok(Some(std::mem::take(&mut loaded.entry.vector)))
     }
 
-    #[allow(dead_code)] // Retain the direct visible-entry route for bounded read fallbacks.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    fn load_visible_entry_by_row(
-        &self,
-        index: &VectorIndexRef,
-        row_id: RowId,
-        snapshot: SnapshotId,
-        owner: &mut VectorCopyAdmission,
-    ) -> Result<Option<VectorEntry>> {
-        self.load_visible_entry_by_row_caching(index, row_id, snapshot, true, owner)
-    }
-
     /// `cache` lets a caller-facing read fault in a fitting durable
     /// partition; commit and maintenance reads only use an existing cache.
     #[expect(
@@ -5840,21 +5825,6 @@ impl IndexState {
                 })
                 .cloned()
         })
-    }
-
-    #[allow(dead_code)] // Retain the direct membership check for bounded read fallbacks.
-    fn directory_has_row_lsn(&self, row_id: RowId, lsn: Lsn) -> bool {
-        let directory = self.raw_directory.read();
-        self.raw_directory_by_row
-            .read()
-            .get(&row_id)
-            .is_some_and(|positions| {
-                positions.iter().any(|position| {
-                    directory
-                        .get(*position)
-                        .is_some_and(|entry| entry.lsn == lsn)
-                })
-            })
     }
 
     pub(crate) fn directory_visible_entry_count(
@@ -13205,22 +13175,6 @@ pub struct VectorMaintenanceReport {
     pub remaining_partitions: usize,
     pub first_failure: Option<VectorMaintenanceFailure>,
     pub first_failure_details: Option<VectorMaintenanceFailureDetails>,
-}
-
-#[derive(Default)]
-#[allow(dead_code)] // Keep pending change ownership grouped for the partitioned write path.
-struct PendingVectorChanges {
-    deletes: Vec<(VectorIndexRef, RowId, TxId, TxId, Lsn)>,
-    inserts: Vec<VectorEntry>,
-    moves: Vec<(VectorIndexRef, RowId, RowId, TxId, TxId, Lsn)>,
-}
-
-#[derive(Default)]
-#[allow(dead_code)] // Keep borrowed pending change ownership grouped with its owned form.
-struct PendingVectorChangesRef<'a> {
-    deletes: Vec<&'a (VectorIndexRef, RowId, TxId)>,
-    inserts: Vec<&'a VectorEntry>,
-    moves: Vec<&'a (VectorIndexRef, RowId, RowId, TxId)>,
 }
 
 #[derive(Default)]
