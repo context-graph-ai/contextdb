@@ -3619,6 +3619,9 @@ impl ReadSession {
             return Err(Error::ReadCancelled);
         }
         if let Some(statement) = contextdb_parser::parser::parse_read_cache_share_statement(sql) {
+            if cancellation.is_cancelled() {
+                return Err(Error::ReadCancelled);
+            }
             return self.execute_cache_setting(statement, selected.as_ref());
         }
         // The keeper is outside all query allocations and survives BOTH
