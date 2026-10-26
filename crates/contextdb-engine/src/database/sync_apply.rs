@@ -1158,6 +1158,42 @@ impl Database {
         Ok(false)
     }
 
+    /// A conflicting CREATE cannot authorize data against a different local
+    /// shape. Judge it before source units split, so the existing durable
+    /// hold also covers dependent rows on later pages and after restart.
+    fn arriving_create_table_shape_refusal(
+        &self,
+        name: &str,
+        columns: &[(String, String)],
+        constraints: &[String],
+        foreign_keys: &[SingleColumnForeignKey],
+        composite_foreign_keys: &[CompositeForeignKey],
+        composite_unique: &[Vec<String>],
+    ) -> Option<Error> {
+        let local = self.table_meta(name)?;
+        if !sync_table_shape_matches(
+            &local,
+            columns,
+            constraints,
+            foreign_keys,
+            composite_foreign_keys,
+            composite_unique,
+        ) {
+            return Some(Error::SchemaInvalid {
+                reason: format!("schema mismatch for table {name}: structured constraints differ"),
+            });
+        }
+        if !sync_table_columns_match(&local, columns) {
+            let (local_columns, remote_columns) = sync_table_column_lists(&local, columns);
+            return Some(Error::SchemaInvalid {
+                reason: format!(
+                    "schema mismatch for table {name}: local columns {local_columns:?} differ from remote {remote_columns:?}"
+                ),
+            });
+        }
+        None
+    }
+
     /// Whether this node's declared or bound policy refuses one arriving
     /// table statement, and with what typed refusal. The caller refuses the
     /// statement's WHOLE authored transaction on a refusal: an authenticated
@@ -1200,6 +1236,18 @@ impl Database {
                 ),
                 _ => return Ok(None),
             };
+        if matches!(change, DdlChange::CreateTable { .. })
+            && let Some(refusal) = self.arriving_create_table_shape_refusal(
+                name,
+                columns,
+                constraints,
+                foreign_keys,
+                composite_foreign_keys,
+                composite_unique,
+            )
+        {
+            return Ok(Some(refusal));
+        }
         let incoming = rough_sync_table_meta(
             columns,
             constraints,
@@ -4227,41 +4275,17 @@ impl Database {
                                 composite_unique,
                             } => {
                                 if self.table_meta(&name).is_some() {
-                                    if let Some(local_meta) = self.table_meta(&name) {
-                                        if !sync_table_shape_matches(
-                                            &local_meta,
-                                            &columns,
-                                            &constraints,
-                                            &foreign_keys,
-                                            &composite_foreign_keys,
-                                            &composite_unique,
-                                        ) {
-                                            return Err(Error::SchemaInvalid {
-                                                reason: format!(
-                                                    "schema mismatch for table {name}: structured constraints differ"
-                                                ),
-                                            });
-                                        }
-                                        if !sync_table_columns_match(&local_meta, &columns) {
-                                            let (local_cols, remote_cols) =
-                                                sync_table_column_lists(&local_meta, &columns);
-                                            result.conflicts.push(Conflict {
-                                    natural_key: NaturalKey::single(
-                                        "table".to_string(),
-                                        Value::Text(name.clone()),
-                                    ),
-                                    resolution: ConflictPolicy::ServerWins,
-                                    reason: Some(format!(
-                                        "schema mismatch: local columns {:?} differ from remote {:?}",
-                                        local_cols, remote_cols
-                                    )),
-                                    table: None,
-                                    mutation_kind: None,
-                                    winning_author_node_id: None,
-                                    hub_acceptance_position: None,
-                                    refusal_cause: None,
-                                });
-                                        }
+                                    // The planner normally removes refused declarations;
+                                    // this boundary also refuses an unplanned mismatch.
+                                    if let Some(refusal) = self.arriving_create_table_shape_refusal(
+                                        &name,
+                                        &columns,
+                                        &constraints,
+                                        &foreign_keys,
+                                        &composite_foreign_keys,
+                                        &composite_unique,
+                                    ) {
+                                        return Err(refusal);
                                     }
                                     // Adopt the arriving declaration's policy for a table
                                     // that already exists here undeclared — the same
