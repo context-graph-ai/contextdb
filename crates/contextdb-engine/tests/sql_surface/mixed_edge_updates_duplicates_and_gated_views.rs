@@ -67,11 +67,13 @@ fn record_session(session: &ReadSession, label: &str, answers: &mut Vec<(String,
         !cursor.first_page().has_more(),
         "{label}: the bindings fit in the first page"
     );
-    assert!(cursor
-        .first_page()
-        .rows()
-        .iter()
-        .all(|row| row == &child(1)[0]));
+    assert!(
+        cursor
+            .first_page()
+            .rows()
+            .iter()
+            .all(|row| row == &child(1)[0])
+    );
     answers.push((
         format!("{label}: file cursor"),
         cursor.first_page().rows().len(),
