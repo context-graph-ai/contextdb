@@ -833,3 +833,8 @@ path = "tests/exact_vector_cursor_releases_only_its_reader_credit.rs"
 name = "memory-census"
 path = "src/bin/memory-census.rs"
 required-features = ["test-seams"]
+
+[[test]]
+name = "import_persistence_without_observer"
+path = "tests/import_persistence_without_observer.rs"
+required-features = ["test-seams"]
