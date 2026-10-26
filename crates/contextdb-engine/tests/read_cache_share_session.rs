@@ -189,7 +189,10 @@ fn owner_cursor_continuation(
             }
         }
     });
-    let effective = session.read_cache_share_status().effective_bytes;
+    let effective = session
+        .read_cache_share_status()
+        .expect("the session inspects its read cache share")
+        .effective_bytes;
     drop(cursor);
     (bytes, rows, effective)
 }
@@ -302,7 +305,9 @@ fn a_session_keeps_its_declared_share_on_the_file_route_it_selects_when_its_writ
         "with its writer closed the session reads through the file"
     );
     let ((), repeated) = backend_bytes(round);
-    let status = session.read_cache_share_status();
+    let status = session
+        .read_cache_share_status()
+        .expect("the session inspects its read cache share");
     assert_eq!(
         (status.declared, status.effective_bytes),
         (Some(40), declared_bytes(40)),
@@ -364,7 +369,9 @@ fn a_readers_cache_and_its_index_fit_inside_its_session_ceiling() {
             )
         });
         assert_eq!(session.route(), ReadRoute::File);
-        let status = session.read_cache_share_status();
+        let status = session
+            .read_cache_share_status()
+            .expect("the session inspects its read cache share");
         let prepaid = status
             .prepaid_index_bytes
             .expect("an open file reader reports the index prepaid for its cache");
@@ -377,4 +384,130 @@ fn a_readers_cache_and_its_index_fit_inside_its_session_ceiling() {
             status.fixed_reservation_bytes
         );
     }
+}
+
+/// After its writer closes, a session that has run no statement since still
+/// inspects and resizes the cache of the file route it now reads through: its
+/// status reports that file reader's cache, not the departed owner route, and
+/// a share it declares then is the file reader's share.
+#[test]
+fn after_its_writer_closes_a_session_inspects_and_resizes_its_file_route_before_any_statement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("turnover-status.db");
+    let writer = seeded_writer(&path, TURNOVER_ROWS);
+    let session = session_beside_the_writer(&path, None);
+    session
+        .execute(
+            "SELECT id FROM cache_share WHERE id = $id",
+            &params([("id", Value::Int64(0))]),
+        )
+        .expect("the session answers beside its writer");
+    writer.close().unwrap();
+
+    let status = session
+        .read_cache_share_status()
+        .expect("the session inspects its read cache share");
+    assert!(
+        status.prepaid_index_bytes.is_some() && status.held_page_bytes.is_some(),
+        "with its writer gone, the session's cache inspection reports the file reader it now \
+         reads through, not the departed owner route: {status:?}"
+    );
+    assert_eq!(
+        session.route(),
+        ReadRoute::File,
+        "inspecting the cache moved the session onto the file route"
+    );
+    session
+        .set_read_cache_share(Some(40))
+        .expect("the session declares a 40% share on its file route");
+    let status = session
+        .read_cache_share_status()
+        .expect("the session inspects its read cache share");
+    assert_eq!(
+        (status.declared, status.effective_bytes),
+        (Some(40), declared_bytes(40)),
+        "the file route's cache is the declared 40%"
+    );
+    assert!(
+        status.prepaid_index_bytes.is_some(),
+        "the file reader's prepaid index is still reported after the change: {status:?}"
+    );
+}
+
+/// What the rest of an owner-route cursor reads, on a fresh copy of the
+/// seeded store, after its writer closed and its first file fetch opened a
+/// private file reader: the cursor opens at `opened_at`, the writer closes,
+/// one page is fetched through the file, the session then declares
+/// `changed_to` if given, and the remaining pages are read. Returns the
+/// remaining fetches' backend bytes and every row in order.
+fn continued_cursor_after_a_share_change(
+    seeded: &Path,
+    opened_at: u8,
+    changed_to: Option<u8>,
+) -> (u64, Vec<Vec<Value>>) {
+    let directory = tempfile::tempdir().unwrap();
+    copy_store(seeded, directory.path());
+    let path = directory.path().join("owner-cursor.db");
+    let writer = Database::open(&path).unwrap();
+    let session = session_beside_the_writer(&path, Some(opened_at));
+    let mut cursor = session
+        .open_cursor(SELECT_ALL, &HashMap::new())
+        .expect("an owner cursor opens beside the writer");
+    let mut rows: Vec<Vec<Value>> = cursor.first_page().rows().to_vec();
+    writer.close().unwrap();
+    let first = cursor
+        .fetch(None)
+        .expect("the cursor continues through its own file reader");
+    rows.extend(first.rows().iter().cloned());
+    assert!(
+        first.has_more(),
+        "the cursor has pages left after its first file fetch"
+    );
+    if let Some(percent) = changed_to {
+        session
+            .set_read_cache_share(Some(percent))
+            .expect("the session changes its share while the cursor continues");
+    }
+    let ((), bytes) = backend_bytes(|| {
+        loop {
+            let page = cursor
+                .fetch(None)
+                .expect("the cursor keeps reading through its own file reader");
+            rows.extend(page.rows().iter().cloned());
+            if !page.has_more() {
+                break;
+            }
+        }
+    });
+    drop(cursor);
+    (bytes, rows)
+}
+
+/// A cursor already continuing on its own file reader after its writer
+/// exited honours a share its session declares afterwards: turned off after
+/// the first file fetch, the rest of the cursor reads like a continuation with
+/// no file cache, not like one still at the 40% it opened with.
+#[test]
+fn a_cursor_continuing_on_its_own_file_reader_honours_a_later_share_change() {
+    let seeded = tempfile::tempdir().unwrap();
+    seeded_store(seeded.path(), CURSOR_ROWS);
+    let (kept_at_40, _) = continued_cursor_after_a_share_change(seeded.path(), 40, None);
+    let (opened_at_0, _) = continued_cursor_after_a_share_change(seeded.path(), 0, None);
+    let (turned_off, rows) = continued_cursor_after_a_share_change(seeded.path(), 40, Some(0));
+    assert_eq!(
+        rows,
+        all_rows(CURSOR_ROWS),
+        "the cursor returns every row once"
+    );
+    assert!(
+        opened_at_0 > 4 * kept_at_40,
+        "the fixture must separate a continuation with no file cache ({opened_at_0} bytes) from \
+         one at 40% ({kept_at_40} bytes)"
+    );
+    assert!(
+        2 * turned_off > opened_at_0 + kept_at_40,
+        "after the session turned its file cache off, the rest of the cursor must read like a \
+         continuation with no cache ({opened_at_0} bytes), not like one still at the 40% its \
+         private reader opened with ({kept_at_40} bytes); it read {turned_off}"
+    );
 }

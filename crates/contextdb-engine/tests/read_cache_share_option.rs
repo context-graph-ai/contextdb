@@ -203,7 +203,9 @@ fn a_read_cache_share_set_on_an_open_session_is_inspected_and_range_checked() {
     let path = root.path().join("api-inspect.db");
     seed(&path);
     let reader = fixture::open_file(&path, options(None), Arc::new(fixture::Routes::default()));
-    let status = reader.read_cache_share_status();
+    let status = reader
+        .read_cache_share_status()
+        .expect("the session inspects its read cache share");
     assert_eq!(reader.options().read_cache_share, None);
     assert_eq!(
         (status.declared, status.effective_bytes as u64),
@@ -213,7 +215,9 @@ fn a_read_cache_share_set_on_an_open_session_is_inspected_and_range_checked() {
     reader
         .set_read_cache_share(Some(40))
         .expect("an open session declares a 40% read cache share");
-    let status = reader.read_cache_share_status();
+    let status = reader
+        .read_cache_share_status()
+        .expect("the session inspects its read cache share");
     assert_eq!(reader.options().read_cache_share, Some(40));
     assert_eq!(
         (
@@ -236,7 +240,9 @@ fn a_read_cache_share_set_on_an_open_session_is_inspected_and_range_checked() {
     reader
         .set_read_cache_share(Some(0))
         .expect("a streaming session turns its file cache off");
-    let status = reader.read_cache_share_status();
+    let status = reader
+        .read_cache_share_status()
+        .expect("the session inspects its read cache share");
     assert_eq!(
         (status.declared, status.effective_bytes as u64),
         (Some(0), 0)
@@ -244,7 +250,9 @@ fn a_read_cache_share_set_on_an_open_session_is_inspected_and_range_checked() {
     reader
         .set_read_cache_share(None)
         .expect("a session returns to the derived default");
-    let status = reader.read_cache_share_status();
+    let status = reader
+        .read_cache_share_status()
+        .expect("the session inspects its read cache share");
     assert_eq!(
         (status.declared, status.effective_bytes as u64),
         (None, derived_default())
@@ -351,7 +359,10 @@ fn shrinking_the_share_under_an_open_cursor_keeps_its_rows_and_snapshot() {
         seen.len()
     );
     assert_eq!(
-        reader.read_cache_share_status().effective_bytes as u64,
+        reader
+            .read_cache_share_status()
+            .expect("the session inspects its read cache share")
+            .effective_bytes as u64,
         declared_bytes(2),
         "once the cursor finishes, the session runs at the smaller cache"
     );
