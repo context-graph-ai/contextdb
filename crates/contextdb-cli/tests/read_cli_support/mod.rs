@@ -16,7 +16,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -487,52 +487,44 @@ pub struct Background {
 pub fn background(args: &[&str]) -> Background {
     let mut cmd = base_command();
     cmd.args(args);
+    // This fixture observes one ordered transcript. One kernel pipe preserves
+    // the child's write order across its two descriptors. The stream-purity
+    // journeys use run(), which captures stdout and stderr separately.
+    let (output, sink) = std::io::pipe().expect("background output pipe");
     let mut child = cmd
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(sink.try_clone().expect("clone background output writer"))
+        .stderr(sink)
         .spawn()
         .expect("spawn a background contextdb session");
 
     let stdin = child.stdin.take().expect("background stdin");
     let transcript = Arc::new((Mutex::new(String::new()), Condvar::new()));
-    let mut output_readers = Vec::new();
-    for stream in [
-        child.stdout.take().map(StreamHandle::Out),
-        child.stderr.take().map(StreamHandle::Err),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let sink = Arc::clone(&transcript);
-        output_readers.push(std::thread::spawn(move || {
-            let mut reader: Box<dyn Read + Send> = match stream {
-                StreamHandle::Out(out) => Box::new(out),
-                StreamHandle::Err(err) => Box::new(err),
-            };
-            let mut buffer = [0u8; 4096];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => {
-                        let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                        let (lock, signal) = &*sink;
-                        let mut held = lock.lock().expect("background transcript lock");
-                        held.push_str(&text);
-                        signal.notify_all();
-                    }
+    let sink = Arc::clone(&transcript);
+    let output_reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(output);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let (lock, signal) = &*sink;
+                    let mut held = lock.lock().expect("background transcript lock");
+                    held.push_str(&line);
+                    signal.notify_all();
                 }
             }
-            let (_, signal) = &*sink;
-            signal.notify_all();
-        }));
-    }
+        }
+        let (_, signal) = &*sink;
+        signal.notify_all();
+    });
 
     Background {
         child,
         stdin: Some(stdin),
         transcript,
-        output_readers,
+        output_readers: vec![output_reader],
         path: PathBuf::new(),
     }
 }
@@ -609,8 +601,8 @@ impl Background {
     pub fn finish(mut self) -> (Option<i32>, String) {
         self.stdin.take();
         let status = self.child.wait().expect("wait for the background session");
-        // Process exit closes its pipes, but the reader threads may still be
-        // draining them. Collect both streams before asserting on the output.
+        // Process exit closes its output. Collect the reader's remaining
+        // bytes before returning the transcript.
         for reader in self.output_readers.drain(..) {
             reader.join().expect("collect background session output");
         }
