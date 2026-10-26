@@ -201,7 +201,7 @@ fn owner_cursor_refresh_contention_refuses_before_refresh_release() {
             .owner_cursor_pin()
             .expect("retry after refresh release"),
     );
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "test-seams"))]
     maintenance_contention_row(MaintenanceContention::PendingHandoff, false);
 }
 
@@ -733,7 +733,7 @@ fn a_registry_replaced_before_validation_is_a_terminal_typed_admission_refusal()
     assert_eq!(pause.attempts_for_test(), 1);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
 #[derive(Clone, Copy)]
 enum MaintenanceContention {
     PendingHandoff,
@@ -744,7 +744,7 @@ enum MaintenanceContention {
 // Original-view continuity and optional-maintenance deferral.
 // These extend the owner-admission schedules; the real caller
 // must distinguish temporary contention from permission to reclaim pages.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
 fn maintenance_contention_row(contention: MaintenanceContention, retention: bool) {
     use super::read_persistence_test_scaffold::{
         ReaderRegistrationLockPhase, pause_reader_registration_lock_for_test,
@@ -1019,7 +1019,7 @@ fn maintenance_contention_row(contention: MaintenanceContention, retention: bool
     db.close().unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
 #[test]
 fn automatic_compaction_defers_registry_contention() {
     if crate::test_process::rerun_alone(
@@ -1032,7 +1032,7 @@ fn automatic_compaction_defers_registry_contention() {
     maintenance_contention_row(MaintenanceContention::Registry, false);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
 #[test]
 fn automatic_compaction_defers_physical_publication_hold() {
     if crate::test_process::rerun_alone(
@@ -1045,13 +1045,13 @@ fn automatic_compaction_defers_physical_publication_hold() {
     maintenance_contention_row(MaintenanceContention::PhysicalHold, false);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
 #[test]
 fn retention_compaction_defers_registry_contention() {
     maintenance_contention_row(MaintenanceContention::Registry, true);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "test-seams"))]
 #[test]
 fn retention_compaction_defers_physical_publication_hold() {
     maintenance_contention_row(MaintenanceContention::PhysicalHold, true);
