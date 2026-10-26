@@ -1822,6 +1822,12 @@ graph_commit_result }.map_err(Self::storage_error)?;
                 // The rows are written again below: the version side of
                 // every index is folded afresh from them.
                 if let Some(meta) = stage.table_meta.get(&table) {
+                    // A retained empty relation still needs a physical family
+                    // and its producer witness. No row callback recreates it.
+                    drop(
+                        content_size::open_rows(&write_txn, table_def, Some(meta))
+                            .map_err(Self::storage_error)?,
+                    );
                     for declaration in Self::relational_index_declarations(meta) {
                         commitments.reset(
                             &write_txn,
