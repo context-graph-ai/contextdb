@@ -901,10 +901,8 @@ pub enum DirectFileReaderError {
     /// a route that must report the same fault the same way whichever way it
     /// reached the store picks the typed answer up there.
     Engine(contextdb_core::error::DiagnosticText),
-    /// A decoder configuration refusal retains its static taxonomy across the
-    /// file route, without allocating or formatting an engine error.
-
-    /// Startup admission failed before a target existed to retain the error.
+    /// A memory refusal preserves the engine's original fields without
+    /// formatting or allocating a replacement diagnostic.
     MemoryBudget {
         subsystem: contextdb_core::error::DiagnosticLabel,
         operation: contextdb_core::error::DiagnosticLabel,
@@ -954,9 +952,11 @@ impl PreparedEngineDiagnostic {
     pub(crate) fn engine(self, error: contextdb_core::Error) -> DirectFileReaderError {
         use contextdb_core::Error;
         match error {
+            error @ (Error::MemoryBudgetExceeded { .. } | Error::NativeEngineOther(_)) => {
+                crate::read_image::history_answer_error(error)
+            }
             Error::Other(reason) => DirectFileReaderError::Engine(reason),
             Error::FundedEngine(owner) => DirectFileReaderError::Engine(owner.into()),
-            Error::NativeEngineOther(refusal) => DirectFileReaderError::Engine(refusal.into()),
             error => {
                 DirectFileReaderError::Engine(contextdb_core::error::DiagnosticText::from_shared(
                     self.0.publish(EngineDiagnostic {

@@ -346,6 +346,14 @@ pub(crate) fn encoding_answer_error(
 /// damage is the typed corrupt-store answer and a memory refusal is the typed
 /// budget answer, so neither is flattened into an untyped engine message.
 pub(crate) fn history_answer_error(error: Error) -> DirectFileReaderError {
+    let error = match error {
+        Error::NativeEngineOther(
+            refusal @ contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded { .. },
+        ) => crate::persistence::native_storage_admission::original_storage_error(
+            crate::persistence::native_storage_admission::NativeStorageFailure::Refused(refusal),
+        ),
+        error => error,
+    };
     match error {
         Error::StoreCorrupted { path, reason } => DirectFileReaderError::CorruptStore(
             crate::direct_file_reader::DirectStoreDiagnostic::MalformedRecord,
@@ -2003,8 +2011,7 @@ pub(crate) fn read_metadata_body(
                             error,
                             contextdb_core::read_contract::ReadLimits::SHIPPED_MEMORY,
                         )
-                    },
-                )?;
+                    })?;
             if has_more == counts.is_some() {
                 return Err(invalid_metadata_payload());
             }
