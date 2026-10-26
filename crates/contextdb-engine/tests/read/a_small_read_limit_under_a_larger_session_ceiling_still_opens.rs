@@ -7,9 +7,9 @@
 //! shipped 16 MiB per-read limit (or 64 MiB) opens its file reader and
 //! answers, exactly as it did before the cache share was derived from the
 //! declared budget, and so do sessions whose ceiling and read limit are both
-//! 16 MiB or both 64 MiB. A budget too small to hold the
-//! committed read image at all is still refused at open with the memory-budget
-//! refusal it always had, never opened past its limit.
+//! 16 MiB or both 64 MiB. A budget too small to hold the committed read image
+//! at all is refused at open with the typed memory-budget refusal, never
+//! opened past its limit.
 
 use super::reader_proof_support as fixture;
 use contextdb_core::Value;
@@ -104,8 +104,11 @@ fn a_reader_opens_and_answers_when_its_session_ceiling_is_at_or_above_its_read_l
     }
 }
 
-/// A budget too small to hold the committed read image is refused at open
-/// with the memory-budget refusal, as before.
+/// A budget too small for the read image is refused at open with the typed
+/// memory-budget refusal: the direct-read subsystem, the image hydration that
+/// needed the memory, the bytes it asked for against the bytes still free,
+/// the declared budget, and a hint. A caller can tell a reader that is too
+/// small from any other failure without reading its message.
 #[test]
 fn a_budget_too_small_for_the_read_image_is_still_refused_at_open() {
     let directory = tempfile::tempdir().unwrap();
@@ -121,11 +124,37 @@ fn a_budget_too_small_for_the_read_image_is_still_refused_at_open() {
             None,
         ) {
             Ok(_) => panic!("a {budget}-byte reader cannot hold the committed read image"),
-            Err(refusal) => refusal.to_string(),
+            Err(refusal) => refusal,
         };
-        assert!(
-            refusal.contains("memory budget exceeded"),
-            "a {budget}-byte reader is refused for its memory budget: {refusal}"
-        );
+        match refusal {
+            contextdb_core::Error::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            } => {
+                assert_eq!(AsRef::<str>::as_ref(&subsystem), "direct_read");
+                assert_eq!(AsRef::<str>::as_ref(&operation), "hydrate_owned_image");
+                assert_eq!(
+                    budget_limit_bytes, budget,
+                    "the refusal names the reader's declared budget"
+                );
+                assert!(
+                    available_bytes <= budget && requested_bytes > available_bytes,
+                    "the hydration asked for more than the budget still had free: requested \
+                     {requested_bytes}, available {available_bytes} of {budget}"
+                );
+                assert!(
+                    !AsRef::<str>::as_ref(&hint).is_empty(),
+                    "the refusal tells the caller what to do"
+                );
+            }
+            other => panic!(
+                "a {budget}-byte reader is refused with the typed Error::MemoryBudgetExceeded, \
+                 not {other:?}"
+            ),
+        }
     }
 }
