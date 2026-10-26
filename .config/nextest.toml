@@ -6,3 +6,8 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'package(contextdb-core) & (binary(read_contract_compile) | binary(txid_newtype_tests) | binary(error_non_exhaustive_tests))'
 test-group = 'core-compile-fixtures'
+
+# The checkpointed-commit kill test runs its cuts on four workers.
+[[profile.default.overrides]]
+filter = 'package(contextdb-engine) & test(/::a_checkpointed_commit_killed_at_every_write_leaves_the_old_or_the_new_state$/)'
+threads-required = 4

@@ -641,7 +641,10 @@ fn stop_at_cut(phase: &str, nth: u64, seen: &std::sync::atomic::AtomicU64) {
     if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == nth {
         // Parsed by the parent to prove the exact intended boundary was reached.
         eprintln!("WRITER_COMMIT_CUT={phase}:{nth}");
-        std::process::abort();
+        // Killed, as the promise says: no destructor, flush or core dump runs.
+        // SAFETY: SIGKILL to this process; kill returns only if it failed.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        unreachable!("SIGKILL ends the process");
     }
 }
 
@@ -850,7 +853,7 @@ fn a_checkpointed_commit_killed_at_every_write_leaves_the_old_or_the_new_state()
     assert_ne!(old, new, "the commit changes what the store holds");
 
     let mut turned_new_at = BTreeMap::new();
-    let cuts = ["before_write", "after_write"]
+    let cuts: Vec<(&str, u64)> = ["before_write", "after_write"]
         .into_iter()
         .flat_map(|phase| (1..=writes).map(move |nth| (phase, nth)))
         .chain(
@@ -858,9 +861,95 @@ fn a_checkpointed_commit_killed_at_every_write_leaves_the_old_or_the_new_state()
                 .into_iter()
                 .flat_map(|phase| (1..=logical_headers).map(move |nth| (phase, nth))),
         )
-        .chain([("before_sync", 1), ("after_sync", 1)]);
-    for (phase, nth) in cuts {
-        let copy = root.path().join(format!("crash-{phase}-{nth}.db"));
+        .chain([("before_sync", 1), ("after_sync", 1)])
+        .collect();
+    // Each cut kills and recovers its own copy, so the cuts run on a fixed
+    // number of workers; the assertions that follow the order of the cuts
+    // read the recovered states in cut order afterwards.
+    const CUT_WORKERS: usize = 4;
+    let recovered_states: Vec<Vec<String>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..CUT_WORKERS)
+            .map(|worker| {
+                let (cuts, root, base, old, new) = (&cuts, &root, &base, &old, &new);
+                scope.spawn(move || {
+                    cuts.iter()
+                        .enumerate()
+                        .skip(worker)
+                        .step_by(CUT_WORKERS)
+                        .map(|(index, &(phase, nth))| {
+                            (
+                                index,
+                                kill_and_recover(
+                                    root.path(),
+                                    base,
+                                    next,
+                                    phase,
+                                    nth,
+                                    writes,
+                                    old,
+                                    new,
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut states = vec![Vec::new(); cuts.len()];
+        for worker in workers {
+            for (index, state) in worker.join().expect("a cut worker panicked") {
+                states[index] = state;
+            }
+        }
+        states
+    });
+    for (&(phase, nth), state) in cuts.iter().zip(recovered_states) {
+        let is_old = state == old;
+        let is_new = state == new;
+        if phase.ends_with("write") && is_new {
+            turned_new_at.entry(phase).or_insert(nth);
+        }
+        if let Some(turned) = turned_new_at.get(phase) {
+            assert!(
+                is_new,
+                "write {nth}: once the commit is published (write {turned}) every later kill keeps it"
+            );
+        }
+        if (phase == "before_write" && nth <= headers[0])
+            || (phase == "after_write" && nth < headers[0])
+        {
+            assert!(
+                is_old,
+                "{phase} {nth}: before header publication must recover old state"
+            );
+        }
+        if phase == "after_sync" {
+            assert!(is_new, "acknowledged durable sync must recover new state");
+        }
+    }
+    // The exact first-header ordinal above, rather than a ratio of write
+    // counts, is the publication boundary required by the existing oracle.
+}
+
+/// Kill a fresh copy of `base` at one cut, recover it in a fresh process, and
+/// check what one cut alone can show: the child died at the armed boundary,
+/// the store is the old or the new state, another reopen keeps it, and the
+/// next append from it converges with the control. Returns the state.
+#[allow(clippy::too_many_arguments)]
+fn kill_and_recover(
+    root: &std::path::Path,
+    base: &std::path::Path,
+    next: u64,
+    phase: &str,
+    nth: u64,
+    writes: u64,
+    old: &[String],
+    new: &[String],
+) -> Vec<String> {
+    // The clock is per thread: a worker re-appends under the control's clock.
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    {
+        let copy = root.join(format!("crash-{phase}-{nth}.db"));
         copy_store(&base, &copy);
         let output = run_child(&copy, "crash", next, Some(nth), Some(phase));
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -885,26 +974,6 @@ fn a_checkpointed_commit_killed_at_every_write_leaves_the_old_or_the_new_state()
             is_old || is_new,
             "write {nth} of {writes}: the killed store is the old or the new state, never a mixture: {state:?}"
         );
-        if phase.ends_with("write") && is_new {
-            turned_new_at.entry(phase).or_insert(nth);
-        }
-        if let Some(turned) = turned_new_at.get(phase) {
-            assert!(
-                is_new,
-                "write {nth}: once the commit is published (write {turned}) every later kill keeps it"
-            );
-        }
-        if (phase == "before_write" && nth <= headers[0])
-            || (phase == "after_write" && nth < headers[0])
-        {
-            assert!(
-                is_old,
-                "{phase} {nth}: before header publication must recover old state"
-            );
-        }
-        if phase == "after_sync" {
-            assert!(is_new, "acknowledged durable sync must recover new state");
-        }
         // The next append from the recovered store converges with the control:
         // an old store takes the same commit again, a new store takes the next.
         let recovered = Database::open(&copy).unwrap();
@@ -923,7 +992,6 @@ fn a_checkpointed_commit_killed_at_every_write_leaves_the_old_or_the_new_state()
             );
         }
         recovered.close().expect("close the recovered store");
+        state
     }
-    // The exact first-header ordinal above, rather than a ratio of write
-    // counts, is the publication boundary required by the existing oracle.
 }
