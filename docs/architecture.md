@@ -93,7 +93,21 @@ Dedicated adjacency index maintained incrementally as edges are inserted/deleted
 - Edge-type filtering per hop
 - Direction control (outgoing, incoming, bidirectional)
 - DAG cycle detection on insert (BFS from target back to source)
-- Deduplication: `(source_id, target_id, edge_type)` is a natural key
+- Edge identity follows its table's declared key. Without a wider declared key,
+  duplicate `(source_id, target_id, edge_type)` writes name one logical edge.
+
+One logical edge can be witnessed through both the graph insertion API and its
+relational row. Readers see one binding when the table uses the triple or has no
+edge key; rows distinguished by a wider declared key remain distinct bindings.
+The graph-door record keeps ownership of its properties, including later updates.
+The row-owned witness keeps its exact row and version coordinates for history and
+purge authentication. Visibility and authorization apply to each witness before
+the shared traversal merge coalesces their alias. On a wider-key table, the
+standalone triple aliases only the row whose extra identity columns equal their
+literal or NULL defaults. Other key values remain distinct; without a matching
+row, the standalone remains its own binding. A volatile default such as `NOW()`
+cannot name one row, so its standalone binding stays distinct.
+<!-- enforced by: one_edge_written_graph_door_first_reads_as_one_edge_through_every_door, one_edge_written_row_door_first_reads_as_one_edge_through_every_door, a_wider_key_sibling_of_an_edge_written_through_both_doors_stays_a_second_binding, a_graph_property_update_keeps_the_mixed_edge_visible_once_through_every_door, memory_file_and_principal_gated_views_agree_on_the_single_mixed_binding -->
 
 ### Vector (`contextdb-vector`)
 

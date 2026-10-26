@@ -1912,6 +1912,9 @@ impl Database {
         if !trigger_callback_bound {
             self.validate_row_constraints(tx, table, &values, None, read_memory.clone())?;
         }
+        if !self.row_graph_insert_allowed(tx, table, &values, read_memory.clone())? {
+            return Ok(RowId(0));
+        }
         let assume_no_state_machine =
             if trigger_callback_bound && !self.has_access_constraints_for_query() {
                 !self.trigger_insert_table_has_state_machine(table)?
@@ -2296,6 +2299,9 @@ impl Database {
             .and_then(|meta| natural_key_from_row_values(&meta, &values));
         if !trigger_callback_bound {
             self.validate_row_constraints(tx, table, &values, None, read_memory.clone())?;
+        }
+        if !self.row_graph_insert_allowed(tx, table, &values, read_memory.clone())? {
+            return Ok(RowId(0));
         }
         // Taken before the values are handed to the relational store, which
         // moves them; the store that owns vectors is written the moment the

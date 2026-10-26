@@ -678,6 +678,259 @@ impl Database {
         Ok(selected)
     }
 
+    /// A surrogate id identifies the stored row. A wider business key
+    /// distinguishes edge bindings; an exact triad key still names the triad.
+    pub(super) fn row_graph_uses_triple(meta: &TableMeta) -> bool {
+        let triple = |columns: &[String]| {
+            columns.len() == 3
+                && ["source_id", "target_id", "edge_type"]
+                    .iter()
+                    .all(|name| columns.iter().any(|column| column == name))
+        };
+        if triple(&meta.primary_key_columns)
+            || meta.unique_constraints.iter().any(|key| triple(key))
+        {
+            return true;
+        }
+        meta.unique_constraints.is_empty()
+            && meta.primary_key_columns.iter().all(|key| key == "id")
+            && meta
+                .natural_key_column
+                .as_deref()
+                .is_none_or(|key| key == "id")
+            && meta
+                .columns
+                .iter()
+                .all(|column| !column.primary_key || column.name == "id")
+    }
+
+    /// The graph door names only the triple. Literal/NULL defaults can name
+    /// one wider-key row; volatile defaults cannot supply a stable identity.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline refusal diagnostics."
+    )]
+    pub(super) fn row_graph_aliases_standalone(
+        &self,
+        tx: Option<TxId>,
+        owner: &RowEdgeOwner,
+        snapshot: SnapshotId,
+        memory: contextdb_core::read_memory::ReadMemoryOwner,
+    ) -> Result<bool> {
+        let captured = self.captured_graph_decisions();
+        let live_meta;
+        let meta = if let Some(captured) = &captured {
+            captured.catalog.get(&owner.table)
+        } else {
+            live_meta = self.table_meta(&owner.table);
+            live_meta.as_ref()
+        }
+        .ok_or_else(|| Error::TableNotFound(owner.table.clone()))?;
+        if Self::row_graph_uses_triple(meta) {
+            return Ok(true);
+        }
+        let extra_identity_column = |name: &str| {
+            !["source_id", "target_id", "edge_type"].contains(&name)
+                && (meta
+                    .unique_constraints
+                    .iter()
+                    .any(|key| key.iter().any(|column| column == name))
+                    || (meta.primary_key_columns.len() > 1 || name != "id")
+                        && meta.primary_key_columns.iter().any(|column| column == name)
+                    || name != "id"
+                        && (meta.natural_key_column.as_deref() == Some(name)
+                            || meta
+                                .columns
+                                .iter()
+                                .any(|column| column.name == name && column.primary_key)))
+        };
+        // Do not evaluate NOW() (or any function) while reading an identity.
+        // It describes no value that the graph-door caller actually wrote.
+        if meta
+            .columns
+            .iter()
+            .filter(|column| extra_identity_column(&column.name))
+            .any(|column| {
+                column.default.as_deref().is_some_and(|default| {
+                    default.eq_ignore_ascii_case("NOW()") || default.contains("FunctionCall")
+                })
+            })
+        {
+            return Ok(false);
+        }
+        let mut credit = contextdb_core::read_memory::ReadCredit::new(memory.clone());
+        let row = self
+            .bounded_row_by_identity(
+                memory,
+                tx,
+                &owner.table,
+                owner.row_id,
+                snapshot,
+                &mut || Ok(()),
+                &mut |bytes| {
+                    credit.try_grow_for(
+                        bytes,
+                        "graph",
+                        "edge_default_identity",
+                        "Raise MEMORY_LIMIT to read this edge's declared identity.",
+                    )
+                },
+            )?
+            .ok_or_else(|| Error::SyncError("visible graph owner has no exact row".into()))?;
+        if row.created_tx != owner.created_tx || row.lsn != owner.lsn {
+            return Err(Error::SyncError(
+                "visible graph owner selects a different row version".into(),
+            ));
+        }
+        for column in meta
+            .columns
+            .iter()
+            .filter(|column| extra_identity_column(&column.name))
+        {
+            // The expression and its result remain charged with the exact row.
+            credit.try_grow_for(
+                column
+                    .default
+                    .as_ref()
+                    .map_or(0, |value| value.len())
+                    .saturating_mul(4)
+                    .saturating_add(std::mem::size_of::<Value>()),
+                "graph",
+                "edge_default_identity",
+                "Raise MEMORY_LIMIT to read this edge's declared identity.",
+            )?;
+            let expected = match &column.default {
+                Some(default) => crate::executor::evaluate_stored_default_expr(default)?,
+                None => Value::Null,
+            };
+            let expected = match (&column.column_type, expected) {
+                (ColumnType::Real, Value::Int64(value)) => Value::Float64(value as f64),
+                (_, value) => value,
+            };
+            let expected = crate::executor::coerce_into_column_with_meta(
+                &owner.table,
+                meta,
+                &column.name,
+                expected,
+                None,
+                tx,
+            )?;
+            if row.values.get(&column.name).unwrap_or(&Value::Null) != &expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline refusal diagnostics."
+    )]
+    pub(super) fn row_graph_insert_allowed(
+        &self,
+        tx: TxId,
+        table: &str,
+        values: &HashMap<ColName, Value>,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<bool> {
+        let (Some(Value::Uuid(source)), Some(Value::Uuid(target)), Some(Value::Text(kind))) = (
+            values.get("source_id"),
+            values.get("target_id"),
+            values.get("edge_type"),
+        ) else {
+            return Ok(true);
+        };
+        self.row_graph_identity_allowed(tx, table, RowId(0), *source, *target, kind, memory)
+    }
+
+    /// Probe only this triad, respecting the transaction's exact row deletes.
+    /// The row keeps its witness; a graph-door property write keeps its own.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline refusal diagnostics."
+    )]
+    pub(super) fn has_implicit_row_graph_binding(
+        &self,
+        tx: TxId,
+        source: NodeId,
+        target: NodeId,
+        kind: &str,
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<bool> {
+        let memory = memory.into();
+        let snapshot = self.snapshot_for_read();
+        let root = self.graph_snapshot(snapshot, memory.clone())?;
+        let mut found = false;
+        self.graph_store.visit_edges_with_owner(
+            root.as_ref(),
+            GraphQuery {
+                node: source,
+                direction: Direction::Outgoing,
+                identity: Some((target, kind)),
+            },
+            |edge, owner| {
+                let Some(owner) = owner else {
+                    return Ok(true);
+                };
+                let visible = edge.visible_at(snapshot)
+                    && !self.tx_mgr.with_read(tx, |ws| {
+                        contextdb_graph::source::GraphOverlay {
+                            inserts: ws.adj_inserts,
+                            deletes: ws.adj_deletes,
+                            row_inserts: ws.row_adj_inserts,
+                            row_deletes: ws.row_adj_deletes,
+                        }
+                        .hides_owned(edge, Some(owner))
+                    })?;
+                if visible
+                    && self.row_graph_aliases_standalone(
+                        Some(tx),
+                        owner,
+                        snapshot,
+                        memory.clone(),
+                    )?
+                {
+                    found = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
+        if found {
+            return Ok(true);
+        }
+        // Release the write-set borrow before resolving its exact row. Only
+        // one funded owner is copied at a time, independent of sibling count.
+        let mut at = 0;
+        loop {
+            let mut credit = contextdb_core::read_memory::ReadCredit::new(memory.clone());
+            let candidate = self.tx_mgr.with_read(tx, |ws| {
+                while let Some(edge) = ws.row_adj_inserts.get(at) {
+                    at += 1;
+                    if edge.entry.source == source
+                        && edge.entry.target == target
+                        && edge.entry.edge_type == kind
+                    {
+                        credit.try_grow_for(
+                            edge.owner.table.len(),
+                            "graph",
+                            "edge_default_identity",
+                            "Raise MEMORY_LIMIT to read this edge's declared identity.",
+                        )?;
+                        return Ok::<_, Error>(Some(edge.owner.clone()));
+                    }
+                }
+                Ok(None)
+            })??;
+            let Some(owner) = candidate else {
+                return Ok(false);
+            };
+            if self.row_graph_aliases_standalone(Some(tx), &owner, snapshot, memory.clone())? {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Declared identities accept siblings. The existing no-key SQL rule
     /// still checks the logical triad, excluding the just-staged row.
     #[expect(
@@ -696,12 +949,11 @@ impl Database {
     ) -> Result<bool> {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
-        if self.table_meta(table).is_some_and(|m| {
-            !m.unique_constraints.is_empty()
-                || m.natural_key_column.is_some()
-                || !m.primary_key_columns.is_empty()
-                || m.columns.iter().any(|column| column.primary_key)
-        }) {
+        if self
+            .table_meta(table)
+            .as_ref()
+            .is_some_and(|meta| !Self::row_graph_uses_triple(meta))
+        {
             return Ok(true);
         }
         let snapshot = self.snapshot_for_read();
@@ -722,7 +974,10 @@ impl Database {
                     identity: Some((target, kind)),
                 },
                 |edge, owner| {
-                    if edge.visible_at(snapshot) && !overlay.hides_owned(edge, owner) {
+                    if edge.visible_at(snapshot)
+                        && !overlay.hides_owned(edge, owner)
+                        && owner.is_some_and(|owner| owner.table == table && owner.row_id != row)
+                    {
                         exists = true;
                         return Ok(false);
                     }
@@ -731,15 +986,12 @@ impl Database {
             )?;
             Ok::<_, Error>(
                 exists
-                    || ws
-                        .adj_inserts
-                        .iter()
-                        .any(|e| e.source == source && e.target == target && e.edge_type == kind)
                     || ws.row_adj_inserts.iter().any(|e| {
                         e.entry.source == source
                             && e.entry.target == target
                             && e.entry.edge_type == kind
-                            && !(e.owner.table == table && e.owner.row_id == row)
+                            && e.owner.table == table
+                            && e.owner.row_id != row
                     }),
             )
         })??;

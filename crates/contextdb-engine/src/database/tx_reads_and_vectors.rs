@@ -947,12 +947,23 @@ impl Database {
             snapshot,
             read_memory.clone(),
         )?;
+        let existing_row = self.has_implicit_row_graph_binding(
+            tx,
+            source,
+            target,
+            &edge_type,
+            read_memory.clone(),
+        )?;
+        if existing_row && properties.is_empty() {
+            return Ok(false);
+        }
         if matches!(&self.tx_mgr, DatabaseTransactionHost::Owned(_)) {
             // The graph executor creates independent source-funded originals;
             // the Legacy logical estimate must not debit or refund them again.
             return self
                 .graph
-                .insert_edge(tx, source, target, edge_type, properties, read_memory);
+                .insert_edge(tx, source, target, edge_type, properties, read_memory)
+                .map(|inserted| inserted && !existing_row);
         }
         // An existing edge can stage a replacement while still returning
         // false. Price its complete merged properties before staging, and
@@ -1045,7 +1056,7 @@ impl Database {
                     .expect("the staged edge is covered by its admitted merged properties");
                 self.finalization.accountant.release(unused);
                 self.finish_private_graph_mutation(tx, private_graph)?;
-                Ok(inserted)
+                Ok(inserted && !existing_row)
             }
             Err(err) => {
                 self.finalization.accountant.release(bytes);
@@ -1223,89 +1234,75 @@ impl Database {
         let read_memory: contextdb_core::read_memory::ReadMemoryOwner = read_memory.into();
 
         let _operation = self.open_operation()?;
-        if !self.access_is_admin()
-            && !self.node_read_allowed(source, snapshot, read_memory.clone())?
-        {
+        let tx = self.private_graph_read_tx(snapshot)?;
+        let input = contextdb_core::read_memory::ReadCredit::try_new(
+            read_memory.clone(),
+            edge_type.len(),
+            "graph",
+            "count_type",
+            "Raise the declared reader memory limit to count these edges.",
+        )?;
+        let edge_types = [edge_type.to_owned()];
+        let memory = std::cell::RefCell::new(contextdb_core::read_memory::ReadCredit::new(
+            read_memory.clone(),
+        ));
+        let retain = |bytes| {
+            memory.borrow_mut().try_grow_for(
+                bytes,
+                "graph",
+                "count_bindings",
+                "Raise the declared reader memory limit to count these edges.",
+            )
+        };
+        let release = |bytes| {
+            memory
+                .borrow_mut()
+                .try_shrink(bytes)
+                .expect("count releases admitted memory")
+        };
+        let Some(mut cursor) = self.bounded_graph_bfs_cursor::<Error>(
+            tx,
+            source,
+            Some(&edge_types),
+            Direction::Outgoing,
+            1,
+            1,
+            snapshot,
+            |_| Ok(()),
+            retain,
+            release,
+            read_memory.clone(),
+        )?
+        else {
             return Ok(0);
+        };
+        drop(edge_types);
+        drop(input);
+        cursor.inner.stream_single_hop_bindings()?;
+        let mut count = 0usize;
+        while let Some(answer) = self.bounded_graph_bfs_next::<Error>(
+            &mut cursor,
+            || Ok(()),
+            || Ok(()),
+            |_| Ok(()),
+            retain,
+            release,
+            || Ok(()),
+            retain,
+            release,
+            || {},
+            None,
+            tx,
+            read_memory.clone(),
+        )? {
+            let bytes = answer.reserved_bytes;
+            drop(answer);
+            release(bytes);
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("graph count overflow".into()))?;
         }
-        let private_tx = self.private_graph_read_tx(snapshot)?;
-        if let Some(root) = self.graph_snapshot(snapshot, read_memory.clone())? {
-            let mut cursor = root.cursor(contextdb_graph::source::GraphQuery {
-                node: source,
-                direction: Direction::Outgoing,
-                identity: None,
-            })?;
-            let mut count: usize = 0;
-            while let Some(window) = cursor.next_edge()? {
-                let edge = window.edge();
-                if edge.edge_type == edge_type
-                    && edge.visible_at(snapshot)
-                    && !private_tx
-                        .map(|tx| self.private_graph_read_hides(tx, edge))
-                        .transpose()?
-                        .unwrap_or(false)
-                    && (self.access_is_admin()
-                        || (self.node_read_allowed(edge.target, snapshot, read_memory.clone())?
-                            && self.edge_read_allowed(
-                                edge.source,
-                                edge.target,
-                                &edge.edge_type,
-                                snapshot,
-                                read_memory.clone(),
-                            )?))
-                {
-                    count += 1;
-                }
-            }
-            if let Some(tx) = private_tx {
-                let pending = self.private_graph_targets(tx, source, edge_type)?;
-                for target in &pending.targets {
-                    if self.access_is_admin()
-                        || (self.node_read_allowed(*target, snapshot, read_memory.clone())?
-                            && self.edge_read_allowed(
-                                source,
-                                *target,
-                                edge_type,
-                                snapshot,
-                                read_memory.clone(),
-                            )?)
-                    {
-                        count = count
-                            .checked_add(1)
-                            .ok_or_else(|| Error::Other("private graph count overflow".into()))?;
-                    }
-                }
-            }
-            return Ok(count);
-        }
-        if self.access_is_admin() {
-            return self
-                .graph
-                .edge_count(source, edge_type, snapshot, read_memory.clone());
-        }
-        let edge_types = [edge_type.to_string()];
-        let mut count = 0;
-        for (target, edge_type, _, edge_source, edge_target) in self
-            .graph_neighbors_with_orientation(
-                source,
-                Some(&edge_types),
-                Direction::Outgoing,
-                snapshot,
-                read_memory.clone(),
-            )?
-        {
-            if self.node_read_allowed(target, snapshot, read_memory.clone())?
-                && self.edge_read_allowed(
-                    edge_source,
-                    edge_target,
-                    &edge_type,
-                    snapshot,
-                    read_memory.clone(),
-                )?
-            {
-                count += 1;
-            }
-        }
+        drop(cursor);
         Ok(count)
     }
 
@@ -1411,6 +1408,7 @@ impl Database {
                         "Raise MEMORY_LIMIT to return edge properties.",
                     )?;
                     properties = Some(edge.properties.clone());
+                    break;
                 }
             }
             self.retain_writer_output(output);
@@ -1420,12 +1418,12 @@ impl Database {
         let properties = graph.get(&source).and_then(|entries| {
             entries
                 .iter()
-                .rev()
-                .find(|entry| {
+                .filter(|entry| {
                     entry.target == target
                         && entry.edge_type == edge_type
                         && entry.visible_at(snapshot)
                 })
+                .min_by_key(|entry| entry.row_owner.is_some())
                 .map(|entry| &entry.properties)
         });
         let mut output = contextdb_core::read_memory::ReadCredit::new(read_memory);

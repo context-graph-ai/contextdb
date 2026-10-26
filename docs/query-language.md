@@ -1409,6 +1409,14 @@ The CLI does not support parameter binding — use literal values directly.
 
 ## Graph Traversal
 
+An edge's identity is the unique key its table declares. Where no edge key is declared,
+`(source_id, target_id, edge_type)` is automatically deduplicated; a surrogate `id` primary key
+still identifies the stored row. A declared key containing additional columns makes those columns
+part of the edge's identity, so two rows differing in one of them are distinct edges. A row
+that duplicates a declared unique key, including a key that is exactly the triple, is refused
+with `UniqueViolation`. Both insertion APIs observe the same logical edge identity.
+<!-- enforced by: an_edge_keeps_the_identity_its_table_declares::with_no_declared_key_the_triple_is_still_deduplicated, an_edge_keeps_the_identity_its_table_declares::an_edge_differing_only_by_an_extra_declared_key_column_is_inserted, an_edge_keeps_the_identity_its_table_declares::a_true_duplicate_under_the_declared_key_is_still_not_inserted_twice -->
+
 Graph cursors keep the row and authorization view captured when they open. Valid writes in the same transaction continue; a newly opened cursor sees those later writes. Captured staged rows retain their original writer admission until their last holder drops.
 
 

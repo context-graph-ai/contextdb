@@ -116,6 +116,48 @@ struct LogicalEdge {
     target: NodeId,
     edge_type: EdgeType,
     retained_bytes: usize,
+    standalone_alias: bool,
+    alias_consumed: bool,
+}
+
+/// Identity resolved from the executing read's captured declaration.
+#[derive(Debug, Clone, Copy)]
+enum GraphBindingIdentity {
+    Standalone,
+    StandaloneAlias,
+    DeclaredRow,
+}
+
+fn graph_binding_identity<E>(
+    cursor: &BoundedBfsCursor,
+    source: NodeId,
+    target: NodeId,
+    edge_type: &str,
+    owner: Option<&RowEdgeOwner>,
+    row_aliases_standalone: &mut impl FnMut(&RowEdgeOwner) -> std::result::Result<bool, E>,
+) -> std::result::Result<GraphBindingIdentity, E> {
+    let Some(owner) = owner else {
+        return Ok(GraphBindingIdentity::Standalone);
+    };
+    // Only a pending standalone alias needs a row-key read. Wider siblings
+    // and ordinary reachability walks need no additional row materialization.
+    let pending = cursor.physical_single_hop
+        && cursor
+            .current
+            .as_ref()
+            .and_then(|current| current.logical_edge.as_ref())
+            .is_some_and(|last| {
+                last.source == source
+                    && last.target == target
+                    && last.edge_type == edge_type
+                    && last.standalone_alias
+                    && !last.alias_consumed
+            });
+    Ok(if pending && row_aliases_standalone(owner)? {
+        GraphBindingIdentity::StandaloneAlias
+    } else {
+        GraphBindingIdentity::DeclaredRow
+    })
 }
 
 /// Identity of one adjacency entry, owned by a suspended continuation. The
@@ -189,6 +231,8 @@ pub struct BoundedBfsCursor {
     retained_bytes: usize,
     exhausted: bool,
     physical_single_hop: bool,
+    binding_only: bool,
+    pending_binding: Option<NodeId>,
 }
 
 /// One staged edge as a traversal needs it: who it joins and by what name.
@@ -274,6 +318,15 @@ impl BoundedBfsCursor {
             ));
         }
         self.physical_single_hop = true;
+        Ok(())
+    }
+
+    /// Scalar consumers use the traversal merge without retaining its paths
+    /// or a frontier proportional to the degree of the counted node.
+    #[doc(hidden)]
+    pub fn stream_single_hop_bindings(&mut self) -> Result<()> {
+        self.preserve_single_hop_bindings()?;
+        self.binding_only = true;
         Ok(())
     }
 }
@@ -558,11 +611,12 @@ where
 /// Source windows and canonical memory adjacency group a triad's physical
 /// owners together. Each is examined and charged, but only the first visible
 /// witness adds a reachability queue entry. No owner list is retained.
-fn retain_logical_edge<E>(
+fn retain_graph_binding<E>(
     cursor: &mut BoundedBfsCursor,
     source: NodeId,
     target: NodeId,
     edge_type: &str,
+    identity: GraphBindingIdentity,
     before_retain: &mut impl FnMut(usize) -> std::result::Result<(), E>,
     release_retained: &mut impl FnMut(usize),
 ) -> std::result::Result<bool, E>
@@ -577,7 +631,30 @@ where
     if current.logical_edge.as_ref().is_some_and(|last| {
         last.source == source && last.target == target && last.edge_type == edge_type
     }) {
-        return Ok(false);
+        if !cursor.physical_single_hop {
+            return Ok(false);
+        }
+        let last = cursor
+            .current
+            .as_mut()
+            .expect("current binding")
+            .logical_edge
+            .as_mut()
+            .expect("matching binding");
+        return Ok(match identity {
+            GraphBindingIdentity::Standalone => {
+                let first = !last.standalone_alias;
+                last.standalone_alias = true;
+                first
+            }
+            GraphBindingIdentity::StandaloneAlias
+                if last.standalone_alias && !last.alias_consumed =>
+            {
+                last.alias_consumed = true;
+                false
+            }
+            _ => true,
+        });
     }
     let (edge_type, retained_bytes) =
         bounded_graph_string(edge_type, before_retain, release_retained)?;
@@ -599,6 +676,8 @@ where
             target,
             edge_type,
             retained_bytes,
+            standalone_alias: matches!(identity, GraphBindingIdentity::Standalone),
+            alias_consumed: false,
         });
     let previous = old.as_ref().map_or(0, |edge| edge.retained_bytes);
     drop(old);
@@ -1304,6 +1383,8 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                         target: entry.target,
                         edge_type,
                         retained_bytes,
+                        standalone_alias: false,
+                        alias_consumed: false,
                     });
                     let previous = old.as_ref().map_or(0, |edge| edge.retained_bytes);
                     drop(old);
@@ -1561,6 +1642,8 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             retained_bytes,
             exhausted: false,
             physical_single_hop: false,
+            binding_only: false,
+            pending_binding: None,
         })
     }
 
@@ -1708,6 +1791,65 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
     pub fn bounded_bfs_next_including_staged_with_owner<E>(
         &self,
         cursor: &mut BoundedBfsCursor,
+        before_edge: impl FnMut() -> std::result::Result<(), E>,
+        before_path_element: impl FnMut() -> std::result::Result<(), E>,
+        before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
+        release_retained: impl FnMut(usize),
+        edge_allowed: impl FnMut(
+            NodeId,
+            NodeId,
+            NodeId,
+            &str,
+            Option<&RowEdgeOwner>,
+        ) -> std::result::Result<bool, E>,
+        // The edges the reader's own open transaction has staged, asked for
+        // one at a time and RESUMED rather than re-scanned: the index goes in
+        // and the index to come back to comes out, so a walk that stops and
+        // starts does not begin the transaction again. What comes back is the
+        // edge a traversal needs, never its properties, so a walk inside a
+        // transaction holds no more than a walk outside one. `None` ends that
+        // direction's staged edges.
+        staged_edge: impl FnMut(
+            NodeId,
+            Direction,
+            usize,
+        )
+            -> std::result::Result<Option<(StagedTraversalEdge, usize, usize)>, E>,
+        // Called once for each adjacency entry this walk actually reads,
+        // however many steps it then takes over that entry. What a caller
+        // counts as "looked at" is entries, not steps.
+        entry_read: impl FnMut(),
+        // The visited-node ceiling this walk answers to, when it has one.
+        // `None` is a walk governed by its caller's own budget and is the
+        // shape this cursor was built for. `Some(cap)` is a caller that
+        // declared no budget of its own and therefore keeps the standing
+        // ceiling, refused with the same typed error and the same number the
+        // eager walk refuses with.
+        visited_cap: Option<usize>,
+    ) -> std::result::Result<Option<BoundedTraversalNode>, E>
+    where
+        E: From<Error>,
+    {
+        self.bounded_bfs_next_including_staged_with_bindings(
+            cursor,
+            before_edge,
+            before_path_element,
+            before_retain,
+            release_retained,
+            edge_allowed,
+            |_owner: &RowEdgeOwner| Ok(false),
+            staged_edge,
+            entry_read,
+            visited_cap,
+        )
+    }
+
+    /// Coalesce identities only after the physical witness is visible and
+    /// authorized. The engine supplies the captured table-key classification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounded_bfs_next_including_staged_with_bindings<E>(
+        &self,
+        cursor: &mut BoundedBfsCursor,
         mut before_edge: impl FnMut() -> std::result::Result<(), E>,
         mut before_path_element: impl FnMut() -> std::result::Result<(), E>,
         mut before_retain: impl FnMut(usize) -> std::result::Result<(), E>,
@@ -1719,6 +1861,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             &str,
             Option<&RowEdgeOwner>,
         ) -> std::result::Result<bool, E>,
+        mut row_aliases_standalone: impl FnMut(&RowEdgeOwner) -> std::result::Result<bool, E>,
         // The edges the reader's own open transaction has staged, asked for
         // one at a time and RESUMED rather than re-scanned: the index goes in
         // and the index to come back to comes out, so a walk that stops and
@@ -1754,6 +1897,16 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         }
 
         loop {
+            if let Some(id) = cursor.pending_binding.take() {
+                return Ok(Some(BoundedTraversalNode {
+                    node: TraversalNode {
+                        id,
+                        depth: 1,
+                        path: Vec::new(),
+                    },
+                    reserved_bytes: 0,
+                }));
+            }
             if cursor.current.is_none() {
                 if cursor.queue_input.is_none() && cursor.queue_output.is_none() {
                     cursor.exhausted = true;
@@ -1961,6 +2114,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                         &mut before_retain,
                         &mut release_retained,
                         &mut edge_allowed,
+                        &mut row_aliases_standalone,
                         &mut entry_read,
                         visited_cap,
                     )?;
@@ -2029,6 +2183,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                         &mut before_retain,
                         &mut release_retained,
                         &mut edge_allowed,
+                        &mut row_aliases_standalone,
                         &mut entry_read,
                         visited_cap,
                     )?;
@@ -2064,11 +2219,20 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                     continue;
                 }
                 entry_read();
+                let identity = graph_binding_identity(
+                    cursor,
+                    entry.source,
+                    entry.target,
+                    &entry.edge_type,
+                    window.row_owner(),
+                    &mut row_aliases_standalone,
+                )?;
                 self.admit_bounded_neighbor(
                     cursor,
                     node,
                     neighbor,
                     &entry.edge_type,
+                    identity,
                     &mut before_edge,
                     &mut before_path_element,
                     &mut before_retain,
@@ -2200,6 +2364,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                         &mut before_retain,
                         &mut release_retained,
                         &mut edge_allowed,
+                        &mut row_aliases_standalone,
                         &mut entry_read,
                         visited_cap,
                     )?;
@@ -2306,11 +2471,20 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                 // Admitted through a borrow of the entry, with the adjacency
                 // guard still held, so nothing is cloned to hand the shared
                 // admission its edge type.
+                let identity = graph_binding_identity(
+                    cursor,
+                    entry.source,
+                    entry.target,
+                    &entry.edge_type,
+                    entry.row_owner.as_ref(),
+                    &mut row_aliases_standalone,
+                )?;
                 self.admit_bounded_neighbor(
                     cursor,
                     node,
                     neighbor,
                     &entry.edge_type,
+                    identity,
                     &mut before_edge,
                     &mut before_path_element,
                     &mut before_retain,
@@ -2341,6 +2515,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
             &str,
             Option<&RowEdgeOwner>,
         ) -> std::result::Result<bool, E>,
+        row_aliases_standalone: &mut impl FnMut(&RowEdgeOwner) -> std::result::Result<bool, E>,
         entry_read: &mut impl FnMut(),
         visited_cap: Option<usize>,
     ) -> std::result::Result<(), E>
@@ -2378,11 +2553,20 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
                 return Ok(());
             }
             entry_read();
+            let identity = graph_binding_identity(
+                cursor,
+                edge.source,
+                edge.target,
+                &edge.edge_type,
+                edge.row_owner.as_ref(),
+                row_aliases_standalone,
+            )?;
             self.admit_bounded_neighbor(
                 cursor,
                 node,
                 neighbor,
                 &edge.edge_type,
+                identity,
                 before_edge,
                 before_path_element,
                 before_retain,
@@ -2416,6 +2600,7 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         node: NodeId,
         neighbor: NodeId,
         edge_type: &EdgeType,
+        identity: GraphBindingIdentity,
         before_edge: &mut Edge,
         before_path_element: &mut Path,
         before_retain: &mut Retain,
@@ -2443,16 +2628,19 @@ impl<S: WriteSetApplicator> MemGraphExecutor<S> {
         } else {
             (node, neighbor)
         };
-        if !cursor.physical_single_hop
-            && !retain_logical_edge(
-                cursor,
-                source,
-                target,
-                edge_type,
-                before_retain,
-                release_retained,
-            )?
-        {
+        if !retain_graph_binding(
+            cursor,
+            source,
+            target,
+            edge_type,
+            identity,
+            before_retain,
+            release_retained,
+        )? {
+            return Ok(());
+        }
+        if cursor.binding_only {
+            cursor.pending_binding = Some(neighbor);
             return Ok(());
         }
         // An edge that arrives at a node the traversal has already

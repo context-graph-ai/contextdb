@@ -5316,7 +5316,7 @@ impl Database {
         // decisions come from the same immutable transaction revision.
         let forward = &cursor.forward;
         let reverse = &cursor.reverse;
-        let result = self.graph.bounded_bfs_next_including_staged_with_owner(
+        let result = self.graph.bounded_bfs_next_including_staged_with_bindings(
             &mut cursor.inner,
             before_edge,
             before_path_element,
@@ -5358,6 +5358,10 @@ impl Database {
                     &mut before_access,
                     read_memory.clone(),
                 )
+            },
+            |owner| {
+                self.row_graph_aliases_standalone(tx, owner, snapshot, read_memory.clone())
+                    .map_err(E::from)
             },
             |node, direction, from| {
                 // Walk forward from where the traversal left off, charging for
