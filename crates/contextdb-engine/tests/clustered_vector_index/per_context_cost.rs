@@ -204,7 +204,7 @@ fn an_unrelated_context_growing_and_republishing_leaves_a_fixed_context_s_work_u
     // resolved them over the whole column would move with unrelated growth.
     db.execute(
         &format!(
-            "CREATE TABLE grown_items (id INTEGER PRIMARY KEY, context_id UUID NOT NULL, embedding VECTOR({DIMENSIONS}) PARTITION_KEY (context_id) SEARCH_MODE INDEXED IVF (RERANK = 32) CONSOLIDATION (CHANGE_PERCENT = 10))"
+            "CREATE TABLE grown_items (id INTEGER PRIMARY KEY, context_id UUID NOT NULL, embedding VECTOR({DIMENSIONS}) PARTITION_KEY (context_id) SEARCH_MODE INDEXED IVF (REFINE_FACTOR = 4.00) CONSOLIDATION (CHANGE_PERCENT = 10))"
         ),
         &empty(),
     )

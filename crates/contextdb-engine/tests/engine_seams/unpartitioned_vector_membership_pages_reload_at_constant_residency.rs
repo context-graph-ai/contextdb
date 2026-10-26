@@ -300,7 +300,7 @@ fn membership_retained_and_final_free(
             .unwrap(),
         Layout::array::<contextdb_core::RowId>(trace.capacities[3]).unwrap(),
         Layout::array::<contextdb_core::RowId>(trace.capacities[4]).unwrap(),
-        Layout::array::<contextdb_vector::store::VectorGraphGeneration>(trace.capacities[5])
+        Layout::array::<contextdb_vector::store::VectorIndexGeneration>(trace.capacities[5])
             .unwrap(),
     ];
     for ((payload, bytes, align), expected) in trace.allocations.into_iter().zip(payload_layouts) {

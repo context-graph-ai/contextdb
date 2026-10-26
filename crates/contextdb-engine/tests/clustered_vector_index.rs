@@ -5,7 +5,7 @@
 //! work, per-depth coverage, the calibration source, the replacement switch,
 //! reader memory, small partitions, the removed graph options, the WITH
 //! policy carrier, damaged index pages, non-finite vectors, objective changes,
-//! retired legacy runs, and the SQL declaration surface.
+//! retired legacy runs, the training seed, and the SQL declaration surface.
 
 #![expect(
     clippy::result_large_err,
@@ -57,6 +57,8 @@ mod small_partitions;
 mod snapshot_isolation;
 #[path = "clustered_vector_index/switch_protocol.rs"]
 mod switch_protocol;
+#[path = "clustered_vector_index/training_seed.rs"]
+mod training_seed;
 #[path = "clustered_vector_index/with_carrier.rs"]
 mod with_carrier;
 #[path = "clustered_vector_index/write_buffer.rs"]

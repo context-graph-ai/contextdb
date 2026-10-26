@@ -240,7 +240,7 @@ async fn with_declarations_travel_with_synced_ddl() {
         .expect("declare the source questions");
     source
         .execute(
-            "CREATE TABLE carrier_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (calibration_depths = [1, 10, 50], centroid_memory_fraction = 0.06, calibration_queries = carrier_questions.embedding, training_seed = 0, quantization = 'SQ4', max_delta_runs = 3)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+            "CREATE TABLE carrier_items (id INTEGER PRIMARY KEY, embedding VECTOR(3) WITH (calibration_depths = [1, 10, 50], centroid_memory_percent = 6.5, calibration_queries = carrier_questions.embedding, training_seed = 0, quantization = 'SQ4', max_delta_runs = 3)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
             &empty(),
         )
         .expect("declare the source column with its carrier");
@@ -280,7 +280,7 @@ async fn with_declarations_travel_with_synced_ddl() {
     );
     assert!(
         schema(&edge, "carrier_items").contains(
-            "WITH (quantization = 'SQ4', calibration_depths = [1, 10, 50], calibration_queries = carrier_questions.embedding, centroid_memory_fraction = 0.06, training_seed = 0, max_delta_runs = 3)"
+            "WITH (quantization = 'SQ4', calibration_depths = [1, 10, 50], calibration_queries = carrier_questions.embedding, centroid_memory_percent = 6.5, training_seed = 0, max_delta_runs = 3)"
         ),
         "the transported carrier renders canonically: {}",
         schema(&edge, "carrier_items")

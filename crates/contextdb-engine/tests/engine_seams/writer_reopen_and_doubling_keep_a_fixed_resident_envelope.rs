@@ -272,7 +272,7 @@ fn prepare(path: &Path, n: usize) {
     stage(b"reopen prepare tombstones-synced-before-ddl\n");
     for ordinal in 0..n / 4 {
         let ddl = format!(
-            "ALTER TABLE items ALTER COLUMN v SET HNSW (EF_SEARCH = {})",
+            "ALTER TABLE items ALTER COLUMN v SET SEARCH (TARGET_ACCURACY = {})",
             32 + ordinal
         );
         exec(&db, &ddl);

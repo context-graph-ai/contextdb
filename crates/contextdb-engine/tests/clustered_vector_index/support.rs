@@ -20,9 +20,10 @@ pub const UNBOUND: &str = "the engine does not expose this clustered vector inde
 /// far fewer cycles than this.
 pub const MAX_MAINTENANCE_CYCLES: usize = 64;
 
-/// The clustered index declaration with every member explicit.
-pub fn ivf(lists: u32, probes: u32, rerank: u32) -> String {
-    format!("IVF (LISTS = {lists}, PROBES = {probes}, RERANK = {rerank})")
+/// The clustered index declaration with every member explicit; the refine
+/// factor multiplies LIMIT to give the candidates rescored at full precision.
+pub fn ivf(lists: u32, probes: u32, refine_factor: u32) -> String {
+    format!("IVF (LISTS = {lists}, PROBES = {probes}, REFINE_FACTOR = {refine_factor}.00)")
 }
 
 pub fn empty() -> HashMap<String, Value> {
@@ -1117,8 +1118,12 @@ pub fn nearest_lists(
 /// Declares the indexed column's TRAINING_SEED through its engineering
 /// policy: the seed of the deterministic reservoir sample and k-means
 /// initialisation. Zero is a valid seed.
-pub fn declare_training_seed(_db: &Database, _table: &str, _column: &str, _seed: u64) {
-    unimplemented!("{UNBOUND}: declaring a training seed")
+pub fn declare_training_seed(db: &Database, table: &str, column: &str, seed: u64) {
+    db.execute(
+        &format!("ALTER TABLE {table} ALTER COLUMN {column} SET WITH (training_seed = {seed})"),
+        &empty(),
+    )
+    .unwrap_or_else(|error| panic!("declare TRAINING_SEED = {seed}: {error:?}"));
 }
 
 /// The work the build of one Context's serving generation did.
@@ -1160,6 +1165,14 @@ pub fn list_pages(
 pub struct InspectedTraining {
     pub iterations: u64,
     pub sample_cap: u64,
+    /// The declared TRAINING_SEED; `None` when undeclared.
+    pub declared_seed: Option<u64>,
+    /// The seed the next build uses: the declared one, or the seed derived
+    /// from the partition's own identity when undeclared.
+    pub effective_seed: u64,
+    /// The seed the serving generation was trained with; `None` before the
+    /// first publication.
+    pub serving_seed: Option<u64>,
 }
 
 pub fn inspected_training(

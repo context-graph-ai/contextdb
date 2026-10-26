@@ -3,7 +3,8 @@
 //! refused on CREATE, ADD COLUMN and ALTER (including SET ... DEFAULT), and
 //! SEARCH_RADIUS is refused when written as a SEARCH or IVF member; each
 //! refusal is a parse error naming the offending keyword in the one removal
-//! sentence, and nothing is published.
+//! sentence, which also says how to declare a target, and nothing is
+//! published.
 
 use super::support::empty;
 use contextdb_core::Error;
@@ -18,7 +19,9 @@ fn schema(db: &Database, table: &str) -> String {
 }
 
 fn assert_names_the_removed_keyword(error: &Error, keyword: &str, sql: &str) {
-    let sentence = format!("Remove the {keyword} clause: the default search policy applies");
+    let sentence = format!(
+        "Remove the {keyword} clause: the default search policy applies; to declare a target use SEARCH (TARGET_ACCURACY = n, EXPECTED_VECTORS = n)"
+    );
     match error {
         Error::ParseError(message) => assert!(
             message.contains(&sentence),

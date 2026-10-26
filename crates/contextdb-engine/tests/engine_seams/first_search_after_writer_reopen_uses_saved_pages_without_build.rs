@@ -84,12 +84,12 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
                     .vector_store_for_test()
                     .passive_activity_counters_for_test();
                 assert_eq!(
-                    after.hnsw_builds, before.hnsw_builds,
+                    after.index_builds, before.index_builds,
                     "per-store atomic lifecycle counts observe all worker threads"
                 );
                 assert_eq!(
-                    after.hnsw_repairs_or_compactions,
-                    before.hnsw_repairs_or_compactions
+                    after.index_repairs_or_compactions,
+                    before.index_repairs_or_compactions
                 );
             }
             drop(reader);
@@ -116,7 +116,7 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
             "writer reopen does not construct a query graph"
         );
         assert_eq!(
-            open_work.saved_graph_loads, 0,
+            open_work.saved_generation_loads, 0,
             "open leaves saved generation pages lazy"
         );
         let sql = "SELECT id FROM saved_items WHERE scope = 1 ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 128";
@@ -137,7 +137,7 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
             "first writable search performs zero graph-build work"
         );
         assert!(
-            first_work.saved_graph_loads > 0 && first_work.saved_graph_bytes > 0,
+            first_work.saved_generation_loads > 0 && first_work.saved_generation_bytes > 0,
             "first search actually loads persisted generation pages: {first_work:?}"
         );
         let (warm, warm_work) =
@@ -149,7 +149,7 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
             "warm search performs zero graph-build work"
         );
         assert_eq!(
-            warm_work.saved_graph_loads, 0,
+            warm_work.saved_generation_loads, 0,
             "warm search reuses the loaded saved generation"
         );
         eprintln!(
