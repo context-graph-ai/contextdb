@@ -3676,6 +3676,13 @@ pub(crate) struct BoundedExecutionResult {
     pub(crate) data_statement: bool,
     pub(crate) result: OwnedQueryResult,
     pub(crate) publication: ReadPublicationScope,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) telemetry: BoundedExecutionTelemetry,
 }
 
@@ -3738,6 +3745,13 @@ pub(crate) struct BoundedCursorOpen {
     pub(crate) observation: CursorObservation,
     pub(crate) storage_snapshot: Option<redb::StorageSnapshotIdentity>,
     pub(crate) publication: ReadPublicationScope,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) telemetry: BoundedExecutionTelemetry,
 }
 

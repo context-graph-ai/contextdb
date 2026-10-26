@@ -768,6 +768,10 @@ impl Background {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "KEEP-SHARED: shared test helper used by read_cli_journeys_cancellation, read_cli_journeys_live_owner, read_cli_journeys_"
+    )]
     pub fn finish(mut self) -> (Option<i32>, String) {
         self.stdin.take();
         let status = self.child.wait().expect("wait for the background session");

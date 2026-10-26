@@ -1798,6 +1798,13 @@ pub(crate) fn record_domain_ceiling_for_test(ceiling: Option<usize>) {
 }
 
 /// (aggregate bytes, recorded process ceiling) for receipts and rows.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from schema_stage_registry.rs"
+    )
+)]
 pub(crate) fn process_aggregate_snapshot() -> (usize, Option<usize>) {
     let domain = PROCESS_WRITER_BUDGET_DOMAIN.read();
     (

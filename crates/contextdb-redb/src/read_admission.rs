@@ -339,6 +339,10 @@ struct ScanScopeNode {
     previous: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
     next: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
     allowance: ScanAllowance,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     invoice: ScanNodeInvoice,
 }
 

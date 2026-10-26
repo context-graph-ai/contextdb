@@ -126,6 +126,13 @@ pub struct DirectTypedImageDigest {
 /// One owned relational row in the committed image.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+    )
+)]
 pub struct DirectStoredRow {
     pub table: String,
     pub row_id: RowId,
@@ -135,6 +142,13 @@ pub struct DirectStoredRow {
 /// One owned graph edge, including all persisted edge properties.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+    )
+)]
 pub struct DirectStoredEdge {
     pub source: Uuid,
     pub target: Uuid,
@@ -153,6 +167,13 @@ pub enum DirectVectorQuantization {
 /// owned queryable values during hydration, never by consulting the file later.
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+    )
+)]
 pub struct DirectStoredVector {
     pub index: VectorIndexRef,
     pub row_id: RowId,
@@ -422,6 +443,13 @@ pub struct DirectOwnedImage {
 }
 
 /// A complete ordinary result and its route-neutral encoding.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+    )
+)]
 pub struct DirectQuery {
     pub result: QueryResult,
     pub canonical_bytes: crate::read_contract::EncodedReadBytes,
@@ -910,6 +938,13 @@ pub enum DirectReaderPrerequisite {
     PersistenceLoadReadImage,
     PersistenceSealedReleaseReceipt,
     VerifiedImageIdentityObservation,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     CursorResourceObservation,
 }
 
@@ -940,6 +975,13 @@ pub enum DirectFileReaderError {
     CorruptStore(DirectStoreDiagnostic, contextdb_core::error::DiagnosticText),
     DirectReadRequiresWriter {
         failure: ReadFailure,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature"
+            )
+        )]
         cause: DirectRepairRequiredCause,
     },
     CursorUnavailable(DirectCursorUnavailable),
@@ -1107,6 +1149,10 @@ pub struct DirectFileReader {
     target: Arc<dyn crate::executor::ReadExecutionTarget>,
     limits: ReadLimits,
     clock: Arc<dyn DeadlineClock>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     verified_digest: DirectTypedImageDigest,
     image_memory: crate::read_image_memory::ImageMemoryHandle,
     retained_source: crate::persistence::RetainedReadSource,
@@ -1257,6 +1303,13 @@ fn consume_released_persistence_load(
     )
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
+    )
+)]
 fn execute_on_backend_neutral_target(
     reader: &DirectFileReader,
     sql: &str,
@@ -1720,6 +1773,13 @@ impl DirectFileReader {
         self.retained_source.select_cache_capacity(capacity)
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn execute(
         &self,
         sql: &str,
@@ -1729,6 +1789,13 @@ impl DirectFileReader {
         self.execute_with_cancellation(sql, params, &cancellation)
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from every_public_route_installs_its_own_memory_owner.rs"
+        )
+    )]
     pub fn execute_with_cancellation(
         &self,
         sql: &str,
@@ -1739,6 +1806,13 @@ impl DirectFileReader {
     }
 
     /// Answer one metadata question from the beginning.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn metadata(
         &self,
         request: DirectMetadataRequest,
@@ -1754,6 +1828,13 @@ impl DirectFileReader {
     /// continues from exactly there. A question that answers in one piece
     /// ignores nothing -- it never issues a continuation, so there is never
     /// one to hand back.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn metadata_from(
         &self,
         request: DirectMetadataRequest,
@@ -1803,6 +1884,13 @@ impl DirectFileReader {
             })
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn open_cursor(
         &self,
         sql: &str,
@@ -1906,6 +1994,13 @@ impl DirectCursor {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn fetch(
         &mut self,
         rows: Option<NonZeroUsize>,

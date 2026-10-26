@@ -611,7 +611,10 @@ struct Pre2TemporaryMemoryReservation {
     bytes: usize,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
+)]
 pub(crate) struct Pre2PreparedMemorySwap {
     accountant: crate::memory_accounting::AccountantHandle,
     reserved_positive_delta: usize,

@@ -724,6 +724,13 @@ pub(crate) struct ReadPersistenceImageParts {
         )
     )]
     pub(crate) vector_entries: Vec<VectorEntry>,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_image_decode.rs"
+        )
+    )]
     pub(crate) current_vectors: HashMap<(VectorIndexRef, RowId), Vec<f32>>,
     pub(crate) sync_source_lsns: HashMap<(String, RowId), Lsn>,
     pub(crate) sync_source_kinds: HashMap<(String, RowId), SyncSourceKind>,

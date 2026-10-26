@@ -956,9 +956,23 @@ struct RouteResources {
     last_query_resident_percent: Mutex<Option<f64>>,
     expiry: SessionExpiry,
     channel_identity: Mutex<Option<ChannelAddress>>,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_lifecycle_contract.rs"
+        )
+    )]
     owner_services_started: std::sync::atomic::AtomicU64,
     local_channel_operations: std::sync::atomic::AtomicU64,
     direct_backend_opens: std::sync::atomic::AtomicU64,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_lifecycle_contract.rs"
+        )
+    )]
     active_owner_slots: std::sync::atomic::AtomicU64,
     active_cursors: std::sync::atomic::AtomicU64,
     /// Real source items THIS route's reads have finished inspecting. Kept per

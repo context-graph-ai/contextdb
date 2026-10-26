@@ -445,9 +445,23 @@ impl PageAllocation {
             .owners
             .load(Ordering::Acquire)
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn ptr_eq(left: &Self, right: &Self) -> bool {
         left.block == right.block
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn as_ptr(this: &Self) -> *const () {
         this.block.as_ptr().cast()
     }

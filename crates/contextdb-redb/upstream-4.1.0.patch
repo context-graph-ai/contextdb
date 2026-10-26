@@ -4478,7 +4478,7 @@
 +}
 --- /dev/null
 +++ b/src/read_admission.rs
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,684 @@
 +//! Operation-scoped admission before allocating a source page. The caller
 +//! keeps admitted bytes owned until its read handles have been released.
 +use crate::StorageError;
@@ -4820,6 +4820,10 @@
 +    previous: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
 +    next: std::cell::Cell<Option<std::ptr::NonNull<ScanScopeNode>>>,
 +    allowance: ScanAllowance,
++    #[allow(
++        dead_code,
++        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
++    )]
 +    invoice: ScanNodeInvoice,
 +}
 +
@@ -20902,7 +20906,7 @@
 +pub use cached_file::CheckedWriterBackendForTest;
 --- /dev/null
 +++ b/src/tree_store/page_store/page_allocation.rs
-@@ -0,0 +1,786 @@
+@@ -0,0 +1,800 @@
 +//! Concrete, weakless owners for the legacy page cache. No byte/control Arc can
 +//! escape independently of the payer. Native copies retain their separate owner.
 +use crate::atomic_compat::AtomicUpdate as _;
@@ -21350,9 +21354,23 @@
 +            .owners
 +            .load(Ordering::Acquire)
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn ptr_eq(left: &Self, right: &Self) -> bool {
 +        left.block == right.block
 +    }
++    #[cfg_attr(
++        not(feature = "test-seams"),
++        allow(
++            dead_code,
++            reason = "KEEP-SEAM: live only under the test-seams feature"
++        )
++    )]
 +    pub(crate) fn as_ptr(this: &Self) -> *const () {
 +        this.block.as_ptr().cast()
 +    }
