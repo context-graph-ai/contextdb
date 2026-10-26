@@ -4680,9 +4680,6 @@ mod original_failure_contract {
     #[serial]
     fn decoder_failure_preserves_diagnosis_when_error_text_cannot_be_admitted() {
         use std::io::Write;
-        // Compare actual travelling layouts with the scalar bootstrap plus the
-        // minimum enum/pointer custody representation, including ABI padding.
-        enum ScalarOrPointer {}
         struct CompactCarrier {}
         assert_eq!(
             std::mem::size_of::<crate::funded_error::OriginalError>(),
