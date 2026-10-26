@@ -1,7 +1,8 @@
 //! Private paid request/cursor adapter for the existing delivery wire format.
 //! Every input buffer is checked against the original operation before parsing.
 use super::{
-    DeliveryMemory, decode_envelope_raw, decode_request, encode_response, validate_cursor_after,
+    DeliveryMemory, decode_envelope_raw, decode_request, encode_response_envelope,
+    encode_response_payload, validate_cursor_after,
 };
 use super::{NativePacketNamespace, encode_custody_outcomes};
 use crate::custody::native_decode::Invalid;
@@ -236,7 +237,7 @@ pub(crate) fn paid_delivery_response(
     }
     batch.checkpoint()?;
     let (tenant, hub, edge) = namespace.text()?;
-    let output = encode_response(
+    let payload = encode_response_payload(
         &memory,
         request.request_nonce,
         hub,
@@ -248,6 +249,10 @@ pub(crate) fn paid_delivery_response(
         batch.more,
     )?;
     batch.checkpoint()?;
+    // The payload owns every encoded outcome byte. Free the selected packet
+    // buffers and their slot array before allocating the larger wire envelope.
+    drop(batch);
+    let output = encode_response_envelope(&memory, &payload)?;
     memory.checkpoint()?;
     Ok(output)
 }

@@ -873,7 +873,7 @@ fn binary_growth(len: usize) -> Option<usize> {
 }
 
 #[allow(clippy::too_many_arguments)] // The reply's namespace fields stay explicit and borrowed.
-pub(crate) fn encode_response<M: DeliveryMemory>(
+pub(crate) fn encode_response_payload<M: DeliveryMemory>(
     memory: &M,
     request_nonce: [u8; 16],
     hub_node_id: &str,
@@ -918,6 +918,19 @@ pub(crate) fn encode_response<M: DeliveryMemory>(
         return Err(M::canonical("response size changed"));
     }
     memory.checkpoint()?;
+    Ok(payload)
+}
+
+/// Encode the final wire envelope after the caller frees the selected outcomes.
+/// The owned payload carries their complete serialized bytes and its own invoice.
+pub(crate) fn encode_response_envelope<M: DeliveryMemory>(
+    memory: &M,
+    payload: &M::Buffer,
+) -> Result<M::Buffer, M::Error> {
+    memory.checkpoint()?;
+    if !memory.owns(payload) {
+        return Err(M::owner_mismatch());
+    }
     let envelope = ReplyEnvelope {
         version: PROTOCOL_VERSION,
         message_type: MessageType::FetchDeliveryOutcomesResponse,
