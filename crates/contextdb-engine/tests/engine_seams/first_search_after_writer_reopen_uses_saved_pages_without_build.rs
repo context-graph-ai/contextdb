@@ -121,8 +121,9 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
         );
         let sql = "SELECT id FROM saved_items WHERE scope = 1 ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 128";
         let params = HashMap::from([("query".to_owned(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
-        let (first, first_work) =
-            observe(|| with_vector_build_observer(builds.clone(), || database.execute(sql, &params)));
+        let (first, first_work) = observe(|| {
+            with_vector_build_observer(builds.clone(), || database.execute(sql, &params))
+        });
         let first = first.unwrap();
         assert_eq!(
             first.rows(),
@@ -140,8 +141,9 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
             first_work.saved_generation_loads > 0 && first_work.saved_generation_bytes > 0,
             "first search actually loads persisted generation pages: {first_work:?}"
         );
-        let (warm, warm_work) =
-            observe(|| with_vector_build_observer(builds.clone(), || database.execute(sql, &params)));
+        let (warm, warm_work) = observe(|| {
+            with_vector_build_observer(builds.clone(), || database.execute(sql, &params))
+        });
         assert_eq!(warm.unwrap().rows(), first.rows());
         assert_eq!(
             builds.0.load(Ordering::SeqCst),
@@ -187,7 +189,8 @@ fn first_search_after_writer_reopen_uses_saved_pages_without_build() {
     let mut ready = false;
     for _ in 0..128 {
         let report =
-            with_vector_build_observer(builds.clone(), || database.run_maintenance_cycle()).unwrap();
+            with_vector_build_observer(builds.clone(), || database.run_maintenance_cycle())
+                .unwrap();
         if report.vector.ready_partitions == 1 && report.vector.remaining_partitions == 0 {
             ready = true;
             break;
