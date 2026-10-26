@@ -849,7 +849,7 @@ pub(crate) enum LoadReadImageError {
     },
     #[cfg(unix)]
     #[error(
-        "read-image I/O failed during acquire reader publication hold: reader publication wait failed: {0:?}"
+        "read-image I/O failed during acquire reader publication hold: reader publication wait failed: {0}"
     )]
     WaitRefused(physical_admission::PublicationWaitRefusal),
     #[error("read-image I/O failed during {operation}: {reason}")]

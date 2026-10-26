@@ -517,6 +517,23 @@ pub(crate) enum PublicationWaitRefusal {
     Quarantined(QuarantinedHelperDiagnostic),
 }
 
+impl std::fmt::Display for PublicationWaitRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HeldByWriter => f.write_str("a writer holds the store"),
+            Self::CancellableWaitUnsupported => f.write_str(
+                "this platform cannot wait for the writer in a way the caller can cancel or bound",
+            ),
+            Self::HelperFailed(failure) => write!(f, "{failure}"),
+            Self::Quarantined(helper) => write!(
+                f,
+                "the writer's acquisition helper (process {}) could not be confirmed stopped, so it is held in quarantine",
+                helper.0
+            ),
+        }
+    }
+}
+
 pub(crate) struct QuarantinedHelperDiagnostic(pub(crate) u32);
 impl std::fmt::Debug for QuarantinedHelperDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
