@@ -1882,109 +1882,123 @@ mod edge_column_owner_contract {
 
     // Non-defining changes keep every owner; losing the ordinary shape retires
     // only this table's row owner. Mutants: retire by type, or retain all owners.
+    // Each case works on its own stores, so the five run on their own threads.
     #[test]
     fn edge_column_changes_keep_or_retire_exact_owners_through_cleanup_and_restore() {
-        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
-        for dag in [false, true] {
-            for column in ["note", "source_id", "target_id", "edge_type"] {
-                if dag && column != "note" {
-                    continue;
-                }
-                for rename in [false, true] {
-                    let dir = tempfile::tempdir().unwrap();
-                    let path = dir.path().join("owners.db");
-                    let db = open(&path);
-                    seed(&db, dag);
-                    let query = alter(column, rename, false);
-                    // Staged shape loss is invisible outside, and rollback restores
-                    // the defining columns and all links without a marker.
-                    let before = state(&db);
-                    let tx = db.begin().unwrap();
-                    db.execute_in_tx(tx, &query, &HashMap::new()).unwrap();
-                    assert_links(&db, 3);
-                    db.rollback(tx).unwrap();
-                    assert_eq!(state(&db), before);
-                    sql(&db, &query);
-                    let expected = if column == "note" { 3 } else { 2 };
-                    assert_links(&db, expected);
-                    assert_eq!(
-                        sql(&db, "SELECT id FROM links"),
-                        vec![vec![Value::Int64(1)]]
-                    );
-                    let visible_column = if rename {
-                        format!("retired_{column}")
-                    } else {
-                        "id".to_string()
-                    };
-                    let value = if !rename {
-                        Value::Int64(1)
-                    } else {
-                        match column {
-                            "source_id" => Value::Uuid(SOURCE),
-                            "target_id" => Value::Uuid(TARGET),
-                            "edge_type" => Value::Text("LINK".into()),
-                            _ => Value::Text("kept".into()),
-                        }
-                    };
-                    assert_eq!(
-                        sql(&db, &format!("SELECT {visible_column} FROM links")),
-                        vec![vec![value]]
-                    );
-                    if !rename {
-                        assert!(
-                            db.execute(&format!("SELECT {column} FROM links"), &HashMap::new())
-                                .is_err()
-                        );
-                    }
-                    let exported = dir.path().join("restored.db");
-                    db.export_snapshot(&exported).unwrap();
-                    let restored = open(&exported);
-                    assert_links(&restored, expected);
-                    restored.close().unwrap();
-                    drop(restored);
-                    let db = reopen(db, &path);
-                    assert_links(&db, expected);
-                    // All three cleanup paths run against independently restored
-                    // copies of the post-migration state, including shape loss.
-                    for cleanup in [
-                        "DELETE FROM links WHERE id = 1",
-                        "DROP TABLE links",
-                        "PURGE FROM links WHERE id = 1",
-                    ] {
-                        let cleanup_path = dir.path().join(format!(
-                            "cleanup-{}.db",
-                            cleanup.split_whitespace().next().unwrap()
-                        ));
-                        db.export_snapshot(&cleanup_path).unwrap();
-                        let cleaned = open(&cleanup_path);
-                        sql(&cleaned, cleanup);
-                        assert_links(&cleaned, 2);
-                        let cleaned = reopen(cleaned, &cleanup_path);
-                        assert_links(&cleaned, 2);
-                        cleaned.close().unwrap();
-                    }
-                    // Remove the two independent owners: zero proves the retired
-                    // row owner was not merely hidden by their overlapping triad.
-                    sql(&db, "DELETE FROM witnesses WHERE id = 2");
-                    let tx = db.begin().unwrap();
-                    db.delete_edge(tx, SOURCE, TARGET, "LINK").unwrap();
-                    db.commit(tx).unwrap();
-                    let actual = {
-                        let fixture_answer_64 = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
-                        &HashMap::from([("s".into(), Value::Uuid(SOURCE))])).unwrap();
-                        fixture_answer_64.rows().to_vec()
-                    };
-                    assert_eq!(
-                        actual,
-                        if column == "note" {
-                            vec![vec![Value::Uuid(TARGET)]]
-                        } else {
-                            Vec::new()
-                        }
-                    );
-                    db.close().unwrap();
-                }
+        std::thread::scope(|scope| {
+            let cases = [
+                (false, "note"),
+                (false, "source_id"),
+                (false, "target_id"),
+                (false, "edge_type"),
+                (true, "note"),
+            ]
+            .map(|(dag, column)| {
+                scope.spawn(move || edge_column_change_keeps_or_retires_exact_owners(dag, column))
+            });
+            for case in cases {
+                case.join().expect("an edge-column case failed");
             }
+        });
+    }
+
+    /// One edge column's change, dropped and renamed, through rollback, export,
+    /// reopen and every cleanup path.
+    fn edge_column_change_keeps_or_retires_exact_owners(dag: bool, column: &str) {
+        let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
+        for rename in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("owners.db");
+            let db = open(&path);
+            seed(&db, dag);
+            let query = alter(column, rename, false);
+            // Staged shape loss is invisible outside, and rollback restores
+            // the defining columns and all links without a marker.
+            let before = state(&db);
+            let tx = db.begin().unwrap();
+            db.execute_in_tx(tx, &query, &HashMap::new()).unwrap();
+            assert_links(&db, 3);
+            db.rollback(tx).unwrap();
+            assert_eq!(state(&db), before);
+            sql(&db, &query);
+            let expected = if column == "note" { 3 } else { 2 };
+            assert_links(&db, expected);
+            assert_eq!(
+                sql(&db, "SELECT id FROM links"),
+                vec![vec![Value::Int64(1)]]
+            );
+            let visible_column = if rename {
+                format!("retired_{column}")
+            } else {
+                "id".to_string()
+            };
+            let value = if !rename {
+                Value::Int64(1)
+            } else {
+                match column {
+                    "source_id" => Value::Uuid(SOURCE),
+                    "target_id" => Value::Uuid(TARGET),
+                    "edge_type" => Value::Text("LINK".into()),
+                    _ => Value::Text("kept".into()),
+                }
+            };
+            assert_eq!(
+                sql(&db, &format!("SELECT {visible_column} FROM links")),
+                vec![vec![value]]
+            );
+            if !rename {
+                assert!(
+                    db.execute(&format!("SELECT {column} FROM links"), &HashMap::new())
+                        .is_err()
+                );
+            }
+            let exported = dir.path().join("restored.db");
+            db.export_snapshot(&exported).unwrap();
+            let restored = open(&exported);
+            assert_links(&restored, expected);
+            restored.close().unwrap();
+            drop(restored);
+            let db = reopen(db, &path);
+            assert_links(&db, expected);
+            // All three cleanup paths run against independently restored
+            // copies of the post-migration state, including shape loss.
+            for cleanup in [
+                "DELETE FROM links WHERE id = 1",
+                "DROP TABLE links",
+                "PURGE FROM links WHERE id = 1",
+            ] {
+                let cleanup_path = dir.path().join(format!(
+                    "cleanup-{}.db",
+                    cleanup.split_whitespace().next().unwrap()
+                ));
+                db.export_snapshot(&cleanup_path).unwrap();
+                let cleaned = open(&cleanup_path);
+                sql(&cleaned, cleanup);
+                assert_links(&cleaned, 2);
+                let cleaned = reopen(cleaned, &cleanup_path);
+                assert_links(&cleaned, 2);
+                cleaned.close().unwrap();
+            }
+            // Remove the two independent owners: zero proves the retired
+            // row owner was not merely hidden by their overlapping triad.
+            sql(&db, "DELETE FROM witnesses WHERE id = 2");
+            let tx = db.begin().unwrap();
+            db.delete_edge(tx, SOURCE, TARGET, "LINK").unwrap();
+            db.commit(tx).unwrap();
+            let actual = {
+                let fixture_answer_64 = db.execute("SELECT t FROM GRAPH_TABLE(witnesses MATCH (a)-[:LINK]->(b) WHERE a.id = $s COLUMNS (b.id AS t))",
+                &HashMap::from([("s".into(), Value::Uuid(SOURCE))])).unwrap();
+                fixture_answer_64.rows().to_vec()
+            };
+            assert_eq!(
+                actual,
+                if column == "note" {
+                    vec![vec![Value::Uuid(TARGET)]]
+                } else {
+                    Vec::new()
+                }
+            );
+            db.close().unwrap();
         }
     }
 

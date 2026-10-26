@@ -11,3 +11,8 @@ test-group = 'core-compile-fixtures'
 [[profile.default.overrides]]
 filter = 'package(contextdb-engine) & test(/::a_checkpointed_commit_killed_at_every_write_leaves_the_old_or_the_new_state$/)'
 threads-required = 4
+
+# The edge-column owner test runs its five cases on five threads.
+[[profile.default.overrides]]
+filter = 'package(contextdb-engine) & test(/::edge_column_changes_keep_or_retire_exact_owners_through_cleanup_and_restore$/)'
+threads-required = 5
