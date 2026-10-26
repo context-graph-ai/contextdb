@@ -901,8 +901,21 @@ struct Page {
     outcomes: usize,
     more: bool,
     peak: u64,
+    /// The page's own bytes whose widths follow its cursor and random key
+    /// material rather than history: `own_bytes` of its request and reply,
+    /// plus the decoded cursor the request holds as an owned buffer of the
+    /// cursor's raw length. A first page carries no cursor; every later page
+    /// carries one.
+    own: u64,
     released: bool,
     last: Option<Vec<u8>>,
+}
+
+impl Page {
+    /// The page's peak less its own bytes: what history could move.
+    fn remainder(&self) -> u64 {
+        self.peak - self.own
+    }
 }
 
 fn decode_page(reply: &[u8]) -> (Vec<crate::protocol::WireDeliveryOutcome>, bool) {
@@ -944,13 +957,15 @@ fn native_pages(world: &World, since: Option<Vec<u8>>) -> Vec<Page> {
         let route = installation(&world.server(&parent));
         crate::database::native_custody_selection::NATIVE_ORDERS_EXAMINED
             .with(|seen| seen.set((0, 0)));
+        let decoded_cursor = since.as_ref().map_or(0, Vec::len) as u64;
         let request = world.request_bytes(5, since.take());
         let (result, reply) = drive(world, &route, &request, |_| {});
         result.expect("one native page");
         let examined = crate::database::native_custody_selection::NATIVE_ORDERS_EXAMINED
             .with(|seen| seen.get());
         drop(route);
-        let (outcomes, more) = decode_page(&reply.expect("page reply"));
+        let reply = reply.expect("page reply");
+        let (outcomes, more) = decode_page(&reply);
         let last = outcomes.last().map(|outcome| cursor_after(world, outcome));
         let peak = parent.file_child_high_water();
         pages.push(Page {
@@ -958,6 +973,7 @@ fn native_pages(world: &World, since: Option<Vec<u8>>) -> Vec<Page> {
             outcomes: outcomes.len(),
             more,
             peak,
+            own: own_bytes(&request, &reply) + decoded_cursor,
             // The serving side drops the page's last allocation just after its
             // reply is published; read the count once that release event fires.
             released: settled(&parent, standing) == standing,
@@ -1145,8 +1161,9 @@ fn describe(pages: &[Page]) -> String {
     let (min, max) = full.iter().fold((u64::MAX, 0), |(lo, hi), page| {
         (lo.min(page.peak), hi.max(page.peak))
     });
+    let remainders: Vec<u64> = full.iter().map(|page| page.remainder()).collect();
     format!(
-        "pages={} delivered={} examined_total(count,collect)=({},{}) max_examined_per_page={:?} full_page_peak_min={} full_page_peak_max={} last_page_peak={} all_released={}",
+        "pages={} delivered={} examined_total(count,collect)=({},{}) max_examined_per_page={:?} full_page_peak_min={} full_page_peak_max={} full_page_remainders={remainders:?} last_page_peak={} all_released={}",
         pages.len(),
         pages.iter().map(|page| page.outcomes).sum::<usize>(),
         pages.iter().map(|page| page.examined.0).sum::<u64>(),
@@ -1275,16 +1292,19 @@ async fn cursor_request_examines_only_the_orders_after_it(
             .all(|examined| *examined == full_examined[0]),
         "a full page's examination grew with its position in history: {full_examined:?}"
     );
+    // Compare full pages like with like: each page's peak less its own
+    // bytes, so the first page's missing cursor and each page's key-material
+    // widths cannot pass for growth with history.
     let full: Vec<u64> = large
         .catch_up
         .iter()
         .filter(|p| p.more)
-        .map(|p| p.peak)
+        .map(Page::remainder)
         .collect();
     let (lo, hi) = (*full.iter().min().unwrap(), *full.iter().max().unwrap());
     assert!(
         (hi - lo) * 100 <= lo,
-        "full-page peak moved with position in history: {lo}..{hi}"
+        "full-page peak beyond its own bytes moved with position in history: {lo}..{hi}"
     );
 }
 
