@@ -6252,13 +6252,6 @@ impl ContentIdentityReadVerifier {
         self.resident.clear()
     }
 
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     pub(super) fn batch(&self, reserved_bytes: usize) -> ReadAuthenticationBatch<'_> {
         ReadAuthenticationBatch {
             verifier: self,
