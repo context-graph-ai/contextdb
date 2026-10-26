@@ -5,8 +5,6 @@ use super::{
     frame_read_refusal, invalid_channel_data, response_decode_refusal,
 };
 use crate::read_contract::decode_metadata_page;
-use bincode::config::standard;
-use bincode::serde::encode_to_vec;
 use contextdb_core::read_contract::{
     DatabaseIdentity, LocalUserIdentity, MetadataPageVocabulary, OwnerReadLimits, OwnerReadStatus,
     OwnerServiceTimeouts, ReadFailure, ReadLimits, WriterRunNumber,

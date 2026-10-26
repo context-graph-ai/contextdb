@@ -3,11 +3,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-// Forces a hard compile dependency on the wrappers existing publicly.
-// If the wrappers are ever removed, this test file fails to compile.
-#[allow(unused_imports)]
-use contextdb_core::{AtomicLsn, AtomicTxId};
-
 use regex::Regex;
 use walkdir::WalkDir;
 

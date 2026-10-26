@@ -4060,7 +4060,7 @@ use owner_cursor_test_support::decode_owner_cursor_page as decode_cursor_page;
 // expanding frame without client-side query allocation taking precedence.
 #[test]
 fn actual_inbound_decoder_refusal_preserves_the_authenticated_stream_and_ordinals() {
-    use contextdb_core::read_memory::{ReadCredit, ReadMemoryBudget};
+    use contextdb_core::read_memory::ReadCredit;
     use contextdb_engine::local_transport::{
         LocalInboundKind, LocalInboundMessage, LocalOutboundMessage, LocalProtocolBoundary,
         LocalResponseExpectation, UnixLocalCarrier,

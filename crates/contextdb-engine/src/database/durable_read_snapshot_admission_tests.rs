@@ -339,7 +339,7 @@ fn fresh_snapshot_pin_does_not_borrow_an_older_readers_root() {
 // for authenticating selected placement companions and their global controls.
 #[test]
 fn historical_vector_queries_refuse_damaged_companions_in_the_selected_root() {
-    use redb::{ReadableDatabase as _, ReadableTable as _};
+    use redb::ReadableTable as _;
 
     let _clock = Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let companions = [

@@ -4,7 +4,6 @@ use super::{AdmittedWireVec, BoundedWireBody};
 use crate::custody::native_selection::{Failure, NativeBuffer};
 use crate::vector_read_memory::{DeclaredReadMemory, DeclaredReadRoot};
 use contextdb_core::read_memory::ReadMemoryOwner;
-use std::sync::Arc;
 
 fn native_owner(limit: u64) -> (DeclaredReadRoot, ReadMemoryOwner) {
     let parent =

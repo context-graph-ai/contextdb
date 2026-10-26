@@ -2469,7 +2469,6 @@ async fn the_iroh_native_reply_control_is_charged_until_its_last_holder_drops() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_iroh_admitted_client_refuses_a_reply_its_reader_cannot_hold_before_reading_it() {
     use crate::transport::{BoundedWireBody, HandlerRegistration, IncomingRequest};
-    use contextdb_core::read_memory::ReadMemoryOwner;
     const REPLY: usize = 256 * 1024;
     let dir = tempfile::tempdir().expect("store directory");
     let endpoint = crate::transport::iroh::IrohServer::bind(&format!(
@@ -3103,7 +3102,6 @@ async fn stop_keeping_store(hub: IrohHub) -> (tempfile::TempDir, Arc<Database>, 
 async fn each_admitted_reply_is_classified_by_its_own_status_on_one_connection() {
     use crate::transport::iroh::{CLIENT_REPLY_CLASSES, ClientReplyClass};
     use crate::transport::{BoundedWireBody, HandlerRegistration, IncomingRequest};
-    use contextdb_core::read_memory::ReadMemoryOwner;
     const OVERSIZED: usize = 69 * 1024 * 1024 + 137;
     let requests =
         DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
@@ -3713,7 +3711,6 @@ async fn a_terminal_the_edge_no_longer_reads_fails_its_write_and_releases_every_
 async fn an_edge_timeout_retries_once_and_both_ends_release_every_charge() {
     use crate::transport::BoundedWireBody;
     use crate::transport::native_pause::{self, Point};
-    use contextdb_core::read_memory::ReadMemoryOwner;
     // A parameter of the exchange, not a synchronization: the hub holds the
     // first attempt until the test releases it, however long that is.
     const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);

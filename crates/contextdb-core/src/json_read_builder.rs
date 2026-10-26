@@ -1146,7 +1146,6 @@ fn number_requests(
 #[cfg(test)]
 mod finite_recipe_provenance_rows {
     use super::*;
-    use serde::de::Error as _;
 
     // A private constructor/provenance row, explicitly NOT a selected-root
     // reachability claim. The selected root always installs a memory owner.

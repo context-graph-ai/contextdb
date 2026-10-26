@@ -492,7 +492,7 @@ fn actual_native_and_legacy_quota_refusal_leave_checked_handles_usable() {
 #[test]
 #[serial]
 fn real_builder_routes_refuse_growth_without_publication_and_retry_the_same_payload() {
-    use redb::{ReadableDatabase, ReadableTable};
+    use redb::ReadableDatabase;
     const TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("writer_io");
     for native in [false, true] {
         let file = tempfile::NamedTempFile::new().unwrap();

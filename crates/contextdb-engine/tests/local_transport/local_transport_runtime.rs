@@ -9,9 +9,8 @@ use contextdb_engine::local_transport::{
     RuntimeDirectoryFacts, RuntimeDirectoryInspector, RuntimeDirectoryRequest,
     RuntimeDirectorySource, RuntimeRootViolation, SystemRuntimeDirectoryInspector,
     channel_socket_path, inspect_channel_path, opaque_channel_basename, prepare_runtime_directory,
-    prepare_runtime_directory_with_environment, resolve_runtime_directory,
-    resolve_runtime_directory_with_environment, unix_socket_path_limit, validate_channel_path,
-    validate_runtime_root,
+    prepare_runtime_directory_with_environment, resolve_runtime_directory_with_environment,
+    unix_socket_path_limit, validate_channel_path, validate_runtime_root,
 };
 use std::collections::BTreeMap;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

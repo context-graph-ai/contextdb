@@ -1,7 +1,7 @@
 use super::*;
 use crate::local_transport::inbound_query::RequestPrefix;
 use crate::local_transport::query_funding::{self, AcquiredQueryOwner, Funded, QueryBudget};
-use contextdb_core::read_memory::{NativeRefusal, ReadMemoryBudget, ReadShared};
+use contextdb_core::read_memory::{NativeRefusal, ReadShared};
 
 /// The decode invoice survives moved strings and parameters. The carrier
 /// keeps an alias outside the request future and joins its worker before

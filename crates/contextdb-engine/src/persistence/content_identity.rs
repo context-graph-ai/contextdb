@@ -16499,6 +16499,3 @@ pub(crate) mod original_version_manifest {
             .ok_or_else(|| bad("mutation layout overflow"))
     }
 }
-
-#[cfg(test)]
-use crate::persistence::writer_source::WriterSnapshotHandle;

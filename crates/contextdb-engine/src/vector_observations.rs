@@ -430,8 +430,7 @@ pub fn take_membership_count_decodes_for_test() -> (usize, usize) {
 // Raw erasure observations stay inside the existing engine diagnostic surface.
 #[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]
 pub(crate) use crate::persistence::writer_source::cold_provider::physical_vector::{
-    PhysicalVectorDiscovery, PhysicalVectorRecordView, PhysicalVectorRootObservation,
-    PhysicalVectorTable,
+    PhysicalVectorRecordView, PhysicalVectorRootObservation, PhysicalVectorTable,
 };
 
 /// None of these observations is a complete erasure receipt. These explicit

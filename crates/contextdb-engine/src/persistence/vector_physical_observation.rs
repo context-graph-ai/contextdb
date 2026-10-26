@@ -7,7 +7,6 @@ use crate::owner_read::NativeReadRequest;
 use crate::persistence::native_storage_admission::{NativeStorageFailure, StorageAdmissionScope};
 use crate::persistence::writer_source::{NativeConfigBytes, NativeConfigFailure};
 use contextdb_core::{Error, Lsn, SnapshotId, read_memory::ReadMemoryOwner};
-use redb::TableHandle as _;
 
 /// Closed physical families, never an arbitrary caller-supplied table name.
 /// A native tail is addressed by physical storage id, NOT logical generation.

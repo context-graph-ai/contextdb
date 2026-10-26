@@ -21,7 +21,7 @@ mod statement {
         observed
     }
 }
-use contextdb_core::read_memory::{ReadMemoryBudget, ReadMemoryOwner};
+use contextdb_core::read_memory::ReadMemoryOwner;
 use contextdb_vector::mem::TraceInvoiceForTest;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::AtomicU64;

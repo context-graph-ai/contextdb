@@ -506,9 +506,7 @@ pub(crate) fn frame_read_refusal(error: LocalTransportError) -> LocalTransportEr
     }
 }
 
-pub(crate) use deadlines::{
-    OperationDeadlineWait, deadline_operation_funded, deadline_operation_owned, wait_until_owned,
-};
+pub(crate) use deadlines::{deadline_operation_funded, deadline_operation_owned, wait_until_owned};
 
 impl PartialEq for LocalTransportError {
     fn eq(&self, other: &Self) -> bool {

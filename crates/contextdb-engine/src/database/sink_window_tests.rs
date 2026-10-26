@@ -2,7 +2,6 @@
 //! planning, install refusal, removal bookkeeping and the decoded charge the
 //! window's owner holds.
 use super::*;
-use std::sync::Arc;
 
 fn entry(id: u64) -> SinkQueueEntry {
     SinkQueueEntry {

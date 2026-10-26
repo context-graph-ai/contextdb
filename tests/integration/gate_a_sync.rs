@@ -9,8 +9,8 @@ use contextdb_engine::Database;
 use contextdb_engine::memory_accounting::MemoryAccountant;
 #[allow(unused_imports)]
 use contextdb_engine::sync_types::{
-    ApplyResult, ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, DdlChange, EdgeChange,
-    NaturalKey, RowChange, SyncAdoption, SyncDirection, VectorChange,
+    ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, NaturalKey, RowChange, SyncAdoption,
+    VectorChange,
 };
 use contextdb_server::{FabricIdentity, InProcessBroker, SyncClient, SyncServer};
 use std::collections::{HashMap, HashSet};

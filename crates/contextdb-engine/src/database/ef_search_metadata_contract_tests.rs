@@ -237,7 +237,6 @@ fn assert_frontier(db: &Database) {
                     "committed_read_lsn_bounds",
                 ))
                 .unwrap();
-            use redb::ReadableTable;
             assert_eq!(
                 table.get("breadth_rows").unwrap().unwrap().value(),
                 db.current_lsn().0,
