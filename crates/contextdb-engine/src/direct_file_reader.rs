@@ -1742,6 +1742,23 @@ impl DirectFileReader {
 }
 
 impl DirectCursor {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Cache admission retains its inline refusal diagnostics."
+    )]
+    pub(crate) fn select_cache_capacity(&self, capacity: usize) -> contextdb_core::Result<()> {
+        match &self.state {
+            DirectCursorState::Active {
+                _resources: resources,
+                ..
+            } => resources
+                ._snapshot
+                ._retained_source
+                .select_cache_capacity(capacity),
+            DirectCursorState::Exhausted { .. } | DirectCursorState::Closed => Ok(()),
+        }
+    }
+
     pub(crate) fn work_observation(
         &self,
     ) -> Result<Option<crate::executor::CursorObservation>, DirectFileReaderError> {

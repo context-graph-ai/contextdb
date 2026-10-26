@@ -2100,10 +2100,14 @@ pub(crate) fn load_read_image_at_registration_with_cache_share(
     open_context
         .checkpoint()
         .map_err(LoadReadImageError::Memory)?;
-    if cache_share.is_some_and(|percent| percent > 100) {
-        return Err(LoadReadImageError::Memory(Error::Other(
-            "READ_CACHE_SHARE must be between 0 and 100 percent".into(),
-        )));
+    if let Some(percent) = cache_share
+        && percent > 100
+    {
+        return Err(LoadReadImageError::Memory(Error::InvalidSetting {
+            name: "READ_CACHE_SHARE",
+            value: percent.to_string(),
+            allowed: "0..=100, an integer percent".to_owned(),
+        }));
     }
     let budget = limit.unwrap_or_else(|| open_context.memory_limit());
     let read_memory = open_context.read_memory();

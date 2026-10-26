@@ -166,7 +166,7 @@ fn direct_registration_refuses_an_invalid_cache_share_before_opening_storage() {
         .unwrap();
         let result = crate::persistence::load_read_image_at_registration_with_cache_share(
             &directory.path().join("not-created.db"),
-            Some(budget as usize),
+            Some(usize::try_from(budget).unwrap()),
             Some(percent),
             None,
             None,

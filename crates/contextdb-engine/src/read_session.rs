@@ -3373,12 +3373,16 @@ impl ReadSession {
         options
     }
 
-    /// Inspect the current declaration and physical file-cache funding.
+    /// Resolve writer turnover and inspect the declaration and physical file cache.
+    /// Route-selection failures retain their typed error instead of returning stale status.
     #[expect(
         clippy::result_large_err,
         reason = "Route selection retains typed inline refusal diagnostics."
     )]
     pub fn read_cache_share_status(&self) -> Result<ReadCacheShareStatus> {
+        if let Some(failure) = self.after_writer_turnover(&OwnerReadCancellation::new())? {
+            return Err(Error::ReadFailure(failure));
+        }
         let _mutation = self
             .cache_policy_mutation
             .lock()
@@ -3408,6 +3412,9 @@ impl ReadSession {
                 value,
                 allowed: "0..=100, an integer percent".to_owned(),
             });
+        }
+        if let Some(failure) = self.after_writer_turnover(&OwnerReadCancellation::new())? {
+            return Err(Error::ReadFailure(failure));
         }
         let _mutation = self
             .cache_policy_mutation
@@ -6102,6 +6109,19 @@ impl OwnerCursorContinuation {
                 ),
             ));
         }
+        if let Some(cursor) = self.cursor.as_ref() {
+            let share = resources.current_read_cache_share();
+            if self.config.read_cache_share != share {
+                let budget = self.config.memory_limit.unwrap_or_else(|| {
+                    usize::try_from(self.config.limits.memory).unwrap_or(usize::MAX)
+                });
+                let capacity = crate::persistence::redb_reader_cache_bytes(budget, share);
+                cursor
+                    .select_cache_capacity(capacity)
+                    .map_err(public_cache_setting_error)?;
+                self.config.read_cache_share = share;
+            }
+        }
         if self.cursor.is_none() {
             let registration = self
                 .registration
@@ -6110,7 +6130,7 @@ impl OwnerCursorContinuation {
                 .retain_owner_snapshot();
             let mut config = self.config.clone();
             // The cursor may have opened before the session changed its share.
-            // Resolve the live declaration only when this reader is created.
+            // Resolve the live declaration at open and again on later fetches.
             config.read_cache_share = resources.current_read_cache_share();
             let available = usize::try_from(self.declared_memory)
                 .unwrap_or(usize::MAX)
@@ -6122,6 +6142,7 @@ impl OwnerCursorContinuation {
                 .limits
                 .cursor_page_rows
                 .min(self.delivered.max(1) as u64);
+            let opened_share = config.read_cache_share;
             let reader =
                 crate::direct_file_reader::DirectFileReader::from_owner_snapshot_with_cancellation(
                     &self.path,
@@ -6164,6 +6185,7 @@ impl OwnerCursorContinuation {
                 }
             };
             let mut first_page = ObservedCursorPage::from(opened.first_page);
+            self.config.read_cache_share = opened_share;
             self.config.limits.memory = admitted_memory;
             self.config.memory_limit = Some(usize::try_from(admitted_memory).unwrap_or(usize::MAX));
             self.cursor = Some(opened.cursor);

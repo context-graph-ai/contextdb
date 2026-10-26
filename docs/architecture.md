@@ -307,16 +307,21 @@ where `B` is the declared session memory ceiling, or `limits.memory` when no
 session ceiling is declared, and
 `F` is the 64 KiB source overhead plus the verifier, LSN and history-open control
 reservations. An explicit percent applies to `B - F`. There is no fixed byte cap.
-`read_cache_share_status()` inspects the declared percent, default percent,
+`ReadSession::read_cache_share_status()` returns `Result<ReadCacheShareStatus>` and
+resolves writer turnover before inspecting the declared percent, default percent,
 budget, fixed reservation, cache capacity and effective percent of the remaining
-budget after fixed source reservations. The file reader's admitted read root now follows the session's declared
+budget after fixed source reservations. Route-selection failures remain typed errors;
+inspection never silently substitutes declaration-only status for a failed route.
+The options-only `ReadSessionOptions::read_cache_share_status()` remains infallible
+and does not open or select a route. The file reader's admitted read root now follows the session's declared
 `memory_limit`, falling back to `limits.memory` when no session limit is declared.
 For example, `memory_limit = 1 GiB` with the shipped 16 MiB `limits.memory` gives
 the file reader a 1 GiB root for loaded state and cache; previously that root was
 bounded by 16 MiB. Each statement remains bounded by `limits.memory`.
 
-`ReadSession::set_read_cache_share` changes capacity immediately under the cache
-insertion lock, without reopening or changing its snapshot. Growth is admitted before
+`ReadSession::set_read_cache_share` resolves writer turnover before accessing the
+selected cache, propagating typed route failures. It changes capacity immediately
+under the cache insertion lock, without reopening or changing its snapshot. Growth is admitted before
 publication; shrink retires entries while cursor-held backing keeps its invoice
 until final physical release. Zero disables file page caching; 100 selects the
 whole remainder and is still subject to total admission. A 100% declaration is
@@ -329,7 +334,10 @@ cache policy, with `prepaid_index_bytes` and `held_page_bytes` both `None`; it d
 not report or resize the writer's shared cache. The owner route can retain a 100%
 declaration without allocating a file cache; a later file open must still pass
 total admission. Lazy owner-cursor continuations and newly selected file readers
-resolve the session's current declaration when they open.
+resolve the session's current declaration when they open. A continuing cursor on its
+own file reader also applies a changed declaration before its next fetch, using that
+reader's admitted memory budget. It resizes the existing retained source, preserving
+the exact registered root and delivered-row position; growth still requires admission.
 
 The SQL session surface is `SET READ_CACHE_SHARE = <percent> | DEFAULT` and
 `SHOW READ_CACHE_SHARE`. It uses the same live mutation path as the Rust API and

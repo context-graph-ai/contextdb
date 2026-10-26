@@ -417,8 +417,10 @@ An integer from 0 through 100 declares that percentage of the session memory bud
 source reservations. `SET READ_CACHE_SHARE = DEFAULT` restores the exact derived default,
 `(budget - fixed reservations) / 7`, displayed as default (14%). Zero disables the file cache.
 The change takes effect immediately without reopening the snapshot; an open cursor keeps its
-rows, snapshot, and funded pinned pages. Another session and a reopened session keep their own
-policy. These statements require no writable store and do not persist a store setting.
+rows, snapshot, and funded pinned pages. An existing cursor also applies a later declaration on
+its next fetch after its writer exits. Cache inspection selects the current readable route after
+writer turnover; routing failures remain typed errors. Another session and a reopened session keep
+their own policy. These statements require no writable store and do not persist a store setting.
 
 ```sql
 SET READ_CACHE_SHARE = 40;
