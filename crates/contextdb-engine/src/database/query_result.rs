@@ -17,6 +17,8 @@ pub struct QueryResult {
 enum QueryResultInner {
     Empty { rows_affected: u64 },
     Shared(ReadShared<OwnedQueryResult>),
+    /// Built by the application itself; application memory, never charged to a reader budget.
+    Application(std::sync::Arc<QueryResultData>),
 }
 
 #[derive(Debug)]
@@ -43,6 +45,25 @@ impl QueryResult {
     pub fn empty() -> Self {
         Self::empty_with_affected(0)
     }
+    /// An answer the application builds itself (adapters, fixtures, embedders). Its rows are
+    /// application memory: no reader budget is charged and it has no encoding owner.
+    pub fn new(
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        rows_affected: u64,
+        trace: QueryTrace,
+        cascade: Option<CascadeReport>,
+    ) -> Self {
+        Self {
+            inner: QueryResultInner::Application(std::sync::Arc::new(QueryResultData {
+                columns,
+                rows,
+                rows_affected,
+                trace,
+                cascade,
+            })),
+        }
+    }
     pub fn empty_with_affected(rows_affected: u64) -> Self {
         Self {
             inner: QueryResultInner::Empty { rows_affected },
@@ -51,7 +72,7 @@ impl QueryResult {
     /// Reuse the originating operation capability for later canonical output.
     pub(crate) fn encoding_owner(&self) -> Option<ReadMemoryOwner> {
         match &self.inner {
-            QueryResultInner::Empty { .. } => None,
+            QueryResultInner::Empty { .. } | QueryResultInner::Application(_) => None,
             QueryResultInner::Shared(answer) => answer
                 .retained_read_memory
                 .clone()
@@ -72,7 +93,7 @@ impl QueryResult {
     #[cfg(all(test, feature = "test-seams"))]
     pub(super) fn original_charge_components_for_test(&self) -> [usize; 5] {
         match &self.inner {
-            QueryResultInner::Empty { .. } => [0; 5],
+            QueryResultInner::Empty { .. } | QueryResultInner::Application(_) => [0; 5],
             QueryResultInner::Shared(answer) => [
                 &**answer as *const OwnedQueryResult as usize,
                 answer.credit().original_payer_identity_for_test(),
@@ -88,37 +109,42 @@ impl QueryResult {
             QueryResultInner::Shared(answer) => {
                 answer.vector_copy_charge.control_receipts_for_test()
             }
-            QueryResultInner::Empty { .. } => [(0, 0, 0, 0); 2],
+            QueryResultInner::Empty { .. } | QueryResultInner::Application(_) => [(0, 0, 0, 0); 2],
         }
     }
     pub fn columns(&self) -> &[String] {
         match &self.inner {
             QueryResultInner::Empty { .. } => &[],
             QueryResultInner::Shared(answer) => &answer.columns,
+            QueryResultInner::Application(answer) => &answer.columns,
         }
     }
     pub fn rows(&self) -> &[Vec<Value>] {
         match &self.inner {
             QueryResultInner::Empty { .. } => &[],
             QueryResultInner::Shared(answer) => &answer.rows,
+            QueryResultInner::Application(answer) => &answer.rows,
         }
     }
     pub fn rows_affected(&self) -> u64 {
         match &self.inner {
             QueryResultInner::Empty { rows_affected } => *rows_affected,
             QueryResultInner::Shared(answer) => answer.rows_affected,
+            QueryResultInner::Application(answer) => answer.rows_affected,
         }
     }
     pub fn trace(&self) -> &QueryTrace {
         match &self.inner {
             QueryResultInner::Empty { .. } => &EMPTY_TRACE,
             QueryResultInner::Shared(answer) => &answer.trace,
+            QueryResultInner::Application(answer) => &answer.trace,
         }
     }
     pub fn cascade(&self) -> Option<&CascadeReport> {
         match &self.inner {
             QueryResultInner::Empty { .. } => None,
             QueryResultInner::Shared(answer) => answer.cascade.as_ref(),
+            QueryResultInner::Application(answer) => answer.cascade.as_ref(),
         }
     }
 

@@ -763,16 +763,16 @@ fn assert_embedder_read_owner_facades(root: &Path) {
     }
 }
 
-// Acceptance: embedders construct QueryResult using its five existing public fields.
+// Acceptance: embedders construct QueryResult from its five public parts and read them back.
 #[test]
-fn external_embedder_query_result_literal_keeps_its_five_public_fields() {
-    let result = contextdb_engine::QueryResult {
-        columns: vec!["id".to_owned()],
-        rows: vec![vec![contextdb_core::Value::Int64(7)]],
-        rows_affected: 0,
-        trace: contextdb_engine::QueryTrace::default(),
-        cascade: None,
-    };
+fn external_embedder_constructs_query_result_from_its_five_parts() {
+    let result = contextdb_engine::QueryResult::new(
+        vec!["id".to_owned()],
+        vec![vec![contextdb_core::Value::Int64(7)]],
+        0,
+        contextdb_engine::QueryTrace::default(),
+        None,
+    );
     assert_eq!(result.columns(), vec!["id"]);
     assert_eq!(result.rows(), vec![vec![contextdb_core::Value::Int64(7)]]);
     assert_eq!(result.rows_affected(), 0);
