@@ -3443,28 +3443,7 @@ mod row_check_cache_ownership_contract {
         row_touches: AtomicU64,
     }
 
-    impl RowCheckCacheFundingProbe {
-        fn reservation_after(&self, charged_bytes: usize) -> u64 {
-            let charged_bytes =
-                u64::try_from(charged_bytes).expect("cache charge fits test receipt");
-            let reservations = self
-                .reservations
-                .lock()
-                .expect("reservation observation lock");
-            let matches = reservations
-                .iter()
-                .filter_map(|(reserved, held_after)| {
-                    (*reserved == charged_bytes).then_some(*held_after)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                matches.len(),
-                1,
-                "the cache charge maps to exactly one real operation-reader reservation: {reservations:?}"
-            );
-            matches[0]
-        }
-    }
+    impl RowCheckCacheFundingProbe {}
 
     impl bounded::ExecutionProbe for RowCheckCacheFundingProbe {
         fn before_work(&self, _source: bounded::TestWorkSource, _completed_work: u64) {}
@@ -4703,15 +4682,10 @@ mod original_failure_contract {
         use std::io::Write;
         // Compare actual travelling layouts with the scalar bootstrap plus the
         // minimum enum/pointer custody representation, including ABI padding.
-        #[allow(dead_code)]
-        enum ScalarOrPointer {
-            Native(contextdb_core::read_memory::NativeRefusal),
-            Prepared(std::ptr::NonNull<()>),
-        }
+        enum ScalarOrPointer {}
         #[allow(dead_code)]
         struct CompactCarrier {
             diagnostic: ScalarOrPointer,
-            scope: Option<std::ptr::NonNull<()>>,
         }
         assert_eq!(
             std::mem::size_of::<crate::funded_error::OriginalError>(),

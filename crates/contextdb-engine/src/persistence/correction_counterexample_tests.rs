@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! Counterexamples for the durable ordering and proof-accounting invariants.
 
 use super::*;
@@ -314,33 +313,6 @@ fn export_admits_its_destination_proof_through_the_owning_accountant() {
     );
     db.set_memory_limit(None).unwrap();
     db.close().unwrap();
-}
-
-fn vector_fixture(path: &std::path::Path) -> Database {
-    let db = Database::open(path).unwrap();
-    db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
-    db.execute(
-        "CREATE TABLE points (id INTEGER PRIMARY KEY, bucket INTEGER NOT NULL, v VECTOR(3) SEARCH_MODE INDEXED HNSW (M = 8, EF_CONSTRUCTION = 32))",
-        &HashMap::new(),
-    )
-    .unwrap();
-    db.execute(
-        "CREATE INDEX points_bucket ON points (bucket ASC)",
-        &HashMap::new(),
-    )
-    .unwrap();
-    for id in 0..24i64 {
-        db.execute(
-            "INSERT INTO points VALUES ($id, $bucket, '[1,0,0]')",
-            &HashMap::from([
-                ("id".into(), Value::Int64(id)),
-                ("bucket".into(), Value::Int64(id % 2)),
-            ]),
-        )
-        .unwrap();
-    }
-    db.run_maintenance_cycle().unwrap();
-    db
 }
 
 /// Counterexample 5: when the authenticated run cannot be built, the identity

@@ -6,7 +6,6 @@
 #![cfg(feature = "nightly-tests")]
 
 #[path = "support/heap_oracle.rs"]
-#[allow(dead_code)] // The shared oracle also serves read-page funding proofs.
 mod heap_oracle;
 
 use contextdb_core::Value;

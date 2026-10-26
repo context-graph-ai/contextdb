@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! What a bulk import actually holds, per passage, and whether the declared
 //! memory limit knows about it.
 //!
@@ -23,7 +22,6 @@ const DIM: usize = 768;
 /// Enough rows to separate a per-row slope from the fixed cost of opening a
 /// store, and few enough that the probe stays inside an ordinary test budget.
 const ROWS: usize = 2_000;
-const SAMPLE_EVERY: usize = 250;
 
 /// Anonymous resident bytes for this process: private, dirty, non-file memory —
 /// the thing a cgroup kills for, and the thing the report measured.
@@ -71,7 +69,6 @@ fn vector(row: usize) -> Vec<f32> {
 
 /// The bytes one passage genuinely carries: its vector and its text.
 const TEXT_BYTES: usize = 512;
-const CONTENT_BYTES_PER_ROW: usize = DIM * 4 + TEXT_BYTES;
 
 /// One arm of the matrix: how the table is declared, and what it is given.
 struct Arm {

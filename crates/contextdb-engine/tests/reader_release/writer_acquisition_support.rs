@@ -2,7 +2,6 @@
 //! parked at named points of their snapshot acquisition, and a writer opened
 //! on its own thread whose admission is observed through the engine's own
 //! event record, so a proof never sleeps to learn what the writer is doing.
-#![allow(dead_code)]
 
 use contextdb_core::Value;
 use contextdb_core::read_contract::ReadRoute;
@@ -50,16 +49,6 @@ pub fn seeded_store(directory: &Path, name: &str) -> PathBuf {
 
 pub fn count_rows(session: &ReadSession) -> i64 {
     let answer = session
-        .execute("SELECT COUNT(*) FROM held", &HashMap::new())
-        .expect("a held-table count");
-    match &answer.rows()[0][0] {
-        Value::Int64(count) => *count,
-        other => panic!("a count is an integer, got {other:?}"),
-    }
-}
-
-pub fn count_rows_in_writer(database: &Database) -> i64 {
-    let answer = database
         .execute("SELECT COUNT(*) FROM held", &HashMap::new())
         .expect("a held-table count");
     match &answer.rows()[0][0] {
@@ -480,7 +469,6 @@ pub fn queue_a_writer_behind_a_reader(name: &str) -> QueuedWriter {
 /// The writer a queued journey ended with, still open and still serving.
 pub struct OpenedWriter {
     pub database: Database,
-    pub path: PathBuf,
     _directory: tempfile::TempDir,
 }
 
@@ -511,7 +499,6 @@ impl QueuedWriter {
         let database = writer.finish().expect("the queued writer opens");
         OpenedWriter {
             database,
-            path,
             _directory: directory,
         }
     }

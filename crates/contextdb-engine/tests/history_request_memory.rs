@@ -215,22 +215,6 @@ fn change_response(
     })
 }
 
-#[allow(dead_code)]
-fn sync_state(
-    reader: &contextdb_engine::direct_file_reader::test_seams::DirectFileReader,
-) -> Result<usize, DirectFileReaderError> {
-    reader
-        .metadata(DirectMetadataRequest::ImageState {
-            kind: DirectImageMetadataKind::Sync,
-        })
-        .map(|response| match response.body.clone() {
-            DirectMetadataBody::ImageState {
-                state: DirectImageState::Sync(state),
-            } => state.tables.len(),
-            other => panic!("sync provenance answers as sync state: {other:?}"),
-        })
-}
-
 fn assert_result_bytes_refusal(error: &DirectFileReaderError, ceiling: u64) {
     use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureKind, ReadFailureLimit};
     let DirectFileReaderError::ReadFailure(failure) = error else {

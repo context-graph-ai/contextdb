@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 //! A retained ordered run is physical work: building it cannot pass a caller's
 //! work ceiling, and a cursor whose working window is evicted continues from
 //! the posting it last proved.
@@ -295,14 +294,6 @@ fn verified_ordered_runs_charge_cold_builds_and_continue_after_forced_eviction()
 /// predicate names one run of `rows` postings.
 const WIDE_LABEL_BYTES: usize = 8 * 1024;
 
-/// A narrower key for the cursor fixture below. It still makes a working window
-/// a countable number of postings while keeping each delivered row small.
-const CURSOR_LABEL_BYTES: usize = 1024;
-
-fn wide_label() -> String {
-    "w".repeat(WIDE_LABEL_BYTES)
-}
-
 fn seed_wide(path: &std::path::Path, rows: i64) {
     seed_labelled(path, rows, WIDE_LABEL_BYTES, 'w', 0);
 }
@@ -357,13 +348,6 @@ fn wide_params() -> HashMap<String, Value> {
     group_params('w')
 }
 
-fn labelled_params(label_bytes: usize) -> HashMap<String, Value> {
-    HashMap::from([
-        ("query".to_owned(), Value::Vector(vec![1.0, 0.0])),
-        ("label".to_owned(), Value::Text("w".repeat(label_bytes))),
-    ])
-}
-
 fn wide_statement(limit: usize) -> String {
     format!(
         "SELECT id FROM wide_runs WHERE label = $label ORDER BY embedding <=> $query LIMIT {limit}"
@@ -388,13 +372,11 @@ fn wide_limits(rows: usize) -> ReadLimits {
 /// measured by the authenticated-page counters alone.
 #[derive(Debug, Clone, Copy)]
 struct PagedMeasurement {
-    rows: usize,
     counters: ReadWorkCounters,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ScaleMeasurement {
-    rows: usize,
     counters: ReadWorkCounters,
     examined: u64,
 }
@@ -429,7 +411,6 @@ fn measure_scale(rows: usize) -> ScaleMeasurement {
         "no identity is dropped or repeated across window boundaries"
     );
     ScaleMeasurement {
-        rows,
         counters,
         examined: answer.result.trace().rows_examined,
     }
@@ -630,11 +611,9 @@ fn measure_paged_scale(rows: usize) -> (PagedMeasurement, PagedMeasurement, usiz
     }
     (
         PagedMeasurement {
-            rows,
             counters: control,
         },
         PagedMeasurement {
-            rows,
             counters: walk,
         },
         displacements,

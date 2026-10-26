@@ -12,7 +12,6 @@ fn p() -> HashMap<String, Value> {
 
 struct Store {
     _dir: Option<tempfile::TempDir>,
-    path: PathBuf,
     db: Arc<Database>,
 }
 
@@ -82,7 +81,6 @@ fn store_with_backlog_in(path: PathBuf, dir: Option<tempfile::TempDir>) -> Store
     drop(session);
     Store {
         _dir: dir,
-        path,
         db,
     }
 }

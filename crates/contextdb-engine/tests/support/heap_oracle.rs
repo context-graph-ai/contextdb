@@ -96,26 +96,3 @@ pub(super) fn measure<T>(operation: impl FnOnce() -> T) -> (T, usize) {
     drop(reset);
     (value, counters.peak.load(Ordering::SeqCst))
 }
-
-pub(crate) fn measure_funding<T>(
-    funding: Arc<AtomicUsize>,
-    operation: impl FnOnce() -> T,
-) -> (T, usize, usize, usize) {
-    let counters = Arc::new(Counters {
-        funding: Some(funding),
-        ..Counters::default()
-    });
-    ACTIVE.with(|active| {
-        assert!(active.get().is_null());
-        active.set(Arc::as_ptr(&counters));
-    });
-    let reset = Reset;
-    let value = operation();
-    drop(reset);
-    (
-        value,
-        counters.peak.load(Ordering::SeqCst),
-        counters.unfunded.load(Ordering::SeqCst),
-        counters.allocations.load(Ordering::SeqCst),
-    )
-}

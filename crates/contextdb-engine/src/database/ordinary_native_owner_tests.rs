@@ -12,15 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 type Request = (usize, usize, usize);
 #[derive(Clone, Copy, Default, Debug)]
-struct NamedImageCall {
-    subsystem: &'static str,
-    operation: &'static str,
-    site: &'static str,
-    bytes: usize,
-    before: u64,
-    after: u64,
-    refused: bool,
-}
+struct NamedImageCall {}
 #[derive(Clone, Copy, Default)]
 struct Capture {
     active: bool,
@@ -86,7 +78,7 @@ thread_local! {
     static HOOK_BUSY: Cell<bool> = const { Cell::new(false) };
     static CAPTURE: Cell<Capture> = const { Cell::new(Capture {
         active: false, invalid: false, invalid_site: 0, actual_constructor_requests: [(0,0,0,0);3], first_expected_child:[0;4], first_unexpected_child:[0;4], named_image_child:0, named_image_counter:0, named_image_calls:0, named_image_start:0,
-        named_image_events:[NamedImageCall { subsystem:"", operation:"", site:"", bytes:0, before:0, after:0, refused:false };32],
+        named_image_events:[NamedImageCall {       };32],
         named_image_event_count:0, parent: 0, parent_counter: 0,
         baseline: 0, children: 0, transaction_replacement: false, replacement_request: (0,0,0), replacement_counter: 0, replacement_funding: [0;2], replacement_physical_cuts: 0, stages: 0, allow_constructor_prefix: false, constructor_base: 0, requests: [(0, 0, 0); 3],
         trace_requests: [(0,0,0); 2], trace_ordinals: [0; 2], trace_invoices: [(0,0); 2], trace_stages: 0,
@@ -112,7 +104,6 @@ pub(crate) fn named_image_child_call(
         let index = capture.named_image_event_count;
         if index < capture.named_image_events.len() {
             capture.named_image_events[index] = NamedImageCall {
-                subsystem, operation, site, bytes, before, after, refused,
             };
         }
         // Fixed diagnostic prefix; overflow is reported explicitly, never
