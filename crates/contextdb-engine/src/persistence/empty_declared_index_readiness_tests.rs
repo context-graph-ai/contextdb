@@ -1117,6 +1117,12 @@ fn assert_public_owner_graph_observer_row(directory: &Path) {
 fn graph_retention_row() -> (TableMeta, VersionedRow) {
     let meta = TableMeta {
         columns: vec![contextdb_core::ColumnDef {
+            search_target_accuracy_hundredths: None,
+            search_expected_vectors: None,
+            ivf_lists: None,
+            ivf_probes: None,
+            ivf_refine_factor_hundredths: None,
+            vector_engine_policy: Default::default(),
             name: "body".into(),
             column_type: ColumnType::Text,
             nullable: false,

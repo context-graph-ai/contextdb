@@ -858,9 +858,14 @@ pub enum VectorPartitionDeclarationIssue {
 /// Safe structural reasons a per-column vector workload policy can be
 /// refused. The enclosing error identifies the column; values are omitted so
 /// bound or synced input is never echoed through the diagnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum VectorPolicyDeclarationIssue {
+    #[error("unknown WITH member {member}")]
+    UnknownMember { member: String },
+    #[error("{member} has an invalid vector policy value")]
+    InvalidMember { member: &'static str },
+
     #[error("{member} has invalid training value {value}")]
     InvalidTrainingValue { member: &'static str, value: u64 },
     #[error("vector policy clauses require a VECTOR column")]

@@ -1523,6 +1523,15 @@ impl Database {
                         )
                         .ok()?;
                     }
+                    AlterAction::SetVectorSearch { .. }
+                    | AlterAction::SetVectorIvf { .. }
+                    | AlterAction::SetVectorWith { .. }
+                    | AlterAction::ResetVectorWith { .. } => {
+                        crate::executor::set_clustered_vector_policy(
+                            &at.table, &at.action, &mut meta,
+                        )
+                        .ok()?;
+                    }
                     AlterAction::SetVectorHnsw { column, hnsw } => {
                         crate::executor::set_vector_hnsw(
                             &at.table,

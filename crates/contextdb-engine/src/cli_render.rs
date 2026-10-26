@@ -147,18 +147,10 @@ pub(crate) struct MetadataColumn<'a>(
 );
 impl std::fmt::Display for MetadataColumn<'_> {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use contextdb_core::{
-            PropagationRule, ScopeLabelKind, VectorQuantization, VectorSearchMode,
-        };
+        use contextdb_core::{PropagationRule, ScopeLabelKind, VectorSearchMode};
         let col = self.0;
         write!(out, "{}", MetadataColumnType(&col.column_type))?;
-        if col.quantization != VectorQuantization::F32 {
-            write!(
-                out,
-                " WITH (quantization = '{}')",
-                col.quantization.as_str()
-            )?;
-        }
+        write!(out, "{}", crate::database::vector_ivf::policy::With(col))?;
         if matches!(col.column_type, ColumnType::Vector(_)) {
             if let Some(keys) = &col.partition_key_columns
                 && !keys.is_empty()
@@ -183,6 +175,7 @@ impl std::fmt::Display for MetadataColumn<'_> {
             if let Some(value) = col.flat_below {
                 write!(out, " FLAT_BELOW {value}")?;
             }
+            write!(out, "{}", crate::database::vector_ivf::policy::Groups(col))?;
             let mut first = true;
             for (name, value) in [
                 ("M", col.hnsw_m),

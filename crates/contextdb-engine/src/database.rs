@@ -10896,3 +10896,5 @@ mod last_handle_release_tests;
 
 #[cfg(all(test, feature = "test-seams", target_os = "linux"))]
 mod coexistence_guards;
+
+pub(crate) mod vector_ivf;

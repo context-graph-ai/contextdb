@@ -5317,6 +5317,12 @@ fn column_equal_except_ef_search(old: &ColumnDef, new: &ColumnDef) -> bool {
         consolidation_change_percent: old_consolidation_change_percent,
         consolidation_tombstone_percent: old_consolidation_tombstone_percent,
         consolidation_disabled: old_consolidation_disabled,
+        search_target_accuracy_hundredths: old_search_target_accuracy_hundredths,
+        search_expected_vectors: old_search_expected_vectors,
+        ivf_lists: old_ivf_lists,
+        ivf_probes: old_ivf_probes,
+        ivf_refine_factor_hundredths: old_ivf_refine_factor_hundredths,
+        vector_engine_policy: old_vector_engine_policy,
     } = old;
     let ColumnDef {
         name: new_name,
@@ -5347,8 +5353,20 @@ fn column_equal_except_ef_search(old: &ColumnDef, new: &ColumnDef) -> bool {
         consolidation_change_percent: new_consolidation_change_percent,
         consolidation_tombstone_percent: new_consolidation_tombstone_percent,
         consolidation_disabled: new_consolidation_disabled,
+        search_target_accuracy_hundredths: new_search_target_accuracy_hundredths,
+        search_expected_vectors: new_search_expected_vectors,
+        ivf_lists: new_ivf_lists,
+        ivf_probes: new_ivf_probes,
+        ivf_refine_factor_hundredths: new_ivf_refine_factor_hundredths,
+        vector_engine_policy: new_vector_engine_policy,
     } = new;
-    old_name == new_name
+    old_search_target_accuracy_hundredths == new_search_target_accuracy_hundredths
+        && old_search_expected_vectors == new_search_expected_vectors
+        && old_ivf_lists == new_ivf_lists
+        && old_ivf_probes == new_ivf_probes
+        && old_ivf_refine_factor_hundredths == new_ivf_refine_factor_hundredths
+        && old_vector_engine_policy == new_vector_engine_policy
+        && old_name == new_name
         && old_column_type == new_column_type
         && old_nullable == new_nullable
         && old_primary_key == new_primary_key
@@ -5407,6 +5425,12 @@ fn column_equal_except_consolidation(old: &ColumnDef, new: &ColumnDef) -> bool {
         consolidation_change_percent: _,
         consolidation_tombstone_percent: _,
         consolidation_disabled: _,
+        search_target_accuracy_hundredths: old_search_target_accuracy_hundredths,
+        search_expected_vectors: old_search_expected_vectors,
+        ivf_lists: old_ivf_lists,
+        ivf_probes: old_ivf_probes,
+        ivf_refine_factor_hundredths: old_ivf_refine_factor_hundredths,
+        vector_engine_policy: old_vector_engine_policy,
     } = old;
     let ColumnDef {
         name: new_name,
@@ -5437,8 +5461,20 @@ fn column_equal_except_consolidation(old: &ColumnDef, new: &ColumnDef) -> bool {
         consolidation_change_percent: _,
         consolidation_tombstone_percent: _,
         consolidation_disabled: _,
+        search_target_accuracy_hundredths: new_search_target_accuracy_hundredths,
+        search_expected_vectors: new_search_expected_vectors,
+        ivf_lists: new_ivf_lists,
+        ivf_probes: new_ivf_probes,
+        ivf_refine_factor_hundredths: new_ivf_refine_factor_hundredths,
+        vector_engine_policy: new_vector_engine_policy,
     } = new;
-    old_name == new_name
+    old_search_target_accuracy_hundredths == new_search_target_accuracy_hundredths
+        && old_search_expected_vectors == new_search_expected_vectors
+        && old_ivf_lists == new_ivf_lists
+        && old_ivf_probes == new_ivf_probes
+        && old_ivf_refine_factor_hundredths == new_ivf_refine_factor_hundredths
+        && old_vector_engine_policy == new_vector_engine_policy
+        && old_name == new_name
         && old_column_type == new_column_type
         && old_nullable == new_nullable
         && old_primary_key == new_primary_key
@@ -6150,6 +6186,20 @@ fn execute_alter_table_plan(
             set_vector_flat_below(&p.table, column, flat_below.as_deref(), &mut table_meta)?;
             validate_vector_partition_declarations(&p.table, &table_meta)?;
             vector_layout_update = Some(VectorIndexRef::new(p.table.clone(), column.clone()));
+            metadata_only_projection = Some((old_meta, table_meta));
+        }
+        AlterAction::SetVectorSearch { column, .. }
+        | AlterAction::SetVectorIvf { column, .. }
+        | AlterAction::SetVectorWith { column, .. }
+        | AlterAction::ResetVectorWith { column, .. } => {
+            let old_meta = db
+                .table_meta(&p.table)
+                .ok_or_else(|| Error::Other(format!("table '{}' not found", p.table).into()))?;
+            refuse_engine_owned_reserved_name_column_alter(&p.table)?;
+            let mut table_meta = old_meta.clone();
+            set_clustered_vector_policy(&p.table, &p.action, &mut table_meta)?;
+            validate_vector_partition_declarations(&p.table, &table_meta)?;
+            vector_layout_update = Some(VectorIndexRef::new(&p.table, column));
             metadata_only_projection = Some((old_meta, table_meta));
         }
         AlterAction::SetVectorHnsw { column, hnsw } => {
@@ -6984,6 +7034,7 @@ fn execute_plan_with_working_state(
             candidates,
             sort_key,
             search_mode,
+            query_policy,
             materialized_columns,
             ..
         }
@@ -6995,9 +7046,15 @@ fn execute_plan_with_working_state(
             candidates,
             sort_key,
             search_mode,
+            query_policy,
             materialized_columns,
             ..
         } => {
+            crate::database::vector_ivf::policy::validate_query(
+                table,
+                column,
+                query_policy.as_ref(),
+            )?;
             let snapshot = db.snapshot_for_read();
             let index = contextdb_core::VectorIndexRef::new(table.clone(), column.clone());
             let mut resolved_search_mode =
@@ -20187,8 +20244,14 @@ fn column_def_matches_canonical(
         context_id,
         scope_label,
         acl_ref,
+        search: candidate_search,
+        ivf: candidate_ivf,
+        engine_policy: candidate_engine_policy,
     } = candidate;
-    *name == canonical.name
+    candidate_search == &canonical.search
+        && candidate_ivf == &canonical.ivf
+        && candidate_engine_policy == &canonical.engine_policy
+        && *name == canonical.name
         && *data_type == canonical.data_type
         && *nullable == canonical.nullable
         && *primary_key == canonical.primary_key
@@ -21675,7 +21738,13 @@ pub(crate) fn core_column_from_ast(
         consolidation_tombstone_percent,
         consolidation_disabled,
     ) = normalized_ast_vector_declaration(table, col)?;
-    Ok(contextdb_core::ColumnDef {
+    let mut result = contextdb_core::ColumnDef {
+        search_target_accuracy_hundredths: Default::default(),
+        search_expected_vectors: Default::default(),
+        ivf_lists: Default::default(),
+        ivf_probes: Default::default(),
+        ivf_refine_factor_hundredths: Default::default(),
+        vector_engine_policy: Default::default(),
         name: col.name.clone(),
         column_type: map_column_type(&col.data_type),
         // SQL primary-key columns are implicitly NOT NULL even when the
@@ -21740,13 +21809,19 @@ pub(crate) fn core_column_from_ast(
         consolidation_change_percent,
         consolidation_tombstone_percent,
         consolidation_disabled,
-    })
+    };
+    crate::database::vector_ivf::policy::from_ast(table, &mut result, col)?;
+    Ok(result)
 }
 
 fn ast_column_from_core(col: contextdb_core::ColumnDef) -> contextdb_parser::ast::ColumnDef {
+    let (search, ivf, engine_policy) = crate::database::vector_ivf::policy::to_ast(&col);
     let is_vector = matches!(&col.column_type, ColumnType::Vector(_));
     let effective_max_partitions = col.effective_max_partitions();
     contextdb_parser::ast::ColumnDef {
+        search,
+        ivf,
+        engine_policy,
         name: col.name,
         data_type: match col.column_type {
             ColumnType::Uuid => DataType::Uuid,
@@ -22239,6 +22314,7 @@ pub(crate) fn validate_create_table_vector_declarations(
 )]
 pub(crate) fn validate_vector_partition_declarations(table: &str, meta: &TableMeta) -> Result<()> {
     for vector in &meta.columns {
+        crate::database::vector_ivf::policy::validate(table, vector)?;
         if !matches!(vector.column_type, ColumnType::Vector(_)) {
             if vector.partition_key_columns.is_some()
                 || vector.max_partitions.is_some()
@@ -24909,3 +24985,45 @@ mod tie_comparison_admission_tests;
 #[cfg(all(test, feature = "test-seams"))]
 #[path = "executor/writecost_missing_index_tests.rs"]
 mod writecost_missing_index_tests;
+
+pub(crate) fn set_clustered_vector_policy(
+    table: &str,
+    action: &AlterAction,
+    meta: &mut TableMeta,
+) -> Result<()> {
+    use crate::database::vector_ivf::policy;
+    let (AlterAction::SetVectorSearch { column, .. }
+    | AlterAction::SetVectorIvf { column, .. }
+    | AlterAction::SetVectorWith { column, .. }
+    | AlterAction::ResetVectorWith { column, .. }) = action
+    else {
+        unreachable!("clustered policy action")
+    };
+    let col = meta
+        .columns
+        .iter_mut()
+        .find(|c| &c.name == column)
+        .ok_or_else(|| Error::Other(format!("column '{column}' not found").into()))?;
+    if !matches!(col.column_type, ColumnType::Vector(_)) {
+        return Err(invalid_vector_policy_declaration(
+            table,
+            column,
+            contextdb_core::VectorPolicyDeclarationIssue::RequiresVectorColumn,
+        ));
+    }
+    let before = col.clone();
+    match action {
+        AlterAction::SetVectorSearch { search, .. } => {
+            policy::apply_search(table, col, search.as_ref())?
+        }
+        AlterAction::SetVectorIvf { ivf, .. } => policy::apply_ivf(table, col, ivf.as_ref())?,
+        AlterAction::SetVectorWith { policy: with, .. } => policy::apply_with(table, col, with)?,
+        AlterAction::ResetVectorWith { members, .. } => policy::reset_with(table, col, members)?,
+        _ => unreachable!(),
+    }
+    if *col != before {
+        col.vector_policy_revision = next_vector_policy_revision(col.vector_policy_revision)
+            .ok_or_else(|| Error::Other("vector policy revision overflow".into()))?;
+    }
+    Ok(())
+}

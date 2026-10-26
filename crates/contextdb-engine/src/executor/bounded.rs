@@ -4902,6 +4902,13 @@ fn select_body_capacity_bytes(
             "subquery ordering",
         )?;
     }
+    bytes = checked_size_add(
+        bytes,
+        crate::database::vector_ivf::policy::query_policy_capacity(
+            body.vector_search_override.as_ref(),
+        ),
+        "subquery vector policy",
+    )?;
     checked_size_add(bytes, optional_string_capacity(&body.use_rank), "subquery")
 }
 
@@ -5124,6 +5131,7 @@ fn physical_plan_capacity_bytes(
             query_expr,
             candidates,
             sort_key,
+            query_policy,
             materialized_columns,
             ..
         }
@@ -5133,10 +5141,16 @@ fn physical_plan_capacity_bytes(
             query_expr,
             candidates,
             sort_key,
+            query_policy,
             materialized_columns,
             ..
         } => {
             let mut bytes = checked_size_add(table.capacity(), column.capacity(), "vector plan")?;
+            bytes = checked_size_add(
+                bytes,
+                crate::database::vector_ivf::policy::query_policy_capacity(query_policy.as_ref()),
+                "vector query policy",
+            )?;
             bytes = checked_size_add(bytes, expr_capacity_bytes(query_expr)?, "vector plan")?;
             bytes = checked_size_add(bytes, optional_string_capacity(sort_key), "vector plan")?;
             if let Some(materialized_columns) = materialized_columns {
@@ -5313,6 +5327,27 @@ fn table_meta_capacity_bytes(
                 string_vec_capacity_bytes(partition_key_columns, "vector partition declaration")?,
                 "table metadata column",
             )?;
+        }
+        for values in [
+            &column.vector_engine_policy.calibration_depths,
+            &column.vector_engine_policy.refine_factors,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = checked_size_add(
+                bytes,
+                checked_size_mul(
+                    values.capacity(),
+                    std::mem::size_of::<u32>(),
+                    "vector policy list",
+                )?,
+                "table metadata policy",
+            )?;
+        }
+        if let Some(source) = &column.vector_engine_policy.calibration_queries {
+            bytes = checked_size_add(bytes, source.table.capacity(), "calibration source table")?;
+            bytes = checked_size_add(bytes, source.column.capacity(), "calibration source column")?;
         }
         if let Some(scope) = column.scope_label.as_ref() {
             match scope {
@@ -16642,6 +16677,12 @@ fn build_vector_kernel<'plan>(
     ctes: &HashMap<&'plan str, &'plan PhysicalPlan>,
     context: &ControlArc<RequestContext>,
 ) -> std::result::Result<PullNode, BoundedExecutionError> {
+    if let PhysicalPlan::VectorSearch { query_policy, .. }
+    | PhysicalPlan::HnswSearch { query_policy, .. } = plan
+    {
+        crate::database::vector_ivf::policy::validate_query(table, column, query_policy.as_ref())?;
+    }
+
     db.assert_table_read_allowed(table)?;
     let index = VectorIndexRef::new(table.to_string(), column.to_string());
     let mut schema_indexes = vec![index.clone()];
