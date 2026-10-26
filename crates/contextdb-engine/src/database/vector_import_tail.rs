@@ -224,14 +224,15 @@ impl MaintenanceContext {
             Native(crate::read_image_memory::ImageMemoryObservation),
         }
         #[cfg(feature = "test-seams")]
-        let observed = match &owner {
-            crate::read_image_memory::ImageMemoryHandle::Arc(image) => {
-                Observation::Legacy(std::sync::Arc::downgrade(image))
-            }
-            crate::read_image_memory::ImageMemoryHandle::Native(_) => Observation::Native(
-                crate::read_image_memory::ImageMemoryObservation::new(&owner),
-            ),
-        };
+        let observed =
+            crate::vector_observations::import_tail_load_observed().then(|| match &owner {
+                crate::read_image_memory::ImageMemoryHandle::Arc(image) => {
+                    Observation::Legacy(std::sync::Arc::downgrade(image))
+                }
+                crate::read_image_memory::ImageMemoryHandle::Native(_) => Observation::Native(
+                    crate::read_image_memory::ImageMemoryObservation::new(&owner),
+                ),
+            });
         #[cfg(feature = "test-seams")]
         let owner_properties = (
             owner.labels(),
@@ -271,11 +272,11 @@ impl MaintenanceContext {
             };
             // Preserve the genuine legacy upgrade through the callback, as before.
             let legacy_survivor = match &observed {
-                Observation::Legacy(observed) => observed.upgrade(),
-                Observation::Native(_) => None,
+                Some(Observation::Legacy(observed)) => observed.upgrade(),
+                _ => None,
             };
             let survivor = match observed {
-                Observation::Legacy(_) => legacy_survivor.as_ref().map(|owner| {
+                Some(Observation::Legacy(_)) => legacy_survivor.as_ref().map(|owner| {
                     (
                         (
                             owner.labels(),
@@ -288,9 +289,10 @@ impl MaintenanceContext {
                 // Dropping a non-final native handle changes no payload fields.
                 // The producer token observes whether that exact block survived;
                 // the immediately preceding sample adds no strong alias.
-                Observation::Native(observed) => observed
+                Some(Observation::Native(observed)) => observed
                     .is_alive()
                     .then_some((owner_properties, held_after_load)),
+                None => None,
             };
             self.observe_import_cohort_load(
                 site,
