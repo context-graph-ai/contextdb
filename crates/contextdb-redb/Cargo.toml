@@ -108,6 +108,11 @@ path = "tests/page_window_contract.rs"
 required-features = ["contextdb-internal", "test-seams"]
 
 [[test]]
+name = "startup_settle_releases_the_replaced_cache_index"
+path = "tests/startup_settle_releases_the_replaced_cache_index.rs"
+required-features = ["contextdb-internal", "test-seams"]
+
+[[test]]
 name = "scan_working_set_stays_cached"
 path = "tests/scan_working_set_stays_cached.rs"
 
