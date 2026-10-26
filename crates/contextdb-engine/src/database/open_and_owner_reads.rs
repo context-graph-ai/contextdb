@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -754,7 +753,9 @@ impl Database {
     /// The fixed-length key this store's local channel is reachable at, when
     /// this open is the one serving it.
     #[cfg(any(test, feature = "test-seams"))]
-    pub(super) fn channel_identity_for_test(&self) -> Option<contextdb_core::read_contract::ChannelAddress> {
+    pub(super) fn channel_identity_for_test(
+        &self,
+    ) -> Option<contextdb_core::read_contract::ChannelAddress> {
         let persistence = self.persistence.as_ref()?;
         self.owner_read_service.as_ref()?;
         crate::local_transport::derive_channel_address(persistence.path()).ok()
@@ -885,7 +886,10 @@ impl Database {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
-    pub(super) fn observe_quiescent_stop_for_test(&self, phase: crate::read_session::QuiescentStopPhase) {
+    pub(super) fn observe_quiescent_stop_for_test(
+        &self,
+        phase: crate::read_session::QuiescentStopPhase,
+    ) {
         if let Some(hooks) = &self.owner_read_config.test_hooks
             && let Some(observer) = &hooks.quiescent_stop
         {
@@ -2305,7 +2309,10 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn wait_for_same_db_trigger_callback_idle(&self, surface: &'static str) -> Result<()> {
+    pub(super) fn wait_for_same_db_trigger_callback_idle(
+        &self,
+        surface: &'static str,
+    ) -> Result<()> {
         let timeout = self.trigger_deadlock_timeout();
         let started = Instant::now();
         let mut observed_wait = false;
@@ -2535,7 +2542,10 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn assert_trigger_callback_tx_not_captured_cross_thread(&self, tx: TxId) -> Result<()> {
+    pub(super) fn assert_trigger_callback_tx_not_captured_cross_thread(
+        &self,
+        tx: TxId,
+    ) -> Result<()> {
         if self.trigger.callback_tx_active(tx) && !self.trigger_callback_tx_bound_matches(tx) {
             return Err(Error::CallbackActiveCrossThread {
                 kind: CallbackKind::Trigger,
@@ -2611,7 +2621,10 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn assert_internal_write_cross_thread_allowed(&self, surface: &'static str) -> Result<()> {
+    pub(super) fn assert_internal_write_cross_thread_allowed(
+        &self,
+        surface: &'static str,
+    ) -> Result<()> {
         if self.cron.callback_active_on_other_thread() {
             return Err(Error::CallbackActiveCrossThread {
                 kind: CallbackKind::Cron,

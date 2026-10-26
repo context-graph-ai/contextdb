@@ -16,12 +16,7 @@ fn vector_meta() -> HashMap<String, TableMeta> {
     )])
 }
 
-fn vector_row(
-    row_id: RowId,
-    created_tx: u64,
-    deleted_tx: Option<u64>,
-    lsn: Lsn,
-) -> VersionedRow {
+fn vector_row(row_id: RowId, created_tx: u64, deleted_tx: Option<u64>, lsn: Lsn) -> VersionedRow {
     VersionedRow {
         row_id,
         values: HashMap::from([(COLUMN.to_string(), Value::Vector(vec![0.25, 0.5, 0.75]))]),

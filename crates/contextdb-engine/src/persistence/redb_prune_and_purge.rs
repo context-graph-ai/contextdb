@@ -1,7 +1,6 @@
 use super::*;
 
 impl RedbPersistence {
-
     /// Rewrite the persisted change log to exactly `entries`, in order. Used by
     /// currency-table version compaction to drop, in lockstep with the pruned
     /// superseded row versions, the `RowInsert`/`RowDelete` entries that
@@ -962,7 +961,9 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn posting_output_original(&self) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
+    pub(super) fn posting_output_original(
+        &self,
+    ) -> Result<crate::memory_accounting::OwnedMemoryReservation> {
         let accountant = self
             .proof_accountant()
             .ok_or_else(|| Error::Other("posting outputs have no writer accountant".into()))?;
@@ -2039,7 +2040,9 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn durable_purge_publication_marker(&self) -> Result<Option<purge_publication::DurableMarker>> {
+    pub(super) fn durable_purge_publication_marker(
+        &self,
+    ) -> Result<Option<purge_publication::DurableMarker>> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
             let table = match read.open_table(PURGE_PUBLICATION_METADATA_TABLE) {

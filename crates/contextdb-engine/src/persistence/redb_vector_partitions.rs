@@ -1,7 +1,6 @@
 use super::*;
 
 impl RedbPersistence {
-
     /// Every raw config value whose key starts with `prefix`, in key order.
     /// Callers that treat the stored bytes as an authority boundary can apply
     /// their own exact decoder without broadening generic config compatibility.
@@ -350,31 +349,50 @@ impl RedbPersistence {
         last: bool,
     ) -> Result<()> {
         let original = crate::memory_accounting::OwnedMemoryReservation::new(accountant);
-        let storage = native_storage_admission::StorageAdmissionScope::writer_original_native(&original)
-            .map_err(Error::NativeEngineOther)?;
-        storage.run_native(|| self.with_db(|db| {
-            let write = Self::begin_history_write(db)?;
-            let table_name = Self::rel_table_name(table);
-            let definition: TableDefinition<&[u8], &[u8]> = TableDefinition::new(&table_name);
-            {
-                let mut relation = write.open_table(definition).map_err(Self::storage_error)?;
-                let (key, old) = {
-                    let mut rows = relation.iter().map_err(Self::storage_error)?;
-                    let (key, body) = if last { rows.next_back() } else { rows.next() }
-                        .transpose().map_err(Self::storage_error)?.expect("fixture row");
-                    (key.value().to_vec(), body.value().to_vec())
-                };
-                let mut new = old.clone();
-                let offset = new.windows(5).position(|window| window == [0, 7, 2, b'{', b'}'])
-                    .expect("fixture has plain JSON text {}");
-                new[offset + 4] = b'x';
-                self.replace_relational_manifest_in_write_original(
-                    &original, &write, table, &key, Some(&old), Some(&new))?;
-                relation.insert(key.as_slice(), new.as_slice()).map_err(Self::storage_error)?;
-            }
-            write.commit().map_err(Self::storage_error)?;
-            Ok(())
-        })).map_err(native_storage_admission::original_storage_error)
+        let storage =
+            native_storage_admission::StorageAdmissionScope::writer_original_native(&original)
+                .map_err(Error::NativeEngineOther)?;
+        storage
+            .run_native(|| {
+                self.with_db(|db| {
+                    let write = Self::begin_history_write(db)?;
+                    let table_name = Self::rel_table_name(table);
+                    let definition: TableDefinition<&[u8], &[u8]> =
+                        TableDefinition::new(&table_name);
+                    {
+                        let mut relation =
+                            write.open_table(definition).map_err(Self::storage_error)?;
+                        let (key, old) = {
+                            let mut rows = relation.iter().map_err(Self::storage_error)?;
+                            let (key, body) = if last { rows.next_back() } else { rows.next() }
+                                .transpose()
+                                .map_err(Self::storage_error)?
+                                .expect("fixture row");
+                            (key.value().to_vec(), body.value().to_vec())
+                        };
+                        let mut new = old.clone();
+                        let offset = new
+                            .windows(5)
+                            .position(|window| window == [0, 7, 2, b'{', b'}'])
+                            .expect("fixture has plain JSON text {}");
+                        new[offset + 4] = b'x';
+                        self.replace_relational_manifest_in_write_original(
+                            &original,
+                            &write,
+                            table,
+                            &key,
+                            Some(&old),
+                            Some(&new),
+                        )?;
+                        relation
+                            .insert(key.as_slice(), new.as_slice())
+                            .map_err(Self::storage_error)?;
+                    }
+                    write.commit().map_err(Self::storage_error)?;
+                    Ok(())
+                })
+            })
+            .map_err(native_storage_admission::original_storage_error)
     }
 
     #[expect(
@@ -4973,7 +4991,9 @@ impl RedbPersistence {
         Self::vector_partition_route_heap_bytes(&membership.index, &membership.partition_key)
     }
 
-    pub(super) fn vector_partition_journal_record_heap_bytes(record: &VectorPartitionJournalRecord) -> usize {
+    pub(super) fn vector_partition_journal_record_heap_bytes(
+        record: &VectorPartitionJournalRecord,
+    ) -> usize {
         let change_bytes = match &record.change {
             VectorPartitionJournalChange::Upsert(membership) => {
                 Self::vector_partition_membership_heap_bytes(membership)
@@ -4995,7 +5015,10 @@ impl RedbPersistence {
     /// so one slot per encoded byte covers that growth; the extra byte factor
     /// also covers string payloads. Exact capacities replace this bound after
     /// decoding. Journal inspection covers both independently stored routes.
-    pub(super) fn vector_partition_record_decode_bound(encoded_bytes: usize, inline_bytes: usize) -> usize {
+    pub(super) fn vector_partition_record_decode_bound(
+        encoded_bytes: usize,
+        inline_bytes: usize,
+    ) -> usize {
         encoded_bytes
             .saturating_mul(std::mem::size_of::<VectorPartitionComponent>().saturating_add(1))
             .saturating_add(inline_bytes)

@@ -77,7 +77,11 @@ impl SnapshotFloorRegistry {
     /// Hold `snapshot` for `partition`'s unpublished paged build. Called at
     /// open before cleanup can run and at build start under the commit gate,
     /// where no removal pass can be sampling concurrently.
-    pub(super) fn hold_construction_floor(&self, partition: &VectorPartitionRef, snapshot: SnapshotId) {
+    pub(super) fn hold_construction_floor(
+        &self,
+        partition: &VectorPartitionRef,
+        snapshot: SnapshotId,
+    ) {
         let mut floors = self.construction_floors.lock();
         let mut state = self.state.lock();
         if let Some(token) = floors.get(partition) {
@@ -128,7 +132,10 @@ impl SnapshotFloorRegistry {
     /// Register one statement and remember its exact token on this thread.
     /// The separate wrapper is deliberately not `Send`: its thread-local
     /// nesting marker must be removed on the same thread that installed it.
-    pub(super) fn register_statement(self: &Arc<Self>, snapshot: SnapshotId) -> StatementSnapshotRegistration {
+    pub(super) fn register_statement(
+        self: &Arc<Self>,
+        snapshot: SnapshotId,
+    ) -> StatementSnapshotRegistration {
         let registration = self.register_as(snapshot, SnapshotRegistrationClass::Statement);
         STATEMENT_SNAPSHOT_REGISTRATION_STACK
             .with(|stack| stack.borrow_mut().push(registration.token));
@@ -274,7 +281,10 @@ impl SnapshotFloorRegistry {
 
     /// Retention reclaims only versions no registered statement, explicit
     /// snapshot pin, or suspended bounded cursor can still observe.
-    pub(super) fn begin_retention_removal_pass(self: &Arc<Self>, watermark: TxId) -> ActiveRemovalPassGuard {
+    pub(super) fn begin_retention_removal_pass(
+        self: &Arc<Self>,
+        watermark: TxId,
+    ) -> ActiveRemovalPassGuard {
         self.begin_removal_pass_inner(watermark, None, true)
     }
 
@@ -362,7 +372,10 @@ impl SnapshotFloorRegistry {
     /// source rows, never a partition state or a retired graph generation, so
     /// those registrations are left out of this sample; relational version
     /// cleanup keeps honoring them through the ordinary passes.
-    pub(super) fn begin_vector_removal_pass(self: &Arc<Self>, watermark: TxId) -> ActiveRemovalPassGuard {
+    pub(super) fn begin_vector_removal_pass(
+        self: &Arc<Self>,
+        watermark: TxId,
+    ) -> ActiveRemovalPassGuard {
         let floors = self.construction_floors.lock();
         let mut state = self.state.lock();
         let mut registered_snapshots: Vec<SnapshotId> = state
@@ -482,7 +495,10 @@ impl Drop for StatementSnapshotRegistration {
 /// smallest such candidate cannot see the row, no larger one can either --
 /// this makes the check `O(log n)` per version (a binary search) rather
 /// than `O(n)`.
-pub(super) fn any_registered_snapshot_sees(registered_snapshots: &[SnapshotId], row: &VersionedRow) -> bool {
+pub(super) fn any_registered_snapshot_sees(
+    registered_snapshots: &[SnapshotId],
+    row: &VersionedRow,
+) -> bool {
     any_registered_snapshot_sees_version(registered_snapshots, row.created_tx, row.deleted_tx)
 }
 
@@ -607,7 +623,9 @@ impl DurableRawVectorSource {
             ),
         }
     }
-    pub(super) fn membership_owner(&self) -> crate::persistence::vector_membership_source::MembershipOwner {
+    pub(super) fn membership_owner(
+        &self,
+    ) -> crate::persistence::vector_membership_source::MembershipOwner {
         use crate::persistence::vector_membership_source::MembershipOwner;
         match self {
             Self::Writable(source) => MembershipOwner::Writable(source.clone()),
@@ -795,7 +813,9 @@ impl DurableRawVectorPartitionLoader {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn load_checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<()> {
+    pub(super) fn load_checkpoint(
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<()> {
         if request(DormantVectorLoadRequest::Checkpoint) {
             Ok(())
         } else {
@@ -2381,7 +2401,9 @@ impl DurableVectorGenerationLoader {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn load_checkpoint(request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool) -> Result<()> {
+    pub(super) fn load_checkpoint(
+        request: &mut dyn FnMut(DormantVectorLoadRequest) -> bool,
+    ) -> Result<()> {
         if request(DormantVectorLoadRequest::Checkpoint) {
             Ok(())
         } else {

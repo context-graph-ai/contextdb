@@ -739,7 +739,10 @@ impl EngineDatabaseHandle {
         })
     }
 
-    pub(super) fn with_host<'h, R>(&'h self, f: impl FnOnce(&'h EngineDatabaseTransactions) -> R) -> R {
+    pub(super) fn with_host<'h, R>(
+        &'h self,
+        f: impl FnOnce(&'h EngineDatabaseTransactions) -> R,
+    ) -> R {
         f(self.data.as_deref().expect("live engine database handle"))
     }
 
@@ -1367,7 +1370,9 @@ pub(super) fn validate_temporary_detach(
     })
 }
 
-pub(super) fn consume_temporary_nonfallible(ticket: ValidatedTemporaryMetadata<'_>) -> OwnedTemporaryMetadata {
+pub(super) fn consume_temporary_nonfallible(
+    ticket: ValidatedTemporaryMetadata<'_>,
+) -> OwnedTemporaryMetadata {
     let ValidatedTemporaryMetadata {
         terminal,
         original_present,
@@ -1479,7 +1484,9 @@ pub(super) fn unwrap_temporary_peer(peer: OwnedTemporaryMetadata) -> OwnedTermin
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn take_owned_conditions(peer: &mut OwnedTemporaryMetadata) -> Result<ConditionalBuffer> {
+pub(super) fn take_owned_conditions(
+    peer: &mut OwnedTemporaryMetadata,
+) -> Result<ConditionalBuffer> {
     match peer.original.node.as_mut() {
         None if !peer.original_present => Ok(MetadataBuffer::empty()),
         None => Err(EngineMetadataJournal::identity_error()),
@@ -2112,7 +2119,10 @@ impl EngineMetadataJournal {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn mutation_binding(&self, tx: TxId) -> Result<((TxId, u64, u64, usize), u64, u64, usize)> {
+    pub(super) fn mutation_binding(
+        &self,
+        tx: TxId,
+    ) -> Result<((TxId, u64, u64, usize), u64, u64, usize)> {
         let binding = {
             let records = self.records.lock();
             Self::record(&records, tx).and_then(|record| {
@@ -3315,7 +3325,10 @@ impl std::task::Wake for ReadPublicationWake {
     }
 }
 
-pub(super) fn publication_scopes_conflict(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+pub(super) fn publication_scopes_conflict(
+    left: &BTreeSet<String>,
+    right: &BTreeSet<String>,
+) -> bool {
     left.contains("*") || right.contains("*") || left.iter().any(|table| right.contains(table))
 }
 
@@ -4100,7 +4113,11 @@ impl MaintenanceWorkerClock {
         self.changed.notify_all();
     }
 
-    pub(super) fn wait_for_cycle(&self, shutdown: &AtomicBool, interval_ms: &AtomicU64) -> Option<u64> {
+    pub(super) fn wait_for_cycle(
+        &self,
+        shutdown: &AtomicBool,
+        interval_ms: &AtomicU64,
+    ) -> Option<u64> {
         let mut state = self.state.lock();
         loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -4175,7 +4192,10 @@ impl MaintenanceWorkerClock {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
-    pub(super) fn wake_once(&self, shutdown: &AtomicBool) -> Result<VectorMaintenanceWorkerCycleForTest> {
+    pub(super) fn wake_once(
+        &self,
+        shutdown: &AtomicBool,
+    ) -> Result<VectorMaintenanceWorkerCycleForTest> {
         let mut state = self.state.lock();
         if !state.held {
             return Err(Error::Other(
@@ -4299,7 +4319,10 @@ impl SnapshotFloorRegistry {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn fund_pin_slots(&self, accountant: crate::memory_accounting::AccountantHandle) -> Result<()> {
+    pub(super) fn fund_pin_slots(
+        &self,
+        accountant: crate::memory_accounting::AccountantHandle,
+    ) -> Result<()> {
         let mut configured = self.pin_slots.lock();
         if configured.is_some() {
             return Ok(());

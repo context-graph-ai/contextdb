@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -191,7 +190,11 @@ impl Database {
         Ok(result)
     }
 
-    pub(super) fn local_table_projection_streamed(&self, table: &str, arriving: &TableMeta) -> bool {
+    pub(super) fn local_table_projection_streamed(
+        &self,
+        table: &str,
+        arriving: &TableMeta,
+    ) -> bool {
         self.relational_store.uses_disk_backed_committed_bodies()
             && self.table_meta(table).is_some_and(|previous| {
                 !previous
@@ -5768,7 +5771,11 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn pending_vector_dimension(&self, tx: TxId, index: &VectorIndexRef) -> Result<Option<usize>> {
+    pub(super) fn pending_vector_dimension(
+        &self,
+        tx: TxId,
+        index: &VectorIndexRef,
+    ) -> Result<Option<usize>> {
         self.tx_mgr.with_read(tx, |ws| {
             ws.vector_inserts
                 .iter()

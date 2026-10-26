@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     /// Resolve exactly one currently visible row life for the private
     /// authoritative-purge kernel.  This only reads durable creation/lineage
     /// evidence; it does not reserve, mutate, or publish anything.
@@ -2594,7 +2593,10 @@ impl Database {
     }
 
     #[cfg(test)]
-    pub(super) fn authoritative_purge_blob_roles_for_test(&self, hash: &[u8; 32]) -> BTreeSet<String> {
+    pub(super) fn authoritative_purge_blob_roles_for_test(
+        &self,
+        hash: &[u8; 32],
+    ) -> BTreeSet<String> {
         let _operation = self.assert_open_operation();
         self.blob_repository
             .authoritative_purge_roles_for_test(hash)
@@ -2714,7 +2716,9 @@ impl Database {
         Ok(rows)
     }
 
-    pub(super) fn authoritative_purge_all_memory_source_provenance(&self) -> Vec<(String, RowId, Lsn, u8)> {
+    pub(super) fn authoritative_purge_all_memory_source_provenance(
+        &self,
+    ) -> Vec<(String, RowId, Lsn, u8)> {
         self.relational_store
             .sync_source_sidecars_snapshot()
             .into_iter()

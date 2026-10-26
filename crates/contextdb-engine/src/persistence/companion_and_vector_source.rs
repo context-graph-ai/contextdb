@@ -10,7 +10,11 @@ impl Drop for CompanionGuard {
     }
 }
 
-pub(super) fn write_companion_region(file: &mut File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_companion_region(
+    file: &mut File,
+    offset: u64,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(bytes)
 }
@@ -410,7 +414,9 @@ impl PersistenceProofOwner {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn prepare(accountant: crate::memory_accounting::StoreAccountantHandle) -> Result<Arc<Self>> {
+    pub(super) fn prepare(
+        accountant: crate::memory_accounting::StoreAccountantHandle,
+    ) -> Result<Arc<Self>> {
         debug_assert!(accountant.is_writer(), "only raw writers prepare an owner");
         let mut owner = Self {
             // The original tagged handle is the sole counted custody. Keep
@@ -495,7 +501,9 @@ impl ProofAccountantSlot {
         ))
     }
 
-    pub(super) fn raw_handle_pointer(pointer: *mut ()) -> *mut crate::memory_accounting::MemoryAccountant {
+    pub(super) fn raw_handle_pointer(
+        pointer: *mut (),
+    ) -> *mut crate::memory_accounting::MemoryAccountant {
         debug_assert!(matches!(
             pointer.addr() & Self::MASK,
             Self::RAW_READER | Self::RAW_WRITER
@@ -1170,7 +1178,10 @@ impl ReadOnlyVectorGenerationSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn with_read<T>(&self, read: impl FnOnce(&redb::ReadTransaction) -> Result<T>) -> Result<T> {
+    pub(super) fn with_read<T>(
+        &self,
+        read: impl FnOnce(&redb::ReadTransaction) -> Result<T>,
+    ) -> Result<T> {
         read(&self.read)
     }
 
@@ -1970,7 +1981,9 @@ impl ReceivedSchemaPersistenceProjection {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn materialize_rows_compatibility(&self) -> Result<HashMap<String, Vec<VersionedRow>>> {
+    pub(super) fn materialize_rows_compatibility(
+        &self,
+    ) -> Result<HashMap<String, Vec<VersionedRow>>> {
         let mut rows = HashMap::<String, Vec<VersionedRow>>::new();
         self.visit_rows(|table, row| {
             self.vector_image_memory.reserve(

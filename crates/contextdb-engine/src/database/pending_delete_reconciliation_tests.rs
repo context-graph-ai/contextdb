@@ -79,9 +79,10 @@ fn pending_delete_reconciliation_retires_only_its_old_row_and_vector_payload() {
             .any(|row| { !row.deleted && row.natural_key == retired_key && row.lsn == Lsn(4) })
     );
     assert!(
-        reconciled.rows.iter().any(|row| {
-            !row.deleted && row.natural_key == different_key && row.lsn == Lsn(2)
-        })
+        reconciled
+            .rows
+            .iter()
+            .any(|row| { !row.deleted && row.natural_key == different_key && row.lsn == Lsn(2) })
     );
     assert!(
         reconciled

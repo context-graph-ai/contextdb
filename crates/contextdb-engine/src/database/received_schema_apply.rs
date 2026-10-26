@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -810,7 +809,10 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn admit_received_side_metadata(&self, changes: &ChangeSet) -> Result<StagedCopyCharge> {
+    pub(super) fn admit_received_side_metadata(
+        &self,
+        changes: &ChangeSet,
+    ) -> Result<StagedCopyCharge> {
         let bytes = if Self::received_side_metadata_required(changes) {
             let event_bytes = self.received_event_bus_projection_bytes()?;
             let trigger_bytes = self.received_trigger_projection_bytes()?;
@@ -1110,7 +1112,9 @@ impl Database {
             .local_policy_metadata_enabled
             .store(false, Ordering::SeqCst);
         // A private schema image never owns a maintenance schedule.
-        working.maintenance_caller_driven.store(true, Ordering::SeqCst);
+        working
+            .maintenance_caller_driven
+            .store(true, Ordering::SeqCst);
         let metadata = self.relational_store.table_meta.read().clone();
         let read_memory = working.declared_reader_memory()?;
         let mut vector_copy_owner = crate::vector_read_memory::admission(read_memory.clone());
@@ -1316,7 +1320,9 @@ impl Database {
             working_vectors.clone(),
         )?;
         // An unpublished schema image never owns a maintenance schedule.
-        working.maintenance_caller_driven.store(true, Ordering::SeqCst);
+        working
+            .maintenance_caller_driven
+            .store(true, Ordering::SeqCst);
         if paged_rows {
             working
                 .relational_store

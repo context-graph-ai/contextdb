@@ -127,12 +127,11 @@ fn owner_publication_wait_wakes_for_cancellation_and_refuses_only_after_elapsed_
     let deadline_gate = Arc::new(ReadPublicationGate::default());
     let _deadline_writer = deadline_gate.acquire_write(&BTreeSet::from(["items".to_owned()]));
     let (deadline_clock, _, _) = controlled_clock(0, Some(21), false);
-    let error = match deadline_gate
-        .acquire_read(&scope(deadline_clock, OwnerReadCancellation::new()))
-    {
-        Ok(_) => panic!("elapsed contended publication must refuse"),
-        Err(error) => error,
-    };
+    let error =
+        match deadline_gate.acquire_read(&scope(deadline_clock, OwnerReadCancellation::new())) {
+            Ok(_) => panic!("elapsed contended publication must refuse"),
+            Err(error) => error,
+        };
     assert!(matches!(
         error,
         Error::ReadFailure(failure)

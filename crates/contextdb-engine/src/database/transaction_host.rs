@@ -79,7 +79,10 @@ impl DdlProvenanceSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn surviving_entries<'a>(&'a self, changes: &ChangeSet) -> Result<Vec<&'a SourceDdlIdentity>> {
+    pub(super) fn surviving_entries<'a>(
+        &'a self,
+        changes: &ChangeSet,
+    ) -> Result<Vec<&'a SourceDdlIdentity>> {
         if changes.ddl.len() != changes.ddl_lsn.len() {
             return Err(Error::SyncError(
                 ("outbound DDL has mismatched ddl_lsn cardinality".to_string()).into(),
@@ -1082,7 +1085,10 @@ impl PreparedMemorySwap {
 
     /// Carry the staged rows this swap re-prices, to be recorded when the
     /// shape they are priced against actually becomes the live one.
-    pub(super) fn carrying_staged_admissions(mut self, repricing: StagedAdmissionRepricing) -> Self {
+    pub(super) fn carrying_staged_admissions(
+        mut self,
+        repricing: StagedAdmissionRepricing,
+    ) -> Self {
         if !repricing.per_tx.is_empty() {
             self.staged_admissions = Some(repricing);
         }
@@ -1472,7 +1478,11 @@ pub(super) fn sync_identity_key(table: &str, natural_key: &NaturalKey) -> Vec<u8
     identity
 }
 
-pub(super) fn dependency_row_references_parent(db: &Database, child: &RowChange, parent: &RowChange) -> bool {
+pub(super) fn dependency_row_references_parent(
+    db: &Database,
+    child: &RowChange,
+    parent: &RowChange,
+) -> bool {
     let Some(meta) = db.table_meta(&child.table) else {
         return false;
     };
@@ -2710,7 +2720,9 @@ impl QueryResultData {
 }
 
 impl VectorSchemaGates {
-    pub(super) fn sorted_refs(refs: impl IntoIterator<Item = VectorIndexRef>) -> Vec<VectorIndexRef> {
+    pub(super) fn sorted_refs(
+        refs: impl IntoIterator<Item = VectorIndexRef>,
+    ) -> Vec<VectorIndexRef> {
         let mut refs = refs.into_iter().collect::<Vec<_>>();
         refs.sort_by(|a, b| a.table.cmp(&b.table).then(a.column.cmp(&b.column)));
         refs.dedup();
@@ -3110,7 +3122,9 @@ impl DatabaseTransactionHost {
         Self::Legacy(transactions)
     }
 
-    pub(super) fn capture_published_read(&self) -> contextdb_tx::native_capture::EnginePublishedRead {
+    pub(super) fn capture_published_read(
+        &self,
+    ) -> contextdb_tx::native_capture::EnginePublishedRead {
         match self {
             Self::Legacy(transactions) => transactions.capture_published_read().into(),
             Self::Owned(handle) => handle.with_host(|host| {
@@ -3312,7 +3326,10 @@ impl DatabaseTransactionHost {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn try_commit_index_floor(&self, upper: std::ops::Bound<Lsn>) -> Result<Option<(Lsn, TxId)>> {
+    pub(super) fn try_commit_index_floor(
+        &self,
+        upper: std::ops::Bound<Lsn>,
+    ) -> Result<Option<(Lsn, TxId)>> {
         match self {
             Self::Legacy(manager) => manager.try_commit_index_floor(upper),
             Self::Owned(handle) => handle.with_host(|host| {
@@ -3457,7 +3474,11 @@ impl DatabaseTransactionHost {
         }
     }
 
-    pub(super) fn try_with_commit_lock_for<F, R>(&self, duration: std::time::Duration, f: F) -> Option<R>
+    pub(super) fn try_with_commit_lock_for<F, R>(
+        &self,
+        duration: std::time::Duration,
+        f: F,
+    ) -> Option<R>
     where
         F: FnOnce() -> R,
     {
@@ -3536,7 +3557,10 @@ impl DatabaseTransactionHost {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn with_deferred_metadata_write<R>(&self, write: impl FnOnce() -> Result<R>) -> Result<R> {
+    pub(super) fn with_deferred_metadata_write<R>(
+        &self,
+        write: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         let publish = || {
             let reservation = self.reserve_deferred_metadata_publication()?;
             let result = write()?;
@@ -3619,7 +3643,10 @@ impl DatabaseTransactionHost {
         }
     }
 
-    pub(super) fn owe_metadata_publication(&self, reservation: Option<Box<dyn std::any::Any + Send>>) {
+    pub(super) fn owe_metadata_publication(
+        &self,
+        reservation: Option<Box<dyn std::any::Any + Send>>,
+    ) {
         match self {
             Self::Legacy(manager) => manager.owe_metadata_publication(reservation),
             Self::Owned(handle) => handle.with_host(|host| {
@@ -4078,7 +4105,10 @@ impl DatabaseTransactionHost {
         }
     }
 
-    pub(super) fn relational_executor(&self, store: Arc<RelationalStore>) -> MemRelationalExecutor<DynStore> {
+    pub(super) fn relational_executor(
+        &self,
+        store: Arc<RelationalStore>,
+    ) -> MemRelationalExecutor<DynStore> {
         match self {
             Self::Legacy(manager) => MemRelationalExecutor::new(store, manager.clone()),
             Self::Owned(handle) => handle.with_host(|host| {

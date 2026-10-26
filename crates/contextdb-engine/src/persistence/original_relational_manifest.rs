@@ -29,9 +29,8 @@ impl OriginalPendingManifestPublication {
             let mut next = Vec::with_capacity(capacity);
             next.extend(std::mem::take(&mut self.mutations));
             self.mutations = next;
-            self.admission.release(
-                old * std::mem::size_of::<content_identity::ContentIdentityMutation>(),
-            );
+            self.admission
+                .release(old * std::mem::size_of::<content_identity::ContentIdentityMutation>());
         }
         let bytes = manifest::manifest_mutation_bytes(coordinate, present)?;
         self.admission.admit(bytes)?;
@@ -68,17 +67,18 @@ impl RedbPersistence {
             original,
             self.proof_scratch_owner(),
         )?;
-        admission.admit(table.len().checked_add(72).ok_or_else(|| {
-            self.relational_manifest_damage("identity allocation overflow")
-        })?)?;
+        admission.admit(
+            table
+                .len()
+                .checked_add(72)
+                .ok_or_else(|| self.relational_manifest_damage("identity allocation overflow"))?,
+        )?;
         let mut prefix = manifest::manifest_prefix(table)?;
         prefix.extend_from_slice(physical);
         let coordinate = manifest::writer_manifest_next(write, &prefix, false, &mut admission)
             .map_err(|e| self.relational_manifest_error(e))?
             .filter(|key| key.starts_with(&prefix))
-            .ok_or_else(|| {
-                self.relational_manifest_damage("physical version member is missing")
-            })?;
+            .ok_or_else(|| self.relational_manifest_damage("physical version member is missing"))?;
         let next = manifest::writer_manifest_next(write, &coordinate, true, &mut admission)
             .map_err(|e| self.relational_manifest_error(e))?;
         let Some(next) = next else {
@@ -123,16 +123,18 @@ impl RedbPersistence {
         mut pending: Option<&mut OriginalPendingManifestPublication>,
     ) -> Result<()> {
         #[cfg(any(test, feature = "test-seams"))]
-        let _family_scope = content_identity::enter_passive_family(
-            content_identity::LogicalFamily::ChangeAndDdl,
-        );
+        let _family_scope =
+            content_identity::enter_passive_family(content_identity::LogicalFamily::ChangeAndDdl);
         let mut admission = content_identity::original_writer::ProofAdmission::new(
             original,
             self.proof_scratch_owner(),
         )?;
-        admission.admit(table.len().checked_add(72).ok_or_else(|| {
-            self.relational_manifest_damage("identity allocation overflow")
-        })?)?;
+        admission.admit(
+            table
+                .len()
+                .checked_add(72)
+                .ok_or_else(|| self.relational_manifest_damage("identity allocation overflow"))?,
+        )?;
         let mut prefix = manifest::manifest_prefix(table)?;
         prefix.extend_from_slice(physical);
         let expected = manifest::writer_manifest_next_pending(
@@ -163,9 +165,7 @@ impl RedbPersistence {
             )
             .map_err(|e| self.relational_manifest_error(e))?;
             if next.as_deref().is_some_and(|key| key.starts_with(&prefix)) {
-                return Err(
-                    self.relational_manifest_damage("duplicate physical version member")
-                );
+                return Err(self.relational_manifest_damage("duplicate physical version member"));
             }
         }
         let new_coordinate = new
@@ -259,9 +259,7 @@ impl RedbPersistence {
                 .len()
                 .checked_add(72)
                 .and_then(|n| n.checked_mul(3))
-                .ok_or_else(|| {
-                    self.relational_manifest_damage("writer group bound overflow")
-                })?,
+                .ok_or_else(|| self.relational_manifest_damage("writer group bound overflow"))?,
         )?;
         let mut prefix = manifest::manifest_prefix(table)?;
         prefix.extend_from_slice(&row_id.0.to_be_bytes());
@@ -277,17 +275,13 @@ impl RedbPersistence {
             self.proof_scratch_owner(),
         )?;
         let Some((key, body)) = latest else {
-            let witnessed = manifest::writer_manifest_next_pending(
-                write,
-                &prefix,
-                false,
-                &mut window,
-                pending,
-            )
-            .map_err(|e| self.relational_manifest_error(e))?;
+            let witnessed =
+                manifest::writer_manifest_next_pending(write, &prefix, false, &mut window, pending)
+                    .map_err(|e| self.relational_manifest_error(e))?;
             if witnessed.is_some_and(|coordinate| coordinate.starts_with(&prefix)) {
-                return Err(self
-                    .relational_manifest_damage("writer group version is physically missing"));
+                return Err(
+                    self.relational_manifest_damage("writer group version is physically missing")
+                );
             }
             return Ok(());
         };
@@ -300,8 +294,8 @@ impl RedbPersistence {
                 .ok_or_else(|| {
                     self.relational_manifest_damage("unwitnessed writer group suffix")
                 })?;
-        let witness = manifest::parse_manifest(&coordinate)
-            .map_err(|e| self.relational_manifest_error(e))?;
+        let witness =
+            manifest::parse_manifest(&coordinate).map_err(|e| self.relational_manifest_error(e))?;
         // The seek starts at the newest physical version, so a different
         // first witness is a newer member with no physical version.
         if key.value() != witness.identity {
@@ -310,23 +304,17 @@ impl RedbPersistence {
             );
         }
         #[cfg(any(test, feature = "test-seams"))]
-        content_identity::version_manifest::commit_row_work::count_group_version_authenticated(
-        );
+        content_identity::version_manifest::commit_row_work::count_group_version_authenticated();
         let actual = manifest::manifest_for_body(table, key.value(), body.value(), &mut window)
             .map_err(|e| self.relational_manifest_error(e))?;
         if actual != coordinate {
-            return Err(self.relational_manifest_damage(
-                "writer group body or closure is unauthenticated",
-            ));
+            return Err(
+                self.relational_manifest_damage("writer group body or closure is unauthenticated")
+            );
         }
-        let after = manifest::writer_manifest_next_pending(
-            write,
-            &coordinate,
-            true,
-            &mut window,
-            pending,
-        )
-        .map_err(|e| self.relational_manifest_error(e))?;
+        let after =
+            manifest::writer_manifest_next_pending(write, &coordinate, true, &mut window, pending)
+                .map_err(|e| self.relational_manifest_error(e))?;
         if after.is_some_and(|coordinate| coordinate.starts_with(&prefix)) {
             return Err(self.relational_manifest_damage(
                 "duplicate or physically missing writer group version",

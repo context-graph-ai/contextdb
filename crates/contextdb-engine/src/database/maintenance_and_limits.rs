@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     pub(super) fn vector_schema_refs_for_state_propagation_from_table(
         &self,
         table: &str,
@@ -3837,7 +3836,10 @@ impl Database {
     /// side is held, no schema statement can publish a new pending stage; if
     /// one landed between the first observation and lock acquisition, drop
     /// the read side and retry as a writer instead of upgrading in place.
-    pub(super) fn enter_commit_schema_publication_gate(&self, tx: TxId) -> SchemaPublicationGuard<'_> {
+    pub(super) fn enter_commit_schema_publication_gate(
+        &self,
+        tx: TxId,
+    ) -> SchemaPublicationGuard<'_> {
         loop {
             let publishes_local_schema = self.pending_local_schema_stages.lock().contains_key(&tx);
             let guard = self.enter_schema_publication_gate(publishes_local_schema);
@@ -5498,7 +5500,12 @@ impl Database {
     }
 
     #[allow(dead_code)]
-    pub(super) fn find_edge(&self, source: &NodeId, target: &NodeId, edge_type: &str) -> Option<AdjEntry> {
+    pub(super) fn find_edge(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        edge_type: &str,
+    ) -> Option<AdjEntry> {
         self.graph_store
             .forward_adj
             .read()
@@ -5691,7 +5698,11 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn append_owned_metadata(&self, tx: TxId, batch: AdmittedMetadataBatch) -> Result<()> {
+    pub(super) fn append_owned_metadata(
+        &self,
+        tx: TxId,
+        batch: AdmittedMetadataBatch,
+    ) -> Result<()> {
         self.publish_owned_metadata(tx, |journal| journal.prepare_metadata_append(tx, batch))
     }
 
@@ -6334,7 +6345,10 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn publish_direct_metadata<R>(&self, write: impl FnOnce() -> Result<R>) -> Result<R> {
+    pub(super) fn publish_direct_metadata<R>(
+        &self,
+        write: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         publish_direct_metadata(&self.tx_mgr, write)
     }
 
@@ -7272,14 +7286,17 @@ impl Database {
         })
     }
 
-    pub(super) const OUTBOUND_SCHEMA_HOLDBACK_PREFIX: &'static str = "sync_schema_holdback_outbound.v1.";
-    pub(super) const INBOUND_SCHEMA_HOLDBACK_PREFIX: &'static str = "sync_schema_holdback_inbound.v1.";
+    pub(super) const OUTBOUND_SCHEMA_HOLDBACK_PREFIX: &'static str =
+        "sync_schema_holdback_outbound.v1.";
+    pub(super) const INBOUND_SCHEMA_HOLDBACK_PREFIX: &'static str =
+        "sync_schema_holdback_inbound.v1.";
 
     /// The RECEIVER's own holdback: tables whose arriving schema unit did not
     /// fit this node's declared `MEMORY_LIMIT`. Its own key so a node that is
     /// both a hub and an edge never overwrites one role's record with the
     /// other's, exactly as the inbound and outbound keys are already separate.
-    pub(super) const MEMORY_SCHEMA_HOLDBACK_PREFIX: &'static str = "sync_schema_holdback_memory.v1.";
+    pub(super) const MEMORY_SCHEMA_HOLDBACK_PREFIX: &'static str =
+        "sync_schema_holdback_memory.v1.";
 
     pub(super) fn schema_holdback_config_key(
         prefix: &str,

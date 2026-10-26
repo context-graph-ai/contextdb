@@ -50,9 +50,7 @@ fn assert_graph_no_population_walk(scope: &ReadWorkObservationScope) {
     );
 }
 
-fn graph_retained_zero_touch_keys(
-    before: &GraphPublicationState,
-) -> Vec<(&'static str, Vec<u8>)> {
+fn graph_retained_zero_touch_keys(before: &GraphPublicationState) -> Vec<(&'static str, Vec<u8>)> {
     // Decode and derive fixture identities before entering Mutation.
     let mut retained = Vec::new();
     for (key, bytes) in &before.1[0] {
@@ -120,9 +118,9 @@ fn assert_graph_context(scope: &ReadWorkObservationScope, phase: ReadWorkPhase) 
             .all(|event| event.operation_id.as_deref() == Some("graph-observer-row"))
     );
     assert!(
-        events.iter().any(
-            |event| event.observation_status == "OBSERVED" && event.captured_root.is_some()
-        )
+        events
+            .iter()
+            .any(|event| event.observation_status == "OBSERVED" && event.captured_root.is_some())
     );
     assert!(
         events
@@ -133,9 +131,7 @@ fn assert_graph_context(scope: &ReadWorkObservationScope, phase: ReadWorkPhase) 
                     event.operation.as_str(),
                     "get" | "remove" | "insert" | "maximum_seek"
                 ))
-            .all(
-                |event| event.observation_status == "OBSERVED" && event.captured_root.is_some()
-            )
+            .all(|event| event.observation_status == "OBSERVED" && event.captured_root.is_some())
     );
 }
 
@@ -291,7 +287,13 @@ fn graph_addressed_observer_row(
             );
             assert!(cursor.next_edge_with(&|| Ok(())).unwrap().is_none());
             result.push(assert_graph_addressed_work(&scope, 7));
-            assert!(scope.graph_events().iter().filter(|event| event.observation_status == "OBSERVED").all(|event| event.captured_root.as_deref() == Some(expected_root.as_str())));
+            assert!(
+                scope
+                    .graph_events()
+                    .iter()
+                    .filter(|event| event.observation_status == "OBSERVED")
+                    .all(|event| event.captured_root.as_deref() == Some(expected_root.as_str()))
+            );
             assert!(scope.graph_counters().graph_payload_decodes > 0);
             drop(cursor);
             drop(scope);
@@ -496,8 +498,7 @@ struct OwnerGraphSnapshotBoundaryObserver {
     capture_events: std::sync::Mutex<Vec<crate::read_work_probe::GraphWorkEvent>>,
     capture_workers: std::sync::Mutex<Vec<crate::read_work_probe::GraphWorkerInstallation>>,
     capture_pages: std::sync::Mutex<Option<(u64, u64)>>,
-    capture_page_owners:
-        std::sync::Mutex<Option<std::collections::BTreeMap<String, (u64, u64)>>>,
+    capture_page_owners: std::sync::Mutex<Option<std::collections::BTreeMap<String, (u64, u64)>>>,
     first_source: std::sync::Mutex<Option<crate::read_session::ReadKernelSourceEvent>>,
 }
 
@@ -544,9 +545,9 @@ impl crate::read_session::ReadKernelTestObserver for OwnerGraphSnapshotBoundaryO
                 "the statement has registered its real snapshot before graph capture reaches its first source touch"
             );
             *self.first_source.lock().unwrap() = Some(event);
-            let page_owners = scope.owner_page_admission_by_owner().expect(
-                "the executing query must expose its actual per-capability admission map",
-            );
+            let page_owners = scope
+                .owner_page_admission_by_owner()
+                .expect("the executing query must expose its actual per-capability admission map");
             let capture = scope
                 .graph_events()
                 .into_iter()
@@ -575,10 +576,11 @@ impl crate::read_session::ReadKernelTestObserver for OwnerGraphSnapshotBoundaryO
             );
             *self.capture_events.lock().unwrap() = scope.graph_events();
             *self.capture_workers.lock().unwrap() = scope.owner_worker_paths();
-            *self.capture_pages.lock().unwrap() =
-                Some(scope.owner_page_admission().expect(
-                    "the installed graph worker must expose its actual page admissions",
-                ));
+            *self.capture_pages.lock().unwrap() = Some(
+                scope
+                    .owner_page_admission()
+                    .expect("the installed graph worker must expose its actual page admissions"),
+            );
         }
     }
     fn cancellation_observed(
@@ -786,9 +788,10 @@ fn assert_public_owner_open_through_graph_capture_row(directory: &Path) {
     // The first real query samples inside the executing kernel before its
     // edge cursor opens, then continues to the actual target as its control.
     let actual_edges = session.execute("SELECT t FROM GRAPH_TABLE(edges MATCH (a)-[:LINKS]->(b) WHERE a.id = $source COLUMNS (b.id AS t))", &HashMap::from([("source".into(), Value::Uuid(uuid::Uuid::from_u128(1)))])).unwrap();
-    let captured = observer.first_edge.lock().unwrap().expect(
-        "the first real graph query must reach the source callback after graph capture",
-    );
+    let captured =
+        observer.first_edge.lock().unwrap().expect(
+            "the first real graph query must reach the source callback after graph capture",
+        );
     assert_eq!(
         captured.graph_payload_decodes, 0,
         "open plus first graph capture has not decoded any edge"
@@ -812,9 +815,7 @@ fn assert_public_owner_open_through_graph_capture_row(directory: &Path) {
     let capture_events = observer.capture_events.lock().unwrap();
     let captures = capture_events
         .iter()
-        .filter(|event| {
-            event.family == "graph_snapshot" && event.operation == "SNAPSHOT_CAPTURE"
-        })
+        .filter(|event| event.family == "graph_snapshot" && event.operation == "SNAPSHOT_CAPTURE")
         .collect::<Vec<_>>();
     assert_eq!(
         captures.len(),
@@ -913,10 +914,11 @@ fn assert_public_owner_open_through_graph_capture_row(directory: &Path) {
     assert!(request_bytes as u64 <= declared_reader_limit);
     // Adapter-control bytes and request bytes are different actual credits.
     // Successful page totals are cumulative admissions, not live credits.
-    let capture_pages =
-        observer.capture_pages.lock().unwrap().expect(
-            "the first graph callback must sample the executing worker's page accessor",
-        );
+    let capture_pages = observer
+        .capture_pages
+        .lock()
+        .unwrap()
+        .expect("the first graph callback must sample the executing worker's page accessor");
     assert_eq!(
         capture_pages,
         (
@@ -977,9 +979,9 @@ fn assert_public_owner_open_through_graph_capture_row(directory: &Path) {
             .is_some_and(|id| !id.is_empty())
     }));
     assert!(
-        events.iter().any(
-            |event| event.captured_root.is_some() && event.observation_status == "OBSERVED"
-        )
+        events
+            .iter()
+            .any(|event| event.captured_root.is_some() && event.observation_status == "OBSERVED")
     );
     let loaded_root = events
         .iter()
@@ -1242,8 +1244,7 @@ fn assert_graph_coordinate_witnesses(
             expected_r.extend_from_slice(&(coordinates.len() as u64).to_be_bytes());
             expected_r.push(u8::from(retired));
             assert_eq!(receipt.value(), expected_r.as_slice());
-            for ((physical, ordinal, entry), expected) in coordinates.iter().zip(private_bytes)
-            {
+            for ((physical, ordinal, entry), expected) in coordinates.iter().zip(private_bytes) {
                 let mut key = String::new();
                 RedbPersistence::write_change_log_entry_key(*physical, *ordinal, &mut key);
                 let value = history.get(key.as_str()).unwrap().unwrap();
@@ -2173,10 +2174,11 @@ impl contextdb_core::read_contract::DeadlineClock for SuffixProgressClock {
         {
             return self.deadline.saturating_add(1);
         }
-        let progressed =
-            self.scope.graph_events().iter().any(|event| {
-                event.family == "commit_index" && event.operation == "iteration_step"
-            });
+        let progressed = self
+            .scope
+            .graph_events()
+            .iter()
+            .any(|event| event.family == "commit_index" && event.operation == "iteration_step");
         if progressed && self.stop == 1 {
             self.cancellation.cancel();
         }
@@ -2224,8 +2226,7 @@ fn commit_suffix_fixture(path: &Path, frontier: Option<(Lsn, TxId)>, suffix: &[(
 
 fn assert_commit_suffix_open_rows(directory: &Path) {
     use contextdb_core::read_contract::{
-        OwnerLimitExceededDetail, OwnerReadCancellation, ReadFailure, ReadFailureLimit,
-        ReadLimits,
+        OwnerLimitExceededDetail, OwnerReadCancellation, ReadFailure, ReadFailureLimit, ReadLimits,
     };
     let frontier = Some((Lsn(20), TxId(100)));
     let cases = [
@@ -2313,9 +2314,7 @@ fn assert_commit_suffix_open_rows(directory: &Path) {
         let advanced = scope
             .graph_events()
             .into_iter()
-            .filter(|event| {
-                event.family == "commit_index" && event.operation == "iteration_step"
-            })
+            .filter(|event| event.family == "commit_index" && event.operation == "iteration_step")
             .collect::<Vec<_>>();
         assert_eq!(advanced.len() as u64, diagnosed);
         assert_eq!(
@@ -2398,8 +2397,7 @@ fn assert_commit_suffix_open_rows(directory: &Path) {
                 Err(error) => Err(LoadReadImageError::Memory(error)),
             });
         match result {
-            Err(LoadReadImageError::Memory(Error::ReadCancelled)) if stop == 1 || stop == 3 => {
-            }
+            Err(LoadReadImageError::Memory(Error::ReadCancelled)) if stop == 1 || stop == 3 => {}
             Err(LoadReadImageError::Memory(Error::ReadFailure(failure)))
                 if stop == 2 || stop == 4 =>
             {
@@ -2436,9 +2434,7 @@ fn assert_commit_suffix_open_rows(directory: &Path) {
         let advanced = scope
             .graph_events()
             .into_iter()
-            .filter(|event| {
-                event.family == "commit_index" && event.operation == "iteration_step"
-            })
+            .filter(|event| event.family == "commit_index" && event.operation == "iteration_step")
             .collect::<Vec<_>>();
         assert_eq!(
             advanced
@@ -2453,7 +2449,15 @@ fn assert_commit_suffix_open_rows(directory: &Path) {
         );
         if stop == 1 || stop == 2 {
             let events = source_events.events();
-            let dropped = events.iter().position(|event| matches!(event, read_persistence_test_scaffold::ReadImageSourceEvent::SourceHandlesDropped)).unwrap();
+            let dropped = events
+                .iter()
+                .position(|event| {
+                    matches!(
+                        event,
+                        read_persistence_test_scaffold::ReadImageSourceEvent::SourceHandlesDropped
+                    )
+                })
+                .unwrap();
             let released = events
                 .iter()
                 .position(|event| {
@@ -2522,8 +2526,7 @@ fn assert_directory_pinned_publication_row(directory: &Path) {
         )
         .unwrap();
     let store = RedbPersistence::open(&path).unwrap();
-    store
-        .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42332).into());
+    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42332).into());
     store
         .flush_commit_index_entries(&BTreeMap::from([(Lsn(40), TxId(101))]))
         .unwrap();
@@ -2803,7 +2806,12 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
             source_registration.image_accountant_used_before_reservation,
             raw_accountant_used
         );
-        let wrapper_held_delta = source_registration.image_held_after_reservation.checked_sub(source_registration.image_held_before_reservation).expect("successful source wrapper reservation increases its actual image owner counter");
+        let wrapper_held_delta = source_registration
+            .image_held_after_reservation
+            .checked_sub(source_registration.image_held_before_reservation)
+            .expect(
+                "successful source wrapper reservation increases its actual image owner counter",
+            );
         let wrapper_accountant_delta = source_registration
             .image_accountant_used_after_reservation
             .checked_sub(source_registration.image_accountant_used_before_reservation)
@@ -2828,9 +2836,7 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
         let constructor_accountant_delta = funding_constructed
             .image_accountant_used_bytes
             .and_then(|used| used.checked_sub(raw_accountant_used))
-            .expect(
-                "construction retains its wrapper and fixed controls on the actual accountant",
-            );
+            .expect("construction retains its wrapper and fixed controls on the actual accountant");
         assert_eq!(
             constructor_accountant_delta,
             wrapper_accountant_delta + fixed_constructor_controls_bytes,
@@ -2849,15 +2855,13 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
             raw_open_identity
         );
         assert!(
-            funding_constructed.open_child.charged_bytes
-                > funding_loaded.open_child.charged_bytes,
+            funding_constructed.open_child.charged_bytes > funding_loaded.open_child.charged_bytes,
             "installed directory controls use the declared open child"
         );
         assert_eq!(
             funding_constructed.open_child.parent_charged_bytes
                 - funding_loaded.open_child.parent_charged_bytes,
-            funding_constructed.open_child.charged_bytes
-                - funding_loaded.open_child.charged_bytes
+            funding_constructed.open_child.charged_bytes - funding_loaded.open_child.charged_bytes
         );
         assert_eq!(
             funding_constructed.image_held_bytes,
@@ -2964,8 +2968,7 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
             Some((0, expected_commit_count as u64))
         );
         drop(public_open);
-        let funding_scope =
-            assert_installed_commit_directory_rows(&file, &expected_commits, &path);
+        let funding_scope = assert_installed_commit_directory_rows(&file, &expected_commits, &path);
         let registration = file.file_storage_registration_for_test().unwrap();
         assert!(registration.descriptor_open);
         assert!(!registration.load_lock_held);
@@ -3022,9 +3025,8 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
             )
             .unwrap();
         let store = RedbPersistence::open(&path).unwrap();
-        store.attach_memory_accountant(
-            std::sync::Arc::clone(&fixture_open_accountant_42536).into(),
-        );
+        store
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42536).into());
         let root = store
             .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
             .unwrap();
@@ -3072,8 +3074,7 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
     for references in [1, 4, 8] {
         for repack in [false, true] {
             let path = directory.join(format!("graph-retirement-{references}-{repack}.db"));
-            let (store, predecessor, entries) =
-                graph_history_fixture(&path, 4, references, repack);
+            let (store, predecessor, entries) = graph_history_fixture(&path, 4, references, repack);
             let before = graph_publication_state(&store);
             let first_ordinal = usize::from(repack);
             let private_bytes = before.1[0]
@@ -3238,8 +3239,7 @@ fn assert_graph_open_and_maintenance_rows(directory: &Path) {
                     .map(|(key, value)| {
                         let mut old = value.clone();
                         let ordinal = u64::from_be_bytes(old[9..17].try_into().unwrap());
-                        old[9..17]
-                            .copy_from_slice(&(ordinal + first_ordinal as u64).to_be_bytes());
+                        old[9..17].copy_from_slice(&(ordinal + first_ordinal as u64).to_be_bytes());
                         (key.clone(), old)
                     })
                     .collect::<Vec<_>>(),
@@ -3630,10 +3630,9 @@ fn graph_durability_interruption_child() -> bool {
             std::sync::Arc::clone(&fixture_open_accountant_42956).into(),
         )
         .unwrap();
-    let store = RedbPersistence::open(Path::new(&path))
-        .expect("open the parent's fresh temporary fixture");
-    store
-        .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42956).into());
+    let store =
+        RedbPersistence::open(Path::new(&path)).expect("open the parent's fresh temporary fixture");
+    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42956).into());
     let candidates = store
         .load_graph_table(GRAPH_FWD_TABLE)
         .unwrap()
@@ -3680,8 +3679,7 @@ fn assert_graph_durability_rows(directory: &Path) {
         )
         .unwrap();
     let control = RedbPersistence::open(&control_path).unwrap();
-    control
-        .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42979).into());
+    control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_42979).into());
     assert_eq!(graph_durability_state(&control), before);
     let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
     let stats = graph_durability_publication(&control, &predecessor).unwrap();
@@ -3760,9 +3758,8 @@ fn assert_graph_durability_rows(directory: &Path) {
             )
             .unwrap();
         let reopened = RedbPersistence::open(&path).unwrap();
-        reopened.attach_memory_accountant(
-            std::sync::Arc::clone(&fixture_open_accountant_43023).into(),
-        );
+        reopened
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43023).into());
         assert_eq!(
             &graph_durability_state(&reopened),
             expected,
@@ -3807,9 +3804,8 @@ fn assert_graph_durability_rows(directory: &Path) {
             )
             .unwrap();
         let store = RedbPersistence::open(&error_path).unwrap();
-        store.attach_memory_accountant(
-            std::sync::Arc::clone(&fixture_open_accountant_43036).into(),
-        );
+        store
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43036).into());
         assert_eq!(graph_durability_state(&store), before);
         let observation = ReadWorkObservationScope::enter(ReadWorkPhase::Mutation);
         arm_currency_reclaim_fault_for_test(boundary, false);
@@ -3834,9 +3830,8 @@ fn assert_graph_durability_rows(directory: &Path) {
             )
             .unwrap();
         let reopened = RedbPersistence::open(&error_path).unwrap();
-        reopened.attach_memory_accountant(
-            std::sync::Arc::clone(&fixture_open_accountant_43047).into(),
-        );
+        reopened
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43047).into());
         assert_eq!(
             &graph_durability_state(&reopened),
             expected,
@@ -3958,9 +3953,7 @@ fn assert_graph_compaction_observation(scope: &ReadWorkObservationScope, boundar
     assert_eq!(
         events
             .iter()
-            .filter(
-                |event| event.family == "publication" && event.operation == "compaction_hook"
-            )
+            .filter(|event| event.family == "publication" && event.operation == "compaction_hook")
             .count(),
         1
     );
@@ -4044,8 +4037,7 @@ fn graph_compaction_interruption_child() -> bool {
         .unwrap();
     let store = RedbPersistence::open(Path::new(&path))
         .expect("open closed temporary compaction fixture beside registered old readers");
-    store
-        .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43134).into());
+    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43134).into());
     arm_retention_reclaim_crash_for_test(boundary);
     let result = graph_compaction_publication(&store);
     panic!("selected compaction interruption {boundary} was not reached: {result:?}");
@@ -4079,8 +4071,7 @@ fn assert_graph_compaction_pinned_rows(directory: &Path, boundaries: &[u8]) {
         )
         .unwrap();
     let control = RedbPersistence::open(&control_path).unwrap();
-    control
-        .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43155).into());
+    control.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43155).into());
     let page_size = control
         .with_db(|db| {
             let snapshot = db
@@ -4153,8 +4144,8 @@ fn assert_graph_compaction_pinned_rows(directory: &Path, boundaries: &[u8]) {
             break;
         }
     }
-    let first_successful_step = first_successful_step
-        .expect("the control executes its first successful compaction step");
+    let first_successful_step =
+        first_successful_step.expect("the control executes its first successful compaction step");
     assert!(
         relocation_observed,
         "the control must execute physical page relocation within {maximum_progress_steps} steps"
@@ -4223,8 +4214,7 @@ fn assert_graph_compaction_pinned_rows(directory: &Path, boundaries: &[u8]) {
             observed_registration.storage_transaction_id
                 >= control_registration.storage_transaction_id
         );
-        observed_registration.storage_transaction_id =
-            control_registration.storage_transaction_id;
+        observed_registration.storage_transaction_id = control_registration.storage_transaction_id;
         assert_eq!(observed_registration, control_registration);
     }
     assert_eq!(
@@ -4582,8 +4572,7 @@ fn assert_graph_compaction_pinned_rows(directory: &Path, boundaries: &[u8]) {
             drop(reopened);
             let fresh_session = ReadSession::open(&path).unwrap();
             assert_eq!(fresh_session.route(), ReadRoute::File);
-            let fresh_registration =
-                fresh_session.file_storage_registration_for_test().unwrap();
+            let fresh_registration = fresh_session.file_storage_registration_for_test().unwrap();
             assert!(fresh_registration.storage_transaction_id >= current_root.transaction_id);
             assert_eq!(
                 (
@@ -4878,13 +4867,11 @@ fn relational_and_vector_readiness_cross_matrix_refuses_malformed_before_rows() 
                 if expected_lazy {
                     // Keep the startup projection fixed while doubling retained
                     // row/vector bodies and adding a committed history entry.
-                    let database = Database::open(&path)
-                        .expect("reopen the readiness matrix growth fixture");
+                    let database =
+                        Database::open(&path).expect("reopen the readiness matrix growth fixture");
                     database
                         .execute(
-                            &format!(
-                                "INSERT INTO {table} VALUES (2, 'ready', $body, $embedding)"
-                            ),
+                            &format!("INSERT INTO {table} VALUES (2, 'ready', $body, $embedding)"),
                             &HashMap::from([
                                 (
                                     "body".to_owned(),
@@ -4899,15 +4886,12 @@ fn relational_and_vector_readiness_cross_matrix_refuses_malformed_before_rows() 
                         .expect("publish the larger readiness fixture");
 
                     let larger_work = ReadWorkObservationScope::enter(ReadWorkPhase::Open);
-                    let larger_image =
-                        load_read_image_with_memory(&path, Some(2 * 1024 * 1024))
-                            .expect("the larger readiness fixture remains readable");
+                    let larger_image = load_read_image_with_memory(&path, Some(2 * 1024 * 1024))
+                        .expect("the larger readiness fixture remains readable");
                     assert!(larger_image.image.lazy_relational, "{case}");
                     assert_open_proves_bounded_history_and_startup_digest(
                         larger_work.counters(),
-                        &format!(
-                            "{case} doubled retained bodies skip complete-image hydration"
-                        ),
+                        &format!("{case} doubled retained bodies skip complete-image hydration"),
                         331,
                     );
                     assert_eq!(
@@ -4942,9 +4926,8 @@ fn assert_graph_admission_rows(directory: &Path) {
             .expect("unlimited graph admission fixture image owner");
         // Same non-cache source reservation as the production load door.
         // Zero is the existing fixture cache option, not a reader limit.
-        let source_bytes = (64 * 1024)
-            + content_identity::READ_VERIFIER_MEMORY_BYTES
-            + std::mem::size_of::<Lsn>();
+        let source_bytes =
+            (64 * 1024) + content_identity::READ_VERIFIER_MEMORY_BYTES + std::mem::size_of::<Lsn>();
         let source_memory =
             SourceMemoryReservation::new(image_memory.clone(), source_bytes).unwrap();
         let limits = crate::read_session::ReadSessionOptions::default().limits;
@@ -4983,9 +4966,8 @@ fn assert_graph_admission_rows(directory: &Path) {
             )
             .unwrap();
         let store = RedbPersistence::open_with_cache(&path, 0).unwrap();
-        store.attach_memory_accountant(
-            std::sync::Arc::clone(&fixture_open_accountant_43602).into(),
-        );
+        store
+            .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43602).into());
         let writer = store
             .initialize_writer_snapshot(SnapshotId(100), Lsn(30))
             .unwrap();
@@ -5053,9 +5035,9 @@ fn assert_graph_admission_rows(directory: &Path) {
             } else {
                 RedbPersistence::graph_fwd_key(&predecessor)
             };
-            let page_memory = Arc::new(
-                crate::memory_accounting::MemoryAccountant::with_budget(key.len() - 1),
-            );
+            let page_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+                key.len() - 1,
+            ));
             let error = graph_read::with_pages(page_memory.clone(), || {
                 let read_page = |read: &redb::ReadTransaction| -> Result<()> {
                     let table = read
@@ -5111,13 +5093,11 @@ fn assert_graph_admission_rows(directory: &Path) {
                 graph_read::GraphReadRoot::Writer(writer) => {
                     read_stored(&writer.owner_read().unwrap()).unwrap()
                 }
-                graph_read::GraphReadRoot::Image(image) => {
-                    image.with_read(read_stored).unwrap()
-                }
+                graph_read::GraphReadRoot::Image(image) => image.with_read(read_stored).unwrap(),
             };
-            let decode_memory = Arc::new(
-                crate::memory_accounting::MemoryAccountant::with_budget(declared_child),
-            );
+            let decode_memory = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
+                declared_child,
+            ));
             let bridge = Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
                 declared_child,
             ));
@@ -5250,8 +5230,8 @@ fn assert_graph_admission_rows(directory: &Path) {
                     memory.clone(),
                 )
                 .and_then(|mut cursor| cursor.next_edge_with(&|| Ok(())).map(|_| ()));
-            let error = outcome
-                .expect_err("one byte below the observed complete operation peak refuses");
+            let error =
+                outcome.expect_err("one byte below the observed complete operation peak refuses");
             assert!(
                 matches!(error, Error::MemoryBudgetExceeded { budget_limit_bytes, .. } if budget_limit_bytes == successful_peak - 1),
                 "page/decode admission preserves its memory refusal: {error:?}"
@@ -5302,8 +5282,7 @@ fn assert_graph_admission_rows(directory: &Path) {
         )
         .unwrap();
     let store = RedbPersistence::open_with_cache(&path, 0).unwrap();
-    store
-        .attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43720).into());
+    store.attach_memory_accountant(std::sync::Arc::clone(&fixture_open_accountant_43720).into());
     assert_eq!(
         graph_publication_state(&store),
         before,
@@ -5545,12 +5524,9 @@ fn assert_graph_authorization_and_cancellation_rows(directory: &Path) {
             drop(owner);
             database.close().unwrap();
             drop(database);
-            let file = ReadSession::open_with_kernel_observer_for_test(
-                &path,
-                options,
-                observer.clone(),
-            )
-            .unwrap();
+            let file =
+                ReadSession::open_with_kernel_observer_for_test(&path, options, observer.clone())
+                    .unwrap();
             assert_eq!(file.route(), ReadRoute::File);
             assert_graph_permission_session(
                 &file,
@@ -5928,9 +5904,7 @@ fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() 
                     "INSERT INTO public_history_rows (id, bucket, body) VALUES (2, 2, 'unaffected')",
                     "UPDATE public_history_rows SET body = 'interior' WHERE id = 1",
                 ] {
-                    if statement.starts_with("CREATE INDEX")
-                        && damage != "omitted_first_posting"
-                    {
+                    if statement.starts_with("CREATE INDEX") && damage != "omitted_first_posting" {
                         continue;
                     }
                     database.execute(statement, &HashMap::new()).unwrap();
@@ -6047,18 +6021,16 @@ fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() 
                         .unwrap();
                     if damage == "valid_key_historical_body" {
                         let mut changed = interior.clone();
-                        changed.values.insert(
-                            "body".into(),
-                            Value::Text("wrong historical value".into()),
-                        );
+                        changed
+                            .values
+                            .insert("body".into(), Value::Text("wrong historical value".into()));
                         assert_eq!(
                             RedbPersistence::rel_row_key(&changed),
                             key,
                             "body tampering preserves the real physical version key"
                         );
-                        let body =
-                            RedbPersistence::encode_versioned_row(&changed, Some(&metadata))
-                                .unwrap();
+                        let body = RedbPersistence::encode_versioned_row(&changed, Some(&metadata))
+                            .unwrap();
                         rows.insert(key.as_slice(), body.as_slice()).unwrap();
                     } else {
                         assert!(
@@ -6150,8 +6122,7 @@ fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() 
             contextdb_core::Value::Float64(f64::MAX),
         ]);
         for value in values {
-            let expected =
-                serde_json::to_string(&value).expect("reference Value serialization");
+            let expected = serde_json::to_string(&value).expect("reference Value serialization");
             let mut actual = Vec::new();
             crate::persistence::content_identity::version_manifest::emit_value(
                 &mut actual,
@@ -6318,10 +6289,7 @@ fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() 
                             "injected_extra_version" => {
                                 assert!(
                                     table
-                                        .insert(
-                                            interior_key.as_slice(),
-                                            interior_bytes.as_slice()
-                                        )
+                                        .insert(interior_key.as_slice(), interior_bytes.as_slice())
                                         .unwrap()
                                         .is_none(),
                                     "{damage}: the lawful replacement retired exactly the injected physical member"
@@ -6405,10 +6373,9 @@ fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() 
                                                     "batch" => {
                                                         // The established verifier owns proof funding. Its
                                                         // constructor caps reuse at the existing source cap.
-                                                        let mut batch =
-                                                            source.content_identity.batch(
-                                                                RETAINED_CONTENT_PROOF_BYTES,
-                                                            );
+                                                        let mut batch = source
+                                                            .content_identity
+                                                            .batch(RETAINED_CONTENT_PROOF_BYTES);
                                                         (
                                                             source.row_identity_by_id_in_read(
                                                                 read,
@@ -6583,9 +6550,7 @@ fn empty_declared_index_publishes_marker_and_postings_for_a_lazy_ordered_read() 
             &read,
             &HashMap::from([(table.to_owned(), meta)]),
         )
-        .expect(
-            "inspect marker and every declared backing table in this same read transaction"
-        ),
+        .expect("inspect marker and every declared backing table in this same read transaction"),
         "the committed marker names a complete relational-index image"
     );
     drop(read);

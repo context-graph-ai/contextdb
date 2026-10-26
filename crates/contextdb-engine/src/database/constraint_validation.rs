@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     /// Read a committed image's history from its pinned snapshot the first
     /// time anything asks for it, and publish it into the same structures a
     /// live handle keeps. Until then those structures are empty and nothing
@@ -1041,7 +1040,12 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn row_id_is_staged_insert(&self, tx: TxId, table: &str, row_id: RowId) -> Result<bool> {
+    pub(super) fn row_id_is_staged_insert(
+        &self,
+        tx: TxId,
+        table: &str,
+        row_id: RowId,
+    ) -> Result<bool> {
         self.tx_mgr.with_read(tx, |ws| {
             ws.relational_inserts
                 .iter()
@@ -2054,7 +2058,10 @@ impl Database {
         Ok(self.relational_store.live_rows_by_id(&keys))
     }
 
-    pub(super) fn relational_insert_prefix_identity(ws: &WriteSet, end: usize) -> Vec<(String, RowId)> {
+    pub(super) fn relational_insert_prefix_identity(
+        ws: &WriteSet,
+        end: usize,
+    ) -> Vec<(String, RowId)> {
         ws.relational_inserts
             .iter()
             .take(end)
@@ -2062,7 +2069,10 @@ impl Database {
             .collect()
     }
 
-    pub(super) fn relational_insert_prefix_unchanged(ws: &WriteSet, expected: &[(String, RowId)]) -> bool {
+    pub(super) fn relational_insert_prefix_unchanged(
+        ws: &WriteSet,
+        expected: &[(String, RowId)],
+    ) -> bool {
         ws.relational_inserts.len() >= expected.len()
             && ws.relational_inserts.iter().zip(expected.iter()).all(
                 |((table, row), (expected_table, expected_row_id))| {

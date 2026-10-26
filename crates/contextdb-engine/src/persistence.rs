@@ -49,13 +49,13 @@ macro_rules! observed_graph_key {
         $key
     };
 }
-#[cfg(test)]
-pub(crate) mod recorder_buffer;
 pub(crate) mod content_identity;
 pub(crate) mod content_size;
 mod erasure_frontiers;
 mod graph_history_read;
 mod historical_index_commitment;
+#[cfg(test)]
+pub(crate) mod recorder_buffer;
 use contextdb_core::read_memory::ReadMemoryBudget as _;
 pub use historical_index_commitment::HistoricalIndexVerification;
 mod graph_history_record;

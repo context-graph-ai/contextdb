@@ -583,7 +583,9 @@ pub(super) fn data_file_on_trusted_local_filesystem(_file: &File) -> bool {
     false
 }
 
-pub(super) fn companion_status_tags(status: &OwnerReadStatus) -> std::result::Result<(u8, u8), String> {
+pub(super) fn companion_status_tags(
+    status: &OwnerReadStatus,
+) -> std::result::Result<(u8, u8), String> {
     status.validate().map_err(|error| error.to_string())?;
     let state = match status.state {
         OwnerServingState::Serving => 0,
@@ -992,7 +994,10 @@ pub(super) fn companion_range_lock(
 }
 
 #[cfg(unix)]
-pub(super) fn take_companion_range_lock_shared(file: &File, offset: u64) -> std::io::Result<RangeLockOutcome> {
+pub(super) fn take_companion_range_lock_shared(
+    file: &File,
+    offset: u64,
+) -> std::io::Result<RangeLockOutcome> {
     companion_range_lock(file, offset, RangeLockMode::Shared.lock_type(), false)
 }
 
@@ -1009,7 +1014,10 @@ pub(super) fn take_companion_range_lock_exclusive(
 /// the byte even momentarily could: a writer trying for the byte at the same
 /// instant would be refused because somebody looked.
 #[cfg(unix)]
-pub(super) fn query_companion_range_lock(file: &File, offset: u64) -> std::io::Result<RangeLockOutcome> {
+pub(super) fn query_companion_range_lock(
+    file: &File,
+    offset: u64,
+) -> std::io::Result<RangeLockOutcome> {
     use std::os::unix::io::AsRawFd as _;
 
     let mut request: libc::flock = unsafe { std::mem::zeroed() };
@@ -1029,7 +1037,10 @@ pub(super) fn query_companion_range_lock(file: &File, offset: u64) -> std::io::R
 }
 
 #[cfg(not(unix))]
-pub(super) fn query_companion_range_lock(_file: &File, _offset: u64) -> std::io::Result<RangeLockOutcome> {
+pub(super) fn query_companion_range_lock(
+    _file: &File,
+    _offset: u64,
+) -> std::io::Result<RangeLockOutcome> {
     Err(std::io::Error::other(
         "advisory byte-range coordination is not implemented on this platform",
     ))
@@ -1230,7 +1241,10 @@ impl From<std::io::Error> for CoordinationWatchFailure {
 impl CoordinationWatch {
     /// Arm the watch BEFORE asking for the byte, so a release that happens
     /// between the ask and the sleep is already queued rather than missed.
-    pub(super) fn arm(companion: &Path, stop: Option<&OwnerReadCancellation>) -> std::io::Result<Self> {
+    pub(super) fn arm(
+        companion: &Path,
+        stop: Option<&OwnerReadCancellation>,
+    ) -> std::io::Result<Self> {
         Self::arm_with_listener(companion, |wake| {
             Ok(stop.map(|stop| {
                 let told = Arc::clone(wake);
@@ -1659,7 +1673,9 @@ impl ReadHistoryProofOwner {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn new(memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>) -> Result<Arc<Self>> {
+    pub(super) fn new(
+        memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
+    ) -> Result<Arc<Self>> {
         let memory: contextdb_core::read_memory::ReadMemoryOwner = memory.into();
 
         let control = contextdb_core::read_memory::ReadCredit::try_new(
@@ -2804,7 +2820,10 @@ pub(super) fn reader_snapshot_directory(runtime_root: &Path, identity: (u64, u64
         .join(format!("storage-{:016x}-{:016x}", identity.0, identity.1))
 }
 
-pub(super) fn reader_snapshot_registry_lock_path(runtime_root: &Path, identity: (u64, u64)) -> PathBuf {
+pub(super) fn reader_snapshot_registry_lock_path(
+    runtime_root: &Path,
+    identity: (u64, u64),
+) -> PathBuf {
     reader_breadcrumb_root(runtime_root).join(format!(
         "storage-{:016x}-{:016x}.snapshot-registry-lock",
         identity.0, identity.1
@@ -2823,7 +2842,9 @@ pub(super) fn next_reader_snapshot_path(
     ))
 }
 
-pub(super) fn encode_reader_snapshot(snapshot: &RegisteredReaderSnapshot) -> std::io::Result<Vec<u8>> {
+pub(super) fn encode_reader_snapshot(
+    snapshot: &RegisteredReaderSnapshot,
+) -> std::io::Result<Vec<u8>> {
     let name = snapshot.process.process_name.as_bytes();
     let name_len = u16::try_from(name.len()).map_err(|_| {
         std::io::Error::new(
@@ -3381,7 +3402,10 @@ impl ReaderSnapshotRegistryLock {
         Self::from_open_file(options.open(&path)?, path)
     }
 
-    pub(super) fn validate_open_file(file: &File, path: &Path) -> std::io::Result<std::fs::Metadata> {
+    pub(super) fn validate_open_file(
+        file: &File,
+        path: &Path,
+    ) -> std::io::Result<std::fs::Metadata> {
         let metadata = file.metadata()?;
         if !trusted_reader_snapshot_registry_lock_metadata(&metadata)
             || !reader_snapshot_registry_lock_path_still_names(path, &metadata)
@@ -3572,7 +3596,11 @@ impl ReaderSnapshotFileGuard {
     /// registry lock is taken -- nobody parses a record while the reader holds
     /// the data lock, and the record stays this reader's throughout.
     #[cfg(unix)]
-    pub(super) fn rewrite(&self, snapshot: &RegisteredReaderSnapshot, torn: bool) -> std::io::Result<()> {
+    pub(super) fn rewrite(
+        &self,
+        snapshot: &RegisteredReaderSnapshot,
+        torn: bool,
+    ) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt as _;
         let file = self
             .file
@@ -4892,7 +4920,9 @@ impl Drop for ReadSnapshotRegistrationGuard {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn verified_linux_reader_process(breadcrumb: &ReaderBreadcrumb) -> Option<ReaderProcessIdentity> {
+pub(super) fn verified_linux_reader_process(
+    breadcrumb: &ReaderBreadcrumb,
+) -> Option<ReaderProcessIdentity> {
     if !safe_reader_process_display_name(&breadcrumb.process_name) {
         return None;
     }
@@ -4932,7 +4962,9 @@ pub(super) fn verified_linux_reader_process(breadcrumb: &ReaderBreadcrumb) -> Op
     })
 }
 
-pub(super) fn verify_locked_reader_breadcrumb(breadcrumb: ReaderBreadcrumb) -> Option<ReaderBreadcrumb> {
+pub(super) fn verify_locked_reader_breadcrumb(
+    breadcrumb: ReaderBreadcrumb,
+) -> Option<ReaderBreadcrumb> {
     #[cfg(target_os = "linux")]
     {
         let observed = verified_linux_reader_process(&breadcrumb)?;
@@ -4965,7 +4997,10 @@ pub(super) fn trusted_reader_breadcrumb_metadata(metadata: &std::fs::Metadata) -
 }
 
 #[cfg(unix)]
-pub(super) fn same_reader_breadcrumb_inode(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+pub(super) fn same_reader_breadcrumb_inode(
+    left: &std::fs::Metadata,
+    right: &std::fs::Metadata,
+) -> bool {
     use std::os::unix::fs::MetadataExt as _;
 
     left.dev() == right.dev()
@@ -4977,7 +5012,9 @@ pub(super) fn same_reader_breadcrumb_inode(left: &std::fs::Metadata, right: &std
 }
 
 #[cfg(unix)]
-pub(super) fn open_trusted_reader_breadcrumb(path: &Path) -> std::io::Result<(File, std::fs::Metadata)> {
+pub(super) fn open_trusted_reader_breadcrumb(
+    path: &Path,
+) -> std::io::Result<(File, std::fs::Metadata)> {
     let entry_metadata = std::fs::symlink_metadata(path)?;
     if !trusted_reader_breadcrumb_metadata(&entry_metadata) {
         return Err(std::io::Error::new(
@@ -5005,7 +5042,9 @@ pub(super) fn open_trusted_reader_breadcrumb(path: &Path) -> std::io::Result<(Fi
 }
 
 #[cfg(not(unix))]
-pub(super) fn open_trusted_reader_breadcrumb(_path: &Path) -> std::io::Result<(File, std::fs::Metadata)> {
+pub(super) fn open_trusted_reader_breadcrumb(
+    _path: &Path,
+) -> std::io::Result<(File, std::fs::Metadata)> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "reader breadcrumb inspection requires Unix no-follow opens",
@@ -5013,7 +5052,10 @@ pub(super) fn open_trusted_reader_breadcrumb(_path: &Path) -> std::io::Result<(F
 }
 
 #[cfg(unix)]
-pub(super) fn reader_breadcrumb_path_still_names(path: &Path, inspected: &std::fs::Metadata) -> bool {
+pub(super) fn reader_breadcrumb_path_still_names(
+    path: &Path,
+    inspected: &std::fs::Metadata,
+) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|current| {
         trusted_reader_breadcrumb_metadata(&current)
             && same_reader_breadcrumb_inode(inspected, &current)
@@ -5021,7 +5063,10 @@ pub(super) fn reader_breadcrumb_path_still_names(path: &Path, inspected: &std::f
 }
 
 #[cfg(not(unix))]
-pub(super) fn reader_breadcrumb_path_still_names(_path: &Path, _inspected: &std::fs::Metadata) -> bool {
+pub(super) fn reader_breadcrumb_path_still_names(
+    _path: &Path,
+    _inspected: &std::fs::Metadata,
+) -> bool {
     false
 }
 
@@ -5048,7 +5093,9 @@ pub(super) fn trusted_reader_snapshot_registry_lock_metadata(metadata: &std::fs:
 }
 
 #[cfg(not(unix))]
-pub(super) fn trusted_reader_snapshot_registry_lock_metadata(_metadata: &std::fs::Metadata) -> bool {
+pub(super) fn trusted_reader_snapshot_registry_lock_metadata(
+    _metadata: &std::fs::Metadata,
+) -> bool {
     false
 }
 

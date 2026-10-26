@@ -33,9 +33,7 @@ fn change_log_row_inserts(db: &Database, table: &str) -> usize {
     db.change_log
         .read()
         .iter()
-        .filter(
-            |entry| matches!(entry, ChangeLogEntry::RowInsert { table: t, .. } if t == table),
-        )
+        .filter(|entry| matches!(entry, ChangeLogEntry::RowInsert { table: t, .. } if t == table))
         .count()
 }
 
@@ -199,17 +197,15 @@ fn compaction_bounds_versions_and_change_log() {
             // conservative physical lower bound, independent of whichever
             // private container production chooses for the selected copies.
             let catalog = db.relational_store.table_meta.read();
-            let (payloads, requests, request_count) =
-                oracle::source_requests_for_test(0, || {
-                    let payloads: [Option<(String, TableMeta)>; 8] = std::array::from_fn(|i| {
-                        (i < count).then(|| (names[i].clone(), catalog[&names[i]].clone()))
-                    });
-                    payloads
+            let (payloads, requests, request_count) = oracle::source_requests_for_test(0, || {
+                let payloads: [Option<(String, TableMeta)>; 8] = std::array::from_fn(|i| {
+                    (i < count).then(|| (names[i].clone(), catalog[&names[i]].clone()))
                 });
+                payloads
+            });
             drop(catalog);
             assert!(request_count > count && request_count <= requests.len());
-            let native_payload_bytes: usize =
-                requests[..request_count].iter().map(|r| r.1).sum();
+            let native_payload_bytes: usize = requests[..request_count].iter().map(|r| r.1).sum();
             assert!(native_payload_bytes >= names.iter().map(String::len).sum());
             drop(payloads);
             let refusal = Arc::new(RefuseCopy {
@@ -313,8 +309,7 @@ fn compaction_bounds_versions_and_change_log() {
             baseline: usize,
             requested: AtomicUsize,
             calls: AtomicUsize,
-            reservations:
-                parking_lot::Mutex<([(&'static str, usize, usize, usize); 64], usize)>,
+            reservations: parking_lot::Mutex<([(&'static str, usize, usize, usize); 64], usize)>,
             releases: parking_lot::Mutex<([(usize, usize, usize); 64], usize)>,
             refunds: AtomicUsize,
             observation: parking_lot::Mutex<Option<oracle::DeclarationObservation>>,
@@ -340,9 +335,7 @@ fn compaction_bounds_versions_and_change_log() {
                     }
                     reservations.1 += 1;
                 }
-                if operation == "cleanup_schema"
-                    && self.calls.fetch_add(1, Ordering::SeqCst) == 0
-                {
+                if operation == "cleanup_schema" && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     self.requested.store(bytes, Ordering::SeqCst);
                     let mut observation = oracle::DeclarationObservation::funded_by_reader(
                         self.parent.clone(),
@@ -467,8 +460,8 @@ fn compaction_bounds_versions_and_change_log() {
             });
             let lsn = db.current_lsn();
             let ((outcome, final_receipt, final_evidence), _, _) = oracle::measured(|| {
-                let outcome = db
-                    .__compact_currency_versions_for_tables_for_test(&tables, observer.clone());
+                let outcome =
+                    db.__compact_currency_versions_for_tables_for_test(&tables, observer.clone());
                 // Capture at the actual producer return, inside measured:
                 // its epilogue and current_lsn's new public operation are
                 // not compaction. Never close over retained producer bytes.
@@ -585,7 +578,13 @@ fn compaction_bounds_versions_and_change_log() {
                 owner: &crate::memory_accounting::AccountantHandle,
                 fired: Arc<AtomicBool>,
                 proof_seen: Arc<AtomicUsize>,
-                target: Arc<std::sync::Mutex<Option<crate::memory_accounting::compaction_admission_capture::GroupingRequest>>>,
+                target: Arc<
+                    std::sync::Mutex<
+                        Option<
+                            crate::memory_accounting::compaction_admission_capture::GroupingRequest,
+                        >,
+                    >,
+                >,
             ) {
                 let captured_owner = owner.clone();
                 owner.set_admission_race_hook(Box::new(move || {
@@ -641,12 +640,9 @@ fn compaction_bounds_versions_and_change_log() {
                 .unwrap()
                 .clone();
             let declaration = RedbPersistence::currency_cleanup_declaration(&meta).unwrap();
-            let state = RedbPersistence::currency_cleanup_progress(
-                &root,
-                "work_capabilities",
-                declaration,
-            )
-            .unwrap();
+            let state =
+                RedbPersistence::currency_cleanup_progress(&root, "work_capabilities", declaration)
+                    .unwrap();
             (
                 state.declaration,
                 state.through,
@@ -673,9 +669,7 @@ fn compaction_bounds_versions_and_change_log() {
         let keeper = history
             .iter()
             .filter_map(|entry| match entry {
-                ChangeLogEntry::RowInsert { table, lsn, .. }
-                    if table == "work_capabilities" =>
-                {
+                ChangeLogEntry::RowInsert { table, lsn, .. } if table == "work_capabilities" => {
                     Some(*lsn)
                 }
                 _ => None,
@@ -1037,9 +1031,7 @@ fn changes_since_survives_reopen_after_compaction() {
                 let ordinary = db.declared_reader_memory().unwrap();
                 let owner = Arc::new(MetadataOwner {
                     ordinary: ordinary.clone(),
-                    refused: Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(
-                        1,
-                    )),
+                    refused: Arc::new(crate::memory_accounting::MemoryAccountant::with_budget(1)),
                     refuse: fault == "memory",
                     answer_admissions: answer_admissions.clone(),
                     metadata_calls: AtomicUsize::new(0),
@@ -1066,20 +1058,15 @@ fn changes_since_survives_reopen_after_compaction() {
                     page: None,
                 };
                 let mut copy = crate::vector_read_memory::admission(owner.clone());
-                let outcome = db.changes_since_base_projected(
-                    since,
-                    &projection,
-                    &mut copy,
-                    owner.clone(),
-                );
+                let outcome =
+                    db.changes_since_base_projected(since, &projection, &mut copy, owner.clone());
                 let original =
                     source_error.or_else(|| owner.original_error.lock().unwrap().clone());
                 let expected_outcome = if fault == "denied" {
                     "denied normally".to_string()
                 } else {
-                    original.expect(
-                        "the real failed metadata read records its original typed error",
-                    )
+                    original
+                        .expect("the real failed metadata read records its original typed error")
                 };
                 let observed_outcome = match outcome {
                     Err(error) => format!("{error:?}"),

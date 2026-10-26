@@ -1,7 +1,6 @@
 use super::*;
 
 impl RedbPersistence {
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     sync_test_seam! {
     /// Marks this handle as a sync relay hub.
     ///
@@ -2108,7 +2107,8 @@ impl Database {
     pub(super) const REFUSED_SCHEMA_PREFIX: &'static str = "sync_refused_schema_unit.v1.";
     pub(super) const REFUSED_SCHEMA_LOOKUP_CHECKPOINT_PREFIX: &'static str =
         "sync_refused_schema_lookup_checkpoint.v1.";
-    pub(super) const REFUSED_SCHEMA_LOCAL_FACT_PREFIX: &'static str = "sync_refused_schema_local_fact.v1.";
+    pub(super) const REFUSED_SCHEMA_LOCAL_FACT_PREFIX: &'static str =
+        "sync_refused_schema_local_fact.v1.";
     pub(super) const POLICY_HELD_DATA_PREFIX: &'static str = "sync_policy_held_data.v1.";
 
     pub(super) fn refused_schema_scope(
@@ -3005,7 +3005,10 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn policy_hold_index_keys(key: &str, hold: &DurablePolicyHold) -> Result<Vec<String>> {
+    pub(super) fn policy_hold_index_keys(
+        key: &str,
+        hold: &DurablePolicyHold,
+    ) -> Result<Vec<String>> {
         let scope = Self::policy_hold_scope(
             hold.tenant_id.as_ref(),
             (!hold.table_absent).then_some(hold.source_node_id.as_str()),

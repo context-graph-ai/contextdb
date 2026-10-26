@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     /// Stamping config records at commit is write working memory. Each record
     /// decodes under its own writer-funded scope that ends with the record,
     /// so the commit's decoder charge stays one record, never one per staged

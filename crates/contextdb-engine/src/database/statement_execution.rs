@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -595,7 +594,10 @@ impl Database {
         SYNC_APPLY_TRIGGER_GATE_BYPASS_DEPTH.with(|depth| depth.get() > 0)
     }
 
-    pub(super) fn enter_sync_apply_local_schema_bypass(&self, tx: TxId) -> SyncApplyLocalSchemaBypassGuard {
+    pub(super) fn enter_sync_apply_local_schema_bypass(
+        &self,
+        tx: TxId,
+    ) -> SyncApplyLocalSchemaBypassGuard {
         let db_id = self.id;
         SYNC_APPLY_LOCAL_SCHEMA_BYPASS_STACK.with(|stack| {
             stack.borrow_mut().push((db_id, tx));
@@ -1127,7 +1129,12 @@ impl Database {
         self.statement_cache.read().get(sql).cloned()
     }
 
-    pub(super) fn cache_statement_if_eligible(&self, sql: &str, stmt: &Statement, plan: &PhysicalPlan) {
+    pub(super) fn cache_statement_if_eligible(
+        &self,
+        sql: &str,
+        stmt: &Statement,
+        plan: &PhysicalPlan,
+    ) {
         if !Self::is_statement_cache_eligible(stmt, plan) {
             return;
         }
@@ -1226,7 +1233,11 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn record_vector_schema_epoch(&self, tx: TxId, index: &VectorIndexRef) -> Result<()> {
+    pub(super) fn record_vector_schema_epoch(
+        &self,
+        tx: TxId,
+        index: &VectorIndexRef,
+    ) -> Result<()> {
         self.record_vector_schema_epochs(tx, [index.clone()])
     }
 

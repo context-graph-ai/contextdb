@@ -696,7 +696,10 @@ pub(super) fn export_edge_at_snapshot(entry: &AdjEntry, watermark: TxId) -> Opti
     Some(entry)
 }
 
-pub(super) fn export_vector_at_snapshot(entry: &VectorEntry, watermark: TxId) -> Option<VectorEntry> {
+pub(super) fn export_vector_at_snapshot(
+    entry: &VectorEntry,
+    watermark: TxId,
+) -> Option<VectorEntry> {
     if entry.created_tx.0 > watermark.0 {
         return None;
     }
@@ -710,7 +713,10 @@ pub(super) fn export_vector_at_snapshot(entry: &VectorEntry, watermark: TxId) ->
 // Source windows are preparation work owned by this retention request. Keep
 // their actual requested/headroom figures while preserving the public refusal
 // identity; all source receipts are dropped by the failed preparation itself.
-pub(super) fn retention_source_admission_error(mut error: Error, preparation: RetentionPreparation) -> Error {
+pub(super) fn retention_source_admission_error(
+    mut error: Error,
+    preparation: RetentionPreparation,
+) -> Error {
     if let Error::MemoryBudgetExceeded {
         subsystem,
         operation,
@@ -747,7 +753,10 @@ impl RetentionPreparation {
 // Candidate and protected-set buckets, growth slack and the longest possible
 // FK blocker string (including the transient joined composite-column names).
 // Payload values are borrowed, so TEXT/BLOB/vector width is absent here.
-pub(super) fn retention_candidate_workspace_bytes(table: &str, metas: &HashMap<String, TableMeta>) -> usize {
+pub(super) fn retention_candidate_workspace_bytes(
+    table: &str,
+    metas: &HashMap<String, TableMeta>,
+) -> usize {
     let mut blocker_bytes = 0usize;
     for (child, meta) in metas {
         for column in &meta.columns {
@@ -1577,7 +1586,10 @@ pub(crate) fn sql_type_for_meta_column(
     render_meta_column(col, rules)
 }
 
-pub(super) fn render_meta_column(col: &contextdb_core::ColumnDef, rules: &[PropagationRule]) -> String {
+pub(super) fn render_meta_column(
+    col: &contextdb_core::ColumnDef,
+    rules: &[PropagationRule],
+) -> String {
     let column = crate::cli_render::MetadataColumn(col, rules);
     let text = format_args!("{column}");
     let bytes =
@@ -1599,7 +1611,10 @@ pub(super) fn append_ast_quantization(
     ty.push_str(&format!(" WITH (quantization = '{quantization}')"));
 }
 
-pub(super) fn append_ast_vector_declaration(ty: &mut String, col: &contextdb_parser::ast::ColumnDef) {
+pub(super) fn append_ast_vector_declaration(
+    ty: &mut String,
+    col: &contextdb_parser::ast::ColumnDef,
+) {
     if !matches!(col.data_type, DataType::Vector(_)) {
         return;
     }
@@ -1652,7 +1667,10 @@ pub(super) fn append_ast_vector_declaration(ty: &mut String, col: &contextdb_par
     append_ast_consolidation_declaration(ty, &col.consolidation);
 }
 
-pub(super) fn append_ast_hnsw_declaration(ty: &mut String, policy: &contextdb_parser::ast::VectorHnswOptions) {
+pub(super) fn append_ast_hnsw_declaration(
+    ty: &mut String,
+    policy: &contextdb_parser::ast::VectorHnswOptions,
+) {
     let render =
         |name: &str, value: &Option<contextdb_parser::ast::VectorPolicyValue>| -> Option<String> {
             match value.as_ref()? {
@@ -2145,7 +2163,10 @@ pub(super) fn sync_table_column_lists(
 
 /// Whether an arriving CREATE declares the same columns, in any order, as the
 /// table this node already holds under that name.
-pub(super) fn sync_table_columns_match(local_meta: &TableMeta, columns: &[(String, String)]) -> bool {
+pub(super) fn sync_table_columns_match(
+    local_meta: &TableMeta,
+    columns: &[(String, String)],
+) -> bool {
     let (mut local, mut remote) = sync_table_column_lists(local_meta, columns);
     local.sort();
     remote.sort();
@@ -2269,7 +2290,9 @@ pub(crate) fn constraint_declares_sync_direction(constraint: &str) -> Option<Syn
 /// The conflict policy a synced DDL constraint declares — so the receiving
 /// machine reconstructs the SAME declaration the writer made rather than a
 /// defaulted one, exactly as it does for the direction clause.
-pub(super) fn constraint_declares_conflict_policy(constraint: &str) -> Option<contextdb_core::ConflictPolicy> {
+pub(super) fn constraint_declares_conflict_policy(
+    constraint: &str,
+) -> Option<contextdb_core::ConflictPolicy> {
     let upper = constraint.to_ascii_uppercase();
     let normalized = upper.split_whitespace().collect::<Vec<_>>().join(" ");
     [
@@ -2862,7 +2885,10 @@ pub(super) fn resolve_sync_rank_policies(table_name: &str, meta: &mut TableMeta)
     }
 }
 
-pub(super) fn sync_rank_policy_protected_index(meta: &TableMeta, joined_column: &str) -> Option<String> {
+pub(super) fn sync_rank_policy_protected_index(
+    meta: &TableMeta,
+    joined_column: &str,
+) -> Option<String> {
     meta.indexes
         .iter()
         .filter(|index| index.kind == IndexKind::UserDeclared)
@@ -3318,7 +3344,11 @@ pub(crate) fn has_graph_edge_table_shape(meta: &TableMeta) -> bool {
     .all(|(name, column_type)| has_exact_column_type(meta, name, &column_type))
 }
 
-pub(super) fn has_exact_column_type(meta: &TableMeta, name: &str, column_type: &ColumnType) -> bool {
+pub(super) fn has_exact_column_type(
+    meta: &TableMeta,
+    name: &str,
+    column_type: &ColumnType,
+) -> bool {
     let mut columns = meta.columns.iter().filter(|column| column.name == name);
     matches!(columns.next(), Some(column) if &column.column_type == column_type)
         && columns.next().is_none()

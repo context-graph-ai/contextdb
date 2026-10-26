@@ -710,7 +710,10 @@ pub(super) fn read_image_contention(reason: impl std::fmt::Display) -> LoadReadI
     LoadReadImageError::Contention { reason }
 }
 
-pub(super) fn read_image_io(operation: &'static str, reason: impl std::fmt::Display) -> LoadReadImageError {
+pub(super) fn read_image_io(
+    operation: &'static str,
+    reason: impl std::fmt::Display,
+) -> LoadReadImageError {
     let reason = reason.to_string();
     LoadReadImageError::Io { operation, reason }
 }
@@ -932,7 +935,10 @@ pub(super) fn decode_read_relational_table_with_bounds(
     clippy::result_large_err,
     reason = "Read-image corruption diagnostics retain their original inline form."
 )]
-pub(super) fn validate_read_row_id(table: &str, row: RowId) -> std::result::Result<(), LoadReadImageError> {
+pub(super) fn validate_read_row_id(
+    table: &str,
+    row: RowId,
+) -> std::result::Result<(), LoadReadImageError> {
     if i64::try_from(row.0).is_err() {
         return Err(invalid_read_image_state(format!(
             "row {} in table {table} is outside the relational identifier range",
@@ -1350,7 +1356,10 @@ pub(super) fn prevalidate_persisted_vector_entry(bytes: &[u8], dimension: usize)
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn decode_image_vector_entry(bytes: &[u8], dimension: usize) -> Result<PersistedVectorEntry> {
+pub(super) fn decode_image_vector_entry(
+    bytes: &[u8],
+    dimension: usize,
+) -> Result<PersistedVectorEntry> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     prevalidate_persisted_vector_entry(bytes, dimension)?;
     RedbPersistence::decode_exact(bytes)
@@ -1903,7 +1912,9 @@ pub(super) fn vector_partition_catalog_has_expected_route(
     .is_ok_and(|(_, consumed)| consumed == payload.len() - route_end)
 }
 
-pub(super) fn vector_generation_catalog_fault_reason(encoded: &[u8]) -> VectorRouteQuarantineReason {
+pub(super) fn vector_generation_catalog_fault_reason(
+    encoded: &[u8],
+) -> VectorRouteQuarantineReason {
     let header_len = VECTOR_PARTITION_RECORD_MAGIC.len() + 2 + 1 + 8;
     if encoded.len() < header_len + 32 {
         return VectorRouteQuarantineReason::CorruptBase;
@@ -2602,7 +2613,9 @@ pub(super) fn read_vector_rename_constraint(constraints: &[String]) -> Option<(S
     None
 }
 
-pub(super) fn read_vector_renames_from_ddl_log(ddl_log: &[(Lsn, DdlChange)]) -> Vec<ReadVectorRename> {
+pub(super) fn read_vector_renames_from_ddl_log(
+    ddl_log: &[(Lsn, DdlChange)],
+) -> Vec<ReadVectorRename> {
     let mut renames = Vec::new();
     for (lsn, change) in ddl_log {
         let DdlChange::AlterTable {
@@ -4008,7 +4021,9 @@ pub(super) fn companion_selector_bytes(
     Ok(selector)
 }
 
-pub(super) fn initialize_companion_inode(file: &mut File) -> std::result::Result<CompanionState, String> {
+pub(super) fn initialize_companion_inode(
+    file: &mut File,
+) -> std::result::Result<CompanionState, String> {
     let selector = companion_selector_bytes(0, 0)?;
     // Every intermediate is recognizable as an incomplete generation-zero
     // initialization. No write can turn a prior complete record into this
@@ -4095,7 +4110,9 @@ pub(super) fn decode_pending_replacement(
     })
 }
 
-pub(super) fn parse_companion_slot(bytes: &[u8]) -> std::result::Result<ParsedCompanionSlot, String> {
+pub(super) fn parse_companion_slot(
+    bytes: &[u8],
+) -> std::result::Result<ParsedCompanionSlot, String> {
     if bytes.len() != COMPANION_SLOT_BYTES {
         return Err(format!(
             "companion slot has {} bytes, expected {COMPANION_SLOT_BYTES}",
@@ -4566,7 +4583,10 @@ pub(super) fn store_file_fingerprint(path: &Path) -> Result<[u8; 32]> {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn store_descriptor_fingerprint(file: &mut File, metadata: &std::fs::Metadata) -> Result<[u8; 32]> {
+pub(super) fn store_descriptor_fingerprint(
+    file: &mut File,
+    metadata: &std::fs::Metadata,
+) -> Result<[u8; 32]> {
     use std::os::unix::fs::MetadataExt as _;
 
     let mut hasher = blake3::Hasher::new();
@@ -4623,7 +4643,11 @@ pub(super) fn open_directory_entry(directory: &File, name: &Path) -> std::io::Re
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn unlink_verified_entry(directory: &File, name: &Path, identity: (u64, u64)) -> Result<bool> {
+pub(super) fn unlink_verified_entry(
+    directory: &File,
+    name: &Path,
+    identity: (u64, u64),
+) -> Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
     let candidate = match open_directory_entry(directory, name) {
@@ -4662,7 +4686,10 @@ pub(super) fn unlink_verified_entry(directory: &File, name: &Path, identity: (u6
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn remove_abandoned_replacement_target(path: &Path, fingerprint: &[u8; 32]) -> Result<()> {
+pub(super) fn remove_abandoned_replacement_target(
+    path: &Path,
+    fingerprint: &[u8; 32],
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
     let (Some(directory_path), Some(store_name)) = (path.parent(), path.file_name()) else {
@@ -4746,7 +4773,10 @@ pub(super) fn remove_abandoned_replacement_target(path: &Path, fingerprint: &[u8
 /// abandoned target is therefore LEFT in place rather than removed on a
 /// pathname's word.
 #[cfg(not(unix))]
-pub(super) fn remove_abandoned_replacement_target(_path: &Path, _fingerprint: &[u8; 32]) -> Result<()> {
+pub(super) fn remove_abandoned_replacement_target(
+    _path: &Path,
+    _fingerprint: &[u8; 32],
+) -> Result<()> {
     Ok(())
 }
 
@@ -4904,7 +4934,11 @@ impl CompanionGuard {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn acquire_inner(path: &Path, admission: CompanionAdmission, may_create: bool) -> Result<Self> {
+    pub(super) fn acquire_inner(
+        path: &Path,
+        admission: CompanionAdmission,
+        may_create: bool,
+    ) -> Result<Self> {
         let companion_path = companion_path(path);
         let exists = companion_exists(path)?;
         let create = !exists && may_create && admission.may_create();
@@ -5123,7 +5157,10 @@ impl CompanionGuard {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn resolve_pending_replacement(path: &Path, state: &mut CompanionGuardState) -> Result<()> {
+    pub(super) fn resolve_pending_replacement(
+        path: &Path,
+        state: &mut CompanionGuardState,
+    ) -> Result<()> {
         Self::resolve_pending_replacement_inner(path, state, AbandonedTarget::Remove)
     }
 
@@ -5134,7 +5171,10 @@ impl CompanionGuard {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn retain_pending_replacement(path: &Path, state: &mut CompanionGuardState) -> Result<()> {
+    pub(super) fn retain_pending_replacement(
+        path: &Path,
+        state: &mut CompanionGuardState,
+    ) -> Result<()> {
         Self::resolve_pending_replacement_inner(path, state, AbandonedTarget::Retain)
     }
 
@@ -5278,7 +5318,11 @@ impl CompanionGuard {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn record_owner_read_status(&self, path: &Path, status: OwnerReadStatus) -> Result<()> {
+    pub(super) fn record_owner_read_status(
+        &self,
+        path: &Path,
+        status: OwnerReadStatus,
+    ) -> Result<()> {
         let mut state = self.lock_state()?;
         let recorded = Self::publish_decided_owner_read_status(path, &mut state, status);
         // This writer has decided, and whatever it decided is now beside the
@@ -5331,7 +5375,11 @@ impl CompanionGuard {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn prepare_replacement_database(&self, path: &Path, replacement_path: &Path) -> Result<()> {
+    pub(super) fn prepare_replacement_database(
+        &self,
+        path: &Path,
+        replacement_path: &Path,
+    ) -> Result<()> {
         let fingerprint = store_file_fingerprint(replacement_path)?;
         let mut state = self.lock_state()?;
         if state.companion.needs_initialization {

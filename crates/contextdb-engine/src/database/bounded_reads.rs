@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     /// Whether `table` has an index whose leading key covers `column`. A
     /// declared `PRIMARY KEY`/`UNIQUE` column is auto-indexed at
     /// `CREATE`/`ALTER` time and always answers `true`; a bare `id`-named
@@ -3641,7 +3640,10 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn refuse_schema_change_under_own_open_cursor(&self, refs: &[VectorIndexRef]) -> Result<()> {
+    pub(super) fn refuse_schema_change_under_own_open_cursor(
+        &self,
+        refs: &[VectorIndexRef],
+    ) -> Result<()> {
         let db_id = self.vector_schema_gate_id();
         let Some(index) = refs
             .iter()

@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     pub(super) fn take_local_schema_stage(&self, lsn: Lsn) -> Option<LocalSchemaStage> {
         self.local_schema_stages.lock().remove(&lsn)
     }
@@ -1378,7 +1377,11 @@ impl Database {
         Ok(OwnedQueryResult::empty_with_affected(count))
     }
 
-    pub(super) fn ddl_change_for_statement(&self, stmt: &Statement, tx: Option<TxId>) -> Option<DdlChange> {
+    pub(super) fn ddl_change_for_statement(
+        &self,
+        stmt: &Statement,
+        tx: Option<TxId>,
+    ) -> Option<DdlChange> {
         match stmt {
             Statement::CreateTable(ct) => {
                 crate::executor::validate_create_table_vector_declarations(&ct.name, ct).ok()?;
@@ -4508,7 +4511,9 @@ impl Database {
     /// dropped but whose next same-name CREATE still depends on their prior
     /// generation.
     #[cfg(test)]
-    pub(super) fn authoritative_table_generations_for_detached_working(&self) -> Result<HashMap<String, u64>> {
+    pub(super) fn authoritative_table_generations_for_detached_working(
+        &self,
+    ) -> Result<HashMap<String, u64>> {
         let _operation = self.open_operation()?;
         let Some(persistence) = &self.persistence else {
             return Ok(self.in_memory_table_generations.lock().clone());
@@ -4602,9 +4607,13 @@ impl Database {
         format!("sync_ddl_generation.v1.{:020}.{ordinal:06}", lsn.0)
     }
 
-    pub(super) const DURABLE_RECEIVED_DDL_ARRIVAL_CONFIG_PREFIX: &str = "sync_ddl_received_arrival.v1.";
+    pub(super) const DURABLE_RECEIVED_DDL_ARRIVAL_CONFIG_PREFIX: &str =
+        "sync_ddl_received_arrival.v1.";
 
-    pub(super) fn durable_received_ddl_arrival_key(local_lsn: Lsn, persisted_ordinal: u32) -> String {
+    pub(super) fn durable_received_ddl_arrival_key(
+        local_lsn: Lsn,
+        persisted_ordinal: u32,
+    ) -> String {
         format!(
             "{}{:020}.{persisted_ordinal:06}",
             Self::DURABLE_RECEIVED_DDL_ARRIVAL_CONFIG_PREFIX,
@@ -4819,7 +4828,10 @@ impl Database {
 
     pub(super) const DURABLE_SUPERSEDED_DDL_CONFIG_PREFIX: &str = "sync_ddl_superseded.v1.";
 
-    pub(super) fn durable_superseded_ddl_occurrence_key(local_lsn: Lsn, persisted_ordinal: u32) -> String {
+    pub(super) fn durable_superseded_ddl_occurrence_key(
+        local_lsn: Lsn,
+        persisted_ordinal: u32,
+    ) -> String {
         format!(
             "{}{:020}.{persisted_ordinal:06}",
             Self::DURABLE_SUPERSEDED_DDL_CONFIG_PREFIX,

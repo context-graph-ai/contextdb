@@ -115,7 +115,9 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn lock_database(&self) -> Result<std::sync::RwLockWriteGuard<'_, Option<redb::Database>>> {
+    pub(super) fn lock_database(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, Option<redb::Database>>> {
         self.db.write().map_err(|_| {
             Error::Other(
                 (format!(
@@ -2199,7 +2201,10 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn open_writer_file(path: &Path, absent: AbsentStoreAnswer) -> Result<Arc<LockedWriterFile>> {
+    pub(super) fn open_writer_file(
+        path: &Path,
+        absent: AbsentStoreAnswer,
+    ) -> Result<Arc<LockedWriterFile>> {
         Self::open_writer_file_in_runtime_dir(path, absent, None)
     }
 
@@ -2208,7 +2213,9 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn prepare_open_diagnostic(path: &Path) -> Result<wait_diagnostic::PreparedOpenDiagnostic> {
+    pub(super) fn prepare_open_diagnostic(
+        path: &Path,
+    ) -> Result<wait_diagnostic::PreparedOpenDiagnostic> {
         let context = current_writer_wait();
         let original = match context.payer.as_ref() {
             Some(original) => original.wait_memory_owner().map_err(|error| {

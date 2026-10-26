@@ -42,7 +42,10 @@ pub(super) fn write_set_touches_vector_search(ws: &WriteSet, index: &VectorIndex
             .any(|(delete_table, _, _)| delete_table == &index.table)
 }
 
-pub(super) fn estimate_active_tx_vector_overlay_bytes(entry_count: usize, dimension: usize) -> usize {
+pub(super) fn estimate_active_tx_vector_overlay_bytes(
+    entry_count: usize,
+    dimension: usize,
+) -> usize {
     let decoded_vector_bytes = dimension.saturating_mul(std::mem::size_of::<f32>());
     let per_entry = std::mem::size_of::<VectorEntry>()
         .saturating_add(std::mem::size_of::<(RowId, Vec<f32>)>())
@@ -60,7 +63,11 @@ pub(super) fn current_wallclock() -> Wallclock {
     Wallclock::now()
 }
 
-pub(super) fn remove_write_set_slice(ws: &mut WriteSet, before: WriteSetCounts, after: WriteSetCounts) {
+pub(super) fn remove_write_set_slice(
+    ws: &mut WriteSet,
+    before: WriteSetCounts,
+    after: WriteSetCounts,
+) {
     fn drain_range<T>(items: &mut Vec<T>, start: usize, end: usize) {
         if start >= items.len() {
             return;
@@ -161,7 +168,9 @@ pub(super) fn bounded_rank_clone_checked_mul(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn bounded_rank_value_clone_planned_bytes(value: &Value) -> std::result::Result<usize, Error> {
+pub(super) fn bounded_rank_value_clone_planned_bytes(
+    value: &Value,
+) -> std::result::Result<usize, Error> {
     match value {
         Value::Text(value) => Ok(value.len()),
         Value::Vector(values) => bounded_rank_clone_checked_mul(
@@ -184,7 +193,9 @@ pub(super) fn bounded_rank_value_clone_planned_bytes(value: &Value) -> std::resu
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn bounded_rank_value_retained_bytes(value: &Value) -> std::result::Result<usize, Error> {
+pub(super) fn bounded_rank_value_retained_bytes(
+    value: &Value,
+) -> std::result::Result<usize, Error> {
     match value {
         Value::Text(value) => Ok(value.capacity()),
         Value::Vector(values) => bounded_rank_clone_checked_mul(
@@ -207,7 +218,9 @@ pub(super) fn bounded_rank_value_retained_bytes(value: &Value) -> std::result::R
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn bounded_rank_row_clone_planned_bytes(row: &VersionedRow) -> std::result::Result<usize, Error> {
+pub(super) fn bounded_rank_row_clone_planned_bytes(
+    row: &VersionedRow,
+) -> std::result::Result<usize, Error> {
     let mut bytes = bounded_rank_clone_checked_add(
         std::mem::size_of::<VersionedRow>(),
         bounded_rank_clone_checked_mul(
@@ -232,7 +245,9 @@ pub(super) fn bounded_rank_row_clone_planned_bytes(row: &VersionedRow) -> std::r
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn bounded_rank_row_retained_bytes(row: &VersionedRow) -> std::result::Result<usize, Error> {
+pub(super) fn bounded_rank_row_retained_bytes(
+    row: &VersionedRow,
+) -> std::result::Result<usize, Error> {
     let mut bytes = bounded_rank_clone_checked_add(
         std::mem::size_of::<VersionedRow>(),
         bounded_rank_clone_checked_mul(
@@ -509,7 +524,11 @@ pub(super) fn consume_failed_vector_row_group(
     }
 }
 
-pub(super) fn next_vector_row_group_matches(vectors: &[VectorChange], cursor: usize, row: &RowChange) -> bool {
+pub(super) fn next_vector_row_group_matches(
+    vectors: &[VectorChange],
+    cursor: usize,
+    row: &RowChange,
+) -> bool {
     vectors.get(cursor).is_some_and(|vector| {
         vector.index.table == row.table
             && vector.lsn == row.lsn
@@ -616,7 +635,10 @@ pub(super) fn is_unrestricted_scan_for_table(plan: &PhysicalPlan, table: &str) -
     )
 }
 
-pub(super) fn vector_filter_index_recovery(candidates: Option<&PhysicalPlan>, table: &str) -> Option<String> {
+pub(super) fn vector_filter_index_recovery(
+    candidates: Option<&PhysicalPlan>,
+    table: &str,
+) -> Option<String> {
     const GENERIC_RECOVERY: &str =
         "use EXACT or rewrite the filter with a supporting relational index";
 
@@ -1163,7 +1185,10 @@ pub(crate) fn vector_index_layout_from_column(column: &ColumnDef) -> Option<Vect
 
 /// Two layouts store their vectors alike: the same dimension, quantization
 /// and partition key. Any other difference is policy.
-pub(super) fn same_vector_storage_shape(left: &VectorIndexLayout, right: &VectorIndexLayout) -> bool {
+pub(super) fn same_vector_storage_shape(
+    left: &VectorIndexLayout,
+    right: &VectorIndexLayout,
+) -> bool {
     left.dimension == right.dimension
         && left.quantization == right.quantization
         && left.partition_key_columns == right.partition_key_columns
@@ -1428,7 +1453,11 @@ pub(super) fn supplement_loaded_vectors_from_table_rows(
     supplemented
 }
 
-pub(super) fn remove_cached_row(cache: &mut HashMap<String, Vec<VersionedRow>>, table: &str, row_id: RowId) {
+pub(super) fn remove_cached_row(
+    cache: &mut HashMap<String, Vec<VersionedRow>>,
+    table: &str,
+    row_id: RowId,
+) {
     if let Some(rows) = cache.get_mut(table) {
         rows.retain(|row| row.row_id != row_id);
     }
@@ -1582,7 +1611,10 @@ pub(super) fn f32_projection_payload_bytes_by_column<'a>(
     })
 }
 
-pub(super) fn f32_projection_payload_bytes(values: &HashMap<ColName, Value>, meta: &TableMeta) -> usize {
+pub(super) fn f32_projection_payload_bytes(
+    values: &HashMap<ColName, Value>,
+    meta: &TableMeta,
+) -> usize {
     f32_projection_payload_bytes_by_column(values, meta).fold(0usize, |bytes, (_, column_bytes)| {
         bytes.saturating_add(column_bytes)
     })
@@ -2599,7 +2631,12 @@ impl Drop for SyncParentKeyProjectionOwner {
     }
 }
 
-pub(super) fn staged_tuple_exists(ws: &WriteSet, table: &str, columns: &[String], values: &[Value]) -> bool {
+pub(super) fn staged_tuple_exists(
+    ws: &WriteSet,
+    table: &str,
+    columns: &[String],
+    values: &[Value],
+) -> bool {
     ws.relational_inserts.iter().any(|(insert_table, row)| {
         insert_table == table
             && columns

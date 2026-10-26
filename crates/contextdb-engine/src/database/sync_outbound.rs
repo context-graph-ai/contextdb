@@ -1,7 +1,6 @@
 use super::*;
 
 impl Database {
-
     /// The pull cursor bound to the specific store that issued it —
     /// `(source incarnation, lsn)` — loaded as ONE record so a crash between
     /// persisting the two halves separately can never pair a NEW cursor with
@@ -2312,7 +2311,9 @@ impl Database {
             .collect()
     }
 
-    pub(super) fn sync_vector_columns(meta: &TableMeta) -> BTreeMap<String, (usize, VectorQuantization)> {
+    pub(super) fn sync_vector_columns(
+        meta: &TableMeta,
+    ) -> BTreeMap<String, (usize, VectorQuantization)> {
         meta.columns
             .iter()
             .filter_map(|column| match column.column_type {
@@ -4116,7 +4117,10 @@ impl Database {
     /// the sidecar must call this before treating the value as a real
     /// arrival; seeing the raw sentinel anywhere outside `set_sync_row_
     /// source_lsn`'s own write path and this resolver is a bug.
-    pub(super) fn resolve_sync_source_lsn(stored: Option<Lsn>, own_committed_lsn: Lsn) -> Option<Lsn> {
+    pub(super) fn resolve_sync_source_lsn(
+        stored: Option<Lsn>,
+        own_committed_lsn: Lsn,
+    ) -> Option<Lsn> {
         match stored {
             Some(SYNC_SOURCE_LSN_OWN_COMMIT) => Some(own_committed_lsn),
             other => other,
@@ -6109,7 +6113,9 @@ impl Database {
     /// tenant or node id may contain dots (or any other display character),
     /// but it must never make one reconciliation context match another when
     /// persistent config values are loaded by prefix.
-    pub(super) fn terminal_refusal_marker_context_prefix(context: &TerminalRefusalPullContext) -> String {
+    pub(super) fn terminal_refusal_marker_context_prefix(
+        context: &TerminalRefusalPullContext,
+    ) -> String {
         let tenant = context.tenant_id.as_str().as_bytes();
         let hub = context.hub_node_id.as_bytes();
         format!(
@@ -6158,7 +6164,9 @@ impl Database {
         Self::terminal_refusal_marker_context_prefix(context) + "scan"
     }
 
-    pub(super) fn terminal_refusal_marker_config_prefix(context: &TerminalRefusalPullContext) -> String {
+    pub(super) fn terminal_refusal_marker_config_prefix(
+        context: &TerminalRefusalPullContext,
+    ) -> String {
         Self::terminal_refusal_marker_context_prefix(context) + "marker."
     }
 

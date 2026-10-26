@@ -209,10 +209,8 @@ impl JourneyPeer {
     fn open(root: &std::path::Path, name: &str) -> Self {
         let path = root.join(format!("{name}.db"));
         let identity = Arc::new(
-            crate::identity::FabricIdentity::load_or_generate(
-                &root.join(format!("{name}.key")),
-            )
-            .expect("persist the peer's fabric identity"),
+            crate::identity::FabricIdentity::load_or_generate(&root.join(format!("{name}.key")))
+                .expect("persist the peer's fabric identity"),
         );
         Self {
             db: Database::open(&path).expect("open the peer"),
@@ -323,7 +321,8 @@ fn refused_schema_outcome_is_durable_exact_and_not_an_acceptance_receipt() {
     let root = tempfile::tempdir().unwrap();
     let author = JourneyPeer::open(root.path(), "policy-author");
     let hub = JourneyPeer::open(root.path(), "policy-hub");
-    let sql = "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
+    let sql =
+        "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
     author.db.execute(sql, &HashMap::new()).unwrap();
     hub.db.execute(sql, &HashMap::new()).unwrap();
     pushed_to(&hub, &author, served_by(&author, Lsn(0)));
@@ -477,11 +476,11 @@ fn refused_schema_outcome_is_durable_exact_and_not_an_acceptance_receipt() {
         )
         .unwrap();
     let later_wire = served_by(&author, corrected_lsn);
-    let second_digest = crate::protocol::authored_schema_unit_digest(&[later_wire
-        .ddl_provenance[0]
-        .author
-        .as_ref()
-        .unwrap()])
+    let second_digest = crate::protocol::authored_schema_unit_digest(&[later_wire.ddl_provenance
+        [0]
+    .author
+    .as_ref()
+    .unwrap()])
     .unwrap();
     pushed_to(&hub, &author, later_wire);
     let fixture_operation_reader_7 = hub
@@ -519,7 +518,8 @@ fn prove_policy_held_replay(dependency_complete: bool) {
     let root = tempfile::tempdir().unwrap();
     let author = JourneyPeer::open(root.path(), "held-author");
     let hub = JourneyPeer::open(root.path(), "held-hub");
-    let sql = "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
+    let sql =
+        "CREATE TABLE notes (id UUID PRIMARY KEY, body TEXT) SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
     author.db.execute(sql, &HashMap::new()).unwrap();
     hub.db.execute(sql, &HashMap::new()).unwrap();
     pushed_to(&hub, &author, served_by(&author, Lsn(0)));
@@ -569,8 +569,7 @@ fn prove_policy_held_replay(dependency_complete: bool) {
             author.incarnation(),
         )
         .unwrap();
-    let held =
-        try_pushed_to_with_atomicity(&hub, &author, row_wire, dependency_complete).unwrap();
+    let held = try_pushed_to_with_atomicity(&hub, &author, row_wire, dependency_complete).unwrap();
     assert_eq!(held.result.applied_rows, 0);
     assert_eq!(
         hub.db
@@ -594,9 +593,7 @@ fn prove_policy_held_replay(dependency_complete: bool) {
         .persistence
         .as_ref()
         .unwrap()
-        .load_config_values_with_prefix::<DurablePolicyHeldData>(
-            Database::POLICY_HELD_DATA_PREFIX,
-        )
+        .load_config_values_with_prefix::<DurablePolicyHeldData>(Database::POLICY_HELD_DATA_PREFIX)
         .unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].1.lineages, expected_lineages);
@@ -722,9 +719,8 @@ fn pushed_to(
     sender: &JourneyPeer,
     wire: crate::protocol::WireChangeSet,
 ) -> PushedUnit {
-    try_pushed_to(receiver, sender, wire).unwrap_or_else(|error| {
-        panic!("the hub installs the authenticated unit whole: {error}")
-    })
+    try_pushed_to(receiver, sender, wire)
+        .unwrap_or_else(|error| panic!("the hub installs the authenticated unit whole: {error}"))
 }
 
 /// [`pushed_to`] through the same door, handing back the receiver's
@@ -758,8 +754,7 @@ fn try_pushed_to_with_atomicity(
             .map_err(|error| format!("{error:?}"))?;
     let arrivals = crate::protocol::wire_row_arrivals(&request.changeset);
     let lineages = crate::protocol::wire_row_lineages(&request.changeset);
-    let changes =
-        ChangeSet::try_from(request.changeset).map_err(|error| format!("{error:?}"))?;
+    let changes = ChangeSet::try_from(request.changeset).map_err(|error| format!("{error:?}"))?;
     let changes = if let Some(received) = received.as_ref() {
         let fixture_operation_reader_10 = receiver
             .db
@@ -883,14 +878,10 @@ fn try_pulled_from(
     wire: crate::protocol::WireChangeSet,
 ) -> std::result::Result<crate::protocol::ReceivedDdlContext, String> {
     let tenant = TenantId::from(JOURNEY_TENANT);
-    let received = crate::protocol::received_ddl_context(
-        &wire,
-        &tenant,
-        &hub.node_id(),
-        hub.incarnation(),
-    )
-    .map_err(|error| format!("{error:?}"))?
-    .expect("the served unit carries schema");
+    let received =
+        crate::protocol::received_ddl_context(&wire, &tenant, &hub.node_id(), hub.incarnation())
+            .map_err(|error| format!("{error:?}"))?
+            .expect("the served unit carries schema");
     let arrivals = crate::protocol::wire_row_arrivals(&wire);
     let lineages = crate::protocol::wire_row_lineages(&wire);
     let changes = ChangeSet::try_from(wire).map_err(|error| format!("{error:?}"))?;
@@ -1231,9 +1222,8 @@ fn a_signed_unit_carrying_a_drop_replays_instead_of_taking_the_noop_exit() {
         let received_schema_read_memory_1 = peer
             .declared_reader_memory()
             .expect("admit the received-schema operation reader");
-        let mut received_schema_copy_owner_1 = contextdb_engine::vector_read_memory::admission(
-            received_schema_read_memory_1.clone(),
-        );
+        let mut received_schema_copy_owner_1 =
+            contextdb_engine::vector_read_memory::admission(received_schema_read_memory_1.clone());
 
         peer.commit_received_schema_stage_for_test(
             &changes,
@@ -1690,8 +1680,7 @@ fn received_arrival(
         (lsn, ordinal),
         (generation.table.clone(), generation.table_generation),
     );
-    if let (Some(table), Some(table_generation)) =
-        (&generation.table, generation.table_generation)
+    if let (Some(table), Some(table_generation)) = (&generation.table, generation.table_generation)
     {
         db.in_memory_table_generations
             .lock()
@@ -1877,9 +1866,8 @@ fn received_ddl_marker_binds_the_stored_occurrence_not_the_outbound_spelling() {
 #[test]
 fn filtered_synthetic_schema_signs_only_its_remaining_authored_order() {
     let root = tempfile::TempDir::new().expect("scratch signing identity");
-    let identity =
-        crate::identity::FabricIdentity::load_or_generate(&root.path().join("node.key"))
-            .expect("create the signing identity");
+    let identity = crate::identity::FabricIdentity::load_or_generate(&root.path().join("node.key"))
+        .expect("create the signing identity");
     let db = Database::open_memory();
     for statement in [
         "CREATE TABLE events (id INTEGER PRIMARY KEY)",
@@ -3040,8 +3028,7 @@ fn prepared_memory_swap_reserves_rolls_back_and_settles_replacement_deltas() {
     drop(abandoned);
     assert_eq!(accountant.usage().used, 0);
 
-    let mut published =
-        PreparedMemorySwap::prepare(accountant.clone().into(), 0, 8, 0).unwrap();
+    let mut published = PreparedMemorySwap::prepare(accountant.clone().into(), 0, 8, 0).unwrap();
     published.commit_after_swap();
     assert_eq!(accountant.usage().used, 8);
 }
@@ -3537,10 +3524,7 @@ fn staged_publication_moves_complete_replacements_across_derived_handles() {
         Some(&"original-author-through-relay".to_string()),
     );
 }
-fn received_single_ddl(
-    ddl: &DdlChange,
-    generation: u64,
-) -> crate::protocol::ReceivedDdlContext {
+fn received_single_ddl(ddl: &DdlChange, generation: u64) -> crate::protocol::ReceivedDdlContext {
     crate::protocol::ReceivedDdlContext {
         tenant_id: TenantId::from("tenant-a"),
         source_node_id: "relay-node".to_string(),
@@ -4186,11 +4170,9 @@ fn received_schema_create_vector_table_with_row_and_vector() -> ReceivedSchemaFi
 /// (`commit_received_schema_stage`, not the lower-level prepare/publish
 /// pair that skips the transaction manager entirely).
 #[test]
-fn an_authenticated_unit_that_declares_a_vector_table_installs_its_vectors_in_the_same_delivery()
- {
+fn an_authenticated_unit_that_declares_a_vector_table_installs_its_vectors_in_the_same_delivery() {
     let db = Database::open_memory();
-    let (changes, received, lineages) =
-        received_schema_create_vector_table_with_row_and_vector();
+    let (changes, received, lineages) = received_schema_create_vector_table_with_row_and_vector();
     let received_schema_read_memory_17 = db
         .declared_reader_memory()
         .expect("admit the received-schema operation reader");
@@ -4716,13 +4698,11 @@ fn a_second_peer_holds_the_authors_signed_identity_not_the_forwarding_hubs() {
             let key = NaturalKey::single("id".to_string(), Value::Uuid(id));
             let signed = author_lineage(&key);
             let stored = edge
-                .persisted::<DurableRowLineageSidecar>(
-                    &Database::durable_row_lineage_config_key(
-                        "notes",
-                        &key,
-                        signed.table_generation,
-                    ),
-                )
+                .persisted::<DurableRowLineageSidecar>(&Database::durable_row_lineage_config_key(
+                    "notes",
+                    &key,
+                    signed.table_generation,
+                ))
                 .unwrap_or_else(|| panic!("the edge stored the row's lineage {when}"));
             assert_eq!(
                 (
@@ -5050,13 +5030,7 @@ fn separate_create_and_structural_alter_keep_original_signatures_through_further
     assert!(schema.indexes.iter().any(|index| index.name == "notes_tag"));
 
     let check = |peer: &JourneyPeer, when: &str| {
-        assert_holds_the_authors_migration(
-            peer,
-            &author,
-            &authored_ddl,
-            &authored_identity,
-            when,
-        );
+        assert_holds_the_authors_migration(peer, &author, &authored_ddl, &authored_identity, when);
         assert_eq!(
             stored_ddl_authors(peer, when)
                 .into_iter()
@@ -5800,12 +5774,11 @@ fn the_fault_after_the_durable_commit_fires_before_any_publication_component() {
     let change = create_table();
     let received = received_single_ddl(&change, 1);
     let retired_key = policy_key.clone();
-    let mut prepare = move |_: &Database,
-                            ws: &mut WriteSet|
-          -> Result<Vec<crate::custody::records::Record>> {
-        ws.config_deletes.push(retired_key.clone());
-        Ok(Vec::new())
-    };
+    let mut prepare =
+        move |_: &Database, ws: &mut WriteSet| -> Result<Vec<crate::custody::records::Record>> {
+            ws.config_deletes.push(retired_key.clone());
+            Ok(Vec::new())
+        };
     RECEIVED_UNIT_FAULT.with(|fault| {
         fault.set(Some((
             ReceivedUnitFaultPoint::AfterDurableCommitBeforePublish,
@@ -5926,12 +5899,7 @@ fn received_schema_redb_failure_drops_stage_without_memory_or_disk_publication()
     assert!(reopened.received_ddl_arrivals.read().is_empty());
 }
 
-fn assert_local_schema_transaction_absent(
-    db: &Database,
-    table: &str,
-    trigger: &str,
-    phase: &str,
-) {
+fn assert_local_schema_transaction_absent(db: &Database, table: &str, trigger: &str, phase: &str) {
     assert!(
         db.table_meta(table).is_none(),
         "{phase}: failed local DDL must not publish table metadata"
@@ -6528,9 +6496,7 @@ fn received_schema_delete_log_uses_latest_key_after_primary_key_update() {
                 row_id: logged_row_id,
                 natural_key,
                 lsn,
-            } if table == "events" && *logged_row_id == row_id => {
-                Some((*lsn, natural_key.clone()))
-            }
+            } if table == "events" && *logged_row_id == row_id => Some((*lsn, natural_key.clone())),
             _ => None,
         })
         .expect("received delete change-log entry");
@@ -6577,9 +6543,7 @@ fn received_schema_delete_log_uses_latest_key_after_primary_key_update() {
             .iter()
             .any(|row| row.deleted && row.natural_key == target_key)
     );
-    assert!(
-        durable_observation::table_index(&reopened, "events").contains(&(stage_lsn, row_id))
-    );
+    assert!(durable_observation::table_index(&reopened, "events").contains(&(stage_lsn, row_id)));
     assert!(
         durable_observation::root(&reopened)
             .change_log_occurrences(stage_lsn)
@@ -6717,8 +6681,7 @@ fn staged_receipt_watermarks_keep_other_keys_and_relay_preserves_creator() {
         higher.mirrors.receipt_and_applied_watermarks[&tenant_watermark_key],
         Lsn(8)
     );
-    let durable_tenant_key =
-        TenantId::from("tenant-a").config_key("sync_applied_push_watermark");
+    let durable_tenant_key = TenantId::from("tenant-a").config_key("sync_applied_push_watermark");
     assert!(
         higher
             .persistence

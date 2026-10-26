@@ -81,10 +81,8 @@ fn a_table_size_that_cannot_be_read_is_never_reported_as_a_smaller_table() {
     let used = database.declared_read_memory.retained_bytes_for_test();
     let original_reader = std::mem::replace(
         &mut database.declared_read_memory,
-        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(
-            used.saturating_add(8),
-        )
-        .expect("admit the declared fixture root"),
+        crate::vector_read_memory::DeclaredReadMemory::from_reader_limit(used.saturating_add(8))
+            .expect("admit the declared fixture root"),
     );
     let refused = database
         .table_size_estimates()

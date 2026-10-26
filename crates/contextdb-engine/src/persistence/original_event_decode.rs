@@ -341,10 +341,7 @@ fn decode_with_route<T: de::DeserializeOwned, E>(
     exact: bool,
     closed_json: bool,
     existing: impl Fn(Error) -> E,
-    reserve: impl Fn(
-        usize,
-    )
-        -> std::result::Result<crate::memory_accounting::OwnedMemoryReservation, E>,
+    reserve: impl Fn(usize) -> std::result::Result<crate::memory_accounting::OwnedMemoryReservation, E>,
     native: impl FnOnce(contextdb_core::read_memory::NativeRefusal) -> E,
     captured: impl FnOnce(crate::funded_error::OriginalError) -> E,
     codec: impl FnOnce(
@@ -353,10 +350,9 @@ fn decode_with_route<T: de::DeserializeOwned, E>(
     ) -> E,
 ) -> std::result::Result<OriginalDecoded<T>, E> {
     #[cfg(test)]
-    let _purge_producer =
-        content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::new::<T>(
-            "original_event_decode::decode_with_route",
-        );
+    let _purge_producer = content_identity::proof_allocation_oracle_tests::PurgeProducerGuard::new::<
+        T,
+    >("original_event_decode::decode_with_route");
     let control = std::mem::size_of::<T>()
         .checked_mul(4)
         .and_then(|n| n.checked_add(128))
@@ -366,13 +362,11 @@ fn decode_with_route<T: de::DeserializeOwned, E>(
     let _control = reserve(control)?;
     let json_diagnostic = if closed_json {
         Some(
-            crate::funded_error::AdmittedJsonDiagnostic::prepare(_original).map_err(
-                |error| {
-                    existing(native_storage_admission::original_storage_error(
-                        native_storage_admission::NativeStorageFailure::Refused(error),
-                    ))
-                },
-            )?,
+            crate::funded_error::AdmittedJsonDiagnostic::prepare(_original).map_err(|error| {
+                existing(native_storage_admission::original_storage_error(
+                    native_storage_admission::NativeStorageFailure::Refused(error),
+                ))
+            })?,
         )
     } else {
         None
@@ -763,14 +757,11 @@ impl<'de, VV: Visitor<'de>> Visitor<'de> for V<'_, VV, VV::Value> {
         capture(result, self.output)
     }
     fn visit_bytes<E: de::Error>(self, value: &[u8]) -> std::result::Result<(), E> {
-        let result = admit::<E>(value.len())
-            .and_then(|()| self.inner.visit_bytes::<CodecError<E>>(value));
+        let result =
+            admit::<E>(value.len()).and_then(|()| self.inner.visit_bytes::<CodecError<E>>(value));
         capture(result, self.output)
     }
-    fn visit_borrowed_bytes<E: de::Error>(
-        self,
-        value: &'de [u8],
-    ) -> std::result::Result<(), E> {
+    fn visit_borrowed_bytes<E: de::Error>(self, value: &'de [u8]) -> std::result::Result<(), E> {
         let result = admit::<E>(value.len())
             .and_then(|()| self.inner.visit_borrowed_bytes::<CodecError<E>>(value));
         capture(result, self.output)

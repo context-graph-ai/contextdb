@@ -184,28 +184,17 @@ fn fallback_snapshots_keep_a_fresh_same_key_row_after_the_old_row_id_is_tombston
                     drop(db);
                     {
                         let reopened = Database::open(&path).unwrap();
-                        for (snapshot, expected) in
-                            [historical, current].into_iter().zip(&controls)
+                        for (snapshot, expected) in [historical, current].into_iter().zip(&controls)
                         {
                             for (sql, rows) in queries.into_iter().zip(expected) {
                                 #[cfg(any(test, feature = "test-seams"))]
-                                let (result, work) =
-                                    crate::writer_query_test_seams::observe_target(
-                                        "version_rows",
-                                        || {
-                                            reopened.execute_at_snapshot(
-                                                sql,
-                                                &HashMap::new(),
-                                                snapshot,
-                                            )
-                                        },
-                                    );
-                                #[cfg(not(any(test, feature = "test-seams")))]
-                                let result = reopened.execute_at_snapshot(
-                                    sql,
-                                    &HashMap::new(),
-                                    snapshot,
+                                let (result, work) = crate::writer_query_test_seams::observe_target(
+                                    "version_rows",
+                                    || reopened.execute_at_snapshot(sql, &HashMap::new(), snapshot),
                                 );
+                                #[cfg(not(any(test, feature = "test-seams")))]
+                                let result =
+                                    reopened.execute_at_snapshot(sql, &HashMap::new(), snapshot);
                                 let result = result.unwrap();
                                 #[cfg(any(test, feature = "test-seams"))]
                                 {
@@ -215,8 +204,13 @@ fn fallback_snapshots_keep_a_fresh_same_key_row_after_the_old_row_id_is_tombston
                                         "{shape}/{damage}: the public read returns the fresh control for the exact requested snapshot"
                                     );
                                     if !rows.0.is_empty() {
-                                        assert!(work.target_source_calls[crate::writer_query_test_seams::PhysicalFamily::Row as usize] > 0,
-                                "{shape}/{damage}: actual source work reads the target table's row family");
+                                        assert!(
+                                            work.target_source_calls
+                                                [crate::writer_query_test_seams::PhysicalFamily::Row
+                                                    as usize]
+                                                > 0,
+                                            "{shape}/{damage}: actual source work reads the target table's row family"
+                                        );
                                     }
                                 }
                                 assert_eq!(
@@ -235,9 +229,8 @@ fn fallback_snapshots_keep_a_fresh_same_key_row_after_the_old_row_id_is_tombston
 
                     // The production decoder identifies the interior member. The raw
                     // mutation below copies production-encoded bytes without a codec.
-                    let fixture_open_accountant_7598 = std::sync::Arc::new(
-                        crate::memory_accounting::MemoryAccountant::no_limit(),
-                    );
+                    let fixture_open_accountant_7598 =
+                        std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
                     let _fixture_decode_scope_7598 =
                         crate::read_image_memory::ImageMemory::enter_writer_operation(
                             std::sync::Arc::clone(&fixture_open_accountant_7598).into(),
@@ -343,8 +336,7 @@ fn fallback_snapshots_keep_a_fresh_same_key_row_after_the_old_row_id_is_tombston
                     write.commit().unwrap();
                     drop(raw);
                     let reopened = Database::open(&path).unwrap();
-                    for (snapshot, expected) in [historical, current].into_iter().zip(&controls)
-                    {
+                    for (snapshot, expected) in [historical, current].into_iter().zip(&controls) {
                         for (sql, owed_rows) in queries.into_iter().zip(expected) {
                             // An empty current index range does not consume the retired
                             // historical group. Corruption is owed before data in each
@@ -553,16 +545,10 @@ fn fallback_snapshots_keep_a_fresh_same_key_row_after_the_old_row_id_is_tombston
                         // Redb orders keys. Exchanging two intact encoded bodies
                         // makes their version identities disagree with that order.
                         table
-                            .insert(
-                                saved[0].0.as_slice(),
-                                saved[interior_position].1.as_slice(),
-                            )
+                            .insert(saved[0].0.as_slice(), saved[interior_position].1.as_slice())
                             .unwrap();
                         table
-                            .insert(
-                                saved[interior_position].0.as_slice(),
-                                saved[0].1.as_slice(),
-                            )
+                            .insert(saved[interior_position].0.as_slice(), saved[0].1.as_slice())
                             .unwrap();
                     }
                     _ => unreachable!(),
@@ -862,8 +848,7 @@ fn fallback_snapshots_keep_a_fresh_same_key_row_after_the_old_row_id_is_tombston
                 .unwrap()
                 .into_parts();
             receipt.validate_released().unwrap();
-            for (snapshot, before) in
-                [(historical, &historical_before), (current, &current_before)]
+            for (snapshot, before) in [(historical, &historical_before), (current, &current_before)]
             {
                 let mut cursor = contextdb_relational::mem::BoundedPhysicalCursor::default();
                 let mut after = Vec::new();
@@ -929,12 +914,7 @@ fn fallback_snapshots_keep_a_fresh_same_key_row_after_the_old_row_id_is_tombston
             }
             for version in &all_versions {
                 let exact = source
-                    .relational_row_by_id_lsn(
-                        "version_rows",
-                        &meta,
-                        version.row_id,
-                        version.lsn,
-                    )
+                    .relational_row_by_id_lsn("version_rows", &meta, version.row_id, version.lsn)
                     .unwrap();
                 assert_eq!(
                     exact.map(|row| (
@@ -1235,8 +1215,7 @@ fn persisted_delta_replays_synthetic_schema_after_its_requested_frontier() {
         .iter()
         .zip(full.ddl_lsn.iter())
         .find_map(|(ddl, lsn)| {
-            matches!(ddl, DdlChange::CreateTable { name, .. } if name == "events")
-                .then_some(*lsn)
+            matches!(ddl, DdlChange::CreateTable { name, .. } if name == "events").then_some(*lsn)
         })
         .expect("complete history records the first table in author order");
     let later_lsn = full
@@ -1298,7 +1277,9 @@ fn persisted_delta_replays_synthetic_schema_after_its_requested_frontier() {
     let index_position = changes
         .ddl
         .iter()
-        .position(|ddl| matches!(ddl, DdlChange::CreateIndex { table, .. } if table == "later_events"))
+        .position(
+            |ddl| matches!(ddl, DdlChange::CreateIndex { table, .. } if table == "later_events"),
+        )
         .expect("affected index is present");
     assert!(
         later_position < index_position,

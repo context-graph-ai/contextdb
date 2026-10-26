@@ -21,9 +21,7 @@ fn gate_granted(path: &Path, identity: (u64, u64)) -> bool {
 
 #[test]
 fn the_data_gate_is_refused_while_a_writer_claims_or_owns_the_store() {
-    use physical_admission::{
-        ByteLock, CLAIM_OFFSET, Granted, release_byte, try_byte, try_data,
-    };
+    use physical_admission::{ByteLock, CLAIM_OFFSET, Granted, release_byte, try_byte, try_data};
     let directory = tempfile::TempDir::new().unwrap();
     let (path, identity) = store(directory.path());
     let writer = OpenOptions::new()

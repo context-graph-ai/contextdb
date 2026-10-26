@@ -1,7 +1,6 @@
 use super::*;
 
 impl RedbPersistence {
-
     /// The free pages only relocation can give back, over the file a trim
     /// would leave: `(free - trailing) / (region pages - trailing)`, from the
     /// totals the allocator maintains as it allocates and frees plus the
@@ -1378,7 +1377,10 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn load_graph_table(&self, definition: TableDefinition<&[u8], &[u8]>) -> Result<Vec<AdjEntry>> {
+    pub(super) fn load_graph_table(
+        &self,
+        definition: TableDefinition<&[u8], &[u8]>,
+    ) -> Result<Vec<AdjEntry>> {
         let _decode_scope = self.reader_decode_scope()?;
         self.with_db(|db| {
             let read_txn = db.begin_read().map_err(Self::storage_error)?;
@@ -1509,7 +1511,10 @@ impl RedbPersistence {
         Ok(Self::column_quantization(meta.as_ref(), &index.column))
     }
 
-    pub(super) fn column_quantization(meta: Option<&TableMeta>, column_name: &str) -> VectorQuantization {
+    pub(super) fn column_quantization(
+        meta: Option<&TableMeta>,
+        column_name: &str,
+    ) -> VectorQuantization {
         meta.and_then(|meta| {
             meta.columns
                 .iter()
@@ -1562,7 +1567,10 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn encode_versioned_row(row: &VersionedRow, meta: Option<&TableMeta>) -> Result<Vec<u8>> {
+    pub(super) fn encode_versioned_row(
+        row: &VersionedRow,
+        meta: Option<&TableMeta>,
+    ) -> Result<Vec<u8>> {
         let mut encoded = Vec::new();
         Self::encode_versioned_row_into(row, meta, &mut encoded)?;
         Ok(encoded)
@@ -1773,7 +1781,10 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn decode_versioned_row(bytes: &[u8], _meta: Option<&TableMeta>) -> Result<VersionedRow> {
+    pub(super) fn decode_versioned_row(
+        bytes: &[u8],
+        _meta: Option<&TableMeta>,
+    ) -> Result<VersionedRow> {
         // Same wire order and variants, decoded directly into the final map.
         // No intermediate persisted HashMap or copied column names exist.
         struct RowValue(Value);
@@ -1935,7 +1946,9 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn decode_persisted_vector_entry_exact(bytes: &[u8]) -> Result<PersistedVectorEntry> {
+    pub(super) fn decode_persisted_vector_entry_exact(
+        bytes: &[u8],
+    ) -> Result<PersistedVectorEntry> {
         // The stored layout of `PersistedVectorEntry`, field for field and
         // variant for variant.
         #[derive(Deserialize)]
@@ -4020,7 +4033,9 @@ impl RedbPersistence {
         Self::vector_partition_prefix_with_suffix_capacity(index, partition_key, 0)
     }
 
-    pub(super) fn vector_partition_membership_key(record: &VectorPartitionMembershipRecord) -> Vec<u8> {
+    pub(super) fn vector_partition_membership_key(
+        record: &VectorPartitionMembershipRecord,
+    ) -> Vec<u8> {
         let mut key = Self::vector_partition_prefix_with_suffix_capacity(
             &record.index,
             &record.partition_key,
@@ -4044,7 +4059,9 @@ impl RedbPersistence {
         key
     }
 
-    pub(super) fn vector_partition_version_identity_key(identity: &VectorPartitionVersionIdentity) -> Vec<u8> {
+    pub(super) fn vector_partition_version_identity_key(
+        identity: &VectorPartitionVersionIdentity,
+    ) -> Vec<u8> {
         let mut key = Self::vector_partition_prefix(&identity.index, &identity.partition_key);
         key.extend_from_slice(&identity.row_id.0.to_be_bytes());
         key.extend_from_slice(&identity.row_created_tx.0.to_be_bytes());
@@ -4054,7 +4071,9 @@ impl RedbPersistence {
         key
     }
 
-    pub(super) fn vector_partition_tombstone_key(record: &VectorPartitionTombstoneRecord) -> Vec<u8> {
+    pub(super) fn vector_partition_tombstone_key(
+        record: &VectorPartitionTombstoneRecord,
+    ) -> Vec<u8> {
         let mut key = Self::vector_partition_membership_key(&record.membership);
         key.extend_from_slice(&record.deleted_tx.0.to_be_bytes());
         key
@@ -4074,7 +4093,9 @@ impl RedbPersistence {
         Self::vector_partition_prefix(index, partition_key)
     }
 
-    pub(super) fn vector_partition_catalog_key(record: &VectorPartitionGenerationCatalogRecord) -> Vec<u8> {
+    pub(super) fn vector_partition_catalog_key(
+        record: &VectorPartitionGenerationCatalogRecord,
+    ) -> Vec<u8> {
         Self::vector_partition_catalog_key_from_parts(&record.index, &record.partition_key)
     }
 
@@ -4121,7 +4142,10 @@ impl RedbPersistence {
         )
     }
 
-    pub(super) fn vector_partition_graph_page_root_key(generation_key: &[u8], is_base: bool) -> Vec<u8> {
+    pub(super) fn vector_partition_graph_page_root_key(
+        generation_key: &[u8],
+        is_base: bool,
+    ) -> Vec<u8> {
         let route_marker = if is_base { 0xb0 } else { 0xc0 };
         let identity_bytes = generation_key
             .len()
@@ -5828,7 +5852,9 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn ensure_open_vector_directory_in_write(write: &redb::WriteTransaction) -> Result<()> {
+    pub(super) fn ensure_open_vector_directory_in_write(
+        write: &redb::WriteTransaction,
+    ) -> Result<()> {
         let mut directory = write
             .open_table(VECTOR_OPEN_DIRECTORY_TABLE)
             .map_err(Self::storage_error)?;
@@ -6512,7 +6538,9 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn require_decode_original(&self) -> Result<crate::memory_accounting::StoreAccountantHandle> {
+    pub(super) fn require_decode_original(
+        &self,
+    ) -> Result<crate::memory_accounting::StoreAccountantHandle> {
         let accountant = self.require_decode_accountant()?;
         self.proof_accountant_handle_for(&accountant)
             .ok_or_else(|| Error::Other("decode accountant has no original provenance".into()))
@@ -6522,7 +6550,9 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn require_decode_accountant(&self) -> Result<crate::memory_accounting::AccountantHandle> {
+    pub(super) fn require_decode_accountant(
+        &self,
+    ) -> Result<crate::memory_accounting::AccountantHandle> {
         if let Some(slot) = self.proof_accountant.get() {
             return Ok(slot.accountant());
         }
@@ -6987,7 +7017,10 @@ impl RedbPersistence {
         Self::held_store_error_in_runtime_dir(path, None)
     }
 
-    pub(super) fn held_store_error_in_runtime_dir(path: &Path, runtime_dir: Option<&Path>) -> Error {
+    pub(super) fn held_store_error_in_runtime_dir(
+        path: &Path,
+        runtime_dir: Option<&Path>,
+    ) -> Error {
         #[cfg(any(test, feature = "test-seams"))]
         read_persistence_test_scaffold::note_writer_admission_for_test(
             path,
@@ -7188,7 +7221,10 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn with_db_handle<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
+    pub(super) fn with_db_handle<T>(
+        &self,
+        f: impl FnOnce(&redb::Database) -> Result<T>,
+    ) -> Result<T> {
         self.with_db_handle_loan(|db| self.with_storage_admission(|| f(db)))
     }
 
@@ -7198,7 +7234,10 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn with_db_handle_loan<T>(&self, f: impl FnOnce(&redb::Database) -> Result<T>) -> Result<T> {
+    pub(super) fn with_db_handle_loan<T>(
+        &self,
+        f: impl FnOnce(&redb::Database) -> Result<T>,
+    ) -> Result<T> {
         #[cfg(test)]
         PERSISTENCE_OWNERSHIP_READS_FOR_TEST.with(|count| count.set(count.get() + 1));
         // Operations borrow shared handle ownership. A writer waiting inside
@@ -7226,7 +7265,10 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn with_storage_admission<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    pub(super) fn with_storage_admission<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         // A caller's already installed capability owns native misses and any
         // pending map created here. Never replace its original payer.
         if redb::native_storage_active() {

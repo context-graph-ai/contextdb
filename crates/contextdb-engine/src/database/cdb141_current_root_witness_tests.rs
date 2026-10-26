@@ -93,28 +93,17 @@ fn test_b_public_current_point_list_and_join_refuse_committed_history_damage() {
                     drop(db);
                     {
                         let reopened = Database::open(&path).unwrap();
-                        for (snapshot, expected) in
-                            [historical, current].into_iter().zip(&controls)
+                        for (snapshot, expected) in [historical, current].into_iter().zip(&controls)
                         {
                             for (sql, rows) in queries.into_iter().zip(expected) {
                                 #[cfg(any(test, feature = "test-seams"))]
-                                let (result, work) =
-                                    crate::writer_query_test_seams::observe_target(
-                                        "version_rows",
-                                        || {
-                                            reopened.execute_at_snapshot(
-                                                sql,
-                                                &HashMap::new(),
-                                                snapshot,
-                                            )
-                                        },
-                                    );
-                                #[cfg(not(any(test, feature = "test-seams")))]
-                                let result = reopened.execute_at_snapshot(
-                                    sql,
-                                    &HashMap::new(),
-                                    snapshot,
+                                let (result, work) = crate::writer_query_test_seams::observe_target(
+                                    "version_rows",
+                                    || reopened.execute_at_snapshot(sql, &HashMap::new(), snapshot),
                                 );
+                                #[cfg(not(any(test, feature = "test-seams")))]
+                                let result =
+                                    reopened.execute_at_snapshot(sql, &HashMap::new(), snapshot);
                                 let result = result.unwrap();
                                 #[cfg(any(test, feature = "test-seams"))]
                                 {
@@ -124,8 +113,13 @@ fn test_b_public_current_point_list_and_join_refuse_committed_history_damage() {
                                         "{shape}/{damage}: the public read returns the fresh control for the exact requested snapshot"
                                     );
                                     if !rows.0.is_empty() {
-                                        assert!(work.target_source_calls[crate::writer_query_test_seams::PhysicalFamily::Row as usize] > 0,
-                                "{shape}/{damage}: actual source work reads the target table's row family");
+                                        assert!(
+                                            work.target_source_calls
+                                                [crate::writer_query_test_seams::PhysicalFamily::Row
+                                                    as usize]
+                                                > 0,
+                                            "{shape}/{damage}: actual source work reads the target table's row family"
+                                        );
                                     }
                                 }
                                 assert_eq!(
@@ -144,9 +138,8 @@ fn test_b_public_current_point_list_and_join_refuse_committed_history_damage() {
 
                     // The production decoder identifies the interior member. The raw
                     // mutation below copies production-encoded bytes without a codec.
-                    let fixture_open_accountant_87263 = std::sync::Arc::new(
-                        crate::memory_accounting::MemoryAccountant::no_limit(),
-                    );
+                    let fixture_open_accountant_87263 =
+                        std::sync::Arc::new(crate::memory_accounting::MemoryAccountant::no_limit());
                     let _fixture_decode_scope_87263 =
                         crate::read_image_memory::ImageMemory::enter_writer_operation(
                             std::sync::Arc::clone(&fixture_open_accountant_87263).into(),
@@ -252,8 +245,7 @@ fn test_b_public_current_point_list_and_join_refuse_committed_history_damage() {
                     write.commit().unwrap();
                     drop(raw);
                     let reopened = Database::open(&path).unwrap();
-                    for (snapshot, expected) in [historical, current].into_iter().zip(&controls)
-                    {
+                    for (snapshot, expected) in [historical, current].into_iter().zip(&controls) {
                         for (sql, _owed_rows) in queries.into_iter().zip(expected) {
                             match reopened.execute_at_snapshot(sql, &HashMap::new(), snapshot) {
                                 Err(Error::StoreCorrupted {

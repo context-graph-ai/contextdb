@@ -160,9 +160,7 @@ fn naive_commit_index(
                     .and_then(|(_, rows)| {
                         rows.iter()
                             .filter(|row| {
-                                row.row_id == *row_id
-                                    && row.lsn < *lsn
-                                    && row.deleted_tx.is_some()
+                                row.row_id == *row_id && row.lsn < *lsn && row.deleted_tx.is_some()
                             })
                             .max_by_key(|row| row.lsn)
                             .and_then(|row| row.deleted_tx)

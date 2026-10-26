@@ -39,7 +39,10 @@ pub(super) fn trusted_reader_snapshot_directory_metadata(_metadata: &std::fs::Me
 }
 
 #[cfg(unix)]
-pub(super) fn same_reader_snapshot_directory(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+pub(super) fn same_reader_snapshot_directory(
+    left: &std::fs::Metadata,
+    right: &std::fs::Metadata,
+) -> bool {
     use std::os::unix::fs::MetadataExt as _;
 
     trusted_reader_snapshot_directory_metadata(right)
@@ -50,7 +53,10 @@ pub(super) fn same_reader_snapshot_directory(left: &std::fs::Metadata, right: &s
 }
 
 #[cfg(not(unix))]
-pub(super) fn same_reader_snapshot_directory(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+pub(super) fn same_reader_snapshot_directory(
+    _left: &std::fs::Metadata,
+    _right: &std::fs::Metadata,
+) -> bool {
     false
 }
 
@@ -63,7 +69,10 @@ pub(super) fn reader_snapshot_path_still_names(path: &Path, inspected: &std::fs:
 }
 
 #[cfg(not(unix))]
-pub(super) fn reader_snapshot_path_still_names(_path: &Path, _inspected: &std::fs::Metadata) -> bool {
+pub(super) fn reader_snapshot_path_still_names(
+    _path: &Path,
+    _inspected: &std::fs::Metadata,
+) -> bool {
     false
 }
 
@@ -142,7 +151,9 @@ pub(super) fn reader_snapshot_directory_entries(directory: &File) -> std::io::Re
 }
 
 #[cfg(not(unix))]
-pub(super) fn reader_snapshot_directory_entries(_directory: &File) -> std::io::Result<Vec<PathBuf>> {
+pub(super) fn reader_snapshot_directory_entries(
+    _directory: &File,
+) -> std::io::Result<Vec<PathBuf>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "reader snapshot registries require unix directory descriptors",
@@ -153,7 +164,10 @@ pub(super) fn reader_snapshot_directory_entries(_directory: &File) -> std::io::R
 /// registry lock is held. The descriptor is still authenticated below before
 /// any entry is used.
 #[cfg(unix)]
-pub(super) fn open_reader_snapshot_directory_entry(directory: &File, name: &Path) -> std::io::Result<File> {
+pub(super) fn open_reader_snapshot_directory_entry(
+    directory: &File,
+    name: &Path,
+) -> std::io::Result<File> {
     let owned = nix::fcntl::openat(
         directory,
         name,
@@ -272,7 +286,10 @@ pub(super) fn macos_process_start(
 /// them for the same file, or `None` when the descriptor is not open or is
 /// not a file.
 #[cfg(target_os = "macos")]
-pub(super) fn macos_descriptor_identity(process_id: u32, descriptor: u32) -> std::io::Result<(u64, u64)> {
+pub(super) fn macos_descriptor_identity(
+    process_id: u32,
+    descriptor: u32,
+) -> std::io::Result<(u64, u64)> {
     // libc 0.2.182 declares `vnode_info` and not `vnode_fdinfo`. Flavor 1 is
     // `proc_fileinfo` plus `vnode_info`. Flavor 2 also applies a path check.
     #[repr(C)]
@@ -723,7 +740,8 @@ pub(super) fn current_writer_wait() -> WriterWaitContext {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-pub(super) fn writer_open_diagnostic_budget() -> Result<contextdb_core::read_memory::ReadMemoryOwner> {
+pub(super) fn writer_open_diagnostic_budget() -> Result<contextdb_core::read_memory::ReadMemoryOwner>
+{
     match current_writer_wait().payer {
         Some(original) => original
             .wait_memory_owner()
@@ -1037,7 +1055,10 @@ impl SourceMemoryReservation {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn detach_control(&self, bytes: usize) -> Result<crate::memory_accounting::ControlCredit> {
+    pub(super) fn detach_control(
+        &self,
+        bytes: usize,
+    ) -> Result<crate::memory_accounting::ControlCredit> {
         let mut funding = self
             .cache_funding
             .lock()
@@ -3014,7 +3035,11 @@ impl RetainedReadSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn verify_history_root_in_read(&self, read: &redb::ReadTransaction, name: &str) -> Result<()> {
+    pub(super) fn verify_history_root_in_read(
+        &self,
+        read: &redb::ReadTransaction,
+        name: &str,
+    ) -> Result<()> {
         RedbPersistence::verify_history_root(read, name).map_err(|error| match error {
             Error::StoreCorrupted { reason, .. } => self.content_identity_corruption(reason),
             other => other,

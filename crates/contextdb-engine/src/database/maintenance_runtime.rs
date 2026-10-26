@@ -138,7 +138,11 @@ impl VectorGenerationWorkspacePlan {
         })
     }
 
-    pub(super) fn assign_raw_decode_owner(&mut self, partition_state_present: bool, delete_carriers: bool) {
+    pub(super) fn assign_raw_decode_owner(
+        &mut self,
+        partition_state_present: bool,
+        delete_carriers: bool,
+    ) {
         // Partition snapshots copy resident entries into the funded raw owner.
         // If its bodies are dormant/evicted, the partition loader independently
         // admits its decoder scratch before hydration. Direct durable reads and
@@ -477,7 +481,10 @@ impl MaintenanceContext {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn publish_direct_metadata<R>(&self, write: impl FnOnce() -> Result<R>) -> Result<R> {
+    pub(super) fn publish_direct_metadata<R>(
+        &self,
+        write: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         publish_direct_metadata(&self.tx_mgr, write)
     }
 
@@ -2100,7 +2107,9 @@ impl MaintenanceContext {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    pub(super) fn reclaim_snapshot_free_vector_graphs(&self) -> Result<MaintenanceMetadataFailures> {
+    pub(super) fn reclaim_snapshot_free_vector_graphs(
+        &self,
+    ) -> Result<MaintenanceMetadataFailures> {
         if !self.vector.has_retired_graph_generations() {
             return Ok(MaintenanceMetadataFailures::default());
         }
@@ -4076,7 +4085,10 @@ impl StagedTupleLookup {
         Ok(Self::from_write_set(&columns_by_table, ws))
     }
 
-    pub(super) fn from_write_set(columns_by_table: &HashMap<String, Vec<Vec<String>>>, ws: &WriteSet) -> Self {
+    pub(super) fn from_write_set(
+        columns_by_table: &HashMap<String, Vec<Vec<String>>>,
+        ws: &WriteSet,
+    ) -> Self {
         let mut lookup = Self::default();
         for (table, row) in &ws.relational_inserts {
             lookup.add_row_with_columns(columns_by_table, table, row);
