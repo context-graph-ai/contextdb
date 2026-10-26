@@ -24,3 +24,6 @@ mod sql_surface_other;
 mod sql_surface_tests;
 #[path = "sql_surface/the_same_edge_through_both_doors_is_one_edge.rs"]
 mod the_same_edge_through_both_doors_is_one_edge;
+
+#[path = "sql_surface/a_volatile_default_keeps_mixed_edge_bindings_distinct.rs"]
+mod a_volatile_default_keeps_mixed_edge_bindings_distinct;
