@@ -60,6 +60,20 @@ pub(super) fn vector(row: usize) -> Vec<f32> {
 }
 
 pub(super) fn seed(path: &Path, rows_per_context: usize) {
+    let db = seed_rows(path, rows_per_context);
+    for _ in 0..64 {
+        db.run_maintenance_cycle()
+            .expect("drive caller-owned build");
+        let status = db.vector_store_for_test().hnsw_maintenance_status();
+        if status.ready_partitions == CONTEXTS && status.remaining_partitions == 0 {
+            break;
+        }
+    }
+    db.close().expect("close the fixture");
+}
+
+/// The fixture's rows in one commit, with no vector graph built over them.
+fn seed_rows(path: &Path, rows_per_context: usize) -> Database {
     let rows = CONTEXTS * rows_per_context;
     let db = Database::open(path).expect("open the writable fixture");
     db.set_maintenance_policy(MaintenancePolicy::CallerDriven);
@@ -92,15 +106,7 @@ pub(super) fn seed(path: &Path, rows_per_context: usize) {
         .expect("insert one fixture row");
     }
     db.commit(tx).expect("commit the fixture");
-    for _ in 0..64 {
-        db.run_maintenance_cycle()
-            .expect("drive caller-owned build");
-        let status = db.vector_store_for_test().hnsw_maintenance_status();
-        if status.ready_partitions == CONTEXTS && status.remaining_partitions == 0 {
-            break;
-        }
-    }
-    db.close().expect("close the fixture");
+    db
 }
 
 pub(super) fn options() -> ReadSessionOptions {
@@ -1010,7 +1016,11 @@ fn a_proof_page_a_statement_still_holds_stays_charged_after_the_cache_evicts_it(
 fn a_tight_session_completes_a_long_walk_instead_of_refusing_it_for_cumulative_reuse() {
     let root = tempfile::tempdir().expect("fixture directory");
     let path = root.path().join("tight-streaming-not-cumulative.db");
-    seed(&path, 4096);
+    // The walk reads relational rows only, so no vector graph is built.
+    const ROWS_PER_CONTEXT: usize = 512;
+    seed_rows(&path, ROWS_PER_CONTEXT)
+        .close()
+        .expect("close the fixture");
 
     // Comfortably above what opening the committed image and any single
     // record's own tree-descent working set need (a few pages at most, well
@@ -1023,7 +1033,9 @@ fn a_tight_session_completes_a_long_walk_instead_of_refusing_it_for_cumulative_r
     let load = load_read_image_with_memory(&path, Some(TIGHT_DECLARED_BYTES))
         .expect("a session this size still opens the retained committed image");
 
+    reset_work_for_test();
     let outcome = walk_rows(&load);
+    let (proved_bytes, _) = take_work_bytes_for_test();
     assert!(
         outcome.is_ok(),
         "a session declared for one record's own streaming working set must complete a long \
@@ -1032,8 +1044,13 @@ fn a_tight_session_completes_a_long_walk_instead_of_refusing_it_for_cumulative_r
     );
     assert_eq!(
         outcome.expect("checked above"),
-        2 * 4096,
+        CONTEXTS * ROWS_PER_CONTEXT,
         "every row is still answered once the walk completes"
+    );
+    assert!(
+        proved_bytes >= 4 * TIGHT_DECLARED_BYTES as u64,
+        "the walk is long: it proves at least four times the declared session in pages, so \
+         cumulative reuse could not have fit: proved={proved_bytes} declared={TIGHT_DECLARED_BYTES}"
     );
 }
 
