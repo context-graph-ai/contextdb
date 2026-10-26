@@ -54,8 +54,6 @@ pub(crate) struct WriterOpenBounds {
     pub(crate) max_row_id: RowId,
     pub(crate) max_tx: TxId,
     pub(crate) max_lsn: Lsn,
-    pub(crate) commit_first: Option<(Lsn, TxId)>,
-    pub(crate) commit_last: Option<(Lsn, TxId)>,
     pub(crate) commit_count: u64,
 }
 
@@ -1260,8 +1258,6 @@ impl RedbPersistence {
             max_lsn: Lsn(stored
                 .source_lsn_floor
                 .max(commit_last.map_or(0, |(lsn, _)| lsn.0))),
-            commit_first,
-            commit_last,
             commit_count: count,
         };
         match read.open_table(DDL_LOG_TABLE) {

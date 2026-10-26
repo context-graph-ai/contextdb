@@ -521,7 +521,6 @@ const WORKING_GRAPH_REWRITE: TableDefinition<&[u8], &[u8]> =
 pub(crate) enum GraphRewrite {
     Keep,
     Replace,
-    Remove,
 }
 
 impl ReceivedWorkingWrite {
@@ -585,7 +584,6 @@ impl ReceivedWorkingWrite {
             }
             let (key, body) = match action {
                 GraphRewrite::Keep => (window.key.as_slice(), window.encoded.as_slice()),
-                GraphRewrite::Remove => continue,
                 GraphRewrite::Replace => {
                     rewritten = original_graph_key(&frame, &window.edge, false)?;
                     encoded = frame.encode(&window.edge)?;

@@ -50,11 +50,6 @@ pub struct WriterHistoryWork {
 
 pub(crate) enum HistoryFamily {
     Row,
-    #[allow(
-        dead_code,
-        reason = "Retained zero-work oracle for writable startup index rebuilding"
-    )]
-    IndexRebuildInput,
     Graph,
     ChangeLog,
     CommitIndex,
@@ -68,7 +63,6 @@ pub(crate) fn note_history(family: HistoryFamily) {
         if let Some(mut counters) = work.get() {
             let count = match family {
                 HistoryFamily::Row => &mut counters.history.row_versions,
-                HistoryFamily::IndexRebuildInput => &mut counters.history.index_rebuild_inputs,
                 HistoryFamily::Graph => &mut counters.history.graph_versions,
                 HistoryFamily::ChangeLog => &mut counters.history.change_log_entries,
                 HistoryFamily::CommitIndex => &mut counters.history.commit_index_entries,

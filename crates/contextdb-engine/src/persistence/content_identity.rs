@@ -139,7 +139,6 @@ pub struct IdentitySpans {
 pub(crate) enum IdentitySpan {
     ReadAndDecode,
     BuildAndHash,
-    EncodeAndStore,
     CoalesceAndGroup,
 }
 
@@ -162,7 +161,6 @@ pub(crate) fn observe_identity_span(span: IdentitySpan, started: std::time::Inst
         let field = match span {
             IdentitySpan::ReadAndDecode => &mut current.read_and_decode_nanos,
             IdentitySpan::BuildAndHash => &mut current.build_and_hash_nanos,
-            IdentitySpan::EncodeAndStore => &mut current.encode_and_store_nanos,
             IdentitySpan::CoalesceAndGroup => &mut current.coalesce_and_group_nanos,
         };
         *field = field.saturating_add(nanos);
@@ -15181,7 +15179,6 @@ pub(crate) mod original_version_manifest {
     pub(crate) struct VersionManifest<'a> {
         pub(crate) table: &'a str,
         pub(crate) identity: [u8; 24],
-        pub(crate) deleted_tx: Option<TxId>,
         pub(crate) digest: [u8; 32],
     }
 
@@ -15231,7 +15228,6 @@ pub(crate) mod original_version_manifest {
         Ok(VersionManifest {
             table,
             identity,
-            deleted_tx,
             digest,
         })
     }

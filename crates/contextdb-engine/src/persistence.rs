@@ -725,7 +725,6 @@ pub(crate) struct ReadPersistenceImageParts {
     pub(crate) lazy_relational: bool,
     pub(crate) read_bounds: WriterRecoveryBounds,
     pub(crate) vector_entries: Vec<VectorEntry>,
-    pub(crate) raw_vector_memberships: Vec<VectorPartitionMembershipRecord>,
     pub(crate) current_vectors: HashMap<(VectorIndexRef, RowId), Vec<f32>>,
     pub(crate) sync_source_lsns: HashMap<(String, RowId), Lsn>,
     pub(crate) sync_source_kinds: HashMap<(String, RowId), SyncSourceKind>,
@@ -741,7 +740,6 @@ pub(crate) struct ReadPersistenceImageParts {
     pub(crate) sink_queue_extents: BTreeMap<String, SinkQueueExtent>,
     pub(crate) vector_generation_catalog: LoadedVectorPartitionGenerationCatalog,
     pub(crate) retained_source: RetainedReadSource,
-    pub(crate) source_path: PathBuf,
     pub(crate) store_file_bytes: Option<u64>,
     // Admission outlives every allocation carried by this image.
     pub(crate) memory: crate::read_image_memory::ImageMemoryHandle,
@@ -798,7 +796,6 @@ pub(crate) enum LoadReadImageErrorKind {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub(crate) enum LoadReadImageError {
     #[error("{}", std::ops::Deref::deref(.0))]
     Funded(contextdb_core::read_memory::ReadShared<LoadReadImageError>),

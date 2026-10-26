@@ -5636,10 +5636,6 @@ pub(super) struct OwnedQueuePreparation {
         VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
         OwnedMemoryReservation,
     )>,
-    retired: Option<(
-        VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
-        OwnedMemoryReservation,
-    )>,
 }
 impl OwnedEventBusHandle {
     #[expect(
@@ -5767,7 +5763,6 @@ impl OwnedEventBusHandle {
                 absent: false,
                 replace_ring: false,
                 replacement: None,
-                retired: None,
             });
         }
         loop {

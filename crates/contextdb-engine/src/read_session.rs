@@ -5445,9 +5445,6 @@ fn published_query_result(
                 )
                 .into_retained());
             }
-            FundedResultReceiveOutcome::Disconnected => {
-                return Err(Error::ReadFailure(owner_disconnected()));
-            }
         }
     }
     drop(responses);

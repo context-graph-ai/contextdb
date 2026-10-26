@@ -467,14 +467,10 @@ struct InMemoryReceivedSchemaManifestState {
 /// local only: it addresses the receiver's one ordered DDL log and generation
 /// sidecars, while `source_ordinal` remains part of the authenticated marker
 /// identity.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ReceivedSchemaOrderEntry {
     change: DdlChange,
-    source_ddl_lsn: Lsn,
-    source_ordinal: u32,
     persisted_ordinal: u32,
-    digest: Vec<u8>,
     generation: DurableDdlGenerationSidecar,
     local_arrival: DurableReceivedDdlArrival,
 }
@@ -750,7 +746,6 @@ type DdlGenerationValue = (Option<String>, Option<u64>);
 pub(crate) struct LocalSchemaStage {
     memory_history: Option<PreparedSchemaHistory>,
     relational: Vec<TableProjection>,
-    affected_tables: HashSet<String>,
     dag_edge_types: PreparedDagEdgeTypes,
     rank_formulas: HashMap<(String, String), Arc<RankFormula>>,
     vector: Option<contextdb_vector::PreparedVectorTablePublication>,
@@ -760,7 +755,6 @@ pub(crate) struct LocalSchemaStage {
     trigger: trigger::PreparedTriggerPublication,
     native_trigger: Option<trigger::OriginalPreparedTriggerPublication>,
     table_generations: Vec<(String, u64)>,
-    ddl_generations: Vec<(DdlGenerationKey, DdlGenerationValue)>,
     #[allow(
         dead_code,
         reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"

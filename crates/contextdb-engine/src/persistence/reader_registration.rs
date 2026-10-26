@@ -1859,7 +1859,6 @@ impl ReadPersistenceImage {
             lazy_relational: self.lazy_relational,
             read_bounds: self.read_bounds,
             vector_entries: self.vector_entries,
-            raw_vector_memberships: self.raw_vector_memberships,
             current_vectors: self.current_vectors,
             sync_source_lsns: self.sync_source_lsns,
             sync_source_kinds: self.sync_source_kinds,
@@ -1875,9 +1874,6 @@ impl ReadPersistenceImage {
             sink_queue_extents: self.sink_queue_extents,
             vector_generation_catalog: self.vector_generation_catalog,
             retained_source,
-            source_path: self
-                .source_path
-                .expect("a finished read image carries its released source path"),
             store_file_bytes: self.store_file_bytes,
         }
     }

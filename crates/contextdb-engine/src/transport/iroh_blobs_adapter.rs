@@ -78,12 +78,6 @@ pub(crate) enum FetchVerdict {
     SourceError(Error),
     Unentitled,
     PolicyForbidden,
-    /// Reserved for a future ledger-derived "does not exist" verdict; today
-    /// non-existence is decided independently of the ledger callback (the
-    /// blob door's own servable-set check), so this arm is never produced,
-    /// only matched (defense in depth if a caller starts producing it).
-    #[allow(dead_code)]
-    NotFound,
 }
 
 /// Why a fetch failed, in adapter-neutral terms the resolver maps onto its
@@ -2519,10 +2513,6 @@ where
         }
         FetchVerdict::PolicyForbidden => {
             let _ = send.reset(RESET_POLICY.into());
-            return Err(());
-        }
-        FetchVerdict::NotFound => {
-            let _ = send.reset(RESET_NOT_FOUND.into());
             return Err(());
         }
     };

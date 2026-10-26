@@ -1209,8 +1209,6 @@ pub(super) struct PrivateReplayContext<'a> {
 }
 pub(super) struct PrivateSyntheticTriggerFiring {
     pub(super) trigger_name: String,
-    pub(super) table: String,
-    pub(super) row_id: RowId,
     pub(super) lsn: Lsn,
     pub(super) tx: TxId,
 }
@@ -3078,8 +3076,6 @@ impl Database {
                 .synthetic_firings
                 .push(PrivateSyntheticTriggerFiring {
                     trigger_name: trigger_name.to_owned(),
-                    table: table.to_owned(),
-                    row_id: row,
                     lsn,
                     tx: state.canonical_tx,
                 });

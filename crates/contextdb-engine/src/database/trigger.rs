@@ -87,7 +87,6 @@ pub(crate) struct TriggerPersistenceCommit {
     pub(crate) config_values: Vec<(String, Vec<u8>)>,
     pub(crate) ddl: Vec<DdlChange>,
     pub(crate) generation_sidecars: Vec<super::DurableDdlGenerationSidecar>,
-    pub(crate) start_ordinal: u32,
 }
 
 /// Trigger declarations and encoded config prepared before the received
@@ -2675,7 +2674,6 @@ impl Database {
             config_values,
             ddl: ddl.to_vec(),
             generation_sidecars,
-            start_ordinal,
         };
         let memory_history = self.prepare_staged_memory_schema_history(
             lsn,
@@ -4787,7 +4785,6 @@ impl Database {
             RetiredOriginalTriggerState {
                 declarations: std::mem::replace(&mut *declarations, publication.declarations),
                 callbacks: std::mem::replace(&mut *callbacks, publication.callbacks),
-                names: std::mem::replace(&mut *names, publication.active_trigger_names),
                 _callback_original: callback_original.take(),
                 _original: original.replace(standing),
             }
@@ -5110,7 +5107,6 @@ impl Database {
             config_values,
             ddl: ddl.to_vec(),
             generation_sidecars,
-            start_ordinal,
         };
         let memory_history = self.prepare_staged_memory_schema_history(
             lsn,
@@ -5223,7 +5219,6 @@ impl TriggerState {
 struct RetiredOriginalTriggerState {
     declarations: BTreeMap<String, TriggerDeclaration>,
     callbacks: HashMap<String, TriggerCallback>,
-    names: Vec<String>,
     _callback_original: Option<OwnedMemoryReservation>,
     _original: Option<OwnedMemoryReservation>,
 }

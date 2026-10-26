@@ -3890,7 +3890,6 @@ impl Database {
             LocalSchemaStage {
                 memory_history,
                 relational,
-                affected_tables,
                 dag_edge_types,
                 rank_formulas,
                 vector,
@@ -3900,7 +3899,6 @@ impl Database {
                 trigger,
                 native_trigger,
                 table_generations: table_generation_updates.into_iter().collect(),
-                ddl_generations,
                 ddl_log,
                 memory_swap,
                 _temporary_memory: temporary_memory,

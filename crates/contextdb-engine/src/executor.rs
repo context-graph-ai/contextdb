@@ -17739,12 +17739,6 @@ pub(crate) struct GraphStartResolution {
     pub(crate) ids: Vec<uuid::Uuid>,
     pub(crate) predicates_pushed: smallvec::SmallVec<[Cow<'static, str>; 4]>,
     pub(crate) pinned: bool,
-    /// Rows this resolution read to find the starts. The eager route reports
-    /// them through the query-wide counter; a bounded read has no such counter
-    /// and puts them in its own trace, so the figure is returned as well as
-    /// bumped.
-    #[allow(dead_code)]
-    pub(crate) examined: u64,
 }
 
 fn graph_trace_shape(
@@ -17846,7 +17840,6 @@ where
             ids: Vec::new(),
             predicates_pushed,
             pinned: false,
-            examined,
         });
     };
     if let Some(ids) = resolve_graph_start_ids_from_filter(
@@ -17865,7 +17858,6 @@ where
             ids,
             predicates_pushed,
             pinned: true,
-            examined,
         });
     }
 
@@ -17875,7 +17867,6 @@ where
             ids: Vec::new(),
             predicates_pushed,
             pinned: false,
-            examined,
         });
     }
     if graph_start_filter_needs_unpinned_null_semantics(&start_filter, start_alias) {
@@ -17883,7 +17874,6 @@ where
             ids: Vec::new(),
             predicates_pushed,
             pinned: false,
-            examined,
         });
     }
     for column in &start_columns {
@@ -17941,7 +17931,6 @@ where
         ids,
         predicates_pushed,
         pinned: true,
-        examined,
     })
 }
 

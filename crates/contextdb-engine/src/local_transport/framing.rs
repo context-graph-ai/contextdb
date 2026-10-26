@@ -2151,7 +2151,6 @@ pub(crate) enum FundedResultReceiveOutcome {
     Published(FundedOrdinaryResult),
     Failed(Funded<contextdb_core::read_contract::ReadFailure>),
     EngineFailed(Funded<LocalEngineFailure>),
-    Disconnected,
 }
 
 #[expect(
@@ -2753,7 +2752,6 @@ impl OrdinaryResultReceiver {
             FundedResultReceiveOutcome::EngineFailed(failure) => {
                 ResultReceiveOutcome::EngineFailed(failure.into_public())
             }
-            FundedResultReceiveOutcome::Disconnected => ResultReceiveOutcome::Disconnected,
         })
     }
 

@@ -702,11 +702,6 @@ impl OwnerClient {
                             .into_retained(),
                         ));
                     }
-                    FundedResultReceiveOutcome::Disconnected => {
-                        return Err(OwnerReadScaffoldError::unimplemented(
-                            "ordinary terminal receiver disconnected without carrier EOF/HUP",
-                        ));
-                    }
                 }
             } else {
                 #[cfg(any(test, feature = "test-seams"))]
