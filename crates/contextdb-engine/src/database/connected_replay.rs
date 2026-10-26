@@ -3577,10 +3577,6 @@ impl Database {
     }
 }
 
-pub(super) struct PrivateGraphTargets {
-    pub(super) targets: Vec<NodeId>,
-    _owner: crate::memory_accounting::OwnedMemoryReservation,
-}
 impl Database {
     #[expect(
         clippy::result_large_err,
@@ -3602,57 +3598,6 @@ impl Database {
             }
             _ => Ok(None),
         }
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn private_graph_read_hides(&self, tx: TxId, edge: &AdjEntry) -> Result<bool> {
-        self.tx_mgr.with_write_set(tx, |ws| {
-            ws.adj_deletes.iter().any(|(source, kind, target, _)| {
-                *source == edge.source && *target == edge.target && kind == &edge.edge_type
-            }) || ws.adj_inserts.iter().any(|pending| {
-                pending.source == edge.source
-                    && pending.target == edge.target
-                    && pending.edge_type == edge.edge_type
-            })
-        })
-    }
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn private_graph_targets(
-        &self,
-        tx: TxId,
-        source: NodeId,
-        kind: &str,
-    ) -> Result<PrivateGraphTargets> {
-        let working = crate::persistence::received_working_source::WorkingReadSource::current_for(
-            self.tx_mgr.identity(),
-        )?
-        .ok_or_else(|| Error::Other("private graph count lost its source".into()))?;
-        working.with_original(|original| {
-            let frame = crate::persistence::OriginalPersistenceFrame::new(original)?;
-            let count = self.tx_mgr.with_write_set(tx, |ws| {
-                ws.adj_inserts
-                    .iter()
-                    .filter(|edge| edge.source == source && edge.edge_type == kind)
-                    .count()
-            })?;
-            frame.array::<NodeId>(count)?;
-            let targets = self.tx_mgr.with_write_set(tx, |ws| {
-                ws.adj_inserts
-                    .iter()
-                    .filter(|edge| edge.source == source && edge.edge_type == kind)
-                    .map(|edge| edge.target)
-                    .collect()
-            })?;
-            Ok(PrivateGraphTargets {
-                targets,
-                _owner: frame.into_reservation(),
-            })
-        })
     }
     #[expect(
         clippy::result_large_err,
