@@ -99,7 +99,13 @@ fn an_undeclared_writer_is_refused_typed_at_the_process_ceiling() {
 
 #[test]
 fn an_undeclared_writer_page_cache_fits_the_process_ceiling() {
-    const CEILING: usize = 32 * 1024 * 1024;
+    const CEILING: usize = 8 * 1024 * 1024;
+    // 12 MiB of vector bodies in commits of about 512 KiB, one and a half
+    // times the ceiling, then every row read back: the page cache sees more
+    // than the ceiling.
+    const COMMITS: i64 = 24;
+    const ROWS_PER_COMMIT: i64 = 340;
+    const _: () = assert!((COMMITS * ROWS_PER_COMMIT) as usize * 384 * 4 > CEILING);
     in_child(
         "an_undeclared_writer_page_cache_fits_the_process_ceiling",
         "cache",
@@ -107,27 +113,25 @@ fn an_undeclared_writer_page_cache_fits_the_process_ceiling() {
         |path| {
             let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
             let db = Database::open_with_options(path, undeclared())
-                .expect("an undeclared writer opens within a 32 MiB process ceiling");
+                .expect("an undeclared writer opens within an 8 MiB process ceiling");
             db.execute(
                 "CREATE TABLE points (id INT PRIMARY KEY, v VECTOR(384))",
                 &HashMap::new(),
             )
             .unwrap();
-            // 48 MiB of vector bodies in commits of about 1 MiB, then every
-            // row read back: the page cache sees more than the ceiling.
-            for commit in 0..48 {
-                insert(&db, commit * 680, 680).unwrap();
+            for commit in 0..COMMITS {
+                insert(&db, commit * ROWS_PER_COMMIT, ROWS_PER_COMMIT).unwrap();
             }
             let rows = db
                 .execute("SELECT id, v FROM points", &HashMap::new())
                 .unwrap()
                 .rows()
                 .len();
-            assert_eq!(rows, 48 * 680);
+            assert_eq!(rows, (COMMITS * ROWS_PER_COMMIT) as usize);
             let high_water = db.write_memory_high_water_for_test();
             let (configured, writer, process, ..) = db.writer_cache_for_test();
             eprintln!(
-                "undeclared writer under a 32 MiB ceiling: cache {configured} B, writer {writer} B, process residue {process} B, high water {high_water}"
+                "undeclared writer under an 8 MiB ceiling: cache {configured} B, writer {writer} B, process residue {process} B, high water {high_water}"
             );
             assert!(
                 configured <= CEILING / 16,
