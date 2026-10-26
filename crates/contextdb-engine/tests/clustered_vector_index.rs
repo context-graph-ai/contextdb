@@ -4,8 +4,8 @@
 //! snapshot isolation, deletes and PURGE, per-Context cost, exact and indexed
 //! work, per-depth coverage, the calibration source, the replacement switch,
 //! reader memory, small partitions, the removed graph options, the WITH
-//! policy carrier, damaged index pages, non-finite vectors, and the SQL
-//! declaration surface.
+//! policy carrier, damaged index pages, non-finite vectors, objective changes,
+//! retired legacy runs, and the SQL declaration surface.
 
 #![expect(
     clippy::result_large_err,
@@ -41,12 +41,16 @@ mod graph_option_refusal;
 mod index_corruption;
 #[path = "clustered_vector_index/non_finite_vectors.rs"]
 mod non_finite_vectors;
+#[path = "clustered_vector_index/objective_change.rs"]
+mod objective_change;
 #[path = "clustered_vector_index/parse_surface.rs"]
 mod parse_surface;
 #[path = "clustered_vector_index/per_context_cost.rs"]
 mod per_context_cost;
 #[path = "clustered_vector_index/reader_memory.rs"]
 mod reader_memory;
+#[path = "clustered_vector_index/retired_run_visibility.rs"]
+mod retired_run_visibility;
 #[path = "clustered_vector_index/small_partitions.rs"]
 mod small_partitions;
 #[path = "clustered_vector_index/snapshot_isolation.rs"]

@@ -708,6 +708,12 @@ pub fn delta_runs(
     unimplemented!("{UNBOUND}: sealed delta runs")
 }
 
+/// The legacy runs of the Context's replacement still to retire; zero
+/// outside the remap phase.
+pub fn legacy_runs(_db: &Database, _table: &str, _column: &str, _context: &[Value]) -> u64 {
+    unimplemented!("{UNBOUND}: legacy runs remaining")
+}
+
 /// Progress of assigning or remapping one Context's sealed runs to its
 /// serving codebook.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
