@@ -448,6 +448,18 @@ pub fn open_reader(_path: &Path) -> Database {
     unimplemented!("{UNBOUND}: a read-only session on a store")
 }
 
+/// Derived-page damage verifications (codebook and directory checks) this
+/// database handle or session has run since it opened.
+pub fn damage_verifications(_db: &Database) -> u64 {
+    unimplemented!("{UNBOUND}: damage verifications run")
+}
+
+/// Whether the Context's damage verdict is recorded in the store, as a
+/// writer persists it, rather than held live in this session's memory.
+pub fn verdict_recorded(_db: &Database, _table: &str, _column: &str, _context: &[Value]) -> bool {
+    unimplemented!("{UNBOUND}: whether the damage verdict is recorded")
+}
+
 /// The Context's row of `SHOW VECTOR_PARTITIONS`, as an operator reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionInspection {
