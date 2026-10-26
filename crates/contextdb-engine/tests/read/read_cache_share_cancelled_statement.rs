@@ -121,3 +121,50 @@ fn a_non_integer_unicode_share_keeps_a_valid_inspection_prefix() {
     assert!(!prefix.is_empty() && token.starts_with(prefix));
     assert_eq!(reader.options().read_cache_share, Some(40));
 }
+
+#[test]
+fn cache_inspection_and_mutation_keep_authoritative_erasure_after_turnover() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("erased-cache-setting.db");
+    let writer = Database::open(&path).unwrap();
+    for sql in [
+        "CREATE TABLE erased (id INTEGER PRIMARY KEY, payload TEXT)",
+        "INSERT INTO erased VALUES (1, 'secret')",
+    ] {
+        writer.execute(sql, &HashMap::new()).unwrap();
+    }
+    writer.close().unwrap();
+    let session = contextdb_engine::ReadSession::open(&path).unwrap();
+    session
+        .execute("SELECT payload FROM erased", &HashMap::new())
+        .unwrap();
+    let writer = Database::open(&path).unwrap();
+    writer
+        .execute(
+            "PURGE FROM erased WHERE payload = 'secret'",
+            &HashMap::new(),
+        )
+        .unwrap();
+    let inspected = session.read_cache_share_status().map(|_| ());
+    let changed = session.set_read_cache_share(Some(0));
+    let shown = session
+        .execute("SHOW READ_CACHE_SHARE", &HashMap::new())
+        .map(|_| ());
+    let assigned = session
+        .execute("SET READ_CACHE_SHARE 0", &HashMap::new())
+        .map(|_| ());
+    let declaration = session.options().read_cache_share;
+    drop(session);
+    writer.close().unwrap();
+    for result in [inspected, changed, shown, assigned] {
+        assert!(
+            matches!(result, Err(Error::ReadFailure(failure)) if failure.kind()
+                == contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure),
+            "cache inspection and mutation preserve the typed erasure refusal"
+        );
+    }
+    assert_eq!(
+        declaration, None,
+        "a route refusal keeps the previous policy"
+    );
+}
