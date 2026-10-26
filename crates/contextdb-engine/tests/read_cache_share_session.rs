@@ -324,3 +324,57 @@ fn a_session_keeps_its_declared_share_on_the_file_route_it_selects_when_its_writ
          declared 40% share: the first read {first} bytes, the repeat {repeated}"
     );
 }
+
+/// A file reader's page cache, the index prepaid to track it and its fixed
+/// source reservations together fit inside the session ceiling that bounds the
+/// reader's loaded state. This holds when the ceiling equals the read limit
+/// (16 MiB, 64 MiB) and when a 256 MiB ceiling sits above a 16 MiB or 64 MiB
+/// read limit, which bounds each read's working memory instead.
+#[test]
+fn a_readers_cache_and_its_index_fit_inside_its_session_ceiling() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("spendable.db");
+    seeded_writer(&path, 200).close().unwrap();
+    for (ceiling, read_limit) in [
+        (16 * MIB, 16 * MIB),
+        (64 * MIB, 64 * MIB),
+        (256 * MIB, 16 * MIB),
+        (256 * MIB, 64 * MIB),
+    ] {
+        let clock: Arc<dyn contextdb_core::read_contract::DeadlineClock> =
+            Arc::new(ManualDeadlineClock::default());
+        let session = ReadSession::open_with_observations_for_test(
+            &path,
+            ReadSessionOptions {
+                memory_limit: Some(ceiling),
+                limits: ReadLimits {
+                    memory: read_limit as u64,
+                    ..fixture::limits()
+                },
+                ..Default::default()
+            },
+            clock,
+            None,
+            None,
+        )
+        .unwrap_or_else(|refusal| {
+            panic!(
+                "a reader with a {ceiling}-byte ceiling and a {read_limit}-byte read limit must \
+                 open its file reader: {refusal:?}"
+            )
+        });
+        assert_eq!(session.route(), ReadRoute::File);
+        let status = session.read_cache_share_status();
+        let prepaid = status
+            .prepaid_index_bytes
+            .expect("an open file reader reports the index prepaid for its cache");
+        assert!(
+            status.effective_bytes + prepaid + status.fixed_reservation_bytes <= ceiling,
+            "a reader with a {ceiling}-byte ceiling and a {read_limit}-byte read limit may hold \
+             {ceiling} bytes of loaded state, but its cache ({}), prepaid index ({prepaid}) and \
+             fixed reservations ({}) need more",
+            status.effective_bytes,
+            status.fixed_reservation_bytes
+        );
+    }
+}

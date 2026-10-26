@@ -172,6 +172,9 @@ mod reader_operation_expiry_contract;
 #[path = "read/reader_proof_support.rs"]
 mod reader_proof_support;
 #[cfg(unix)]
+#[path = "read/a_small_read_limit_under_a_larger_session_ceiling_still_opens.rs"]
+mod a_small_read_limit_under_a_larger_session_ceiling_still_opens;
+#[cfg(unix)]
 #[path = "read/working_set_bounded_contract.rs"]
 mod working_set_bounded_contract;
 #[cfg(unix)]
