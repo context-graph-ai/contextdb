@@ -18,3 +18,5 @@ mod purging_an_edge_row_erases_exactly_its_own_graph_witness;
 mod sql_surface_other;
 #[path = "sql_surface/sql_surface_tests.rs"]
 mod sql_surface_tests;
+#[path = "sql_surface/the_same_edge_through_both_doors_is_one_edge.rs"]
+mod the_same_edge_through_both_doors_is_one_edge;
