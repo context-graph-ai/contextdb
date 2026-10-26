@@ -752,7 +752,15 @@ impl Database {
             .filter(|column| extra_identity_column(&column.name))
             .any(|column| {
                 column.default.as_deref().is_some_and(|default| {
-                    default.eq_ignore_ascii_case("NOW()") || default.contains("FunctionCall")
+                    // Match the stored literal encoding, not words inside a
+                    // text literal. Every non-constant expression stays distinct.
+                    !(default.starts_with("Literal(")
+                        || default.starts_with('\'') && default.ends_with('\'')
+                        || default.eq_ignore_ascii_case("NULL")
+                        || default.eq_ignore_ascii_case("TRUE")
+                        || default.eq_ignore_ascii_case("FALSE")
+                        || default.parse::<i64>().is_ok()
+                        || default.parse::<f64>().is_ok())
                 })
             })
         {

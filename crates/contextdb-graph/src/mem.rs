@@ -324,6 +324,10 @@ impl BoundedBfsCursor {
     /// Scalar consumers use the traversal merge without retaining its paths
     /// or a frontier proportional to the degree of the counted node.
     #[doc(hidden)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error retains inline refusal diagnostics without a failure-time allocation."
+    )]
     pub fn stream_single_hop_bindings(&mut self) -> Result<()> {
         self.preserve_single_hop_bindings()?;
         self.binding_only = true;

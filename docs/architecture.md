@@ -107,7 +107,7 @@ standalone triple aliases only the row whose extra identity columns equal their
 literal or NULL defaults. Other key values remain distinct; without a matching
 row, the standalone remains its own binding. A volatile default such as `NOW()`
 cannot name one row, so its standalone binding stays distinct.
-<!-- enforced by: one_edge_written_graph_door_first_reads_as_one_edge_through_every_door, one_edge_written_row_door_first_reads_as_one_edge_through_every_door, a_wider_key_sibling_of_an_edge_written_through_both_doors_stays_a_second_binding, a_graph_property_update_keeps_the_mixed_edge_visible_once_through_every_door, memory_file_and_principal_gated_views_agree_on_the_single_mixed_binding -->
+<!-- enforced by: one_edge_written_graph_door_first_reads_as_one_edge_through_every_door, one_edge_written_row_door_first_reads_as_one_edge_through_every_door, a_wider_key_sibling_of_an_edge_written_through_both_doors_stays_a_second_binding, a_graph_property_update_keeps_the_mixed_edge_visible_once_through_every_door, memory_file_and_principal_gated_views_agree_on_the_single_mixed_binding, a_volatile_default_in_a_wider_edge_key_keeps_the_graph_and_row_bindings_distinct -->
 
 ### Vector (`contextdb-vector`)
 

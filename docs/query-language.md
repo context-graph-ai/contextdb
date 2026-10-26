@@ -772,6 +772,12 @@ CREATE TABLE child (
 | `IMMUTABLE` | Column is audit-frozen — INSERT sets the value once; `UPDATE`, `ON CONFLICT DO UPDATE`, sync-apply mutations, and schema-altering DDL against the column are rejected with `Error::ImmutableColumn` |
 | `ACL REFERENCES table(col)` | Column carries the row's access-control id — a non-administrative handle reads the row only when its principal holds a matching grant; a handle with no grant-holding principal is refused the table with `Error::PrincipalRequired` |
 
+Declared column defaults apply to both SQL `INSERT` and `Database::insert_row`
+before constraint validation. Supplied values remain unchanged; an omitted
+`DEFAULT NULL` is stored as a NULL cell. `DEFAULT NOW()` is evaluated at insertion,
+and later reads and reopens keep that stored timestamp.
+<!-- enforced by: raw_row_inserts_apply_typed_literal_defaults_and_preserve_explicit_values, raw_row_inserts_store_null_defaults_and_preserve_explicit_values, raw_row_inserts_evaluate_now_once_and_preserve_explicit_timestamps -->
+
 ### Audit-Frozen Columns
 
 An audit-frozen column carries data that must not be silently rewritten by anyone, through any path. Declare it with `IMMUTABLE`:
