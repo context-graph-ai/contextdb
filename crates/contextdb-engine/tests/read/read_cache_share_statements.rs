@@ -7,11 +7,12 @@
 //! `SET READ_CACHE_SHARE = DEFAULT` returns to the cache derived from the
 //! budget. `SHOW READ_CACHE_SHARE` reports the declared value (`default` when
 //! none is declared) beside the effective cache size in bytes and as a
-//! percent. A declaration takes effect at the next statement boundary in both
-//! directions, is not persisted, and is not seen by any other session. A share
-//! above 100 is refused and leaves the previous declaration in place.
-//! Shrinking the share while a cursor is open does not disturb the cursor:
-//! it finishes every row at the snapshot it opened on.
+//! percent. A declaration takes effect immediately, in both directions: every
+//! statement after it reads under the new share. It is not persisted and is
+//! not seen by any other session. A share above 100 is refused and leaves the
+//! previous declaration in place. Shrinking the share while a cursor is open
+//! does not disturb the cursor: it keeps the pages it holds and finishes every
+//! row at the snapshot it opened on.
 
 use super::reader_proof_support as fixture;
 use contextdb_core::Value;
