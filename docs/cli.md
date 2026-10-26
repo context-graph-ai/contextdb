@@ -86,21 +86,24 @@ nothing else — never routing, limits, results, or exits.
 
 The first store-reading command resolves how this session reads (`.help`, `.trace`, `.quit`,
 `.exit`, `.sync status`, and `.owner status` never resolve a route). At route selection the CLI
-emits exactly one structured notice on stderr, and the route never changes within the session:
+emits a structured notice on stderr after that command. It emits another notice whenever the
+selected route or committed snapshot LSN changes; an unchanged selection is announced only once:
 <!-- enforced by: read_cli_journeys_session_shape::the_route_notice_is_emitted_once_on_stderr_at_the_first_store_reading_command, read_cli_journeys_session_shape::session_only_commands_never_resolve_a_route -->
 
 ```json
-{"notice":{"class":"io","message":"…","detail":{"kind":"read_route","route":"file","snapshot_at":"2026-08-16T09:30:12Z"}}}
+{"notice":{"class":"io","message":"…","detail":{"kind":"read_route","route":"file","snapshot_lsn":42,"snapshot_at":"2026-08-16T09:30:12Z"}}}
 ```
 
 `route` is `file` (a direct read of the committed snapshot) or `owner` (a live process owns the
 store and serves this session over its authenticated local channel — same commands, same
-shapes). On the file route `snapshot_at` states the committed-snapshot moment this session
-serves — a long-open read terminal is a snapshot, not a live view; on the owner route it is
-`null` (an owner serves live committed state). <!-- enforced by: read_cli_journeys_session_shape::the_route_notice_is_emitted_once_on_stderr_at_the_first_store_reading_command, read_cli_journeys_session_shape::session_only_commands_never_resolve_a_route --> If the owner
-disappears mid-session the statement fails with `owner_disconnected`, nothing of that result is
-published, and the session never silently falls back to the file; a new invocation routes
-afresh. <!-- enforced by: read_cli_journeys_live_owner::a_vanished_owner_fails_the_session_visibly_and_never_rereads_the_file, read_cli_journeys_live_owner::a_fresh_invocation_after_the_owner_leaves_reads_the_idle_file -->
+shapes). On the file route `snapshot_lsn` identifies the committed snapshot, and `snapshot_at`
+states when it was selected. The LSN names its committed read frontier. Both fields are
+`null` on the owner route, which serves live committed state.
+Later commands follow returning writers within the same store incarnation and announce their
+new selection. An already open cursor keeps the snapshot it captured. If a statement loses its
+owner while running and cannot continue, the statement fails visibly without publishing a
+partial result; later commands select the current route within their routing allowance.
+<!-- enforced by: read_cli_journeys_route_changes::a_reading_shell_reports_its_route_again_each_time_its_writer_leaves_or_returns -->
 
 Two liveness notices share the `--read-hydration-notice-ms` threshold (default 1 s), both on
 stderr so `--json` stdout stays pure: while the first read is still loading the store, a

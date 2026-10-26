@@ -913,25 +913,24 @@ pub(crate) fn events_status_body_document(
     })
 }
 
-/// The one notice that says HOW this session reads.
-///
-/// Emitted once, at the first store-reading command, and never again: the
-/// route is chosen once and does not change, so saying it twice would suggest
-/// it might have. `snapshot_at` is the committed moment a file-route session
-/// serves — a long-open reading terminal is a snapshot, not a live view — and
-/// is null on the owner route, where the owner serves live committed state and
-/// there is no single moment to report.
+/// Render the selected read route, committed file LSN and snapshot moment.
+/// The shell emits this after the first store read and when route or LSN changes.
+/// Owner reads serve live committed state and have no single snapshot moment.
 pub(crate) fn read_route_notice_document(
     route: ReadRoute,
     snapshot_at: Option<contextdb_core::Wallclock>,
+    snapshot_lsn: Option<contextdb_core::Lsn>,
 ) -> Value {
     let route_word = match route {
         ReadRoute::File => "file",
         ReadRoute::Owner => "owner",
     };
+    let lsn_detail = snapshot_lsn
+        .map(|lsn| format!(" (LSN {})", lsn.0))
+        .unwrap_or_default();
     let message = match snapshot_at {
         Some(instant) => format!(
-            "reading the committed snapshot taken at {}",
+            "reading the committed snapshot taken at {}{lsn_detail}",
             rfc3339_utc(instant.0)
         ),
         None => "reading through the live owner's local channel".to_owned(),
@@ -943,6 +942,7 @@ pub(crate) fn read_route_notice_document(
             "detail": {
                 "kind": "read_route",
                 "route": route_word,
+                "snapshot_lsn": snapshot_lsn.map(|lsn| lsn.0),
                 "snapshot_at": match snapshot_at {
                     Some(instant) => json!(rfc3339_utc(instant.0)),
                     None => Value::Null,

@@ -1408,9 +1408,13 @@ impl DirectFileReader {
             .original_reader_for_observation()
             .map(|owner| {
                 let identity = owner.accounting_identity();
-                let (constructed_identity, counter) = self.original_image_counter
+                let (constructed_identity, counter) = self
+                    .original_image_counter
                     .expect("actual typed open-child constructor receipt");
-                assert_eq!(identity, constructed_identity, "image accountant retains the actual open child");
+                assert_eq!(
+                    identity, constructed_identity,
+                    "image accountant retains the actual open child"
+                );
                 // The actual image accountant above pins this exact original
                 // owner; constructor captured its typed counter, no cast from
                 // arbitrary provider identity or observation-registry alias.
@@ -1478,6 +1482,11 @@ impl DirectFileReader {
 
     pub(crate) fn database_path(&self) -> &Path {
         self.retained_source.database_path()
+    }
+
+    /// The committed frontier decoded from this reader's retained image.
+    pub(crate) fn snapshot_lsn(&self) -> Lsn {
+        self.image.changes.current_lsn
     }
 
     pub(crate) fn database_identity(
@@ -1552,13 +1561,14 @@ impl DirectFileReader {
                     u64::try_from(limit).unwrap_or(u64::MAX)
                 }),
             )
-                .map_err(crate::read_image::history_answer_error)?;
+            .map_err(crate::read_image::history_answer_error)?;
         #[cfg(all(test, feature = "test-seams"))]
         let (open_child, original_image_counter) = declared_read_memory
             .child_with_physical_counter_for_test()
             .map_err(crate::read_image::history_answer_error)?;
         #[cfg(not(all(test, feature = "test-seams")))]
-        let open_child = declared_read_memory.child()
+        let open_child = declared_read_memory
+            .child()
             .map_err(crate::read_image::history_answer_error)?;
         let open_context = crate::executor::bounded::ReadOpenContext::new(
             open_child,
@@ -1576,9 +1586,14 @@ impl DirectFileReader {
             open_context,
         )
         .map_err(|error| error.into_direct_reader_error())?;
-        let reader = consume_released_persistence_load(load, config, declared_read_memory, observation)?;
+        let reader =
+            consume_released_persistence_load(load, config, declared_read_memory, observation)?;
         #[cfg(all(test, feature = "test-seams"))]
-        let reader = { let mut reader = reader; reader.original_image_counter = Some(original_image_counter); reader };
+        let reader = {
+            let mut reader = reader;
+            reader.original_image_counter = Some(original_image_counter);
+            reader
+        };
         Ok(reader)
     }
 

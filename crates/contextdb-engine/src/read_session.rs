@@ -3473,14 +3473,18 @@ impl ReadSession {
         }
     }
 
-    /// When the view this session reads was taken.
-    ///
-    /// A session that reads a committed file reads ONE image, taken at one
-    /// moment, and every answer it gives describes the store as it was then --
-    /// so a caller can say how old the answer is. A session talking to a live
-    /// owner has no such moment: the owner's state is still moving, and every
-    /// answer is as current as the instant it was asked, which is why there is
-    /// no instant to report rather than a made-up one.
+    /// The committed LSN of the currently selected file snapshot.
+    /// Live-owner reads have no fixed session-wide snapshot to report.
+    pub fn snapshot_lsn(&self) -> Option<contextdb_core::Lsn> {
+        match self.selected_state().as_ref() {
+            ReadSessionState::DirectFile(reader) => Some(reader.snapshot_lsn()),
+            ReadSessionState::LiveDatabase(_) | ReadSessionState::OwnerChannel(_) => None,
+        }
+    }
+
+    /// When the currently selected file image was taken.
+    /// Later operations can select a new image when the store's writer changes.
+    /// A live owner serves moving committed state and has no fixed moment.
     pub fn snapshot_at(&self) -> Option<contextdb_core::Wallclock> {
         self.state.read().expect("selected read route").snapshot_at
     }

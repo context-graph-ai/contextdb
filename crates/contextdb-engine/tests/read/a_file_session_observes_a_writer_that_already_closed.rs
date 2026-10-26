@@ -33,6 +33,7 @@ fn a_file_session_reads_a_commit_even_when_its_writer_closed_between_statements(
     );
     assert_eq!(session.route(), ReadRoute::File);
     let first_snapshot = session.snapshot_at().unwrap();
+    let first_lsn = session.snapshot_lsn().unwrap();
 
     let replacement = Database::open(&path).unwrap();
     replacement
@@ -49,6 +50,7 @@ fn a_file_session_reads_a_commit_even_when_its_writer_closed_between_statements(
     );
     assert_eq!(session.route(), ReadRoute::File);
     assert!(session.snapshot_at().unwrap() > first_snapshot);
+    assert!(session.snapshot_lsn().unwrap() > first_lsn);
 }
 
 #[test]

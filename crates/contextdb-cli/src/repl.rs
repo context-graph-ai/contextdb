@@ -9,7 +9,6 @@ use contextdb_core::read_contract::{
     OwnerReadCancellation, OwnerServingState, ReadFailure, ReadFailureDetail, ReadFailureKind,
     ReadFailureLimit, ReadLimits,
 };
-use contextdb_engine::vector_read_memory::DeclaredReadMemory;
 use contextdb_engine::{Database, MetadataBody, MetadataRequest, ReadCursor, ReadSession};
 use contextdb_server::exit_codes::{EXIT_ERROR, EXIT_INTERRUPTED_PUSH_UNCONFIRMED, EXIT_OK};
 use contextdb_server::{SyncClient, SyncPlugin};
@@ -346,9 +345,11 @@ pub struct SessionState {
     /// Where a running statement announces itself so an interrupt can reach
     /// it. `None` when nobody is at a terminal to press Ctrl-C.
     interrupts: Option<Arc<RunningStatement>>,
-    /// Whether this session has already said how it reads. The route is chosen
-    /// once and never changes, so saying it twice would suggest it might have.
-    route_reported: bool,
+    /// The last route and file snapshot announced after a store-reading command.
+    reported_read_route: Option<(
+        contextdb_core::read_contract::ReadRoute,
+        Option<contextdb_core::Lsn>,
+    )>,
     /// Whether this session has an open write transaction. The CLI issues
     /// every `BEGIN`/`COMMIT`/`ROLLBACK` itself, so it knows; a cursor may not
     /// open across one, because cursor state must never mix committed and
@@ -1573,22 +1574,19 @@ impl contextdb_engine::ReadProgressObserver for ReadProgressReporter {
     }
 }
 
-/// Say once, at the first store-reading command, HOW this session reads.
-///
-/// Only a session that CHOSE a route has one to report. A writing session is
-/// the owner: it reads its own live state in its own process, with no file-or-
-/// owner decision behind it and therefore nothing to announce. `.help`,
-/// `.trace`, `.quit`, `.exit`, `.sync status` and `.owner status` read no rows,
-/// so none of them reaches here.
+/// Announce a changed route or committed snapshot LSN after a store-reading command.
+/// Writing sessions have no selected file-or-owner route to report.
 fn note_read_route(session_handle: &Session, input: InputContext, session: &mut SessionState) {
-    if session.route_reported {
-        return;
-    }
     let Session::Reading { reader, .. } = session_handle else {
         return;
     };
-    session.route_reported = true;
-    let document = json_output::read_route_notice_document(reader.route(), reader.snapshot_at());
+    let selected = (reader.route(), reader.snapshot_lsn());
+    if session.reported_read_route == Some(selected) {
+        return;
+    }
+    session.reported_read_route = Some(selected);
+    let document =
+        json_output::read_route_notice_document(selected.0, reader.snapshot_at(), selected.1);
     if input.output.json {
         json_output::print_stderr_document(&document);
     } else if let Some(message) = document
@@ -1615,8 +1613,9 @@ fn answer_metadata(
     input: InputContext,
     session: &mut SessionState,
 ) -> MetaCommandOutcome {
+    let answer = session_handle.reader().metadata(request, continuation);
     note_read_route(session_handle, input, session);
-    match session_handle.reader().metadata(request, continuation) {
+    match answer {
         Ok(answer) => {
             publish_metadata(&answer, input);
             MetaCommandOutcome::done()
@@ -1636,21 +1635,22 @@ fn answer_maintenance_status(
     input: InputContext,
     session: &mut SessionState,
 ) -> MetaCommandOutcome {
-    note_read_route(session_handle, input, session);
-    let answer = match session_handle
+    let answer = session_handle
         .reader()
-        .metadata(MetadataRequest::MaintenanceStatus, None)
-    {
+        .metadata(MetadataRequest::MaintenanceStatus, None);
+    note_read_route(session_handle, input, session);
+    let answer = match answer {
         Ok(answer) => answer,
         Err(error) => {
             report_error(&error, input);
             return MetaCommandOutcome::failed();
         }
     };
-    let compaction = match session_handle
+    let compaction = session_handle
         .reader()
-        .execute("SHOW STORAGE_COMPACTION", &HashMap::new())
-    {
+        .execute("SHOW STORAGE_COMPACTION", &HashMap::new());
+    note_read_route(session_handle, input, session);
+    let compaction = match compaction {
         Ok(result) => result,
         Err(error) => {
             report_error(&error, input);
@@ -2026,11 +2026,11 @@ fn cursor_open(
         }
         Err(_) => return refuse_cursor(ReadFailureKind::CursorInvalidStatement, input),
     }
-    note_read_route(session_handle, input, session);
-    match session_handle
+    let opened = session_handle
         .reader()
-        .open_cursor(argument, &HashMap::new())
-    {
+        .open_cursor(argument, &HashMap::new());
+    note_read_route(session_handle, input, session);
+    match opened {
         Ok(cursor) => {
             let page = cursor.first_page().clone();
             session.cursor_statement =
@@ -3088,7 +3088,6 @@ fn execute_sql(
         return false;
     }
 
-    note_read_route(session_handle, input, session);
     let cancellation = OwnerReadCancellation::new();
     let executed = match session_handle.database() {
         // A write has one door, and it is the live database.
@@ -3114,6 +3113,7 @@ fn execute_sql(
         }
     };
 
+    note_read_route(session_handle, input, session);
     match executed {
         Ok(result) => {
             if let Some(database) = session_handle.database() {
