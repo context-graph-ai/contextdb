@@ -2640,7 +2640,10 @@ impl CompositeStore {
             self.vector.publish_prepared_partitioned_batch(
                 publication,
                 partition_mutations.commit_lsn,
-                Some(&*self.accountant),
+                // Owned insertion copies have allocation-scoped reservations.
+                // They never transfer a legacy per-insert raw-body debit, so
+                // publication must not refund one when it discards the copy.
+                None,
             );
         }
         let clear_source_lsns = std::mem::take(&mut prepared.clear_sources);
