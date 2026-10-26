@@ -4683,13 +4683,7 @@ mod original_failure_contract {
         // Compare actual travelling layouts with the scalar bootstrap plus the
         // minimum enum/pointer custody representation, including ABI padding.
         enum ScalarOrPointer {}
-        struct CompactCarrier {
-            #[allow(
-                dead_code,
-                reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
-            )]
-            diagnostic: ScalarOrPointer,
-        }
+        struct CompactCarrier {}
         assert_eq!(
             std::mem::size_of::<crate::funded_error::OriginalError>(),
             std::mem::size_of::<CompactCarrier>()
