@@ -447,8 +447,3 @@ pub(crate) fn note_membership_count_decode_for_test() {
 pub fn take_membership_count_decodes_for_test() -> (usize, usize) {
     MEMBERSHIP_COUNT_DECODES.with(|count| count.replace((0, 0)))
 }
-
-// Raw erasure observations stay inside the existing engine diagnostic surface.
-#[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]
-pub(crate) use crate::persistence::writer_source::cold_provider::physical_vector::{
-};
