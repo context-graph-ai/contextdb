@@ -9,17 +9,10 @@ use crate::transport::in_process::InProcessBroker;
 use crate::vector_read_memory::{DeclaredReadMemory, DeclaredReadRoot};
 use contextdb_core::Value;
 use contextdb_core::read_contract::ReadLimits;
-use std::time::Duration;
 
 const TENANT: &str = "pull-page-cut";
 const TABLE: &str = "embeddings";
 const DIM: usize = 768;
-
-async fn within<F: std::future::Future>(future: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(600), future)
-        .await
-        .expect("bounded in-process exchange")
-}
 
 /// Funds every hub request from its own fresh declared reader at the shipped
 /// default limit, and keeps each one, so a request's own peak is observable.
@@ -118,14 +111,19 @@ async fn pull_all(db: Arc<Database>) -> contextdb_core::Result<Pulled> {
         )
         .expect("hub"),
     );
-    let client = broker.client_as(&crate::identity::FabricIdentity::generate().node_id());
+    // Every exchange runs to completion with no deadline: the answer depends
+    // only on the work the hub completed and the memory it charged, and a hung
+    // exchange is the test runner's to terminate.
+    let client_node = crate::identity::FabricIdentity::generate().node_id();
     let shutdown = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn({
         let server = server.clone();
         let shutdown = shutdown.clone();
         async move { server.run_until(shutdown).await }
     });
-    within(broker.wait_for_registered_route_for_test(&pull_subject(TENANT))).await;
+    broker
+        .wait_for_registered_route_for_test(&pull_subject(TENANT))
+        .await;
     let mut pulled = Pulled {
         rows: 0,
         page_rows: Vec::new(),
@@ -147,15 +145,15 @@ async fn pull_all(db: Arc<Database>) -> contextdb_core::Result<Pulled> {
             },
         )
         .expect("encode pull");
-        let reply =
-            match within(client.request(&pull_subject(TENANT), bytes, Duration::from_secs(300)))
-                .await
-            {
-                Ok(reply) => reply,
-                Err(error) => {
-                    break Err(contextdb_core::Error::SyncError(error.to_string().into()));
-                }
-            };
+        let reply = match broker
+            .request_to_completion_for_test(&client_node, &pull_subject(TENANT), bytes)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                break Err(contextdb_core::Error::SyncError(error.to_string().into()));
+            }
+        };
         let envelope = decode(&reply).expect("decode reply");
         let response = match envelope.message_type {
             MessageType::PullResponse => {
@@ -193,7 +191,7 @@ async fn pull_all(db: Arc<Database>) -> contextdb_core::Result<Pulled> {
         assert!(pulled.pages < 10_000, "the pull makes progress");
     };
     shutdown.store(true, Ordering::SeqCst);
-    within(task).await.expect("hub stops");
+    task.await.expect("hub stops");
     outcome.map(|()| pulled)
 }
 

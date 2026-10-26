@@ -108,61 +108,78 @@ impl ClientTransport for InProcessClient {
         timeout: Duration,
     ) -> TransportFuture<'a, Vec<u8>> {
         Box::pin(async move {
-            let subject = subject.to_string();
-            let request_for_log = request_bytes.clone();
             let inner = self.inner.clone();
-            tokio::time::timeout(timeout, async move {
-                tokio::task::yield_now().await;
-                {
-                    let mut attempts = inner
-                        .request_attempts
-                        .lock()
-                        .unwrap_or_else(|err| err.into_inner());
-                    *attempts.entry(subject.clone()).or_default() += 1;
-                }
-                inner.request_attempted.notify_waiters();
-                let handler = {
-                    let routes = inner.routes.lock().unwrap_or_else(|err| err.into_inner());
-                    routes.get(&subject).cloned()
-                };
-                let Some(handler) = handler else {
-                    return Err(TransportError::NoResponder);
-                };
-
-                let (reply_tx, reply_rx) = oneshot::channel::<Vec<u8>>();
-                let responder: Responder = Box::new(move |response_bytes| {
-                    Box::pin(async move {
-                        let _ = reply_tx.send(response_bytes);
-                        Ok(())
-                    })
-                });
-
-                handler(IncomingRequest {
-                    bytes: request_bytes,
-                    responder,
-                    node_id: self.node_id.clone(),
-                })
-                .await?;
-
-                let response_bytes = reply_rx.await.map_err(|_| {
-                    TransportError::Other(("responder dropped without replying".to_string()).into())
-                })?;
-
-                inner
-                    .exchanges
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .push(RecordedExchange {
-                        subject,
-                        request_bytes: request_for_log,
-                        response_bytes: response_bytes.clone(),
-                    });
-                Ok(response_bytes)
-            })
+            tokio::time::timeout(
+                timeout,
+                exchange(
+                    inner,
+                    subject.to_string(),
+                    request_bytes,
+                    self.node_id.clone(),
+                ),
+            )
             .await
             .map_err(|_| TransportError::Timeout)?
         })
     }
+}
+
+/// One request through the served route, to completion: the route handler's
+/// reply, recorded as an exchange. A client's request bounds it by its
+/// deadline.
+async fn exchange(
+    inner: Arc<Inner>,
+    subject: String,
+    request_bytes: Vec<u8>,
+    node_id: Option<String>,
+) -> Result<Vec<u8>, TransportError> {
+    let request_for_log = request_bytes.clone();
+    tokio::task::yield_now().await;
+    {
+        let mut attempts = inner
+            .request_attempts
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *attempts.entry(subject.clone()).or_default() += 1;
+    }
+    inner.request_attempted.notify_waiters();
+    let handler = {
+        let routes = inner.routes.lock().unwrap_or_else(|err| err.into_inner());
+        routes.get(&subject).cloned()
+    };
+    let Some(handler) = handler else {
+        return Err(TransportError::NoResponder);
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel::<Vec<u8>>();
+    let responder: Responder = Box::new(move |response_bytes| {
+        Box::pin(async move {
+            let _ = reply_tx.send(response_bytes);
+            Ok(())
+        })
+    });
+
+    handler(IncomingRequest {
+        bytes: request_bytes,
+        responder,
+        node_id,
+    })
+    .await?;
+
+    let response_bytes = reply_rx.await.map_err(|_| {
+        TransportError::Other(("responder dropped without replying".to_string()).into())
+    })?;
+
+    inner
+        .exchanges
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(RecordedExchange {
+            subject,
+            request_bytes: request_for_log,
+            response_bytes: response_bytes.clone(),
+        });
+    Ok(response_bytes)
 }
 
 impl ServerTransport for InProcessServer {
@@ -340,6 +357,26 @@ impl InProcessBroker {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
+    }
+
+    /// Exchange one request with the served route as `node_id`, to completion
+    /// and with no deadline: a harness whose answer must depend only on
+    /// completed work uses it, and a hung exchange is left to the test runner.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub async fn request_to_completion_for_test(
+        &self,
+        node_id: &str,
+        subject: &str,
+        request_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, TransportError> {
+        exchange(
+            self.inner.clone(),
+            subject.to_string(),
+            request_bytes,
+            Some(node_id.to_string()),
+        )
+        .await
     }
 
     /// Wait until the serving side has installed `subject`. This is the
