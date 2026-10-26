@@ -379,6 +379,24 @@ pub(super) fn capture_reader_snapshot_registry(
     capture_reader_snapshot_registry_scanned(identity, runtime_dir, None)
 }
 
+/// Take a runtime root's serializer for a writer's reader inventory. Under
+/// this store's exclusive reader hold no reader of this store can be inside a
+/// join (a reader takes its shared hold byte before the serializer), so a
+/// contended serializer is another store's join or leave: it is neither waited
+/// for nor refused, and the inventory proceeds without it (`Ok(None)`).
+/// Without the hold, contention comes back as `WouldBlock`.
+#[cfg(target_os = "linux")]
+pub(super) fn serialize_runtime_root_for_inventory(
+    root: &Path,
+    hold: Option<&writer_file::ReaderAdmissionHold>,
+) -> std::io::Result<Option<RuntimeRootSerializer>> {
+    match serialize_runtime_root(root, true) {
+        Ok(serializer) => Ok(Some(serializer)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && hold.is_some() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn capture_reader_snapshot_registry_scanned(
     identity: (u64, u64),
@@ -391,9 +409,8 @@ pub(super) fn capture_reader_snapshot_registry_scanned(
     }
     let mut combined = Vec::new();
     for runtime in roots {
-        let _serializer = match serialize_runtime_root(runtime.root(), true) {
-            Ok(serializer) => Some(serializer),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && hold.is_some() => None,
+        let _serializer = match serialize_runtime_root_for_inventory(runtime.root(), hold) {
+            Ok(serializer) => serializer,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return ReaderSnapshotRegistry::Contended(runtime.path().to_path_buf());
             }

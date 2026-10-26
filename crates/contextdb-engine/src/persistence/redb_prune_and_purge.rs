@@ -1961,13 +1961,20 @@ impl RedbPersistence {
                 .database_identity;
             let mut fences = Vec::new();
             for runtime in runtimes {
+                // Under the audit's exclusive reader hold, another store's join
+                // or leave holding this root is neither waited for nor refused.
+                #[cfg(target_os = "linux")]
+                let serializer = serialize_runtime_root_for_inventory(
+                    runtime.root(),
+                    Some(physical.admission_hold()),
+                );
+                #[cfg(not(target_os = "linux"))]
+                let serializer = serialize_runtime_root(runtime.root(), true).map(Some);
                 let _serializer =
-                    serialize_runtime_root(runtime.root(), true).map_err(|error| {
-                        Error::ReaderCoordinationUnavailable {
-                            operation: "authoritative purge".to_owned(),
-                            path: runtime.path().display().to_string(),
-                            reason: error.to_string(),
-                        }
+                    serializer.map_err(|error| Error::ReaderCoordinationUnavailable {
+                        operation: "authoritative purge".to_owned(),
+                        path: runtime.path().display().to_string(),
+                        reason: error.to_string(),
                     })?;
                 let live_here =
                     match capture_reader_snapshot_registry_one(owner.identity(), &runtime) {

@@ -100,6 +100,14 @@ pub(super) struct ReaderAudit {
     _owner: Arc<LockedWriterFile>,
 }
 
+#[cfg(target_os = "linux")]
+impl ReaderAudit {
+    /// The exclusive reader hold this audit keeps for as long as it lives.
+    pub(super) fn admission_hold(&self) -> &ReaderAdmissionHold {
+        &self._hold
+    }
+}
+
 impl LockedWriterFile {
     /// The boot and exact data file this writer holds, for its published run.
     pub(super) fn boot_binding(&self) -> Option<super::WriterBootBinding> {
