@@ -846,23 +846,39 @@ pub(in crate::tree_store) fn hash128_from_windows<E>(
     for block in 0..blocks {
         for index in 0..stripes_per_block {
             read(block * block_len + index * STRIPE_LENGTH, &mut stripe)?;
-            accumulate_stripe_generic(&mut accumulators, &stripe,
-                &secret[index * SECRET_CONSUME_RATE..]);
+            accumulate_stripe_generic(
+                &mut accumulators,
+                &stripe,
+                &secret[index * SECRET_CONSUME_RATE..],
+            );
         }
         scramble_accumulators_generic(&mut accumulators, &secret[secret.len() - STRIPE_LENGTH..]);
     }
     let stripes = ((len - 1) - block_len * blocks) / STRIPE_LENGTH;
     for index in 0..stripes {
         read(blocks * block_len + index * STRIPE_LENGTH, &mut stripe)?;
-        accumulate_stripe_generic(&mut accumulators, &stripe,
-            &secret[index * SECRET_CONSUME_RATE..]);
+        accumulate_stripe_generic(
+            &mut accumulators,
+            &stripe,
+            &secret[index * SECRET_CONSUME_RATE..],
+        );
     }
     read(len - STRIPE_LENGTH, &mut stripe)?;
-    accumulate_stripe_generic(&mut accumulators, &stripe,
-        &secret[secret.len() - STRIPE_LENGTH - 7..]);
-    let low = merge_accumulators(accumulators, &secret[11..], PRIME64[0].wrapping_mul(len as u64));
-    let high = merge_accumulators(accumulators, &secret[secret.len() - 64 - 11..],
-        !(PRIME64[1].wrapping_mul(len as u64)));
+    accumulate_stripe_generic(
+        &mut accumulators,
+        &stripe,
+        &secret[secret.len() - STRIPE_LENGTH - 7..],
+    );
+    let low = merge_accumulators(
+        accumulators,
+        &secret[11..],
+        PRIME64[0].wrapping_mul(len as u64),
+    );
+    let high = merge_accumulators(
+        accumulators,
+        &secret[secret.len() - 64 - 11..],
+        !(PRIME64[1].wrapping_mul(len as u64)),
+    );
     Ok(((high as u128) << 64) | low as u128)
 }
 

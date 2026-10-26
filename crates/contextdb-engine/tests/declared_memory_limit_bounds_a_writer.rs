@@ -900,7 +900,8 @@ fn every_charge_a_row_takes_comes_back_when_the_row_does() {
             &HashMap::new(),
         )
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(full_rows.len(), ROWS);
     for (row, values) in full_rows.iter().enumerate() {
         assert_eq!(values[0], Value::Uuid(event_uuid(row)));
@@ -3482,7 +3483,8 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
         let mut rows = db
             .execute("SELECT author, seq FROM notes", &HashMap::new())
             .expect("read the table back")
-            .rows().to_vec();
+            .rows()
+            .to_vec();
         rows.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
         rows
     };

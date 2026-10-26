@@ -66,7 +66,11 @@ fn selected_historical_membership_and_body_reconcile_the_owning_row_once() {
             &HashMap::new(),
         )
         .unwrap();
-        db.execute("INSERT INTO after_snapshot_marker VALUES (1)", &HashMap::new()).unwrap();
+        db.execute(
+            "INSERT INTO after_snapshot_marker VALUES (1)",
+            &HashMap::new(),
+        )
+        .unwrap();
         let child = db.ordinary_read_child().unwrap();
         crate::executor::bounded::with_native_read_memory(child, |memory, _trace_refund| {
             let image = crate::read_image_memory::ImageMemory::new_direct_reader(None, memory.clone())?;
@@ -272,25 +276,49 @@ fn count_header_producer_skips_future_authenticated_malformed_json() {
 fn authenticated_json_count_fixture(malformed: bool, future: bool) {
     let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_700_000_000_000);
     let dir = tempfile::tempdir().unwrap();
-    let db = Database::open_with_options(dir.path().join("json-count.redb"), DatabaseOpenOptions {
-        maintenance_policy: MaintenancePolicy::CallerDriven, ..Default::default()
-    }).unwrap();
-    db.execute("CREATE TABLE count_json (id INTEGER PRIMARY KEY, doc JSON, v VECTOR(4)) HISTORY ALL", &HashMap::new()).unwrap();
-    db.execute("INSERT INTO count_json VALUES (1,$doc,$v)", &HashMap::from([
-        ("doc".into(), Value::Json(serde_json::json!({}))),
-        ("v".into(), Value::Vector(vec![1.0,0.0,0.0,0.0])),
-    ])).unwrap();
+    let db = Database::open_with_options(
+        dir.path().join("json-count.redb"),
+        DatabaseOpenOptions {
+            maintenance_policy: MaintenancePolicy::CallerDriven,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE count_json (id INTEGER PRIMARY KEY, doc JSON, v VECTOR(4)) HISTORY ALL",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO count_json VALUES (1,$doc,$v)",
+        &HashMap::from([
+            ("doc".into(), Value::Json(serde_json::json!({}))),
+            ("v".into(), Value::Vector(vec![1.0, 0.0, 0.0, 0.0])),
+        ]),
+    )
+    .unwrap();
     let snapshot = db.snapshot();
     if future {
-        db.execute("UPDATE count_json SET doc = $doc WHERE id = 1", &HashMap::from([
-            ("doc".into(), Value::Json(serde_json::json!({}))),
-        ])).unwrap();
+        db.execute(
+            "UPDATE count_json SET doc = $doc WHERE id = 1",
+            &HashMap::from([("doc".into(), Value::Json(serde_json::json!({})))]),
+        )
+        .unwrap();
     }
     if malformed {
-        db.persistence.as_ref().unwrap().malformed_count_json_for_test(db.accountant.clone(), "count_json", future).unwrap();
+        db.persistence
+            .as_ref()
+            .unwrap()
+            .malformed_count_json_for_test(db.accountant.clone(), "count_json", future)
+            .unwrap();
     }
-    db.execute("CREATE TABLE count_json_marker (id INTEGER PRIMARY KEY)", &HashMap::new()).unwrap();
-    db.execute("INSERT INTO count_json_marker VALUES (1)", &HashMap::new()).unwrap();
+    db.execute(
+        "CREATE TABLE count_json_marker (id INTEGER PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.execute("INSERT INTO count_json_marker VALUES (1)", &HashMap::new())
+        .unwrap();
     crate::executor::bounded::with_native_read_memory(db.ordinary_read_child().unwrap(), |memory, _trace_refund| {
         let image = crate::read_image_memory::ImageMemory::new_direct_reader(None, memory.clone())?;
         image.scope(|| {

@@ -704,7 +704,10 @@ fn mv02_pre_delete_reader_still_sees_row() {
         )
         .unwrap();
     assert_eq!(r_before.trace().physical_plan, "IndexScan");
-    assert_eq!(r_before.rows(), vec![vec![Value::Int64(9), Value::Int64(99)]]);
+    assert_eq!(
+        r_before.rows(),
+        vec![vec![Value::Int64(9), Value::Int64(99)]]
+    );
 
     let r_now = db
         .execute("SELECT a, b FROM t WHERE a = 9", &empty())
@@ -3535,7 +3538,8 @@ fn ord08_tie_break_row_id_ascending_cross_peer_byte_identical() {
         .execute("SELECT id, tag FROM t WHERE a = 7", &empty())
         .unwrap();
     assert_eq!(
-        r_a.rows(), r_b.rows(),
+        r_a.rows(),
+        r_b.rows(),
         "edge A and edge B must agree row-by-row"
     );
     // And both must match the insertion-order id sequence.

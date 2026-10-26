@@ -141,7 +141,8 @@ fn eager_execution_never_claims_to_elide_a_descending_sort_it_still_runs() {
         .find(|c| c.name == FK_INDEX)
     {
         assert_ne!(
-            fk.rejected_reason, ONE_ROW_REASON,
+            fk.rejected_reason,
+            ONE_ROW_REASON,
             "the eager executor picked whichever index it did honestly, having never claimed a \
              reverse elision it cannot deliver; its own considered-candidate reasons must not \
              say otherwise: {:?}",

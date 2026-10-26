@@ -235,7 +235,10 @@ impl NavigationCache {
             _ => None,
         }
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn row_at_point(
         &mut self,
         layer: usize,
@@ -862,7 +865,10 @@ struct OpenLayer<'a, 's> {
     supplied: Option<UnionSeedRows<'s>>,
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn check_point_origin(expected: Option<usize>, actual: usize) -> Result<()> {
     if expected.is_some_and(|expected| expected != actual) {
         return Err(Error::Other(
@@ -3481,7 +3487,8 @@ where
                             contextdb_core::find_attribution::inline_phases::Phase::IsAllowed,
                         );
                         is_allowed(layer.partition, *row_id)
-                    }; if res {
+                    };
+                    if res {
                         if ties.len() < kept_capacity {
                             ties.push((position, *row_id, None));
                         } else if let Some((worst, worst_id)) = ties
@@ -3571,7 +3578,8 @@ where
                                 &mut before_source_entry,
                                 &mut before_distance,
                             )
-                        }; match res {
+                        };
+                        match res {
                             Ok(score) => score,
                             Err(error) => {
                                 retained = Err(error);

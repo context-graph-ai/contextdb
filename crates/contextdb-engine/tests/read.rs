@@ -191,6 +191,9 @@ mod writing_handle_bounded_read_transaction_boundaries;
 #[path = "read/a_small_read_limit_under_a_larger_session_ceiling_still_opens.rs"]
 mod a_small_read_limit_under_a_larger_session_ceiling_still_opens;
 #[cfg(unix)]
+#[path = "read/read_cache_share_statements.rs"]
+mod read_cache_share_statements;
+#[cfg(unix)]
 #[path = "read/reader_continuity_contract.rs"]
 mod reader_continuity_contract;
 #[cfg(unix)]
@@ -205,9 +208,6 @@ mod reader_proof_support;
 #[cfg(unix)]
 #[path = "read/working_set_bounded_contract.rs"]
 mod working_set_bounded_contract;
-#[cfg(unix)]
-#[path = "read/read_cache_share_statements.rs"]
-mod read_cache_share_statements;
 
 #[path = "read/content_size_independent_contract.rs"]
 mod content_size_independent_contract;

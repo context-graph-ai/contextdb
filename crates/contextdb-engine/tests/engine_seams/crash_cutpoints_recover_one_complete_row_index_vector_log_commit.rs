@@ -170,11 +170,11 @@ fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
         .unwrap();
         let rows = {
             let fixture_answer_36 = recovered
-            .execute(
-                "SELECT id FROM atomic_items WHERE scope = 42 ORDER BY id",
-                &params,
-            )
-            .unwrap();
+                .execute(
+                    "SELECT id FROM atomic_items WHERE scope = 42 ORDER BY id",
+                    &params,
+                )
+                .unwrap();
             fixture_answer_36.rows().to_vec()
         };
         let old = vec![vec![Value::Int64(1)]];
@@ -259,7 +259,8 @@ fn crash_cutpoints_recover_one_complete_row_index_vector_log_commit() {
             .unwrap();
         assert_eq!(indexed.trace().index_used.as_deref(), Some("atomic_scope"));
         assert_eq!(
-            indexed.rows(), rows,
+            indexed.rows(),
+            rows,
             "{selected} physical index postings agree with the complete row state"
         );
         // Keep all cutpoint names tied to the real seam vocabulary.

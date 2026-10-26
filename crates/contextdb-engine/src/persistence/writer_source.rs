@@ -197,7 +197,10 @@ impl WriterSnapshotHandle {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn control_bytes(&self) -> usize {
         self.descriptor_control_bytes()
             .saturating_add(self.schema._memory.bytes())
@@ -1601,7 +1604,10 @@ impl WriterSnapshot {
         owner.reserve(bytes, "store_adapter")
     }
     #[cfg(any(test, feature = "test-seams"))]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn control_bytes(&self) -> usize {
         self._control
             .bytes()
@@ -1847,7 +1853,10 @@ impl WriterSnapshot {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1885,7 +1894,10 @@ impl WriterSnapshot {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_staged.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn exact_row(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -4499,11 +4511,14 @@ impl WriterSnapshotHandle {
             true,
             before,
             &mut |meta, bytes, header| {
-                let header = header.ok_or_else(|| Error::Other("authenticated row header is absent".into()))?;
+                let header = header
+                    .ok_or_else(|| Error::Other("authenticated row header is absent".into()))?;
                 if header.requires_owned_validation {
                     // This is the same decoder, schema validation and genuine
                     // selected-row image owner as the original full-row path.
-                    drop(RedbPersistence::decode_relational_source_row(table, meta, bytes)?);
+                    drop(RedbPersistence::decode_relational_source_row(
+                        table, meta, bytes,
+                    )?);
                 }
                 Ok(header)
             },

@@ -240,8 +240,8 @@ fn native_scan_value_allocates_nothing_and_its_node_keeps_original_invoices_thro
         counter,
     } = reader;
     let used = || {
-        unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
-            .load(AtomicOrdering::SeqCst) as usize
+        unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }.load(AtomicOrdering::SeqCst)
+            as usize
     };
     drop(scope);
     drop(allowance);
@@ -284,7 +284,10 @@ fn native_scan_value_needs_only_an_admission_and_entry_refusals_distinguish_node
                 redb::NativeColdReadError::AdmissionRefused
             ))
         ));
-        assert_eq!(count, 0, "a missing admission refuses before any allocation");
+        assert_eq!(
+            count, 0,
+            "a missing admission refuses before any allocation"
+        );
         reader.finish();
     }
     for receipt_denied in [false, true] {

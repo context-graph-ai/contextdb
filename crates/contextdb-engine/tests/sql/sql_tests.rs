@@ -970,7 +970,8 @@ fn test_insert_value_txid_beyond_watermark_rejected() {
     let rows = db
         .execute("SELECT * FROM t", &Default::default())
         .expect("SELECT must succeed")
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(rows.len(), 0, "rejected insert must not commit any row");
 }
 

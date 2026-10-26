@@ -627,8 +627,9 @@ pub(crate) fn native_u8_table_root(
 }
 
 #[cfg(feature = "contextdb-internal")]
-pub(crate) fn native_u64_bytes_table_root(data: &[u8])
-    -> std::result::Result<Option<BtreeHeader>, crate::NativeColdReadError> {
+pub(crate) fn native_u64_bytes_table_root(
+    data: &[u8],
+) -> std::result::Result<Option<BtreeHeader>, crate::NativeColdReadError> {
     native_fixed_u64_table_root_impl(data)
 }
 #[cfg(feature = "contextdb-internal")]

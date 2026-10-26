@@ -15,7 +15,9 @@ pub struct QueryResult {
 
 #[derive(Debug, Clone)]
 enum QueryResultInner {
-    Empty { rows_affected: u64 },
+    Empty {
+        rows_affected: u64,
+    },
     Shared(ReadShared<OwnedQueryResult>),
     /// Built by the application itself; application memory, never charged to a reader budget.
     Application(std::sync::Arc<QueryResultData>),

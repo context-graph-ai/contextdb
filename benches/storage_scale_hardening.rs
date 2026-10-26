@@ -219,7 +219,10 @@ fn insert_wide_rows_by_commit_size(db: &Database, rows_per_commit: usize) {
         start += batch;
     }
     let count = db.execute("SELECT COUNT(*) FROM t", &empty()).unwrap();
-    assert_eq!(count.rows(), vec![vec![Value::Int64(WIDE_TOTAL_ROWS as i64)]]);
+    assert_eq!(
+        count.rows(),
+        vec![vec![Value::Int64(WIDE_TOTAL_ROWS as i64)]]
+    );
 }
 
 fn bench_wide_batch_size_comparator(c: &mut Criterion) {

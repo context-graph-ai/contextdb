@@ -869,7 +869,8 @@ fn graph_targets(db: &Database, source: Uuid) -> BTreeSet<Uuid> {
         )
         .expect("traverse exact graph source");
     assert_eq!(
-        result.trace().physical_plan, "AdjacencyProbe",
+        result.trace().physical_plan,
+        "AdjacencyProbe",
         "graph proof must read the production adjacency index"
     );
     assert_eq!(
@@ -3970,7 +3971,8 @@ async fn shared_blob_purge_names_the_remaining_referent() {
         )
         .expect("authoritative purge selects the work-ledger referent");
     assert_eq!(
-        purge_result.rows_affected(), 1,
+        purge_result.rows_affected(),
+        1,
         "purge reports the one selected work-ledger referent"
     );
     let report =

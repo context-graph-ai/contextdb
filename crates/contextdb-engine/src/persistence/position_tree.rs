@@ -75,7 +75,10 @@ impl PositionTree {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(in crate::persistence) fn height(&self) -> u8 {
         self.height_of(self.root)
     }

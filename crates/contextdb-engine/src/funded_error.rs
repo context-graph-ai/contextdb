@@ -34,13 +34,22 @@ struct DiagnosticPayload {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OriginalStoragePhase {
-    #[allow(dead_code, reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build"
+    )]
     Database,
     Queue,
     ColdSource,
-    #[allow(dead_code, reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build"
+    )]
     ReceivedOuter,
-    #[allow(dead_code, reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build"
+    )]
     ReceivedBegin,
 }
 #[derive(Debug)]

@@ -101,7 +101,8 @@ fn sync_sent_counters(receipts: &[TransferReceipt]) -> TransferCounters {
 fn row(db: &Database, table: &str, id: Uuid) -> Option<VersionedRow> {
     let read_memory = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
         FIXTURE_READ_LIMIT,
-    ).expect("the declared read limit is admitted");
+    )
+    .expect("the declared read limit is admitted");
     db.point_lookup_with_read_memory_for_test(
         table,
         "id",
@@ -218,7 +219,8 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
     let fixture_read_memory =
         contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             FIXTURE_READ_LIMIT,
-        ).expect("the declared read limit is admitted");
+        )
+        .expect("the declared read limit is admitted");
     let (changes, arrivals) = edge
         .changes_since_with_arrivals_with_read_memory_for_test(
             source_before,
@@ -432,7 +434,8 @@ async fn oversized_dependency_unit_uses_the_authenticated_sync_fallback_and_comm
             hub_before,
             contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
                 FIXTURE_READ_LIMIT,
-            ).expect("the declared read limit is admitted")
+            )
+            .expect("the declared read limit is admitted")
             .child()
             .expect("admit the fixture change read"),
         )

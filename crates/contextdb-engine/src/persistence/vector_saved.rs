@@ -1464,7 +1464,10 @@ impl RedbPersistence {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from redb_vector_partitions.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(super) fn materialize_paged_topology_for_test(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         fn u64_into(bytes: &mut Vec<u8>, value: usize) {
             bytes.extend_from_slice(&(value as u64).to_le_bytes());

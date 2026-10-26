@@ -513,7 +513,10 @@ fn cwv_04_generality_plain_unique_fk() {
     );
 
     assert_eq!(
-        db.execute("SELECT id FROM c", &empty()).unwrap().rows().len(),
+        db.execute("SELECT id FROM c", &empty())
+            .unwrap()
+            .rows()
+            .len(),
         N as usize
     );
 }
@@ -1457,7 +1460,8 @@ fn cwv_08_conditional_stale_update_downgrades_to_noop() {
         )
         .unwrap();
     assert_eq!(
-        staged.rows_affected(), 1,
+        staged.rows_affected(),
+        1,
         "positive case: the stale writer matched at execution time"
     );
 
@@ -1468,7 +1472,8 @@ fn cwv_08_conditional_stale_update_downgrades_to_noop() {
         )
         .unwrap();
     assert_eq!(
-        winner.rows_affected(), 1,
+        winner.rows_affected(),
+        1,
         "positive case: concurrent winner updates the committed row"
     );
 

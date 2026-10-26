@@ -1209,9 +1209,15 @@ pub(super) struct PrivateReplayContext<'a> {
 }
 pub(super) struct PrivateSyntheticTriggerFiring {
     pub(super) trigger_name: String,
-    #[allow(dead_code, reason = "LAYOUT-ONLY: each retained firing is charged by this type's layout")]
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: each retained firing is charged by this type's layout"
+    )]
     pub(super) table: String,
-    #[allow(dead_code, reason = "LAYOUT-ONLY: each retained firing is charged by this type's layout")]
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: each retained firing is charged by this type's layout"
+    )]
     pub(super) row_id: RowId,
     pub(super) lsn: Lsn,
     pub(super) tx: TxId,

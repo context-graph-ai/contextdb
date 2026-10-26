@@ -457,7 +457,10 @@ fn at16_multiple_alters_in_sequence() {
 
     let first_idx = col_index(&result, "first").unwrap();
     let c_idx = col_index(&result, "c").unwrap();
-    assert_eq!(result.rows()[0][first_idx], Value::Text("alpha".to_string()));
+    assert_eq!(
+        result.rows()[0][first_idx],
+        Value::Text("alpha".to_string())
+    );
     assert_eq!(result.rows()[0][c_idx], Value::Null);
     for val in &result.rows()[0] {
         assert_ne!(

@@ -466,7 +466,10 @@ impl RedbPersistence {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from empty_declared_index_readiness_tests.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn load_relational_row_version(
         &self,
         table: &str,
@@ -3506,7 +3509,10 @@ impl RedbPersistence {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from prior_base_decode_tests.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn load_vector_partition_base_generation_with_expected_graph_bytes(
         &self,
         index: &VectorIndexRef,

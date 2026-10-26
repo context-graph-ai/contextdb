@@ -182,7 +182,8 @@ fn bodies(db: &Database) -> BTreeSet<String> {
         .position(|column| column == "body")
         .expect("the windows table has a body column");
     result
-        .rows().to_vec()
+        .rows()
+        .to_vec()
         .into_iter()
         .map(|row| match row.into_iter().nth(body_col) {
             Some(Value::Text(body)) => body,

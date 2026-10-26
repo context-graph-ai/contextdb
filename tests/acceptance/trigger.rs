@@ -1,5 +1,3 @@
-#[cfg(feature = "test-seams")]
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use super::common::{count_rows, empty_params};
 #[cfg(feature = "test-seams")]
 use contextdb_core::CallbackKind;
@@ -25,6 +23,13 @@ use contextdb_core::VectorIndexRef;
 #[cfg(feature = "test-seams")]
 use contextdb_core::VectorPartitionKey;
 use contextdb_core::VersionedRow;
+use contextdb_engine::Database;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::MaintenancePolicy;
+use contextdb_engine::TriggerAuditFilter;
+use contextdb_engine::TriggerAuditStatus;
+use contextdb_engine::TriggerAuditStatusFilter;
+use contextdb_engine::TriggerEvent;
 use contextdb_engine::sync_types::ChangeSet;
 use contextdb_engine::sync_types::DdlChange;
 #[cfg(feature = "test-seams")]
@@ -35,18 +40,8 @@ use contextdb_engine::sync_types::NaturalKey;
 use contextdb_engine::sync_types::RowChange;
 #[cfg(feature = "test-seams")]
 use contextdb_engine::sync_types::VectorChange;
-use contextdb_engine::Database;
 #[cfg(feature = "test-seams")]
-use contextdb_engine::MaintenancePolicy;
-use contextdb_engine::TriggerAuditFilter;
-use contextdb_engine::TriggerAuditStatus;
-use contextdb_engine::TriggerAuditStatusFilter;
-use contextdb_engine::TriggerEvent;
-use contextdb_server::protocol::WireChangeSet;
-#[cfg(feature = "test-seams")]
-use contextdb_server::protocol::WireDdlAuthor;
-use contextdb_server::protocol::WireDdlProvenance;
-use contextdb_server::protocol::canonical_ddl_provenance_digest;
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 #[cfg(feature = "test-seams")]
 use contextdb_server::FabricIdentity;
 #[cfg(feature = "test-seams")]
@@ -55,15 +50,20 @@ use contextdb_server::InProcessBroker;
 use contextdb_server::SyncClient;
 #[cfg(feature = "test-seams")]
 use contextdb_server::SyncServer;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use contextdb_server::protocol::WireChangeSet;
 #[cfg(feature = "test-seams")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use contextdb_server::protocol::WireDdlAuthor;
+use contextdb_server::protocol::WireDdlProvenance;
+use contextdb_server::protocol::canonical_ddl_provenance_digest;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(feature = "test-seams")]
 use std::sync::Barrier;
 use std::sync::Mutex;
+#[cfg(feature = "test-seams")]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;

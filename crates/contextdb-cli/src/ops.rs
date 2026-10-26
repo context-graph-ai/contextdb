@@ -58,7 +58,10 @@ where
 /// ever opening the caller-supplied path directly. The engine copies it into
 /// a private disposable copy first, opens only that copy, and exposes only
 /// bounded key/blob DTOs.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn run_inspect<F>(args: &[String], read_memory_factory: F) -> i32
 where
     F: FnOnce() -> contextdb_core::Result<(
@@ -594,7 +597,10 @@ fn run_reset(args: &[String]) -> i32 {
 /// snapshot restore already rely on -- including the standalone-edge-only
 /// refusal (`Error::PurgeRequiresAuthoritativeHub`) once a sync peer is
 /// configured.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn run_purge(args: &[String]) -> i32 {
     let Some(path_str) = positional_path(args) else {
         eprintln!("Error: purge requires a database path");

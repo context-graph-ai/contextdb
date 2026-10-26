@@ -42,7 +42,7 @@ pub use page_allocation::CacheReserveOwner;
 
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
-pub use cached_file::{CachePageForTest, CacheWriteForTest, CacheWriteControlForTest};
+pub use cached_file::{CachePageForTest, CacheWriteControlForTest, CacheWriteForTest};
 
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 #[doc(hidden)]

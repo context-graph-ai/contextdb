@@ -1,8 +1,8 @@
 #[rustfmt::skip]
 use contextdb_core::{ContextId, Error, Lsn, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
+use contextdb_engine::Database;
 #[cfg(feature = "test-seams")]
 use contextdb_engine::memory_accounting::MemoryAccountant;
-use contextdb_engine::Database;
 #[cfg(feature = "test-seams")]
 use contextdb_engine::sync_types as sync;
 use std::collections::{BTreeSet, HashMap};

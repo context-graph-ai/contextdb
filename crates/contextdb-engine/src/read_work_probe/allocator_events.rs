@@ -956,7 +956,10 @@ pub fn after_dealloc(token: FreeToken) {
     });
 }
 
-#[allow(dead_code, reason = "KEEP-SEAM: read by the statement child proof in unit tests and the test-seams build")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: read by the statement child proof in unit tests and the test-seams build"
+)]
 pub(crate) fn constructor_ordinal() -> usize {
     access(|state| {
         if state.pending_constructor {
@@ -967,7 +970,10 @@ pub(crate) fn constructor_ordinal() -> usize {
     })
     .unwrap_or(0)
 }
-#[allow(dead_code, reason = "KEEP-SEAM: read by the statement child proof in unit tests and the test-seams build")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: read by the statement child proof in unit tests and the test-seams build"
+)]
 pub(crate) fn constructor_request(
     before: usize,
     payload: usize,

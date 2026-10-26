@@ -247,7 +247,10 @@ pub struct ImageMemoryObservation {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     identity: usize,
 }
 #[cfg(any(test, feature = "test-seams"))]
@@ -287,7 +290,10 @@ impl ImageMemoryObservation {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn identity(self) -> usize {
         self.identity
     }
@@ -313,7 +319,10 @@ impl ImageMemoryObservation {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_allocation_oracle_tests.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn retained_payload_bytes(self) -> usize {
         crate::vector_read_memory::root_observations::producer_sample(self.image).2
     }

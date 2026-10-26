@@ -25,7 +25,6 @@ impl<'root> ColdCommittedProvider<'root> {
             read: root.owner_read()?,
         })
     }
-
 }
 
 impl ColdCommittedProvider<'_> {}

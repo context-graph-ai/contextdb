@@ -5636,7 +5636,10 @@ pub(super) struct OwnedQueuePreparation {
         VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
         OwnedMemoryReservation,
     )>,
-    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     retired: Option<(
         VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
         OwnedMemoryReservation,

@@ -610,12 +610,8 @@ fn measure_paged_scale(rows: usize) -> (PagedMeasurement, PagedMeasurement, usiz
         check(group, ids, "interleaved");
     }
     (
-        PagedMeasurement {
-            counters: control,
-        },
-        PagedMeasurement {
-            counters: walk,
-        },
+        PagedMeasurement { counters: control },
+        PagedMeasurement { counters: walk },
         displacements,
     )
 }

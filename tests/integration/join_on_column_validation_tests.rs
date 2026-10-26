@@ -195,7 +195,8 @@ fn join_on_valid_column_with_rows_still_works() {
             .execute(sql, &empty())
             .expect("three-table join resolves qualified columns from every input");
         assert_eq!(
-            joined.rows(), expected,
+            joined.rows(),
+            expected,
             "third-table WHERE excludes both low and high sequences without losing the second input's qualifier"
         );
     }

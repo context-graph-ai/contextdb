@@ -21,6 +21,10 @@ use std::process::Command;
 use std::process::Output;
 #[cfg(feature = "test-seams")]
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
+#[cfg(feature = "test-seams")]
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "test-seams")]
 use std::sync::atomic::AtomicU64;
@@ -28,10 +32,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::Arc;
-use std::sync::Mutex;
-#[cfg(feature = "test-seams")]
-use std::sync::Weak;
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "test-seams")]

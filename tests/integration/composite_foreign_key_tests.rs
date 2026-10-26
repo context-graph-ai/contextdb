@@ -533,7 +533,8 @@ fn cfk_update_rejects_missing_parent() {
     let rows = db
         .execute("SELECT c1, c2 FROM child WHERE id = 1", &p())
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(rows, vec![vec![Value::Int64(1), Value::Int64(2)]]);
     db.close().unwrap();
     assert_eq!(
@@ -717,7 +718,8 @@ fn cfk_parent_rewrite_new_tuple_child_matches_new() {
     let rows = db
         .execute("SELECT c1, c2 FROM child WHERE id = 1", &p())
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(rows, vec![vec![Value::Int64(3), Value::Int64(4)]]);
     db.close().unwrap();
     assert_eq!(

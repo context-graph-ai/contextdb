@@ -79,10 +79,7 @@ fn store_with_backlog_in(path: PathBuf, dir: Option<tempfile::TempDir>) -> Store
     churn(&db, 140);
     drop(cursor);
     drop(session);
-    Store {
-        _dir: dir,
-        db,
-    }
+    Store { _dir: dir, db }
 }
 
 fn store_with_backlog() -> Store {

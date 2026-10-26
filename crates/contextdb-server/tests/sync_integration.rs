@@ -1532,7 +1532,11 @@ fn sync_apply_accepts_peer_txid_beyond_local_watermark() {
     let result = edge_b
         .execute("SELECT x FROM t", &HashMap::new())
         .expect("SELECT must succeed");
-    assert_eq!(result.rows().len(), 1, "edge_b must have exactly 1 row in t");
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "edge_b must have exactly 1 row in t"
+    );
     let x_idx = result
         .columns()
         .iter()
@@ -1631,7 +1635,8 @@ fn sync_apply_rejects_peer_txid_u64_max() {
     let count_rows = db
         .execute("SELECT COUNT(*) FROM t", &HashMap::new())
         .expect("SELECT COUNT(*) must succeed")
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(count_rows.len(), 1);
     assert_eq!(
         count_rows[0][0],
@@ -1721,7 +1726,8 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
     let count_rows = db
         .execute("SELECT COUNT(*) FROM t", &HashMap::new())
         .expect("SELECT COUNT(*) must succeed")
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(count_rows.len(), 1);
     assert_eq!(
         count_rows[0][0],
@@ -1742,7 +1748,8 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
     let first_rows = db
         .execute("SELECT x FROM t WHERE pk = $pk", &params_first)
         .expect("SELECT x WHERE pk = first must succeed")
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(
         first_rows.len(),
         1,
@@ -1759,7 +1766,8 @@ fn sync_apply_row_count_preserved_across_txid_boundary() {
     let last_rows = db
         .execute("SELECT x FROM t WHERE pk = $pk", &params_last)
         .expect("SELECT x WHERE pk = last must succeed")
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(
         last_rows.len(),
         1,

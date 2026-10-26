@@ -2,10 +2,10 @@ use super::common::*;
 #[cfg(feature = "test-seams")]
 use contextdb_core::Error;
 use contextdb_core::Value;
-use contextdb_engine::cli_render::render_explain;
 use contextdb_engine::Database;
 #[cfg(feature = "test-seams")]
 use contextdb_engine::QueryResult;
+use contextdb_engine::cli_render::render_explain;
 #[cfg(feature = "test-seams")]
 use std::panic::AssertUnwindSafe;
 #[cfg(feature = "test-seams")]

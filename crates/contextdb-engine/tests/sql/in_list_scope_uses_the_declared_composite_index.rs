@@ -402,7 +402,10 @@ fn assert_active_plan(result: &contextdb_engine::QueryResult) {
             .iter()
             .find(|candidate| candidate.name == longer)
             .unwrap_or_else(|| {
-                panic!("trace omitted competing index {longer}: {:?}", result.trace())
+                panic!(
+                    "trace omitted competing index {longer}: {:?}",
+                    result.trace()
+                )
             });
         assert!(
             candidate.rejected_reason.contains("whole-key coverage"),

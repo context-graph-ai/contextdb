@@ -14,13 +14,13 @@ use contextdb_core::{
     types::{EdgeType, NodeId},
 };
 #[cfg(feature = "test-seams")]
-use contextdb_engine::memory_accounting::MemoryAccountant;
-#[cfg(feature = "test-seams")]
-use contextdb_engine::plugin::DatabasePlugin;
-#[cfg(feature = "test-seams")]
 use contextdb_engine::CronAuditKind;
 use contextdb_engine::Database;
 use contextdb_engine::QueryResult;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::memory_accounting::MemoryAccountant;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::plugin::DatabasePlugin;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};

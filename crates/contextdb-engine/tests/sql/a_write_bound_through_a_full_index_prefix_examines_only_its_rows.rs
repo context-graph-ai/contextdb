@@ -171,7 +171,9 @@ fn the_same_where_in_a_select_examines_only_its_rows() {
             .expect("select one session");
         eprintln!(
             "write_through_index select rows={rows} plan={} index={:?} examined={}",
-            result.trace().physical_plan, result.trace().index_used, result.trace().rows_examined
+            result.trace().physical_plan,
+            result.trace().index_used,
+            result.trace().rows_examined
         );
         assert_eq!(result.rows().len(), ROWS_PER_SESSION as usize);
         assert_eq!(result.trace().index_used.as_deref(), Some("p_session_idx"));

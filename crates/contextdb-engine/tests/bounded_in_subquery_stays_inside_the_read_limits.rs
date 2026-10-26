@@ -366,7 +366,8 @@ fn a_filter_that_reads_a_whole_table_is_bounded_by_the_ceiling_that_covers_it() 
         .execute(OUTER, &empty())
         .expect("a bounded read answers when nothing is tightened");
     assert_eq!(
-        unbounded.trace().rows_examined, really_examined,
+        unbounded.trace().rows_examined,
+        really_examined,
         "a bounded read does the same work getting to this answer that the executor does, so \
          what its ceilings bound is the inner scan: the executor examined {really_examined} and \
          it examined {}",

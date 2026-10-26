@@ -75,7 +75,8 @@ fn insert_child(db: &Database, id: Uuid, parent_id: Uuid) {
 fn row(db: &Database, table: &str, id: Uuid) -> Option<VersionedRow> {
     let fixture_read = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
         512 * 1024 * 1024,
-    ).expect("the declared read limit is admitted");
+    )
+    .expect("the declared read limit is admitted");
     db.point_lookup_with_read_memory_for_test(
         table,
         "id",
@@ -295,7 +296,8 @@ async fn a_push_under_a_tight_read_budget_delivers_its_oversized_unit_and_record
     let client = SyncClient::new(edge.clone(), &dial_spec, TenantId::from(TENANT))
         .expect("construct reopened SyncClient");
     let tight =
-        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(READ_LIMIT).expect("the declared read limit is admitted");
+        contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(READ_LIMIT)
+            .expect("the declared read limit is admitted");
     let pushed = client
         .push_with_read_memory(tight.child().expect("tight read budget"))
         .await;

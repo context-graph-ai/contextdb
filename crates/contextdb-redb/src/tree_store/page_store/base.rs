@@ -189,7 +189,9 @@ pub struct PageImpl {
 
 impl PageImpl {
     #[cfg(feature = "test-seams")]
-    pub(crate) fn memory_for_test(&self) -> &PageMemory { &self.mem }
+    pub(crate) fn memory_for_test(&self) -> &PageMemory {
+        &self.mem
+    }
 
     pub(crate) fn to_arc(&self) -> PageMemory {
         self.mem.clone()

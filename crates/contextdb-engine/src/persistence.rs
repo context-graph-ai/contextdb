@@ -371,7 +371,10 @@ pub(crate) struct OwnerCursorStoragePin {
 /// A failed nonblocking pin attempt retains the typed refusal and whether
 /// admission can safely retry after releasing the engine commit boundary.
 pub(crate) enum OwnerCursorPinAdmissionError {
-    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     Busy(Error),
     Refused(Error),
 }
@@ -718,7 +721,10 @@ pub(crate) struct ReadPersistenceImageParts {
         )
     )]
     pub(crate) vector_entries: Vec<VectorEntry>,
-    #[allow(dead_code, reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun")]
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun"
+    )]
     pub(crate) raw_vector_memberships: Vec<VectorPartitionMembershipRecord>,
     #[cfg_attr(
         not(feature = "test-seams"),
@@ -756,7 +762,10 @@ pub(crate) struct ReadPersistenceImageParts {
     pub(crate) sink_queue_extents: BTreeMap<String, SinkQueueExtent>,
     pub(crate) vector_generation_catalog: LoadedVectorPartitionGenerationCatalog,
     pub(crate) retained_source: RetainedReadSource,
-    #[allow(dead_code, reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun")]
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun"
+    )]
     pub(crate) source_path: PathBuf,
     pub(crate) store_file_bytes: Option<u64>,
     // Admission outlives every allocation carried by this image.
@@ -902,7 +911,10 @@ struct ReaderBreadcrumbGuard {
 struct ReaderSnapshotFileGuard {
     file: Option<File>,
     path: PathBuf,
-    #[allow(dead_code, reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun")]
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun"
+    )]
     metadata: std::fs::Metadata,
     registry_lock: ReaderSnapshotRegistryLock,
     nonblocking_teardown: bool,
@@ -1341,13 +1353,25 @@ struct PayloadDecodeDiagnostic(Error);
 enum InspectedVectorPartitionComponent<'a> {
     Uuid(uuid::Uuid),
     Text(#[serde(borrow)] &'a str),
-    #[allow(dead_code, reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format")]
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format"
+    )]
     Integer(i64),
-    #[allow(dead_code, reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format")]
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format"
+    )]
     Boolean(bool),
-    #[allow(dead_code, reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format")]
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format"
+    )]
     Timestamp(i64),
-    #[allow(dead_code, reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format")]
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format"
+    )]
     TxId(TxId),
 }
 

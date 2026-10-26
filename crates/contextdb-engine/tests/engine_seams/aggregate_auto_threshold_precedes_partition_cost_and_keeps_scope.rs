@@ -92,7 +92,8 @@ fn aggregate_auto_threshold_precedes_partition_cost_and_keeps_scope() {
             });
             let automatic = automatic.unwrap();
             assert_eq!(
-                automatic.rows(), exact.rows(),
+                automatic.rows(),
+                exact.rows(),
                 "automatic planning preserves complete scope, ties and global order at total={total}, sizes={sizes:?}"
             );
             let disclosure = automatic

@@ -190,7 +190,8 @@ fn count_rows(db: &Database, table: &str) -> i64 {
     let rows = db
         .execute(&format!("SELECT COUNT(*) FROM {table}"), &empty())
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     match rows.first().and_then(|row| row.first()) {
         Some(Value::Int64(n)) => *n,
         other => panic!("expected COUNT(*) Int64, got {other:?}"),
@@ -1128,11 +1129,13 @@ fn ssh_c1_explicit_tx_parity() {
     let auto = db
         .execute("SELECT id, col FROM t_auto ORDER BY col ASC", &empty())
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     let in_tx = db
         .execute("SELECT id, col FROM t_tx ORDER BY col ASC", &empty())
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(auto, in_tx);
 }
 
@@ -1381,7 +1384,8 @@ fn ssh_c4_row_order_stable() {
                 &empty(),
             )
             .unwrap()
-            .rows().to_vec();
+            .rows()
+            .to_vec();
         db.close().unwrap();
     }
     let reopened = Database::open(&path).unwrap();
@@ -1391,7 +1395,8 @@ fn ssh_c4_row_order_stable() {
             &empty(),
         )
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(after, before);
 }
 
@@ -1529,7 +1534,8 @@ fn ssh_c4_winner_stable() {
                 &empty(),
             )
             .unwrap()
-            .trace().clone();
+            .trace()
+            .clone();
         db.close().unwrap();
     }
     let reopened = Database::open(&path).unwrap();
@@ -1539,7 +1545,8 @@ fn ssh_c4_winner_stable() {
             &empty(),
         )
         .unwrap()
-        .trace().clone();
+        .trace()
+        .clone();
     assert_eq!(before.index_used, after.index_used);
     assert_eq!(after.index_used.as_deref(), Some("idx_c"));
     assert_eq!(before.predicates_pushed, after.predicates_pushed);

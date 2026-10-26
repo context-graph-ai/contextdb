@@ -114,7 +114,8 @@ fn every_row_write_is_refused(ddl: &str) {
             let before_rows = db
                 .execute("SELECT * FROM mixed_rows ORDER BY id", &empty())
                 .unwrap()
-                .rows().to_vec();
+                .rows()
+                .to_vec();
             let before_changes = db
                 .changes_since(contextdb_core::Lsn(0))
                 .expect("read the declared changes");

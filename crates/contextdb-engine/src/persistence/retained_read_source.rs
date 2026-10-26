@@ -3489,7 +3489,10 @@ impl RetainedReadSource {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from content_identity.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn resident_proof_chunk_ceiling_for_test(&self) -> usize {
         self.content_identity
             .resident_proof_chunk_ceiling_for_test()
@@ -3542,7 +3545,10 @@ impl RetainedReadSource {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn evict_resident_proof_chunks_for_test(&self) -> usize {
         let evicted = self.content_identity.evict_resident_proof_chunks_for_test();
         self.clear_statement_proofs();
@@ -3584,7 +3590,10 @@ impl RetainedReadSource {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn evict_record_witnesses_for_test(&self) -> usize {
         self.content_identity.evict_record_witnesses_for_test()
     }
@@ -4607,7 +4616,10 @@ impl RetainedReadSource {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(super) fn row_by_id_in_read(
         &self,
         read: &redb::ReadTransaction,
@@ -4723,7 +4735,10 @@ impl RetainedReadSource {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(super) fn row_identity_by_id_in_read(
         &self,
         read: &redb::ReadTransaction,
@@ -6179,7 +6194,10 @@ impl RetainedReadSource {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn bounded_relational_ordered_next<E>(
         &self,
         table: &str,

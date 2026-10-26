@@ -60,13 +60,19 @@ pub const CREATE_WORK_NODE_CONTACTS: &str = "CREATE TABLE work_node_contacts (\
 /// safe to call at every hub open and on every recorded contact. A root
 /// created before this table declared `HISTORY CURRENT ONLY SYNC OFF` is
 /// reconciled via the same `ALTER TABLE` an operator would type.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn install_node_contacts_schema(db: &contextdb_engine::Database) -> Result<(), Error> {
     let read_memory = db.declared_reader_memory()?;
     install_node_contacts_schema_with_read_memory(db, read_memory)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn install_node_contacts_schema_with_read_memory(
     db: &contextdb_engine::Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -113,7 +119,10 @@ pub fn install_node_contacts_schema_with_read_memory(
 /// registry carries the present contact time, not a history of contacts); it
 /// is the named exception to the ledger's append-only guard, alongside the
 /// capability registry. Never synced to edges.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn record_node_contact(
     db: &contextdb_engine::Database,
     node_id: &str,
@@ -123,7 +132,10 @@ pub fn record_node_contact(
     record_node_contact_with_read_memory(db, read_memory, node_id, now_ms)
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub fn record_node_contact_with_read_memory(
     db: &contextdb_engine::Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -374,7 +386,10 @@ pub async fn claim_job_with_read_memory(
 /// failures into a terminal `Failed` verdict only at the attempt ceiling) —
 /// the defer-own-submission rule needs "has this job EVER failed an
 /// attempt", regardless of how many attempts remain.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn job_has_failure_rows(
     db: &contextdb_engine::Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -397,7 +412,10 @@ fn job_has_failure_rows(
 /// the job carries a future deadline (no deadline means never deferred),
 /// that deadline has not yet passed, and no attempt has failed yet (a
 /// failure releases the job for immediate self-reclaim, deadline or not).
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn defers_own_submission(
     db: &contextdb_engine::Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -427,7 +445,10 @@ fn defers_own_submission(
 /// per-byte codec) — that helper is private to `contextdb_engine`, so a
 /// caller assembling bytes alongside a resolved `blob_ref` input reads the
 /// table directly and decodes with the identical convention.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn decode_hex_payload(encoded: &str) -> Result<Vec<u8>, Error> {
     if !encoded.len().is_multiple_of(2) {
         return Err(Error::Other(
@@ -460,7 +481,10 @@ fn decode_hex_payload(encoded: &str) -> Result<Vec<u8>, Error> {
 /// mixed job — [`ledger::materialize_inputs`] refuses the whole job the
 /// instant ANY input is a `blob_ref`, so a mixed job's ledger-carried bytes
 /// must be read directly.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn read_ledger_input_rows(
     db: &contextdb_engine::Database,
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -908,7 +932,10 @@ fn is_offline_sync_error(error: &Error) -> bool {
     matches!(error, Error::SyncError(_))
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn tolerate_offline_sync(
     result: Result<contextdb_engine::sync_types::ApplyResult, Error>,
 ) -> Result<(), Error> {

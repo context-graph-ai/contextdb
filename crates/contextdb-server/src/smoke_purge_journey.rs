@@ -250,7 +250,8 @@ fn export_key(
     let inspection_memory =
         contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             db.owner_read_config().limits.limits.memory,
-        ).map_err(|error| error.to_string())?;
+        )
+        .map_err(|error| error.to_string())?;
     let inspection_read = inspection_memory
         .child()
         .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
@@ -269,7 +270,8 @@ fn export_blob(db: &Database, artifact: &Path, hash: &BlobHash) -> Result<BlobIn
     let inspection_memory =
         contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             db.owner_read_config().limits.limits.memory,
-        ).map_err(|error| error.to_string())?;
+        )
+        .map_err(|error| error.to_string())?;
     let inspection_read = inspection_memory
         .child()
         .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
@@ -707,7 +709,8 @@ async fn run_copy_erasure(root: &Path) -> Result<(), String> {
     let inspection_memory =
         contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             hub.db.owner_read_config().limits.limits.memory,
-        ).map_err(|error| error.to_string())?;
+        )
+        .map_err(|error| error.to_string())?;
     let inspection_read = inspection_memory
         .child()
         .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;
@@ -945,7 +948,8 @@ fn sync_state(db: &Database, artifact: &Path) -> Result<JsonValue, String> {
     let inspection_memory =
         contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             db.owner_read_config().limits.limits.memory,
-        ).map_err(|error| error.to_string())?;
+        )
+        .map_err(|error| error.to_string())?;
     let inspection_read = inspection_memory
         .child()
         .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;

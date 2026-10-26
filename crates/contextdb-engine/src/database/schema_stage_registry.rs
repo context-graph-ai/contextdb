@@ -2143,7 +2143,10 @@ fn family_refusal_literals_for_test() {
 // fields have the same pointer layout under the selected private wrappers.
 // It pins only the registry migration; every other field takes its current
 // type, so `tx_mgr` follows the transaction host Database now holds.
-#[allow(dead_code, reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges")]
+#[allow(
+    dead_code,
+    reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
+)]
 struct Pre2Database {
     /// This handle's identity, never an address. Every handle gets its own,
     /// including one derived by narrowing another's access, exactly as each
@@ -2476,7 +2479,10 @@ struct Pre2Database {
     /// independently opened database, and present only for test observation.
     #[cfg(any(test, feature = "test-seams"))]
     candidate_rows_materialized: Arc<AtomicU64>,
-    #[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
+    #[allow(
+        dead_code,
+        reason = "HNSW: goes with the HNSW index when it is replaced"
+    )]
     last_vector_search_used_hnsw: Arc<AtomicBool>,
     last_vector_search_trace: Arc<RwLock<Option<contextdb_vector::mem::OwnedVectorSearchTrace>>>,
     statement_cache: RwLock<HashMap<String, Arc<CachedStatement>>>,

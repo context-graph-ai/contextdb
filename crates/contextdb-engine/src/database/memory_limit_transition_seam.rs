@@ -23,7 +23,10 @@ thread_local! {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from correction_counterexample_tests.rs"
     )
 )]
-#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+)]
 pub(crate) fn arm_memory_limit_transition_pause_for_test(hook: Hook) {
     PAUSE.with(|pause| *pause.borrow_mut() = Some(hook));
 }
@@ -35,7 +38,10 @@ pub(crate) fn arm_memory_limit_transition_pause_for_test(hook: Hook) {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from correction_counterexample_tests.rs"
     )
 )]
-#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+)]
 pub(crate) fn disarm_memory_limit_transition_pause_for_test() {
     PAUSE.with(|pause| *pause.borrow_mut() = None);
 }

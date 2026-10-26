@@ -178,7 +178,8 @@ fn with_no_order_by_the_original_whole_key_preference_is_unchanged() {
         .find(|candidate| candidate.name == COMPOSITE_INDEX)
         .unwrap_or_else(|| panic!("trace omitted the competing index: {:?}", result.trace()));
     assert_eq!(
-        composite.rejected_reason, "chosen index has whole-key coverage",
+        composite.rejected_reason,
+        "chosen index has whole-key coverage",
         "the pre-existing rejection wording must survive untouched when no sort is in play: {:?}",
         result.trace()
     );

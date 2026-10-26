@@ -755,7 +755,10 @@ type DdlGenerationValue = (Option<String>, Option<u64>);
 pub(crate) struct LocalSchemaStage {
     memory_history: Option<PreparedSchemaHistory>,
     relational: Vec<TableProjection>,
-    #[allow(dead_code, reason = "LAYOUT-ONLY: matched field-for-field by Pre2LocalSchemaStage, whose layout the registry subtracts from this one")]
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: matched field-for-field by Pre2LocalSchemaStage, whose layout the registry subtracts from this one"
+    )]
     affected_tables: HashSet<String>,
     dag_edge_types: PreparedDagEdgeTypes,
     rank_formulas: HashMap<(String, String), Arc<RankFormula>>,
@@ -766,7 +769,10 @@ pub(crate) struct LocalSchemaStage {
     trigger: trigger::PreparedTriggerPublication,
     native_trigger: Option<trigger::OriginalPreparedTriggerPublication>,
     table_generations: Vec<(String, u64)>,
-    #[allow(dead_code, reason = "LAYOUT-ONLY: matched field-for-field by Pre2LocalSchemaStage, whose layout the registry subtracts from this one")]
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: matched field-for-field by Pre2LocalSchemaStage, whose layout the registry subtracts from this one"
+    )]
     ddl_generations: Vec<(DdlGenerationKey, DdlGenerationValue)>,
     #[allow(
         dead_code,
@@ -10666,7 +10672,10 @@ struct ProjectedSyncApply {
     _incoming_values_owner: SyncParentKeyProjectionOwner,
 }
 
-#[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
+#[allow(
+    dead_code,
+    reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+)]
 #[derive(Debug)]
 struct SyncParentKeyProjectionOwner(OwnedMemoryReservation);
 

@@ -50,7 +50,8 @@ fn assert_primary_key_prefix(result: &contextdb_engine::QueryResult) {
         "both equality columns of the primary-key prefix are pushed"
     );
     assert_eq!(
-        result.trace().rows_examined, 3,
+        result.trace().rows_examined,
+        3,
         "one passage lookup must not scan a 30,000-link context"
     );
 }

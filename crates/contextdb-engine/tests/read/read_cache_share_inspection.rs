@@ -17,7 +17,10 @@ fn cache_inspection_keeps_the_declaration_and_the_admitted_session_budget() {
     let declared = options.read_cache_share_status();
     assert_eq!(declared.declared, Some(2));
     assert_eq!(declared.budget_bytes, default.budget_bytes);
-    assert_eq!(declared.fixed_reservation_bytes, default.fixed_reservation_bytes);
+    assert_eq!(
+        declared.fixed_reservation_bytes,
+        default.fixed_reservation_bytes
+    );
     assert!(declared.effective_bytes < default.effective_bytes);
     assert!(declared.effective_percent > 1.0 && declared.effective_percent <= 2.0);
     assert_eq!(options.clone().read_cache_share, Some(2));

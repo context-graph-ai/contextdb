@@ -231,7 +231,8 @@ fn inspect_delete_obligation(
     let inspection_memory =
         contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
             db.owner_read_config().limits.limits.memory,
-        ).map_err(|error| error.to_string())?;
+        )
+        .map_err(|error| error.to_string())?;
     let inspection_read = inspection_memory
         .child()
         .map_err(|e| format!("cannot admit smoke snapshot inspection: {e}"))?;

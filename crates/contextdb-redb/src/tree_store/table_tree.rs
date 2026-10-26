@@ -399,7 +399,10 @@ impl TableTreeMut<'_> {
 
     #[cfg_attr(
         not(debug_assertions),
-        expect(dead_code, reason = "KEEP-FEATURE: called only by debug-assertion checks")
+        expect(
+            dead_code,
+            reason = "KEEP-FEATURE: called only by debug-assertion checks"
+        )
     )]
     pub(crate) fn visit_all_pages<F>(&self, mut visitor: F) -> Result
     where

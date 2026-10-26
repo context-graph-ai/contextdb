@@ -991,7 +991,10 @@ pub(super) fn validate_read_cell_shape(
     }
     Ok(())
 }
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(super) fn read_row_shape_error(table: &str, error: LoadReadImageError) -> Error {
     crate::funded_error::corruption_display(
         crate::read_image_memory::active_owner().and_then(|owner| owner.diagnostic_budget()),

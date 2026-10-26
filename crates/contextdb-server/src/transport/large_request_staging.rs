@@ -149,13 +149,13 @@ impl LargeRequestBegin {
     ) -> TransportResult<Self> {
         let total_bytes = u64::try_from(total_bytes).map_err(|_| {
             TransportError::Other(
-                "oversized request length cannot be represented on this platform".to_string() ,
+                "oversized request length cannot be represented on this platform".to_string(),
             )
         })?;
         let total_fragments = u32::try_from(fragment_count(usize::try_from(total_bytes).map_err(
             |_| {
                 TransportError::Other(
-                    "oversized request length cannot be represented on this platform".to_string() ,
+                    "oversized request length cannot be represented on this platform".to_string(),
                 )
             },
         )?))
@@ -185,7 +185,7 @@ impl LargeRequestBegin {
         }
         let total = usize::try_from(self.total_bytes).map_err(|_| {
             TransportError::Other(
-                "oversized request length cannot be represented on this platform".to_string() ,
+                "oversized request length cannot be represented on this platform".to_string(),
             )
         })?;
         if fragment_count(total) != self.total_fragments as usize
@@ -301,24 +301,24 @@ impl LargeRequestFragment {
                 u64::try_from(total_bytes).map_err(|_| {
                     TransportError::Other(
                         "oversized request length cannot be represented on this platform"
-                            .to_string() ,
+                            .to_string(),
                     )
                 })?,
                 u32::try_from(total_fragments).map_err(|_| {
-                    TransportError::Other("oversized request has too many fragments".to_string() )
+                    TransportError::Other("oversized request has too many fragments".to_string())
                 })?,
             ),
             fragment_digest: *blake3::hash(payload).as_bytes(),
             total_bytes: u64::try_from(total_bytes).map_err(|_| {
                 TransportError::Other(
-                    "oversized request length cannot be represented on this platform".to_string() ,
+                    "oversized request length cannot be represented on this platform".to_string(),
                 )
             })?,
             sequence: u32::try_from(sequence).map_err(|_| {
-                TransportError::Other("oversized request has too many fragments".to_string() )
+                TransportError::Other("oversized request has too many fragments".to_string())
             })?,
             total_fragments: u32::try_from(total_fragments).map_err(|_| {
-                TransportError::Other("oversized request has too many fragments".to_string() )
+                TransportError::Other("oversized request has too many fragments".to_string())
             })?,
             payload: payload.to_vec(),
         };
@@ -588,7 +588,7 @@ pub(super) fn begin_request_admitted(
     if let Some(admission) = admission {
         let total_bytes = usize::try_from(begin.total_bytes).map_err(|_| {
             TransportError::Other(
-                "oversized request length cannot be represented on this platform".to_string() ,
+                "oversized request length cannot be represented on this platform".to_string(),
             )
         })?;
         admission
@@ -2053,11 +2053,20 @@ fn reset_errno() {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PausePoint {
-    #[allow(dead_code, reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build"
+    )]
     CreateDirectory,
-    #[allow(dead_code, reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build"
+    )]
     Publish,
-    #[allow(dead_code, reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build"
+    )]
     Read,
     Cleanup,
     Pressure,

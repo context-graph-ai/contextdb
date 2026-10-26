@@ -369,7 +369,8 @@ fn assert_count(db: &Database, table: &str, expected: i64) {
     let rows = db
         .execute(&format!("SELECT COUNT(*) FROM {table}"), &empty_params())
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(rows[0][0], Value::Int64(expected));
 }
 
@@ -696,7 +697,8 @@ fn commit_failed_observer_receives_vector_and_relational_write_set_with_byte_equ
             &params(vec![("q", Value::Vector(loser_vector.clone()))]),
         )
         .unwrap()
-        .rows().to_vec();
+        .rows()
+        .to_vec();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], text("winner"));
     assert_eq!(rows[0][1], Value::Vector(winner_vector));

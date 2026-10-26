@@ -709,7 +709,10 @@ impl DeclaredReadRoot {
         })?;
         Ok((receipt.into_owner(), observed))
     }
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn native_child_unqualified_observed(
         &self,
         observe: impl FnOnce(&NativeDeclaredChild, &ReadMemoryOwner),
@@ -1552,7 +1555,10 @@ impl DeclaredReadChildObserver {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from retained_trace_ownership_tests.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn retain_original_for_physical_test(&self) -> Option<ReadMemoryOwner> {
         let source = {
             let registry = native_child_observers()
@@ -1725,7 +1731,10 @@ pub(crate) trait NativeOriginalPinSource: Send + Sync {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from control_memory.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     fn original_native_owner(&self) -> ReadMemoryOwner;
 }
 #[cfg(any(test, feature = "test-seams"))]

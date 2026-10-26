@@ -686,9 +686,9 @@
 +            prepared: false,
 +            #[cfg(feature = "contextdb-internal")]
 +            prepared_active: None,
-+        }
-+    }
-+
+         }
+     }
+ 
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn new_prepared(
 +        transaction_id: TransactionId,
@@ -704,9 +704,9 @@
 +    pub(crate) fn activate_prepared(&self) {
 +        if let Some(active) = &self.prepared_active {
 +            active.store(true, std::sync::atomic::Ordering::Release);
-         }
-     }
- 
++        }
++    }
++
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn prepared_active(&self) -> bool {
 +        self.prepared_active
@@ -1701,7 +1701,7 @@
              txn.set_two_phase_commit(true);
              // Also shrink the database file by the maximum amount
              txn.set_shrink_policy(ShrinkPolicy::Maximum);
-@@ -678,7 +1761,314 @@
+@@ -678,7 +1761,317 @@
          Ok(compacted)
      }
  
@@ -2012,12 +2012,15 @@
 +
 +    #[cfg_attr(
 +        not(debug_assertions),
-+        expect(dead_code, reason = "KEEP-FEATURE: called only by debug-assertion checks")
++        expect(
++            dead_code,
++            reason = "KEEP-FEATURE: called only by debug-assertion checks"
++        )
 +    )]
      fn check_repaired_allocated_pages_table(
          system_root: Option<BtreeHeader>,
          mem: Arc<TransactionalMemory>,
-@@ -891,14 +2281,19 @@
+@@ -891,14 +2284,19 @@
          Ok([data_root, system_root])
      }
  
@@ -2038,7 +2041,7 @@
          #[cfg(feature = "logging")]
          let file_path = format!("{:?}", &file);
          #[cfg(feature = "logging")]
-@@ -910,6 +2305,8 @@
+@@ -910,6 +2308,8 @@
              region_size,
              cache_size,
              false,
@@ -2047,7 +2050,7 @@
          )?;
          let mut mem = Arc::new(mem);
          // If the last transaction used 2-phase commit and updated the allocator state table, then
-@@ -919,7 +2316,12 @@
+@@ -919,7 +2319,12 @@
              info!("Found valid allocator state, full repair not needed");
              mem.load_allocator_state(&tree)?;
              #[cfg(debug_assertions)]
@@ -2061,7 +2064,7 @@
          } else {
              #[cfg(feature = "logging")]
              warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
-@@ -944,9 +2346,22 @@
+@@ -944,9 +2349,22 @@
  
          let db = Database {
              mem,
@@ -2085,7 +2088,7 @@
          // Restore the tracker state for any persistent savepoints
          let txn = db.begin_write().map_err(|e| e.into_storage_error())?;
          if let Some(next_id) = txn.next_persistent_savepoint_id()? {
-@@ -1035,16 +2450,35 @@
+@@ -1035,16 +2453,35 @@
      /// write may be in progress at a time. If a write is in progress, this function will block
      /// until it completes.
      pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
@@ -2121,7 +2124,7 @@
      fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
          // Make a new quick-repair commit to update the allocator state table
          #[cfg(feature = "logging")]
-@@ -1056,16 +2490,183 @@
+@@ -1056,16 +2493,183 @@
  
          Ok(())
      }
@@ -2307,7 +2310,7 @@
              #[cfg(feature = "logging")]
              warn!("Failed to flush database file. Repair may be required at restart.");
          }
-@@ -1106,6 +2707,8 @@
+@@ -1106,6 +2710,8 @@
      region_size: Option<u64>,
      cache_size: usize,
      repair_callback: Box<dyn Fn(&mut RepairSession)>,
@@ -2316,7 +2319,7 @@
  }
  
  impl Builder {
-@@ -1125,6 +2728,8 @@
+@@ -1125,6 +2731,8 @@
              // TODO: Default should probably take into account the total system memory
              cache_size: 1024 * 1024 * 1024,
              repair_callback: Box::new(|_| {}),
@@ -2325,7 +2328,7 @@
          }
      }
  
-@@ -1157,13 +2762,37 @@
+@@ -1157,13 +2765,37 @@
          self
      }
  
@@ -2364,7 +2367,7 @@
      pub fn set_region_size(&mut self, size: u64) -> &mut Self {
          assert!(size.is_power_of_two());
          self.region_size = Some(size);
-@@ -1175,6 +2804,7 @@
+@@ -1175,6 +2807,7 @@
      /// * if the file is a valid redb database, it will be opened
      /// * otherwise this function will return an error
      pub fn create(&self, path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
@@ -2372,7 +2375,7 @@
          let file = OpenOptions::new()
              .read(true)
              .write(true)
-@@ -1183,26 +2813,75 @@
+@@ -1183,26 +2816,75 @@
              .open(path)?;
  
          Database::new(
@@ -2450,7 +2453,7 @@
          )
      }
  
-@@ -1225,6 +2904,58 @@
+@@ -1225,6 +2907,58 @@
          )
      }
  
@@ -2509,7 +2512,7 @@
      /// Open an existing or create a new database in the given `file`.
      ///
      /// The file must be empty or contain a valid database.
-@@ -1236,6 +2967,70 @@
+@@ -1236,6 +2970,70 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2580,7 +2583,7 @@
          )
      }
  
-@@ -1251,6 +3046,9 @@
+@@ -1251,6 +3049,9 @@
              self.region_size,
              self.cache_size,
              &self.repair_callback,
@@ -2590,7 +2593,7 @@
          )
      }
  }
-@@ -1262,17 +3060,215 @@
+@@ -1262,17 +3063,215 @@
  }
  
  #[cfg(test)]
@@ -2808,7 +2811,7 @@
      #[derive(Debug)]
      struct FailingBackend {
          inner: FileBackend,
-@@ -1298,7 +3294,7 @@
+@@ -1298,7 +3297,7 @@
          fn decrement_countdown(&self) -> Result<(), std::io::Error> {
              if self
                  .countdown
@@ -4487,7 +4490,7 @@
 +}
 --- /dev/null
 +++ b/src/read_admission.rs
-@@ -0,0 +1,688 @@
+@@ -0,0 +1,700 @@
 +//! Operation-scoped admission before allocating a source page. The caller
 +//! keeps admitted bytes owned until its read handles have been released.
 +use crate::StorageError;
@@ -4572,13 +4575,22 @@
 +// Preserve opaque foreign callers exactly, without silently treating their Box
 +// as the concrete free-before-refund protocol used by the closed engine factory.
 +pub(crate) enum ReadMemoryCharge {
-+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
++    #[allow(
++        dead_code,
++        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
++    )]
 +    Legacy(ReadPageCharge),
 +    #[cfg(feature = "contextdb-internal")]
-+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
++    #[allow(
++        dead_code,
++        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
++    )]
 +    Native(crate::native_storage_admission::NativePageCharge),
 +    #[cfg(feature = "contextdb-internal")]
-+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
++    #[allow(
++        dead_code,
++        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
++    )]
 +    Owned(OwnedReadPageCharge),
 +}
 +
@@ -4825,7 +4837,10 @@
 +enum ScanNodeInvoice {
 +    Legacy,
 +    #[cfg(feature = "contextdb-internal")]
-+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
++    #[allow(
++        dead_code,
++        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
++    )]
 +    Native(crate::NativeStorageCredit),
 +}
 +struct ScanScopeNode {
@@ -5326,7 +5341,7 @@
      }
  }
  
-@@ -668,3 +754,81 @@
+@@ -668,3 +754,82 @@
          })
      }
  }
@@ -5384,7 +5399,8 @@
 +    /// their materialized page guards drop.
 +    #[doc(hidden)]
 +    pub fn cursor_authenticated(&self) -> crate::BoundedByteCursor<'_> {
-+        self.tree.cursor_authenticated(self.transaction.transaction_guard().clone())
++        self.tree
++            .cursor_authenticated(self.transaction.transaction_guard().clone())
 +    }
 +
 +    #[doc(hidden)]
@@ -12343,16 +12359,17 @@
 +}
 --- a/src/tree_store/btree.rs
 +++ b/src/tree_store/btree.rs
-@@ -7,7 +7,7 @@
+@@ -7,8 +7,7 @@
  use crate::tree_store::btree_mutator::MutateHelper;
  use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory};
  use crate::tree_store::{
 -    AccessGuardMutInPlace, AllPageNumbersBtreeIter, BtreeRangeIter, PageHint, PageNumber,
-+    AccessGuardMutInPlace, BtreeRangeIter, PageHint, PageNumber,
-     PageTrackerPolicy,
+-    PageTrackerPolicy,
++    AccessGuardMutInPlace, BtreeRangeIter, PageHint, PageNumber, PageTrackerPolicy,
  };
  use crate::types::{Key, MutInPlaceValue, Value};
-@@ -21,6 +21,125 @@
+ use crate::{AccessGuard, Result};
+@@ -21,6 +20,125 @@
  use std::ops::RangeBounds;
  use std::sync::{Arc, Mutex};
  
@@ -12478,7 +12495,7 @@
  pub(crate) struct BtreeStats {
      pub(crate) tree_height: u32,
      pub(crate) leaf_pages: u64,
-@@ -68,7 +187,7 @@
+@@ -68,7 +186,7 @@
      root: Option<BtreeHeader>,
      hint: PageHint,
      key_width: Option<usize>,
@@ -12487,7 +12504,7 @@
  }
  
  impl UntypedBtree {
-@@ -84,7 +203,7 @@
+@@ -84,7 +202,7 @@
              root,
              hint,
              key_width,
@@ -12496,7 +12513,7 @@
          }
      }
  
-@@ -100,6 +219,106 @@
+@@ -100,6 +218,106 @@
          Ok(())
      }
  
@@ -12603,7 +12620,7 @@
      fn visit_pages_helper<F>(&self, path: PagePath, visitor: &mut F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -126,6 +345,14 @@
+@@ -126,6 +344,14 @@
      }
  }
  
@@ -12618,7 +12635,7 @@
  pub(crate) struct UntypedBtreeMut {
      mem: Arc<TransactionalMemory>,
      root: Option<BtreeHeader>,
-@@ -179,6 +406,13 @@
+@@ -179,6 +405,13 @@
      fn finalize_dirty_checksums_helper(&mut self, page_number: PageNumber) -> Result<Checksum> {
          assert!(self.mem.uncommitted(page_number));
          let mut page = self.mem.get_page_mut(page_number)?;
@@ -12632,7 +12649,7 @@
  
          match page.memory()[0] {
              LEAF => leaf_checksum(&page, self.key_width, self.value_width),
-@@ -281,12 +515,12 @@
+@@ -281,12 +514,12 @@
          page_number: PageNumber,
          relocation_map: &HashMap<PageNumber, PageNumber>,
      ) -> Result<Option<(PageNumber, Checksum)>> {
@@ -12646,7 +12663,7 @@
          new_page.memory_mut().copy_from_slice(old_page.memory());
  
          let node_mem = old_page.memory();
-@@ -309,12 +543,15 @@
+@@ -309,12 +542,15 @@
              _ => unreachable!(),
          }
  
@@ -12662,7 +12679,7 @@
          }
  
          Ok(Some((new_page.get_page_number(), DEFERRED)))
-@@ -322,7 +559,7 @@
+@@ -322,7 +558,7 @@
  }
  
  pub(crate) struct BtreeMut<'a, K: Key + 'static, V: Value + 'static> {
@@ -12671,7 +12688,7 @@
      transaction_guard: Arc<TransactionGuard>,
      root: Option<BtreeHeader>,
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-@@ -364,21 +601,6 @@
+@@ -364,21 +600,6 @@
          Ok(self.root)
      }
  
@@ -12693,7 +12710,7 @@
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -454,7 +676,10 @@
+@@ -454,7 +675,10 @@
              fake_allocated_pages,
          );
          operation.insert_inplace(key, value)?;
@@ -12705,7 +12722,7 @@
          Ok(())
      }
  
-@@ -472,11 +697,6 @@
+@@ -472,11 +696,6 @@
          Ok(result)
      }
  
@@ -12717,7 +12734,7 @@
      pub(crate) fn stats(&self) -> Result<BtreeStats> {
          btree_stats(
              self.get_root().map(|x| x.root),
-@@ -522,6 +742,8 @@
+@@ -522,6 +741,8 @@
                  new_page.memory_mut().copy_from_slice(old_page.memory());
                  drop(old_page);
                  freed_pages.push(root.root);
@@ -12726,7 +12743,7 @@
  
                  root.root = new_page.get_page_number();
                  root.checksum = DEFERRED;
-@@ -582,6 +804,8 @@
+@@ -582,6 +803,8 @@
                          .copy_from_slice(old_child_page.memory());
                      drop(old_child_page);
                      freed_pages.push(child_page);
@@ -12735,7 +12752,7 @@
  
                      let mut mutator = BranchMutator::new(page.memory_mut());
                      mutator.write_child_page(child_index, new_page.get_page_number(), DEFERRED);
-@@ -672,6 +896,8 @@
+@@ -672,6 +895,8 @@
          for page in freed {
              if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                  freed_pages.push(page);
@@ -12744,7 +12761,7 @@
              }
          }
  
-@@ -711,6 +937,28 @@
+@@ -711,6 +936,28 @@
      }
  }
  
@@ -12773,7 +12790,7 @@
  pub(crate) struct RawBtree {
      mem: Arc<TransactionalMemory>,
      root: Option<BtreeHeader>,
-@@ -762,6 +1010,22 @@
+@@ -762,6 +1009,22 @@
          }
      }
  
@@ -12796,7 +12813,7 @@
      fn verify_checksum_helper(
          &self,
          page_number: PageNumber,
-@@ -804,12 +1068,12 @@
+@@ -804,12 +1067,12 @@
  }
  
  pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
@@ -12811,7 +12828,7 @@
      _key_type: PhantomData<K>,
      _value_type: PhantomData<V>,
  }
-@@ -822,7 +1086,16 @@
+@@ -822,7 +1085,16 @@
          mem: Arc<TransactionalMemory>,
      ) -> Result<Self> {
          let cached_root = if let Some(header) = root {
@@ -12829,7 +12846,7 @@
          } else {
              None
          };
-@@ -837,6 +1110,24 @@
+@@ -837,6 +1109,24 @@
          })
      }
  
@@ -12854,7 +12871,7 @@
      pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
          &self.transaction_guard
      }
-@@ -860,6 +1151,17 @@
+@@ -860,6 +1150,17 @@
          .verify_checksum()
      }
  
@@ -12872,7 +12889,7 @@
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -877,6 +1179,10 @@
+@@ -877,6 +1178,10 @@
      pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
          if let Some(ref root_page) = self.cached_root {
              self.get_helper(root_page, K::as_bytes(key).as_ref())
@@ -12883,7 +12900,7 @@
          } else {
              Ok(None)
          }
-@@ -898,8 +1204,10 @@
+@@ -898,8 +1203,10 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(page, K::fixed_width());
@@ -12895,7 +12912,7 @@
                  self.get_helper(&child_page, query)
              }
              _ => unreachable!(),
-@@ -911,6 +1219,10 @@
+@@ -911,6 +1218,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.first_helper(root.clone())
@@ -12906,7 +12923,7 @@
          } else {
              Ok(None)
          }
-@@ -932,7 +1244,10 @@
+@@ -932,7 +1243,10 @@
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
                  let child_page = accessor.child_page(0).unwrap();
@@ -12918,7 +12935,7 @@
              }
              _ => unreachable!(),
          }
-@@ -943,6 +1258,10 @@
+@@ -943,6 +1257,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.last_helper(root.clone())
@@ -12929,7 +12946,7 @@
          } else {
              Ok(None)
          }
-@@ -964,8 +1283,12 @@
+@@ -964,8 +1282,12 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
@@ -12944,7 +12961,7 @@
              }
              _ => unreachable!(),
          }
-@@ -975,14 +1298,37 @@
+@@ -975,14 +1297,37 @@
          &self,
          range: &'_ T,
      ) -> Result<BtreeRangeIter<K, V>> {
@@ -12984,7 +13001,7 @@
      pub(crate) fn len(&self) -> Result<u64> {
          Ok(self.root.map_or(0, |x| x.length))
      }
-@@ -996,42 +1342,6 @@
+@@ -996,42 +1341,6 @@
              self.hint,
          )
      }
@@ -13027,7 +13044,7 @@
  }
  
  impl<K: Key, V: Value> Drop for Btree<K, V> {
-@@ -1118,3 +1428,521 @@
+@@ -1118,3 +1427,521 @@
          _ => unreachable!(),
      }
  }
@@ -14680,7 +14697,7 @@
 +
 +#[cfg(feature = "test-seams")]
 +#[doc(hidden)]
-+pub use page_store::{CachePageForTest, CacheWriteForTest, CacheWriteControlForTest};
++pub use page_store::{CachePageForTest, CacheWriteControlForTest, CacheWriteForTest};
 +
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +#[doc(hidden)]
@@ -15440,19 +15457,19 @@
  
  pub(crate) const MAX_VALUE_LENGTH: usize = 3 * 1024 * 1024 * 1024;
  pub(crate) const MAX_PAIR_LENGTH: usize = 3 * 1024 * 1024 * 1024 + 768 * 1024 * 1024;
-@@ -104,6 +103,11 @@
-             page_index: index,
-             page_order: order,
+@@ -106,6 +105,11 @@
          }
-+    }
-+
+     }
+ 
 +    pub(crate) fn validated_from_le_bytes(bytes: [u8; 8]) -> Option<Self> {
 +        let page = Self::from_le_bytes(bytes);
 +        (page.page_order <= MAX_MAX_PAGE_ORDER).then_some(page)
-     }
- 
++    }
++
      #[cfg(test)]
-@@ -177,14 +181,17 @@
+     pub(crate) fn to_order0(self) -> Vec<PageNumber> {
+         let mut pages = vec![self];
+@@ -177,14 +181,19 @@
  }
  
  pub struct PageImpl {
@@ -15466,13 +15483,15 @@
  impl PageImpl {
 -    pub(crate) fn to_arc(&self) -> Arc<[u8]> {
 +    #[cfg(feature = "test-seams")]
-+    pub(crate) fn memory_for_test(&self) -> &PageMemory { &self.mem }
++    pub(crate) fn memory_for_test(&self) -> &PageMemory {
++        &self.mem
++    }
 +
 +    pub(crate) fn to_arc(&self) -> PageMemory {
          self.mem.clone()
      }
  }
-@@ -204,13 +211,16 @@
+@@ -204,13 +213,16 @@
          *value -= 1;
          if *value == 0 {
              open_pages.remove(&self.page_number);
@@ -15490,15 +15509,11 @@
      }
  
      fn get_page_number(&self) -> PageNumber {
-@@ -267,14 +277,30 @@
+@@ -267,14 +279,30 @@
  impl Drop for PageMut<'_> {
      fn drop(&mut self) {
          #[cfg(debug_assertions)]
 -        assert!(self.open_pages.lock().unwrap().remove(&self.page_number));
--    }
--}
--
--#[derive(Copy, Clone)]
 +        {
 +            let mut open_pages = self.open_pages.lock().unwrap();
 +            assert!(open_pages.remove(&self.page_number));
@@ -15506,9 +15521,10 @@
 +                *open_pages = HashSet::new();
 +            }
 +        }
-+    }
-+}
-+
+     }
+ }
+ 
+-#[derive(Copy, Clone)]
 +#[derive(Copy, Clone, PartialEq, Eq)]
  pub(crate) enum PageHint {
      None,
@@ -20912,7 +20928,7 @@
 +
 +#[cfg(feature = "test-seams")]
 +#[doc(hidden)]
-+pub use cached_file::{CachePageForTest, CacheWriteForTest, CacheWriteControlForTest};
++pub use cached_file::{CachePageForTest, CacheWriteControlForTest, CacheWriteForTest};
 +
 +#[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 +#[doc(hidden)]
@@ -23116,14 +23132,17 @@
          drop(state);
  
          self.state.lock().unwrap().header.recovery_required = false;
-@@ -550,12 +1550,22 @@
+@@ -550,12 +1550,25 @@
          Ok(())
      }
  
 -    #[cfg_attr(not(debug_assertions), expect(unused_variables))]
 +    #[cfg_attr(
 +        not(debug_assertions),
-+        expect(unused_variables, reason = "KEEP-FEATURE: read only by debug-assertion checks")
++        expect(
++            unused_variables,
++            reason = "KEEP-FEATURE: read only by debug-assertion checks"
++        )
 +    )]
      pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
          #[cfg(debug_assertions)]
@@ -23142,7 +23161,7 @@
          }
          #[cfg(not(debug_assertions))]
          {
-@@ -586,6 +1596,32 @@
+@@ -586,6 +1599,32 @@
          result
      }
  
@@ -23175,7 +23194,7 @@
      #[allow(clippy::too_many_arguments)]
      fn commit_inner(
          &self,
-@@ -612,13 +1648,112 @@
+@@ -612,13 +1651,112 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
@@ -23288,7 +23307,7 @@
          self.write_header(&header)?;
  
          // Use 2-phase commit, if checksums are disabled
-@@ -634,6 +1769,7 @@
+@@ -634,6 +1772,7 @@
          // Write the new header to disk
          self.write_header(&header)?;
          self.storage.flush()?;
@@ -23296,7 +23315,7 @@
  
          if shrunk {
              let result = self.storage.resize(header.layout().len());
-@@ -658,6 +1794,7 @@
+@@ -658,6 +1797,7 @@
          );
          state.header = header;
          self.read_from_secondary.store(false, Ordering::Release);
@@ -23304,7 +23323,7 @@
          // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
          // TODO: maybe we can remove the whole read_from_secondary flag?
          drop(state);
-@@ -678,6 +1815,7 @@
+@@ -678,6 +1818,7 @@
          #[cfg(debug_assertions)]
          debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
          assert!(!self.needs_recovery.load(Ordering::Acquire));
@@ -23312,7 +23331,7 @@
  
          let mut unpersisted = self.unpersisted.lock().unwrap();
          let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-@@ -725,8 +1863,11 @@
+@@ -725,8 +1866,11 @@
              state
                  .get_region_mut(region_index)
                  .free(page_number.page_index, page_number.page_order);
@@ -23325,7 +23344,7 @@
  
              let address = page_number.address_range(
                  self.page_size.into(),
-@@ -745,12 +1886,18 @@
+@@ -745,12 +1889,18 @@
      }
  
      pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
@@ -23344,7 +23363,7 @@
          let len: usize = (range.end - range.start).try_into().unwrap();
          let mem = self.storage.read(range.start, len, hint)?;
  
-@@ -776,6 +1923,33 @@
+@@ -776,6 +1926,33 @@
          })
      }
  
@@ -23378,7 +23397,7 @@
      // NOTE: the caller must ensure that the read cache has been invalidated or stale reads my occur
      pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
          #[cfg(debug_assertions)]
-@@ -824,6 +1998,44 @@
+@@ -824,6 +2001,44 @@
          }
      }
  
@@ -23423,7 +23442,7 @@
      pub(crate) fn get_data_root(&self) -> Option<BtreeHeader> {
          let state = self.state.lock().unwrap();
          if self.read_from_secondary.load(Ordering::Acquire) {
-@@ -871,7 +2083,9 @@
+@@ -871,7 +2086,9 @@
                      .unwrap()
                      .contains_key(&page)
              );
@@ -23434,7 +23453,7 @@
              assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
          }
          allocated.remove(page);
-@@ -881,6 +2095,7 @@
+@@ -881,6 +2098,7 @@
          state
              .get_region_mut(region_index)
              .free(page.page_index, page.page_order);
@@ -23442,7 +23461,7 @@
          // Ensure that the region is marked as having free space
          state
              .get_region_tracker_mut()
-@@ -953,12 +2168,32 @@
+@@ -953,12 +2171,32 @@
              page_number
          } else {
              self.grow(&mut state, required_order)?;
@@ -23477,7 +23496,7 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -987,7 +2222,6 @@
+@@ -987,7 +2225,6 @@
              .try_into()
              .unwrap();
  
@@ -23485,7 +23504,7 @@
          let mut mem = self.storage.write(address_range.start, len, true)?;
          debug_assert!(mem.mem().len() >= allocation_size);
  
-@@ -1024,7 +2258,28 @@
+@@ -1024,7 +2261,28 @@
              } else {
                  region.alloc(required_order)
              };
@@ -23514,7 +23533,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +2316,7 @@
+@@ -1061,7 +2319,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -23523,7 +23542,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1093,27 +2348,52 @@
+@@ -1093,27 +2351,52 @@
                  layout.usable_bytes() + required_growth * 2,
              )
          };
@@ -23588,7 +23607,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1123,7 +2403,12 @@
+@@ -1123,7 +2406,12 @@
          allocation_size: usize,
          allocated: &mut PageTrackerPolicy,
      ) -> Result<PageMut<'txn>> {
@@ -23602,7 +23621,7 @@
          if let Ok(ref page) = result {
              allocated.insert(page.get_page_number());
          }
-@@ -1135,7 +2420,7 @@
+@@ -1135,7 +2423,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -23611,7 +23630,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +2430,7 @@
+@@ -1145,7 +2433,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -23620,7 +23639,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +2443,41 @@
+@@ -1158,8 +2446,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -23663,7 +23682,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +2546,469 @@
+@@ -1228,4 +2549,469 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }
@@ -25145,7 +25164,7 @@
  fn hash64_large_generic(
      data: &[u8],
      seed: u64,
-@@ -813,6 +824,48 @@
+@@ -813,6 +824,64 @@
      ((high as u128) << 64) | low as u128
  }
  
@@ -25171,23 +25190,39 @@
 +    for block in 0..blocks {
 +        for index in 0..stripes_per_block {
 +            read(block * block_len + index * STRIPE_LENGTH, &mut stripe)?;
-+            accumulate_stripe_generic(&mut accumulators, &stripe,
-+                &secret[index * SECRET_CONSUME_RATE..]);
++            accumulate_stripe_generic(
++                &mut accumulators,
++                &stripe,
++                &secret[index * SECRET_CONSUME_RATE..],
++            );
 +        }
 +        scramble_accumulators_generic(&mut accumulators, &secret[secret.len() - STRIPE_LENGTH..]);
 +    }
 +    let stripes = ((len - 1) - block_len * blocks) / STRIPE_LENGTH;
 +    for index in 0..stripes {
 +        read(blocks * block_len + index * STRIPE_LENGTH, &mut stripe)?;
-+        accumulate_stripe_generic(&mut accumulators, &stripe,
-+            &secret[index * SECRET_CONSUME_RATE..]);
++        accumulate_stripe_generic(
++            &mut accumulators,
++            &stripe,
++            &secret[index * SECRET_CONSUME_RATE..],
++        );
 +    }
 +    read(len - STRIPE_LENGTH, &mut stripe)?;
-+    accumulate_stripe_generic(&mut accumulators, &stripe,
-+        &secret[secret.len() - STRIPE_LENGTH - 7..]);
-+    let low = merge_accumulators(accumulators, &secret[11..], PRIME64[0].wrapping_mul(len as u64));
-+    let high = merge_accumulators(accumulators, &secret[secret.len() - 64 - 11..],
-+        !(PRIME64[1].wrapping_mul(len as u64)));
++    accumulate_stripe_generic(
++        &mut accumulators,
++        &stripe,
++        &secret[secret.len() - STRIPE_LENGTH - 7..],
++    );
++    let low = merge_accumulators(
++        accumulators,
++        &secret[11..],
++        PRIME64[0].wrapping_mul(len as u64),
++    );
++    let high = merge_accumulators(
++        accumulators,
++        &secret[secret.len() - 64 - 11..],
++        !(PRIME64[1].wrapping_mul(len as u64)),
++    );
 +    Ok(((high as u128) << 64) | low as u128)
 +}
 +
@@ -25459,19 +25494,22 @@
              freed_pages,
              allocated_pages,
          }
-@@ -250,7 +397,10 @@
+@@ -250,7 +397,13 @@
          self.pending_table_updates.clear();
      }
  
 -    #[cfg_attr(not(debug_assertions), expect(dead_code))]
 +    #[cfg_attr(
 +        not(debug_assertions),
-+        expect(dead_code, reason = "KEEP-FEATURE: called only by debug-assertion checks")
++        expect(
++            dead_code,
++            reason = "KEEP-FEATURE: called only by debug-assertion checks"
++        )
 +    )]
      pub(crate) fn visit_all_pages<F>(&self, mut visitor: F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -285,16 +435,65 @@
+@@ -285,16 +438,65 @@
          table_root: Option<BtreeHeader>,
          length: u64,
      ) {
@@ -25539,7 +25577,7 @@
      }
  
      pub(crate) fn flush_and_close(
-@@ -318,64 +517,145 @@
+@@ -318,64 +520,145 @@
      }
  
      fn flush_inner(&mut self) -> Result<Option<BtreeHeader>> {
@@ -25733,7 +25771,7 @@
      // Opens a table, calls the provided closure to insert entries into it, and then
      // flushes the table root. The flush is done using insert_inplace(), so it's guaranteed
      // that no pages will be allocated or freed after the closure returns
-@@ -539,12 +819,28 @@
+@@ -539,12 +822,28 @@
              if self.get_table_untyped(new_name, table_type)?.is_some() {
                  return Err(TableError::TableExists(new_name.to_string()));
              }
@@ -25765,7 +25803,7 @@
          } else {
              return Err(TableError::TableDoesNotExist(name.to_string()));
          }
-@@ -570,6 +866,8 @@
+@@ -570,6 +869,8 @@
              for page in pages {
                  if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                      freed_pages.push(page);
@@ -25774,7 +25812,7 @@
                  }
              }
              drop(allocated_pages);
-@@ -578,6 +876,14 @@
+@@ -578,6 +879,14 @@
              self.pending_table_updates.remove(name);
  
              let found = self.tree.remove(&name)?.is_some();
@@ -25789,7 +25827,7 @@
              return Ok(found);
          }
  
-@@ -594,6 +900,14 @@
+@@ -594,6 +903,14 @@
          } else {
              let table = InternalTableDefinition::new::<K, V>(table_type, None, 0);
              self.tree.insert(&name, &table)?;
@@ -25804,7 +25842,7 @@
              table
          };
  
-@@ -660,16 +974,15 @@
+@@ -660,16 +977,15 @@
                  definition.set_header(*updated_root, *updated_length);
              }
  
@@ -25824,7 +25862,7 @@
              }
          }
  
-@@ -678,6 +991,109 @@
+@@ -678,6 +994,109 @@
          Ok(())
      }
  
@@ -25934,7 +25972,7 @@
      pub fn stats(&self) -> Result<DatabaseStats> {
          let master_tree_stats = self.tree.stats()?;
          let mut max_subtree_height = 0;
-@@ -761,6 +1177,193 @@
+@@ -761,6 +1180,193 @@
      }
  }
  
@@ -26163,7 +26201,7 @@
      fn private_get_root(&self) -> Option<BtreeHeader> {
          match self {
              InternalTableDefinition::Normal { table_root, .. }
-@@ -505,3 +522,186 @@
+@@ -505,3 +522,187 @@
          TypeName::internal("redb::InternalTableDefinition")
      }
  }
@@ -26272,8 +26310,9 @@
 +}
 +
 +#[cfg(feature = "contextdb-internal")]
-+pub(crate) fn native_u64_bytes_table_root(data: &[u8])
-+    -> std::result::Result<Option<BtreeHeader>, crate::NativeColdReadError> {
++pub(crate) fn native_u64_bytes_table_root(
++    data: &[u8],
++) -> std::result::Result<Option<BtreeHeader>, crate::NativeColdReadError> {
 +    native_fixed_u64_table_root_impl(data)
 +}
 +#[cfg(feature = "contextdb-internal")]

@@ -2489,7 +2489,10 @@ fn rd01_non_vector_reads_unchanged() {
     let join_sql = "SELECT decisions.id, outcomes.success FROM decisions INNER JOIN outcomes ON decisions.id = outcomes.decision_id";
     let joined_with_policy = with_policy.execute(join_sql, &empty_params()).unwrap();
     let joined_without_policy = without_policy.execute(join_sql, &empty_params()).unwrap();
-    assert_eq!(joined_with_policy.columns(), joined_without_policy.columns());
+    assert_eq!(
+        joined_with_policy.columns(),
+        joined_without_policy.columns()
+    );
     assert_eq!(joined_with_policy.rows(), joined_without_policy.rows());
 }
 

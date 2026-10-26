@@ -6706,18 +6706,17 @@ impl Database {
             Ok(())
         };
         result?;
-        if consolidation_only
-            && let Some(published) = published_policy {
-                // Match ordinary local/received policy publication: a refused
-                // inspection-only recheck keeps its failure mark until the
-                // next maintenance pass. Durable metadata remains authoritative.
-                if let Ok(read_memory) = self.declared_reader_memory() {
-                    let mut owner = crate::vector_read_memory::admission(read_memory);
-                    let _ = self
-                        .vector_store
-                        .recheck_policy_maintenance_failures(&published, &mut owner);
-                }
+        if consolidation_only && let Some(published) = published_policy {
+            // Match ordinary local/received policy publication: a refused
+            // inspection-only recheck keeps its failure mark until the
+            // next maintenance pass. Durable metadata remains authoritative.
+            if let Ok(read_memory) = self.declared_reader_memory() {
+                let mut owner = crate::vector_read_memory::admission(read_memory);
+                let _ = self
+                    .vector_store
+                    .recheck_policy_maintenance_failures(&published, &mut owner);
             }
+        }
         Ok(())
     }
 

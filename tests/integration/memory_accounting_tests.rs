@@ -1194,7 +1194,9 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
     )
     .unwrap();
     assert_eq!(
-        db.execute("SELECT name FROM items", &empty()).unwrap().rows(),
+        db.execute("SELECT name FROM items", &empty())
+            .unwrap()
+            .rows(),
         vec![vec![Value::Text("fits".to_owned())]]
     );
 }

@@ -369,7 +369,10 @@ pub struct Fixture {
         reason = "KEEP-SHARED: shared test helper used by a_borrowed_serving_page_keeps_its_charge_through_a_give_back"
     )]
     pub store: Arc<VectorStore>,
-    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     tx_mgr: Arc<TransactionManager<TestStore>>,
     exec: MemVectorExecutor<TestStore>,
     index: VectorIndexRef,

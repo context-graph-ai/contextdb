@@ -27,9 +27,7 @@ use crate::executor::ReadExecutionTarget;
 #[cfg(any(test, feature = "test-seams"))]
 use crate::memory_accounting::MemoryAccountant;
 use crate::persistence::ReadPersistenceImageParts;
-use contextdb_core::read_contract::{
-    DeadlineClock, ReadFailure, ReadLimits,
-};
+use contextdb_core::read_contract::{DeadlineClock, ReadFailure, ReadLimits};
 use contextdb_core::{
     ColumnType, ContextId, Direction, Error, HistoryPolicy, IndexKind, Lsn, Principal,
     PropagationRule, Result, RetainUnit, ScopeLabel, ScopeLabelKind, SortDirection, SyncDirection,

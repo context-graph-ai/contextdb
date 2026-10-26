@@ -93,18 +93,28 @@ thread_local! {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn named_image_child_call(
-    payload: usize, counter: usize, _subsystem: &'static str, _operation: &'static str,
-    _site: &'static str, _bytes: usize, _before: u64, _after: u64, _refused: bool,
+    payload: usize,
+    counter: usize,
+    _subsystem: &'static str,
+    _operation: &'static str,
+    _site: &'static str,
+    _bytes: usize,
+    _before: u64,
+    _after: u64,
+    _refused: bool,
 ) {
     update(|capture| {
-        if payload != capture.named_image_child || capture.named_image_child == 0 { return; }
+        if payload != capture.named_image_child || capture.named_image_child == 0 {
+            return;
+        }
         if counter != capture.named_image_counter {
-            capture.invalid = true; capture.invalid_site = line!(); return;
+            capture.invalid = true;
+            capture.invalid_site = line!();
+            return;
         }
         let index = capture.named_image_event_count;
         if index < capture.named_image_events.len() {
-            capture.named_image_events[index] = NamedImageCall {
-            };
+            capture.named_image_events[index] = NamedImageCall {};
         }
         // Fixed diagnostic prefix; overflow is reported explicitly, never
         // treated as a complete allocation census or expected invoice cost.
@@ -112,13 +122,17 @@ pub(crate) fn named_image_child_call(
     });
 }
 fn named_image_sample(capture: &Capture, route: &str, cut: &str) {
-    if capture.named_image_child == 0 { return; }
+    if capture.named_image_child == 0 {
+        return;
+    }
     // The direct reader/session still owns the exact original child at all
     // these cuts. This borrowed scalar never extends its lifetime.
     let held = unsafe { &*(capture.named_image_counter as *const AtomicU64) }
         .load(std::sync::atomic::Ordering::SeqCst);
-    eprintln!("actual_named_image_lifetime route={route} cut={cut} child={} counter={} starting={} held={} diagnostic_only=true",
-        capture.named_image_child, capture.named_image_counter, capture.named_image_start, held);
+    eprintln!(
+        "actual_named_image_lifetime route={route} cut={cut} child={} counter={} starting={} held={} diagnostic_only=true",
+        capture.named_image_child, capture.named_image_counter, capture.named_image_start, held
+    );
 }
 
 // Reentry or a fourth selected constructor is a failed precondition, never
@@ -333,19 +347,26 @@ pub(crate) fn child_allocated(
             let funding = oracle::last_source_request_credit_for_test();
             let expected = ordinary_native_child_layout_for_test();
             let counter = child_counter as *const _ as usize;
-            let after = unsafe { &*(c.parent_counter as *const AtomicU64) }
-                .load(Ordering::SeqCst);
-            if c.stages != 3 || c.trace_stages != 0
-                || layout != expected || (bytes, align) != (layout.size(), layout.align())
+            let after = unsafe { &*(c.parent_counter as *const AtomicU64) }.load(Ordering::SeqCst);
+            if c.stages != 3
+                || c.trace_stages != 0
+                || layout != expected
+                || (bytes, align) != (layout.size(), layout.align())
                 || pointer != oracle::last_request_pointer_for_test()
-                || pointer == c.requests[0].0 || ordinal <= c.constructor_base + 3
-                || counter <= pointer || counter >= pointer + bytes
-                || counter == c.child_counter || child_counter.load(Ordering::SeqCst) != 0
-                || funding.0 != c.parent_counter || funding.2 != ordinal
+                || pointer == c.requests[0].0
+                || ordinal <= c.constructor_base + 3
+                || counter <= pointer
+                || counter >= pointer + bytes
+                || counter == c.child_counter
+                || child_counter.load(Ordering::SeqCst) != 0
+                || funding.0 != c.parent_counter
+                || funding.2 != ordinal
                 || funding.1 as u64 != after
             {
                 c.invalid = true;
-                if c.invalid_site == 0 { c.invalid_site = line!(); }
+                if c.invalid_site == 0 {
+                    c.invalid_site = line!();
+                }
                 return;
             }
             c.replacement_request = (pointer, bytes, align);
@@ -377,20 +398,25 @@ pub(crate) fn replacement_physical_cut(
             return;
         }
         // The first owner must still be alive before borrowing its counter.
-        if request != c.replacement_request || parent_counter != c.parent_counter
-            || c.child_counter == 0 || oracle::source_free_for_test(1)[0].2 != 0
+        if request != c.replacement_request
+            || parent_counter != c.parent_counter
+            || c.child_counter == 0
+            || oracle::source_free_for_test(1)[0].2 != 0
             || c.replacement_physical_cuts != usize::from(after)
         {
             c.invalid = true;
-            if c.invalid_site == 0 { c.invalid_site = line!(); }
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
             return;
         }
         let outer = unsafe { &*(c.child_counter as *const AtomicU64) }.load(Ordering::SeqCst);
-        let due = c.baseline + c.requests[0].1 as u64
-            + c.replacement_request.1 as u64 + outer;
+        let due = c.baseline + c.requests[0].1 as u64 + c.replacement_request.1 as u64 + outer;
         if paid as u64 != due {
             c.invalid = true;
-            if c.invalid_site == 0 { c.invalid_site = line!(); }
+            if c.invalid_site == 0 {
+                c.invalid_site = line!();
+            }
         }
         c.replacement_physical_cuts += 1;
     });
@@ -425,15 +451,19 @@ pub(crate) fn child_counter(
 
         // Identified by the actual typed second constructor, not its Layout
         // or a provider name. Every other counter still fails below.
-        if c.transaction_replacement && c.replacement_counter != 0
+        if c.transaction_replacement
+            && c.replacement_counter != 0
             && counter as *const _ as usize == c.replacement_counter
         {
-            if c.parent != parent as *const _ as usize || limit != c.declared_limit
+            if c.parent != parent as *const _ as usize
+                || limit != c.declared_limit
                 || payload < c.replacement_request.0
                 || payload >= c.replacement_request.0 + c.replacement_request.1
             {
                 c.invalid = true;
-                if c.invalid_site == 0 { c.invalid_site = line!(); }
+                if c.invalid_site == 0 {
+                    c.invalid_site = line!();
+                }
             }
             return;
         }
@@ -602,14 +632,20 @@ impl Observation {
     }
     fn assert_admitted(&self) -> Capture {
         let c = self.capture();
-        assert_eq!((c.children, c.stages), (if c.transaction_replacement { 2 } else { 1 }, 3));
+        assert_eq!(
+            (c.children, c.stages),
+            (if c.transaction_replacement { 2 } else { 1 }, 3)
+        );
         if c.transaction_replacement {
             assert_ne!(c.replacement_request.0, 0);
             assert_ne!(c.replacement_counter, 0);
             assert_eq!(c.replacement_funding[0], c.replacement_funding[1]);
-            assert!(c.replacement_funding[0] >= c.baseline
-                + c.requests.iter().map(|r| r.1 as u64).sum::<u64>()
-                + c.replacement_request.1 as u64);
+            assert!(
+                c.replacement_funding[0]
+                    >= c.baseline
+                        + c.requests.iter().map(|r| r.1 as u64).sum::<u64>()
+                        + c.replacement_request.1 as u64
+            );
         }
         assert_eq!(
             c.child_limit, c.declared_limit,
@@ -714,10 +750,18 @@ impl Observation {
         if c.transaction_replacement {
             assert_eq!(c.trace_stages, 0);
             let free = oracle::source_free_for_test(4)[3];
-            assert_eq!(free.2, 1, "the actual replacement child physically frees once");
-            assert_eq!(free.0, free.1, "its original parent invoice remains paid across System.dealloc");
-            assert_eq!(c.replacement_physical_cuts, 2,
-                "the second original invoice must qualify on both sides of physical free");
+            assert_eq!(
+                free.2, 1,
+                "the actual replacement child physically frees once"
+            );
+            assert_eq!(
+                free.0, free.1,
+                "its original parent invoice remains paid across System.dealloc"
+            );
+            assert_eq!(
+                c.replacement_physical_cuts, 2,
+                "the second original invoice must qualify on both sides of physical free"
+            );
         }
         assert_eq!(db.declared_read_memory.charged_bytes(), c.baseline);
     }
@@ -1856,9 +1900,12 @@ fn assert_route_original_physical_invoices(
             controls.named_image_child, controls.named_image_counter, controls.named_image_calls
         );
         named_image_sample(&controls, route, "post-statement");
-        eprintln!("actual_named_image_calls route={route} total={} retained_prefix={} records={:?} diagnostic_only=true",
-            controls.named_image_event_count, controls.named_image_event_count.min(32),
-            &controls.named_image_events[..controls.named_image_event_count.min(32)]);
+        eprintln!(
+            "actual_named_image_calls route={route} total={} retained_prefix={} records={:?} diagnostic_only=true",
+            controls.named_image_event_count,
+            controls.named_image_event_count.min(32),
+            &controls.named_image_events[..controls.named_image_event_count.min(32)]
+        );
     }
     let retained = db.last_vector_search_trace.write().take().unwrap();
     let invoice = retained.complete_invoice_for_test(|_| {});
@@ -2024,7 +2071,9 @@ fn actual_direct_file_public_readers_keep_original_invoices_through_physical_fre
                 reader.original_image_payer_for_physical_test()
             );
             db.clear_last_vector_search_trace();
-            let (image_child, image_counter, image_start) = reader.original_image_payer_for_physical_test().expect("actual image original");
+            let (image_child, image_counter, image_start) = reader
+                .original_image_payer_for_physical_test()
+                .expect("actual image original");
             let capture = Observation::begin_parent(parent);
             update(|c| {
                 c.allow_constructor_prefix = true;

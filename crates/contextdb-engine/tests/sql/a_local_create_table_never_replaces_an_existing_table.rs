@@ -175,7 +175,11 @@ fn create_table_if_not_exists_on_an_existing_name_changes_nothing() {
     let result = db
         .execute("SELECT a FROM foo", &empty())
         .expect("foo must still be readable after an IF NOT EXISTS no-op");
-    assert_eq!(result.rows().len(), 1, "the existing row must still be there");
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "the existing row must still be there"
+    );
     let a_idx = result
         .columns()
         .iter()

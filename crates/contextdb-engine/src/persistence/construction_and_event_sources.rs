@@ -205,7 +205,10 @@ pub(super) fn retention_reclaim_checkpoint_for_test(boundary: u8) {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from consolidation_metadata_contract_tests.rs"
     )
 )]
-#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+)]
 pub(crate) fn arm_policy_metadata_fault_for_test(boundary: u8, crash: bool) {
     assert!(matches!(boundary, 10 | 11));
     POLICY_METADATA_FAULT.with(|armed| armed.set((boundary, crash)));
@@ -256,7 +259,10 @@ pub(crate) fn arm_stored_relational_row_bytes_fault_for_test() {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from empty_declared_index_readiness_tests.rs"
     )
 )]
-#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+)]
 pub(crate) fn arm_currency_reclaim_fault_for_test(boundary: u8, crash: bool) {
     assert!((1..=34).contains(&boundary));
     assert!(

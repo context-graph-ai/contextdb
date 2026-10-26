@@ -1969,7 +1969,8 @@ fn type_reject_helper(
         .position(|c| c == flagged_col)
         .unwrap_or_else(|| panic!("flagged column {flagged_col} missing from SELECT *"));
     assert_eq!(
-        &result.rows()[0][idx], original_value,
+        &result.rows()[0][idx],
+        original_value,
         "flagged column value must be bytes-identical to the original INSERT"
     );
 }

@@ -252,7 +252,10 @@ fn r05b_pruning_expired_history_keeps_newer_live_version() {
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows()[0][idx], Value::Text("live-version".to_string()));
+    assert_eq!(
+        result.rows()[0][idx],
+        Value::Text("live-version".to_string())
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1101,7 +1101,10 @@ fn hub_last_contact_ms(hub: &Database, node_id: &str) -> Option<i64> {
             &params,
         )
         .ok()?;
-    let idx = result.columns().iter().position(|c| c == "last_contact_ms")?;
+    let idx = result
+        .columns()
+        .iter()
+        .position(|c| c == "last_contact_ms")?;
     match result.rows().first()?.get(idx)? {
         Value::Timestamp(ms) => Some(*ms),
         Value::Int64(ms) => Some(*ms),

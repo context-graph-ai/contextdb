@@ -44,7 +44,7 @@ pub use page_store::CacheReserveOwner;
 
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
-pub use page_store::{CachePageForTest, CacheWriteForTest, CacheWriteControlForTest};
+pub use page_store::{CachePageForTest, CacheWriteControlForTest, CacheWriteForTest};
 
 #[cfg(all(feature = "test-seams", feature = "contextdb-internal"))]
 #[doc(hidden)]

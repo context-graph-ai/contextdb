@@ -2067,7 +2067,10 @@ impl Database {
 
     #[cfg_attr(
         not(debug_assertions),
-        expect(dead_code, reason = "KEEP-FEATURE: called only by debug-assertion checks")
+        expect(
+            dead_code,
+            reason = "KEEP-FEATURE: called only by debug-assertion checks"
+        )
     )]
     fn check_repaired_allocated_pages_table(
         system_root: Option<BtreeHeader>,

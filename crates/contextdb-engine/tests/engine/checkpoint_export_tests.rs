@@ -46,7 +46,8 @@ fn assert_has_tables(db: &Database, tables: &[&str], what: &str) {
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     db.execute(sql, &p())
         .unwrap_or_else(|e| panic!("query `{sql}` failed: {e}"))
-        .rows().to_vec()
+        .rows()
+        .to_vec()
 }
 
 fn dir_names(dir: &Path) -> Vec<String> {
@@ -281,7 +282,8 @@ fn ce04_vectors_round_trip_search_results_equal() {
             &params(vec![("q", Value::Vector(vec![1.0_f32, 0.0, 0.0]))]),
         )
         .unwrap_or_else(|e| panic!("vector search failed: {e}"))
-        .rows().to_vec()
+        .rows()
+        .to_vec()
         .into_iter()
         .map(|mut r| r.remove(0))
         .collect()
@@ -394,7 +396,8 @@ fn ce06_persisted_config_round_trip_disk_limit() {
     let expected_bytes = Value::Int64(1024 * 1024 * 1024);
     let before = src.execute("SHOW DISK_LIMIT", &p()).unwrap();
     assert_eq!(
-        before.rows()[0][0], expected_bytes,
+        before.rows()[0][0],
+        expected_bytes,
         "precondition: source SHOW DISK_LIMIT must reflect the set limit at the `limit` cell: {:?}",
         before.rows()
     );
@@ -413,7 +416,8 @@ fn ce06_persisted_config_round_trip_disk_limit() {
         "SHOW DISK_LIMIT returns exactly one row"
     );
     assert_eq!(
-        after.rows()[0][0], expected_bytes,
+        after.rows()[0][0],
+        expected_bytes,
         "persisted DISK_LIMIT must survive export at the exact `limit` cell; artifact row: {:?}",
         after.rows()
     );

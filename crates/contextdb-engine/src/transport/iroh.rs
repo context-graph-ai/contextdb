@@ -4219,8 +4219,7 @@ async fn serve_sync_connection(
                                 Ok(LargeResponseControlReply::Chunk(chunk))
                             } else {
                                 Err(TransportError::Other(
-                                    "too many unfinished oversized response transfers"
-                                        .to_string(),
+                                    "too many unfinished oversized response transfers".to_string(),
                                 ))
                             }
                         })
@@ -4257,8 +4256,7 @@ async fn serve_sync_connection(
                                 ) =>
                             {
                                 Err(TransportError::Other(
-                                    "too many unfinished oversized response transfers"
-                                        .to_string(),
+                                    "too many unfinished oversized response transfers".to_string(),
                                 ))
                             }
                             Ok(()) => tokio::task::spawn_blocking(move || {
@@ -4833,7 +4831,10 @@ pub(crate) enum NativeReplyEvent {
         edge: usize,
     },
     /// A further holder of the live control, handed to the probe.
-    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     Hold(Box<dyn std::any::Any + Send>),
 }
 

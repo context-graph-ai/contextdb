@@ -87,7 +87,10 @@ pub(crate) struct TriggerPersistenceCommit {
     pub(crate) config_values: Vec<(String, Vec<u8>)>,
     pub(crate) ddl: Vec<DdlChange>,
     pub(crate) generation_sidecars: Vec<super::DurableDdlGenerationSidecar>,
-    #[allow(dead_code, reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun")]
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun"
+    )]
     pub(crate) start_ordinal: u32,
 }
 
@@ -5229,7 +5232,10 @@ struct RetiredOriginalTriggerState {
         reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
     )]
     callbacks: HashMap<String, TriggerCallback>,
-    #[allow(dead_code, reason = "KEEP-GUARD: holds the replaced trigger names so they are freed outside every lock, before their reservation is released")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: holds the replaced trigger names so they are freed outside every lock, before their reservation is released"
+    )]
     names: Vec<String>,
     _callback_original: Option<OwnedMemoryReservation>,
     _original: Option<OwnedMemoryReservation>,

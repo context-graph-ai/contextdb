@@ -120,7 +120,8 @@ fn assert_ordered_result(
         result.trace()
     );
     assert_eq!(
-        result.trace().sort_elided, expected_sort_elided,
+        result.trace().sort_elided,
+        expected_sort_elided,
         "{route} must report whether its physical index walk supplies {order_by}: {:?}",
         result.trace(),
     );
@@ -243,7 +244,8 @@ fn is_null_beside_equality_crashes_the_query() {
             )
             .expect("a contradictory nullable indexed UPDATE must complete");
         assert_eq!(
-            update.rows_affected(), 0,
+            update.rows_affected(),
+            0,
             "a contradictory nullable indexed UPDATE changed rows for {predicate}"
         );
 
@@ -254,7 +256,8 @@ fn is_null_beside_equality_crashes_the_query() {
             )
             .expect("a contradictory nullable indexed DELETE must complete");
         assert_eq!(
-            delete.rows_affected(), 0,
+            delete.rows_affected(),
+            0,
             "a contradictory nullable indexed DELETE changed rows for {predicate}"
         );
     }
@@ -448,7 +451,8 @@ fn assert_cost_result(result: &contextdb_engine::QueryResult, expected_index: &s
     assert_eq!(result.trace().index_used.as_deref(), Some(expected_index));
     assert_eq!(result.trace().predicates_pushed.len(), pushed);
     assert_eq!(
-        result.trace().rows_examined, 1,
+        result.trace().rows_examined,
+        1,
         "only the one stored key in the 10,000-value finite scope is examined"
     );
 }

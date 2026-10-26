@@ -47,7 +47,10 @@ pub enum Session {
 impl Session {
     /// Build a writing session over an already-open database, with the bounded
     /// read view its own reads will go through.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn writing(
         database: Arc<Database>,
         limits: ReadLimits,
@@ -75,7 +78,10 @@ impl Session {
     }
 
     /// Each operation shares the working-set parent declared by this session.
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     pub fn request_read_memory(
         &self,
     ) -> contextdb_core::Result<contextdb_core::read_memory::ReadMemoryOwner> {
@@ -1254,7 +1260,10 @@ impl MetaCommandOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 pub(crate) fn handle_meta_command(
     session_handle: &Session,
     sync_client: Option<&SyncClient>,
@@ -2343,7 +2352,10 @@ fn handle_trace_command(line: &str, input: InputContext, trace_enabled: &mut boo
     true
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn handle_explain_command(
     session_handle: &Session,
     line: &str,
@@ -2463,7 +2475,10 @@ enum ExplainPath {
 /// from SQL text or rendered plan prose. Ordinary SELECT/WITH keeps the
 /// shipped executed-trace behavior, while every vector nearest-neighbour
 /// SELECT remains passive and every non-SELECT statement is planned only.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn explain_path(sql: &str) -> contextdb_core::Result<ExplainPath> {
     let statement = contextdb_parser::parse(sql)?;
     Ok(match &statement {
@@ -2547,7 +2562,10 @@ fn interactive_pull_progress_line(pages_read: u64, last_reported: u64) -> Option
 /// session (plain text piped through a script) gets neither: nobody is
 /// watching stdout as text and nothing parses stderr as JSON there, so
 /// there's nothing to usefully stream.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn pull_with_progress(
     read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
     client: &SyncClient,
@@ -3038,7 +3056,10 @@ fn print_direct_events_status(status: &contextdb_engine::DirectEventsStatus) {
 /// depend on this). An interactive/piped `:memory:` session has no later
 /// process to hand off to -- it IS the whole session -- so it gets the
 /// zero-config convenience instead.
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn register_cli_defaults_for_statement(db: &Database, sql: &str) {
     if !db.is_memory_backed() {
         return;
@@ -3084,7 +3105,10 @@ fn settle_cli_registered_sinks(db: &Database) {
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
 fn execute_sql(
     session_handle: &Session,
     sql: &str,
@@ -3232,7 +3256,8 @@ mod tests {
             ReadLimits::default(),
             contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
                 ReadLimits::default().memory,
-            ).expect("the declared read limit is admitted"),
+            )
+            .expect("the declared read limit is admitted"),
         )
         .expect("a live database opens its own bounded read view")
     }

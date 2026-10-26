@@ -3224,7 +3224,10 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         vector_membership_pages::occupancy_visible_at_any_in_read(&root.read, &route, snapshots)
     }
 
-    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
     fn visible_count(
         &self,
         snapshot: SnapshotId,
@@ -4585,12 +4588,36 @@ use crate::persistence::writer_source::WriterSnapshotHandle;
 /// count authenticates every placement at its OWN cut, so an invisible newer
 /// malformed placement still correctly rejects there; that is a different cut.
 #[cfg(all(test, feature = "test-seams"))]
-pub(crate) fn count_header_before_future_version_for_test(owner: &MembershipOwner, table: &str, snapshot: SnapshotId) -> Result<usize> {
+pub(crate) fn count_header_before_future_version_for_test(
+    owner: &MembershipOwner,
+    table: &str,
+    snapshot: SnapshotId,
+) -> Result<usize> {
     let context = operation_for(owner).expect("actual captured vector operation");
-    let root = context.root.writer.as_ref().expect("actual writer historical producer");
-    let proof = root.open_historical_row_proof(table, context.snapshot, context.memory.clone(), &mut || Ok(()))?;
+    let root = context
+        .root
+        .writer
+        .as_ref()
+        .expect("actual writer historical producer");
+    let proof = root.open_historical_row_proof(
+        table,
+        context.snapshot,
+        context.memory.clone(),
+        &mut || Ok(()),
+    )?;
     let mut count = 0;
-    root.visit_historical_row_headers_with_proof(table, None, snapshot, context.snapshot,
-        context.memory.clone(), &proof, &mut || Ok(()), &mut |_row| { count += 1; Ok(()) })?;
+    root.visit_historical_row_headers_with_proof(
+        table,
+        None,
+        snapshot,
+        context.snapshot,
+        context.memory.clone(),
+        &proof,
+        &mut || Ok(()),
+        &mut |_row| {
+            count += 1;
+            Ok(())
+        },
+    )?;
     Ok(count)
 }

@@ -808,7 +808,8 @@ impl Table<'_, &'static [u8], &'static [u8]> {
     /// their materialized page guards drop.
     #[doc(hidden)]
     pub fn cursor_authenticated(&self) -> crate::BoundedByteCursor<'_> {
-        self.tree.cursor_authenticated(self.transaction.transaction_guard().clone())
+        self.tree
+            .cursor_authenticated(self.transaction.transaction_guard().clone())
     }
 
     #[doc(hidden)]

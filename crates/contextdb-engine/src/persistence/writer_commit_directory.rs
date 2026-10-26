@@ -330,4 +330,3 @@ impl CommitDirectory for RedbPersistence {
         // Never perform a second, fallible write after successful apply.
     }
 }
-

@@ -754,7 +754,10 @@ fn unpartitioned_vector_membership_pages_reload_at_constant_residency() {
             assert!(refusal_limit < MEMBERSHIP_WORKSPACE as u64);
             let (refused, refused_reader) =
                 contextdb_engine::vector_read_memory::statement_child_proof::observe(
-                    &reader_parent, refusal_limit, query);
+                    &reader_parent,
+                    refusal_limit,
+                    query,
+                );
             assert!(
                 matches!(&refused, Err(contextdb_core::Error::MemoryBudgetExceeded {
                     budget_limit_bytes, ..
@@ -770,7 +773,12 @@ fn unpartitioned_vector_membership_pages_reload_at_constant_residency() {
             assert_eq!(refused_reader.parent_before, refusal_baseline);
             assert_eq!(refused_reader.parent_after, refusal_baseline);
             assert_eq!(db.accountant().usage().used, baseline);
-            assert_eq!(db.accountant().high_water_for_test().saturating_sub(baseline), 0);
+            assert_eq!(
+                db.accountant()
+                    .high_water_for_test()
+                    .saturating_sub(baseline),
+                0
+            );
             db.set_memory_limit(Some(64 * 1024 * 1024)).unwrap();
             store.evict_raw_partition_for_test(&index(table), &key);
             displace_membership_pages(&db);

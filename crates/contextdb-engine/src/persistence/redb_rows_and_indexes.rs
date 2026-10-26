@@ -1208,7 +1208,10 @@ impl RedbPersistence {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_current_identity.rs"
         )
     )]
-    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+    #[allow(
+        dead_code,
+        reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+    )]
     pub(crate) fn write_corrupt_store_vector_memberships_for_test(
         &self,
         records: &[VectorPartitionMembershipRecord],

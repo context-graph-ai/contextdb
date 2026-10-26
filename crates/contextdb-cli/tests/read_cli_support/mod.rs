@@ -579,7 +579,6 @@ impl Terminal {
         let text = sink.0.lock().expect("transcript lock").clone();
         (status.code(), text)
     }
-
 }
 
 #[allow(

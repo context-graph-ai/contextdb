@@ -29,11 +29,11 @@ mod a_maintenance_cycle_that_prunes_nothing_walks_no_storage_statistics;
 mod a_scoped_sink_receives_and_counts_only_its_own_events;
 #[path = "engine_seams/aggregate_reads_complete_across_bounded_pages.rs"]
 mod aggregate_reads_complete_across_bounded_pages;
+#[path = "engine_seams/an_arriving_count_declaration_meets_the_same_door_a_local_one_does.rs"]
+mod an_arriving_count_declaration_meets_the_same_door_a_local_one_does;
 #[cfg(target_os = "linux")]
 #[path = "engine_seams/an_authoritative_purge_is_not_refused_by_another_stores_reader.rs"]
 mod an_authoritative_purge_is_not_refused_by_another_stores_reader;
-#[path = "engine_seams/an_arriving_count_declaration_meets_the_same_door_a_local_one_does.rs"]
-mod an_arriving_count_declaration_meets_the_same_door_a_local_one_does;
 #[path = "engine_seams/an_import_tail_charges_each_decoded_vector_once.rs"]
 mod an_import_tail_charges_each_decoded_vector_once;
 #[path = "engine_seams/an_import_tail_larger_than_the_reader_default_completes.rs"]

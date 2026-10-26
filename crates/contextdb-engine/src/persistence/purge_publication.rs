@@ -1125,7 +1125,10 @@ fn run_publication_wait_hook(
         reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
-#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+)]
 pub(crate) fn install_after_held_admission_take_hook_for_test(hook: PublicationWaitHook) {
     AFTER_HELD_ADMISSION_TAKE.with(|slot| *slot.borrow_mut() = Some(hook));
 }
@@ -1138,7 +1141,10 @@ pub(crate) fn install_after_held_admission_take_hook_for_test(hook: PublicationW
         reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
-#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+#[allow(
+    dead_code,
+    reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it"
+)]
 pub(crate) fn install_before_admission_sleep_hook_for_test(hook: PublicationWaitHook) {
     BEFORE_ADMISSION_SLEEP.with(|slot| *slot.borrow_mut() = Some(hook));
 }
@@ -1378,7 +1384,10 @@ impl Fence {
         budget: Option<&crate::executor::ReadPublicationBudget>,
         #[cfg_attr(
             not(feature = "test-seams"),
-            allow(unused_variables, reason = "KEEP-SEAM: only the test-seams build pauses on it")
+            allow(
+                unused_variables,
+                reason = "KEEP-SEAM: only the test-seams build pauses on it"
+            )
         )]
         publishing_result: bool,
     ) -> Result<T> {
