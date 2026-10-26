@@ -163,7 +163,7 @@ fn join_on_valid_column_with_rows_still_works() {
         )
         .expect("a JOIN with a valid ON condition over real rows must succeed");
     assert_eq!(
-        result.rows,
+        result.rows(),
         vec![vec![Value::Int64(1), Value::Int64(100)]],
         "must return exactly the one row whose id matches across both tables"
     );
@@ -195,7 +195,7 @@ fn join_on_valid_column_with_rows_still_works() {
             .execute(sql, &empty())
             .expect("three-table join resolves qualified columns from every input");
         assert_eq!(
-            joined.rows, expected,
+            joined.rows(), expected,
             "third-table WHERE excludes both low and high sequences without losing the second input's qualifier"
         );
     }

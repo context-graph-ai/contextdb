@@ -2418,9 +2418,9 @@ mod no_test_seams_contract {
                 &HashMap::from([("id".to_owned(), Value::Int64(id))]),
             )
             .expect("production cfg executes through the bounded target");
-        assert_eq!(result.result.columns, vec!["id", "payload"]);
+        assert_eq!(result.result.columns(), vec!["id", "payload"]);
         assert_eq!(
-            result.result.rows,
+            result.result.rows(),
             vec![vec![Value::Int64(id), Value::Text(payload)]]
         );
     }

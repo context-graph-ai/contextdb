@@ -76,10 +76,10 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
         .expect("metric_windows scan");
     let idx = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == name)
-            .unwrap_or_else(|| panic!("column {name} must be selected, got {:?}", result.columns))
+            .unwrap_or_else(|| panic!("column {name} must be selected, got {:?}", result.columns()))
     };
     let (machine, sensor, metric, window_start, value) = (
         idx("machine_id"),
@@ -97,7 +97,7 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
         other => panic!("expected an integer, got {other:?}"),
     };
     let mut rows: Vec<(String, String, String, i64, i64)> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             (
@@ -117,12 +117,12 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
 fn note_bodies(db: &Database) -> Vec<String> {
     let result = db.execute("SELECT * FROM notes", &p()).expect("notes scan");
     let body = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "body")
         .expect("body column must be selected");
     let mut bodies: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[body] {
             Value::Text(text) => text.clone(),
@@ -515,7 +515,7 @@ fn guard_a_keyless_id_table_round_trips_unchanged() {
     let mut rows: Vec<(i64, String)> = target
         .execute("SELECT id, body FROM keyless", &p())
         .expect("scan")
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Int64(id), Value::Text(body)) => (*id, body.clone()),

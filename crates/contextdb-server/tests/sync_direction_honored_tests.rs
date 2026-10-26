@@ -51,7 +51,7 @@ async fn within<F: std::future::Future>(fut: F) -> F::Output {
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"))
-        .rows
+        .rows()
         .len()
 }
 

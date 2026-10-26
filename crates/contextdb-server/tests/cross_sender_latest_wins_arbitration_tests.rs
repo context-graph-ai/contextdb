@@ -146,7 +146,7 @@ fn only_body(db: &Database, id: i64) -> Option<String> {
     let result = db
         .execute("SELECT body FROM notes WHERE id = $id", &params)
         .expect("notes scan");
-    result.rows.into_iter().next().map(|row| match &row[0] {
+    result.rows().into_iter().next().map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
         other => panic!("expected a text body, got {other:?}"),
     })
@@ -181,7 +181,7 @@ fn capability_tags(db: &Database, node_id: &str) -> Option<Vec<String>> {
             &params,
         )
         .expect("work_capabilities scan");
-    result.rows.into_iter().next().map(|row| match &row[0] {
+    result.rows().into_iter().next().map(|row| match &row[0] {
         Value::Json(serde_json::Value::Array(items)) => items
             .iter()
             .map(|item| item.as_str().expect("tag must be a string").to_string())

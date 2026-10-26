@@ -65,7 +65,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
         .expect("select note");
-    result.rows.first().and_then(|row| match row.first() {
+    result.rows().first().and_then(|row| match row.first() {
         Some(Value::Text(body)) => Some(body.clone()),
         _ => None,
     })

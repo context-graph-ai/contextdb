@@ -159,7 +159,7 @@ fn insert_windows(db: &Database, ids: std::ops::Range<i64>) {
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"))
-        .rows
+        .rows()
         .len()
 }
 
@@ -170,12 +170,12 @@ fn bodies(db: &Database, table: &str) -> std::collections::BTreeSet<String> {
         .execute(&format!("SELECT id, body FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"));
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "body")
         .expect("result must project column 'body'");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[idx] {
             Value::Text(t) => t.clone(),
@@ -2861,7 +2861,7 @@ async fn a_row_committed_before_an_unclean_restart_still_pushes_after_reopen() {
             &p(),
         )
         .expect("hub scan")
-        .rows
+        .rows()
         .len();
     assert_eq!(
         hub_rows, 1,

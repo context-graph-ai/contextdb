@@ -388,11 +388,11 @@ fn assert_sync_refusal_attributed(
     {
         assert!(!attributed(&Error::MemoryBudgetExceeded {
             subsystem: "relational_index".into(),
-            operation: operation.clone(),
+            operation: operation.to_string().into(),
             requested_bytes: *requested_bytes,
             available_bytes: *available_bytes,
             budget_limit_bytes: *budget_limit_bytes,
-            hint: hint.clone()
+            hint: hint.to_string().into()
         }));
     }
 }
@@ -739,7 +739,7 @@ fn a_declared_memory_limit_refuses_before_the_writer_retains_more_than_it() {
         .execute("SELECT id FROM events", &HashMap::new())
         .expect("a store that refused a write still answers a read");
     assert_eq!(
-        read.rows.len(),
+        read.rows().len(),
         stored,
         "the read must see exactly the events that were admitted"
     );
@@ -759,7 +759,7 @@ fn a_declared_memory_limit_refuses_before_the_writer_retains_more_than_it() {
         .execute("SELECT id FROM events", &HashMap::new())
         .expect("read the reopened store");
     assert_eq!(
-        after.rows.len(),
+        after.rows().len(),
         stored,
         "every committed event must survive the close and reopen"
     );
@@ -900,7 +900,7 @@ fn every_charge_a_row_takes_comes_back_when_the_row_does() {
             &HashMap::new(),
         )
         .unwrap()
-        .rows;
+        .rows().to_vec();
     assert_eq!(full_rows.len(), ROWS);
     for (row, values) in full_rows.iter().enumerate() {
         assert_eq!(values[0], Value::Uuid(event_uuid(row)));
@@ -927,7 +927,7 @@ fn every_charge_a_row_takes_comes_back_when_the_row_does() {
     assert!(
         db.execute("SELECT id FROM notes", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
 
@@ -940,7 +940,7 @@ fn every_charge_a_row_takes_comes_back_when_the_row_does() {
             &HashMap::new()
         )
         .unwrap()
-        .rows,
+        .rows(),
         full_rows
     );
 
@@ -1822,11 +1822,11 @@ fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
     {
         let wrong_owner = Error::MemoryBudgetExceeded {
             subsystem: "relational_index".into(),
-            operation: operation.clone(),
+            operation: operation.to_string().into(),
             requested_bytes: *requested_bytes,
             available_bytes: *available_bytes,
             budget_limit_bytes: *budget_limit_bytes,
-            hint: hint.clone(),
+            hint: hint.to_string().into(),
         };
         assert!(!correct_owner(&wrong_owner));
     }
@@ -1849,7 +1849,7 @@ fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
     assert_eq!(
         db.execute("SELECT COUNT(*) FROM notes", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(ROWS as i64)]]
     );
     db.apply_changes(
@@ -1882,7 +1882,7 @@ fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
         reopened
             .execute("SELECT COUNT(*) FROM notes", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(ROWS as i64)]]
     );
     reopened.close().unwrap();
@@ -2204,7 +2204,7 @@ fn a_tiny_declared_limit_still_opens_an_empty_store_that_answers_and_can_raise_i
     let shown = reopened
         .execute("SHOW MEMORY_LIMIT", &HashMap::new())
         .expect("the store answers a read under its tiny limit");
-    assert_eq!(shown.rows[0][0], Value::Int64(128 * 1024));
+    assert_eq!(shown.rows()[0][0], Value::Int64(128 * 1024));
 
     // And the statement that raises the limit still goes through, which is the
     // way back in an unconditional cache floor took away.
@@ -2224,7 +2224,7 @@ fn a_tiny_declared_limit_still_opens_an_empty_store_that_answers_and_can_raise_i
         reopened
             .execute("SELECT id FROM tiny", &HashMap::new())
             .expect("and read it back")
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -3482,7 +3482,7 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
         let mut rows = db
             .execute("SELECT author, seq FROM notes", &HashMap::new())
             .expect("read the table back")
-            .rows;
+            .rows().to_vec();
         rows.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
         rows
     };
@@ -5154,9 +5154,9 @@ fn a_received_drop_column_and_rename_column_install_whole_and_survive_restart() 
         let rows = db
             .execute("SELECT content FROM wide", &HashMap::new())
             .unwrap_or_else(|error| panic!("the renamed column is queryable {when}: {error:?}"));
-        assert_eq!(rows.rows.len(), 1, "the row survived the reshape {when}");
+        assert_eq!(rows.rows().len(), 1, "the row survived the reshape {when}");
         assert_eq!(
-            rows.rows[0][0],
+            rows.rows()[0][0],
             Value::Text("hello".to_owned()),
             "the row's value under its new column name is unchanged {when}"
         );
@@ -5271,26 +5271,26 @@ fn assert_rename_evidence_outcome(
     let rows = db
         .execute("SELECT * FROM div", &HashMap::new())
         .unwrap_or_else(|error| panic!("the table answers {when}: {error:?}"));
-    assert_eq!(rows.rows.len(), 1, "the row keyed by id survives {when}");
+    assert_eq!(rows.rows().len(), 1, "the row keyed by id survives {when}");
     let new_at = rows
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "new")
-        .unwrap_or_else(|| panic!("`new` is selectable {when}: {:?}", rows.columns));
+        .unwrap_or_else(|| panic!("`new` is selectable {when}: {:?}", rows.columns()));
     assert_eq!(
-        rows.rows[0][new_at],
+        rows.rows()[0][new_at],
         expected.map_or(Value::Null, |value| Value::Text(value.to_owned())),
         "`new` holds only what the author's schema change put there {when}"
     );
     let old_preserved = expected_columns.contains(&"old");
     if expected.is_none() && !old_preserved {
         assert!(
-            rows.rows
+            rows.rows()
                 .iter()
                 .flatten()
                 .all(|value| *value != Value::Text(lost.to_owned())),
             "the dropped column's value `{lost}` appears in no column {when}: {:?}",
-            rows.rows
+            rows.rows()
         );
     }
     if old_preserved {
@@ -5298,12 +5298,12 @@ fn assert_rename_evidence_outcome(
         // into `new` -- so the value the receiver already held stays exactly
         // where it was, not lost and not renamed.
         let old_at = rows
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "old")
-            .unwrap_or_else(|| panic!("`old` is selectable {when}: {:?}", rows.columns));
+            .unwrap_or_else(|| panic!("`old` is selectable {when}: {:?}", rows.columns()));
         assert_eq!(
-            rows.rows[0][old_at],
+            rows.rows()[0][old_at],
             Value::Text(lost.to_owned()),
             "the omitted column keeps its own value under its own name, neither dropped nor \
              renamed, {when}"
@@ -5628,7 +5628,7 @@ fn a_unit_with_no_provenance_installs_whole_or_not_at_all() {
     let rows_before = db
         .execute("SELECT id FROM wide", &HashMap::new())
         .expect("the receiver answers before the unit")
-        .rows
+        .rows()
         .len();
 
     // Room for the unit's own price and not for what installing it really
@@ -5672,7 +5672,7 @@ fn a_unit_with_no_provenance_installs_whole_or_not_at_all() {
     assert_eq!(
         db.execute("SELECT id FROM wide", &HashMap::new())
             .expect("the receiver still answers")
-            .rows
+            .rows()
             .len(),
         rows_before,
         "every row the receiver held is still there"
@@ -5691,7 +5691,7 @@ fn a_unit_with_no_provenance_installs_whole_or_not_at_all() {
         reopened
             .execute("SELECT id FROM wide", &HashMap::new())
             .expect("the reopened receiver answers")
-            .rows
+            .rows()
             .len(),
         rows_before,
         "and every row, after a restart"

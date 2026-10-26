@@ -69,11 +69,11 @@ fn examined_at_every_size(sql: &str, expected: fn(i64) -> Value) -> Vec<(i64, u6
                 )
                 .expect("run the statement");
             assert_eq!(
-                result.rows,
+                result.rows(),
                 vec![vec![expected(rows)]],
                 "{sql}: the answer at {rows} rows"
             );
-            (rows, result.trace.rows_examined)
+            (rows, result.trace().rows_examined)
         })
         .collect()
 }

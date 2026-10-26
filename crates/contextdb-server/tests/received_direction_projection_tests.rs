@@ -31,7 +31,7 @@ fn body(db: &Database, table: &str, id: i64) -> Option<String> {
     let result = db
         .execute(&format!("SELECT body FROM {table} WHERE id = $id"), &values)
         .unwrap_or_else(|err| panic!("read {table} must succeed: {err}"));
-    result.rows.first().and_then(|row| match row.first() {
+    result.rows().first().and_then(|row| match row.first() {
         Some(Value::Text(value)) => Some(value.clone()),
         _ => None,
     })

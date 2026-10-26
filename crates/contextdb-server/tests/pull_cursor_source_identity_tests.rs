@@ -141,7 +141,7 @@ fn only_body(db: &Database, id: i64) -> Option<String> {
     let result = db
         .execute("SELECT body FROM notes WHERE id = $id", &params)
         .expect("notes scan");
-    result.rows.into_iter().next().map(|row| match &row[0] {
+    result.rows().into_iter().next().map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
         other => panic!("expected a text body, got {other:?}"),
     })
@@ -153,7 +153,7 @@ fn row_exists(db: &Database, id: i64) -> bool {
     let result = db
         .execute("SELECT id FROM notes WHERE id = $id", &params)
         .expect("notes scan");
-    !result.rows.is_empty()
+    !result.rows().is_empty()
 }
 
 struct HubGen {

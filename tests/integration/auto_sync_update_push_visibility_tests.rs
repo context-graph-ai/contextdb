@@ -110,11 +110,11 @@ fn selected_text_at(db: &Database, key: Uuid) -> Option<String> {
         )
         .unwrap();
     assert!(
-        result.rows.len() <= 1,
+        result.rows().len() <= 1,
         "primary-key SELECT must return at most one row"
     );
     result
-        .rows
+        .rows()
         .first()
         .and_then(|row| row.first())
         .and_then(Value::as_text)

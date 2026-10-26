@@ -255,18 +255,18 @@ fn assert_mixed_landed(db: &Database, n: usize, history_rows: usize) {
             &empty(),
         )
         .expect("select invalidated parents");
-    assert_eq!(invalidated.rows.len(), n);
+    assert_eq!(invalidated.rows().len(), n);
     assert_eq!(
         db.execute("SELECT id FROM child", &empty())
             .expect("select children")
-            .rows
+            .rows()
             .len(),
         history_rows + n
     );
     assert_eq!(
         db.execute("SELECT id FROM edges", &empty())
             .expect("select edges")
-            .rows
+            .rows()
             .len(),
         history_rows + n
     );
@@ -278,7 +278,7 @@ fn assert_upsert_landed(db: &Database, n: usize, upsert_hits: usize) {
         .execute("SELECT tag FROM child", &empty())
         .expect("select child tags");
     let updated = rows
-        .rows
+        .rows()
         .iter()
         .filter(|row| matches!(&row[0], Value::Text(tag) if tag.starts_with("updated-")))
         .count();

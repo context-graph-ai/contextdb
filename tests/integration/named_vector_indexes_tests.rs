@@ -63,23 +63,23 @@ fn nv02_two_vector_columns_on_one_row_round_trip_independently() {
             &params(vec![("id", Value::Uuid(text_wins_id))]),
         )
         .expect("select both vectors");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     let text_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_text")
         .expect("text col");
     let vision_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_vision")
         .expect("vision col");
     assert_eq!(
-        result.rows[0][text_idx],
+        result.rows()[0][text_idx],
         Value::Vector(text_wins_text.clone())
     );
     assert_eq!(
-        result.rows[0][vision_idx],
+        result.rows()[0][vision_idx],
         Value::Vector(text_wins_vision.clone())
     );
 
@@ -95,9 +95,9 @@ fn nv02_two_vector_columns_on_one_row_round_trip_independently() {
                 &params(vec![("q", Value::Vector(text_probe))]),
             )
             .expect("text ANN");
-        let i = r.columns.iter().position(|c| c == "id").unwrap();
+        let i = r.columns().iter().position(|c| c == "id").unwrap();
         assert_eq!(
-            r.rows[0][i],
+            r.rows()[0][i],
             Value::Uuid(text_wins_id),
             "vector_text ANN must route to the vector_text column even when vector_vision has the same dimension"
         );
@@ -110,7 +110,7 @@ fn nv02_two_vector_columns_on_one_row_round_trip_independently() {
         )
         .expect("vision ANN");
     assert_eq!(
-        r.rows[0][id_idx],
+        r.rows()[0][id_idx],
         Value::Uuid(vision_wins_id),
         "vector_vision ANN must route to the vector_vision column, not a shared same-dimension store"
     );
@@ -194,12 +194,12 @@ fn nv02_two_vector_columns_on_one_row_round_trip_independently() {
         )
         .expect("receiver text ANN");
     let receiver_id_idx = receiver_text
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "id")
         .unwrap();
     assert_eq!(
-        receiver_text.rows[0][receiver_id_idx],
+        receiver_text.rows()[0][receiver_id_idx],
         Value::Uuid(text_wins_id),
         "receiver must materialize generated vector_text payloads from VectorChange envelopes"
     );
@@ -210,7 +210,7 @@ fn nv02_two_vector_columns_on_one_row_round_trip_independently() {
         )
         .expect("receiver vision ANN");
     assert_eq!(
-        receiver_vision.rows[0][receiver_id_idx],
+        receiver_vision.rows()[0][receiver_id_idx],
         Value::Uuid(vision_wins_id),
         "receiver must materialize generated vector_vision payloads from VectorChange envelopes"
     );
@@ -298,12 +298,12 @@ fn nv03_update_one_column_invalidates_only_that_index() {
         )
         .expect("text search after update");
     let id_idx = new_text_hits
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "id")
         .unwrap();
-    assert_eq!(new_text_hits.rows.len(), 1);
-    assert_eq!(new_text_hits.rows[0][id_idx], Value::Uuid(id));
+    assert_eq!(new_text_hits.rows().len(), 1);
+    assert_eq!(new_text_hits.rows()[0][id_idx], Value::Uuid(id));
 
     // The old vector for `id` no longer wins ANN against itself: top-1 must be the OTHER row,
     // which still carries the closer vector to original_text in this layout.
@@ -313,9 +313,9 @@ fn nv03_update_one_column_invalidates_only_that_index() {
             &params(vec![("q", Value::Vector(original_text.clone()))]),
         )
         .expect("text search against stale");
-    assert_eq!(stale_hits.rows.len(), 1);
+    assert_eq!(stale_hits.rows().len(), 1);
     assert_ne!(
-        stale_hits.rows[0][id_idx],
+        stale_hits.rows()[0][id_idx],
         Value::Uuid(id),
         "stale-vector probe must NOT return the updated row at top-1; HNSW must drop the old entry"
     );
@@ -342,7 +342,7 @@ fn nv03_update_one_column_invalidates_only_that_index() {
             &params(vec![("q", Value::Vector(original_vision.clone()))]),
         )
         .expect("vision search");
-    assert_eq!(vision_hits.rows[0][id_idx], Value::Uuid(id));
+    assert_eq!(vision_hits.rows()[0][id_idx], Value::Uuid(id));
 
     let projection = db
         .execute(
@@ -351,12 +351,12 @@ fn nv03_update_one_column_invalidates_only_that_index() {
         )
         .expect("read vision");
     let vision_idx = projection
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_vision")
         .unwrap();
     assert_eq!(
-        projection.rows[0][vision_idx],
+        projection.rows()[0][vision_idx],
         Value::Vector(original_vision)
     );
 }
@@ -401,14 +401,14 @@ fn nv04_delete_drops_row_from_every_vector_index() {
             &params(vec![("q", Value::Vector(text_vec.clone()))]),
         )
         .expect("text search");
-    assert!(text_hits.rows.is_empty());
+    assert!(text_hits.rows().is_empty());
     let vision_hits = db
         .execute(
             "SELECT id FROM evidence ORDER BY vector_vision <=> $q LIMIT 5",
             &params(vec![("q", Value::Vector(vision_vec.clone()))]),
         )
         .expect("vision search");
-    assert!(vision_hits.rows.is_empty());
+    assert!(vision_hits.rows().is_empty());
     let sender_snap = db.snapshot();
     let raw_text_hits = db
         .query_vector(
@@ -678,13 +678,13 @@ fn nv06_same_column_name_two_tables_stays_disjoint() {
         )
         .expect("evidence search");
     let id_idx = evidence_hits
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "id")
         .unwrap();
     assert_eq!(
         evidence_hits
-            .rows
+            .rows()
             .iter()
             .map(|r| r[id_idx].clone())
             .collect::<Vec<_>>(),
@@ -699,7 +699,7 @@ fn nv06_same_column_name_two_tables_stays_disjoint() {
         .expect("digest search");
     assert_eq!(
         digest_hits
-            .rows
+            .rows()
             .iter()
             .map(|r| r[id_idx].clone())
             .collect::<Vec<_>>(),
@@ -796,13 +796,13 @@ fn nv08_snapshot_round_trip_rebuilds_independent_indexes_per_table_column() {
             )
             .expect("receiver text search");
         let id_idx = text_hits
-            .columns
+            .columns()
             .iter()
             .position(|c| c == "id")
             .expect("receiver id column");
-        assert_eq!(text_hits.rows.len(), 1, "{label}: text receiver hits");
+        assert_eq!(text_hits.rows().len(), 1, "{label}: text receiver hits");
         assert_eq!(
-            text_hits.rows[0][id_idx],
+            text_hits.rows()[0][id_idx],
             Value::Uuid(id),
             "{label}: text search must return the row from the generated snapshot"
         );
@@ -813,9 +813,9 @@ fn nv08_snapshot_round_trip_rebuilds_independent_indexes_per_table_column() {
                 &params(vec![("q", Value::Vector(vision_vec.clone()))]),
             )
             .expect("receiver vision search");
-        assert_eq!(vision_hits.rows.len(), 1, "{label}: vision receiver hits");
+        assert_eq!(vision_hits.rows().len(), 1, "{label}: vision receiver hits");
         assert_eq!(
-            vision_hits.rows[0][id_idx],
+            vision_hits.rows()[0][id_idx],
             Value::Uuid(id),
             "{label}: vision search must return the row from the generated snapshot"
         );
@@ -850,10 +850,10 @@ fn nv08_snapshot_round_trip_rebuilds_independent_indexes_per_table_column() {
             &params(vec![("q", Value::Vector(text_vec.clone()))]),
         )
         .expect("text search after reopen");
-    let id_idx = text_hits.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(text_hits.rows.len(), 1);
+    let id_idx = text_hits.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(text_hits.rows().len(), 1);
     assert_eq!(
-        text_hits.rows[0][id_idx],
+        text_hits.rows()[0][id_idx],
         Value::Uuid(id),
         "text search after reopen must return the same row id the writer inserted"
     );
@@ -864,9 +864,9 @@ fn nv08_snapshot_round_trip_rebuilds_independent_indexes_per_table_column() {
             &params(vec![("q", Value::Vector(vision_vec.clone()))]),
         )
         .expect("vision search after reopen");
-    assert_eq!(vision_hits.rows.len(), 1);
+    assert_eq!(vision_hits.rows().len(), 1);
     assert_eq!(
-        vision_hits.rows[0][id_idx],
+        vision_hits.rows()[0][id_idx],
         Value::Uuid(id),
         "vision search after reopen must return the same row id the writer inserted"
     );
@@ -914,7 +914,7 @@ fn nv13_multi_vector_insert_partial_failure_rolls_back_atomically() {
     let count = db
         .execute("SELECT id FROM evidence", &empty_params())
         .expect("select")
-        .rows
+        .rows()
         .len();
     assert_eq!(count, 0, "relational row must roll back");
 
@@ -926,7 +926,7 @@ fn nv13_multi_vector_insert_partial_failure_rolls_back_atomically() {
         )
         .expect("text search");
     assert!(
-        hits.rows.is_empty(),
+        hits.rows().is_empty(),
         "vector_text must have rolled back too"
     );
     let raw_hits = db
@@ -1003,22 +1003,22 @@ fn nv13b_multi_vector_update_partial_failure_rolls_back_atomically() {
         )
         .expect("read");
     let text_idx = projection
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_text")
         .unwrap();
     let vision_idx = projection
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_vision")
         .unwrap();
     assert_eq!(
-        projection.rows[0][text_idx],
+        projection.rows()[0][text_idx],
         Value::Vector(original_text),
         "vector_text must NOT be updated when vector_vision validation fails"
     );
     assert_eq!(
-        projection.rows[0][vision_idx],
+        projection.rows()[0][vision_idx],
         Value::Vector(original_vision.clone()),
         "vector_vision must remain at its original value"
     );
@@ -1030,8 +1030,8 @@ fn nv13b_multi_vector_update_partial_failure_rolls_back_atomically() {
             &params(vec![("q", Value::Vector(vec![1.0, 0.0, 0.0, 0.0]))]),
         )
         .expect("text search");
-    let id_idx = hits.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(hits.rows[0][id_idx], Value::Uuid(id));
+    let id_idx = hits.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(hits.rows()[0][id_idx], Value::Uuid(id));
     let raw_new_text_hits = db
         .query_vector(
             VectorIndexRef::new("evidence", "vector_text"),
@@ -1106,8 +1106,8 @@ fn nv02b_null_vector_column_produces_no_index_entry() {
             &params(vec![("q", Value::Vector(vec![1.0_f32, 0.0, 0.0, 0.0]))]),
         )
         .expect("text search");
-    let id_idx = text_hits.columns.iter().position(|c| c == "id").unwrap();
-    let returned: Vec<Value> = text_hits.rows.iter().map(|r| r[id_idx].clone()).collect();
+    let id_idx = text_hits.columns().iter().position(|c| c == "id").unwrap();
+    let returned: Vec<Value> = text_hits.rows().iter().map(|r| r[id_idx].clone()).collect();
     assert_eq!(
         returned,
         vec![Value::Uuid(text_row)],
@@ -1124,7 +1124,7 @@ fn nv02b_null_vector_column_produces_no_index_entry() {
             )]),
         )
         .expect("vision search");
-    let returned: Vec<Value> = vision_hits.rows.iter().map(|r| r[id_idx].clone()).collect();
+    let returned: Vec<Value> = vision_hits.rows().iter().map(|r| r[id_idx].clone()).collect();
     assert_eq!(returned, vec![Value::Uuid(vision_row)]);
 
     // The emitted changeset for the text row's INSERT carries exactly ONE VectorChange (for vector_text),
@@ -1208,22 +1208,22 @@ fn nv05b_vector_order_by_preserves_full_row_projection() {
     // All four declared columns must be in the projection.
     for col in &["id", "category", "vector_text", "vector_vision"] {
         assert!(
-            result.columns.iter().any(|c| c == col),
+            result.columns().iter().any(|c| c == col),
             "SELECT * with ORDER BY <vec> must project `{col}`; got columns {:?}",
-            result.columns
+            result.columns()
         );
     }
-    assert_eq!(result.rows.len(), 1);
-    let row = &result.rows[0];
-    let id_idx = result.columns.iter().position(|c| c == "id").unwrap();
-    let cat_idx = result.columns.iter().position(|c| c == "category").unwrap();
+    assert_eq!(result.rows().len(), 1);
+    let row = &result.rows()[0];
+    let id_idx = result.columns().iter().position(|c| c == "id").unwrap();
+    let cat_idx = result.columns().iter().position(|c| c == "category").unwrap();
     let text_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_text")
         .unwrap();
     let vision_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_vision")
         .unwrap();
@@ -1482,7 +1482,7 @@ fn nv14b_three_way_unified_transaction_atomicity() {
     let relational = db
         .execute("SELECT id FROM evidence", &empty_params())
         .expect("current relational read");
-    assert_eq!(relational.rows.len(), 1);
+    assert_eq!(relational.rows().len(), 1);
 }
 
 #[test]
@@ -1594,20 +1594,20 @@ fn nv16_empty_index_registers_at_declared_dimension() {
     let indexes = db
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show vector indexes");
-    let table_idx = indexes.columns.iter().position(|c| c == "table").unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
+    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
     let dimension_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "dimension")
         .unwrap();
     let count_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_count")
         .unwrap();
     let find_index = |column: &str| {
-        indexes.rows.iter().find(|row| {
+        indexes.rows().iter().find(|row| {
             matches!(&row[table_idx], Value::Text(table) if table == "evidence")
                 && matches!(&row[column_idx], Value::Text(found) if found == column)
         })
@@ -1638,7 +1638,7 @@ fn nv16_empty_index_registers_at_declared_dimension() {
         &params(vec![("q", Value::Vector(vec![0.0_f32; 16]))]),
     );
     match result {
-        Ok(qr) => assert!(qr.rows.is_empty(), "empty index returns empty result"),
+        Ok(qr) => assert!(qr.rows().is_empty(), "empty index returns empty result"),
         Err(other) => panic!("empty index search must succeed with empty result, got {other:?}"),
     }
 
@@ -1726,7 +1726,7 @@ fn nv16b_engine_surface_is_embedding_space_id_agnostic() {
     .iter()
     .copied()
     .collect();
-    for col in &indexes.columns {
+    for col in indexes.columns() {
         assert!(
             allowed.contains(col.as_str()),
             "SHOW VECTOR_INDEXES column `{col}` is not in the engine-only allowlist; embedding_space_id and consumer-side metadata must NOT appear in the engine surface"
@@ -1817,10 +1817,10 @@ fn nv19b_changeset_ddl_applies_before_vector_changes_for_new_index() {
         vision_hits.as_ref().err()
     );
     let vision_hits = vision_hits.unwrap();
-    assert_eq!(vision_hits.rows.len(), 1);
-    let id_idx = vision_hits.columns.iter().position(|c| c == "id").unwrap();
+    assert_eq!(vision_hits.rows().len(), 1);
+    let id_idx = vision_hits.columns().iter().position(|c| c == "id").unwrap();
     assert_eq!(
-        vision_hits.rows[0][id_idx],
+        vision_hits.rows()[0][id_idx],
         Value::Uuid(id),
         "vision search must return the row whose vector arrived via VectorChange envelope; \
                 a spurious row_id indicates the envelope never landed correctly"
@@ -1875,8 +1875,8 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
     let indexes = db
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show");
-    let table_idx = indexes.columns.iter().position(|c| c == "table").unwrap();
-    let tables: Vec<&Value> = indexes.rows.iter().map(|r| &r[table_idx]).collect();
+    let table_idx = indexes.columns().iter().position(|c| c == "table").unwrap();
+    let tables: Vec<&Value> = indexes.rows().iter().map(|r| &r[table_idx]).collect();
     assert!(
         !tables
             .iter()
@@ -1888,7 +1888,7 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
             .iter()
             .any(|v| matches!(v, Value::Text(s) if s == "digests")),
         "DROP TABLE evidence must not clear unrelated vector indexes; SHOW rows were {:?}",
-        indexes.rows
+        indexes.rows()
     );
     let digest_hits = db
         .execute(
@@ -1897,12 +1897,12 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
         )
         .expect("unrelated digest vector search after drop");
     assert!(
-        !digest_hits.rows.is_empty(),
+        !digest_hits.rows().is_empty(),
         "DROP TABLE evidence must leave digests.vector_text searchable; got no hits"
     );
-    let digest_id_idx = digest_hits.columns.iter().position(|c| c == "id").unwrap();
+    let digest_id_idx = digest_hits.columns().iter().position(|c| c == "id").unwrap();
     assert_eq!(
-        digest_hits.rows[0][digest_id_idx],
+        digest_hits.rows()[0][digest_id_idx],
         Value::Uuid(digest_id),
         "DROP TABLE evidence must not clear payload/HNSW state for digests.vector_text"
     );
@@ -1948,25 +1948,25 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show after recreate");
     let table_idx = recreated_indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "table")
         .unwrap();
     let column_idx = recreated_indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "column")
         .unwrap();
     let dim_idx = recreated_indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "dimension")
         .unwrap();
-    let recreated_text_row = recreated_indexes.rows.iter().find(|row| {
+    let recreated_text_row = recreated_indexes.rows().iter().find(|row| {
         matches!(&row[table_idx], Value::Text(t) if t == "evidence")
             && matches!(&row[column_idx], Value::Text(c) if c == "vector_text")
     });
-    let recreated_vision_row = recreated_indexes.rows.iter().find(|row| {
+    let recreated_vision_row = recreated_indexes.rows().iter().find(|row| {
         matches!(&row[table_idx], Value::Text(t) if t == "evidence")
             && matches!(&row[column_idx], Value::Text(c) if c == "vector_vision")
     });
@@ -1976,7 +1976,7 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
             Some(Value::Int64(16))
         ),
         "recreated evidence.vector_text must be registered at dimension 16; got {:?}",
-        recreated_indexes.rows
+        recreated_indexes.rows()
     );
     assert!(
         matches!(
@@ -1984,7 +1984,7 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
             Some(Value::Int64(32))
         ),
         "recreated evidence.vector_vision must be registered at dimension 32; got {:?}",
-        recreated_indexes.rows
+        recreated_indexes.rows()
     );
 
     let text_hits = db
@@ -1994,12 +1994,12 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
         )
         .expect("recreated text ANN search");
     assert!(
-        !text_hits.rows.is_empty(),
+        !text_hits.rows().is_empty(),
         "recreated vector_text index must be populated and searchable; got no hits"
     );
-    let id_idx = text_hits.columns.iter().position(|c| c == "id").unwrap();
+    let id_idx = text_hits.columns().iter().position(|c| c == "id").unwrap();
     assert_eq!(
-        text_hits.rows[0][id_idx],
+        text_hits.rows()[0][id_idx],
         Value::Uuid(recreated_id),
         "recreated vector_text index must be populated and searchable"
     );
@@ -2010,12 +2010,12 @@ fn nv20_drop_table_deregisters_vector_indexes_and_emits_ddl_change() {
         )
         .expect("recreated vision ANN search");
     assert!(
-        !vision_hits.rows.is_empty(),
+        !vision_hits.rows().is_empty(),
         "recreated vector_vision index must be populated and searchable; got no hits"
     );
-    let id_idx = vision_hits.columns.iter().position(|c| c == "id").unwrap();
+    let id_idx = vision_hits.columns().iter().position(|c| c == "id").unwrap();
     assert_eq!(
-        vision_hits.rows[0][id_idx],
+        vision_hits.rows()[0][id_idx],
         Value::Uuid(recreated_id),
         "recreated vector_vision index must be populated and searchable"
     );
@@ -2059,8 +2059,8 @@ fn nv20b_alter_table_drop_column_deregisters_only_that_index() {
     let indexes = db
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show");
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
-    let cols: Vec<&Value> = indexes.rows.iter().map(|r| &r[column_idx]).collect();
+    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
+    let cols: Vec<&Value> = indexes.rows().iter().map(|r| &r[column_idx]).collect();
     assert!(
         !cols
             .iter()
@@ -2080,8 +2080,8 @@ fn nv20b_alter_table_drop_column_deregisters_only_that_index() {
             &params(vec![("q", Value::Vector(original_text))]),
         )
         .expect("text search");
-    let id_idx = r.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(r.rows[0][id_idx], Value::Uuid(id));
+    let id_idx = r.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(r.rows()[0][id_idx], Value::Uuid(id));
 
     // Querying the now-dropped column returns UnknownVectorIndex.
     let dropped = db.execute(
@@ -2102,9 +2102,9 @@ fn nv16d_show_vector_indexes_on_empty_database_returns_empty_with_header() {
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("SHOW VECTOR_INDEXES on empty DB must succeed (not error)");
     assert!(
-        r.rows.is_empty(),
+        r.rows().is_empty(),
         "empty DB must return zero rows; got {} rows",
-        r.rows.len()
+        r.rows().len()
     );
     let expected: Vec<&str> = vec![
         "table",
@@ -2154,7 +2154,7 @@ fn nv16d_show_vector_indexes_on_empty_database_returns_empty_with_header() {
         "broad_route_recovery_action",
     ];
     assert_eq!(
-        r.columns.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        r.columns().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         expected,
         "SHOW VECTOR_INDEXES must return the canonical header even when empty"
     );
@@ -2181,20 +2181,20 @@ fn nv16c_alter_table_add_column_registers_new_vector_index() {
     let indexes = db
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show");
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
     let dim_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "dimension")
         .unwrap();
     let audio_row = indexes
-        .rows
+        .rows()
         .iter()
         .find(|r| matches!(&r[column_idx], Value::Text(s) if s == "vector_audio"));
     assert!(
         audio_row.is_some(),
         "ALTER TABLE ADD COLUMN must register vector_audio in SHOW VECTOR_INDEXES; got {:?}",
-        indexes.rows
+        indexes.rows()
     );
     let audio_row = audio_row.unwrap();
     assert!(
@@ -2223,8 +2223,8 @@ fn nv16c_alter_table_add_column_registers_new_vector_index() {
             &params(vec![("q", Value::Vector(probe))]),
         )
         .expect("audio search");
-    let id_idx = r.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(r.rows[0][id_idx], Value::Uuid(id));
+    let id_idx = r.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(r.rows()[0][id_idx], Value::Uuid(id));
 
     // Wrong-dim probe against the new column fires VectorIndexDimensionMismatch with the right index.
     let mismatched = db.execute(
@@ -2393,20 +2393,20 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
     let before = receiver
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show before repopulate");
-    let column_idx = before.columns.iter().position(|c| c == "column").unwrap();
+    let column_idx = before.columns().iter().position(|c| c == "column").unwrap();
     let count_idx = before
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_count")
         .unwrap();
     let text_index = before
-        .rows
+        .rows()
         .iter()
         .find(|row| matches!(&row[column_idx], Value::Text(s) if s == "vector_text"));
     assert!(
         text_index.is_some(),
         "pruning must leave the vector_text index registered even when it has zero entries; got {:?}",
-        before.rows
+        before.rows()
     );
     assert!(
         matches!(&text_index.unwrap()[count_idx], Value::Int64(0)),
@@ -2447,8 +2447,8 @@ fn nv_sync_apply_routes_to_pruned_then_repopulated_index() {
             &params(vec![("q", Value::Vector(vec![0.0_f32, 1.0, 0.0, 0.0]))]),
         )
         .expect("text search");
-    let id_idx = r.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(r.rows[0][id_idx], Value::Uuid(new_id));
+    let id_idx = r.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(r.rows()[0][id_idx], Value::Uuid(new_id));
 }
 
 #[test]
@@ -2511,10 +2511,10 @@ fn nv_deferred_hnsw_build_per_index() {
         let indexes = db
             .execute("SHOW VECTOR_INDEXES", &empty_params())
             .expect("show vector indexes");
-        let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
-        let bytes_idx = indexes.columns.iter().position(|c| c == "bytes").unwrap();
+        let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
+        let bytes_idx = indexes.columns().iter().position(|c| c == "bytes").unwrap();
         indexes
-            .rows
+            .rows()
             .iter()
             .find(|row| matches!(&row[column_idx], Value::Text(c) if c == column))
             .and_then(|row| match &row[bytes_idx] {
@@ -2562,8 +2562,8 @@ fn nv_deferred_hnsw_build_per_index() {
             &params(vec![("q", Value::Vector(text_vec))]),
         )
         .expect("text search");
-    let id_idx = r1.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(r1.rows[0][id_idx], Value::Uuid(text_id));
+    let id_idx = r1.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(r1.rows()[0][id_idx], Value::Uuid(text_id));
     assert_eq!(db.accountant().usage().used, used_before_text_build);
     assert_eq!(
         db.__debug_vector_hnsw_len(VectorIndexRef::new("evidence", "vector_text")),
@@ -2651,7 +2651,7 @@ fn nv_deferred_hnsw_build_per_index() {
         )
         .expect("vision search");
     assert_eq!(
-        r2.rows[0][id_idx],
+        r2.rows()[0][id_idx],
         Value::Uuid(vision_id),
         "vision search must succeed independently of vector_text's HNSW build state"
     );
@@ -2722,7 +2722,7 @@ fn nv13c_multi_row_multi_vector_insert_partial_failure_rolls_back_atomically() {
     let count = db
         .execute("SELECT id FROM evidence", &empty_params())
         .expect("select")
-        .rows
+        .rows()
         .len();
     assert_eq!(
         count, 0,
@@ -2736,9 +2736,9 @@ fn nv13c_multi_row_multi_vector_insert_partial_failure_rolls_back_atomically() {
         )
         .expect("text search");
     assert!(
-        r.rows.is_empty(),
+        r.rows().is_empty(),
         "vector_text index must roll back too; got {} hits",
-        r.rows.len()
+        r.rows().len()
     );
     for leaked_probe in [vec![1.0_f32, 0.0, 0.0, 0.0], vec![0.0_f32, 0.0, 1.0, 0.0]] {
         let raw_hits = db
@@ -2831,8 +2831,8 @@ fn nv02c_multi_row_multi_vector_insert_succeeds_with_per_row_routing() {
             &params(vec![("q", Value::Vector(vec![0.0_f32, 0.0, 1.0, 0.0]))]),
         )
         .expect("text search for id_b's vector");
-    let id_idx = r.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(r.rows[0][id_idx], Value::Uuid(id_b));
+    let id_idx = r.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(r.rows()[0][id_idx], Value::Uuid(id_b));
     let vision = db
         .execute(
             "SELECT id FROM evidence ORDER BY vector_vision <=> $q LIMIT 1",
@@ -2842,8 +2842,8 @@ fn nv02c_multi_row_multi_vector_insert_succeeds_with_per_row_routing() {
             )]),
         )
         .expect("vision search for id_a's vector");
-    let id_idx = vision.columns.iter().position(|c| c == "id").unwrap();
-    assert_eq!(vision.rows[0][id_idx], Value::Uuid(id_a));
+    let id_idx = vision.columns().iter().position(|c| c == "id").unwrap();
+    assert_eq!(vision.rows()[0][id_idx], Value::Uuid(id_a));
 }
 
 #[test]
@@ -3140,7 +3140,7 @@ fn nv_retain_prunes_every_vector_index_for_expired_row() {
         )
         .expect("text search after prune");
     assert!(
-        text_hits.rows.is_empty(),
+        text_hits.rows().is_empty(),
         "vector_text must drop pruned row"
     );
 
@@ -3154,7 +3154,7 @@ fn nv_retain_prunes_every_vector_index_for_expired_row() {
         )
         .expect("vision search after prune");
     assert!(
-        vision_hits.rows.is_empty(),
+        vision_hits.rows().is_empty(),
         "vector_vision must drop pruned row — TTL prune must walk every registered (table, column)"
     );
     let prune_snap = db.snapshot();
@@ -3187,18 +3187,18 @@ fn nv_retain_prunes_every_vector_index_for_expired_row() {
         .execute("SHOW VECTOR_INDEXES", &empty_params())
         .expect("show");
     assert_eq!(
-        indexes.rows.len(),
+        indexes.rows().len(),
         2,
         "both vector indexes must remain registered after pruning; got {:?}",
-        indexes.rows
+        indexes.rows()
     );
     let count_idx = indexes
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "vector_count")
         .unwrap();
-    let column_idx = indexes.columns.iter().position(|c| c == "column").unwrap();
-    for row in &indexes.rows {
+    let column_idx = indexes.columns().iter().position(|c| c == "column").unwrap();
+    for row in indexes.rows() {
         if matches!(&row[column_idx], Value::Text(s) if s.starts_with("vector_")) {
             assert!(
                 matches!(&row[count_idx], Value::Int64(0)),
@@ -3289,8 +3289,8 @@ fn nv_indexed_filter_intersects_per_column_vector_search() {
             ]),
         )
         .expect("filtered text search");
-    let id_idx = r.columns.iter().position(|c| c == "id").unwrap();
-    let returned: Vec<Value> = r.rows.iter().map(|row| row[id_idx].clone()).collect();
+    let id_idx = r.columns().iter().position(|c| c == "id").unwrap();
+    let returned: Vec<Value> = r.rows().iter().map(|row| row[id_idx].clone()).collect();
     assert!(
         returned
             .iter()
@@ -3310,18 +3310,18 @@ fn nv_indexed_filter_intersects_per_column_vector_search() {
         "filtered vector_text ANN must rank the nearest A row first, not merely return any A row"
     );
     assert_eq!(
-        r.trace.physical_plan, "IndexScan -> VectorSearch",
+        r.trace().physical_plan, "IndexScan -> VectorSearch",
         "runtime trace must prove the indexed candidate set fed vector_text ANN; got {:?}",
-        r.trace
+        r.trace()
     );
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_category"));
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_category"));
     assert!(
-        r.trace
+        r.trace()
             .predicates_pushed
             .iter()
             .any(|predicate| predicate.as_ref() == "category"),
         "runtime trace must show category was pushed into the candidate IndexScan; got {:?}",
-        r.trace
+        r.trace()
     );
     assert!(
         db.__rows_examined() <= a_ids.len() as u64,
@@ -3352,7 +3352,7 @@ fn nv_indexed_filter_intersects_per_column_vector_search() {
             ]),
         )
         .expect("filtered vision search");
-    let returned2: Vec<Value> = r2.rows.iter().map(|row| row[id_idx].clone()).collect();
+    let returned2: Vec<Value> = r2.rows().iter().map(|row| row[id_idx].clone()).collect();
     assert!(
         returned2
             .iter()
@@ -3370,11 +3370,11 @@ fn nv_indexed_filter_intersects_per_column_vector_search() {
         "filtered vector_vision ANN must rank the nearest A row first, not merely return any A row"
     );
     assert_eq!(
-        r2.trace.physical_plan, "IndexScan -> VectorSearch",
+        r2.trace().physical_plan, "IndexScan -> VectorSearch",
         "runtime trace must prove the indexed candidate set fed vector_vision ANN; got {:?}",
-        r2.trace
+        r2.trace()
     );
-    assert_eq!(r2.trace.index_used.as_deref(), Some("idx_category"));
+    assert_eq!(r2.trace().index_used.as_deref(), Some("idx_category"));
     assert!(
         db.__rows_examined() <= a_ids.len() as u64,
         "filtered vision ANN must read only the category='A' index postings before vector search; rows_examined={}",

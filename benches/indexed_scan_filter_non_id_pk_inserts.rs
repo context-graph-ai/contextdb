@@ -36,16 +36,16 @@ fn seed_and_assert() {
     let probe = db
         .__probe_constraint_check("t", "user_id", Value::Uuid(user))
         .unwrap();
-    assert_eq!(probe.trace.physical_plan, "IndexScan");
+    assert_eq!(probe.trace().physical_plan, "IndexScan");
     let result = db
         .execute(
             "SELECT user_id, name FROM t WHERE user_id = $id",
             &params(vec![("id", Value::Uuid(user))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Uuid(user));
-    assert_eq!(result.rows[0][1], Value::Text(format!("u{SAMPLE}")));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Uuid(user));
+    assert_eq!(result.rows()[0][1], Value::Text(format!("u{SAMPLE}")));
 }
 
 fn timed_seed_and_assert() {

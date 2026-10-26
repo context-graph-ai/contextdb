@@ -91,7 +91,7 @@ fn digest_summaries(db: &Database) -> Vec<(String, String)> {
         .execute("SELECT id, summary FROM digests", &p())
         .expect("digest scan");
     let mut rows = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Text(id), Value::Text(summary)) => (id.clone(), summary.clone()),

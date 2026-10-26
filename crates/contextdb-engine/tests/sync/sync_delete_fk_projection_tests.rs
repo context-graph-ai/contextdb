@@ -49,13 +49,13 @@ fn rejected_keep_first_parent_delete_stays_present_during_mixed_ddl_fk_preflight
     )
     .expect("rejected tombstone must not project parent absence or fail FK preflight");
     assert_eq!(
-        db.execute("SELECT id FROM parents", &p).unwrap().rows.len(),
+        db.execute("SELECT id FROM parents", &p).unwrap().rows().len(),
         1
     );
     assert_eq!(
         db.execute("SELECT id FROM children", &p)
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -111,13 +111,13 @@ fn rejected_keep_first_composite_parent_delete_stays_present_during_mixed_ddl_fk
     )
     .expect("rejected composite tombstone must not project parent absence");
     assert_eq!(
-        db.execute("SELECT id FROM parents", &p).unwrap().rows.len(),
+        db.execute("SELECT id FROM parents", &p).unwrap().rows().len(),
         1
     );
     assert_eq!(
         db.execute("SELECT id FROM children", &p)
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );

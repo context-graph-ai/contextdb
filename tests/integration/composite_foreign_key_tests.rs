@@ -32,7 +32,7 @@ fn file_db(name: &str) -> (TempDir, PathBuf, Database) {
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap()
-        .rows
+        .rows()
         .len()
 }
 
@@ -43,7 +43,7 @@ fn persisted_row_count(path: &Path, table: &str) -> usize {
 
 fn persisted_rows(path: &Path, sql: &str) -> Vec<Vec<Value>> {
     let db = Database::open(path).unwrap();
-    db.execute(sql, &p()).unwrap().rows
+    db.execute(sql, &p()).unwrap().rows().to_vec()
 }
 
 fn create_parent_child(db: &Database) {
@@ -533,7 +533,7 @@ fn cfk_update_rejects_missing_parent() {
     let rows = db
         .execute("SELECT c1, c2 FROM child WHERE id = 1", &p())
         .unwrap()
-        .rows;
+        .rows().to_vec();
     assert_eq!(rows, vec![vec![Value::Int64(1), Value::Int64(2)]]);
     db.close().unwrap();
     assert_eq!(
@@ -717,7 +717,7 @@ fn cfk_parent_rewrite_new_tuple_child_matches_new() {
     let rows = db
         .execute("SELECT c1, c2 FROM child WHERE id = 1", &p())
         .unwrap()
-        .rows;
+        .rows().to_vec();
     assert_eq!(rows, vec![vec![Value::Int64(3), Value::Int64(4)]]);
     db.close().unwrap();
     assert_eq!(
@@ -831,14 +831,14 @@ fn cfk_batch_uses_indexed_tuple_probes() {
         reopened
             .execute("SELECT c1, c2 FROM child WHERE id = 0", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Int64(2)]]
     );
     assert_eq!(
         reopened
             .execute("SELECT c1, c2 FROM child WHERE id = 999", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Int64(2)]]
     );
 }
@@ -1167,7 +1167,7 @@ fn ddl_sync_skipped_parent_row_does_not_satisfy_composite_fk_child() {
         receiver
             .execute("SELECT a, b FROM parent WHERE id = 1", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Int64(1)]],
         "server_wins parent conflict must leave the local parent unchanged"
     );
@@ -1371,7 +1371,7 @@ fn ddl_sync_future_parent_update_away_does_not_satisfy_composite_fk_child() {
         receiver
             .execute("SELECT a, b FROM parent WHERE id = 1", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(9), Value::Int64(9)]],
         "parent update should still apply after child is bounded as a conflict"
     );
@@ -1450,7 +1450,7 @@ fn ddl_sync_parent_update_rejected_by_immutable_does_not_satisfy_composite_fk_ch
         receiver
             .execute("SELECT a, b, frozen FROM parent WHERE id = 1", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             Value::Int64(1),
             Value::Int64(2),
@@ -1553,7 +1553,7 @@ fn ddl_sync_parent_update_rejected_by_projected_unique_does_not_satisfy_composit
         receiver
             .execute("SELECT a, b, u FROM parent WHERE id = 1", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             Value::Int64(1),
             Value::Int64(2),
@@ -1565,7 +1565,7 @@ fn ddl_sync_parent_update_rejected_by_projected_unique_does_not_satisfy_composit
         receiver
             .execute("SELECT a, b, u FROM parent WHERE id = 2", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             Value::Int64(5),
             Value::Int64(5),
@@ -2177,7 +2177,7 @@ fn assert_composite_parent_projection_prices_keys_not_payloads() {
                         &p(),
                     )
                     .unwrap()
-                    .rows,
+                    .rows(),
                 vec![vec![
                     Value::Int64(1),
                     Value::Text(key.clone()),
@@ -2191,7 +2191,7 @@ fn assert_composite_parent_projection_prices_keys_not_payloads() {
                         &p(),
                     )
                     .unwrap()
-                    .rows,
+                    .rows(),
                 vec![vec![
                     Value::Int64(1),
                     Value::Text(key.clone()),

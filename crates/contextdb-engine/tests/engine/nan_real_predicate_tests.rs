@@ -93,10 +93,10 @@ fn between_query_with_nan_lower_bound_on_a_non_indexed_real_column_returns_empty
         )
         .expect("a NaN-bounded range query on a non-indexed column must not error");
     assert!(
-        result.rows.is_empty(),
+        result.rows().is_empty(),
         "a NaN lower bound must match nothing (every comparison against NaN is false under \
          IEEE-754), not silently include rows: {:?}",
-        result.rows
+        result.rows()
     );
 }
 
@@ -142,10 +142,10 @@ fn between_query_with_nan_lower_bound_on_an_indexed_real_column_does_not_panic()
 
     match result {
         Ok(query_result) => assert!(
-            query_result.rows.is_empty(),
+            query_result.rows().is_empty(),
             "a NaN lower bound must match nothing, matching the non-indexed column's own \
              behavior, not silently include rows: {:?}",
-            query_result.rows
+            query_result.rows()
         ),
         Err(err) => {
             // A typed refusal is an acceptable alternative to the sane

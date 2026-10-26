@@ -87,7 +87,7 @@ fn holder(db: &Database, key: &str) -> Option<String> {
             &HashMap::from([("claim_key".to_string(), Value::Text(key.to_string()))]),
         )
         .expect("claim scan");
-    result.rows.first().map(|row| match &row[0] {
+    result.rows().first().map(|row| match &row[0] {
         Value::Text(holder) => holder.clone(),
         other => panic!("expected a text holder, got {other:?}"),
     })

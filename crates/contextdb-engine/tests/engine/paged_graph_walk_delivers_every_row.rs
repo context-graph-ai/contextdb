@@ -158,16 +158,16 @@ fn page_through(database: &Database, sql: &str, sql_params: &HashMap<String, Val
     // it is part of what opening a cursor gives you, not something a later
     // fetch re-delivers. A reader that starts counting at the first `fetch`
     // discards it and mistakes its own omission for lost rows.
-    let mut rows = rendered(&cursor.first_page().rows);
+    let mut rows = rendered(&cursor.first_page().rows());
     let mut pages = 1_usize;
-    let mut has_more = cursor.first_page().has_more;
+    let mut has_more = cursor.first_page().has_more();
     let mut stopped_by = None;
     while has_more {
         match cursor.fetch(NonZeroUsize::new(PAGE_ROWS as usize)) {
             Ok(page) => {
-                rows.extend(rendered(&page.rows));
+                rows.extend(rendered(&page.rows()));
                 pages += 1;
-                has_more = page.has_more;
+                has_more = page.has_more();
             }
             Err(error) => {
                 stopped_by = Some(error.to_string());
@@ -194,7 +194,7 @@ fn both_ways(what: &str, sql: &str, sql_params: &HashMap<String, Value>, ordered
         .execute(sql, sql_params)
         .unwrap_or_else(|error| panic!("the executor answers {what}: {error}"));
     let expected = {
-        let mut expected = rendered(&whole.rows);
+        let mut expected = rendered(&whole.rows());
         if !ordered {
             expected.sort();
         }

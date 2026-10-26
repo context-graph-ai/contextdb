@@ -40,7 +40,7 @@ fn work_inputs_row_count(db: &Database, job_id: &str) -> usize {
         &params,
     )
     .expect("select work_inputs")
-    .rows
+    .rows()
     .len()
 }
 
@@ -243,7 +243,7 @@ fn an_ordinary_incremental_pull_does_not_resurrect_an_expired_input_row() {
             &HashMap::new(),
         )
         .expect("select the unrelated job")
-        .rows
+        .rows()
         .len()
             == 1,
         "the incremental pull must still deliver genuinely new work -- proving this is a real \

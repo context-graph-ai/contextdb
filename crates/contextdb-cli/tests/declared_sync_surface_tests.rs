@@ -264,7 +264,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
         .expect("select body")
-        .rows;
+        .rows().to_vec();
     rows.first().and_then(|row| match row.first() {
         Some(Value::Text(value)) => Some(value.clone()),
         _ => None,

@@ -74,10 +74,10 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
         .expect("metric_windows scan");
     let idx = |name: &str| {
         result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == name)
-            .unwrap_or_else(|| panic!("column {name} must be selected, got {:?}", result.columns))
+            .unwrap_or_else(|| panic!("column {name} must be selected, got {:?}", result.columns()))
     };
     let (machine, sensor, metric, window_start, value) = (
         idx("machine_id"),
@@ -95,7 +95,7 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
         other => panic!("expected an integer, got {other:?}"),
     };
     let mut rows: Vec<(String, String, String, i64, i64)> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             (
@@ -115,12 +115,12 @@ fn windows(db: &Database) -> Vec<(String, String, String, i64, i64)> {
 fn note_bodies(db: &Database) -> Vec<String> {
     let result = db.execute("SELECT * FROM notes", &p()).expect("notes scan");
     let body = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "body")
         .expect("body column must be selected");
     let mut bodies: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[body] {
             Value::Text(text) => text.clone(),
@@ -590,7 +590,7 @@ fn c5d_guard_a_multi_column_unique_constraint_is_not_an_identity() {
         .execute("SELECT id, value FROM readings", &p())
         .expect("readings scan");
     let mut kept: Vec<(i64, i64)> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Int64(id), Value::Int64(value)) => (*id, *value),
@@ -675,7 +675,7 @@ fn c5d_guard_a_multi_column_index_is_not_an_identity() {
     let mut ids: Vec<i64> = target
         .execute("SELECT id FROM indexed_readings", &p())
         .expect("scan")
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Int64(id) => *id,
@@ -761,8 +761,8 @@ fn c5d_a_vector_column_is_addressed_by_the_key_and_is_never_the_identity() {
             &params,
         )
         .expect("a ROW_VECTOR query keyed by the natural key must resolve");
-    assert_eq!(result.rows.len(), 3, "the ranked query returns every row");
-    for row in &result.rows {
+    assert_eq!(result.rows().len(), 3, "the ranked query returns every row");
+    for row in result.rows() {
         assert!(
             matches!(row[0], Value::Uuid(_)),
             "ROW_VECTOR results are identities, not vectors: {row:?}"
@@ -827,7 +827,7 @@ fn c5b_guard_a_keyless_id_table_replicates_unchanged() {
     let mut rows: Vec<(i64, String)> = target
         .execute("SELECT id, body FROM keyless", &p())
         .expect("scan")
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Int64(id), Value::Text(body)) => (*id, body.clone()),
@@ -909,7 +909,7 @@ fn c5c_a_composite_key_sync_safe_table_arrives_by_synced_ddl() {
     let mut windows: Vec<i64> = receiver
         .execute("SELECT window_start FROM arrived_windows", &p())
         .expect("scan")
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Int64(w) => *w,

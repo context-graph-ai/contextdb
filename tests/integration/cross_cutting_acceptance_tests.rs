@@ -75,11 +75,11 @@ fn oom_does_not_partially_commit_visible_state() {
     {
         let wrong_owner = contextdb_core::Error::MemoryBudgetExceeded {
             subsystem: "vector".to_owned().into(),
-            operation: operation.clone(),
+            operation: operation.to_string().into(),
             requested_bytes: *requested_bytes,
             available_bytes: *available_bytes,
             budget_limit_bytes: *budget_limit_bytes,
-            hint: hint.clone(),
+            hint: hint.to_string().into(),
         };
         assert!(!attributed(&wrong_owner));
     }
@@ -103,7 +103,7 @@ fn oom_does_not_partially_commit_visible_state() {
         recovered
             .execute("SELECT payload FROM big", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("fitting".to_owned())]]
     );
     recovered.close().unwrap();

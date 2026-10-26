@@ -58,7 +58,7 @@ fn status(db: &Database) -> Option<String> {
             ]),
         )
         .expect("status scan");
-    result.rows.first().map(|row| match &row[0] {
+    result.rows().first().map(|row| match &row[0] {
         Value::Text(status) => status.clone(),
         other => panic!("expected a text status, got {other:?}"),
     })

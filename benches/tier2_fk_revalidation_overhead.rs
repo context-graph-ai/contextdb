@@ -101,14 +101,14 @@ fn setup_seeded_db() -> (Database, Vec<Uuid>) {
     assert_eq!(
         db.execute("SELECT id FROM decisions", &empty())
             .expect("count parents")
-            .rows
+            .rows()
             .len(),
         pre_gate_rows
     );
     assert_eq!(
         db.execute("SELECT id FROM invalidations", &empty())
             .expect("count children")
-            .rows
+            .rows()
             .len(),
         pre_gate_rows
     );

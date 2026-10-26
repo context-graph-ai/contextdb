@@ -234,8 +234,8 @@ fn si_09_reopen_preserves_configured_memory_limit() {
     let show = reopened
         .execute("SHOW MEMORY_LIMIT", &HashMap::new())
         .unwrap();
-    assert_eq!(show.rows.len(), 1);
-    assert_eq!(show.rows[0][0], Value::Int64(1024));
+    assert_eq!(show.rows().len(), 1);
+    assert_eq!(show.rows()[0][0], Value::Int64(1024));
 
     let err = reopened
         .execute(

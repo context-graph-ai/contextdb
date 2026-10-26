@@ -312,7 +312,7 @@ fn a_peer_applying_the_changeset_answers_the_same_vectors() {
                     &params(vec![("id", Value::Uuid(id))]),
                 )
                 .expect("the receiver answers for a replicated row");
-            let carried = match answered.rows.first().and_then(|row| row.first()) {
+            let carried = match answered.rows().first().and_then(|row| row.first()) {
                 Some(Value::Vector(carried)) => carried.clone(),
                 other => panic!("the receiver answers {column} for {id} with a vector: {other:?}"),
             };
@@ -330,8 +330,8 @@ fn a_peer_applying_the_changeset_answers_the_same_vectors() {
         .execute("SHOW VECTOR_INDEXES", &empty())
         .expect("the receiver describes its vector indexes");
     assert_eq!(
-        rmp_serde::to_vec(&receiver_indexes.rows).expect("index rows encode"),
-        rmp_serde::to_vec(&sender_indexes.rows).expect("index rows encode"),
+        rmp_serde::to_vec(&receiver_indexes.rows()).expect("index rows encode"),
+        rmp_serde::to_vec(&sender_indexes.rows()).expect("index rows encode"),
         "sender and receiver describe the same vector indexes, so the quantization travelled \
          with the rows rather than being re-derived"
     );

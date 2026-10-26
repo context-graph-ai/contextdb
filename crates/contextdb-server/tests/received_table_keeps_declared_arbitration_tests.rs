@@ -56,7 +56,7 @@ fn holder(db: &Database, key: &str) -> Option<String> {
             &HashMap::from([("claim_key".to_string(), Value::Text(key.to_string()))]),
         )
         .expect("claim scan");
-    result.rows.first().map(|row| match &row[0] {
+    result.rows().first().map(|row| match &row[0] {
         Value::Text(holder) => holder.clone(),
         other => panic!("expected a text holder, got {other:?}"),
     })
@@ -69,7 +69,7 @@ fn declared_policies(db: &Database) -> Vec<String> {
         .execute("SHOW SYNC_CONFLICT_POLICY", &p())
         .expect("show declared conflict policy");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(policy) => policy.clone(),

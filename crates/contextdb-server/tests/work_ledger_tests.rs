@@ -82,21 +82,21 @@ fn hub_claim_holder(hub: &Database, job_id: &str, attempt: i64) -> Option<String
         )
         .expect("hub claim scan");
     let node_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "node_id")
         .expect("node_id col");
     let job_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "job_id")
         .expect("job_id col");
     let attempt_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "attempt")
         .expect("attempt col");
-    result.rows.iter().find_map(|row| {
+    result.rows().iter().find_map(|row| {
         let job_matches = matches!(&row[job_idx], Value::Text(j) if j == job_id);
         let attempt_matches = matches!(&row[attempt_idx], Value::Int64(a) if *a == attempt);
         if job_matches && attempt_matches {
@@ -986,12 +986,12 @@ fn hub_capability_row_count(hub: &Database, node_id: &str) -> usize {
         Err(_) => return 0,
     };
     let node_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "node_id")
         .expect("node_id col");
     result
-        .rows
+        .rows()
         .iter()
         .filter(|row| matches!(&row[node_idx], Value::Text(n) if n == node_id))
         .count()
@@ -1079,8 +1079,8 @@ fn hub_capability_advertised_at(hub: &Database, node_id: &str, capability_id: &s
             &params,
         )
         .ok()?;
-    let idx = result.columns.iter().position(|c| c == "advertised_at")?;
-    match result.rows.first()?.get(idx)? {
+    let idx = result.columns().iter().position(|c| c == "advertised_at")?;
+    match result.rows().first()?.get(idx)? {
         Value::Timestamp(ms) => Some(*ms),
         _ => None,
     }
@@ -1101,8 +1101,8 @@ fn hub_last_contact_ms(hub: &Database, node_id: &str) -> Option<i64> {
             &params,
         )
         .ok()?;
-    let idx = result.columns.iter().position(|c| c == "last_contact_ms")?;
-    match result.rows.first()?.get(idx)? {
+    let idx = result.columns().iter().position(|c| c == "last_contact_ms")?;
+    match result.rows().first()?.get(idx)? {
         Value::Timestamp(ms) => Some(*ms),
         Value::Int64(ms) => Some(*ms),
         _ => None,

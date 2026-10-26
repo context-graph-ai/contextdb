@@ -5326,16 +5326,16 @@ fn sync_partition_heal_value_txid_lww_deterministic() {
                 .execute("SELECT x FROM t WHERE pk = $pk", &select_params)
                 .expect("bound select must succeed");
             assert_eq!(
-                result.rows.len(),
+                result.rows().len(),
                 1,
                 "{name} must have exactly 1 row for pk on iteration {iteration}; got {}",
-                result.rows.len()
+                result.rows().len()
             );
             assert_eq!(
-                result.rows[0][0],
+                result.rows()[0][0],
                 Value::TxId(TxId(200)),
                 "{name} must converge to Value::TxId(TxId(200)) on iteration {iteration}; got {:?}",
-                result.rows[0][0]
+                result.rows()[0][0]
             );
         }
     }

@@ -147,7 +147,7 @@ fn edge_client(db: &Arc<Database>, broker: &InProcessBroker, _role: &str) -> Syn
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"))
-        .rows
+        .rows()
         .len()
 }
 

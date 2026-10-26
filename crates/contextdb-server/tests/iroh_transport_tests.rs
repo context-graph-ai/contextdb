@@ -424,11 +424,11 @@ fn note_body(db: &Database, id: Uuid) -> Option<String> {
         .execute("SELECT body FROM notes WHERE id = $id", &key)
         .expect("select note");
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "body")
         .expect("body column");
-    result.rows.first().map(|row| match &row[idx] {
+    result.rows().first().map(|row| match &row[idx] {
         Value::Text(text) => text.clone(),
         other => panic!("notes.body must be text, got {other:?}"),
     })

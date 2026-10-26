@@ -146,7 +146,7 @@ async fn inbound_purge_removes_last_ref_blob_and_preserves_shared_blob() {
             &HashMap::new(),
         )
         .expect("read edge work rows after inbound removal")
-        .rows;
+        .rows().to_vec();
     assert_eq!(jobs, vec![vec![Value::Text("shared-survivor".to_string())]]);
 
     within(client.shutdown()).await;

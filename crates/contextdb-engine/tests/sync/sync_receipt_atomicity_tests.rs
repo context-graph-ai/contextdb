@@ -119,7 +119,7 @@ fn failed_synced_commit_publishes_neither_row_nor_authenticated_receipt() {
     assert_eq!(
         hub.execute("SELECT * FROM notes", &params)
             .expect("query hub after rejected sync")
-            .rows
+            .rows()
             .len(),
         0,
         "a failed sync commit must not publish its row either"
@@ -142,7 +142,7 @@ fn failed_synced_commit_publishes_neither_row_nor_authenticated_receipt() {
         reopened
             .execute("SELECT * FROM notes", &params)
             .expect("query reopened hub")
-            .rows
+            .rows()
             .len(),
         0,
         "the failed row must not appear after reopening the durable hub"
@@ -217,7 +217,7 @@ fn durable_table_drop_and_rewrite_cleanup_remove_both_sync_provenance_sidecars()
         reopened_cleanup
             .execute("SELECT * FROM notes", &params)
             .expect("query rewritten table")
-            .rows
+            .rows()
             .is_empty(),
         "the cleanup rewrite must remain applied after reopen"
     );
@@ -323,7 +323,7 @@ fn status_regression_keeps_live_and_delete_work_pending_until_fresh_acknowledgem
     assert_eq!(
         db.execute("SELECT body FROM notes WHERE id = 1", &params)
             .expect("query pending row")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("lost-local".to_string())]],
         "a continuing pull cannot overwrite local work while its hub order is pending"
     );
@@ -403,7 +403,7 @@ fn confirmed_identical_echo_stays_pending_across_reopen_until_refresh_commits() 
         reopened
             .execute("SELECT body FROM notes WHERE id = 1", &params)
             .expect("query protected row")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("local".to_string())]],
         "a restored hub cannot overwrite the unrefreshed local row"
     );
@@ -464,7 +464,7 @@ fn status_regression_keeps_accepted_local_delete_pushable_and_unordered() {
     assert!(
         edge.execute("SELECT * FROM notes", &params)
             .expect("query after stale live pull")
-            .rows
+            .rows()
             .is_empty(),
         "a stale pull cannot resurrect a delete before its fresh acknowledgement"
     );
@@ -491,7 +491,7 @@ fn status_regression_keeps_accepted_local_delete_pushable_and_unordered() {
     assert_eq!(
         edge.execute("SELECT body FROM notes WHERE id = 1", &params)
             .expect("query after later hub edit")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("later-hub-edit".to_string())]],
         "a fresh delete acknowledgement must not suppress later hub truth"
     );
@@ -534,7 +534,7 @@ fn restored_before_pending_marks_a_fresh_local_delete_stampless_until_confirmed(
     assert!(
         edge.execute("SELECT * FROM notes", &params)
             .expect("query after stale pull")
-            .rows
+            .rows()
             .is_empty(),
         "the restored hub cannot resurrect a fresh local delete before confirmation"
     );
@@ -553,7 +553,7 @@ fn restored_before_pending_marks_a_fresh_local_delete_stampless_until_confirmed(
     assert_eq!(
         edge.execute("SELECT body FROM notes WHERE id = 1", &params)
             .expect("query later edit")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("later-hub-edit".to_string())]],
         "the confirmed tombstone must release later hub truth"
     );

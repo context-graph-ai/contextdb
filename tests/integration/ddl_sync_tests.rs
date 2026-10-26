@@ -726,7 +726,7 @@ fn ds10d_sync_alter_unique_name_collision_rebuilds_auto_index_storage() {
     let inserted = db
         .execute("INSERT INTO c (id, p_key) VALUES (1, 'key-1')", &empty)
         .unwrap();
-    assert_eq!(inserted.rows_affected, 1);
+    assert_eq!(inserted.rows_affected(), 1);
     let stats = db.__commit_stage_stats();
     assert!(
         stats.indexed_probes >= 1,

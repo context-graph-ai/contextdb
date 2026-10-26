@@ -112,13 +112,13 @@ fn assert_control(db: &Database) {
     assert_eq!(
         db.execute("SELECT id, body FROM unrelated", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(99), Value::Text("preserved".to_owned())]]
     );
     assert_eq!(
         db.execute("SELECT id FROM received_parent", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(7)]]
     );
 }
@@ -132,13 +132,13 @@ fn assert_absent(db: &Database, before: Lsn) {
     assert!(
         db.execute("SELECT id FROM received_source", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     assert!(
         db.execute("SELECT id FROM received_derived", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     assert!(
@@ -160,13 +160,13 @@ fn assert_complete(db: &Database, before: Lsn) {
     assert_eq!(
         db.execute("SELECT id, note FROM received_source", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Null]]
     );
     assert_eq!(
         db.execute("SELECT id, parent_id FROM received_derived", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1), Value::Int64(7)]]
     );
     let log = db

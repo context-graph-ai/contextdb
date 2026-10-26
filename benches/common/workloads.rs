@@ -230,7 +230,7 @@ pub fn run_flagship_recall_query(db: &Database) {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "expected one active matching decision"
     );

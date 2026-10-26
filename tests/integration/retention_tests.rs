@@ -14,15 +14,15 @@ fn p() -> HashMap<String, Value> {
 
 fn row_count(db: &Database, table: &str) -> usize {
     let result = db.execute(&format!("SELECT * FROM {table}"), &p()).unwrap();
-    result.rows.len()
+    result.rows().len()
 }
 
 fn col_idx(result: &QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == name)
-        .unwrap_or_else(|| panic!("column '{name}' not found in {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column '{name}' not found in {:?}", result.columns()))
 }
 
 // ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ fn r01_basic_age_pruning() {
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("young".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("young".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ fn r02_short_ttl_prunes_old_not_new() {
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("new".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("new".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ fn r05_expires_column_per_row_override() {
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("future".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("future".to_string()));
 }
 
 #[test]
@@ -252,7 +252,7 @@ fn r05b_pruning_expired_history_keeps_newer_live_version() {
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("live-version".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("live-version".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +382,7 @@ fn r08_alter_table_set_retain() {
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("young".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("young".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -556,7 +556,7 @@ fn r14_timestamp_iso8601_round_trip() {
         .execute("SELECT * FROM events WHERE id = 1", &p())
         .unwrap();
     let idx = col_idx(&result, "ts");
-    match &result.rows[0][idx] {
+    match &result.rows()[0][idx] {
         Value::Timestamp(millis) => {
             // 2026-03-24T12:00:00Z in epoch millis
             assert!(*millis > 0, "timestamp must be positive epoch millis");
@@ -592,7 +592,7 @@ fn r15_infinity_sentinel_value() {
 
     let result = db.execute("SELECT * FROM obs WHERE id = 1", &p()).unwrap();
     let idx = col_idx(&result, "expires_at");
-    match &result.rows[0][idx] {
+    match &result.rows()[0][idx] {
         Value::Timestamp(millis) => {
             assert_eq!(*millis, i64::MAX, "'infinity' must be stored as i64::MAX");
         }
@@ -781,7 +781,7 @@ fn r19_pruning_removes_vector_entries() {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "vector search must find the row before pruning"
     );
@@ -801,7 +801,7 @@ fn r19_pruning_removes_vector_entries() {
         )
         .unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         0,
         "vector search must return nothing after pruning"
     );
@@ -946,7 +946,7 @@ fn r21_in_memory_retention_works() {
 
     let result = db.execute("SELECT * FROM obs", &p()).unwrap();
     let idx = col_idx(&result, "data");
-    assert_eq!(result.rows[0][idx], Value::Text("young".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("young".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,7 +1245,7 @@ fn r28_concurrent_prune_and_insert() {
     assert_eq!(
         db.execute("SELECT id FROM obs WHERE id < 100", &p())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
@@ -1341,15 +1341,15 @@ fn mr1_ann_accuracy_after_vector_pruning() {
 
     // Must return exactly 5 results (the surviving new vectors).
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         5,
         "ANN search must return only surviving vectors, got {}",
-        result.rows.len()
+        result.rows().len()
     );
 
     // None of the old IDs should appear in results.
     let result_ids: Vec<uuid::Uuid> = result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match &row[0] {
             Value::Uuid(id) => Some(*id),
@@ -1628,7 +1628,7 @@ fn retention_defers_physical_reclaim_to_a_two_pass_statement() {
         .execute("SELECT * FROM obs", &p())
         .expect("a fresh SELECT must succeed even though reclaim is deferred");
     assert_eq!(
-        fresh.rows.len(),
+        fresh.rows().len(),
         0,
         "logical expiry must have advanced under the live two-pass statement"
     );
@@ -1642,13 +1642,13 @@ fn retention_defers_physical_reclaim_to_a_two_pass_statement() {
     // complete, intact row set it registered against — one statement, one
     // view.
     assert_eq!(
-        original.rows.len(),
+        original.rows().len(),
         EXPIRING_ROWS,
         "the two-pass statement must return every row from the snapshot it registered"
     );
     let id = col_idx(&original, "id");
     let data = col_idx(&original, "data");
-    let mut original_rows = original.rows;
+    let mut original_rows = original.rows().to_vec();
     original_rows.sort_by_key(|row| match &row[id] {
         Value::Int64(value) => *value,
         other => panic!("selected id must be an integer, got {other:?}"),
@@ -1775,7 +1775,7 @@ fn mr4_pruning_under_concurrent_read() {
         .execute("SELECT * FROM obs", &p())
         .expect("a fresh SELECT must succeed while reads continue");
     assert_eq!(
-        fresh_after_cycle_1.rows.len(),
+        fresh_after_cycle_1.rows().len(),
         0,
         "logical expiry must have advanced while the continuous read loop kept running"
     );
@@ -1787,7 +1787,7 @@ fn mr4_pruning_under_concurrent_read() {
         .expect("reader A must still be waiting for release");
     let reader_a_result = reader_a.join().expect("reader A thread must not panic");
     assert_eq!(
-        reader_a_result.rows.len(),
+        reader_a_result.rows().len(),
         EXPIRING_ROWS,
         "reader A must return every row from the snapshot it registered"
     );
@@ -1826,7 +1826,7 @@ fn mr4_pruning_under_concurrent_read() {
         .expect("reader B must still be waiting for release");
     let reader_b_result = reader_b.join().expect("reader B thread must not panic");
     assert_eq!(
-        reader_b_result.rows.len(),
+        reader_b_result.rows().len(),
         0,
         "reader B registered after expiry must return zero rows"
     );
@@ -1913,7 +1913,7 @@ fn retention_defers_reclaim_without_breaking_vector_search() {
         )
         .expect("vector search over a stamped-but-unreclaimed row must succeed, not error");
     assert_eq!(
-        current_search.rows.len(),
+        current_search.rows().len(),
         0,
         "vector search must not return a logically expired row"
     );
@@ -1929,7 +1929,7 @@ fn retention_defers_reclaim_without_breaking_vector_search() {
         )
         .expect("vector search at the pinned snapshot must succeed");
     assert_eq!(
-        pinned_search.rows.len(),
+        pinned_search.rows().len(),
         SEEDED_VECTOR_ROWS,
         "the pinned snapshot must still see every seeded row"
     );
@@ -1950,7 +1950,7 @@ fn retention_defers_reclaim_without_breaking_vector_search() {
             &search_params,
         )
         .expect("vector search must still succeed after physical reclaim");
-    assert_eq!(search_after_reclaim.rows.len(), 0);
+    assert_eq!(search_after_reclaim.rows().len(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2025,7 +2025,7 @@ fn retention_expiry_stamp_survives_reopen() {
             .execute("SELECT * FROM obs", &p())
             .expect("SELECT must succeed immediately after reopen");
         assert_eq!(
-            rows.rows.len(),
+            rows.rows().len(),
             0,
             "the logical expiry stamp must survive a reopen with no cycle run yet"
         );
@@ -2036,7 +2036,7 @@ fn retention_expiry_stamp_survives_reopen() {
             )
             .expect("vector search must succeed immediately after reopen");
         assert_eq!(
-            search.rows.len(),
+            search.rows().len(),
             0,
             "the vector tombstone must survive a reopen with no cycle run yet"
         );
@@ -2060,7 +2060,7 @@ fn retention_expiry_stamp_survives_reopen() {
                 &search_params,
             )
             .expect("vector search must succeed after the second reopen");
-        assert_eq!(search.rows.len(), 0);
+        assert_eq!(search.rows().len(), 0);
     }
 }
 
@@ -2095,7 +2095,7 @@ fn retention_keeps_rows_an_explicit_snapshot_pin_is_entitled_to() {
     let pinned = db
         .execute_at_snapshot("SELECT data FROM obs", &p(), snapshot)
         .expect("the pinned snapshot must remain readable across calls");
-    assert_eq!(pinned.rows, vec![vec![Value::Text("pinned".to_string())]]);
+    assert_eq!(pinned.rows(), vec![vec![Value::Text("pinned".to_string())]]);
 
     drop(pin);
     let reclaimed = db
@@ -2253,9 +2253,9 @@ fn retention_tolerates_ntp_backward_jump() {
     let result = db
         .execute("SELECT COUNT(*) FROM t", &Default::default())
         .expect("SELECT COUNT must succeed");
-    assert_eq!(result.rows.len(), 1, "COUNT returns exactly one row");
+    assert_eq!(result.rows().len(), 1, "COUNT returns exactly one row");
     assert_eq!(
-        result.rows[0][0],
+        result.rows()[0][0],
         Value::Int64(1),
         "row with created_at > now must survive pruning (saturating_sub semantics)"
     );
@@ -2315,7 +2315,7 @@ fn retention_expiry_budget_refusal_publishes_nothing_and_ownership_releases_once
             &p()
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         1
     );
@@ -2329,7 +2329,7 @@ fn retention_expiry_budget_refusal_publishes_nothing_and_ownership_releases_once
             snapshot
         )
         .unwrap()
-        .rows
+        .rows()
         .len(),
         1
     );

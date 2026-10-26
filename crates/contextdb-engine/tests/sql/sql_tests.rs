@@ -216,7 +216,7 @@ fn vector_search_and_explain() {
             &params(vec![("q", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap();
-    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows().len(), 1);
 
     let explain = db
         .explain("SELECT * FROM observations ORDER BY embedding <=> $q LIMIT 1")
@@ -290,7 +290,7 @@ fn parameter_binding_and_uuid_text_coercion() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows().len(), 1);
 }
 
 #[test]
@@ -905,17 +905,17 @@ fn test_insert_value_txid_within_watermark_succeeds() {
         .execute("SELECT * FROM t", &empty)
         .expect("SELECT * FROM t must succeed");
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "exactly one row must be stored after the single insert",
     );
     let x_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "x")
         .expect("result must have column \"x\"");
     assert_eq!(
-        result.rows[0][x_idx],
+        result.rows()[0][x_idx],
         Value::TxId(TxId(2)),
         "stored value must round-trip equal to Value::TxId(TxId(2))",
     );
@@ -970,7 +970,7 @@ fn test_insert_value_txid_beyond_watermark_rejected() {
     let rows = db
         .execute("SELECT * FROM t", &Default::default())
         .expect("SELECT must succeed")
-        .rows;
+        .rows().to_vec();
     assert_eq!(rows.len(), 0, "rejected insert must not commit any row");
 }
 
@@ -1055,17 +1055,17 @@ fn test_insert_null_respects_txid_nullability() {
         .execute("SELECT * FROM t_null", &empty)
         .expect("SELECT * FROM t_null must succeed");
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "exactly one row must be stored in t_null",
     );
     let x_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "x")
         .expect("result must have column \"x\"");
     assert_eq!(
-        result.rows[0][x_idx],
+        result.rows()[0][x_idx],
         Value::Null,
         "stored value must round-trip as Value::Null",
     );

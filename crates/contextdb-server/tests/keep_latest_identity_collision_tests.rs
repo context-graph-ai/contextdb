@@ -100,7 +100,7 @@ fn outcomes(db: &Database) -> Vec<(String, String)> {
         )
         .expect("outcome scan");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Text(id), Value::Text(notes)) => (id.clone(), notes.clone()),

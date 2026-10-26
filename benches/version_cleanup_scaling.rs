@@ -190,7 +190,7 @@ fn row_count(db: &Database, table: &str) -> i64 {
     let result = db
         .execute(&format!("SELECT COUNT(*) FROM {table}"), &empty())
         .expect("count query");
-    match &result.rows[0][0] {
+    match &result.rows()[0][0] {
         Value::Int64(n) => *n,
         other => panic!("expected COUNT(*) to return an integer, got {other:?}"),
     }

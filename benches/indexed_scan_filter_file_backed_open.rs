@@ -47,12 +47,12 @@ fn insert_rows(path: &std::path::Path) -> Uuid {
 fn assert_reopened(path: &std::path::Path, sampled_id: Uuid) {
     let db = Database::open(path).unwrap();
     let count = db.execute("SELECT COUNT(*) FROM t", &empty()).unwrap();
-    assert_eq!(count.rows, vec![vec![Value::Int64(ROWS)]]);
+    assert_eq!(count.rows(), vec![vec![Value::Int64(ROWS)]]);
     let r = db
         .execute("SELECT id FROM t WHERE bucket = 42", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.rows.len(), 10);
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.rows().len(), 10);
     assert!(db.__rows_examined() <= 50, "got {}", db.__rows_examined());
     let sampled = db
         .execute(
@@ -60,9 +60,9 @@ fn assert_reopened(path: &std::path::Path, sampled_id: Uuid) {
             &params(vec![("id", Value::Uuid(sampled_id))]),
         )
         .unwrap();
-    assert_eq!(sampled.rows.len(), 1);
-    assert_eq!(sampled.rows[0][0], Value::Uuid(sampled_id));
-    assert_eq!(sampled.rows[0][1], Value::Int64(SAMPLE % 10_000));
+    assert_eq!(sampled.rows().len(), 1);
+    assert_eq!(sampled.rows()[0][0], Value::Uuid(sampled_id));
+    assert_eq!(sampled.rows()[0][1], Value::Int64(SAMPLE % 10_000));
 }
 
 fn seed_reopen_and_assert() {

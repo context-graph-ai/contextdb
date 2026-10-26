@@ -44,7 +44,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("read exact row")
-    .rows
+    .rows()
     .first()
     .map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
@@ -488,7 +488,7 @@ async fn fresh_same_key_hub_lineage_survives_stale_descendant_group_and_stale_ed
                 &HashMap::from([("id".to_string(), Value::Uuid(sibling_id))]),
             )
             .expect("count hub sibling")
-            .rows
+            .rows()
             .len(),
         1,
         "the accepted sibling appears at the hub exactly once"

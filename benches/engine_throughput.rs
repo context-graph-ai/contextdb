@@ -109,22 +109,22 @@ fn insert_vectors_direct(
 fn vector_index_bytes(db: &Database, table: &str, column: &str) -> usize {
     let result = db.execute("SHOW VECTOR_INDEXES", &HashMap::new()).unwrap();
     let table_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "table")
         .unwrap();
     let column_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "column")
         .unwrap();
     let bytes_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == "bytes")
         .unwrap();
     result
-        .rows
+        .rows()
         .iter()
         .find_map(|row| {
             let table_matches = matches!(&row[table_idx], Value::Text(value) if value == table);

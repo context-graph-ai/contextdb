@@ -46,7 +46,7 @@ fn assert_has_tables(db: &Database, tables: &[&str], what: &str) {
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     db.execute(sql, &p())
         .unwrap_or_else(|e| panic!("query `{sql}` failed: {e}"))
-        .rows
+        .rows().to_vec()
 }
 
 fn dir_names(dir: &Path) -> Vec<String> {
@@ -281,7 +281,7 @@ fn ce04_vectors_round_trip_search_results_equal() {
             &params(vec![("q", Value::Vector(vec![1.0_f32, 0.0, 0.0]))]),
         )
         .unwrap_or_else(|e| panic!("vector search failed: {e}"))
-        .rows
+        .rows().to_vec()
         .into_iter()
         .map(|mut r| r.remove(0))
         .collect()
@@ -318,13 +318,13 @@ fn ce04_vectors_round_trip_search_results_equal() {
         ];
         let positions = stable_catalog_columns.map(|name| {
             result
-                .columns
+                .columns()
                 .iter()
                 .position(|column| column == name)
                 .unwrap_or_else(|| panic!("SHOW VECTOR_INDEXES omitted {name}"))
         });
         result
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 format!(
@@ -394,28 +394,28 @@ fn ce06_persisted_config_round_trip_disk_limit() {
     let expected_bytes = Value::Int64(1024 * 1024 * 1024);
     let before = src.execute("SHOW DISK_LIMIT", &p()).unwrap();
     assert_eq!(
-        before.rows[0][0], expected_bytes,
+        before.rows()[0][0], expected_bytes,
         "precondition: source SHOW DISK_LIMIT must reflect the set limit at the `limit` cell: {:?}",
-        before.rows
+        before.rows()
     );
 
     src.export_snapshot(&dest).unwrap();
     let artifact = Database::open(&dest).unwrap();
     let after = artifact.execute("SHOW DISK_LIMIT", &p()).unwrap();
     assert_eq!(
-        after.columns,
+        after.columns(),
         vec!["limit", "used", "available", "startup_ceiling"],
         "SHOW DISK_LIMIT column shape on the artifact"
     );
     assert_eq!(
-        after.rows.len(),
+        after.rows().len(),
         1,
         "SHOW DISK_LIMIT returns exactly one row"
     );
     assert_eq!(
-        after.rows[0][0], expected_bytes,
+        after.rows()[0][0], expected_bytes,
         "persisted DISK_LIMIT must survive export at the exact `limit` cell; artifact row: {:?}",
-        after.rows
+        after.rows()
     );
 }
 
@@ -1023,7 +1023,7 @@ fn ce14_in_memory_source_round_trip() {
         )
         .unwrap_or_else(|e| panic!("artifact vector search failed: {e}"));
     assert_eq!(
-        near.rows,
+        near.rows(),
         vec![vec![Value::Int64(2)]],
         "vector search on the artifact must find the in-memory source's nearest row"
     );
@@ -1621,7 +1621,7 @@ fn ce22_vector_index_completeness_at_scale() {
             )]),
         )
         .unwrap_or_else(|e| panic!("{what}: wide vector query failed: {e}"))
-        .rows
+        .rows()
         .into_iter()
         .map(|r| match &r[0] {
             Value::Uuid(u) => *u,
@@ -1637,11 +1637,11 @@ fn ce22_vector_index_completeness_at_scale() {
             )
             .unwrap_or_else(|e| panic!("{what}: beacon query failed: {e}"));
         assert_eq!(
-            result.rows.len(),
+            result.rows().len(),
             1,
             "{what}: beacon query must return exactly one row"
         );
-        result.rows.remove(0).remove(0)
+        result.rows().to_vec().remove(0).remove(0)
     };
     let expected_ids: BTreeSet<Uuid> = (0..999_u128).map(uuid_for).collect();
 
@@ -1714,7 +1714,7 @@ fn checkpoint_preserves_current_and_historical_vectors_in_every_quantization() {
     let artifact = Database::open(&dest).unwrap();
     let sql = "SELECT f32, sq8, sq4 FROM vector_history WHERE id = 1";
     assert_eq!(
-        artifact.execute(sql, &p()).unwrap().rows,
+        artifact.execute(sql, &p()).unwrap().rows(),
         vec![vec![
             stored_vector(&current, VectorQuantization::F32),
             stored_vector(&current, VectorQuantization::SQ8),
@@ -1725,7 +1725,7 @@ fn checkpoint_preserves_current_and_historical_vectors_in_every_quantization() {
         artifact
             .execute_at_snapshot(sql, &p(), old_snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![
             stored_vector(&old, VectorQuantization::F32),
             stored_vector(&old, VectorQuantization::SQ8),
@@ -1802,7 +1802,7 @@ fn checkpoint_uses_one_pinned_durable_source_while_history_pruning_waits() {
     let artifact = Database::open(&dest).unwrap();
     let sql = "SELECT embedding FROM checkpoint_history WHERE id = 1";
     assert_eq!(
-        artifact.execute(sql, &p()).unwrap().rows,
+        artifact.execute(sql, &p()).unwrap().rows(),
         vec![vec![Value::Vector(captured.to_vec())]],
         "the artifact uses the durable source captured before the later commit"
     );
@@ -1810,12 +1810,12 @@ fn checkpoint_uses_one_pinned_durable_source_while_history_pruning_waits() {
         artifact
             .execute_at_snapshot(sql, &p(), old_snapshot)
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Vector(first.to_vec())]],
         "the registered historical version remains usable in the artifact"
     );
     assert_eq!(
-        src.execute(sql, &p()).unwrap().rows,
+        src.execute(sql, &p()).unwrap().rows(),
         vec![vec![Value::Vector(later.to_vec())]],
         "the source continued past the checkpoint boundary"
     );

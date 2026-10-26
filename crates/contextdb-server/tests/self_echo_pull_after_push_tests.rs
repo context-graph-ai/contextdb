@@ -71,12 +71,12 @@ fn only_body(db: &Database, id: i64) -> String {
         .execute("SELECT body FROM notes WHERE id = $id", &params)
         .expect("notes scan");
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "exactly one row must carry id {id}, got {:?}",
-        result.rows
+        result.rows()
     );
-    match &result.rows[0][0] {
+    match &result.rows()[0][0] {
         Value::Text(body) => body.clone(),
         other => panic!("expected a text body, got {other:?}"),
     }

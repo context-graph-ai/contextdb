@@ -3224,7 +3224,7 @@ mod tests {
             ReadLimits::default(),
             contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
                 ReadLimits::default().memory,
-            ),
+            ).expect("the declared read limit is admitted"),
         )
         .expect("a live database opens its own bounded read view")
     }

@@ -52,7 +52,7 @@ fn hot_selects(
     let started = Instant::now();
     for _ in 0..iterations {
         let result = db.execute(sql, params).unwrap();
-        std::hint::black_box(result.rows[0][0].clone());
+        std::hint::black_box(result.rows()[0][0].clone());
     }
     started.elapsed()
 }
@@ -74,14 +74,14 @@ fn bench_context_guard_overhead(c: &mut Criterion) {
         admin
             .execute("SELECT id FROM docs", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         rows as usize
     );
     c.bench_function("tier1_context_guard_overhead/ungated", |b| {
         b.iter(|| {
             let result = admin.execute(hot_sql, &hot_params).unwrap();
-            std::hint::black_box(result.rows[0][0].clone());
+            std::hint::black_box(result.rows()[0][0].clone());
         });
     });
 
@@ -91,7 +91,7 @@ fn bench_context_guard_overhead(c: &mut Criterion) {
         gated
             .execute("SELECT id, context_id FROM docs", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         (rows / 2) as usize
     );
@@ -99,7 +99,7 @@ fn bench_context_guard_overhead(c: &mut Criterion) {
         gated
             .execute("SELECT context_id FROM docs", &empty())
             .unwrap()
-            .rows
+            .rows()
             .iter()
             .all(|row| row[0] == Value::Uuid(ctx_a))
     );
@@ -121,7 +121,7 @@ fn bench_context_guard_overhead(c: &mut Criterion) {
     c.bench_function("tier1_context_guard_overhead/gated", |b| {
         b.iter(|| {
             let result = gated.execute(hot_sql, &hot_params).unwrap();
-            std::hint::black_box(result.rows[0][0].clone());
+            std::hint::black_box(result.rows()[0][0].clone());
         });
     });
 }

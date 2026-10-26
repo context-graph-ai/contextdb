@@ -250,10 +250,10 @@ fn compact_now_resets_the_automatic_paths_interval_clock() {
 
 fn col_idx(result: &contextdb_engine::QueryResult, name: &str) -> usize {
     result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == name)
-        .unwrap_or_else(|| panic!("column '{name}' not found in {:?}", result.columns))
+        .unwrap_or_else(|| panic!("column '{name}' not found in {:?}", result.columns()))
 }
 
 /// A compaction restores steady-state write cost, not just file size, by
@@ -295,7 +295,7 @@ fn compact_now_recycles_the_handle_and_reports_it_honestly() {
         .expect("a query right after compact_now must succeed through the recycled handle");
     let idx = col_idx(&result, "capability_id");
     let node_idx = col_idx(&result, "node_id");
-    let found = result.rows.iter().any(|row| {
+    let found = result.rows().iter().any(|row| {
         row[node_idx] == Value::Text("node-marker".to_string())
             && row[idx] == Value::Text("cap-marker".to_string())
     });
@@ -303,7 +303,7 @@ fn compact_now_recycles_the_handle_and_reports_it_honestly() {
         found,
         "the row written before compaction must still be readable through the same handle \
          right after the recycle: {:?}",
-        result.rows
+        result.rows()
     );
 }
 
@@ -349,13 +349,13 @@ fn a_failed_handle_recycle_leaves_the_file_intact_and_a_fresh_open_recovers() {
         .expect("a fresh open must read back every row, including what compaction reclaimed");
     let idx = col_idx(&result, "capability_id");
     let node_idx = col_idx(&result, "node_id");
-    let found = result.rows.iter().any(|row| {
+    let found = result.rows().iter().any(|row| {
         row[node_idx] == Value::Text("node-marker".to_string())
             && row[idx] == Value::Text("cap-marker".to_string())
     });
     assert!(
         found,
         "the marker row must survive a failed handle recycle followed by a fresh open: {:?}",
-        result.rows
+        result.rows()
     );
 }

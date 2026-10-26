@@ -34,7 +34,7 @@ fn assert_distinct_tags(db: &Database) {
     let result = db
         .execute("SELECT DISTINCT tag FROM items", &empty())
         .unwrap();
-    assert_eq!(result.rows.len(), 100);
+    assert_eq!(result.rows().len(), 100);
 }
 
 fn seed_and_assert() {

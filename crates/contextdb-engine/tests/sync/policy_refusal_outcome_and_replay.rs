@@ -292,7 +292,7 @@ async fn data_held_after_policy_refusal_replays_when_a_corrected_unit_releases_t
         hub.db
             .execute("SELECT body FROM notes", &params())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     within(client.shutdown()).await;
@@ -318,7 +318,7 @@ async fn data_held_after_policy_refusal_replays_when_a_corrected_unit_releases_t
         hub.db
             .execute("SELECT body FROM notes", &params())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("held until correction".into())]],
         "the earlier row remains owed after its cursor passed and must replay exactly once"
     );
@@ -330,7 +330,7 @@ async fn data_held_after_policy_refusal_replays_when_a_corrected_unit_releases_t
         hub.db
             .execute("SELECT body FROM notes", &params())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -804,7 +804,7 @@ async fn a_recreated_edges_new_life_does_not_inherit_or_release_its_old_policy_h
         hub.db
             .execute("SELECT id FROM links", &params())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(uuid::Uuid::from_u128(0xB001))]],
         "only the new life's row reaches the hub"
     );

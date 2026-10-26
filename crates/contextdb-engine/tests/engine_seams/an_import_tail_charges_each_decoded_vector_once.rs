@@ -1061,7 +1061,7 @@ fn a_committed_lsn_larger_than_a_lowered_limit_is_absorbed_by_a_bounded_rebuild(
             &HashMap::new()
         )
         .unwrap()
-        .rows,
+        .rows(),
         vec![vec![Value::Int64(BASE_ROWS + rows as i64 + 1)]]
     );
 }

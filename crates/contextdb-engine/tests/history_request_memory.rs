@@ -191,7 +191,7 @@ fn change_history(
         .metadata(DirectMetadataRequest::ImageState {
             kind: DirectImageMetadataKind::ChangeLog,
         })
-        .map(|response| match response.body {
+        .map(|response| match response.body.clone() {
             DirectMetadataBody::ImageState {
                 state: DirectImageState::ChangeLog(changes),
             } => changes.ddl.len(),
@@ -223,7 +223,7 @@ fn sync_state(
         .metadata(DirectMetadataRequest::ImageState {
             kind: DirectImageMetadataKind::Sync,
         })
-        .map(|response| match response.body {
+        .map(|response| match response.body.clone() {
             DirectMetadataBody::ImageState {
                 state: DirectImageState::Sync(state),
             } => state.tables.len(),
@@ -2074,7 +2074,7 @@ fn a_refused_lineage_scratch_reservation_copies_nothing() {
             ..
         }) => {
             assert_eq!(
-                (subsystem.as_str(), operation.as_str(), requested_bytes),
+                (subsystem.as_ref(), operation.as_ref(), requested_bytes),
                 ("lineage_config", "authenticate", 2 * largest_copied_record),
                 "the refused reservation is the record's authentication copy"
             );

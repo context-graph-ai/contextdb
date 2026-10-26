@@ -177,7 +177,7 @@ fn reopen_and_assert(path: &Path, rows: usize, total_index_slots: usize) {
         "open maintenance visits must match rows times table-local index slots"
     );
     let count = db.execute("SELECT COUNT(*) FROM t", &empty()).unwrap();
-    assert_eq!(count.rows, vec![vec![Value::Int64(rows as i64)]]);
+    assert_eq!(count.rows(), vec![vec![Value::Int64(rows as i64)]]);
 }
 
 fn reopen_row_counts() -> Vec<usize> {
@@ -219,7 +219,7 @@ fn insert_wide_rows_by_commit_size(db: &Database, rows_per_commit: usize) {
         start += batch;
     }
     let count = db.execute("SELECT COUNT(*) FROM t", &empty()).unwrap();
-    assert_eq!(count.rows, vec![vec![Value::Int64(WIDE_TOTAL_ROWS as i64)]]);
+    assert_eq!(count.rows(), vec![vec![Value::Int64(WIDE_TOTAL_ROWS as i64)]]);
 }
 
 fn bench_wide_batch_size_comparator(c: &mut Criterion) {
@@ -271,7 +271,7 @@ fn insert_file_autocommit_rows(path: &Path) {
     }
     let count = db.execute("SELECT COUNT(*) FROM t", &empty()).unwrap();
     assert_eq!(
-        count.rows,
+        count.rows(),
         vec![vec![Value::Int64(FILE_AUTOCOMMIT_ROWS as i64)]]
     );
 }

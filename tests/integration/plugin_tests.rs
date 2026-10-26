@@ -988,7 +988,7 @@ fn p15e_on_ddl_veto_drop_table() {
     // Verify we can still query the table
     let result = db.execute("SELECT * FROM widgets", &p).unwrap();
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         0,
         "table must be queryable after vetoed DROP"
     );
@@ -1034,7 +1034,7 @@ fn p15f_on_ddl_veto_alter_table() {
     .unwrap();
     let result = db.execute("SELECT * FROM people", &p).unwrap();
     assert_eq!(
-        result.columns.len(),
+        result.columns().len(),
         2,
         "schema must still have exactly 2 columns (id, name)"
     );

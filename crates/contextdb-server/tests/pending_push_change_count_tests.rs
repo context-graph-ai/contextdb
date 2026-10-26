@@ -242,7 +242,7 @@ async fn pending_push_change_count_matches_the_authenticated_iroh_push_set_acros
         )
         .expect("read hub control row");
     assert_eq!(
-        hub_control.rows,
+        hub_control.rows(),
         vec![vec![Value::Text("real Iroh exchange".to_string())]],
         "hub state confirms the authenticated control exchange completed"
     );

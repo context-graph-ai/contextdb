@@ -113,8 +113,8 @@ fn assert_durable(fixture: &DrainFixture) {
     let r = reopened
         .execute("SELECT id FROM evidence", &empty_params())
         .expect("select");
-    let id_idx = r.columns.iter().position(|c| c == "id").unwrap();
-    let returned: Vec<Value> = r.rows.iter().map(|row| row[id_idx].clone()).collect();
+    let id_idx = r.columns().iter().position(|c| c == "id").unwrap();
+    let returned: Vec<Value> = r.rows().iter().map(|row| row[id_idx].clone()).collect();
     assert!(
         returned.contains(&Value::Uuid(fixture.in_flight_id)),
         "first in-flight commit must survive graceful drain"

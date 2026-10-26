@@ -78,7 +78,7 @@ fn p() -> HashMap<String, Value> {
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"))
-        .rows
+        .rows()
         .len()
 }
 
@@ -1848,12 +1848,12 @@ async fn lost_ack_recovery_pulls_a_newer_hub_edit_without_replaying_the_stale_ed
         .db
         .execute("SELECT body FROM notes WHERE id = 1", &p())
         .expect("hub read")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     let edge_body = edge
         .execute("SELECT body FROM notes WHERE id = 1", &p())
         .expect("edge read")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     assert_eq!(hub_body, Value::Text("hub-newer".to_string()));
     assert_eq!(
@@ -1915,12 +1915,12 @@ async fn reopened_edge_reconciles_pending_lost_ack_before_it_can_resend_old_rows
         .db
         .execute("SELECT body FROM notes WHERE id = 1", &p())
         .expect("hub read")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     let edge_body = reopened
         .execute("SELECT body FROM notes WHERE id = 1", &p())
         .expect("edge read")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     assert_eq!(hub_body, Value::Text("hub-newer".to_string()));
     assert_eq!(
@@ -2107,7 +2107,7 @@ async fn lost_refusal_reply_keeps_original_diagnostics_after_a_newer_hub_edit() 
         loser
             .execute("SELECT body FROM windows", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("refused-value".to_string())]],
         "push-only content never arrives by pull"
     );
@@ -2121,7 +2121,7 @@ async fn lost_refusal_reply_keeps_original_diagnostics_after_a_newer_hub_edit() 
         hub.db
             .execute("SELECT body FROM windows", &p())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("newer-hub-value".to_string())]]
     );
     hub.stop().await;
@@ -2246,7 +2246,7 @@ async fn accepted_delete_replay_retires_only_its_adjudicated_work_across_reopen(
     );
     assert!(!resumed.has_pending_push_changes().unwrap());
     assert_eq!(
-        hub.db.execute("SELECT id FROM notes", &p()).unwrap().rows,
+        hub.db.execute("SELECT id FROM notes", &p()).unwrap().rows(),
         vec![vec![Value::Int64(2)]]
     );
     hub.stop().await;

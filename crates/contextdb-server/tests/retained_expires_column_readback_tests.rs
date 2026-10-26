@@ -62,12 +62,12 @@ fn bodies(db: &Database, table: &str) -> Vec<String> {
         .execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("{table} scan must succeed: {err}"));
     let body_index = result
-        .columns
+        .columns()
         .iter()
         .position(|column| column == "body")
-        .unwrap_or_else(|| panic!("{table} must expose a body column: {:?}", result.columns));
+        .unwrap_or_else(|| panic!("{table} must expose a body column: {:?}", result.columns()));
     let mut out: Vec<String> = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(body_index) {
             Some(Value::Text(text)) => text.clone(),

@@ -25,11 +25,11 @@ fn assert_posting_refusal(error: &Error, limit: usize) {
     {
         assert!(!attributed(&Error::MemoryBudgetExceeded {
             subsystem: "writer_source".to_owned().into(),
-            operation: operation.clone(),
+            operation: operation.to_string().into(),
             requested_bytes: *requested_bytes,
             available_bytes: *available_bytes,
             budget_limit_bytes: *budget_limit_bytes,
-            hint: hint.clone()
+            hint: hint.to_string().into()
         }));
     }
 }
@@ -281,9 +281,9 @@ fn m03_delete_reclaims_memory_for_insert() {
             &make_params(vec![("id", Value::Uuid(id3))]),
         )
         .expect("SELECT after re-insert must succeed");
-    assert_eq!(select.rows.len(), 1, "must find exactly one row");
+    assert_eq!(select.rows().len(), 1, "must find exactly one row");
     assert_eq!(
-        select.rows[0][0],
+        select.rows()[0][0],
         Value::Text("third".to_string()),
         "row must contain 'third'"
     );
@@ -329,7 +329,7 @@ fn m04_vector_search_succeeds_under_budget() {
         result.is_ok(),
         "vector search under budget must succeed: {result:?}"
     );
-    assert_eq!(result.unwrap().rows.len(), 3);
+    assert_eq!(result.unwrap().rows().len(), 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +470,7 @@ fn m07_bfs_succeeds_under_budget() {
     );
     assert!(result.is_ok(), "BFS under budget must succeed: {result:?}");
     assert_eq!(
-        result.unwrap().rows.len(),
+        result.unwrap().rows().len(),
         2,
         "BFS from A must find exactly B and C"
     );
@@ -541,7 +541,7 @@ fn m09_set_and_show_memory_limit() {
     // SHOW MEMORY_LIMIT must reflect the set value.
     let show_result = db.execute("SHOW MEMORY_LIMIT", &empty()).unwrap();
     assert_eq!(
-        show_result.columns,
+        show_result.columns(),
         vec![
             "limit",
             "used",
@@ -550,9 +550,9 @@ fn m09_set_and_show_memory_limit() {
             "ceiling_refresh_failures"
         ]
     );
-    assert_eq!(show_result.rows.len(), 1);
+    assert_eq!(show_result.rows().len(), 1);
 
-    let limit_val = &show_result.rows[0][0];
+    let limit_val = &show_result.rows()[0][0];
     match limit_val {
         Value::Text(s) => assert_eq!(s, "536870912", "limit must be 512M in bytes"),
         Value::Int64(n) => assert_eq!(*n, 536870912, "limit must be 512M in bytes"),
@@ -572,7 +572,7 @@ fn m10_set_memory_limit_none_removes_limit() {
 
     // Verify it was set.
     let show1 = db.execute("SHOW MEMORY_LIMIT", &empty()).unwrap();
-    let limit1 = &show1.rows[0][0];
+    let limit1 = &show1.rows()[0][0];
     let is_set = match limit1 {
         Value::Text(s) => s != "none",
         Value::Int64(n) => *n > 0,
@@ -586,7 +586,7 @@ fn m10_set_memory_limit_none_removes_limit() {
 
     // Verify limit is removed.
     let show2 = db.execute("SHOW MEMORY_LIMIT", &empty()).unwrap();
-    let limit2 = &show2.rows[0][0];
+    let limit2 = &show2.rows()[0][0];
     match limit2 {
         Value::Text(s) => assert_eq!(s, "none", "limit must be 'none' after removal"),
         Value::Int64(n) => assert_eq!(*n, 0, "limit must be 0 after removal"),
@@ -743,11 +743,11 @@ fn m12_open_with_config_wires_accountant() {
     {
         assert!(!attributed(&Error::MemoryBudgetExceeded {
             subsystem: "relational_index".to_owned().into(),
-            operation: operation.clone(),
+            operation: operation.to_string().into(),
             requested_bytes: *requested_bytes,
             available_bytes: *available_bytes,
             budget_limit_bytes: *budget_limit_bytes,
-            hint: hint.clone()
+            hint: hint.to_string().into()
         }));
     }
     eprintln!("m12 refusal={error:?}");
@@ -755,7 +755,7 @@ fn m12_open_with_config_wires_accountant() {
     assert_eq!(
         db.execute("SELECT * FROM items", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0
     );
@@ -772,7 +772,7 @@ fn m12_open_with_config_wires_accountant() {
         reader
             .execute("SELECT name FROM items", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Text("ok".to_owned())]]
     );
 }
@@ -1176,9 +1176,9 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
             &make_params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(select.rows.len(), 1);
+    assert_eq!(select.rows().len(), 1);
     assert_eq!(
-        select.rows[0][0],
+        select.rows()[0][0],
         Value::Text("small".to_string()),
         "original row must be unchanged after failed UPDATE"
     );
@@ -1194,7 +1194,7 @@ fn mt2_update_rejection_leaves_accounting_unchanged() {
     )
     .unwrap();
     assert_eq!(
-        db.execute("SELECT name FROM items", &empty()).unwrap().rows,
+        db.execute("SELECT name FROM items", &empty()).unwrap().rows(),
         vec![vec![Value::Text("fits".to_owned())]]
     );
 }

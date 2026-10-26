@@ -139,7 +139,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
         .expect("read exact note");
-    result.rows.first().map(|row| match &row[0] {
+    result.rows().first().map(|row| match &row[0] {
         Value::Text(value) => value.clone(),
         other => panic!("notes.body must be TEXT, got {other:?}"),
     })
@@ -152,7 +152,7 @@ fn keep_first_body(db: &Database, id: Uuid) -> Option<String> {
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
         .expect("read keep-first note");
-    result.rows.first().map(|row| match &row[0] {
+    result.rows().first().map(|row| match &row[0] {
         Value::Text(value) => value.clone(),
         other => panic!("first_notes.body must be TEXT, got {other:?}"),
     })
@@ -172,7 +172,7 @@ fn assert_absent(db: &Database, id: Uuid, place: &str) {
 fn note_keys(db: &Database) -> BTreeSet<Uuid> {
     db.execute("SELECT id FROM notes", &HashMap::new())
         .expect("select exact note keys")
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row[0] {
             Value::Uuid(id) => id,
@@ -810,18 +810,18 @@ fn maintain_notes_vector_index_until_complete(db: &Database, place: &str) {
             )
             .unwrap_or_else(|error| panic!("inspect {place} vector serving state: {error}"));
         let query_state = partitions
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "query_state")
             .unwrap_or_else(|| panic!("{place} inspection must report query_state"));
         let maintenance_state = partitions
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "maintenance_state")
             .unwrap_or_else(|| panic!("{place} inspection must report maintenance_state"));
-        if partitions.rows.len() == 1
-            && partitions.rows[0].get(query_state) == Some(&Value::Text("ready".to_string()))
-            && partitions.rows[0].get(maintenance_state) == Some(&Value::Text("idle".to_string()))
+        if partitions.rows().len() == 1
+            && partitions.rows()[0].get(query_state) == Some(&Value::Text("ready".to_string()))
+            && partitions.rows()[0].get(maintenance_state) == Some(&Value::Text("idle".to_string()))
         {
             return;
         }
@@ -869,16 +869,16 @@ fn graph_targets(db: &Database, source: Uuid) -> BTreeSet<Uuid> {
         )
         .expect("traverse exact graph source");
     assert_eq!(
-        result.trace.physical_plan, "AdjacencyProbe",
+        result.trace().physical_plan, "AdjacencyProbe",
         "graph proof must read the production adjacency index"
     );
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some("forward_adj"),
         "graph proof must read the forward adjacency index"
     );
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row[0] {
             Value::Uuid(id) => id,
@@ -957,7 +957,7 @@ fn work_job_ids(db: &Database, job_id: &str) -> Vec<String> {
         &HashMap::from([("job_id".to_string(), Value::Text(job_id.to_string()))]),
     )
     .expect("query exact work-ledger referent")
-    .rows
+    .rows()
     .into_iter()
     .map(|row| match &row[0] {
         Value::Text(value) => value.clone(),
@@ -1094,7 +1094,7 @@ fn assert_restored_purge(
         )
         .unwrap_or_else(|error| panic!("materialize {place} ANN/HNSW state: {error}"));
     assert!(
-        vector_plan.trace.physical_plan.contains("HNSWSearch"),
+        vector_plan.trace().physical_plan.contains("HNSWSearch"),
         "{place} vector proof must exercise ANN/HNSW"
     );
     let hnsw_len = restored
@@ -1132,12 +1132,12 @@ fn assert_restored_purge(
         )
         .unwrap_or_else(|error| panic!("inspect {place} selected index entry: {error}"));
     assert_eq!(
-        selected_lookup.trace.index_used.as_deref(),
+        selected_lookup.trace().index_used.as_deref(),
         Some("notes_body_idx"),
         "{place} selected absence proof must use the relational index"
     );
     assert!(
-        selected_lookup.rows.is_empty(),
+        selected_lookup.rows().is_empty(),
         "{place} relational index must not serve the selected payload"
     );
     let survivor_lookup = restored
@@ -1147,12 +1147,12 @@ fn assert_restored_purge(
         )
         .unwrap_or_else(|error| panic!("inspect {place} survivor index entry: {error}"));
     assert_eq!(
-        survivor_lookup.trace.index_used.as_deref(),
+        survivor_lookup.trace().index_used.as_deref(),
         Some("notes_body_idx"),
         "{place} survivor proof must use the relational index"
     );
     assert_eq!(
-        survivor_lookup.rows,
+        survivor_lookup.rows(),
         vec![vec![Value::Uuid(survivor)]],
         "{place} relational index keeps the survivor"
     );
@@ -1630,7 +1630,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
                 held_snapshot,
             )
             .expect("read superseded selected version through open snapshot")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("selected-secret-before-edit".to_string())]],
         "fixture must hold and inspect the selected superseded version"
     );
@@ -1644,7 +1644,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         )
         .expect("materialize production vector search");
     assert!(
-        vector_query.trace.physical_plan.contains("HNSWSearch")
+        vector_query.trace().physical_plan.contains("HNSWSearch")
             && edge_a
                 .__debug_vector_hnsw_len(VectorIndexRef::new("notes", "embedding"))
                 .is_some(),
@@ -1657,7 +1657,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
                 &HashMap::new(),
             )
             .expect("probe secondary relational index")
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(selected)]],
         "secondary-index lookup must expose the selected row before purge"
     );
@@ -1743,7 +1743,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             "{place} pre-purge HNSW graph must contain the selected node and exactly 1,000 survivors"
         );
         assert!(
-            search.trace.physical_plan.contains("HNSWSearch") && hnsw_len > 0,
+            search.trace().physical_plan.contains("HNSWSearch") && hnsw_len > 0,
             "{place} must hold a materialized ANN/HNSW copy before purge"
         );
         let vectors = db
@@ -1768,12 +1768,12 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             )
             .unwrap_or_else(|error| panic!("read {place} secondary index: {error}"));
         assert_eq!(
-            indexed.rows,
+            indexed.rows(),
             vec![vec![Value::Uuid(selected)]],
             "{place} secondary index must serve the selected row before purge"
         );
         assert_eq!(
-            indexed.trace.index_used.as_deref(),
+            indexed.trace().index_used.as_deref(),
             Some("notes_body_idx"),
             "{place} proof must read the production secondary index"
         );
@@ -1802,7 +1802,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             )
             .unwrap_or_else(|error| panic!("inspect {place} sink source rows: {error}"));
         assert_eq!(
-            queued_rows.rows.len(),
+            queued_rows.rows().len(),
             2,
             "{place} must enqueue selected and survivor events before callback registration"
         );
@@ -2052,7 +2052,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             )
             .unwrap_or_else(|error| panic!("rebuild {place} ANN graph after purge: {error}"));
         assert!(
-            rebuilt_search.trace.physical_plan.contains("HNSWSearch"),
+            rebuilt_search.trace().physical_plan.contains("HNSWSearch"),
             "{place} must rematerialize the production HNSW path after purge"
         );
         let selected_tail_copies = db.__debug_vector_hnsw_raw_entry_count_for_row_for_test(
@@ -2106,12 +2106,12 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             )
             .unwrap_or_else(|error| panic!("inspect {place} secondary index after purge: {error}"));
         assert_eq!(
-            indexed_absence.rows,
+            indexed_absence.rows(),
             Vec::<Vec<Value>>::new(),
             "{place} secondary relational index must not serve the selected row"
         );
         assert_eq!(
-            indexed_absence.trace.index_used.as_deref(),
+            indexed_absence.trace().index_used.as_deref(),
             Some("notes_body_idx"),
             "{place} absence proof must read the production secondary index"
         );
@@ -2122,12 +2122,12 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
             )
             .unwrap_or_else(|error| panic!("read {place} indexed decoy after purge: {error}"));
         assert_eq!(
-            indexed_decoy.rows,
+            indexed_decoy.rows(),
             vec![vec![Value::Uuid(survivor)]],
             "{place} secondary index keeps the unrelated decoy"
         );
         assert_eq!(
-            indexed_decoy.trace.index_used.as_deref(),
+            indexed_decoy.trace().index_used.as_deref(),
             Some("notes_body_idx"),
             "{place} decoy proof must read the production secondary index"
         );
@@ -2157,7 +2157,7 @@ async fn authoritative_purge_removes_every_engine_held_copy() {
         held_snapshot,
     ) {
         assert_eq!(
-            held_read.rows,
+            held_read.rows(),
             Vec::<Vec<Value>>::new(),
             "a still-readable pre-purge snapshot must not expose the removed lineage"
         );
@@ -3477,7 +3477,7 @@ async fn post_purge_backup_preserves_absence() {
         .expect("materialize pre-purge backup HNSW graph");
     assert!(
         before_vector_plan
-            .trace
+            .trace()
             .physical_plan
             .contains("HNSWSearch"),
         "backup fixture must capture real ANN/HNSW state"
@@ -3771,7 +3771,7 @@ async fn purge_reaches_push_only_table_and_refuses_stale_lineage() {
                 &HashMap::from([("id".to_string(), Value::Uuid(id))]),
             )
             .expect("read hub one-way row")
-            .rows,
+            .rows(),
         vec![vec![Value::Text(
             "must-be-purged-from-one-way-lane".to_string()
         )]],
@@ -3783,7 +3783,7 @@ async fn purge_reaches_push_only_table_and_refuses_stale_lineage() {
             &HashMap::from([("id".to_string(), Value::Uuid(sentinel_id))]),
         )
         .expect("read edge before purge pull")
-        .rows
+        .rows()
         .is_empty(),
         "ordinary hub-only push-only rows stay absent before purge delivery"
     );
@@ -3805,7 +3805,7 @@ async fn purge_reaches_push_only_table_and_refuses_stale_lineage() {
             &HashMap::from([("id".to_string(), Value::Uuid(sentinel_id))]),
         )
         .expect("read edge after purge pull")
-        .rows
+        .rows()
         .is_empty(),
         "the purge plane crosses without pulling the unrelated hub-only row downward"
     );
@@ -3816,7 +3816,7 @@ async fn purge_reaches_push_only_table_and_refuses_stale_lineage() {
                 &HashMap::from([("id".to_string(), Value::Uuid(id))]),
             )
             .unwrap_or_else(|error| panic!("read {place} after purge: {error}"))
-            .rows
+            .rows()
             .is_empty(),
             "{place} must keep the purged one-way row absent"
         );
@@ -3886,7 +3886,7 @@ async fn purge_reaches_push_only_table_and_refuses_stale_lineage() {
                 &HashMap::from([("id".to_string(), Value::Uuid(id))]),
             )
             .expect("read live hub after stale descendant refusal")
-            .rows
+            .rows()
             .is_empty(),
         "the live hub keeps the purged one-way row absent after refusing the stale descendant"
     );
@@ -3900,7 +3900,7 @@ async fn purge_reaches_push_only_table_and_refuses_stale_lineage() {
                 &HashMap::from([("id".to_string(), Value::Uuid(id))]),
             )
             .unwrap_or_else(|error| panic!("read {place} after authoritative purge: {error}"))
-            .rows
+            .rows()
             .is_empty(),
             "{place} keeps the purged one-way row absent"
         );
@@ -3918,7 +3918,7 @@ async fn purge_reaches_push_only_table_and_refuses_stale_lineage() {
                 &HashMap::from([("id".to_string(), Value::Uuid(sentinel_id))]),
             )
             .expect("read stale edge after authoritative purge")
-            .rows
+            .rows()
             .is_empty(),
         "the purge plane does not pull the unrelated hub-only push-only sentinel downward"
     );
@@ -3970,11 +3970,11 @@ async fn shared_blob_purge_names_the_remaining_referent() {
         )
         .expect("authoritative purge selects the work-ledger referent");
     assert_eq!(
-        purge_result.rows_affected, 1,
+        purge_result.rows_affected(), 1,
         "purge reports the one selected work-ledger referent"
     );
     let report =
-        serde_json::to_string(&purge_result.rows).expect("purge survivor report serializes");
+        serde_json::to_string(&purge_result.rows()).expect("purge survivor report serializes");
     assert!(
         report.contains("remaining-job"),
         "purge result must name the surviving job that still references the shared blob: {report}"
@@ -3984,7 +3984,7 @@ async fn shared_blob_purge_names_the_remaining_referent() {
         .execute("SELECT job_id FROM work_jobs", &HashMap::new())
         .expect("read surviving work-ledger referent");
     assert_eq!(
-        jobs.rows,
+        jobs.rows(),
         vec![vec![Value::Text("remaining-job".to_string())]],
         "only the named remaining job keeps the shared input live"
     );

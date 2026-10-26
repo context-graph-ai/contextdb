@@ -137,9 +137,9 @@ async fn established_owner_vector_update_syncs_before_delete_arbitration() {
                 &HashMap::new(),
             )
             .expect("SQL owner and vector");
-        assert_eq!(sql.rows.len(), 1, "owner remains present with exact key");
+        assert_eq!(sql.rows().len(), 1, "owner remains present with exact key");
         assert_eq!(
-            sql.rows[0],
+            sql.rows()[0],
             vec![
                 Value::Text("owner first".to_string()),
                 Value::Vector(vec![1.0, 0.0, 0.0]),

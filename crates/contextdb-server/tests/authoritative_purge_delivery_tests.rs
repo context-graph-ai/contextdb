@@ -49,7 +49,7 @@ fn note_body(db: &Database, id: Uuid) -> Option<String> {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("read exact note")
-    .rows
+    .rows()
     .first()
     .map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
@@ -60,7 +60,7 @@ fn note_body(db: &Database, id: Uuid) -> Option<String> {
 fn note_ids(db: &Database) -> BTreeSet<Uuid> {
     db.execute("SELECT id FROM notes", &HashMap::new())
         .expect("read note keys")
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row[0] {
             Value::Uuid(id) => id,

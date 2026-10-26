@@ -101,7 +101,7 @@ fn assert_records(db: &Database, ids: &[i64]) {
                 &empty()
             )
             .unwrap()
-            .rows,
+            .rows(),
             expected,
             "durable records in {table}"
         );
@@ -141,7 +141,7 @@ fn read_only_uncertainty(path: &std::path::Path, route: ReadRoute) -> (u64, u64)
     let answer = session
         .metadata(MetadataRequest::EventsStatus, None)
         .expect("read event status");
-    let MetadataBody::EventsStatus { status, .. } = answer.body else {
+    let MetadataBody::EventsStatus { status, .. } = answer.body.clone() else {
         panic!("expected event status");
     };
     let sink = status
@@ -709,7 +709,7 @@ fn scheduled_action_identity_survives_drained_queue_and_restart() {
         reopened
             .execute("SELECT id FROM scheduled_actions ORDER BY id", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
     );
 }
@@ -823,7 +823,7 @@ fn full_sink_queue_refuses_scheduled_row_and_delivery_together() {
     assert_eq!(
         db.execute("SELECT id FROM scheduled_actions ORDER BY id", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]],
         "full queue refuses the scheduled row commit"
     );
@@ -835,7 +835,7 @@ fn full_sink_queue_refuses_scheduled_row_and_delivery_together() {
         reopened
             .execute("SELECT id FROM scheduled_actions ORDER BY id", &empty())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Int64(1)]]
     );
     assert_eq!(reopened.sink_metrics("outgoing").queued, 1);

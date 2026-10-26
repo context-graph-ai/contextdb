@@ -100,7 +100,7 @@ async fn decoded_old_pull_row_cannot_apply_after_a_destination_move() {
     assert!(
         edge.execute("SELECT * FROM notes WHERE id = 41", &HashMap::new())
             .expect("inspect edge after rejected old pull")
-            .rows
+            .rows()
             .is_empty(),
         "the decoded old-hub row cannot become visible after the move"
     );
@@ -202,7 +202,7 @@ async fn decoded_pull_row_obeys_sync_off_declared_before_apply() {
     assert!(
         edge.execute("SELECT * FROM notes WHERE id = 42", &HashMap::new())
             .expect("inspect edge after SYNC OFF")
-            .rows
+            .rows()
             .is_empty(),
         "a row decoded before SYNC OFF must still obey the declaration current at apply"
     );

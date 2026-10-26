@@ -648,13 +648,13 @@ fn run_scan_hub(db_path: &str, marker: &str) {
             eprintln!("[scan-hub] could not scan table {table}; skipping");
             continue;
         };
-        if table == "work_jobs" && !result.rows.is_empty() {
+        if table == "work_jobs" && !result.rows().is_empty() {
             has_job_rows = true;
         }
-        if table == "work_claims" && !result.rows.is_empty() {
+        if table == "work_claims" && !result.rows().is_empty() {
             has_claim_rows = true;
         }
-        for row in &result.rows {
+        for row in result.rows() {
             for value in row {
                 let text = cell_as_text(value);
                 if text.contains(marker) || text.contains(&marker_hex) || text.contains(&marker_b64)

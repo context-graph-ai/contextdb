@@ -42,7 +42,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("read exact note")
-    .rows
+    .rows()
     .first()
     .map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
@@ -374,7 +374,7 @@ async fn fresh_same_key_insert_after_authoritative_purge_starts_new_lineage_and_
             &HashMap::from([("id".to_string(), Value::Uuid(selected_id))]),
         )
         .expect("the hub purges the new life at the purged key");
-    assert_eq!(second_purge.rows_affected, 1);
+    assert_eq!(second_purge.rows_affected(), 1);
     assert_eq!(body(&hub.db, selected_id), None);
     assert_eq!(
         hub.db

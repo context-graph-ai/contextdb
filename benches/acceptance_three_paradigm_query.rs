@@ -136,8 +136,8 @@ fn run_query_and_assert(db: &Database) {
             &params(vec![("query_vec", Value::Vector(vec![1.0, 0.0, 0.0]))]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let desc = match &result.rows[0][1] {
+    assert_eq!(result.rows().len(), 1);
+    let desc = match &result.rows()[0][1] {
         Value::Text(value) => value,
         other => panic!("expected Text for description, got: {other:?}"),
     };

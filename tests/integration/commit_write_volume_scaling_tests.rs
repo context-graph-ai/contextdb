@@ -185,14 +185,14 @@ fn run_measured_mixed_cascade(n: usize) -> contextdb_engine::CommitStageStats {
     assert_eq!(
         db.execute("SELECT id FROM child", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         n
     );
     assert_eq!(
         db.execute("SELECT id FROM edges", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         n
     );
@@ -203,7 +203,7 @@ fn run_measured_mixed_cascade(n: usize) -> contextdb_engine::CommitStageStats {
         )
         .unwrap();
     assert_eq!(
-        invalidated.rows.len(),
+        invalidated.rows().len(),
         n,
         "all N parents must read 'invalidated'"
     );
@@ -513,7 +513,7 @@ fn cwv_04_generality_plain_unique_fk() {
     );
 
     assert_eq!(
-        db.execute("SELECT id FROM c", &empty()).unwrap().rows.len(),
+        db.execute("SELECT id FROM c", &empty()).unwrap().rows().len(),
         N as usize
     );
 }
@@ -559,7 +559,7 @@ fn cwv_04b_single_column_fk_parent_delete_uses_child_index() {
             &params(vec![("id", Value::Int64(N))]),
         )
         .unwrap();
-    assert_eq!(deleted.rows_affected, 1);
+    assert_eq!(deleted.rows_affected(), 1);
 
     let stats = db.__commit_stage_stats();
     assert!(
@@ -621,7 +621,7 @@ fn cwv_04c_single_column_fk_name_collision_keeps_both_child_indexes() {
             &params(vec![("d", Value::Int64(N))]),
         )
         .unwrap();
-    assert_eq!(deleted.rows_affected, 1);
+    assert_eq!(deleted.rows_affected(), 1);
 
     let stats = db.__commit_stage_stats();
     assert!(
@@ -689,7 +689,7 @@ fn cwv_04d_composite_fk_name_collision_keeps_both_child_indexes() {
             &params(vec![("d", Value::Int64(N)), ("e", Value::Int64(N))]),
         )
         .unwrap();
-    assert_eq!(deleted.rows_affected, 1);
+    assert_eq!(deleted.rows_affected(), 1);
 
     let stats = db.__commit_stage_stats();
     assert!(
@@ -962,13 +962,13 @@ fn cwv_04h_single_column_fk_nulls_do_not_block_parent_delete_or_update() {
     assert_eq!(
         db.execute("DELETE FROM p WHERE id = 1", &empty())
             .unwrap()
-            .rows_affected,
+            .rows_affected(),
         1
     );
     assert_eq!(
         db.execute("UPDATE p SET code = 'assigned' WHERE id = 2", &empty())
             .unwrap()
-            .rows_affected,
+            .rows_affected(),
         1
     );
     assert_eq!(
@@ -1265,14 +1265,14 @@ fn cwv_05_trigger_staged_counter_parity() {
         plain
             .execute("SELECT id FROM child", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         N as usize
     );
     assert_eq!(
         trig.execute("SELECT id FROM child", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         N as usize
     );
@@ -1315,7 +1315,7 @@ fn cwv_06_unique_rejection_wins_over_fk() {
         "UNIQUE must surface before FK; got {err:?}"
     );
     let rows = db.execute("SELECT id FROM c", &empty()).unwrap();
-    assert_eq!(rows.rows.len(), 1, "only the original child survives");
+    assert_eq!(rows.rows().len(), 1, "only the original child survives");
 }
 
 #[test]
@@ -1367,7 +1367,7 @@ fn cwv_07_state_machine_illegal_transition_rejected() {
     assert_eq!(
         db.execute("SELECT id FROM child", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0,
         "no child from the rejected tx may survive"
@@ -1378,9 +1378,9 @@ fn cwv_07_state_machine_illegal_transition_rejected() {
             &params(vec![("a", Value::Uuid(a)), ("b", Value::Int64(b))]),
         )
         .unwrap();
-    assert_eq!(parent.rows.len(), 1, "the exact parent row must survive");
+    assert_eq!(parent.rows().len(), 1, "the exact parent row must survive");
     assert_eq!(
-        parent.rows[0][0],
+        parent.rows()[0][0],
         Value::Text("invalidated".to_string()),
         "parent must remain at the exact pre-tx status after rollback"
     );
@@ -1417,7 +1417,7 @@ fn cwv_07b_upsert_illegal_state_transition_rejected() {
         )
         .unwrap();
     assert_eq!(
-        row.rows[0][0],
+        row.rows()[0][0],
         Value::Text("queued".to_string()),
         "conflict row must keep its prior value after a rejected upsert"
     );
@@ -1428,7 +1428,7 @@ fn cwv_07b_upsert_illegal_state_transition_rejected() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .expect("legal upsert transition must succeed");
-    assert_eq!(ok.rows_affected, 1);
+    assert_eq!(ok.rows_affected(), 1);
     let row = db
         .execute(
             "SELECT status FROM jobs WHERE id = $id",
@@ -1436,7 +1436,7 @@ fn cwv_07b_upsert_illegal_state_transition_rejected() {
         )
         .unwrap();
     assert_eq!(
-        row.rows[0][0],
+        row.rows()[0][0],
         Value::Text("running".to_string()),
         "legal upsert hit must apply the post-image, not report success as a no-op"
     );
@@ -1457,7 +1457,7 @@ fn cwv_08_conditional_stale_update_downgrades_to_noop() {
         )
         .unwrap();
     assert_eq!(
-        staged.rows_affected, 1,
+        staged.rows_affected(), 1,
         "positive case: the stale writer matched at execution time"
     );
 
@@ -1468,7 +1468,7 @@ fn cwv_08_conditional_stale_update_downgrades_to_noop() {
         )
         .unwrap();
     assert_eq!(
-        winner.rows_affected, 1,
+        winner.rows_affected(), 1,
         "positive case: concurrent winner updates the committed row"
     );
 
@@ -1481,7 +1481,7 @@ fn cwv_08_conditional_stale_update_downgrades_to_noop() {
             &params(vec![("a", Value::Uuid(a)), ("b", Value::Int64(b))]),
         )
         .unwrap();
-    assert_eq!(row.rows[0][0], Value::Text("invalidated".to_string()));
+    assert_eq!(row.rows()[0][0], Value::Text("invalidated".to_string()));
 }
 
 // A multi-column UNIQUE violation on INSERT is a loud, standard-SQL
@@ -1504,7 +1504,7 @@ fn cwv_09_composite_unique_duplicate_is_refused_loudly() {
             ]),
         )
         .unwrap();
-    assert_eq!(first.rows_affected, 1, "positive: first tuple inserts");
+    assert_eq!(first.rows_affected(), 1, "positive: first tuple inserts");
 
     let err = db
         .execute(
@@ -1524,7 +1524,7 @@ fn cwv_09_composite_unique_duplicate_is_refused_loudly() {
     assert_eq!(
         db.execute("SELECT id FROM child", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1,
         "the refused duplicate must not have added a second row"
@@ -1587,7 +1587,7 @@ fn cwv_10_midset_violation_all_or_nothing() {
     assert_eq!(
         db.execute("SELECT id FROM child", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0,
         "no child from the rolled-back tx survives (not even the good one)"
@@ -1595,7 +1595,7 @@ fn cwv_10_midset_violation_all_or_nothing() {
     assert_eq!(
         db.execute("SELECT id FROM edges", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         0,
         "no edge from the rolled-back tx survives"
@@ -1724,7 +1724,7 @@ fn cwv_11_upsert_transformation_path_bounded() {
     assert_eq!(
         db.execute("SELECT id FROM child", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         N,
         "K upsert hits update in place; remaining inserts add rows - N child rows total"
@@ -1736,7 +1736,7 @@ fn cwv_11_upsert_transformation_path_bounded() {
                 &params(vec![("tag", Value::Text(format!("updated-{b}")))]),
             )
             .unwrap()
-            .rows
+            .rows()
             .len(),
             1,
             "upsert hit must update the conflict row to its post-image"
@@ -1747,7 +1747,7 @@ fn cwv_11_upsert_transformation_path_bounded() {
                 &params(vec![("tag", Value::Text(format!("tag-{b}")))]),
             )
             .unwrap()
-            .rows
+            .rows()
             .len(),
             0,
             "old conflict tuple must not remain visible after update"

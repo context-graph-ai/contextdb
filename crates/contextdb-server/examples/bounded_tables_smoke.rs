@@ -176,7 +176,7 @@ fn now_ms() -> i64 {
 /// numbers being measured alongside it.
 fn row_count_fast(db: &Database, table: &str) -> i64 {
     match db.execute(&format!("SELECT COUNT(*) FROM {table}"), &p()) {
-        Ok(result) => match result.rows.first().and_then(|row| row.first()) {
+        Ok(result) => match result.rows().first().and_then(|row| row.first()) {
             Some(Value::Int64(count)) => *count,
             _ => -1,
         },
@@ -186,7 +186,7 @@ fn row_count_fast(db: &Database, table: &str) -> i64 {
 
 fn row_count(db: &Database, table: &str) -> i64 {
     match db.execute(&format!("SELECT * FROM {table}"), &p()) {
-        Ok(result) => result.rows.len() as i64,
+        Ok(result) => result.rows().len() as i64,
         // -1 is an unmistakable "could not read", never confusable with a real
         // count, so a script assertion on it fails rather than reads as empty.
         Err(_) => -1,

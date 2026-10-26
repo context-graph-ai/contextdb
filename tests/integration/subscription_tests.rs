@@ -311,7 +311,7 @@ fn s10_bounded_channel_does_not_block_commits() {
     let result = db
         .execute("SELECT COUNT(*) FROM t", &HashMap::new())
         .unwrap();
-    let count = &result.rows[0][0];
+    let count = &result.rows()[0][0];
     match count {
         Value::Int64(n) => assert_eq!(*n, 100),
         _ => panic!("expected integer count"),

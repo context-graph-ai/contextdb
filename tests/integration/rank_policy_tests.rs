@@ -193,9 +193,9 @@ fn result_ids(results: &[SearchResult]) -> Vec<Uuid> {
 }
 
 fn result_ids_from_query(result: &contextdb_engine::QueryResult) -> Vec<Uuid> {
-    let id_col = result.columns.iter().position(|c| c == "id").unwrap();
+    let id_col = result.columns().iter().position(|c| c == "id").unwrap();
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[id_col] {
             Value::Uuid(id) => id,
@@ -2178,9 +2178,9 @@ fn api01_use_rank_parses_and_orders() {
         "SELECT id FROM decisions ORDER BY embedding <=> $q USE RANK effective_confidence LIMIT 3",
         &params(vec![("q", Value::Vector(query_vec()))]),
     ).unwrap();
-    let col = result.columns.iter().position(|c| c == "id").unwrap();
+    let col = result.columns().iter().position(|c| c == "id").unwrap();
     let ids = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[col] {
             Value::Uuid(id) => id,
@@ -2250,9 +2250,9 @@ fn api06_select_without_use_rank() {
             &params(vec![("q", Value::Vector(query_vec()))]),
         )
         .unwrap();
-    let col = result.columns.iter().position(|c| c == "id").unwrap();
+    let col = result.columns().iter().position(|c| c == "id").unwrap();
     let ids = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[col] {
             Value::Uuid(id) => id,
@@ -2461,8 +2461,8 @@ fn rd01_non_vector_reads_unchanged() {
     let b = without_policy
         .execute("SELECT * FROM decisions", &empty_params())
         .unwrap();
-    assert_eq!(a.columns, b.columns);
-    assert_eq!(a.rows, b.rows);
+    assert_eq!(a.columns(), b.columns());
+    assert_eq!(a.rows(), b.rows());
     let scan_with_policy = with_policy
         .scan_filter("decisions", with_policy.snapshot(), &|_| true)
         .unwrap();
@@ -2489,8 +2489,8 @@ fn rd01_non_vector_reads_unchanged() {
     let join_sql = "SELECT decisions.id, outcomes.success FROM decisions INNER JOIN outcomes ON decisions.id = outcomes.decision_id";
     let joined_with_policy = with_policy.execute(join_sql, &empty_params()).unwrap();
     let joined_without_policy = without_policy.execute(join_sql, &empty_params()).unwrap();
-    assert_eq!(joined_with_policy.columns, joined_without_policy.columns);
-    assert_eq!(joined_with_policy.rows, joined_without_policy.rows);
+    assert_eq!(joined_with_policy.columns(), joined_without_policy.columns());
+    assert_eq!(joined_with_policy.rows(), joined_without_policy.rows());
 }
 
 /// REGRESSION GUARD: BOOL values outside rank formulas remain bools.
@@ -2526,23 +2526,23 @@ fn rd02_bool_outside_rank_formula_unchanged() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(result.rows[0][0], Value::Bool(true));
+    assert_eq!(result.rows()[0][0], Value::Bool(true));
     let result = db
         .execute(
             "SELECT success FROM outcomes WHERE decision_id = $id AND success = FALSE",
             &params(vec![("id", Value::Uuid(false_id))]),
         )
         .unwrap();
-    assert_eq!(result.rows[0][0], Value::Bool(false));
+    assert_eq!(result.rows()[0][0], Value::Bool(false));
     let joined = db
         .execute(
             "SELECT decisions.id, outcomes.success FROM decisions INNER JOIN outcomes ON decisions.id = outcomes.decision_id AND outcomes.success = TRUE",
             &empty_params(),
         )
         .unwrap();
-    assert_eq!(joined.rows.len(), 1);
-    assert_eq!(joined.rows[0][0], Value::Uuid(id));
-    assert_eq!(joined.rows[0][1], Value::Bool(true));
+    assert_eq!(joined.rows().len(), 1);
+    assert_eq!(joined.rows()[0][0], Value::Uuid(id));
+    assert_eq!(joined.rows()[0][1], Value::Bool(true));
 }
 
 #[test]
@@ -2721,7 +2721,7 @@ fn write01_reader_at_snapshot_unaffected() {
             snap,
         )
         .unwrap();
-    assert_eq!(result.rows, vec![vec![Value::Uuid(d2)]]);
+    assert_eq!(result.rows(), vec![vec![Value::Uuid(d2)]]);
     expect_policy_order(&db, &[d1, d2]);
 }
 

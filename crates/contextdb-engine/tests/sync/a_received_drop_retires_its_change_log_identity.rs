@@ -84,7 +84,7 @@ fn committed_row_change_count(path: &std::path::Path) -> usize {
             "a strict committed-history read must answer an honestly installed image, \
              not refuse it as damage",
         )
-        .body
+        .body.clone()
     {
         DirectMetadataBody::ImageState {
             state: DirectImageState::ChangeLog(changes),

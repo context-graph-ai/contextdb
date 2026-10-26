@@ -81,7 +81,7 @@ fn setup_seeded_db() -> (Database, u64) {
     let count = db
         .execute("SELECT id FROM entities", &empty())
         .expect("count seeded rows")
-        .rows
+        .rows()
         .len();
     assert_eq!(count as u64, pre_gate_rows);
     (db, pre_gate_rows)

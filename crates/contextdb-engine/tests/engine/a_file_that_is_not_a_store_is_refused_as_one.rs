@@ -26,7 +26,7 @@ fn refusal_reason(error: &Error, path: &std::path::Path) -> String {
                 &path.display().to_string(),
                 "the refusal names the file it is about"
             );
-            reason.clone()
+            reason.to_string()
         }
         other => panic!(
             "a file that is not a store is refused as a store that cannot be read, got {other:?}"

@@ -69,12 +69,12 @@ fn insert_edge(db: &Database, source: Uuid, target: Uuid, edge_type: &str) {
 
 fn uuid_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<Uuid> {
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == column || c.rsplit('.').next() == Some(column))
-        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns));
+        .unwrap_or_else(|| panic!("column {column} not found in {:?}", result.columns()));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[idx] {
             Value::Uuid(id) => *id,
@@ -136,8 +136,8 @@ fn run_forward_probe(db: &Database, start: Uuid, expected: &BTreeSet<Uuid>) {
         )
         .unwrap();
     assert_eq!(uuid_set(&result, "t"), *expected);
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), expected.len() as u64);
 }
 
@@ -163,8 +163,8 @@ fn run_reverse_probe(db: &Database, anchor: Uuid, expected: &BTreeSet<Uuid>) {
         )
         .unwrap();
     assert_eq!(uuid_set(&result, "d"), *expected);
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("reverse_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("reverse_adj"));
     assert_eq!(db.__rows_examined(), expected.len() as u64);
 }
 
@@ -234,8 +234,8 @@ fn run_non_id_start_probe(db: &Database, expected: &BTreeSet<Uuid>) {
         )
         .unwrap();
     assert_eq!(uuid_set(&result, "t"), *expected);
-    assert_eq!(result.trace.physical_plan, "AdjacencyProbe");
-    assert_eq!(result.trace.index_used.as_deref(), Some("forward_adj"));
+    assert_eq!(result.trace().physical_plan, "AdjacencyProbe");
+    assert_eq!(result.trace().index_used.as_deref(), Some("forward_adj"));
     assert_eq!(db.__rows_examined(), 1 + expected.len() as u64);
 }
 

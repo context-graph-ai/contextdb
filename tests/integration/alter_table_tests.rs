@@ -8,7 +8,7 @@ fn empty_params() -> HashMap<String, Value> {
 }
 
 fn col_index(result: &QueryResult, name: &str) -> Option<usize> {
-    result.columns.iter().position(|c| c == name)
+    result.columns().iter().position(|c| c == name)
 }
 
 #[test]
@@ -30,9 +30,9 @@ fn at01_add_column_existing_rows_show_null() {
 
     let result = db.execute("SELECT * FROM t", &empty_params()).unwrap();
     let idx = col_index(&result, "score").expect("column 'score' must exist after ADD COLUMN");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Null,
         "existing row must have NULL for added column"
     );
@@ -59,7 +59,7 @@ fn at02_add_column_new_insert_uses_it() {
         .execute("SELECT * FROM t WHERE id = 1", &empty_params())
         .unwrap();
     let idx = col_index(&result, "score").expect("column 'score' must exist");
-    assert_eq!(result.rows[0][idx], Value::Float64(314_f64 / 100.0));
+    assert_eq!(result.rows()[0][idx], Value::Float64(314_f64 / 100.0));
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn at03_drop_column_disappears_from_select_star() {
         col_index(&result, "extra").is_none(),
         "'extra' must not appear after DROP COLUMN"
     );
-    for row in &result.rows {
+    for row in result.rows() {
         for val in row {
             assert_ne!(
                 *val,
@@ -127,13 +127,13 @@ fn at04_drop_column_remaining_data_intact() {
         .execute("SELECT name FROM t WHERE id = 1", &empty_params())
         .unwrap();
     let idx = col_index(&result, "name").expect("'name' column must exist");
-    assert_eq!(result.rows[0][idx], Value::Text("alice".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("alice".to_string()));
 
     let result2 = db
         .execute("SELECT name FROM t WHERE id = 2", &empty_params())
         .unwrap();
     assert_eq!(
-        result2.rows[0][col_index(&result2, "name").unwrap()],
+        result2.rows()[0][col_index(&result2, "name").unwrap()],
         Value::Text("bob".to_string())
     );
 }
@@ -178,7 +178,7 @@ fn at06_rename_column_new_name_returns_data() {
         .unwrap();
     let idx = col_index(&result, "temperature").expect("'temperature' must exist after RENAME");
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Float64(98.6),
         "renamed column must retain data"
     );
@@ -210,7 +210,7 @@ fn at07_rename_column_old_name_gone() {
         "'old_name' must not appear after RENAME"
     );
     let idx = col_index(&result, "new_name").expect("'new_name' must exist");
-    assert_eq!(result.rows[0][idx], Value::Text("data".to_string()));
+    assert_eq!(result.rows()[0][idx], Value::Text("data".to_string()));
 }
 
 #[test]
@@ -338,7 +338,7 @@ fn at13_add_column_persists_across_reopen() {
     );
     let idx = col_index(&result, "note").unwrap();
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Null,
         "old row must have NULL for added column after reopen"
     );
@@ -372,7 +372,7 @@ fn at14_drop_column_persists_across_reopen() {
         col_index(&result, "extra").is_none(),
         "'extra' must stay dropped after reopen"
     );
-    for row in &result.rows {
+    for row in result.rows() {
         for val in row {
             assert_ne!(
                 *val,
@@ -413,7 +413,7 @@ fn at15_rename_column_persists_across_reopen() {
     );
     let idx = col_index(&result, "new").expect("'new' must persist after reopen");
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Text("kept".to_string()),
         "data must survive rename + reopen"
     );
@@ -457,9 +457,9 @@ fn at16_multiple_alters_in_sequence() {
 
     let first_idx = col_index(&result, "first").unwrap();
     let c_idx = col_index(&result, "c").unwrap();
-    assert_eq!(result.rows[0][first_idx], Value::Text("alpha".to_string()));
-    assert_eq!(result.rows[0][c_idx], Value::Null);
-    for val in &result.rows[0] {
+    assert_eq!(result.rows()[0][first_idx], Value::Text("alpha".to_string()));
+    assert_eq!(result.rows()[0][c_idx], Value::Null);
+    for val in &result.rows()[0] {
         assert_ne!(
             *val,
             Value::Text("beta".to_string()),
@@ -489,7 +489,7 @@ fn at17_add_without_column_keyword() {
     let idx =
         col_index(&result, "score").expect("'score' must exist after ADD without COLUMN keyword");
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Float64(42.0),
         "column added without COLUMN keyword must be usable"
     );
@@ -538,11 +538,11 @@ fn at19_add_column_non_text_types_preserved() {
     let ref_idx = col_index(&result, "ref_id").expect("'ref_id' column must exist");
 
     assert_eq!(
-        result.rows[0][flag_idx],
+        result.rows()[0][flag_idx],
         Value::Bool(true),
         "BOOLEAN type must be preserved, not stored as TEXT"
     );
-    match &result.rows[0][ref_idx] {
+    match &result.rows()[0][ref_idx] {
         Value::Uuid(u) => assert_eq!(u.to_string(), "550e8400-e29b-41d4-a716-446655440000"),
         other => panic!("UUID type must be preserved, got: {other:?}"),
     }
@@ -573,7 +573,7 @@ fn at20_column_type_survives_persistence() {
         .unwrap();
     let idx = col_index(&result, "score").expect("'score' must persist after reopen");
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Float64(2718_f64 / 1000.0),
         "column type must survive persistence - value must be Float64, not Text"
     );

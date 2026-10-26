@@ -190,7 +190,7 @@ fn count_rows(db: &Database, table: &str) -> i64 {
     let rows = db
         .execute(&format!("SELECT COUNT(*) FROM {table}"), &empty())
         .unwrap()
-        .rows;
+        .rows().to_vec();
     match rows.first().and_then(|row| row.first()) {
         Some(Value::Int64(n)) => *n,
         other => panic!("expected COUNT(*) Int64, got {other:?}"),
@@ -199,7 +199,7 @@ fn count_rows(db: &Database, table: &str) -> i64 {
 
 fn pushed(result: &QueryResult) -> Vec<&str> {
     result
-        .trace
+        .trace()
         .predicates_pushed
         .iter()
         .map(|column| column.as_ref())
@@ -798,19 +798,19 @@ fn ssh_c3_open_isolated() {
     assert_eq!(
         db.execute("SELECT id FROM t WHERE col = 3", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(uuid(203))]]
     );
     assert_eq!(
         db.execute("SELECT id FROM sib WHERE x = 1", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(uuid(301))]]
     );
     assert_eq!(
         db.execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         (0..5)
             .map(|i| vec![Value::Uuid(uuid(200 + i)), Value::Int64(i as i64)])
             .collect::<Vec<_>>()
@@ -818,7 +818,7 @@ fn ssh_c3_open_isolated() {
     assert_eq!(
         db.execute("SELECT id, x FROM sib ORDER BY x", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         (0..2)
             .map(|i| vec![Value::Uuid(uuid(300 + i)), Value::Int64(i as i64)])
             .collect::<Vec<_>>()
@@ -833,7 +833,7 @@ fn ssh_c3_open_isolated() {
     assert_eq!(
         db.execute("SELECT id FROM t WHERE col = 5", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(uuid(205))]]
     );
 }
@@ -858,13 +858,13 @@ fn ssh_c3_open_sibling_scaling() {
             assert_eq!(
                 db.execute("SELECT id FROM t WHERE col = 1", &HashMap::new())
                     .unwrap()
-                    .rows,
+                    .rows(),
                 vec![vec![Value::Uuid(uuid(0x1001))]]
             );
             assert_eq!(
                 db.execute("SELECT x, y FROM sib ORDER BY x", &HashMap::new())
                     .unwrap()
-                    .rows,
+                    .rows(),
                 (0..sibling_rows)
                     .map(|i| vec![Value::Int64(i as i64), Value::Int64(i as i64)])
                     .collect::<Vec<_>>()
@@ -872,7 +872,7 @@ fn ssh_c3_open_sibling_scaling() {
             assert_eq!(
                 db.execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
                     .unwrap()
-                    .rows,
+                    .rows(),
                 (0..3)
                     .map(|i| vec![Value::Uuid(uuid(0x1000 + i)), Value::Int64(i as i64)])
                     .collect::<Vec<_>>()
@@ -883,7 +883,7 @@ fn ssh_c3_open_sibling_scaling() {
             assert_eq!(
                 db.execute("SELECT id FROM t WHERE col = 3", &HashMap::new())
                     .unwrap()
-                    .rows,
+                    .rows(),
                 vec![vec![Value::Uuid(uuid(0x1003))]]
             );
             measurements.push(work.history);
@@ -915,19 +915,19 @@ fn ssh_c3_open_empty_sibling() {
     assert_eq!(
         db.execute("SELECT id FROM t WHERE col = 1", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(uuid(0x1001))]]
     );
     assert!(
         db.execute("SELECT id FROM sib WHERE x = 1", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     assert_eq!(
         db.execute("SELECT id, col FROM t ORDER BY col", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         (0..3)
             .map(|i| vec![Value::Uuid(uuid(0x1000 + i)), Value::Int64(i as i64)])
             .collect::<Vec<_>>()
@@ -942,7 +942,7 @@ fn ssh_c3_open_empty_sibling() {
     assert_eq!(
         db.execute("SELECT id FROM sib WHERE x = 1 AND y = 1", &HashMap::new())
             .unwrap()
-            .rows,
+            .rows(),
         vec![vec![Value::Uuid(uuid(0x2000))]]
     );
 }
@@ -972,15 +972,15 @@ fn ssh_c1_rows_identical_int64_pk() {
             )
             .unwrap();
         }
-        before_update = exec(&db, "UPDATE t SET col2 = 99 WHERE col = 2").rows_affected;
+        before_update = exec(&db, "UPDATE t SET col2 = 99 WHERE col = 2").rows_affected();
         let selected = db
             .execute(
                 "SELECT id, col, col2 FROM t WHERE col IN (2, 4) ORDER BY id ASC",
                 &empty(),
             )
             .unwrap();
-        before_trace = selected.trace.clone();
-        before_rows = selected.rows;
+        before_trace = selected.trace().clone();
+        before_rows = selected.rows().to_vec();
         db.close().unwrap();
     }
     let reopened = Database::open(&path).unwrap();
@@ -990,7 +990,7 @@ fn ssh_c1_rows_identical_int64_pk() {
             &empty(),
         )
         .unwrap();
-    let after_update = exec(&reopened, "UPDATE t SET col2 = 99 WHERE col = 2").rows_affected;
+    let after_update = exec(&reopened, "UPDATE t SET col2 = 99 WHERE col = 2").rows_affected();
     assert_eq!(
         before_rows,
         vec![
@@ -998,15 +998,15 @@ fn ssh_c1_rows_identical_int64_pk() {
             vec![Value::Int64(4), Value::Int64(4), Value::Int64(40)],
         ]
     );
-    assert_eq!(selected.rows, before_rows);
-    assert_eq!(selected.trace.physical_plan, before_trace.physical_plan);
-    assert_eq!(selected.trace.index_used, before_trace.index_used);
+    assert_eq!(selected.rows(), before_rows);
+    assert_eq!(selected.trace().physical_plan, before_trace.physical_plan);
+    assert_eq!(selected.trace().index_used, before_trace.index_used);
     assert_eq!(
-        selected.trace.predicates_pushed,
+        selected.trace().predicates_pushed,
         before_trace.predicates_pushed
     );
     assert_eq!(before_update, after_update);
-    assert_eq!(selected.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(selected.trace().index_used.as_deref(), Some("idx_a"));
 }
 
 #[test]
@@ -1020,17 +1020,17 @@ fn ssh_c1_rows_identical_inmem() {
         )
         .unwrap();
     assert_eq!(
-        selected.rows,
+        selected.rows(),
         vec![
             vec![Value::Uuid(ids[1]), Value::Int64(2), Value::Int64(20)],
             vec![Value::Uuid(ids[3]), Value::Int64(4), Value::Int64(40)],
         ]
     );
     assert_eq!(
-        exec(&db, "UPDATE t SET col2 = 99 WHERE col = 2").rows_affected,
+        exec(&db, "UPDATE t SET col2 = 99 WHERE col = 2").rows_affected(),
         1
     );
-    assert_eq!(exec(&db, "DELETE FROM t WHERE col = 4").rows_affected, 1);
+    assert_eq!(exec(&db, "DELETE FROM t WHERE col = 4").rows_affected(), 1);
     assert_eq!(count_rows(&db, "t"), 5);
 }
 
@@ -1050,12 +1050,12 @@ fn ssh_c1_trace_identical() {
     let r = db
         .execute("SELECT col FROM t WHERE col = 1 AND col2 = 2", &empty())
         .unwrap();
-    assert_eq!(r.trace.physical_plan, "IndexScan");
-    assert_eq!(r.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(r.trace().physical_plan, "IndexScan");
+    assert_eq!(r.trace().index_used.as_deref(), Some("idx_c"));
     assert_eq!(pushed(&r), vec!["col", "col2"]);
-    assert!(!r.trace.sort_elided);
+    assert!(!r.trace().sort_elided);
     assert_eq!(
-        considered(&r.trace),
+        considered(&r.trace()),
         vec![("__pk_id", "first column not in WHERE")]
     );
 }
@@ -1128,11 +1128,11 @@ fn ssh_c1_explicit_tx_parity() {
     let auto = db
         .execute("SELECT id, col FROM t_auto ORDER BY col ASC", &empty())
         .unwrap()
-        .rows;
+        .rows().to_vec();
     let in_tx = db
         .execute("SELECT id, col FROM t_tx ORDER BY col ASC", &empty())
         .unwrap()
-        .rows;
+        .rows().to_vec();
     assert_eq!(auto, in_tx);
 }
 
@@ -1263,7 +1263,7 @@ fn ssh_c2_failed_commit_releases_and_usable() {
             &params(vec![("id", Value::Uuid(uuid(481)))]),
         )
         .unwrap();
-    assert!(loser.rows.is_empty());
+    assert!(loser.rows().is_empty());
 }
 
 #[test]
@@ -1381,7 +1381,7 @@ fn ssh_c4_row_order_stable() {
                 &empty(),
             )
             .unwrap()
-            .rows;
+            .rows().to_vec();
         db.close().unwrap();
     }
     let reopened = Database::open(&path).unwrap();
@@ -1391,7 +1391,7 @@ fn ssh_c4_row_order_stable() {
             &empty(),
         )
         .unwrap()
-        .rows;
+        .rows().to_vec();
     assert_eq!(after, before);
 }
 
@@ -1418,12 +1418,12 @@ fn ssh_c4_tombstone_invisible() {
     let survivor_scan = reopened
         .execute("SELECT id FROM t WHERE col2 = 30", &empty())
         .unwrap();
-    assert!(deleted.rows.is_empty());
-    assert!(deleted_scan.rows.is_empty());
-    assert_eq!(survivor.rows.len(), 1);
-    assert_eq!(survivor.rows, survivor_scan.rows);
-    assert_eq!(deleted.trace.index_used.as_deref(), Some("idx_a"));
-    assert_eq!(deleted_scan.trace.physical_plan, "Scan");
+    assert!(deleted.rows().is_empty());
+    assert!(deleted_scan.rows().is_empty());
+    assert_eq!(survivor.rows().len(), 1);
+    assert_eq!(survivor.rows(), survivor_scan.rows());
+    assert_eq!(deleted.trace().index_used.as_deref(), Some("idx_a"));
+    assert_eq!(deleted_scan.trace().physical_plan, "Scan");
 }
 
 #[test]
@@ -1442,14 +1442,14 @@ fn ssh_c4_next_row_id_no_reuse() {
         reopened
             .execute("SELECT id FROM t WHERE col = 6", &empty())
             .unwrap()
-            .rows
+            .rows()
             .is_empty()
     );
     assert_eq!(
         reopened
             .execute("SELECT id FROM t WHERE col = 100", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -1498,7 +1498,7 @@ fn ssh_c4_schema_and_indexes_persist() {
     let routed = reopened
         .execute("SELECT id FROM t WHERE status = 'active'", &empty())
         .unwrap();
-    assert_eq!(routed.trace.index_used.as_deref(), Some("idx_status"));
+    assert_eq!(routed.trace().index_used.as_deref(), Some("idx_status"));
 }
 
 #[test]
@@ -1529,7 +1529,7 @@ fn ssh_c4_winner_stable() {
                 &empty(),
             )
             .unwrap()
-            .trace;
+            .trace().clone();
         db.close().unwrap();
     }
     let reopened = Database::open(&path).unwrap();
@@ -1539,7 +1539,7 @@ fn ssh_c4_winner_stable() {
             &empty(),
         )
         .unwrap()
-        .trace;
+        .trace().clone();
     assert_eq!(before.index_used, after.index_used);
     assert_eq!(after.index_used.as_deref(), Some("idx_c"));
     assert_eq!(before.predicates_pushed, after.predicates_pushed);
@@ -1588,7 +1588,7 @@ fn ssh_c4_graph_and_vector_intact() {
             &params(vec![("s", Value::Uuid(uuid(641)))]),
         )
         .unwrap();
-    assert_eq!(graph.rows, vec![vec![Value::Uuid(target)]]);
+    assert_eq!(graph.rows(), vec![vec![Value::Uuid(target)]]);
     let row = reopened
         .point_lookup("docs", "id", &Value::Uuid(target), reopened.snapshot())
         .unwrap()
@@ -1619,7 +1619,7 @@ fn ssh_c4_crash_shaped_reopen() {
         reopened
             .execute("SELECT id FROM t WHERE col = 3", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -1643,10 +1643,10 @@ fn ssh_c4_reopen_after_delete_final_write() {
     let scan_empty = reopened
         .execute("SELECT id FROM t WHERE col2 = 10", &empty())
         .unwrap();
-    assert!(routed_empty.rows.is_empty());
-    assert!(scan_empty.rows.is_empty());
-    assert_eq!(routed_empty.trace.index_used.as_deref(), Some("idx_a"));
-    assert_eq!(scan_empty.trace.physical_plan, "Scan");
+    assert!(routed_empty.rows().is_empty());
+    assert!(scan_empty.rows().is_empty());
+    assert_eq!(routed_empty.trace().index_used.as_deref(), Some("idx_a"));
+    assert_eq!(scan_empty.trace().physical_plan, "Scan");
     reopened
         .execute(
             "INSERT INTO t (id, col, col2) VALUES ($id, 1, 10)",
@@ -1660,7 +1660,7 @@ fn ssh_c4_reopen_after_delete_final_write() {
         .execute("SELECT id FROM t WHERE col2 = 10", &empty())
         .unwrap();
     assert_eq!(count_rows(&reopened, "t"), 1);
-    assert_eq!(routed_new.rows, scan_new.rows);
+    assert_eq!(routed_new.rows(), scan_new.rows());
 }
 
 #[test]
@@ -1683,7 +1683,7 @@ fn ssh_c2_subscribe_after_reopen() {
     let routed = reopened
         .execute("SELECT id FROM t WHERE col = 3", &empty())
         .unwrap();
-    assert_eq!(routed.trace.index_used.as_deref(), Some("idx_a"));
+    assert_eq!(routed.trace().index_used.as_deref(), Some("idx_a"));
 }
 
 #[test]
@@ -1720,11 +1720,11 @@ fn ssh_c2_sync_applied_index_ddl_lifecycle() {
     let routed = peer
         .execute("SELECT id FROM t WHERE col = 1 AND col2 = 2", &empty())
         .unwrap();
-    assert_eq!(routed.trace.index_used.as_deref(), Some("idx_c"));
+    assert_eq!(routed.trace().index_used.as_deref(), Some("idx_c"));
     let sib = peer
         .execute("SELECT id FROM sib WHERE x = 9", &empty())
         .unwrap();
-    assert_eq!(sib.trace.index_used.as_deref(), Some("sib_x"));
+    assert_eq!(sib.trace().index_used.as_deref(), Some("sib_x"));
 
     let drop_base = source.current_lsn();
     exec(&source, "DROP INDEX idx_c ON t");
@@ -1738,9 +1738,9 @@ fn ssh_c2_sync_applied_index_ddl_lifecycle() {
     let rerouted = peer
         .execute("SELECT id FROM t WHERE col = 1 AND col2 = 2", &empty())
         .unwrap();
-    assert_ne!(rerouted.trace.index_used.as_deref(), Some("idx_c"));
+    assert_ne!(rerouted.trace().index_used.as_deref(), Some("idx_c"));
     assert!(
-        !considered(&rerouted.trace)
+        !considered(&rerouted.trace())
             .iter()
             .any(|(name, _)| *name == "idx_c")
     );
@@ -1823,7 +1823,7 @@ fn ssh_c2_mixed_paradigm_failed_commit_atomic() {
             &params(vec![("s", Value::Uuid(source_id))]),
         )
         .unwrap();
-    assert!(graph.rows.is_empty());
+    assert!(graph.rows().is_empty());
     let failed = records.commit_failed.lock().unwrap();
     let (ws, tag) = failed.last().unwrap();
     assert_eq!(tag, "unique:t.note");

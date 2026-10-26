@@ -111,7 +111,7 @@ fn start_hub(broker: &InProcessBroker, tenant: &str, hub_db: Arc<Database>) -> R
 fn row_count(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap_or_else(|err| panic!("scan {table}: {err}"))
-        .rows
+        .rows()
         .len()
 }
 

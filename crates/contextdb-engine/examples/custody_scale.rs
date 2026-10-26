@@ -230,10 +230,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(status.accepted, total as u64);
     assert_eq!(status.pending, 0);
     let rows = hub.execute("SELECT COUNT(*) FROM records", &p)?;
-    assert_eq!(rows.rows, vec![vec![Value::Int64(total as i64)]]);
+    assert_eq!(rows.rows(), vec![vec![Value::Int64(total as i64)]]);
     println!(
         "{}",
-        serde_json::json!({"statement":"11/14","phase":"complete","units":total,"edge_accepted":status.accepted,"edge_pending":status.pending,"hub_count":format!("{:?}",rows.rows),"elapsed_ms":start.elapsed().as_millis()})
+        serde_json::json!({"statement":"11/14","phase":"complete","units":total,"edge_accepted":status.accepted,"edge_pending":status.pending,"hub_count":format!("{:?}",rows.rows()),"elapsed_ms":start.elapsed().as_millis()})
     );
     let before_status = edge.__custody_metadata_work_for_test()?;
     let repeated = edge.delivery_status("records")?;

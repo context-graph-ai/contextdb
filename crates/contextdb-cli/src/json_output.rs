@@ -1282,11 +1282,11 @@ mod tests {
         .unwrap();
         let limits = db.execute("SHOW MEMORY_LIMIT", &HashMap::new()).unwrap();
         let used_column = limits
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "used")
             .unwrap();
-        let contextdb_core::Value::Int64(used) = &limits.rows[0][used_column] else {
+        let contextdb_core::Value::Int64(used) = &limits.rows()[0][used_column] else {
             panic!("SHOW MEMORY_LIMIT reports used bytes: {limits:?}");
         };
         let used = *used;
@@ -1337,8 +1337,8 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/held.db"),
             },
             Error::StoreCorrupted {
-                path: "/tmp/store".to_string(),
-                reason: "truncated".to_string(),
+                path: "/tmp/store".to_string().into(),
+                reason: "truncated".to_string().into(),
             },
             Error::ReaderCoordinationUnavailable {
                 operation: "authoritative purge".to_string(),

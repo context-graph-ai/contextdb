@@ -93,12 +93,12 @@ fn insert_edge(db: &Database, id: Uuid, source_id: Uuid, target_id: Uuid, edge_t
 
 fn ids_from_result(result: &QueryResult) -> BTreeSet<Uuid> {
     let id_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "id" || c.rsplit('.').next() == Some("id"))
-        .unwrap_or_else(|| panic!("id column not found in {:?}", result.columns));
+        .unwrap_or_else(|| panic!("id column not found in {:?}", result.columns()));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[id_idx] {
             Value::Uuid(id) => *id,
@@ -195,19 +195,19 @@ fn run_route_query(case: &RouteCase, assert_rows_examined: bool) {
     }
     let result = case.db.execute(&case.sql, &case.params).unwrap();
     assert_eq!(ids_from_result(&result), case.expected_ids);
-    assert_eq!(result.trace.physical_plan, "IndexScan");
+    assert_eq!(result.trace().physical_plan, "IndexScan");
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some("__graph_edge_source_target_type")
     );
     let pushed = result
-        .trace
+        .trace()
         .predicates_pushed
         .iter()
         .map(|c| c.as_ref())
         .collect::<Vec<_>>();
     assert_eq!(pushed, ["source_id", "target_id", "edge_type"]);
-    assert!(result.trace.indexes_considered.iter().any(|candidate| {
+    assert!(result.trace().indexes_considered.iter().any(|candidate| {
         candidate.name == "idx_edges_source"
             && candidate.rejected_reason.as_ref()
                 == "fewer predicate columns matched than chosen index"

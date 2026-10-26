@@ -52,7 +52,7 @@ fn spec(job_id: &str, submitter: &str, requirement_tags: &[&str], refs: Vec<Inpu
 fn count_rows(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &HashMap::new())
         .unwrap_or_else(|err| panic!("scan {table}: {err}"))
-        .rows
+        .rows()
         .len()
 }
 
@@ -897,8 +897,8 @@ fn capability_advertised_at(db: &Database, node_id: &str, capability_id: &str) -
             &params,
         )
         .expect("scan work_capabilities advertised_at");
-    let idx = result.columns.iter().position(|c| c == "advertised_at")?;
-    match result.rows.first()?.get(idx)? {
+    let idx = result.columns().iter().position(|c| c == "advertised_at")?;
+    match result.rows().first()?.get(idx)? {
         contextdb_core::Value::Timestamp(ms) => Some(*ms),
         _ => None,
     }

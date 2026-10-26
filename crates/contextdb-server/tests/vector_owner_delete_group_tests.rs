@@ -215,7 +215,7 @@ async fn mixed_same_commit_vector_provenance_is_exact_and_durable() {
     assert_eq!(
         edge.execute("SELECT body FROM notes WHERE id = 2", &empty())
             .expect("adopted B query")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("incoming-b-refused".to_string())]],
         "B's stored value must become the hub's adopted value, not the edge's own"
     );
@@ -301,7 +301,7 @@ async fn same_lsn_multi_owner_vector_deletes_remove_each_ann_owner() {
         receiver
             .execute("SELECT * FROM notes", &empty())
             .expect("scan receiver")
-            .rows
+            .rows()
             .is_empty(),
         "both relational owners are absent"
     );
@@ -560,14 +560,14 @@ async fn deleting_edge_pulls_its_own_vector_tombstone_with_remote_row_id() {
     assert!(
         edge.execute("SELECT * FROM notes WHERE id = 1", &empty())
             .expect("deleted-key query")
-            .rows
+            .rows()
             .is_empty(),
         "the deleted keyed row remains absent"
     );
     assert_eq!(
         edge.execute("SELECT body FROM notes WHERE id = 2", &empty())
             .expect("survivor keyed query")
-            .rows,
+            .rows(),
         vec![vec![Value::Text("survivor".to_string())]],
         "the second keyed vector owner keeps its exact value"
     );
@@ -718,7 +718,7 @@ async fn pulled_vector_groups_do_not_echo_but_later_local_vector_work_does() {
     assert!(
         edge.execute("SELECT * FROM notes WHERE id = 2", &empty())
             .expect("deleted row query")
-            .rows
+            .rows()
             .is_empty(),
         "the pulled tombstone removes the keyed row"
     );

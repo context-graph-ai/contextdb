@@ -65,7 +65,7 @@ fn value_of(db: &Database, machine: &str) -> Option<i64> {
             &params,
         )
         .expect("scan");
-    result.rows.first().map(|row| match &row[0] {
+    result.rows().first().map(|row| match &row[0] {
         Value::Int64(v) => *v,
         other => panic!("value must be an integer, got {other:?}"),
     })

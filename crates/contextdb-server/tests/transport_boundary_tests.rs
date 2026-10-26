@@ -108,13 +108,13 @@ fn expect_text_value(db: &Database, table: &str, column: &str, id: Uuid, expecte
         .execute(&sql, &key)
         .unwrap_or_else(|err| panic!("{table}.{column} lookup must succeed: {err}"));
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "{table} must hold exactly the row {id}"
     );
-    let idx = column_index(&result.columns, column);
+    let idx = column_index(&result.columns(), column);
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Text(expected.to_string()),
         "{table}.{column} for {id} must match"
     );
@@ -124,9 +124,9 @@ fn uuid_set(db: &Database, table: &str) -> BTreeSet<Uuid> {
     let result = db
         .execute(&format!("SELECT id FROM {table}"), &HashMap::new())
         .unwrap_or_else(|err| panic!("{table} id scan must succeed: {err}"));
-    let id_idx = column_index(&result.columns, "id");
+    let id_idx = column_index(&result.columns(), "id");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[id_idx] {
             Value::Uuid(id) => *id,

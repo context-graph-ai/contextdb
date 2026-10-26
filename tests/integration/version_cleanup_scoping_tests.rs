@@ -56,12 +56,12 @@ fn capability_ids(db: &Database, key: &str) -> Vec<String> {
         )
         .expect("select");
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "capability_id")
         .unwrap();
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match &row[idx] {
             Value::Text(s) => s.clone(),
@@ -206,11 +206,11 @@ fn capability_id_at_snapshot(
         )
         .expect("execute_at_snapshot must succeed even when narrower than before");
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "capability_id")
         .unwrap();
-    result.rows.first().map(|row| match &row[idx] {
+    result.rows().first().map(|row| match &row[idx] {
         Value::Text(s) => s.clone(),
         other => panic!("expected TEXT, got {other:?}"),
     })

@@ -74,7 +74,7 @@ fn hot_selects(
     let started = Instant::now();
     for _ in 0..iterations {
         let result = db.execute(sql, params).unwrap();
-        std::hint::black_box(result.rows[0][0].clone());
+        std::hint::black_box(result.rows()[0][0].clone());
     }
     started.elapsed()
 }
@@ -94,7 +94,7 @@ fn bench_acl_overhead(c: &mut Criterion) {
         admin
             .execute("SELECT id FROM memos", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         rows as usize
     );
@@ -102,7 +102,7 @@ fn bench_acl_overhead(c: &mut Criterion) {
         admin
             .execute("SELECT id FROM acl_grants", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         rows as usize,
         "bench must include one grant per protected row"
@@ -110,7 +110,7 @@ fn bench_acl_overhead(c: &mut Criterion) {
     c.bench_function("tier1_acl_overhead/ungated", |b| {
         b.iter(|| {
             let result = admin.execute(hot_sql, &hot_params).unwrap();
-            std::hint::black_box(result.rows[0][0].clone());
+            std::hint::black_box(result.rows()[0][0].clone());
         });
     });
 
@@ -119,7 +119,7 @@ fn bench_acl_overhead(c: &mut Criterion) {
         gated
             .execute("SELECT id, acl_id FROM memos", &empty())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         (rows / 2) as usize
     );
@@ -127,7 +127,7 @@ fn bench_acl_overhead(c: &mut Criterion) {
         gated
             .execute("SELECT id FROM memos", &empty())
             .unwrap()
-            .rows
+            .rows()
             .iter()
             .all(|row| matches!(&row[0], Value::Uuid(id) if (id.as_u128() - 10) % 2 == 0))
     );
@@ -149,7 +149,7 @@ fn bench_acl_overhead(c: &mut Criterion) {
     c.bench_function("tier1_acl_overhead/gated", |b| {
         b.iter(|| {
             let result = gated.execute(hot_sql, &hot_params).unwrap();
-            std::hint::black_box(result.rows[0][0].clone());
+            std::hint::black_box(result.rows()[0][0].clone());
         });
     });
 }

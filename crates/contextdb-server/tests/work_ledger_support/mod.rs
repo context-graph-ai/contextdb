@@ -82,6 +82,6 @@ pub fn tags(list: &[&str]) -> Vec<String> {
 pub fn count_rows(db: &Database, table: &str) -> usize {
     db.execute(&format!("SELECT * FROM {table}"), &HashMap::new())
         .unwrap_or_else(|err| panic!("scan {table}: {err}"))
-        .rows
+        .rows()
         .len()
 }

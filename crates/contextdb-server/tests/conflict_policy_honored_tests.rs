@@ -72,12 +72,12 @@ fn only_table_body(db: &Database, table: &str, id: i64) -> String {
         .execute(&format!("SELECT body FROM {table} WHERE id = $id"), &params)
         .expect("table scan");
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "exactly one {table} row must carry id {id}, got {:?}",
-        result.rows
+        result.rows()
     );
-    match &result.rows[0][0] {
+    match &result.rows()[0][0] {
         Value::Text(body) => body.clone(),
         other => panic!("expected a text body, got {other:?}"),
     }
@@ -430,7 +430,7 @@ async fn accepted_delete_and_insert_from_one_source_transaction_share_one_hub_co
         .execute("SELECT id, body FROM notes", &p())
         .expect("hub read");
     assert_eq!(
-        rows.rows,
+        rows.rows(),
         vec![vec![Value::Int64(2), Value::Text("new".to_string())]]
     );
 }

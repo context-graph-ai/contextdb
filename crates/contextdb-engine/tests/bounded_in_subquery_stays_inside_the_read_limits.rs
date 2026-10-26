@@ -255,7 +255,7 @@ fn arm(
         open(limits)
             .expect("open a bounded read view")
             .execute(OUTER, &empty())
-            .map(|answered| answered.rows.len())
+            .map(|answered| answered.rows().len())
     };
     let outcome = classify(result);
     let peak = peak_growth_since(before);
@@ -324,12 +324,12 @@ fn run_through_a_cursor(
 ) -> contextdb_core::Result<usize> {
     let session = open(limits).expect("open a bounded read view");
     let mut cursor = session.open_cursor(OUTER, &empty())?;
-    let mut delivered = cursor.first_page().rows.len();
-    let mut has_more = cursor.first_page().has_more;
+    let mut delivered = cursor.first_page().rows().len();
+    let mut has_more = cursor.first_page().has_more();
     while has_more {
         let page = cursor.fetch(NonZeroUsize::new(64))?;
-        delivered += page.rows.len();
-        has_more = page.has_more;
+        delivered += page.rows().len();
+        has_more = page.has_more();
     }
     cursor.close()?;
     Ok(delivered)
@@ -342,14 +342,14 @@ fn a_filter_that_reads_a_whole_table_is_bounded_by_the_ceiling_that_covers_it() 
         .execute(OUTER, &empty())
         .expect("the executor answers the outer statement");
     assert_eq!(
-        whole.rows.len() as u128,
+        whole.rows().len() as u128,
         ANSWER_ROWS,
         "the answer is small; it is the work behind it that is not"
     );
 
     // What the statement really costs, taken from the executor rather than
     // restated: it is the figure the work ceiling is supposed to bound.
-    let really_examined = whole.trace.rows_examined;
+    let really_examined = whole.trace().rows_examined;
     assert!(
         really_examined >= INNER_ROWS as u64,
         "deciding which rows to return means reading the inner table, so the work behind this \
@@ -366,11 +366,11 @@ fn a_filter_that_reads_a_whole_table_is_bounded_by_the_ceiling_that_covers_it() 
         .execute(OUTER, &empty())
         .expect("a bounded read answers when nothing is tightened");
     assert_eq!(
-        unbounded.trace.rows_examined, really_examined,
+        unbounded.trace().rows_examined, really_examined,
         "a bounded read does the same work getting to this answer that the executor does, so \
          what its ceilings bound is the inner scan: the executor examined {really_examined} and \
          it examined {}",
-        unbounded.trace.rows_examined
+        unbounded.trace().rows_examined
     );
 
     let mut failures = Vec::new();

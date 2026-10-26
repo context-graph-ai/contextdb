@@ -56,7 +56,7 @@ fn query_scores(db: &Database, sql: &str, extra: Vec<(&str, Value)>) -> Vec<i64>
         .execute(sql, &params(extra))
         .unwrap_or_else(|err| panic!("query `{sql}` must not error: {err:?}"));
     result
-        .rows
+        .rows()
         .into_iter()
         .map(|row| match row[0] {
             Value::Int64(n) => n,
@@ -241,10 +241,10 @@ fn nan_bounded_range_query_on_a_desc_indexed_real_column_returns_empty_without_p
     });
     let result = result.expect("a NaN-bounded range query must not return a typed error either");
     assert!(
-        result.rows.is_empty(),
+        result.rows().is_empty(),
         "a NaN-bounded range query on a DESC index must return empty, matching the ASC/\
          non-indexed behavior: {:?}",
-        result.rows
+        result.rows()
     );
 }
 
@@ -276,14 +276,14 @@ fn query_a_via_composite(
         .execute(sql, &params(extra))
         .unwrap_or_else(|err| panic!("query `{sql}` must not error: {err:?}"));
     let values = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[0] {
             Value::Int64(n) => n,
             ref other => panic!("expected an INTEGER a, got {other:?}"),
         })
         .collect();
-    (values, result.trace)
+    (values, result.trace().clone())
 }
 
 /// The DESC-leading-column fix has two arms in the executor: single-column

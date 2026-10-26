@@ -63,11 +63,11 @@ fn row_text(db: &Database, id: Uuid, col: &str) -> String {
         )
         .expect("SELECT must succeed");
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == col)
         .unwrap_or_else(|| panic!("column {col} missing from result"));
-    match &result.rows[0][idx] {
+    match &result.rows()[0][idx] {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text for {col}, got {other:?}"),
     }
@@ -85,11 +85,11 @@ fn row_snapshot(db: &Database, table: &str, id: Uuid) -> Vec<Value> {
         )
         .expect("snapshot SELECT must succeed");
     assert_eq!(
-        result.rows.len(),
+        result.rows().len(),
         1,
         "expected exactly one row for snapshot"
     );
-    result.rows[0].clone()
+    result.rows()[0].clone()
 }
 
 /// Assert that a rejection produced zero forward progress in the change log
@@ -241,7 +241,7 @@ fn ce05_on_conflict_do_update_on_flagged_column_rejected() {
     let before_count = db
         .execute("SELECT * FROM decisions", &empty())
         .unwrap()
-        .rows
+        .rows()
         .len();
     let before_snapshot = row_snapshot(&db, "decisions", id);
     let lsn_before = db.current_lsn();
@@ -269,7 +269,7 @@ fn ce05_on_conflict_do_update_on_flagged_column_rejected() {
     let after_count = db
         .execute("SELECT * FROM decisions", &empty())
         .unwrap()
-        .rows
+        .rows()
         .len();
     assert_eq!(
         before_count, after_count,
@@ -308,10 +308,10 @@ fn ce07_delete_row_with_flagged_columns_succeeds() {
     .expect("DELETE must succeed even when table has flagged columns");
 
     let result = db.execute("SELECT * FROM decisions", &empty()).unwrap();
-    assert_eq!(result.rows.len(), 1, "exactly one row must remain");
-    let idx = result.columns.iter().position(|c| c == "id").unwrap();
+    assert_eq!(result.rows().len(), 1, "exactly one row must remain");
+    let idx = result.columns().iter().position(|c| c == "id").unwrap();
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Uuid(id_b),
         "the remaining row must be the non-deleted one"
     );
@@ -460,7 +460,7 @@ fn ce11_pk_plus_immutable_update_rejected_as_immutable_column() {
         )
         .unwrap();
     assert_eq!(
-        rows_at_orig.rows.len(),
+        rows_at_orig.rows().len(),
         1,
         "row must still be at original id"
     );
@@ -470,7 +470,7 @@ fn ce11_pk_plus_immutable_update_rejected_as_immutable_column() {
             &params(vec![("id", Value::Uuid(new_id))]),
         )
         .unwrap();
-    assert_eq!(rows_at_new.rows.len(), 0, "row must NOT appear at new id");
+    assert_eq!(rows_at_new.rows().len(), 0, "row must NOT appear at new id");
 }
 
 // ============================================================================
@@ -632,11 +632,11 @@ fn ce16_dag_retain_plus_column_immutable_compose() {
         )
         .unwrap();
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "edge_type")
         .unwrap();
-    assert_eq!(result.rows[0][idx], Value::Text("REL".into()));
+    assert_eq!(result.rows()[0][idx], Value::Text("REL".into()));
 }
 
 // ============================================================================
@@ -1276,7 +1276,7 @@ fn al02_alter_drop_non_flagged_column_succeeds() {
     db.execute("ALTER TABLE decisions DROP COLUMN reasoning", &empty())
         .expect("DROP of non-flagged reasoning must succeed");
     let result = db.execute("SELECT * FROM decisions", &empty()).unwrap();
-    assert!(!result.columns.iter().any(|c| c == "reasoning"));
+    assert!(!result.columns().iter().any(|c| c == "reasoning"));
 }
 
 // ============================================================================
@@ -1306,7 +1306,7 @@ fn al04_alter_rename_non_flagged_column_succeeds() {
     )
     .expect("RENAME of non-flagged reasoning must succeed");
     let result = db.execute("SELECT * FROM decisions", &empty()).unwrap();
-    assert!(result.columns.iter().any(|c| c == "rationale"));
+    assert!(result.columns().iter().any(|c| c == "rationale"));
 }
 
 // ============================================================================
@@ -1348,14 +1348,14 @@ fn re01_read_paths_unaffected_by_flag() {
     let id = Uuid::new_v4();
     insert_decision(&db, id);
     let result = db.execute("SELECT * FROM decisions", &empty()).unwrap();
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "decision_type")
         .unwrap();
     assert_eq!(
-        result.rows[0][idx],
+        result.rows()[0][idx],
         Value::Text("sql-migration".into()),
         "flagged column must be readable in SELECT *"
     );
@@ -1365,7 +1365,7 @@ fn re01_read_paths_unaffected_by_flag() {
             &params(vec![("dt", Value::Text("sql-migration".into()))]),
         )
         .unwrap();
-    assert_eq!(filtered.rows.len(), 1);
+    assert_eq!(filtered.rows().len(), 1);
 }
 
 // ============================================================================
@@ -1560,7 +1560,7 @@ fn al07_same_statement_drop_add_still_refuses_flagged_drop() {
     // and the phrase.
     match &add_err {
         Error::Other(msg) => assert!(
-            msg.to_lowercase().contains("already exists"),
+            msg.to_string().to_lowercase().contains("already exists"),
             "expected 'already exists' in error message, got: {msg}"
         ),
         other => panic!("expected Error::Other with 'already exists', got {other:?}"),
@@ -1964,12 +1964,12 @@ fn type_reject_helper(
         )
         .unwrap();
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == flagged_col)
         .unwrap_or_else(|| panic!("flagged column {flagged_col} missing from SELECT *"));
     assert_eq!(
-        &result.rows[0][idx], original_value,
+        &result.rows()[0][idx], original_value,
         "flagged column value must be bytes-identical to the original INSERT"
     );
 }
@@ -2344,11 +2344,11 @@ fn ic10_multi_statement_txn_flagged_reject_rolls_back_only_failing_stmt() {
         )
         .unwrap();
     let conf_idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "confidence")
         .unwrap();
-    assert_eq!(result.rows[0][conf_idx], Value::Float64(0.1));
+    assert_eq!(result.rows()[0][conf_idx], Value::Float64(0.1));
     // Flagged UPDATE did not commit.
     assert_eq!(row_text(&db, id, "decision_type"), "sql-migration");
 }
@@ -2678,11 +2678,11 @@ fn ic14_cross_variant_coercion_into_flagged_column_rejected() {
         )
         .unwrap();
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "created_tx")
         .unwrap();
-    assert_eq!(result.rows[0][idx], Value::TxId(contextdb_core::TxId(42)));
+    assert_eq!(result.rows()[0][idx], Value::TxId(contextdb_core::TxId(42)));
 }
 
 // ============================================================================
@@ -3009,8 +3009,8 @@ fn alter_table_add_column_immutable_replicates_and_peer_rejects_update() {
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
-    assert_eq!(r.rows.len(), 1);
-    match &r.rows[0][0] {
+    assert_eq!(r.rows().len(), 1);
+    match &r.rows()[0][0] {
         Value::Text(s) => assert_eq!(s, "original"),
         other => panic!("expected Text(\"original\"), got {other:?}"),
     }

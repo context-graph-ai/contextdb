@@ -35,7 +35,7 @@ fn body_of(db: &Database, id: i64) -> Option<String> {
     let result = db
         .execute("SELECT body FROM notes WHERE id = $id", &params)
         .expect("scan");
-    result.rows.first().map(|row| match &row[0] {
+    result.rows().first().map(|row| match &row[0] {
         Value::Text(t) => t.clone(),
         other => panic!("body must be text, got {other:?}"),
     })

@@ -48,7 +48,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
         &HashMap::from([("id".to_string(), Value::Uuid(id))]),
     )
     .expect("read exact row")
-    .rows
+    .rows()
     .first()
     .map(|row| match &row[0] {
         Value::Text(body) => body.clone(),
@@ -338,7 +338,7 @@ async fn authoritative_purge_reaches_sync_off_edge_while_ordinary_rows_stay_loca
         )
         .expect("the hub issues the node-local instruction again");
     assert_eq!(
-        repeated.rows_affected, 0,
+        repeated.rows_affected(), 0,
         "the hub holds no row at that key"
     );
     within(client.pull_default())

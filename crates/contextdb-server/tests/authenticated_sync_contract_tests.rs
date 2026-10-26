@@ -75,7 +75,7 @@ fn body(db: &Database, id: Uuid) -> Option<String> {
     let result = db
         .execute("SELECT body FROM notes WHERE id = $id", &values)
         .expect("select note");
-    result.rows.first().and_then(|row| match row.first() {
+    result.rows().first().and_then(|row| match row.first() {
         Some(Value::Text(value)) => Some(value.clone()),
         _ => None,
     })
@@ -1341,14 +1341,14 @@ async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
     let sql = "SELECT COUNT(*) FROM placements WHERE owner = $owner";
     let params = HashMap::from([("owner".to_string(), Value::Text("ada".into()))]);
     let count = hub.db.execute(sql, &params).unwrap();
-    assert_eq!(count.rows[0][0], Value::Int64(3));
+    assert_eq!(count.rows()[0][0], Value::Int64(3));
     assert!(
         matches!(
-            count.trace.maintained_count.as_deref(),
+            count.trace().maintained_count.as_deref(),
             Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. })
         ),
         "a writable handle serves the same exact maintained count: {:?}",
-        count.trace.maintained_count
+        count.trace().maintained_count
     );
 
     let edge_b_path = root.path().join("edge-b.db");
@@ -1370,15 +1370,15 @@ async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
     let edge_b_read_only = contextdb_engine::ReadSession::open(&edge_b_path)
         .expect("read the second edge's committed image after close");
     let edge_b_count = edge_b_read_only.execute(sql, &params).unwrap();
-    assert_eq!(edge_b_count.rows[0][0], Value::Int64(3));
+    assert_eq!(edge_b_count.rows()[0][0], Value::Int64(3));
     assert!(
         matches!(
-            edge_b_count.trace.maintained_count.as_deref(),
+            edge_b_count.trace().maintained_count.as_deref(),
             Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. })
         ),
         "the second edge's committed image serves the received count, per \
          docs/query-language.md:928-931: {:?}",
-        edge_b_count.trace.maintained_count
+        edge_b_count.trace().maintained_count
     );
 
     let hub_path = root.path().join("hub.db");
@@ -1393,15 +1393,15 @@ async fn a_maintained_count_declaration_crosses_sync_or_holds_back_its_table() {
     let read_only =
         contextdb_engine::ReadSession::open(&hub_path).expect("read the hub's committed image");
     let read_only_count = read_only.execute(sql, &params).unwrap();
-    assert_eq!(read_only_count.rows[0][0], Value::Int64(3));
+    assert_eq!(read_only_count.rows()[0][0], Value::Int64(3));
     assert!(
         matches!(
-            read_only_count.trace.maintained_count.as_deref(),
+            read_only_count.trace().maintained_count.as_deref(),
             Some(contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. })
         ),
         "a store read as a committed image serves the answer from the maintained count, per \
          docs/query-language.md:928-931: {:?}",
-        read_only_count.trace.maintained_count
+        read_only_count.trace().maintained_count
     );
 }
 
@@ -1461,7 +1461,7 @@ async fn current_iroh_holds_only_the_missing_schema_capability_then_catches_up()
         hub.db
             .execute("SELECT id FROM embeddings", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );
@@ -1491,7 +1491,7 @@ async fn current_iroh_holds_only_the_missing_schema_capability_then_catches_up()
         receiver
             .execute("SELECT id FROM embeddings", &HashMap::new())
             .unwrap()
-            .rows
+            .rows()
             .len(),
         1
     );

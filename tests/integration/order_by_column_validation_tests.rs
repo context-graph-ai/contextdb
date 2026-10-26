@@ -135,14 +135,14 @@ fn order_by_select_list_alias_must_sort_not_silently_pass_through() {
     let r = db
         .execute("SELECT b AS x FROM t ORDER BY x", &empty())
         .expect("ORDER BY a SELECT-list alias is standard SQL and must succeed");
-    let got: Vec<i64> = r.rows.iter().map(|row| int_col(&row[0])).collect();
+    let got: Vec<i64> = r.rows().iter().map(|row| int_col(&row[0])).collect();
     assert_eq!(
         got,
         vec![8, 9, 10],
         "ORDER BY x must actually sort by the aliased column b; got {:?} \
          (insertion order [10, 9, 8] would mean the alias silently failed to \
          sort)",
-        r.rows
+        r.rows()
     );
 }
 
@@ -186,12 +186,12 @@ fn order_by_arithmetic_expression_sorts_by_the_evaluated_value() {
     let r = db
         .execute("SELECT b FROM t ORDER BY a + 1", &empty())
         .expect("ORDER BY a + 1 is standard SQL arithmetic and must succeed");
-    let got: Vec<i64> = r.rows.iter().map(|row| int_col(&row[0])).collect();
+    let got: Vec<i64> = r.rows().iter().map(|row| int_col(&row[0])).collect();
     assert_eq!(
         got,
         vec![9, 8, 10],
         "must sort ascending by a + 1 = [2, 3, 4] (a = [1, 2, 3]), got {:?}",
-        r.rows
+        r.rows()
     );
 }
 

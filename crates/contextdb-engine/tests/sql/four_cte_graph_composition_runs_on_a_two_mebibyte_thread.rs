@@ -104,7 +104,7 @@ fn four_cte_graph_composition_runs_on_a_two_mebibyte_thread() {
         .expect("the engine does not overflow the 2 MiB debug thread")
         .expect("execute the actual four-CTE Context Graph discovery statement");
     let returned = result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.as_slice() {
             [Value::Uuid(id)] => *id,

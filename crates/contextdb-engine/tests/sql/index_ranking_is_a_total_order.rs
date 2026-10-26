@@ -86,25 +86,25 @@ fn the_sort_saving_candidate_wins_under_every_declaration_order() {
             )
             .unwrap_or_else(|e| panic!("query under declaration order {declare:?}: {e}"));
         assert_eq!(
-            result.trace.index_used.as_deref(),
+            result.trace().index_used.as_deref(),
             Some(SORT_SAVING),
             "declaration order {declare:?} must not change the winner: {:?}",
-            result.trace
+            result.trace()
         );
         assert!(
-            result.trace.sort_elided,
+            result.trace().sort_elided,
             "declaration order {declare:?}: the sort must be reported elided: {:?}",
-            result.trace
+            result.trace()
         );
         assert_eq!(
-            result.rows,
+            result.rows(),
             vec![
                 vec![Value::Int64(7)],
                 vec![Value::Int64(18)],
                 vec![Value::Int64(29)],
             ],
             "declaration order {declare:?}: rows must already arrive in b-order: {:?}",
-            result.trace
+            result.trace()
         );
     }
 }
@@ -173,10 +173,10 @@ fn two_whole_key_candidates_that_both_supply_the_order_resolve_deterministically
         )
         .expect("query must succeed");
     assert_eq!(
-        result.trace.index_used.as_deref(),
+        result.trace().index_used.as_deref(),
         Some("cycle_twin_first_idx"),
         "two equally-ranked whole-key, sort-eliding candidates must resolve by creation order: {:?}",
-        result.trace
+        result.trace()
     );
-    assert!(result.trace.sort_elided, "{:?}", result.trace);
+    assert!(result.trace().sort_elided, "{:?}", result.trace());
 }

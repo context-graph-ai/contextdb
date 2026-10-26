@@ -265,8 +265,8 @@ async fn main() {
                     &params,
                 )
                 .expect("claims scan");
-            println!("  claim rows: {}", claims.rows.len());
-            for row in &claims.rows {
+            println!("  claim rows: {}", claims.rows().len());
+            for row in claims.rows() {
                 println!("    claim: {row:?}");
             }
             let results = db
@@ -275,7 +275,7 @@ async fn main() {
                     &params,
                 )
                 .expect("results scan");
-            println!("  result rows: {}", results.rows.len());
+            println!("  result rows: {}", results.rows().len());
         }
         Command::Cancel { job_id } => {
             ledger::cancel_job(&db, &job_id, &node_id, Some("demo cancel"), wall_now_ms())

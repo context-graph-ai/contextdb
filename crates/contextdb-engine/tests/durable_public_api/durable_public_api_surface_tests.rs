@@ -773,8 +773,8 @@ fn external_embedder_query_result_literal_keeps_its_five_public_fields() {
         trace: contextdb_engine::QueryTrace::default(),
         cascade: None,
     };
-    assert_eq!(result.columns, vec!["id"]);
-    assert_eq!(result.rows, vec![vec![contextdb_core::Value::Int64(7)]]);
-    assert_eq!(result.rows_affected, 0);
-    assert!(result.cascade.is_none());
+    assert_eq!(result.columns(), vec!["id"]);
+    assert_eq!(result.rows(), vec![vec![contextdb_core::Value::Int64(7)]]);
+    assert_eq!(result.rows_affected(), 0);
+    assert!(result.cascade().is_none());
 }

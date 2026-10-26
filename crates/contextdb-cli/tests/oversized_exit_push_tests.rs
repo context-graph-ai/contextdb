@@ -177,7 +177,7 @@ async fn quitting_the_cli_pushes_a_pending_oversized_unit_and_exits_clean() {
     // The check reads the 64 MiB row back: a caller read funded explicitly.
     let check_read = contextdb_engine::vector_read_memory::DeclaredReadMemory::from_reader_limit(
         512 * 1024 * 1024,
-    );
+    ).expect("the declared read limit is admitted");
     let parent = hub
         .db
         .point_lookup_with_read_memory_for_test(

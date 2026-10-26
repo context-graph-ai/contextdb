@@ -114,13 +114,13 @@ fn run(db: &Database, sql: &str) -> (u64, u64) {
     eprintln!(
         "write_through_index sql={sql:?} plan={} index={:?} examined={} affected={} \
          considered={:?}",
-        result.trace.physical_plan,
-        result.trace.index_used,
-        result.trace.rows_examined,
-        result.rows_affected,
-        result.trace.indexes_considered,
+        result.trace().physical_plan,
+        result.trace().index_used,
+        result.trace().rows_examined,
+        result.rows_affected(),
+        result.trace().indexes_considered,
     );
-    (result.trace.rows_examined, result.rows_affected)
+    (result.trace().rows_examined, result.rows_affected())
 }
 
 fn examined_by_size(sql: &str) -> Vec<(i64, u64)> {
@@ -171,11 +171,11 @@ fn the_same_where_in_a_select_examines_only_its_rows() {
             .expect("select one session");
         eprintln!(
             "write_through_index select rows={rows} plan={} index={:?} examined={}",
-            result.trace.physical_plan, result.trace.index_used, result.trace.rows_examined
+            result.trace().physical_plan, result.trace().index_used, result.trace().rows_examined
         );
-        assert_eq!(result.rows.len(), ROWS_PER_SESSION as usize);
-        assert_eq!(result.trace.index_used.as_deref(), Some("p_session_idx"));
-        examined.push((rows, result.trace.rows_examined));
+        assert_eq!(result.rows().len(), ROWS_PER_SESSION as usize);
+        assert_eq!(result.trace().index_used.as_deref(), Some("p_session_idx"));
+        examined.push((rows, result.trace().rows_examined));
     }
     assert_eq!(
         examined[0].1, examined[1].1,
@@ -191,7 +191,7 @@ fn the_same_where_examines_the_same_entries_on_every_route() {
     let select = db
         .execute(&format!("SELECT id FROM p {WHERE}"), &params())
         .expect("select one session")
-        .trace
+        .trace()
         .rows_examined;
     let (update, _) = run(
         &db,

@@ -327,8 +327,8 @@ fn a2_03_insert_via_sql() {
     let result = db
         .execute("SELECT * FROM entities", &HashMap::new())
         .expect("select entities");
-    assert_eq!(result.rows.len(), 1);
-    let row = &result.rows[0];
+    assert_eq!(result.rows().len(), 1);
+    let row = &result.rows()[0];
     assert!(row.contains(&Value::Uuid(id)));
     assert!(row.contains(&Value::Text("sql insert".to_string())));
 }
@@ -364,8 +364,8 @@ fn a2_04_select_with_where_clause() {
             &HashMap::new(),
         )
         .expect("select with where");
-    assert_eq!(result.rows.len(), 2);
-    for row in result.rows {
+    assert_eq!(result.rows().len(), 2);
+    for row in result.rows() {
         assert!(row.contains(&Value::Text("server".to_string())));
     }
 }
@@ -441,9 +441,9 @@ fn a2_06_update_modifies_row() {
             &make_params(vec![("id", Value::Uuid(id))]),
         )
         .expect("select");
-    assert_eq!(selected.rows.len(), 1);
-    assert!(selected.rows[0].contains(&Value::Text("new".to_string())));
-    assert!(!selected.rows[0].contains(&Value::Text("old".to_string())));
+    assert_eq!(selected.rows().len(), 1);
+    assert!(selected.rows()[0].contains(&Value::Text("new".to_string())));
+    assert!(!selected.rows()[0].contains(&Value::Text("old".to_string())));
 }
 
 #[test]
@@ -1298,7 +1298,7 @@ fn a4_08_vector_search_via_sql() {
             &make_params(vec![("q", Value::Vector(v))]),
         )
         .expect("vector select");
-    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.rows().len(), 3);
 
     let explain = db
         .explain("SELECT * FROM observations ORDER BY embedding <=> $q LIMIT 3")
@@ -1621,14 +1621,14 @@ fn a4_13_vector_search_with_context_prefilter() {
             &make_params(vec![("q", Value::Vector(vec![1.0, 0.0]))]),
         )
         .expect("query");
-    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.rows().len(), 3);
     // SELECT * must return user columns (no internal row_id), verify context_id directly
     let ctx_idx = out
-        .columns
+        .columns()
         .iter()
         .position(|c| c == "context_id")
         .expect("context_id column must exist in output");
-    for row in &out.rows {
+    for row in out.rows() {
         assert_eq!(
             row[ctx_idx],
             Value::Text("ctx1".to_string()),
@@ -2675,8 +2675,8 @@ fn a7_10_graph_table_cte_chain_with_later_match_stays_graph_query() {
         "multi-CTE graph query should not be rejected as full-text search: {result:?}"
     );
     let result = result.expect("graph query should succeed");
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], Value::Uuid(c));
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0][0], Value::Uuid(c));
 }
 
 #[test]

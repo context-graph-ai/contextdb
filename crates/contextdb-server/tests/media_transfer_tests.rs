@@ -1033,7 +1033,7 @@ async fn hub_holds_only_the_reference_never_the_blob_bytes() {
 
 fn row_count(db: &Database, table: &str) -> usize {
     match db.execute(&format!("SELECT * FROM {table}"), &HashMap::new()) {
-        Ok(r) => r.rows.len(),
+        Ok(r) => r.rows().len(),
         Err(_) => 0,
     }
 }
@@ -1043,7 +1043,7 @@ fn any_table_contains(db: &Database, needle: &[u8]) -> bool {
         let Ok(result) = db.execute(&format!("SELECT * FROM {table}"), &HashMap::new()) else {
             continue;
         };
-        for row in &result.rows {
+        for row in result.rows() {
             for cell in row {
                 let rendered = format!("{cell:?}");
                 if rendered

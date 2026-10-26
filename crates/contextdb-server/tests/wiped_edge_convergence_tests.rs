@@ -102,16 +102,16 @@ fn contents(db: &Database, table: &str) -> (Vec<String>, BTreeSet<String>) {
         .execute(&format!("SELECT * FROM {table}"), &p())
         .unwrap_or_else(|error| panic!("{table} must be readable: {error}"));
     let rows = result
-        .rows
+        .rows()
         .iter()
         .map(|row| format!("{row:?}"))
         .collect::<BTreeSet<_>>();
     assert_eq!(
         rows.len(),
-        result.rows.len(),
+        result.rows().len(),
         "{table}: a row appears twice"
     );
-    (result.columns.clone(), rows)
+    (result.columns().to_vec(), rows)
 }
 
 fn declared_columns(db: &Database, table: &str) -> Vec<(String, String)> {
