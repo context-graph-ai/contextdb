@@ -240,6 +240,13 @@ impl ImageMemoryHandle {
 pub struct ImageMemoryObservation {
     image: crate::vector_read_memory::root_observations::Token,
     accountant: crate::vector_read_memory::root_observations::Token,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     identity: usize,
 }
 #[cfg(any(test, feature = "test-seams"))]
@@ -272,6 +279,13 @@ impl ImageMemoryObservation {
             identity,
         }
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn identity(self) -> usize {
         self.identity
     }
@@ -290,6 +304,13 @@ impl ImageMemoryObservation {
         let accountant = records::producer_sample(self.accountant);
         (image.0, image.1, accountant.0, accountant.1)
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_allocation_oracle_tests.rs"
+        )
+    )]
     pub(crate) fn retained_payload_bytes(self) -> usize {
         crate::vector_read_memory::root_observations::producer_sample(self.image).2
     }

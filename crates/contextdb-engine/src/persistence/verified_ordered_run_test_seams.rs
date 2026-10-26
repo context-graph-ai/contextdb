@@ -47,6 +47,13 @@ thread_local! {
 
 /// Make the authenticated run build fail to reserve its memory, the way a
 /// database whose budget cannot hold the proof does.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from correction_counterexample_tests.rs"
+    )
+)]
 pub(crate) fn arm_verified_run_memory_exhaustion_for_test(armed: bool) {
     REFUSE_RUN_MEMORY.with(|refuse| refuse.set(armed));
 }
@@ -76,6 +83,13 @@ thread_local! {
 /// Make the durable config write of a memory-limit transition fail, the way
 /// a full disk or a damaged store does, so the transition's rollback is
 /// observable rather than argued.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from correction_counterexample_tests.rs"
+    )
+)]
 pub(crate) fn arm_config_write_failure_for_test(armed: bool) {
     REFUSE_CONFIG_WRITE.with(|refuse| refuse.set(armed));
 }

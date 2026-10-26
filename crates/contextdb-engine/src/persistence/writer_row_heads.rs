@@ -753,6 +753,13 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
 
     /// What this pass has admitted and still holds.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(super) fn ledger(&self) -> HoldLedger {
         self.ledger
     }
@@ -1120,9 +1127,30 @@ pub(super) enum HoldStep {
 #[cfg(any(test, feature = "test-seams"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HoldFault {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     Error,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from event_bus_self_join.rs"
+        )
+    )]
     Panic,
     /// The next registry array allocation fails as the global allocator would.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
+        )
+    )]
     GlobalAllocation,
 }
 
@@ -1138,12 +1166,26 @@ thread_local! {
 
 /// Fail the `skip + 1`-th arrival at `step` on this thread.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
+    )
+)]
 pub(super) fn inject_hold_fault(step: HoldStep, fault: HoldFault, skip: usize) {
     HOLD_FAULT.with(|slot| slot.set(Some((step, fault, skip))));
 }
 
 /// Disarm the injected fault; true when it was still waiting to fire.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
+    )
+)]
 pub(super) fn clear_hold_fault() -> bool {
     HOLD_FAULT.with(|slot| slot.take().is_some())
 }
@@ -1151,6 +1193,13 @@ pub(super) fn clear_hold_fault() -> bool {
 /// Registry bytes holders allocated outside a funded reserve on this thread
 /// since the last call.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
+    )
+)]
 pub(super) fn take_held_overdraft() -> usize {
     HELD_OVERDRAFT.with(|total| total.replace(0))
 }
@@ -1177,6 +1226,13 @@ fn take_hold_fault(step: HoldStep) -> Option<HoldFault> {
 
 /// How many times each step was reached on this thread since the last call.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
+    )
+)]
 pub(super) fn take_hold_arrivals() -> [usize; 16] {
     HOLD_ARRIVALS.with(|arrivals| arrivals.replace([0; 16]))
 }

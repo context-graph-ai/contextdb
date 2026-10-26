@@ -198,6 +198,13 @@ pub(super) fn retention_reclaim_checkpoint_for_test(boundary: u8) {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from consolidation_metadata_contract_tests.rs"
+    )
+)]
 pub(crate) fn arm_policy_metadata_fault_for_test(boundary: u8, crash: bool) {
     assert!(matches!(boundary, 10 | 11));
     POLICY_METADATA_FAULT.with(|armed| armed.set((boundary, crash)));
@@ -241,6 +248,13 @@ pub(crate) fn arm_stored_relational_row_bytes_fault_for_test() {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from empty_declared_index_readiness_tests.rs"
+    )
+)]
 pub(crate) fn arm_currency_reclaim_fault_for_test(boundary: u8, crash: bool) {
     assert!((1..=34).contains(&boundary));
     assert!(

@@ -1118,11 +1118,25 @@ fn run_publication_wait_hook(
 /// Install a one-shot hook for the window named by `slot`, taken by the first
 /// wait that reaches it on this thread.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub(crate) fn install_after_held_admission_take_hook_for_test(hook: PublicationWaitHook) {
     AFTER_HELD_ADMISSION_TAKE.with(|slot| *slot.borrow_mut() = Some(hook));
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub(crate) fn install_before_admission_sleep_hook_for_test(hook: PublicationWaitHook) {
     BEFORE_ADMISSION_SLEEP.with(|slot| *slot.borrow_mut() = Some(hook));
 }

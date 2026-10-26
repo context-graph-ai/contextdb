@@ -1028,6 +1028,13 @@ pub(crate) fn graph_storage_key<K: AsRef<[u8]>>(family: &str, operation: &str, k
 }
 
 /// Initial roots of this executing transaction, captured before any open handles.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from graph_publication_root_tests.rs"
+    )
+)]
 pub(crate) fn bind_graph_write_root(write: &redb::WriteTransaction) {
     bind_graph_write_root_with(write, |root| {
         GRAPH_ROOT.with(|r| {

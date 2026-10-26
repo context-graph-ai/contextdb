@@ -227,6 +227,13 @@ impl MaintenanceContext {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn maintenance_inventory_phase_locked(&self) -> Result<InventoryPhase> {
         self.maintenance_inventory_phase_with_catalog_retention_locked(true)
     }
@@ -876,6 +883,13 @@ impl MaintenanceContext {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(super) fn maintenance_catalog_inventory_locked(
         &self,
     ) -> Result<MaintenanceCatalogInventory> {
@@ -886,6 +900,13 @@ impl MaintenanceContext {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_public_cycle_admission_tests.rs"
+        )
     )]
     pub(super) fn maintenance_catalog_inventory(&self) -> Result<MaintenanceCatalogInventory> {
         self.tx_mgr

@@ -1457,6 +1457,13 @@ impl RedbPersistence {
     /// Existing inspection callers expect the canonical durable envelope.
     /// This materialization is absent from every production-only build.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from redb_vector_partitions.rs"
+        )
+    )]
     pub(super) fn materialize_paged_topology_for_test(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         fn u64_into(bytes: &mut Vec<u8>, value: usize) {
             bytes.extend_from_slice(&(value as u64).to_le_bytes());

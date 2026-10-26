@@ -2158,6 +2158,13 @@ pub(in super::super) mod commit_row_work {
         GROUP_VERSIONS_AUTHENTICATED.with(|count| count.set(count.get().saturating_add(1)));
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
+        )
+    )]
     pub(in super::super::super) fn take_group_versions_authenticated() -> u64 {
         GROUP_VERSIONS_AUTHENTICATED.with(|count| count.replace(0))
     }
@@ -2169,10 +2176,24 @@ pub(in super::super) mod commit_row_work {
         RETENTION_CLOCK_STEPS.with(|count| count.set(count.get().saturating_add(1)));
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
+        )
+    )]
     pub(in super::super::super) fn take_retention_clock_steps() -> u64 {
         RETENTION_CLOCK_STEPS.with(|count| count.replace(0))
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
+        )
+    )]
     pub(in super::super::super) fn take_declared_table_visits() -> u64 {
         DECLARED_TABLE_VISITS.with(|count| count.replace(0))
     }
@@ -2184,6 +2205,13 @@ pub(in super::super) mod commit_row_work {
         PROTECTED_ROOT_EVENTS.with(|count| count.set(count.get().saturating_add(1)));
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
+        )
+    )]
     pub(in super::super::super) fn take_protected_root_events() -> u64 {
         PROTECTED_ROOT_EVENTS.with(|count| count.replace(0))
     }
@@ -2196,6 +2224,13 @@ pub(in super::super) mod commit_row_work {
         OVERLAY_COMPARISONS.with(|count| count.set(count.get().saturating_add(comparisons as u64)));
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
+        )
+    )]
     pub(in super::super::super) fn take_overlay_comparisons() -> u64 {
         OVERLAY_COMPARISONS.with(|count| count.replace(0))
     }
@@ -2213,16 +2248,37 @@ pub(in super::super) mod commit_row_work {
         HELD_RELATION_WORK.with(|count| count.set(count.get().saturating_add(units as u64)));
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
+        )
+    )]
     pub(in super::super::super) fn take_held_relation_work() -> u64 {
         HELD_RELATION_WORK.with(|count| count.replace(0))
     }
 
     /// Start recording, per reconciliation pass, the tables in the order the
     /// pass first used them.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
+        )
+    )]
     pub(in super::super::super) fn watch_held_first_uses() {
         HELD_FIRST_USES.with(|uses| *uses.borrow_mut() = Some(Vec::new()));
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
+        )
+    )]
     pub(in super::super::super) fn take_held_first_uses() -> Vec<Vec<String>> {
         HELD_FIRST_USES.with(|uses| uses.borrow_mut().take().unwrap_or_default())
     }

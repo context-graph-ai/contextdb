@@ -16,10 +16,24 @@ thread_local! {
     static PAUSE: RefCell<Option<Hook>> = const { RefCell::new(None) };
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from correction_counterexample_tests.rs"
+    )
+)]
 pub(crate) fn arm_memory_limit_transition_pause_for_test(hook: Hook) {
     PAUSE.with(|pause| *pause.borrow_mut() = Some(hook));
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from correction_counterexample_tests.rs"
+    )
+)]
 pub(crate) fn disarm_memory_limit_transition_pause_for_test() {
     PAUSE.with(|pause| *pause.borrow_mut() = None);
 }

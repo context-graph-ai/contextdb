@@ -1544,6 +1544,13 @@ pub(crate) struct DeclaredReadChildObserver {
 #[cfg(any(test, feature = "test-seams"))]
 impl DeclaredReadChildObserver {
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from retained_trace_ownership_tests.rs"
+        )
+    )]
     pub(crate) fn retain_original_for_physical_test(&self) -> Option<ReadMemoryOwner> {
         let source = {
             let registry = native_child_observers()
@@ -1709,6 +1716,13 @@ pub fn pin_original_native_for_test(
 
 #[cfg(any(test, feature = "test-seams"))]
 pub(crate) trait NativeOriginalPinSource: Send + Sync {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from control_memory.rs"
+        )
+    )]
     fn original_native_owner(&self) -> ReadMemoryOwner;
 }
 #[cfg(any(test, feature = "test-seams"))]

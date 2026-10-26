@@ -3482,6 +3482,13 @@ impl RetainedReadSource {
 
     /// The most this reader may hold in proved chunks.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from content_identity.rs"
+        )
+    )]
     pub(crate) fn resident_proof_chunk_ceiling_for_test(&self) -> usize {
         self.content_identity
             .resident_proof_chunk_ceiling_for_test()
@@ -3527,6 +3534,13 @@ impl RetainedReadSource {
     /// Drop every retained authenticated chunk, as capacity eviction does. The
     /// next statement proves them against the committed root again.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
+        )
+    )]
     pub(crate) fn evict_resident_proof_chunks_for_test(&self) -> usize {
         let evicted = self.content_identity.evict_resident_proof_chunks_for_test();
         self.clear_statement_proofs();
@@ -3561,6 +3575,13 @@ impl RetainedReadSource {
 
     /// Drop the remembered result-record witnesses only.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
+        )
+    )]
     pub(crate) fn evict_record_witnesses_for_test(&self) -> usize {
         self.content_identity.evict_record_witnesses_for_test()
     }
@@ -4576,6 +4597,13 @@ impl RetainedReadSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
+        )
+    )]
     pub(super) fn row_by_id_in_read(
         &self,
         read: &redb::ReadTransaction,
@@ -4683,6 +4711,13 @@ impl RetainedReadSource {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
+        )
     )]
     pub(super) fn row_identity_by_id_in_read(
         &self,
@@ -6132,6 +6167,13 @@ impl RetainedReadSource {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
+        )
+    )]
     pub(crate) fn bounded_relational_ordered_next<E>(
         &self,
         table: &str,

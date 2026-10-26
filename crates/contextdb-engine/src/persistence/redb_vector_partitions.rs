@@ -459,6 +459,13 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from empty_declared_index_readiness_tests.rs"
+        )
+    )]
     pub(crate) fn load_relational_row_version(
         &self,
         table: &str,
@@ -3491,6 +3498,13 @@ impl RedbPersistence {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from prior_base_decode_tests.rs"
+        )
+    )]
     pub(crate) fn load_vector_partition_base_generation_with_expected_graph_bytes(
         &self,
         index: &VectorIndexRef,

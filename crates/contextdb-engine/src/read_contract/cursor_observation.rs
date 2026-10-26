@@ -206,6 +206,13 @@ pub(crate) struct CanonicalObservedCursorPage {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from response_encoding_proofs.rs"
+    )
+)]
 pub(crate) fn encode_observed_cursor_page(
     page: &CursorPage,
     observation: &CursorObservation,

@@ -1201,6 +1201,13 @@ impl RedbPersistence {
     /// and authenticated directory companions, deliberately bypassing placement
     /// overlap validation so loader corruption detection can be tested separately.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_current_identity.rs"
+        )
+    )]
     pub(crate) fn write_corrupt_store_vector_memberships_for_test(
         &self,
         records: &[VectorPartitionMembershipRecord],
