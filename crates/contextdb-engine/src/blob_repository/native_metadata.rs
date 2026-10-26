@@ -341,27 +341,6 @@ fn scan(reader: &mut Reader<'_, '_>, depth: usize) -> Result<usize> {
     Ok(maximum)
 }
 
-#[derive(Default)]
-struct CheckedBytes;
-impl<'de> serde::Deserialize<'de> for CheckedBytes {
-    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> std::result::Result<Self, D::Error> {
-        struct V;
-        impl<'de> serde::de::Visitor<'de> for V {
-            type Value = CheckedBytes;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a sequence")
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut values: A,
-            ) -> std::result::Result<CheckedBytes, A::Error> {
-                while values.next_element::<u8>()?.is_some() {}
-                Ok(CheckedBytes)
-            }
-        }
-        decoder.deserialize_seq(V)
-    }
-}
 #[derive(serde::Deserialize)]
 pub(super) struct Tag {
     pub version: u8,
