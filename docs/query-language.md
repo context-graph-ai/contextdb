@@ -411,6 +411,45 @@ Size suffixes are binary. Both settings accept an unquoted or quoted size and `N
 **2147483648 bytes**. CLI `--memory-limit 2G` uses the same value. The limit governs charged bytes,
 which are separate from whole-process RSS.
 
+`SET READ_CACHE_SHARE = <percent>` changes only the current `ReadSession`'s file page cache.
+An integer from 0 through 100 declares that percentage of the session memory budget after fixed
+source reservations. `SET READ_CACHE_SHARE = DEFAULT` restores the exact derived default,
+`(budget - fixed reservations) / 7`, displayed as default (14%). Zero disables the file cache.
+The change takes effect immediately without reopening the snapshot; an open cursor keeps its
+rows, snapshot, and funded pinned pages. Another session and a reopened session keep their own
+policy. These statements require no writable store and do not persist a store setting.
+
+```sql
+SET READ_CACHE_SHARE = 40;
+SHOW READ_CACHE_SHARE;
+SET READ_CACHE_SHARE = 0;
+SET READ_CACHE_SHARE = DEFAULT;
+```
+
+Range refusals use `Error::InvalidSetting { name, value, allowed }`; for this setting `name` is
+`READ_CACHE_SHARE` and `allowed` is `0..=100`. `SET MEMORY_LIMIT` above its startup ceiling (or
+`NONE` under a finite startup ceiling) uses the same typed variant. A valid cache percentage still
+has to pass total memory admission: on an opened file reader, 100 consumes the entire remainder
+and leaves no room for the prepaid index and decoded state, so it returns the typed
+`MemoryBudgetExceeded` refusal. Either refusal keeps the previous declaration and capacity.
+
+`SHOW READ_CACHE_SHARE` returns one row: `declared` (an integer, or text `default`),
+`effective_bytes` (Int64), `effective_percent` (Float64, relative to the remainder after fixed
+reservations), `last_refusal` (the last refused value as text, at most 64 ASCII bytes; initially
+Null), `last_query_resident_percent` (Float64 percent; initially Null), `budget_bytes`,
+`fixed_reservation_bytes`, `prepaid_index_bytes`, `held_page_bytes`, and `default_percent`.
+Settings and their inspection do not replace the last data statement's residency observation.
+On the owner route the policy describes a future file reader; physical cache fields and query
+residency are Null because this session does not own the writer's shared cache.
+
+Query residency is advisory. The engine records distinct opaque page identifiers on ordinary,
+windowed, and native reads, including hits, within the existing admitted cache index arena.
+The window retains at most `effective_bytes / page_size` identifiers; a larger statement is
+represented by the first bounded set. After the statement, the production cache residency probe
+peeks those identifiers without I/O, allocation, or changes to eviction priority. An empty window
+reports zero. Concurrent eviction can change the answer; this estimate does not certify a
+snapshot or predict query cost. Index storage remains prepaid and visible even at share zero.
+
 `SHOW DISK_LIMIT` returns the same columns for file-backed storage. On `:memory:` databases, disk limit commands are accepted but ignored.
 
 `SHOW CONTENT_SIZE` is a read-only inspection of a file-backed store's captured committed snapshot.

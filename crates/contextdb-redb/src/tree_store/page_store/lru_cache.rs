@@ -9,6 +9,10 @@ use std::sync::{Mutex, RwLock, RwLockReadGuard};
 const NONE: u32 = u32::MAX;
 
 struct Entry<T> {
+    #[cfg(feature = "contextdb-internal")]
+    query_page: AtomicU64,
+    #[cfg(feature = "contextdb-internal")]
+    query_epoch: AtomicU64,
     key: AtomicU64,
     second_chance: AtomicBool,
     previous: AtomicU32,
@@ -18,6 +22,12 @@ struct Entry<T> {
 }
 
 struct FreeSlots {
+    #[cfg(feature = "contextdb-internal")]
+    query_epoch: u64,
+    #[cfg(feature = "contextdb-internal")]
+    query_limit: usize,
+    #[cfg(feature = "contextdb-internal")]
+    query_count: usize,
     slots: Box<[u32]>,
     len: usize,
 }
@@ -47,6 +57,10 @@ impl<T> EntryArena<T> {
         assert!(capacity < NONE as usize);
         let entries = cache_array_prepaid(capacity, |_| {
             Ok(Entry {
+                #[cfg(feature = "contextdb-internal")]
+                query_page: AtomicU64::new(0),
+                #[cfg(feature = "contextdb-internal")]
+                query_epoch: AtomicU64::new(0),
                 key: AtomicU64::new(0),
                 second_chance: AtomicBool::new(false),
                 previous: AtomicU32::new(NONE),
@@ -61,6 +75,12 @@ impl<T> EntryArena<T> {
         CacheShared::new_prepaid(Self {
             entries,
             free: Mutex::new(FreeSlots {
+                #[cfg(feature = "contextdb-internal")]
+                query_epoch: 0,
+                #[cfg(feature = "contextdb-internal")]
+                query_limit: 0,
+                #[cfg(feature = "contextdb-internal")]
+                query_count: 0,
                 slots,
                 len: capacity,
             }),
@@ -71,6 +91,70 @@ impl<T> EntryArena<T> {
         CacheShared::<Self>::layout().size()
             + self.entries.len() * size_of::<Entry<T>>()
             + self.entries.len() * size_of::<u32>()
+    }
+
+    // No second array, map or owner: the original arena Layout prepays this
+    // bounded page-id window and keeps it paid through physical free.
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn begin_page_window(&self, limit: usize) -> u64 {
+        let mut free = self.free.lock().unwrap();
+        free.query_epoch = free.query_epoch.wrapping_add(1);
+        if free.query_epoch == 0 {
+            for entry in &self.entries {
+                entry.query_epoch.store(0, Ordering::Release);
+            }
+            free.query_epoch = 1;
+        }
+        free.query_limit = limit.min(self.entries.len());
+        free.query_count = 0;
+        free.query_epoch
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "The hash is reduced modulo the window length."
+    )]
+    pub(crate) fn record_page(&self, epoch: u64, id: [u8; 8]) {
+        let mut free = self.free.lock().unwrap();
+        let limit = free.query_limit;
+        if free.query_epoch != epoch || limit == 0 || free.query_count == limit {
+            return;
+        }
+        let key = u64::from_le_bytes(id);
+        let mut hasher = FastHasher64::default();
+        hasher.write_u64(key);
+        let start = (hasher.finish() % limit as u64) as usize;
+        for offset in 0..limit {
+            let entry = &self.entries[(start + offset) % limit];
+            if entry.query_epoch.load(Ordering::Acquire) != epoch {
+                entry.query_page.store(key, Ordering::Relaxed);
+                entry.query_epoch.store(epoch, Ordering::Release);
+                free.query_count += 1;
+                return;
+            }
+            if entry.query_page.load(Ordering::Relaxed) == key {
+                return;
+            }
+        }
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn visit_page_window(&self, epoch: u64, mut visit: impl FnMut([u8; 8])) {
+        let limit = {
+            let free = self.free.lock().unwrap();
+            if free.query_epoch != epoch {
+                return;
+            }
+            free.query_limit
+        };
+        // Release the arena lock before peeking cache stripes. Cache insertion
+        // can hold a stripe while acquiring this arena's free-slot lock.
+        for entry in &self.entries[..limit] {
+            if entry.query_epoch.load(Ordering::Acquire) == epoch {
+                visit(entry.query_page.load(Ordering::Relaxed).to_le_bytes());
+            }
+        }
     }
 
     fn take(&self) -> Option<u32> {
@@ -149,6 +233,19 @@ impl<T> LRUCache<T> {
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn arena_capacity(&self) -> usize {
         self.arena.entries.len()
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn page_window_arena(&self) -> CacheShared<EntryArena<T>> {
+        self.arena.clone()
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn begin_page_window(&self, limit: usize) -> u64 {
+        self.arena.begin_page_window(limit)
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn record_page(&self, epoch: u64, id: [u8; 8]) {
+        self.arena.record_page(epoch, id);
     }
 
     pub(crate) fn arena_index_bytes(&self) -> usize {
@@ -960,6 +1057,35 @@ pub(crate) mod arena_index_tests {
 
 #[cfg(all(test, feature = "contextdb-internal"))]
 mod residency_tests {
+    #[test]
+    fn query_page_window_is_distinct_bounded_and_does_not_evict_pages() {
+        let arena = super::EntryArena::new(8);
+        let mut cache = super::LRUCache::new(arena.clone(), 8);
+        assert_eq!(cache.insert(1, 10), None);
+        assert_eq!(cache.insert(2, 20), None);
+        let epoch = arena.begin_page_window(3);
+        for id in [1_u64, 1, 1, 2, 3, 4, 5] {
+            arena.record_page(epoch, id.to_le_bytes());
+        }
+        let mut ids = Vec::new();
+        arena.visit_page_window(epoch, |id| ids.push(u64::from_le_bytes(id)));
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2, 3]);
+        let next = arena.begin_page_window(1);
+        arena.record_page(epoch, 99_u64.to_le_bytes());
+        arena.record_page(next, 6_u64.to_le_bytes());
+        ids.clear();
+        arena.visit_page_window(next, |id| ids.push(u64::from_le_bytes(id)));
+        assert_eq!(ids, [6]);
+        assert_eq!(cache.pop_lowest_priority(), Some((1, 10)));
+        assert_eq!(cache.pop_lowest_priority(), Some((2, 20)));
+        let off = arena.begin_page_window(0);
+        arena.record_page(off, 1_u64.to_le_bytes());
+        arena.visit_page_window(off, |_| {
+            panic!("a zero-capacity window retains no identifiers")
+        });
+    }
+
     #[test]
     fn residency_peek_preserves_the_clock_victim() {
         let mut cache = super::LRUCache::new(super::EntryArena::new(2), 8);

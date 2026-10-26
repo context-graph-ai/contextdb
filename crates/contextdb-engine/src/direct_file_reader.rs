@@ -1614,6 +1614,10 @@ impl DirectFileReader {
         self.retained_source.prepaid_cache_index_bytes()
     }
 
+    pub(crate) fn with_cache_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, f64) {
+        self.retained_source.with_cache_page_window(operation)
+    }
+
     pub(crate) fn held_cache_page_bytes(&self) -> usize {
         self.retained_source.held_cache_page_bytes()
     }

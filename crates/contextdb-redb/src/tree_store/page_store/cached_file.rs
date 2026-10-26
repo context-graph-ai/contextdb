@@ -613,6 +613,22 @@ impl PagedCachedFile {
         })
     }
 
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn begin_page_window(&self) -> u64 {
+        let limit =
+            self.max_cache_size.load(Ordering::Acquire) / usize::try_from(self.page_size).unwrap();
+        self.read_cache[0].read().unwrap().begin_page_window(limit)
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn record_query_page(&self, epoch: u64, id: [u8; 8]) {
+        self.read_cache[0].read().unwrap().record_page(epoch, id);
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) {
+        let arena = self.read_cache[0].read().unwrap().page_window_arena();
+        arena.visit_page_window(epoch, visit);
+    }
+
     fn uncached(buffer: PageAllocation) -> PageMemory {
         if buffer.is_charged() {
             PageMemory::Charged(buffer)

@@ -7058,15 +7058,18 @@ impl Database {
         if let Some(ceiling) = usage.startup_ceiling {
             match limit {
                 Some(bytes) if bytes > ceiling => {
-                    return Err(Error::Other(
-                        (format!("memory limit {bytes} exceeds startup ceiling {ceiling}")).into(),
-                    ));
+                    return Err(Error::InvalidSetting {
+                        name: "MEMORY_LIMIT",
+                        value: bytes.to_string(),
+                        allowed: "no greater than the startup ceiling",
+                    });
                 }
                 None => {
-                    return Err(Error::Other(
-                        ("cannot remove memory limit when a startup ceiling is set".to_string())
-                            .into(),
-                    ));
+                    return Err(Error::InvalidSetting {
+                        name: "MEMORY_LIMIT",
+                        value: "NONE".to_owned(),
+                        allowed: "a finite limit no greater than the startup ceiling",
+                    });
                 }
                 _ => {}
             }

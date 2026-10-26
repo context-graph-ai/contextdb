@@ -743,6 +743,23 @@ impl ReadOnlyDatabase {
         self.mem.read_cache_resident_fraction(page_ids)
     }
 
+    /// Observe a bounded set of this statement's distinct page identifiers.
+    /// The original prepaid cache arena stores at most capacity/page_size IDs.
+    /// Larger statements keep the first such set; the estimate is advisory.
+    /// No I/O or allocation is performed by observation or the final probe.
+    #[cfg(feature = "contextdb-internal")]
+    #[doc(hidden)]
+    pub fn with_read_cache_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, f64) {
+        let (result, epoch) = self.mem.with_page_window(operation);
+        let mut resident = 0.0;
+        let mut count = 0.0;
+        self.mem.visit_page_window(epoch, |id| {
+            resident += self.read_cache_resident_fraction(&[id]);
+            count += 1.0;
+        });
+        (result, if count == 0.0 { 0.0 } else { resident / count })
+    }
+
     #[cfg(feature = "test-seams")]
     #[doc(hidden)]
     pub fn write_control_for_test(&self) -> crate::CacheWriteControlForTest {

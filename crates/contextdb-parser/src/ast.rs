@@ -16,6 +16,9 @@ pub enum Statement {
     Rollback,
     SetMemoryLimit(SetMemoryLimitValue),
     ShowMemoryLimit,
+    /// Session-only file-cache policy; None restores the derived default.
+    SetReadCacheShare(Option<String>),
+    ShowReadCacheShare,
     SetDiskLimit(SetDiskLimitValue),
     ShowDiskLimit,
     ShowContentSize,

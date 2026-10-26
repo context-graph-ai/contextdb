@@ -14,8 +14,10 @@ pub enum StatementEffect {
 pub fn statement_effect(statement: &Statement) -> StatementEffect {
     match statement {
         // These statements inspect an already-open store without changing its
-        // durable or session state.
+        // durable state. Session-only settings do not require a writable store.
         Statement::Select(_)
+        | Statement::SetReadCacheShare(_)
+        | Statement::ShowReadCacheShare
         | Statement::ShowMemoryLimit
         | Statement::ShowDiskLimit
         | Statement::ShowContentSize

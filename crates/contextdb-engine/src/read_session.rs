@@ -790,6 +790,9 @@ struct RouteResources {
     // Zero means undeclared; a declared percent is encoded as percent + 1.
     // The existing shared route control outlives every owner continuation.
     read_cache_share: std::sync::atomic::AtomicU8,
+    // Bounded inline diagnostics: no retained formatted error or query-owned storage.
+    last_cache_refusal: Mutex<Option<[u8; 64]>>,
+    last_query_resident_percent: Mutex<Option<f64>>,
     expiry: SessionExpiry,
     channel_identity: Mutex<Option<ChannelAddress>>,
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]
@@ -3078,9 +3081,14 @@ impl ReadSession {
             .read_cache_share
             .is_some_and(|percent| percent > 100)
         {
-            return Err(Error::Other(
-                "READ_CACHE_SHARE must be between 0 and 100 percent".into(),
-            ));
+            return Err(Error::InvalidSetting {
+                name: "READ_CACHE_SHARE",
+                value: options
+                    .read_cache_share
+                    .expect("invalid declared percent")
+                    .to_string(),
+                allowed: "0..=100",
+            });
         }
         if let Some(limit) = options.memory_limit {
             options.limits.memory = options.limits.memory.min(limit as u64);
@@ -3366,9 +3374,13 @@ impl ReadSession {
     )]
     pub fn set_read_cache_share(&self, percent: Option<u8>) -> Result<()> {
         if percent.is_some_and(|percent| percent > 100) {
-            return Err(Error::Other(
-                "READ_CACHE_SHARE must be between 0 and 100 percent".into(),
-            ));
+            let value = percent.expect("invalid declared percent").to_string();
+            self.note_cache_refusal(&value);
+            return Err(Error::InvalidSetting {
+                name: "READ_CACHE_SHARE",
+                value,
+                allowed: "0..=100",
+            });
         }
         let _mutation = self
             .cache_policy_mutation
@@ -3377,10 +3389,182 @@ impl ReadSession {
         if let ReadSessionState::DirectFile(reader) = self.selected_state().as_ref() {
             let mut options = self.options();
             options.read_cache_share = percent;
-            reader.select_cache_capacity(options.read_cache_share_status().effective_bytes)?;
+            if let Err(error) =
+                reader.select_cache_capacity(options.read_cache_share_status().effective_bytes)
+            {
+                self.note_cache_refusal(
+                    &percent.map_or_else(|| "DEFAULT".to_owned(), |value| value.to_string()),
+                );
+                return Err(error);
+            }
         }
         self.resources.publish_read_cache_share(percent);
         Ok(())
+    }
+
+    fn note_cache_refusal(&self, value: &str) {
+        let mut text = [0_u8; 64];
+        let length = value.len().min(text.len());
+        text[..length].copy_from_slice(&value.as_bytes()[..length]);
+        *self
+            .resources
+            .last_cache_refusal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(text);
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Setting refusals retain typed inline diagnostics."
+    )]
+    fn execute_cache_setting(
+        &self,
+        statement: contextdb_parser::Statement,
+        selected: &ReadSessionState,
+    ) -> Result<QueryResult> {
+        match statement {
+            contextdb_parser::Statement::SetReadCacheShare(value) => {
+                let percent = match value.as_deref() {
+                    None => None,
+                    Some(value) => match value.parse::<u8>() {
+                        Ok(percent) if percent <= 100 => Some(percent),
+                        _ => {
+                            self.note_cache_refusal(value);
+                            return Err(Error::InvalidSetting {
+                                name: "READ_CACHE_SHARE",
+                                value: value.to_owned(),
+                                allowed: "0..=100",
+                            });
+                        }
+                    },
+                };
+                self.set_read_cache_share(percent)
+                    .map_err(|error| match error {
+                        Error::NativeEngineOther(
+                            contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                                subsystem,
+                                operation,
+                                requested_bytes,
+                                available_bytes,
+                                budget_limit_bytes,
+                                hint,
+                            },
+                        ) => Error::MemoryBudgetExceeded {
+                            subsystem: subsystem.into(),
+                            operation: operation.into(),
+                            requested_bytes,
+                            available_bytes,
+                            budget_limit_bytes,
+                            hint: hint.into(),
+                        },
+                        other => other,
+                    })?;
+                Ok(QueryResult::empty())
+            }
+            contextdb_parser::Statement::ShowReadCacheShare => self.show_cache_setting(selected),
+            _ => unreachable!("parser recognizes only read cache settings"),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Inspection retains the original reader's typed refusals."
+    )]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "Inspection uses the established Int64 byte-count SQL surface."
+    )]
+    fn show_cache_setting(&self, selected: &ReadSessionState) -> Result<QueryResult> {
+        use contextdb_core::read_memory::ReadCredit;
+        const COLUMNS: [&str; 10] = [
+            "declared",
+            "effective_bytes",
+            "effective_percent",
+            "last_refusal",
+            "last_query_resident_percent",
+            "budget_bytes",
+            "fixed_reservation_bytes",
+            "prepaid_index_bytes",
+            "held_page_bytes",
+            "default_percent",
+        ];
+        let owner = match selected {
+            ReadSessionState::DirectFile(reader) => reader
+                .request_read_memory()
+                .map_err(|error| direct_error(Path::new(""), error))?,
+            ReadSessionState::LiveDatabase(database) => {
+                database.ordinary_read_child()?.into_owner()
+            }
+            ReadSessionState::OwnerChannel(_) => {
+                crate::local_transport::query_funding::QueryMemory::new(self.options.limits.memory)?
+                    .image()
+                    .owner()
+            }
+        };
+        let status = self.read_cache_share_status();
+        let refusal = *self
+            .resources
+            .last_cache_refusal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let refusal = refusal.as_ref().map(|bytes| {
+            let length = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
+            std::str::from_utf8(&bytes[..length]).expect("setting values are ASCII")
+        });
+        let resident = *self
+            .resources
+            .last_query_resident_percent
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Exact fixed output Layouts and string bytes are admitted before any
+        // vectors or text are allocated; the answer retains that same invoice.
+        let bytes = COLUMNS.len() * (size_of::<String>() + size_of::<Value>())
+            + size_of::<Vec<Value>>()
+            + COLUMNS.iter().map(|name| name.len()).sum::<usize>()
+            + if status.declared.is_none() {
+                "default".len()
+            } else {
+                0
+            }
+            + refusal.map_or(0, str::len);
+        let credit = ReadCredit::try_new_owned(
+            owner.clone(),
+            bytes,
+            "reader",
+            "show_read_cache_share",
+            "Release retained answers or raise the reader memory limit.",
+        )?;
+        let charge = crate::read_image_memory::QueryAnswerCharge::holding_reader(credit)?;
+        QueryResult::publish_with_owner(owner.clone(), || {
+            let mut result = QueryResultData::empty();
+            result.columns = COLUMNS.into_iter().map(str::to_owned).collect();
+            result.rows = vec![vec![
+                status.declared.map_or_else(
+                    || Value::Text("default".to_owned()),
+                    |value| Value::Int64(i64::from(value)),
+                ),
+                Value::Int64(status.effective_bytes as i64),
+                Value::Float64(status.effective_percent),
+                refusal.map_or(Value::Null, |value| Value::Text(value.to_owned())),
+                resident.map_or(Value::Null, Value::Float64),
+                Value::Int64(status.budget_bytes as i64),
+                Value::Int64(status.fixed_reservation_bytes as i64),
+                status
+                    .prepaid_index_bytes
+                    .map_or(Value::Null, |value| Value::Int64(value as i64)),
+                status
+                    .held_page_bytes
+                    .map_or(Value::Null, |value| Value::Int64(value as i64)),
+                Value::Int64(i64::from(status.default_percent)),
+            ]];
+            let mut answer = OwnedQueryResult::new(result);
+            answer.answer_charge = charge;
+            answer.retained_read_memory = Some(owner);
+            Ok(answer)
+        })
     }
 
     /// Run a bounded query with a fresh cancellation token.
@@ -3411,6 +3595,9 @@ impl ReadSession {
             && cancellation.is_cancelled()
         {
             return Err(Error::ReadCancelled);
+        }
+        if let Some(statement) = contextdb_parser::parser::parse_read_cache_share_statement(sql) {
+            return self.execute_cache_setting(statement, selected.as_ref());
         }
         // The keeper is outside all query allocations and survives BOTH
         // success conversion and final error conversion at this public door.
@@ -3499,11 +3686,12 @@ impl ReadSession {
                 let request = reader
                     .request_query_read_owner()
                     .map_err(|error| direct_error(Path::new(""), error))?;
-                crate::executor::bounded::with_request_read_memory(
-                    request,
-                    |error| error,
-                    |read_memory, native_trace_refund| {
-                        let executed =
+                let (result, fraction) = reader.with_cache_page_window(|| {
+                    crate::executor::bounded::with_request_read_memory(
+                        request,
+                        |error| error,
+                        |read_memory, native_trace_refund| {
+                            let executed =
                             crate::executor::execute_bounded_on_target_with_native_trace_refund(
                                 reader.execution_target().as_ref(),
                                 sql,
@@ -3517,9 +3705,16 @@ impl ReadSession {
                                 native_trace_refund.as_ref(),
                             )
                             .map_err(read_error)?;
-                        reader.publish_bounded_result(&executed.publication, executed.result)
-                    },
-                )
+                            reader.publish_bounded_result(&executed.publication, executed.result)
+                        },
+                    )
+                });
+                *self
+                    .resources
+                    .last_query_resident_percent
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(fraction * 100.0);
+                result
             }
             ReadSessionState::OwnerChannel(owner) => {
                 let receiving_memory = query_memory

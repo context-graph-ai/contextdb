@@ -1,3 +1,16 @@
+#[cfg(feature = "contextdb-internal")]
+thread_local! {
+    static QUERY_PAGE_WINDOW: std::cell::Cell<Option<(usize, u64)>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(feature = "contextdb-internal")]
+struct QueryPageWindowReset(Option<(usize, u64)>);
+#[cfg(feature = "contextdb-internal")]
+impl Drop for QueryPageWindowReset {
+    fn drop(&mut self) {
+        QUERY_PAGE_WINDOW.with(|slot| slot.set(self.0));
+    }
+}
+
 use crate::CacheStats;
 use crate::ScratchBackend;
 use crate::transaction_tracker::TransactionId;
@@ -820,6 +833,29 @@ impl TransactionalMemory {
 
     pub(crate) fn cache_stripe_control_bytes(&self) -> usize {
         self.storage.stripe_control_bytes()
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn with_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, u64) {
+        let epoch = self.storage.begin_page_window();
+        let previous = QUERY_PAGE_WINDOW
+            .with(|slot| slot.replace(Some((std::ptr::from_ref(self) as usize, epoch))));
+        let _reset = QueryPageWindowReset(previous);
+        (operation(), epoch)
+    }
+    #[cfg(feature = "contextdb-internal")]
+    fn record_query_page(&self, page: PageNumber) {
+        QUERY_PAGE_WINDOW.with(|slot| {
+            if let Some((identity, epoch)) = slot.get()
+                && identity == std::ptr::from_ref(self) as usize
+            {
+                self.storage.record_query_page(epoch, page.to_le_bytes());
+            }
+        });
+    }
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) {
+        self.storage.visit_page_window(epoch, visit);
     }
 
     #[cfg(feature = "contextdb-internal")]
@@ -1839,6 +1875,8 @@ impl TransactionalMemory {
     }
 
     pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
+        #[cfg(feature = "contextdb-internal")]
+        self.record_query_page(page_number);
         let range = page_number.address_range(
             self.page_size.into(),
             self.region_size,
@@ -1880,6 +1918,8 @@ impl TransactionalMemory {
         range: std::ops::Range<usize>,
         hint: PageHint,
     ) -> Result<super::cached_file::PageMemory> {
+        #[cfg(feature = "contextdb-internal")]
+        self.record_query_page(page);
         let address = page.address_range(
             self.page_size.into(),
             self.region_size,
@@ -2603,6 +2643,7 @@ impl TransactionalMemory {
         &self,
         page: PageNumber,
     ) -> std::result::Result<super::cached_file::PageMemory, crate::NativeColdReadError> {
+        self.record_query_page(page);
         let (offset, len) = self.native_page_address(page)?;
         self.storage.read_native_clean_miss(offset, len)
     }
@@ -2615,6 +2656,7 @@ impl TransactionalMemory {
         &self,
         page: PageNumber,
     ) -> std::result::Result<super::cached_file::PageMemory, crate::PreparedReadError> {
+        self.record_query_page(page);
         // Preserve the existing read-work checkpoint and its producer error.
         if self
             .read_budget

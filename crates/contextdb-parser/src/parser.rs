@@ -8,6 +8,41 @@ use pest_derive::Parser;
 #[grammar = "grammar.pest"]
 struct ContextDbParser;
 
+/// Recognize only a session cache setting; other SQL keeps its normal parse path.
+#[doc(hidden)]
+pub fn parse_read_cache_share_statement(input: &str) -> Option<Statement> {
+    let leading = input.trim_start();
+    if !leading
+        .get(..3)
+        .is_some_and(|word| word.eq_ignore_ascii_case("SET"))
+        && !leading
+            .get(..4)
+            .is_some_and(|word| word.eq_ignore_ascii_case("SHOW"))
+        && !leading.starts_with("--")
+        && !leading.starts_with("/*")
+    {
+        return None;
+    }
+    let outer = ContextDbParser::parse(Rule::read_cache_share_statement, input)
+        .ok()?
+        .next()?;
+    let inner = outer.into_inner().next()?;
+    match inner.as_rule() {
+        Rule::show_read_cache_share => Some(Statement::ShowReadCacheShare),
+        Rule::set_read_cache_share => Some(build_read_cache_share(inner)),
+        _ => None,
+    }
+}
+
+fn build_read_cache_share(pair: Pair<'_, Rule>) -> Statement {
+    let value = pair
+        .into_inner()
+        .next()
+        .expect("cache share value")
+        .as_str();
+    Statement::SetReadCacheShare((!value.eq_ignore_ascii_case("DEFAULT")).then(|| value.to_owned()))
+}
+
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -96,6 +131,8 @@ fn parse_statement(sql: &str) -> Result<Statement> {
         Rule::show_vector_partitions_stmt => build_show_vector_partitions(inner)?,
         Rule::set_memory_limit => Statement::SetMemoryLimit(build_set_memory_limit(inner)?),
         Rule::show_memory_limit => Statement::ShowMemoryLimit,
+        Rule::set_read_cache_share => build_read_cache_share(inner),
+        Rule::show_read_cache_share => Statement::ShowReadCacheShare,
         Rule::set_disk_limit => Statement::SetDiskLimit(build_set_disk_limit(inner)?),
         Rule::show_disk_limit => Statement::ShowDiskLimit,
         Rule::show_content_size => Statement::ShowContentSize,

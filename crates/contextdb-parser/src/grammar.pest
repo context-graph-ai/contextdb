@@ -2,6 +2,8 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" | line_comment | block_comment }
 line_comment = _{ "--" ~ (!"\n" ~ ANY)* }
 block_comment = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
+read_cache_share_statement = { SOI ~ (set_read_cache_share | show_read_cache_share) ~ semicolon? ~ EOI }
+
 statement = { SOI ~ stmt ~ semicolon? ~ EOI }
 semicolon = _{ ";" }
 
@@ -34,6 +36,8 @@ stmt = _{
     | show_sync_conflict_policy
     | show_vector_indexes_stmt
     | show_vector_partitions_stmt
+    | set_read_cache_share
+    | show_read_cache_share
     | set_memory_limit
     | show_memory_limit
     | set_disk_limit
@@ -67,6 +71,10 @@ show_vector_partitions_stmt = {
 }
 show_vector_partitions_target = { identifier ~ "." ~ identifier }
 show_vector_partitions_paging = { ^"LIMIT" ~ integer ~ (^"OFFSET" ~ integer)? }
+set_read_cache_share = { ^"SET" ~ ^"READ_CACHE_SHARE" ~ "=" ~ read_cache_share_value }
+read_cache_share_value = @{ ^"DEFAULT" | ("-" | "+")? ~ ASCII_DIGIT+ }
+show_read_cache_share = { ^"SHOW" ~ ^"READ_CACHE_SHARE" }
+
 set_memory_limit = { ^"SET" ~ ^"MEMORY_LIMIT" ~ ("'" ~ memory_limit_value ~ "'" | memory_limit_value) }
 show_memory_limit = { ^"SHOW" ~ ^"MEMORY_LIMIT" }
 memory_limit_value = { ^"none" | size_with_unit }

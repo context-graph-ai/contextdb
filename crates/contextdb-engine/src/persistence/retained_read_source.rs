@@ -2515,6 +2515,10 @@ impl RetainedReadSource {
         self.database.read_cache_index_bytes()
     }
 
+    pub(crate) fn with_cache_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, f64) {
+        self.database.with_read_cache_page_window(operation)
+    }
+
     pub(crate) fn held_cache_page_bytes(&self) -> usize {
         self.database.read_cache_held_bytes()
     }

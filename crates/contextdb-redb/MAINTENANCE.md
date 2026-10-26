@@ -1109,3 +1109,12 @@ and the private shared-payload getter are removed with the obsolete object.
 | Changed source | Reason |
 |---|---|
 | `src/read_admission.rs`, `src/native_storage_admission.rs` | Remove the unused native growth-counter allocation and its test-only observers; retain original-admission custody, funded thread-local nodes, and the live legacy allowance. |
+
+The file reader can observe a statement through `ReadOnlyDatabase::with_read_cache_page_window`.
+This scopes page touches (including hits, byte windows, and native reads) to the actual storage
+on the current thread and restores the enclosing scope on unwind. Distinct opaque identifiers
+reuse inline fields in the prepaid `EntryArena`; their exact Layout is included in its original
+invoice, with no second array or owner. The selected cache capacity bounds the window in pages.
+After it fills, later identifiers are omitted. Final residency uses the production
+`read_cache_resident_fraction` probe shared with `NativeReadView`, without reading pages or
+changing CLOCK priority. The result is advisory under concurrent cache activity.

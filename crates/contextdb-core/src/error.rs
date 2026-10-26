@@ -851,6 +851,13 @@ pub enum StorageCompactionDeclarationIssue {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A setting was understood but its value is outside the allowed range.
+    #[error("invalid {name} value {value}; allowed: {allowed}")]
+    InvalidSetting {
+        name: &'static str,
+        value: String,
+        allowed: &'static str,
+    },
     /// Engine-produced diagnostic whose admitted backing survives until the
     /// caller destroys it. Application/plugin errors keep their original form.
     #[doc(hidden)]

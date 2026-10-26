@@ -96,6 +96,9 @@ pub fn plan(stmt: &Statement) -> Result<PhysicalPlan> {
             where_clause: u.where_clause.clone(),
         })),
         Statement::Select(sel) => plan_select(sel),
+        Statement::SetReadCacheShare(_) | Statement::ShowReadCacheShare => Err(Error::PlanError(
+            "READ_CACHE_SHARE belongs to a ReadSession".into(),
+        )),
         Statement::SetMemoryLimit(val) => Ok(PhysicalPlan::SetMemoryLimit(val.clone())),
         Statement::ShowMemoryLimit => Ok(PhysicalPlan::ShowMemoryLimit),
         Statement::SetDiskLimit(val) => Ok(PhysicalPlan::SetDiskLimit(val.clone())),

@@ -308,8 +308,8 @@ session ceiling is declared, and
 `F` is the 64 KiB source overhead plus the verifier, LSN and history-open control
 reservations. An explicit percent applies to `B - F`. There is no fixed byte cap.
 `read_cache_share_status()` inspects the declared percent, default percent,
-budget, fixed reservation, cache capacity and effective percent of the complete
-budget. The file reader's admitted read root now follows the session's declared
+budget, fixed reservation, cache capacity and effective percent of the remaining
+budget after fixed source reservations. The file reader's admitted read root now follows the session's declared
 `memory_limit`, falling back to `limits.memory` when no session limit is declared.
 For example, `memory_limit = 1 GiB` with the shipped 16 MiB `limits.memory` gives
 the file reader a 1 GiB root for loaded state and cache; previously that root was
@@ -330,6 +330,26 @@ not report or resize the writer's shared cache. The owner route can retain a 100
 declaration without allocating a file cache; a later file open must still pass
 total admission. Lazy owner-cursor continuations and newly selected file readers
 resolve the session's current declaration when they open.
+
+The SQL session surface is `SET READ_CACHE_SHARE = <percent> | DEFAULT` and
+`SHOW READ_CACHE_SHARE`. It uses the same live mutation path as the Rust API and
+never writes a durable setting. The show row includes the declared and effective
+values, last refused value, and `last_query_resident_percent`. Out-of-range
+cache shares and memory limits above their startup ceiling use the common
+`Error::InvalidSetting { name, value, allowed }` vocabulary. Admission refusals
+keep their memory-budget fields and leave the prior declaration intact.
+
+Each file statement scopes a bounded distinct-page window to its own storage on
+the executing thread. Page hits, byte windows, and native reads all contribute.
+Identifiers occupy inline metadata in the existing prepaid native index arena;
+there is no second array, map, retained query workspace, or allocation owner.
+The original exact arena Layout invoice includes these bytes until physical free.
+The window keeps at most the selected capacity divided by page size; when full,
+it retains the first bounded set and stops admitting identifiers. The production
+residency probe inspects that set after execution without I/O or CLOCK changes.
+The reported percentage is advisory, initially Null, and zero for an empty
+window. Settings and SHOW preserve the last data statement's observation. Owner
+routes have no session-owned file-cache residency to report and retain Null.
 
 The native index slots are prepaid for the maximum selectable capacity `B - F`
 and reused across changes. Session inspection reports `prepaid_index_bytes`,
