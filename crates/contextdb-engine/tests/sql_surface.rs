@@ -27,3 +27,6 @@ mod the_same_edge_through_both_doors_is_one_edge;
 
 #[path = "sql_surface/a_volatile_default_keeps_mixed_edge_bindings_distinct.rs"]
 mod a_volatile_default_keeps_mixed_edge_bindings_distinct;
+
+#[path = "sql_surface/raw_row_inserts_apply_declared_defaults.rs"]
+mod raw_row_inserts_apply_declared_defaults;
