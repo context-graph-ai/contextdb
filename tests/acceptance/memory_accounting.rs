@@ -192,33 +192,52 @@ fn a_ma6_error_message_has_diagnostic_fields() {
 // ---------------------------------------------------------------------------
 #[test]
 fn a_ma7_insert_exhaust_delete_insert() {
+    // 128 KiB admits a writable open, the table and a small row with room to
+    // spare; the second row is larger than the whole budget, so it can never
+    // be admitted however the working set moves.
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "a_ma7.db");
+    let oversized = "x".repeat(256 * 1024);
     let output = run_cli_script(
         &db_path,
-        &["--write", "--memory-limit", "2048"],
-        concat!(
-            "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\n",
-            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'first');\n",
-            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000002', 'second attempt that may fail');\n",
-            "DELETE FROM t WHERE id = '00000000-0000-0000-0000-000000000001';\n",
-            "INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'after reclaim');\n",
-            "SELECT COUNT(*) FROM t;\n",
-            ".quit\n",
+        &["--write", "--memory-limit", "131072"],
+        &format!(
+            "CREATE TABLE t (id UUID PRIMARY KEY, name TEXT);\n\
+             INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'first');\n\
+             INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000002', '{oversized}');\n\
+             DELETE FROM t WHERE id = '00000000-0000-0000-0000-000000000001';\n\
+             INSERT INTO t (id, name) VALUES ('00000000-0000-0000-0000-000000000003', 'after reclaim');\n\
+             SELECT id, name FROM t;\n\
+             .quit\n"
         ),
     );
     assert_eq!(
         output.status.code(),
         Some(1),
-        "CLI must exit cleanly with the definitive-error code (the probing second INSERT fails), not crash"
+        "CLI must exit cleanly with the definitive-error code (the oversized INSERT fails), not crash"
+    );
+    let stderr = output_string(&output.stderr);
+    assert!(
+        stderr.contains("memory budget exceeded"),
+        "the oversized INSERT is refused with the typed memory-budget error on stderr: {stderr}"
     );
     let stdout = output_string(&output.stdout);
-    // The final INSERT (after DELETE) must succeed, proving memory reclamation works.
-    // The SELECT COUNT(*) output must show a count (at least 1 row survived).
-    // Also verify "after reclaim" row is present — it was the post-delete INSERT.
+    // After the refusal the store keeps working: the DELETE and the replacement
+    // INSERT succeed, and the readback shows exactly the replacement row. Rows
+    // are matched as result-table cells, since the script's own lines may be
+    // echoed.
     assert!(
-        stdout.contains("after reclaim"),
-        "final INSERT with 'after reclaim' must succeed and be visible in SELECT: {stdout}"
+        stdout.contains("| 00000000-0000-0000-0000-000000000003 | after reclaim |"),
+        "the replacement row is read back with its payload: {stdout}"
+    );
+    assert!(
+        !stdout.contains("| 00000000-0000-0000-0000-000000000001 |")
+            && !stdout.contains("| 00000000-0000-0000-0000-000000000002 |"),
+        "neither the deleted row nor the refused row is read back: {stdout}"
+    );
+    assert!(
+        stdout.contains("(1 rows)"),
+        "exactly one row remains: {stdout}"
     );
 }
 
@@ -259,15 +278,18 @@ fn a_ma9_memory_limit_survives_restart() {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = temp_db_file(&tmp, "a_ma9.db");
 
+    // 128 KiB admits the reopened writer's own working set, so the persisted
+    // limit can be read back; the payload is larger than the whole budget, so
+    // the persisted limit must refuse it.
     let configured = run_cli_script(
         &db_path,
         &["--write"],
-        "SET MEMORY_LIMIT '1K';\nSHOW MEMORY_LIMIT;\n.quit\n",
+        "SET MEMORY_LIMIT '128K';\nSHOW MEMORY_LIMIT;\n.quit\n",
     );
     assert!(configured.status.success());
     let configured_stdout = output_string(&configured.stdout);
     assert!(
-        configured_stdout.contains("1024"),
+        configured_stdout.contains("131072"),
         "SHOW MEMORY_LIMIT must report the configured limit before restart: {configured_stdout}"
     );
 
@@ -276,7 +298,7 @@ fn a_ma9_memory_limit_survives_restart() {
         &["--write"],
         &format!(
             "SHOW MEMORY_LIMIT;\nCREATE TABLE big (id UUID PRIMARY KEY, payload TEXT);\nINSERT INTO big (id, payload) VALUES ('00000000-0000-0000-0000-000000000001', '{}');\n.quit\n",
-            "x".repeat(4096)
+            "x".repeat(256 * 1024)
         ),
     );
     assert_eq!(
@@ -286,7 +308,7 @@ fn a_ma9_memory_limit_survives_restart() {
     );
     let reopened_stdout = output_string(&reopened.stdout);
     assert!(
-        reopened_stdout.contains("1024"),
+        reopened_stdout.contains("| 131072 "),
         "reopened database must still report the configured MEMORY_LIMIT: {reopened_stdout}"
     );
     let reopened_stderr = output_string(&reopened.stderr);
