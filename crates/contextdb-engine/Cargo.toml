@@ -820,6 +820,10 @@ name = "every_public_route_installs_its_own_memory_owner"
 path = "tests/every_public_route_installs_its_own_memory_owner.rs"
 required-features = ["test-seams", "iroh"]
 
+[[test]]
+name = "exact_vector_cursor_releases_only_its_reader_credit"
+path = "tests/exact_vector_cursor_releases_only_its_reader_credit.rs"
+
 [[bin]]
 name = "memory-census"
 path = "src/bin/memory-census.rs"
