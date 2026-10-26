@@ -3392,14 +3392,36 @@ impl ReadSession {
             if let Err(error) =
                 reader.select_cache_capacity(options.read_cache_share_status().effective_bytes)
             {
-                self.note_cache_refusal(
-                    &percent.map_or_else(|| "DEFAULT".to_owned(), |value| value.to_string()),
-                );
+                self.note_cache_percent_refusal(percent);
                 return Err(error);
             }
         }
         self.resources.publish_read_cache_share(percent);
         Ok(())
+    }
+
+    fn note_cache_percent_refusal(&self, percent: Option<u8>) {
+        match percent {
+            None => self.note_cache_refusal("DEFAULT"),
+            Some(value) => {
+                // Admission has already failed: formatting must not allocate.
+                let digits = [
+                    b'0' + value / 100,
+                    b'0' + value / 10 % 10,
+                    b'0' + value % 10,
+                ];
+                let start = if value >= 100 {
+                    0
+                } else if value >= 10 {
+                    1
+                } else {
+                    2
+                };
+                self.note_cache_refusal(
+                    std::str::from_utf8(&digits[start..]).expect("ASCII percent"),
+                );
+            }
+        }
     }
 
     fn note_cache_refusal(&self, value: &str) {
