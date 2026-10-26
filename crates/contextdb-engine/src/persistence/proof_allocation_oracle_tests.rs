@@ -38,6 +38,10 @@ thread_local! {
     static NEXT_EXACT_FREE: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
     static NATIVE_REQUESTS: std::cell::Cell<[(usize, usize, usize); 256]> = const { std::cell::Cell::new([(0, 0, 0); 256]) };
     static DECLARATION_EPOCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // The first declaration epoch the current funding census can contain. A
+    // declaration set built under one observation and freed under a later one
+    // of the same census leaves that census at its physical free.
+    static DECLARATION_CENSUS_FROM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static DECLARATION_CENSUS_INVALID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DECLARATION_OBSERVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Own only the budget parent, never the selected payload or its credit.
@@ -385,6 +389,8 @@ impl DeclarationObservation {
         FUNDING_READER_ACTIVE.with(|active| active.set(true));
         FUNDING_CENSUS.with(|slot| slot.set((0, baseline, 0, 0, 0)));
         DECLARATION_CENSUS_INVALID.with(|slot| slot.set(false));
+        DECLARATION_CENSUS_FROM
+            .with(|slot| slot.set(NEXT_DECLARATION_EPOCH.load(AtomicOrdering::SeqCst)));
         let mut observation = declaration_observation();
         observation.reset_counter = true;
         observation
@@ -445,6 +451,7 @@ impl Drop for DeclarationObservation {
         DECLARATION_EPOCH.with(|slot| slot.set(0));
         if self.reset_counter {
             FUNDING_CENSUS.with(|slot| slot.set((0, 0, 0, 0, 0)));
+            DECLARATION_CENSUS_FROM.with(|slot| slot.set(0));
             FUNDING_READER_ACTIVE.with(|active| active.set(false));
             // Release the RefCell borrow before an Arc drop can reenter the allocator.
             let parent = FUNDING_READER.with(|slot| slot.borrow_mut().take());
@@ -652,6 +659,7 @@ pub(crate) fn funded_requests<T>(
     impl Drop for Guard {
         fn drop(&mut self) {
             FUNDING_CENSUS.with(|slot| slot.set((0, 0, 0, 0, 0)));
+            DECLARATION_CENSUS_FROM.with(|slot| slot.set(0));
         }
     }
     FUNDING_CENSUS.with(|slot| {
@@ -663,6 +671,8 @@ pub(crate) fn funded_requests<T>(
             0,
         ));
     });
+    DECLARATION_CENSUS_FROM
+        .with(|slot| slot.set(NEXT_DECLARATION_EPOCH.load(AtomicOrdering::SeqCst)));
     let guard = Guard;
     DECLARATION_CENSUS_INVALID.with(|invalid| invalid.set(false));
     let (value, _, _) = measured(operation);
@@ -1438,11 +1448,20 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         // Keep the complete live request, including this block, in the
         // census until System has physically freed it. An early invoice
         // release therefore appears as a gap at its real deallocation.
+        // A block allocated under any declaration observation of the current
+        // census leaves it here, including one freed under a later
+        // observation of the same census.
+        let current_epoch = DECLARATION_EPOCH
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(0);
+        let census_from = DECLARATION_CENSUS_FROM
+            .try_with(std::cell::Cell::get)
+            .unwrap_or(0);
         let declaration_free = header.declaration_epoch != 0
-            && DECLARATION_EPOCH
-                .try_with(std::cell::Cell::get)
-                .unwrap_or(0)
-                == header.declaration_epoch;
+            && (current_epoch == header.declaration_epoch
+                || (current_epoch != 0
+                    && census_from != 0
+                    && header.declaration_epoch >= census_from));
         if declaration_free {
             DECLARATION_EVENT
                 .with(|slot| slot.set([pointer as usize, layout.size(), layout.align(), 2]));
@@ -5333,7 +5352,12 @@ fn maintenance_allocator_observation_tracks_real_payload_before_refund() {
     // exact identity. No inferred native header or adapter layout is used.
     let bytes = 83;
     spy.source
-        .try_reserve(bytes, "reader", "materialize_answer", "bounded observer guard")
+        .try_reserve(
+            bytes,
+            "reader",
+            "materialize_answer",
+            "bounded observer guard",
+        )
         .unwrap();
     let owner = &spy as *const _ as usize;
     MAINTENANCE_INVOICES.with(|tickets| {
