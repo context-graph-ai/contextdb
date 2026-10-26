@@ -592,6 +592,10 @@ fn a_commit_writing_tables_in_descending_order_holds_each_once_with_logarithmic_
 /// commits stay the same, and the pages it rewrites grow by tree levels only.
 #[test]
 fn a_row_update_authenticates_its_latest_version_not_its_history() {
+    // Every version is stamped, and the stamps reach the content hashes that
+    // place the history's proof nodes among the store's pages: one clock
+    // gives one page layout, so the page count is the same every run.
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| 1_800_000_000_000);
     let row = Value::Uuid(uuid::Uuid::from_u128(0xc0_0c << 112));
     let mut measured = Vec::new();
     for history in [16i64, 512] {
