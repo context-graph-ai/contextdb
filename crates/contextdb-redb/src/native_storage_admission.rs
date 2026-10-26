@@ -1027,8 +1027,6 @@ pub(crate) fn pending_allocation_error() -> crate::StorageError {
 /// Preparation retains the actual lower producer error. An admission marker
 /// must be recovered from its producing scope, never formatted as replacement
 /// I/O or corruption. This type is private to the internal feature protocol.
-#[doc(hidden)]
-#[derive(Debug)]
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(
@@ -1036,6 +1034,8 @@ pub(crate) fn pending_allocation_error() -> crate::StorageError {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from native_storage_admission.rs"
     )
 )]
+#[doc(hidden)]
+#[derive(Debug)]
 pub enum PreparedReadError {
     /// Same existing static corruption diagnosis, before String materialization.
     StaticCorrupted(&'static str),

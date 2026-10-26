@@ -110,7 +110,6 @@ pub struct RuntimeDirectoryRequest {
     pub current_user: LocalUserIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(
@@ -118,6 +117,7 @@ pub struct RuntimeDirectoryRequest {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
     )
 )]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRuntimeDirectory {
     pub path: PathBuf,
     pub source: RuntimeDirectorySource,

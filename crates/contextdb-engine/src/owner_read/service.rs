@@ -968,7 +968,6 @@ impl CompletedOwnerRequest {
 
 /// Resource counters used by deterministic leak assertions. A live cursor is
 /// the sole documented non-baseline state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(
@@ -976,6 +975,7 @@ impl CompletedOwnerRequest {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
     )
 )]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnerReadResourceSnapshot {
     pub active_slots: u64,
     pub cursor_count: u64,

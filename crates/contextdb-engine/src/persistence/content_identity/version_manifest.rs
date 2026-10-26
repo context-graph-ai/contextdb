@@ -9,8 +9,8 @@ use contextdb_core::{IndexDecl, SnapshotId};
 const FORMAT: u8 = 1;
 const FIXED_KEY_BYTES: usize = 72;
 
-#[derive(Clone, Copy)]
 #[allow(dead_code, reason = "WIRE-FIELD: part of a fixed encoded format")]
+#[derive(Clone, Copy)]
 pub(in super::super) struct VersionManifest<'a> {
     pub(in super::super) table: &'a str,
     pub(in super::super) identity: [u8; 24],

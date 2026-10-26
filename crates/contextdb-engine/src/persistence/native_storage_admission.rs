@@ -9,6 +9,7 @@ use crate::memory_accounting::{
 use contextdb_core::read_memory::ReadMemoryBudget as _;
 use contextdb_core::read_memory::{NativeRefusal, ReadCredit, ReadMemoryOwner};
 use contextdb_core::{Error, Lsn, Result, SnapshotId};
+use contextdb_tx::SourceFunder;
 use redb::{NativeStorageAdmission, NativeStorageCredit, NativeStorageRefused};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::mem::ManuallyDrop;
@@ -74,7 +75,10 @@ unsafe fn inspect_scope_allocation_funding(raw: NonNull<()>) -> Option<(usize, u
     let scope = &unsafe { raw.cast::<StorageScopeBlock>().as_ref() }.payload;
     let owner = match &scope.funding {
         StorageFunding::Original(original) => Some(original.accountant().as_ptr() as usize),
-        StorageFunding::PreparedWriter {
+        StorageFunding::Writer {
+            original_handle, ..
+        }
+        | StorageFunding::PreparedWriter {
             original_handle, ..
         } => Some(original_handle.as_handle().as_ptr() as usize),
         StorageFunding::Read(reader) | StorageFunding::ReadUnqualified(reader) => {
@@ -87,6 +91,15 @@ unsafe fn inspect_scope_allocation_funding(raw: NonNull<()>) -> Option<(usize, u
 
 enum StorageFunding {
     Original(OwnedMemoryReservation),
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: never constructed; it sets StorageFunding to the size StorageScopeBlock is charged at, so removing it waits for the measured accounting rerun"
+    )]
+    Writer {
+        original_use: WriterUse,
+        original_handle: StoreAccountantHandle,
+        genuine_funder: SourceFunder,
+    },
     // Preparation already holds the authenticated Original. It does not need
     // a newly discovered SourceFunder or a current writer registration.
     PreparedWriter {
@@ -109,6 +122,24 @@ impl StorageFunding {
         match self {
             Self::Original(original) => {
                 reserve_original_bootstrap(original, layout.size()).map(StorageAllocation::Writer)
+            }
+            Self::Writer {
+                original_use,
+                original_handle,
+                genuine_funder,
+            } => {
+                debug_assert!(original_handle.is_writer());
+                // writer_unqualified/prepare_writer validated this immutable
+                // funder against the held use before building StorageFunding.
+                // Keep it alive with the scope; never rediscover a registration.
+                let _ = genuine_funder;
+                crate::memory_accounting::reserve_native_storage_from_writer_use(
+                    original_use,
+                    original_handle,
+                    layout.size(),
+                )
+                .map(StorageAllocation::Writer)
+                .map_err(|failure| original_storage_error(NativeStorageFailure::Refused(failure)))
             }
             Self::PreparedWriter { .. } => {
                 unreachable!("prepared storage uses scalar admission exclusively")
@@ -156,7 +187,12 @@ impl StorageFunding {
                 )
                 .map(StorageAllocation::Writer)
             }
-            Self::PreparedWriter {
+            Self::Writer {
+                original_use,
+                original_handle,
+                ..
+            }
+            | Self::PreparedWriter {
                 original_use,
                 original_handle,
             } => crate::memory_accounting::reserve_native_storage_from_writer_use(

@@ -4146,8 +4146,6 @@
 +/// Preparation retains the actual lower producer error. An admission marker
 +/// must be recovered from its producing scope, never formatted as replacement
 +/// I/O or corruption. This type is private to the internal feature protocol.
-+#[doc(hidden)]
-+#[derive(Debug)]
 +#[cfg_attr(
 +    not(feature = "test-seams"),
 +    allow(
@@ -4155,6 +4153,8 @@
 +        reason = "KEEP-SEAM: live only under the test-seams feature; used from native_storage_admission.rs"
 +    )
 +)]
++#[doc(hidden)]
++#[derive(Debug)]
 +pub enum PreparedReadError {
 +    /// Same existing static corruption diagnosis, before String materialization.
 +    StaticCorrupted(&'static str),
@@ -5667,7 +5667,6 @@
 +}
 +
 +/// Why the cost of a registry change could not be learned or paid.
-+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 +#[cfg_attr(
 +    not(feature = "test-seams"),
 +    allow(
@@ -5675,6 +5674,7 @@
 +        reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
 +    )
 +)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 +pub enum RegistryReserveError {
 +    /// The requested capacity overflows the hash table's layout arithmetic;
 +    /// nothing was asked of the allocator.

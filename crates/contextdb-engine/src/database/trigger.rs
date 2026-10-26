@@ -87,6 +87,8 @@ pub(crate) struct TriggerPersistenceCommit {
     pub(crate) config_values: Vec<(String, Vec<u8>)>,
     pub(crate) ddl: Vec<DdlChange>,
     pub(crate) generation_sidecars: Vec<super::DurableDdlGenerationSidecar>,
+    #[allow(dead_code, reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun")]
+    pub(crate) start_ordinal: u32,
 }
 
 /// Trigger declarations and encoded config prepared before the received
@@ -2674,6 +2676,7 @@ impl Database {
             config_values,
             ddl: ddl.to_vec(),
             generation_sidecars,
+            start_ordinal,
         };
         let memory_history = self.prepare_staged_memory_schema_history(
             lsn,
@@ -4774,7 +4777,7 @@ impl Database {
         let retired = {
             let mut declarations = self.trigger.declarations.lock();
             let mut callbacks = self.trigger.callbacks.write();
-            let _names = self.trigger.active_trigger_names.lock();
+            let mut names = self.trigger.active_trigger_names.lock();
             let mut original = self.trigger.native_publication_memory.lock();
             let mut callback_original = self.trigger.native_callback_map_memory.lock();
             self.trigger
@@ -4783,6 +4786,7 @@ impl Database {
             RetiredOriginalTriggerState {
                 declarations: std::mem::replace(&mut *declarations, publication.declarations),
                 callbacks: std::mem::replace(&mut *callbacks, publication.callbacks),
+                names: std::mem::replace(&mut *names, publication.active_trigger_names),
                 _callback_original: callback_original.take(),
                 _original: original.replace(standing),
             }
@@ -5105,6 +5109,7 @@ impl Database {
             config_values,
             ddl: ddl.to_vec(),
             generation_sidecars,
+            start_ordinal,
         };
         let memory_history = self.prepare_staged_memory_schema_history(
             lsn,
@@ -5224,6 +5229,8 @@ struct RetiredOriginalTriggerState {
         reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
     )]
     callbacks: HashMap<String, TriggerCallback>,
+    #[allow(dead_code, reason = "KEEP-GUARD: holds the replaced trigger names so they are freed outside every lock, before their reservation is released")]
+    names: Vec<String>,
     _callback_original: Option<OwnedMemoryReservation>,
     _original: Option<OwnedMemoryReservation>,
 }

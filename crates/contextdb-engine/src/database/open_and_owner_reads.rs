@@ -1648,6 +1648,7 @@ impl Database {
             lazy_relational,
             read_bounds,
             vector_entries: _,
+            raw_vector_memberships: _,
             current_vectors: _,
             sync_source_lsns,
             sync_source_kinds,
@@ -1663,6 +1664,7 @@ impl Database {
             sink_queue_extents,
             vector_generation_catalog,
             retained_source,
+            source_path: _,
             store_file_bytes,
         } = parts;
         // The decoded configuration moves into the startup state, which holds

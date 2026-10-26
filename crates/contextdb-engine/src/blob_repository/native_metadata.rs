@@ -341,18 +341,58 @@ fn scan(reader: &mut Reader<'_, '_>, depth: usize) -> Result<usize> {
     Ok(maximum)
 }
 
+#[derive(Default)]
+struct CheckedBytes;
+impl<'de> serde::Deserialize<'de> for CheckedBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = CheckedBytes;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a sequence")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut values: A,
+            ) -> std::result::Result<CheckedBytes, A::Error> {
+                while values.next_element::<u8>()?.is_some() {}
+                Ok(CheckedBytes)
+            }
+        }
+        decoder.deserialize_seq(V)
+    }
+}
+#[allow(
+    dead_code,
+    reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `Tag` format and are validated as they stream"
+)]
 #[derive(serde::Deserialize)]
 pub(super) struct Tag {
-    #[allow(dead_code, reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format")]
     pub version: u8,
+    name: CheckedBytes,
     pub hash: [u8; 32],
     pub generation: u64,
+    pub format: u8,
+    role: BlobTagRole,
 }
+#[allow(
+    dead_code,
+    reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `Staging` format and are validated as they stream"
+)]
 #[derive(serde::Deserialize)]
 pub(super) struct Staging {
     pub version: u8,
     pub object_id: [u8; 16],
+    start_lsn: u64,
+    expected_size: Option<u64>,
+    received_size: u64,
+    payload_chunk_count: u64,
+    outboard_chunk_count: u64,
+    payload_indices: CheckedBytes,
+    outboard_indices: CheckedBytes,
     pub provisional_generation: Option<([u8; 32], u64)>,
+    #[serde(default)]
+    adapter_state: CheckedBytes,
 }
 
 // Both projections contain only scalars, fixed arrays/tuples and CheckedBytes.

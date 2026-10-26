@@ -15156,11 +15156,12 @@ pub(crate) mod original_version_manifest {
     const FORMAT: u8 = 1;
     const FIXED_KEY_BYTES: usize = 72;
 
-    #[derive(Clone, Copy)]
     #[allow(dead_code, reason = "WIRE-FIELD: part of a fixed encoded format")]
+    #[derive(Clone, Copy)]
     pub(crate) struct VersionManifest<'a> {
         pub(crate) table: &'a str,
         pub(crate) identity: [u8; 24],
+        pub(crate) deleted_tx: Option<TxId>,
         pub(crate) digest: [u8; 32],
     }
 
@@ -15201,7 +15202,7 @@ pub(crate) mod original_version_manifest {
         let p = 5 + length;
         let identity = coordinate[p..p + 24].try_into().expect("identity");
         let closure = u64::from_be_bytes(coordinate[p + 25..p + 33].try_into().expect("closure"));
-        let _deleted_tx = match coordinate[p + 24] {
+        let deleted_tx = match coordinate[p + 24] {
             0 if closure == 0 => None,
             1 => Some(TxId(closure)),
             _ => return Err(bad("invalid closure marker")),
@@ -15210,6 +15211,7 @@ pub(crate) mod original_version_manifest {
         Ok(VersionManifest {
             table,
             identity,
+            deleted_tx,
             digest,
         })
     }

@@ -1293,10 +1293,13 @@ pub(super) fn plan_received_schema_source_order_with_coordinates(
         ));
         source_order.push(ReceivedSchemaOrderEntry {
             change: change.clone(),
+            source_ddl_lsn: entry.map_or(*source_lsn, |entry| entry.source_ddl_lsn),
+            source_ordinal: entry.map_or(persisted_ordinal, |entry| entry.ordinal),
             persisted_ordinal,
             // The AUTHOR's signed digest. An unattested unit has none, and an
             // empty one is the honest answer -- the receiver's own arrival
             // digest above is a different fact and must not stand in for it.
+            digest: entry.map(|entry| entry.digest.clone()).unwrap_or_default(),
             generation,
             local_arrival,
         });

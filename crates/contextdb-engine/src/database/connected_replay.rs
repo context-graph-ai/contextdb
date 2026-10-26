@@ -1209,6 +1209,10 @@ pub(super) struct PrivateReplayContext<'a> {
 }
 pub(super) struct PrivateSyntheticTriggerFiring {
     pub(super) trigger_name: String,
+    #[allow(dead_code, reason = "LAYOUT-ONLY: each retained firing is charged by this type's layout")]
+    pub(super) table: String,
+    #[allow(dead_code, reason = "LAYOUT-ONLY: each retained firing is charged by this type's layout")]
+    pub(super) row_id: RowId,
     pub(super) lsn: Lsn,
     pub(super) tx: TxId,
 }
@@ -3049,7 +3053,7 @@ impl Database {
         &self,
         tx: TxId,
         table: &str,
-        _row: RowId,
+        row: RowId,
         trigger_name: &str,
         lsn: Lsn,
     ) -> Result<()> {
@@ -3076,6 +3080,8 @@ impl Database {
                 .synthetic_firings
                 .push(PrivateSyntheticTriggerFiring {
                     trigger_name: trigger_name.to_owned(),
+                    table: table.to_owned(),
+                    row_id: row,
                     lsn,
                     tx: state.canonical_tx,
                 });

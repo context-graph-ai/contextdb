@@ -91,8 +91,6 @@ pub enum StaleChannelAction {
 
 /// The old owner identity is supplied by the coordination layer; this module
 /// never reads a durable coordination record itself.
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(
@@ -100,6 +98,8 @@ pub enum StaleChannelAction {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from open_and_owner_reads.rs"
     )
 )]
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleChannelProbe {
     pub path: PathBuf,
     pub expected_owner: LocalHandshake,

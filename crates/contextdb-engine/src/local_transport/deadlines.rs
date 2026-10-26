@@ -92,7 +92,6 @@ pub enum DeadlineStage {
     ShutdownDrain,
 }
 
-#[derive(Default)]
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(
@@ -100,6 +99,7 @@ pub enum DeadlineStage {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract_types.rs"
     )
 )]
+#[derive(Default)]
 struct ManualDeadlineState {
     now_ms: u64,
     next_registration: u64,
@@ -122,7 +122,6 @@ struct RegisteredWaiter {
 
 /// Deterministic clock for channel deadline tests. Production callers supply
 /// their own `DeadlineClock`; this type is only the hidden test seam.
-#[derive(Clone, Default)]
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(
@@ -130,6 +129,7 @@ struct RegisteredWaiter {
         reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
+#[derive(Clone, Default)]
 pub struct ManualDeadlineClock {
     state: Arc<Mutex<ManualDeadlineState>>,
 }

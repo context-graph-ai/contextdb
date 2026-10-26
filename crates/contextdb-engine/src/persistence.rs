@@ -661,6 +661,9 @@ pub(crate) struct ReadPersistenceImage {
     lazy_relational: bool,
     read_bounds: WriterRecoveryBounds,
     vector_entries: Vec<VectorEntry>,
+    /// Checksummed placement and visibility identities for lazy raw-vector
+    /// point loads. Empty on the complete-hydration fallback.
+    raw_vector_memberships: Vec<VectorPartitionMembershipRecord>,
     current_vectors: HashMap<(VectorIndexRef, RowId), Vec<f32>>,
     sync_source_lsns: HashMap<(String, RowId), Lsn>,
     sync_source_kinds: HashMap<(String, RowId), SyncSourceKind>,
@@ -682,6 +685,9 @@ pub(crate) struct ReadPersistenceImage {
     /// Graph bodies and journal pages remain in the store until a query
     /// actually chooses the dormant indexed route.
     vector_generation_catalog: LoadedVectorPartitionGenerationCatalog,
+    /// The released source a dormant generation loader may reopen read-only.
+    /// Hydration never carries a Redb handle into the committed image.
+    source_path: Option<PathBuf>,
     /// How large the store file was when this image was read out of it.
     ///
     /// It is the same number a writer reports as disk usage -- the length of
@@ -712,6 +718,8 @@ pub(crate) struct ReadPersistenceImageParts {
         )
     )]
     pub(crate) vector_entries: Vec<VectorEntry>,
+    #[allow(dead_code, reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun")]
+    pub(crate) raw_vector_memberships: Vec<VectorPartitionMembershipRecord>,
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(
@@ -748,6 +756,8 @@ pub(crate) struct ReadPersistenceImageParts {
     pub(crate) sink_queue_extents: BTreeMap<String, SinkQueueExtent>,
     pub(crate) vector_generation_catalog: LoadedVectorPartitionGenerationCatalog,
     pub(crate) retained_source: RetainedReadSource,
+    #[allow(dead_code, reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun")]
+    pub(crate) source_path: PathBuf,
     pub(crate) store_file_bytes: Option<u64>,
     // Admission outlives every allocation carried by this image.
     pub(crate) memory: crate::read_image_memory::ImageMemoryHandle,
@@ -892,6 +902,8 @@ struct ReaderBreadcrumbGuard {
 struct ReaderSnapshotFileGuard {
     file: Option<File>,
     path: PathBuf,
+    #[allow(dead_code, reason = "LAYOUT-ONLY: never read; removing it changes a layout that memory accounting may charge, so it waits for the measured accounting rerun")]
+    metadata: std::fs::Metadata,
     registry_lock: ReaderSnapshotRegistryLock,
     nonblocking_teardown: bool,
     /// What the last departing reader needs to prove no purge-capable writer
@@ -1324,8 +1336,8 @@ struct PayloadDecodeDiagnostic(Error);
 /// A serde inspection form: TEXT is borrowed, and sequence elements are
 /// consumed one at a time. In particular its visitor never reserves from the
 /// stored sequence hint. Variant order follows VectorPartitionComponent.
-#[derive(Deserialize)]
 #[allow(dead_code, reason = "WIRE-FIELD: part of a fixed encoded format")]
+#[derive(Deserialize)]
 enum InspectedVectorPartitionComponent<'a> {
     Uuid(uuid::Uuid),
     Text(#[serde(borrow)] &'a str),
@@ -1353,15 +1365,21 @@ struct InspectedSequence<T> {
 
 /// Positional inspection forms of the canonical persisted vector. All route
 /// strings borrow the authenticated input; payload sequences never reserve.
+#[allow(
+    dead_code,
+    reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `InspectedPersistedVector` format"
+)]
 #[derive(Deserialize)]
 enum InspectedPersistedVector {
     F32(InspectedSequence<f32>),
     SQ8 {
+        min: f32,
+        max: f32,
         len: u32,
         payload: InspectedSequence<u8>,
     },
     SQ4 {
-        #[allow(dead_code, reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format")]
+        min: f32,
         max: f32,
         len: u32,
         payload: InspectedSequence<u8>,

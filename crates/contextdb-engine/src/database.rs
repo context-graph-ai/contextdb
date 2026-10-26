@@ -466,10 +466,17 @@ struct InMemoryReceivedSchemaManifestState {
 /// local only: it addresses the receiver's one ordered DDL log and generation
 /// sidecars, while `source_ordinal` remains part of the authenticated marker
 /// identity.
+#[allow(
+    dead_code,
+    reason = "LAYOUT-ONLY: Pre2ReceivedSchemaStage holds these entries, so their fields are part of a layout the registry charges"
+)]
 #[derive(Debug, Clone)]
 struct ReceivedSchemaOrderEntry {
     change: DdlChange,
+    source_ddl_lsn: Lsn,
+    source_ordinal: u32,
     persisted_ordinal: u32,
+    digest: Vec<u8>,
     generation: DurableDdlGenerationSidecar,
     local_arrival: DurableReceivedDdlArrival,
 }
@@ -748,6 +755,8 @@ type DdlGenerationValue = (Option<String>, Option<u64>);
 pub(crate) struct LocalSchemaStage {
     memory_history: Option<PreparedSchemaHistory>,
     relational: Vec<TableProjection>,
+    #[allow(dead_code, reason = "LAYOUT-ONLY: matched field-for-field by Pre2LocalSchemaStage, whose layout the registry subtracts from this one")]
+    affected_tables: HashSet<String>,
     dag_edge_types: PreparedDagEdgeTypes,
     rank_formulas: HashMap<(String, String), Arc<RankFormula>>,
     vector: Option<contextdb_vector::PreparedVectorTablePublication>,
@@ -757,6 +766,8 @@ pub(crate) struct LocalSchemaStage {
     trigger: trigger::PreparedTriggerPublication,
     native_trigger: Option<trigger::OriginalPreparedTriggerPublication>,
     table_generations: Vec<(String, u64)>,
+    #[allow(dead_code, reason = "LAYOUT-ONLY: matched field-for-field by Pre2LocalSchemaStage, whose layout the registry subtracts from this one")]
+    ddl_generations: Vec<(DdlGenerationKey, DdlGenerationValue)>,
     #[allow(
         dead_code,
         reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
@@ -1772,7 +1783,6 @@ pub enum VectorSearchTailState {
 
 /// Ordinary-build component receipt for memory ownership measurements.
 /// Its consumer surface is supplied by measurement callers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(
@@ -1780,6 +1790,7 @@ pub enum VectorSearchTailState {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from maintenance_and_limits.rs"
     )
 )]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct VectorMemoryOwnershipReceipt {
     /// Actual held source/loader metadata credits, deduplicated by Arc identity.
     pub source_metadata: usize,
@@ -10655,8 +10666,8 @@ struct ProjectedSyncApply {
     _incoming_values_owner: SyncParentKeyProjectionOwner,
 }
 
-#[derive(Debug)]
 #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
+#[derive(Debug)]
 struct SyncParentKeyProjectionOwner(OwnedMemoryReservation);
 
 /// The most one distinct LSN's entry in `change_log_lsn_refcounts` occupies:

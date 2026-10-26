@@ -881,8 +881,6 @@ impl HydrationObservation {
 
 /// Aggregate of persistence, bounded-target, and subsystem-owned probes. The
 /// direct module does not maintain or self-certify any of these counters.
-#[cfg(any(test, feature = "test-seams"))]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(
@@ -890,6 +888,8 @@ impl HydrationObservation {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
     )
 )]
+#[cfg(any(test, feature = "test-seams"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectReaderCounters {
     pub persistence_read_only_opens: u64,
     pub persistence_source_accesses: u64,
@@ -2193,7 +2193,6 @@ pub mod test_seams {
     };
     pub use contextdb_core::read_contract::OwnerReadCancellation as DirectCancellation;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(
@@ -2201,13 +2200,13 @@ pub mod test_seams {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from direct_file_reader_contract_tests.rs"
         )
     )]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum CancellationOperation {
         Execute,
         CursorOpen,
         CursorFetch,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(
@@ -2215,6 +2214,7 @@ pub mod test_seams {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct CancellationTokenObservation {
         pub operation: CancellationOperation,
         pub identity: u64,

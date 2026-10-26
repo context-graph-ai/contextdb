@@ -311,7 +311,6 @@ mod route_observation {
 
     // This vocabulary is exposed only to `test-seams` integration proofs.
     /// The bounded operations whose cancellation identity is observable.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(
@@ -319,6 +318,7 @@ mod route_observation {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_application_contract.rs"
         )
     )]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadSessionOperation {
         Execute,
         Metadata,
@@ -495,7 +495,6 @@ mod route_observation {
     /// Concrete production source reached by a bounded read. These values are
     /// emitted only by the adapter implementing the bounded kernel's execution
     /// probe; route selection and backend setup have no callback door for them.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(
@@ -503,6 +502,7 @@ mod route_observation {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
         )
     )]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReadKernelSource {
         TableRow,
         IndexEntry,
@@ -516,7 +516,6 @@ mod route_observation {
 
     /// Evidence emitted from the bounded source loop, after route and backend
     /// selection and immediately before one real source item is inspected.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(
@@ -524,6 +523,7 @@ mod route_observation {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
         )
     )]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReadKernelSourceEvent {
         pub funding_owner: Option<usize>,
         pub control_reservation_bytes: Option<usize>,
@@ -535,7 +535,6 @@ mod route_observation {
 
     /// Evidence emitted by the bounded kernel immediately before it returns its
     /// typed cancellation result.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[cfg_attr(
         not(feature = "test-seams"),
         allow(
@@ -543,6 +542,7 @@ mod route_observation {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from a_statement_on_the_file_route_costs_what_the_statement_costs.rs"
         )
     )]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReadKernelCancellationEvent {
         pub operation: ReadSessionOperation,
         pub route: ReadRoute,

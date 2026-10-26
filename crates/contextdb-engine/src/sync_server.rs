@@ -1402,9 +1402,15 @@ fn refused_outcomes_for_request(
 /// The protocol version a push request names, read without decoding its
 /// payload, so a refusal can answer in the sender's version.
 fn push_request_version(bytes: &[u8]) -> u8 {
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded `EnvelopeHead` format"
+    )]
     #[derive(serde::Deserialize)]
     struct EnvelopeHead {
         version: u8,
+        message_type: serde::de::IgnoredAny,
+        payload: serde::de::IgnoredAny,
     }
     rmp_serde::from_slice::<EnvelopeHead>(bytes)
         .map(|head| head.version)

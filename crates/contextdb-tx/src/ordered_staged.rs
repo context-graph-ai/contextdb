@@ -1920,6 +1920,11 @@ struct NativeEagerVectorBody {
 
 #[derive(Clone)]
 enum NativeEagerVectorPayload {
+    #[allow(
+        dead_code,
+        reason = "LAYOUT-ONLY: never constructed; it sets the payload's size, which the funded vector body charges, so removing it waits for the measured accounting rerun"
+    )]
+    Scalar(crate::statement_rows::NativeEagerRow),
     Owned(crate::staged_source::FundedArc<crate::staged_source::AdmittedEagerSourceVector>),
 }
 
@@ -1959,6 +1964,7 @@ impl NativeEagerVector {
             .retained_bytes()
             .saturating_add(self.0.column.retained_bytes())
             .saturating_add(match &self.0.payload {
+                NativeEagerVectorPayload::Scalar(_) => 0,
                 NativeEagerVectorPayload::Owned(payload) => payload
                     .retained_bytes()
                     .saturating_add(payload.invoice.retained_bytes()),
@@ -1970,6 +1976,12 @@ impl NativeEagerVector {
 
     pub(crate) fn vector(&self) -> &[f32] {
         match &self.0.payload {
+            NativeEagerVectorPayload::Scalar(row) => {
+                match row.row().values.get(self.0.column.as_str()) {
+                    Some(Value::Vector(values)) => values,
+                    _ => unreachable!("immutable eager scalar vector owner"),
+                }
+            }
             NativeEagerVectorPayload::Owned(owner) => &owner.entry.vector,
         }
     }
@@ -3624,6 +3636,9 @@ impl StagedPostingCharge for TerminalVectorPayload {
 impl NativeEagerVector {
     fn terminal_shell(&self) -> Arc<StagedVectorCapability> {
         let payload = match &self.0.payload {
+            NativeEagerVectorPayload::Scalar(row) => StagedVectorPayload::Scalar(
+                row.terminal_owner(Arc::new(StagedSchema::from_native(row.schema().clone()))),
+            ),
             NativeEagerVectorPayload::Owned(payload) => {
                 StagedVectorPayload::Owned(Arc::new(AdmittedVectorPayload {
                     values: payload.entry.vector.clone(),
@@ -3903,6 +3918,7 @@ impl NativeEagerVector {
         self.0.visit_retained_debits(visit);
         self.0.column.visit_retained_debits(visit);
         match &self.0.payload {
+            NativeEagerVectorPayload::Scalar(row) => row.visit_retained_debits(visit),
             NativeEagerVectorPayload::Owned(payload) => {
                 payload.visit_retained_debits(visit);
                 (**payload).visit_retained_debits(visit);
@@ -5388,6 +5404,18 @@ impl NativeEagerVector {
             return Err(exact_native_error());
         }
         let mut copied = match &self.0.payload {
+            NativeEagerVectorPayload::Scalar(row) => row.copy_original_vector_input_for(
+                crate::staged_source::BorrowedOriginalVectorCopyInput::new(
+                    &entry.index.table,
+                    &entry.index.column,
+                    self.vector(),
+                    row.row().row_id,
+                    row.row().created_tx,
+                    row.row().deleted_tx,
+                    row.row().lsn,
+                ),
+                funder,
+            )?,
             NativeEagerVectorPayload::Owned(payload) => {
                 payload.validate_original_pairing(funder)?;
                 if !payload.is_funded_by(funder) || payload.entry.index != entry.index {

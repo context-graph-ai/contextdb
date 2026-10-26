@@ -254,7 +254,6 @@ impl Drop for FundedCall<'_> {
 }
 
 /// Why the cost of a registry change could not be learned or paid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(feature = "test-seams"),
     allow(
@@ -262,6 +261,7 @@ impl Drop for FundedCall<'_> {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from transactions.rs"
     )
 )]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryReserveError {
     /// The requested capacity overflows the hash table's layout arithmetic;
     /// nothing was asked of the allocator.

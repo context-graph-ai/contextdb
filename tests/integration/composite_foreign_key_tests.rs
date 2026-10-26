@@ -1772,11 +1772,18 @@ fn ddl_sync_wire_round_trip_byte_shape_preserves_structured_constraints() {
     // no reader can turn a missing field into "this table has no foreign key".
     #[derive(serde::Serialize)]
     #[allow(clippy::enum_variant_names)]
+    #[allow(
+        dead_code,
+        reason = "WIRE-FIELD: encoded by both codecs; its variant order is the short-record encoding the test refuses"
+    )]
     enum ShortDdlChange {
         CreateTable {
             name: String,
             columns: Vec<(String, String)>,
             constraints: Vec<String>,
+        },
+        DropTable {
+            name: String,
         },
         AlterTable {
             name: String,

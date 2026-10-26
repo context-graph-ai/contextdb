@@ -7243,8 +7243,8 @@ mod tests {
 /// must obtain this admission before opening/growing allocator metadata and
 /// report actual capacities, including overlapping resize copies. Naming a
 /// charge does not itself supply a structural allocator residency bound.
-#[derive(Debug)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
+#[derive(Debug)]
 pub(crate) struct RedbAllocatorStateCharge {
     reservation: OwnedMemoryReservation,
     pub(crate) resident_bytes: usize,

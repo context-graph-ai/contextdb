@@ -148,11 +148,11 @@ pub fn finish_maintenance(db: &Database, partitions: usize) {
     panic!("maintenance did not publish the fixture's {partitions} generations");
 }
 
-#[derive(Default)]
 #[allow(
     dead_code,
     reason = "KEEP-SHARED: shared test helper used by read, read_cache_share_option"
 )]
+#[derive(Default)]
 pub struct Routes(pub Mutex<Vec<ReadSessionEvent>>);
 impl ReadSessionTestObserver for Routes {
     fn observe_event(&self, e: ReadSessionEvent) {

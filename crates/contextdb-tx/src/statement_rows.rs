@@ -773,6 +773,23 @@ impl NativeEagerRow {
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         self.0.ptr_eq(&other.0)
     }
+    pub(crate) fn terminal_owner(
+        &self,
+        schema: Arc<crate::ordered_staged::StagedSchema>,
+    ) -> Arc<RowOwner> {
+        Arc::new(RowOwner {
+            row: self.row().clone(),
+            sequence: self.sequence(),
+            keys: self
+                .keys()
+                .map(|(name, key)| (name.to_owned(), key.clone()))
+                .collect(),
+            schema,
+            _charge: Arc::new(TerminalRowCharge {
+                origin: StatementOrigin(StatementOriginOwner::Row(self.clone())),
+            }),
+        })
+    }
 }
 
 impl std::fmt::Debug for NativeEagerRow {

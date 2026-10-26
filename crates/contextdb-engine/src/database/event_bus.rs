@@ -5636,6 +5636,11 @@ pub(super) struct OwnedQueuePreparation {
         VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
         OwnedMemoryReservation,
     )>,
+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
+    retired: Option<(
+        VecDeque<OwnedEventShared<OwnedSinkQueueEntry>>,
+        OwnedMemoryReservation,
+    )>,
 }
 impl OwnedEventBusHandle {
     #[expect(
@@ -5763,6 +5768,7 @@ impl OwnedEventBusHandle {
                 absent: false,
                 replace_ring: false,
                 replacement: None,
+                retired: None,
             });
         }
         loop {
