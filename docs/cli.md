@@ -447,6 +447,13 @@ Every statement ends with a `;`; pressing Enter before one continues the stateme
 returns to the prompt with the session and any open cursor intact; Ctrl-C at an idle prompt
 clears the typed line; Ctrl-D or `.quit` ends the session. <!-- enforced by: read_cli_journeys_cancellation::interrupting_a_running_statement_returns_to_the_prompt_with_the_session_alive, read_cli_journeys_cancellation::interrupting_at_an_idle_prompt_clears_the_typed_line, read_cli_journeys_cancellation::an_open_cursor_survives_the_interruption -->
 
+A reader can use `SET READ_CACHE_SHARE 40` (or `SET READ_CACHE_SHARE = 40`),
+`SET READ_CACHE_SHARE DEFAULT`, and `SHOW READ_CACHE_SHARE` without `--write`.
+The declaration changes this session's file cache immediately; it is not persisted.
+SHOW includes the declared/effective share, the last refusal and advisory last-query residency.
+Null means no pages were measured. Percentages must be integers from 0 through 100; admission
+can refuse a valid percentage while keeping the previous declaration.
+
 Runtime budget control is SQL-driven and classified like everything else: `SHOW MEMORY_LIMIT` /
 `SHOW DISK_LIMIT` are reads; `SET MEMORY_LIMIT '512M'` / `SET DISK_LIMIT '1G'` are writes and
 need a `--write` session. <!-- enforced by: read_cli_journeys_invocation::a_reading_session_refuses_every_mutating_statement_before_it_executes, read_cli_journeys_invocation::writer_only_meta_commands_are_refused_in_a_reading_session --> Input that does not parse as any
@@ -929,7 +936,9 @@ nobody can act on it once the process is gone.
 
 A script continues after a refused statement, including a memory or disk refusal. Independent
 statements still run. `SHOW MEMORY_LIMIT` / `SET MEMORY_LIMIT` and `SHOW DISK_LIMIT` /
-`SET DISK_LIMIT` remain available to inspect and raise an exhausted limit, but successful recovery
+`SET DISK_LIMIT` accept optional `=` and remain available to inspect and raise an exhausted limit.
+`SET READ_CACHE_SHARE [=] <percent> | DEFAULT` and `SHOW READ_CACHE_SHARE` also remain available
+to adjust or inspect this session's file cache without a writable store. Successful recovery
 does not erase the earlier error: that scripted run still exits `1`.
 <!-- enforced by: read_cli_journeys_script_continuation::a_memory_refusal_is_followed_by_independent_work_and_recovery, read_cli_journeys_script_continuation::a_disk_refusal_is_followed_by_independent_work_and_recovery, read_cli_journeys_script_continuation::a_refusal_through_the_translated_sync_inspection_route_still_continues -->
 

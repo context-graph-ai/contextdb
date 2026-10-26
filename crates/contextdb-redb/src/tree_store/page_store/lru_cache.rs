@@ -3,6 +3,8 @@ use crate::tree_store::page_store::fast_hash::FastHashMapU64;
 use crate::tree_store::page_store::fast_hash::FastHasher64;
 use std::hash::Hasher;
 use std::ops::Deref;
+#[cfg(feature = "contextdb-internal")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard};
 
@@ -13,6 +15,8 @@ struct Entry<T> {
     query_page: AtomicU64,
     #[cfg(feature = "contextdb-internal")]
     query_epoch: AtomicU64,
+    #[cfg(feature = "contextdb-internal")]
+    query_next: AtomicU32,
     key: AtomicU64,
     second_chance: AtomicBool,
     previous: AtomicU32,
@@ -22,12 +26,6 @@ struct Entry<T> {
 }
 
 struct FreeSlots {
-    #[cfg(feature = "contextdb-internal")]
-    query_epoch: u64,
-    #[cfg(feature = "contextdb-internal")]
-    query_limit: usize,
-    #[cfg(feature = "contextdb-internal")]
-    query_count: usize,
     slots: Box<[u32]>,
     len: usize,
 }
@@ -35,6 +33,42 @@ struct FreeSlots {
 pub(crate) struct EntryArena<T> {
     entries: Box<[Entry<T>]>,
     free: Mutex<FreeSlots>,
+    // All window controls are inline in this same prepaid arena. Beginning a
+    // window serializes resets; recording never acquires either arena mutex.
+    #[cfg(feature = "contextdb-internal")]
+    query_begin: Mutex<()>,
+    #[cfg(feature = "contextdb-internal")]
+    query_epoch: AtomicU64,
+    #[cfg(feature = "contextdb-internal")]
+    query_invalid_through: AtomicU64,
+    #[cfg(feature = "contextdb-internal")]
+    query_limit: AtomicUsize,
+    #[cfg(feature = "contextdb-internal")]
+    query_count: AtomicUsize,
+    #[cfg(feature = "contextdb-internal")]
+    query_first: AtomicU32,
+    #[cfg(feature = "contextdb-internal")]
+    query_writers: AtomicUsize,
+    #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+    query_entries_visited: AtomicUsize,
+}
+
+#[cfg(feature = "contextdb-internal")]
+struct QueryPageWriter<'a, T> {
+    arena: &'a EntryArena<T>,
+    epoch: u64,
+}
+#[cfg(feature = "contextdb-internal")]
+impl<T> Drop for QueryPageWriter<'_, T> {
+    fn drop(&mut self) {
+        let current = self.arena.query_epoch.load(Ordering::Acquire);
+        if current != self.epoch {
+            self.arena
+                .query_invalid_through
+                .fetch_max(current, Ordering::AcqRel);
+        }
+        self.arena.query_writers.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl<T> EntryArena<T> {
@@ -61,6 +95,8 @@ impl<T> EntryArena<T> {
                 query_page: AtomicU64::new(0),
                 #[cfg(feature = "contextdb-internal")]
                 query_epoch: AtomicU64::new(0),
+                #[cfg(feature = "contextdb-internal")]
+                query_next: AtomicU32::new(NONE),
                 key: AtomicU64::new(0),
                 second_chance: AtomicBool::new(false),
                 previous: AtomicU32::new(NONE),
@@ -75,15 +111,25 @@ impl<T> EntryArena<T> {
         CacheShared::new_prepaid(Self {
             entries,
             free: Mutex::new(FreeSlots {
-                #[cfg(feature = "contextdb-internal")]
-                query_epoch: 0,
-                #[cfg(feature = "contextdb-internal")]
-                query_limit: 0,
-                #[cfg(feature = "contextdb-internal")]
-                query_count: 0,
                 slots,
                 len: capacity,
             }),
+            #[cfg(feature = "contextdb-internal")]
+            query_begin: Mutex::new(()),
+            #[cfg(feature = "contextdb-internal")]
+            query_epoch: AtomicU64::new(0),
+            #[cfg(feature = "contextdb-internal")]
+            query_invalid_through: AtomicU64::new(0),
+            #[cfg(feature = "contextdb-internal")]
+            query_limit: AtomicUsize::new(0),
+            #[cfg(feature = "contextdb-internal")]
+            query_count: AtomicUsize::new(0),
+            #[cfg(feature = "contextdb-internal")]
+            query_first: AtomicU32::new(NONE),
+            #[cfg(feature = "contextdb-internal")]
+            query_writers: AtomicUsize::new(0),
+            #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+            query_entries_visited: AtomicUsize::new(0),
         })
     }
 
@@ -93,68 +139,121 @@ impl<T> EntryArena<T> {
             + self.entries.len() * size_of::<u32>()
     }
 
-    // No second array, map or owner: the original arena Layout prepays this
-    // bounded page-id window and keeps it paid through physical free.
+    // A statement records at most half the hash slots, within its selected
+    // page capacity. Intrusive links reuse these same prepaid entries.
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn begin_page_window(&self, limit: usize) -> u64 {
-        let mut free = self.free.lock().unwrap();
-        free.query_epoch = free.query_epoch.wrapping_add(1);
-        if free.query_epoch == 0 {
-            for entry in &self.entries {
-                entry.query_epoch.store(0, Ordering::Release);
-            }
-            free.query_epoch = 1;
+        let _begin = self.query_begin.lock().unwrap();
+        let Some(epoch) = self.query_epoch.load(Ordering::Acquire).checked_add(1) else {
+            // Never reuse an epoch and mistake historical entries for current
+            // pages. Exhaustion disables measurement without scanning the arena.
+            self.query_limit.store(0, Ordering::Release);
+            return 0;
+        };
+        self.query_epoch.store(epoch, Ordering::Release);
+        if self.query_writers.load(Ordering::Acquire) != 0 {
+            self.query_invalid_through
+                .fetch_max(epoch, Ordering::AcqRel);
         }
-        free.query_limit = limit.min(self.entries.len());
-        free.query_count = 0;
-        free.query_epoch
+        self.query_limit
+            .store(limit.min(self.entries.len() / 2), Ordering::Release);
+        self.query_count.store(0, Ordering::Release);
+        self.query_first.store(NONE, Ordering::Release);
+        #[cfg(feature = "test-seams")]
+        self.query_entries_visited.store(0, Ordering::Relaxed);
+        epoch
     }
 
     #[cfg(feature = "contextdb-internal")]
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "The hash is reduced modulo the window length."
+        reason = "The hash is reduced modulo the arena length, whose slots are u32 indexed."
     )]
     pub(crate) fn record_page(&self, epoch: u64, id: [u8; 8]) {
-        let mut free = self.free.lock().unwrap();
-        let limit = free.query_limit;
-        if free.query_epoch != epoch || limit == 0 || free.query_count == limit {
+        if epoch == 0 || self.query_epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        let limit = self.query_limit.load(Ordering::Acquire);
+        if limit == 0 || self.query_count.load(Ordering::Acquire) >= limit {
+            return;
+        }
+        self.query_writers.fetch_add(1, Ordering::AcqRel);
+        let _writer = QueryPageWriter { arena: self, epoch };
+        if self.query_epoch.load(Ordering::Acquire) != epoch {
             return;
         }
         let key = u64::from_le_bytes(id);
         let mut hasher = FastHasher64::default();
         hasher.write_u64(key);
-        let start = (hasher.finish() % limit as u64) as usize;
-        for offset in 0..limit {
-            let entry = &self.entries[(start + offset) % limit];
-            if entry.query_epoch.load(Ordering::Acquire) != epoch {
-                entry.query_page.store(key, Ordering::Relaxed);
-                entry.query_epoch.store(epoch, Ordering::Release);
-                free.query_count += 1;
+        let modulus = self.entries.len();
+        let start = (hasher.finish() % modulus as u64) as usize;
+        for offset in 0..modulus {
+            if self.query_epoch.load(Ordering::Acquire) != epoch {
                 return;
             }
-            if entry.query_page.load(Ordering::Relaxed) == key {
+            let index = (start + offset) % modulus;
+            let entry = &self.entries[index];
+            let previous = entry.query_epoch.load(Ordering::Acquire);
+            if previous == epoch {
+                if entry.query_page.load(Ordering::Relaxed) == key {
+                    return;
+                }
+            } else if previous < epoch
+                && entry
+                    .query_epoch
+                    .compare_exchange(previous, epoch, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                entry.query_page.store(key, Ordering::Relaxed);
+                entry
+                    .query_next
+                    .store(self.query_first.load(Ordering::Acquire), Ordering::Relaxed);
+                self.query_first.store(index as u32, Ordering::Release);
+                self.query_count.fetch_add(1, Ordering::AcqRel);
                 return;
             }
         }
     }
 
     #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn visit_page_window(&self, epoch: u64, mut visit: impl FnMut([u8; 8])) {
-        let limit = {
-            let free = self.free.lock().unwrap();
-            if free.query_epoch != epoch {
-                return;
-            }
-            free.query_limit
-        };
-        // Release the arena lock before peeking cache stripes. Cache insertion
-        // can hold a stripe while acquiring this arena's free-slot lock.
-        for entry in &self.entries[..limit] {
-            if entry.query_epoch.load(Ordering::Acquire) == epoch {
-                visit(entry.query_page.load(Ordering::Relaxed).to_le_bytes());
-            }
+    fn page_window_is_current(&self, epoch: u64) -> bool {
+        epoch != 0
+            && self.query_epoch.load(Ordering::Acquire) == epoch
+            && self.query_invalid_through.load(Ordering::Acquire) < epoch
+            && self.query_writers.load(Ordering::Acquire) == 0
+    }
+
+    #[cfg(feature = "contextdb-internal")]
+    pub(crate) fn visit_page_window(&self, epoch: u64, mut visit: impl FnMut([u8; 8])) -> bool {
+        #[cfg(feature = "test-seams")]
+        self.query_entries_visited.store(0, Ordering::Relaxed);
+        if !self.page_window_is_current(epoch) {
+            return false;
         }
+        let count = self.query_count.load(Ordering::Acquire);
+        if count > self.query_limit.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut slot = self.query_first.load(Ordering::Acquire);
+        for _ in 0..count {
+            let Some(entry) = self.entries.get(slot as usize) else {
+                return false;
+            };
+            #[cfg(feature = "test-seams")]
+            self.query_entries_visited.fetch_add(1, Ordering::Relaxed);
+            if entry.query_epoch.load(Ordering::Acquire) != epoch {
+                return false;
+            }
+            let id = entry.query_page.load(Ordering::Relaxed).to_le_bytes();
+            slot = entry.query_next.load(Ordering::Acquire);
+            visit(id);
+        }
+        slot == NONE && self.page_window_is_current(epoch)
+    }
+
+    #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+    pub(crate) fn page_window_entries_visited_for_test(&self) -> usize {
+        self.query_entries_visited.load(Ordering::Relaxed)
     }
 
     fn take(&self) -> Option<u32> {
@@ -238,14 +337,6 @@ impl<T> LRUCache<T> {
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn page_window_arena(&self) -> CacheShared<EntryArena<T>> {
         self.arena.clone()
-    }
-    #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn begin_page_window(&self, limit: usize) -> u64 {
-        self.arena.begin_page_window(limit)
-    }
-    #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn record_page(&self, epoch: u64, id: [u8; 8]) {
-        self.arena.record_page(epoch, id);
     }
 
     pub(crate) fn arena_index_bytes(&self) -> usize {
@@ -1057,6 +1148,32 @@ pub(crate) mod arena_index_tests {
 
 #[cfg(all(test, feature = "contextdb-internal"))]
 mod residency_tests {
+    #[test]
+    fn a_window_is_invalid_if_another_window_starts_during_the_probe() {
+        let arena = super::EntryArena::<u64>::new(16);
+        let epoch = arena.begin_page_window(8);
+        arena.record_page(epoch, 1_u64.to_le_bytes());
+        let mut nested = false;
+        let measured = arena.visit_page_window(epoch, |_| {
+            nested = true;
+            let next = arena.begin_page_window(8);
+            arena.record_page(next, 2_u64.to_le_bytes());
+        });
+        assert!(nested && !measured);
+    }
+
+    #[test]
+    fn recording_caps_load_at_half_the_prepaid_slots() {
+        let arena = super::EntryArena::<u64>::new(16);
+        let epoch = arena.begin_page_window(16);
+        for id in 0..100_u64 {
+            arena.record_page(epoch, id.to_le_bytes());
+        }
+        let mut count = 0;
+        assert!(arena.visit_page_window(epoch, |_| count += 1));
+        assert_eq!(count, 8);
+    }
+
     #[test]
     fn query_page_window_is_distinct_bounded_and_does_not_evict_pages() {
         let arena = super::EntryArena::new(8);

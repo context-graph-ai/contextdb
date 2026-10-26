@@ -30,6 +30,29 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+fn public_cache_setting_error(error: Error) -> Error {
+    match error {
+        Error::NativeEngineOther(
+            contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
+                subsystem,
+                operation,
+                requested_bytes,
+                available_bytes,
+                budget_limit_bytes,
+                hint,
+            },
+        ) => Error::MemoryBudgetExceeded {
+            subsystem: subsystem.into(),
+            operation: operation.into(),
+            requested_bytes,
+            available_bytes,
+            budget_limit_bytes,
+            hint: hint.into(),
+        },
+        other => other,
+    }
+}
+
 /// Per-session bounded read policy, owner-client deadlines, and the
 /// visibility this session reads under.
 ///
@@ -3087,7 +3110,7 @@ impl ReadSession {
                     .read_cache_share
                     .expect("invalid declared percent")
                     .to_string(),
-                allowed: "0..=100",
+                allowed: "0..=100, an integer percent".to_owned(),
             });
         }
         if let Some(limit) = options.memory_limit {
@@ -3379,7 +3402,7 @@ impl ReadSession {
             return Err(Error::InvalidSetting {
                 name: "READ_CACHE_SHARE",
                 value,
-                allowed: "0..=100",
+                allowed: "0..=100, an integer percent".to_owned(),
             });
         }
         let _mutation = self
@@ -3393,7 +3416,7 @@ impl ReadSession {
                 reader.select_cache_capacity(options.read_cache_share_status().effective_bytes)
             {
                 self.note_cache_percent_refusal(percent);
-                return Err(error);
+                return Err(public_cache_setting_error(error));
             }
         }
         self.resources.publish_read_cache_share(percent);
@@ -3426,7 +3449,10 @@ impl ReadSession {
 
     fn note_cache_refusal(&self, value: &str) {
         let mut text = [0_u8; 64];
-        let length = value.len().min(text.len());
+        let mut length = value.len().min(text.len());
+        while !value.is_char_boundary(length) {
+            length -= 1;
+        }
         text[..length].copy_from_slice(&value.as_bytes()[..length]);
         *self
             .resources
@@ -3455,32 +3481,12 @@ impl ReadSession {
                             return Err(Error::InvalidSetting {
                                 name: "READ_CACHE_SHARE",
                                 value: value.to_owned(),
-                                allowed: "0..=100",
+                                allowed: "0..=100, an integer percent".to_owned(),
                             });
                         }
                     },
                 };
-                self.set_read_cache_share(percent)
-                    .map_err(|error| match error {
-                        Error::NativeEngineOther(
-                            contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded {
-                                subsystem,
-                                operation,
-                                requested_bytes,
-                                available_bytes,
-                                budget_limit_bytes,
-                                hint,
-                            },
-                        ) => Error::MemoryBudgetExceeded {
-                            subsystem: subsystem.into(),
-                            operation: operation.into(),
-                            requested_bytes,
-                            available_bytes,
-                            budget_limit_bytes,
-                            hint: hint.into(),
-                        },
-                        other => other,
-                    })?;
+                self.set_read_cache_share(percent)?;
                 Ok(QueryResult::empty())
             }
             contextdb_parser::Statement::ShowReadCacheShare => self.show_cache_setting(selected),
@@ -3534,7 +3540,7 @@ impl ReadSession {
                 .iter()
                 .position(|byte| *byte == 0)
                 .unwrap_or(bytes.len());
-            std::str::from_utf8(&bytes[..length]).expect("setting values are ASCII")
+            std::str::from_utf8(&bytes[..length]).expect("setting value prefix is valid UTF-8")
         });
         let resident = *self
             .resources
@@ -3713,6 +3719,7 @@ impl ReadSession {
                 let request = reader
                     .request_query_read_owner()
                     .map_err(|error| direct_error(Path::new(""), error))?;
+                let mut data_statement = false;
                 let (result, fraction) = reader.with_cache_page_window(|| {
                     crate::executor::bounded::with_request_read_memory(
                         request,
@@ -3732,15 +3739,19 @@ impl ReadSession {
                                 native_trace_refund.as_ref(),
                             )
                             .map_err(read_error)?;
+                            data_statement = executed.data_statement;
                             reader.publish_bounded_result(&executed.publication, executed.result)
                         },
                     )
                 });
-                *self
-                    .resources
-                    .last_query_resident_percent
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = Some(fraction * 100.0);
+                if result.is_ok() && data_statement {
+                    *self
+                        .resources
+                        .last_query_resident_percent
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        fraction.map(|value| value * 100.0);
+                }
                 result
             }
             ReadSessionState::OwnerChannel(owner) => {

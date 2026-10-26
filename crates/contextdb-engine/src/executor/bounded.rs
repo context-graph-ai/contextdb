@@ -19524,6 +19524,7 @@ pub(super) fn execute_with_native_trace_refund(
         cache: Some(redb::ReadCacheRequest::enter()),
     };
     let statement = contextdb_parser::parse(sql)?;
+    let data_statement = matches!(&statement, Statement::Select(_));
     db.plugin().on_query(sql)?;
     let plugin_started_ms = clock.now_ms();
     let plugin_clock = Arc::clone(&clock);
@@ -19826,6 +19827,7 @@ pub(super) fn execute_with_native_trace_refund(
             context.release(params_bytes)?;
         }
         Ok(BoundedExecutionResult {
+            data_statement,
             result,
             publication,
             telemetry: context.telemetry(),

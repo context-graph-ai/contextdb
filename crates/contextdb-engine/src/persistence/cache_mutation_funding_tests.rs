@@ -79,12 +79,7 @@ fn refused_cache_growth_keeps_the_old_declaration_capacity_and_charge() {
     let charge = reader.charged_bytes().unwrap();
     let error = reader.set_read_cache_share(Some(100)).unwrap_err();
     assert!(
-        matches!(
-            &error,
-            contextdb_core::Error::NativeEngineOther(
-                contextdb_core::read_memory::NativeRefusal::MemoryBudgetExceeded { .. }
-            )
-        ),
+        matches!(&error, contextdb_core::Error::MemoryBudgetExceeded { .. }),
         "growth must return its original typed refusal: {error:?}"
     );
     drop(error);

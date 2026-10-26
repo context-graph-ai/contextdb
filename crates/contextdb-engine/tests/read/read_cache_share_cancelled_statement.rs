@@ -75,3 +75,49 @@ fn cache_inspection_honours_the_declared_result_byte_limit() {
         other => panic!("inspection keeps the typed result-byte refusal: {other:?}"),
     }
 }
+
+#[test]
+fn a_non_integer_unicode_share_keeps_a_valid_inspection_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unicode-cache-setting.db");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE small (id INTEGER PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.close().unwrap();
+    let reader = fixture::open_file(
+        &path,
+        ReadSessionOptions {
+            memory_limit: Some(64 * 1024 * 1024),
+            read_cache_share: Some(40),
+            limits: ReadLimits {
+                memory: 64 * 1024 * 1024,
+                ..fixture::limits()
+            },
+            ..Default::default()
+        },
+        Arc::new(fixture::Routes::default()),
+    );
+    let token = format!("'{}'", "🙂".repeat(24));
+    let error = reader
+        .execute(&format!("SET READ_CACHE_SHARE {token}"), &HashMap::new())
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidSetting { name: "READ_CACHE_SHARE", value, .. } if value == token)
+    );
+    let shown = reader
+        .execute("SHOW READ_CACHE_SHARE", &HashMap::new())
+        .unwrap();
+    let column = shown
+        .columns()
+        .iter()
+        .position(|name| name == "last_refusal")
+        .unwrap();
+    let contextdb_core::Value::Text(prefix) = &shown.rows()[0][column] else {
+        panic!("the refused value is text")
+    };
+    assert!(!prefix.is_empty() && token.starts_with(prefix));
+    assert_eq!(reader.options().read_cache_share, Some(40));
+}

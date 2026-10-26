@@ -856,7 +856,7 @@ pub enum Error {
     InvalidSetting {
         name: &'static str,
         value: String,
-        allowed: &'static str,
+        allowed: String,
     },
     /// Engine-produced diagnostic whose admitted backing survives until the
     /// caller destroys it. Application/plugin errors keep their original form.

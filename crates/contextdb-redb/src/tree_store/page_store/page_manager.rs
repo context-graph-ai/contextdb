@@ -854,8 +854,13 @@ impl TransactionalMemory {
         });
     }
     #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) {
-        self.storage.visit_page_window(epoch, visit);
+    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) -> bool {
+        self.storage.visit_page_window(epoch, visit)
+    }
+
+    #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+    pub(crate) fn page_window_entries_visited_for_test(&self) -> usize {
+        self.storage.page_window_entries_visited_for_test()
     }
 
     #[cfg(feature = "contextdb-internal")]

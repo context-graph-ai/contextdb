@@ -7061,14 +7061,20 @@ impl Database {
                     return Err(Error::InvalidSetting {
                         name: "MEMORY_LIMIT",
                         value: bytes.to_string(),
-                        allowed: "no greater than the startup ceiling",
+                        allowed: format!(
+                            "at most {} (startup ceiling)",
+                            memory_ceiling_description(ceiling)
+                        ),
                     });
                 }
                 None => {
                     return Err(Error::InvalidSetting {
                         name: "MEMORY_LIMIT",
                         value: "NONE".to_owned(),
-                        allowed: "a finite limit no greater than the startup ceiling",
+                        allowed: format!(
+                            "cannot remove memory limit when a startup ceiling is set ({})",
+                            memory_ceiling_description(ceiling)
+                        ),
                     });
                 }
                 _ => {}
@@ -8060,5 +8066,14 @@ impl Database {
                 .pull_watermark = watermark;
         }
         Ok(())
+    }
+}
+
+fn memory_ceiling_description(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if bytes.is_multiple_of(MIB) {
+        format!("{} MiB ({bytes} bytes)", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }

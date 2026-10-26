@@ -339,17 +339,19 @@ cache shares and memory limits above their startup ceiling use the common
 `Error::InvalidSetting { name, value, allowed }` vocabulary. Admission refusals
 keep their memory-budget fields and leave the prior declaration intact.
 
-Each file statement scopes a bounded distinct-page window to its own storage on
-the executing thread. Page hits, byte windows, and native reads all contribute.
-Identifiers occupy inline metadata in the existing prepaid native index arena;
-there is no second array, map, retained query workspace, or allocation owner.
-The original exact arena Layout invoice includes these bytes until physical free.
-The window keeps at most the selected capacity divided by page size; when full,
-it retains the first bounded set and stops admitting identifiers. The production
-residency probe inspects that set after execution without I/O or CLOCK changes.
-The reported percentage is advisory, initially Null, and zero for an empty
-window. Settings and SHOW preserve the last data statement's observation. Owner
-routes have no session-owned file-cache residency to report and retain Null.
+Successful file data statements publish residency from a bounded distinct-page window,
+including ordinary, byte-window and native cache hits. Non-data inspections and failed statements
+preserve the previous observation. Empty, zero-share and superseded windows report Null;
+Null means no pages were measured. Owner and in-memory routes also have no session-owned file
+cache to measure.
+
+Identifiers and their intrusive list links live in the existing prepaid native index arena;
+its original exact Layout invoice covers the metadata through physical free. Recording uses
+atomic controls, without the free-slot mutex or cache stripe locks. The hash table stays at most
+half full; the sample is also bounded by selected cache capacity divided by page size. The final
+residency walk follows recorded links only, never the capacity array, and probes production cache
+residency without I/O or CLOCK changes. A superseding epoch or an in-flight writer invalidates the
+measurement instead of inventing zero percent. Window initialization alone serializes its reset.
 
 The native index slots are prepaid for the maximum selectable capacity `B - F`
 and reused across changes. Session inspection reports `prepaid_index_bytes`,

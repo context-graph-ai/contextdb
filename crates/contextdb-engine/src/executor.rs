@@ -3767,6 +3767,7 @@ pub(crate) struct BoundedExecutionTelemetry {
 
 #[derive(Debug)]
 pub(crate) struct BoundedExecutionResult {
+    pub(crate) data_statement: bool,
     pub(crate) result: OwnedQueryResult,
     pub(crate) publication: ReadPublicationScope,
     #[cfg_attr(not(feature = "test-seams"), allow(dead_code))]

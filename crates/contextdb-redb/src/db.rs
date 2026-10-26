@@ -749,15 +749,18 @@ impl ReadOnlyDatabase {
     /// No I/O or allocation is performed by observation or the final probe.
     #[cfg(feature = "contextdb-internal")]
     #[doc(hidden)]
-    pub fn with_read_cache_page_window<R>(&self, operation: impl FnOnce() -> R) -> (R, f64) {
+    pub fn with_read_cache_page_window<R>(
+        &self,
+        operation: impl FnOnce() -> R,
+    ) -> (R, Option<f64>) {
         let (result, epoch) = self.mem.with_page_window(operation);
         let mut resident = 0.0;
         let mut count = 0.0;
-        self.mem.visit_page_window(epoch, |id| {
+        let measured = self.mem.visit_page_window(epoch, |id| {
             resident += self.read_cache_resident_fraction(&[id]);
             count += 1.0;
         });
-        (result, if count == 0.0 { 0.0 } else { resident / count })
+        (result, (measured && count > 0.0).then(|| resident / count))
     }
 
     #[cfg(feature = "test-seams")]
@@ -770,6 +773,14 @@ impl ReadOnlyDatabase {
     #[doc(hidden)]
     pub fn cached_header_for_test(&self) -> Result<crate::CachePageForTest> {
         self.mem.cached_header_for_test()
+    }
+
+    /// Number of recorded entries examined by the most recent window visit.
+    #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn page_window_entries_visited_for_test(&self) -> usize {
+        self.mem.page_window_entries_visited_for_test()
     }
 
     /// Capture one internally funded retained root without ordinary table controls.

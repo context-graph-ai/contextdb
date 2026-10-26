@@ -361,6 +361,8 @@ pub(super) struct PagedCachedFile {
     writes_hits: AtomicU64,
     #[cfg(feature = "cache_metrics")]
     evictions: AtomicU64,
+    #[cfg(feature = "contextdb-internal")]
+    page_window_arena: CacheShared<EntryArena<PageAllocation>>,
     read_cache: Box<[RwLock<LRUCache<PageAllocation>>]>,
     // TODO: maybe move this cache to WriteTransaction?
     write_buffer: CacheShared<Mutex<LRUWriteCache>>,
@@ -514,6 +516,8 @@ impl PagedCachedFile {
         let read_cache =
             Self::prepare_read_index(max_cache_size, usize::try_from(page_size).unwrap(), 0)?;
 
+        #[cfg(feature = "contextdb-internal")]
+        let page_window_arena = read_cache[0].read().unwrap().page_window_arena();
         Ok(Self {
             file: CheckedBackend::new(file),
             no_victim_generation: AtomicU64::new(0),
@@ -534,6 +538,8 @@ impl PagedCachedFile {
             writes_hits: Default::default(),
             #[cfg(feature = "cache_metrics")]
             evictions: Default::default(),
+            #[cfg(feature = "contextdb-internal")]
+            page_window_arena,
             read_cache,
             write_buffer: CacheShared::new_prepaid(Mutex::new(LRUWriteCache::new()))?,
         })
@@ -617,16 +623,21 @@ impl PagedCachedFile {
     pub(crate) fn begin_page_window(&self) -> u64 {
         let limit =
             self.max_cache_size.load(Ordering::Acquire) / usize::try_from(self.page_size).unwrap();
-        self.read_cache[0].read().unwrap().begin_page_window(limit)
+        self.page_window_arena.begin_page_window(limit)
     }
     #[cfg(feature = "contextdb-internal")]
     pub(crate) fn record_query_page(&self, epoch: u64, id: [u8; 8]) {
-        self.read_cache[0].read().unwrap().record_page(epoch, id);
+        self.page_window_arena.record_page(epoch, id);
     }
     #[cfg(feature = "contextdb-internal")]
-    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) {
-        let arena = self.read_cache[0].read().unwrap().page_window_arena();
-        arena.visit_page_window(epoch, visit);
+    pub(crate) fn visit_page_window(&self, epoch: u64, visit: impl FnMut([u8; 8])) -> bool {
+        self.page_window_arena.visit_page_window(epoch, visit)
+    }
+
+    #[cfg(all(feature = "contextdb-internal", feature = "test-seams"))]
+    pub(crate) fn page_window_entries_visited_for_test(&self) -> usize {
+        self.page_window_arena
+            .page_window_entries_visited_for_test()
     }
 
     fn uncached(buffer: PageAllocation) -> PageMemory {
