@@ -1831,13 +1831,6 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     pub(crate) fn cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1867,13 +1860,6 @@ impl WriterSnapshot {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_staged.rs"
-        )
     )]
     pub(crate) fn exact_row(
         self: &Arc<Self>,

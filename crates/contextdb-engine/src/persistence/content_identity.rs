@@ -2240,13 +2240,6 @@ fn parse_posting_tree_key(key: &[u8]) -> Result<PostingTreeKeyParts<'_>> {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_authentication_tests.rs"
-    )
-)]
 fn decode_posting_position(bytes: &[u8]) -> Result<super::EncodedRelationalIndexPosition> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     RedbPersistence::decode_exact::<super::EncodedRelationalIndexPosition>(bytes).map_err(|error| {
@@ -4505,13 +4498,6 @@ use writer_window::update_family;
 
 /// Reader-test ceiling retained for comparisons with the writer's resident
 /// original path and bounded builder; no storage is allocated from it.
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
-    )
-)]
 const fn proof_path_bytes(height: u32) -> usize {
     (height as usize + 3) * (MAX_NODE_BYTES + 4096)
 }
@@ -5610,13 +5596,6 @@ impl ProofMemory {
 
     /// For callers that hold no reservation of their own, such as the
     /// engine-internal contracts. The charge is still measured.
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from declared_memory_limit_bounds_a_writer.rs"
-        )
-    )]
     pub(super) fn unlimited() -> Self {
         Self::with_limit(usize::MAX)
     }
@@ -5765,24 +5744,10 @@ impl ProofMemory {
 
     /// What the descent itself held at its deepest, without the pages it chose
     /// to keep or the caller's payload.
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
-        )
-    )]
     pub(super) fn live_peak(&self) -> usize {
         self.live_peak.get()
     }
 
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     pub(super) fn live_bytes(&self) -> usize {
         self.live.get()
     }
@@ -5878,21 +5843,7 @@ pub(super) struct ReadAuthenticationBatch<'a> {
         reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
     )]
     nodes: BTreeMap<[u8; 33], Arc<VerifiedReadNode>>,
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     bytes: usize,
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from framing.rs"
-        )
-    )]
     byte_limit: usize,
 }
 
@@ -6045,13 +5996,6 @@ impl ReadAuthenticationBatch<'_> {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
     )]
     pub(super) fn verify(&mut self, mutation: &ContentIdentityMutation) -> Result<()> {
         self.verifier

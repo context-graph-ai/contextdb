@@ -1660,7 +1660,6 @@ pub(super) fn inspect_companion_record(
         .and_then(|(payload, checksum)| recover_companion_record(&payload, checksum))
 }
 
-#[allow(dead_code)]
 pub(super) fn read_active_companion_slot(
     database_path: &Path,
 ) -> std::result::Result<(Vec<u8>, [u8; 32]), String> {

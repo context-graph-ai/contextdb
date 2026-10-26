@@ -68,13 +68,6 @@ impl PositionTree {
         *self = Self::new();
     }
 
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     pub(in crate::persistence) fn height(&self) -> u8 {
         self.height_of(self.root)
     }

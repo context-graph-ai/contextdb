@@ -4576,13 +4576,6 @@ impl RetainedReadSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
-        )
-    )]
     pub(super) fn row_by_id_in_read(
         &self,
         read: &redb::ReadTransaction,
@@ -4690,13 +4683,6 @@ impl RetainedReadSource {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
-        )
     )]
     pub(super) fn row_identity_by_id_in_read(
         &self,
@@ -6146,13 +6132,6 @@ impl RetainedReadSource {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
-        )
-    )]
     pub(crate) fn bounded_relational_ordered_next<E>(
         &self,
         table: &str,

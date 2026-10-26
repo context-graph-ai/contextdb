@@ -19576,6 +19576,16 @@
  }
  
  // TODO: replace these with wasi::FileExt when https://github.com/rust-lang/rust/issues/71213
+--- a/src/tree_store/page_store/header.rs
++++ b/src/tree_store/page_store/header.rs
+@@ -523,7 +523,6 @@
+         .unwrap();
+         file.write_all(&[0; size_of::<u128>()]).unwrap();
+ 
+-        #[allow(unused_mut)]
+         let mut db2 = Database::create(tmpfile.path()).unwrap();
+         let write_txn = db2.begin_write().unwrap();
+         {
 --- a/src/tree_store/page_store/layout.rs
 +++ b/src/tree_store/page_store/layout.rs
 @@ -1,10 +1,11 @@
