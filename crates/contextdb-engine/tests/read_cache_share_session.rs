@@ -511,3 +511,43 @@ fn a_cursor_continuing_on_its_own_file_reader_honours_a_later_share_change() {
          private reader opened with ({kept_at_40} bytes); it read {turned_off}"
     );
 }
+
+/// After its writer closes, a session whose first call is to declare a share
+/// moves onto the file route for that call: the share is the file reader's,
+/// and the status that follows reports it there.
+#[test]
+fn after_its_writer_closes_a_session_whose_first_call_declares_a_share_applies_it_to_its_file_route()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("turnover-set-first.db");
+    let writer = seeded_writer(&path, TURNOVER_ROWS);
+    let session = session_beside_the_writer(&path, None);
+    session
+        .execute(
+            "SELECT id FROM cache_share WHERE id = $id",
+            &params([("id", Value::Int64(0))]),
+        )
+        .expect("the session answers beside its writer");
+    writer.close().unwrap();
+
+    session
+        .set_read_cache_share(Some(40))
+        .expect("the session declares a 40% share as its first call after the writer closed");
+    assert_eq!(
+        session.route(),
+        ReadRoute::File,
+        "declaring a share moved the session onto the file route it now reads through"
+    );
+    let status = session
+        .read_cache_share_status()
+        .expect("the session inspects its read cache share");
+    assert_eq!(
+        (status.declared, status.effective_bytes),
+        (Some(40), declared_bytes(40)),
+        "the file route's cache is the declared 40%"
+    );
+    assert!(
+        status.prepaid_index_bytes.is_some() && status.held_page_bytes.is_some(),
+        "the status reports the file reader the share applies to: {status:?}"
+    );
+}
