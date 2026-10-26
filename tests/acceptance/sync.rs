@@ -512,18 +512,25 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     );
     stop_child(&mut server);
 
-    // A refusal is a diagnostic, and the CLI writes diagnostics to standard
-    // error; standard output carries only results.
-    let stderr = output_string(&pull_output.stderr).to_lowercase();
+    // A schema mismatch is not a failed pull: the pull succeeds and reports the
+    // table as a conflict, with the mismatch as its reason, in its result on
+    // standard output.
+    let stdout = output_string(&pull_output.stdout);
     assert!(
-        stderr.contains("schema mismatch"),
-        "pull must report 'schema mismatch' on standard error when local and remote schemas \
-         differ, got stderr: {stderr}\nstdout: {}",
-        output_string(&pull_output.stdout)
+        pull_output.status.success(),
+        "a pull that reports a schema conflict succeeds; stdout: {stdout}\nstderr: {}",
+        output_string(&pull_output.stderr)
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("conflict:")
+            && line.contains(r#"{"Text":"sensors"}"#)
+            && line.contains("schema mismatch")),
+        "the pull reports the sensors table as a conflict whose reason is a schema mismatch; \
+         stdout: {stdout}"
     );
 
-    // The refused pull leaves edge B's own table as it was: its declared
-    // columns, and none of the remote rows.
+    // The conflicted table is left as it was: its declared columns, and none
+    // of the remote rows.
     let after = run_cli_script(
         &edge_b_path,
         &[],
@@ -532,7 +539,7 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     let after_stdout = output_string(&after.stdout);
     assert!(
         after.status.success() && after_stdout.contains("(0 rows)"),
-        "the refused pull must leave edge B's sensors table with its own columns and no rows; \
+        "a pull that reports a schema conflict must leave edge B's sensors table with its own columns and no rows; \
          stdout: {after_stdout}\nstderr: {}",
         output_string(&after.stderr)
     );
