@@ -440,10 +440,6 @@ impl Terminal {
         self.transcript().contains(marker)
     }
 
-    pub fn occurrences(&self, marker: &str) -> usize {
-        self.transcript().matches(marker).count()
-    }
-
     /// End the session the way a person does and collect its exit code.
     pub fn quit(mut self) -> (Option<i32>, String) {
         self.send_line(".quit");
@@ -592,10 +588,6 @@ impl Background {
                 panic!("the background session never produced {marker:?}. transcript:\n{held}");
             }
         }
-    }
-
-    pub fn close_input(&mut self) {
-        self.stdin.take();
     }
 
     pub fn finish(mut self) -> (Option<i32>, String) {
