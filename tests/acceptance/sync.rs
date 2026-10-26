@@ -512,11 +512,29 @@ async fn f09h_constraint_violations_during_sync_pull_are_handled() {
     );
     stop_child(&mut server);
 
-    let stdout = output_string(&pull_output.stdout).to_lowercase();
+    // A refusal is a diagnostic, and the CLI writes diagnostics to standard
+    // error; standard output carries only results.
+    let stderr = output_string(&pull_output.stderr).to_lowercase();
     assert!(
-        stdout.contains("schema mismatch"),
-        "pull output must contain 'schema mismatch' when local and remote schemas differ, got: {}",
-        stdout
+        stderr.contains("schema mismatch"),
+        "pull must report 'schema mismatch' on standard error when local and remote schemas \
+         differ, got stderr: {stderr}\nstdout: {}",
+        output_string(&pull_output.stdout)
+    );
+
+    // The refused pull leaves edge B's own table as it was: its declared
+    // columns, and none of the remote rows.
+    let after = run_cli_script(
+        &edge_b_path,
+        &[],
+        "SELECT id, label, score FROM sensors;\n.quit\n",
+    );
+    let after_stdout = output_string(&after.stdout);
+    assert!(
+        after.status.success() && after_stdout.contains("(0 rows)"),
+        "the refused pull must leave edge B's sensors table with its own columns and no rows; \
+         stdout: {after_stdout}\nstderr: {}",
+        output_string(&after.stderr)
     );
 }
 
