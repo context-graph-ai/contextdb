@@ -8,7 +8,8 @@
 //! is repeated with its keys staged in shuffled order, and with its rows
 //! alternating between two tables (A1, B1, A2, B2, ...), both as an insert
 //! and as one transaction updating every row in that alternating order
-//! (N = 512 to 4,096 for the update). Two exact work counters are read around
+//! (N = 256 to 2,048 for the update: two sizes above the thousand rows from
+//! which a rescan of the pending deltas exceeds the bound). Two exact work counters are read around
 //! each commit, on the committing thread:
 //!
 //! * pending manifest overlay comparisons: every comparison of a pending
@@ -37,6 +38,7 @@ use std::collections::HashMap;
 
 const INSERT_ROW_COUNTS: [usize; 4] = [1_024, 2_048, 4_096, 8_192];
 const DELETE_ROW_COUNTS: [usize; 4] = [512, 1_024, 2_048, 4_096];
+const UPDATE_ROW_COUNTS: [usize; 4] = [256, 512, 1_024, 2_048];
 const TABLES: [&str; 2] = ["imported", "mirrored"];
 /// Measured at the indexed revision: about 3 for an import, 12 for a bulk
 /// delete and 21 for an update (each row retires one version and adds one).
@@ -65,7 +67,8 @@ impl Measured {
             Measured::Insert | Measured::ShuffledInsert | Measured::AlternatingInsert => {
                 INSERT_ROW_COUNTS
             }
-            Measured::Delete | Measured::AlternatingUpdate => DELETE_ROW_COUNTS,
+            Measured::Delete => DELETE_ROW_COUNTS,
+            Measured::AlternatingUpdate => UPDATE_ROW_COUNTS,
         }
     }
 
