@@ -72,13 +72,6 @@ pub use authentication::{
         reason = "KEEP-SEAM: live only under the test-seams feature; used from authentication.rs"
     )
 )]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_authentication.rs"
-    )
-)]
 pub use authentication::{ReadPrincipal, authenticate_peer, peer_user_from_stream};
 #[cfg(unix)]
 #[cfg_attr(
@@ -94,13 +87,6 @@ pub use carrier::{StaleRemovalInterlock, UnixLocalCarrier};
     allow(
         unused_imports,
         reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
 pub use deadlines::{
@@ -127,20 +113,6 @@ pub use deadlines::{
     allow(
         unused_imports,
         reason = "KEEP-SEAM: live only under the test-seams feature; used from engine_answer.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_read_channel_error_document.rs"
     )
 )]
 pub use engine_answer::{
@@ -172,34 +144,6 @@ pub(crate) use engine_answer::{BLOB_SOURCE_REFUSAL_MAX_BYTES, encode_read_error_
     allow(
         unused_imports,
         reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_refusal_taxonomy.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from inbound.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_wire_values.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from framing.rs"
     )
 )]
 pub use framing::{
@@ -240,27 +184,6 @@ pub(crate) use runtime::runtime_directory_for_store;
         reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deep_runtime_directory.rs"
     )
 )]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from runtime.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_containment.rs"
-    )
-)]
 pub use runtime::{
     ChannelPathFacts, ChannelPathViolation, LocalPlatformAvailability, OWNER_ONLY_MODE,
     ProcessRuntimeDirectoryEnvironment, ResolvedRuntimeDirectory, RuntimeDirectoryEnvironment,
@@ -290,13 +213,6 @@ pub use stale::{
     allow(
         unused_imports,
         reason = "KEEP-SEAM: live only under the test-seams feature; used from open_and_owner_reads.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from stale.rs"
     )
 )]
 pub use stale::{

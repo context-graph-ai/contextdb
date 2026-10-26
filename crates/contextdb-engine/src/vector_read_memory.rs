@@ -709,6 +709,7 @@ impl DeclaredReadRoot {
         })?;
         Ok((receipt.into_owner(), observed))
     }
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn native_child_unqualified_observed(
         &self,
         observe: impl FnOnce(&NativeDeclaredChild, &ReadMemoryOwner),

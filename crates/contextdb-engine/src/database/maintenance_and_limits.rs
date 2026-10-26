@@ -6706,8 +6706,8 @@ impl Database {
             Ok(())
         };
         result?;
-        if consolidation_only {
-            if let Some(published) = published_policy {
+        if consolidation_only
+            && let Some(published) = published_policy {
                 // Match ordinary local/received policy publication: a refused
                 // inspection-only recheck keeps its failure mark until the
                 // next maintenance pass. Durable metadata remains authoritative.
@@ -6718,7 +6718,6 @@ impl Database {
                         .recheck_policy_maintenance_failures(&published, &mut owner);
                 }
             }
-        }
         Ok(())
     }
 

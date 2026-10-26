@@ -3224,6 +3224,7 @@ impl RawVectorMembershipSource for DurableMembershipSource {
         vector_membership_pages::occupancy_visible_at_any_in_read(&root.read, &route, snapshots)
     }
 
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn visible_count(
         &self,
         snapshot: SnapshotId,

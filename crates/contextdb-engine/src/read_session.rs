@@ -655,20 +655,6 @@ pub use route_observation::{
         reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_application_contract.rs"
     )
 )]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session_route_contract.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from a_statement_on_the_file_route_costs_what_the_statement_costs.rs"
-    )
-)]
 pub(crate) use route_observation::{
     OwnerHandshakeMismatchForTest, ReadKernelCancellationEvent, ReadKernelSource,
     ReadKernelSourceEvent, ReadKernelTestObserver, ReadRouteOpenFailure, ReadSessionEvent,

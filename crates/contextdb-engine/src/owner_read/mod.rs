@@ -34,13 +34,6 @@ mod service;
         reason = "KEEP-SEAM: live only under the test-seams feature; used from admission.rs"
     )
 )]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from service.rs"
-    )
-)]
 pub use admission::{OwnerAdmission, RequestLease};
 pub use client::OwnerClient;
 #[cfg(unix)]
@@ -58,13 +51,6 @@ pub(crate) use native_request::NativeReadRequest;
     allow(
         unused_imports,
         reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
-    )
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        unused_imports,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from service.rs"
     )
 )]
 pub use service::{

@@ -1069,6 +1069,7 @@ pub(super) trait PageSource {
     ) -> Result<Option<ScopedVectorCopy<(Vec<u8>, Vec<u8>)>>>;
 }
 impl<T: ReadableTable<&'static [u8], &'static [u8]>> PageSource for T {
+    #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
     fn read_page<V>(
         &self,
         key: &[u8],

@@ -606,7 +606,6 @@ impl Drop for LocalRegistration {
     dead_code,
     reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
 )]
-#[allow(dead_code, reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges")]
 struct Pre2TemporaryMemoryReservation {
     accountant: crate::memory_accounting::AccountantHandle,
     bytes: usize,
@@ -616,7 +615,6 @@ struct Pre2TemporaryMemoryReservation {
     dead_code,
     reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
 )]
-#[allow(dead_code, reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges")]
 pub(crate) struct Pre2PreparedMemorySwap {
     accountant: crate::memory_accounting::AccountantHandle,
     reserved_positive_delta: usize,
@@ -635,7 +633,6 @@ pub(crate) struct Pre2PreparedMemorySwap {
     dead_code,
     reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
 )]
-#[allow(dead_code, reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges")]
 pub(super) struct Pre2PendingLocalSchemaStage {
     working: Pre2Database,
     base_tables: HashMap<String, TableMeta>,
@@ -649,7 +646,6 @@ pub(super) struct Pre2PendingLocalSchemaStage {
     dead_code,
     reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
 )]
-#[allow(dead_code, reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges")]
 pub(crate) struct Pre2LocalSchemaStage {
     relational: Vec<TableProjection>,
     affected_tables: HashSet<String>,
@@ -672,7 +668,6 @@ pub(crate) struct Pre2LocalSchemaStage {
     dead_code,
     reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges"
 )]
-#[allow(dead_code, reason = "LAYOUT-ONLY: never constructed; its layout sizes production memory charges")]
 pub(crate) struct Pre2ReceivedSchemaStage {
     custody_memory: Option<custody_store::CustodyDelta>,
     source_order: Vec<ReceivedSchemaOrderEntry>,

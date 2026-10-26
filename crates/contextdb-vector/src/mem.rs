@@ -730,6 +730,7 @@ impl<'check, 'storage, E: From<Error>> RowCheckLedger<'check, 'storage, E> {
 // These are the union's actual mandatory row-filter doors. Keep reclamation
 // immediately beside the source operation so the source's existing admission,
 // visibility, cancellation, and copied value stay on the original funder.
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn streamed_tail_row_with_navigation(
     tail: &dyn crate::store::CapturedVectorStreamedTail,
     row: RowId,
@@ -742,6 +743,7 @@ fn streamed_tail_row_with_navigation(
     tail.includes_row(row, snapshot, owner, before_read)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn journal_row_with_navigation(
     state: &crate::store::VectorQueryState,
     row: RowId,

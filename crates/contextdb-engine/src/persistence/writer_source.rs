@@ -4688,7 +4688,7 @@ impl WriterSnapshotHandle {
                                 coordinate,
                                 &mut |header| {
                                     validate_read_version_bounds(
-                                        &read,
+                                        read,
                                         table,
                                         header.lsn,
                                         header.created_tx,
@@ -4736,7 +4736,7 @@ impl WriterSnapshotHandle {
                         ));
                         if !count_header {
                             validate_read_version_bounds(
-                                &read,
+                                read,
                                 table,
                                 lsn,
                                 created,

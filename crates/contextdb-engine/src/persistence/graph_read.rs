@@ -15,13 +15,6 @@ pub(crate) enum CapturedGraphReadRoot<R> {
     Writer(R),
     Image(RetainedReadSource),
 }
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) type GraphReadRoot = CapturedGraphReadRoot<Arc<WriterSnapshot>>;
 pub(crate) type EngineGraphReadRoot = CapturedGraphReadRoot<WriterSnapshotHandle>;

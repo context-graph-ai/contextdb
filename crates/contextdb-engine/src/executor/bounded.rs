@@ -800,13 +800,6 @@ impl RequestContext {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn new(
         reader_budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -20713,13 +20706,6 @@ fn default_page_rows(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature"
-    )
 )]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(super) fn open_cursor(

@@ -1954,10 +1954,6 @@ async fn handle_push(
 // These separate inputs jointly determine one atomic sync-page decision;
 // keeping them explicit preserves the page's holdback, cursor, and wire rules.
 #[allow(clippy::too_many_arguments)]
-#[expect(
-    clippy::result_large_err,
-    reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
 async fn handle_pull(
     db: Arc<Database>,
     lineage_signer: Option<LineageSigner>,
@@ -1986,6 +1982,8 @@ async fn handle_pull(
         .await
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_pull_in_memory_scope(
     db: Arc<Database>,
     lineage_signer: Option<LineageSigner>,

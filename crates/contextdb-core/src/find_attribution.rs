@@ -1032,7 +1032,6 @@ pub mod inline_phases {
                 writeln!(output)
             })();
             let len = output.position() as usize;
-            drop(output);
             if formatted.is_ok() {
                 let _ = std::io::stderr().write_all(&buffer[..len]);
             }

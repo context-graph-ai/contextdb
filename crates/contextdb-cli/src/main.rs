@@ -388,6 +388,7 @@ fn validated_configuration(args: &Args, path: &str) -> (ReadConfiguration, Owner
     (read, owner)
 }
 
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 fn main() {
     let args = Args::parse();
 

@@ -217,6 +217,7 @@ fn main() {
 }
 
 #[tokio::main]
+#[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     tracing::info!(

@@ -729,10 +729,6 @@ impl SyncClient {
             .await
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub async fn bind_application_table_policy_with_read_memory(
         &self,
         expectation: ApplicationTablePolicyExpectation,
@@ -905,10 +901,6 @@ impl SyncClient {
             .await
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     async fn fetch_delivery_outcomes_in_memory_scope(
         &self,
         since: Option<DeliveryOutcomeCursor>,
@@ -3118,10 +3110,6 @@ impl SyncClient {
     /// committed it the edge can always record that outcome. If even the
     /// writer budget cannot fit the unit, the push refuses with that budget's
     /// typed memory error before sending anything.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     pub async fn push_with_read_memory(
         &self,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -5139,10 +5127,6 @@ impl SyncClient {
             .await
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
     async fn pull_default_in_memory_scope(
         &self,
         read_memory: contextdb_core::read_memory::ReadMemoryOwner,

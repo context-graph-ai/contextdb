@@ -1151,13 +1151,6 @@ static OS_CEILING_SOURCE_FOR_TEST: parking_lot::Mutex<Option<CeilingRead>> =
 /// Test seam: what the operating system reports as the process ceiling, read
 /// through the production observation at each boundary.
 #[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from undeclared_writer_ceiling_tests.rs"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn set_os_ceiling_source_for_test(ceiling: Option<usize>) {
     *OS_CEILING_SOURCE_FOR_TEST.lock() = ceiling.map(Ok);
@@ -1165,13 +1158,6 @@ pub(crate) fn set_os_ceiling_source_for_test(ceiling: Option<usize>) {
 
 /// Test seam: the operating system's ceiling cannot be discovered.
 #[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from undeclared_writer_ceiling_tests.rs"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn fail_os_ceiling_source_for_test() {
     *OS_CEILING_SOURCE_FOR_TEST.lock() = Some(Err(CeilingUnavailable));
@@ -1182,13 +1168,6 @@ static CEILING_OBSERVATIONS_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
 
 /// Test seam: how many times this process has read its inherited ceiling.
 #[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from undeclared_writer_ceiling_tests.rs"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn ceiling_observations_for_test() -> usize {
     CEILING_OBSERVATIONS_FOR_TEST.load(Ordering::Relaxed)
@@ -1216,13 +1195,6 @@ static FIRST_CEILING_CHECK: AtomicUsize = AtomicUsize::new(0);
 
 /// Test seam: record the inherited ceiling the next admission checks.
 #[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from undeclared_writer_ceiling_tests.rs"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn arm_first_ceiling_check_for_test() {
     FIRST_CEILING_CHECK.store(0, Ordering::Release);
@@ -1232,13 +1204,6 @@ pub(crate) fn arm_first_ceiling_check_for_test() {
 /// Test seam: the inherited ceiling the first admission since arming checked,
 /// or `None` if none has run.
 #[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from undeclared_writer_ceiling_tests.rs"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn first_ceiling_check_for_test() -> Option<usize> {
     (!FIRST_CEILING_CHECK_ARMED.load(Ordering::Acquire))
@@ -1247,13 +1212,6 @@ pub(crate) fn first_ceiling_check_for_test() -> Option<usize> {
 
 /// Test seam: the ceiling admissions currently check, as last observed.
 #[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from undeclared_writer_ceiling_tests.rs"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn observed_process_ceiling_for_test() -> usize {
     OBSERVED_CEILING.load(Ordering::Acquire)
@@ -1647,13 +1605,6 @@ thread_local! {
 /// Test seam: make the next `count` system calls of this thread's file reads
 /// report EINTR, as a delivered signal would.
 #[cfg(all(target_os = "linux", any(test, feature = "test-seams")))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from cgroup_ceiling_tests.rs"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn interrupt_file_reads_for_test(count: usize) {
     INTERRUPTIONS_FOR_TEST.with(|left| left.set(count));
@@ -1824,13 +1775,6 @@ static PROCESS_CEILING_FOR_TEST: parking_lot::Mutex<Option<usize>> = parking_lot
 /// Test seam: fix the inherited process ceiling for a later activation, and
 /// for an already active runtime.
 #[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from schema_stage_registry.rs"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn set_process_ceiling_for_test(ceiling: Option<usize>) {
     *PROCESS_CEILING_FOR_TEST.lock() = ceiling;
@@ -1857,13 +1801,6 @@ pub(crate) fn effective_process_ceiling() -> usize {
 /// Test seam: record a domain ceiling as a resident insertion runtime's
 /// activation would, without activating one.
 #[cfg(any(test, feature = "test-seams"))]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature; used from undeclared_writer_ceiling_tests.rs"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn record_domain_ceiling_for_test(ceiling: Option<usize>) {
     PROCESS_WRITER_BUDGET_DOMAIN.write().ceiling = ceiling;
@@ -2380,13 +2317,6 @@ impl WriterBudget {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from selected_json_producer_rows.rs"
-        )
-    )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn reserve_assembly_original(
         &self,
@@ -2421,13 +2351,6 @@ impl WriterBudget {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from selected_json_producer_rows.rs"
-        )
     )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn prepare_source_funder(
@@ -4631,13 +4554,6 @@ impl MemoryAccountant {
     }
 
     /// Restore a persisted live setting without establishing a startup ceiling.
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from correction_counterexample_tests.rs"
-        )
-    )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn with_runtime_budget(bytes: usize) -> Self {
         Self::with_initial_budget(Some(bytes), false)
@@ -7328,13 +7244,6 @@ mod tests {
 /// report actual capacities, including overlapping resize copies. Naming a
 /// charge does not itself supply a structural allocator residency bound.
 #[derive(Debug)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) struct RedbAllocatorStateCharge {
     reservation: OwnedMemoryReservation,
@@ -7344,13 +7253,6 @@ pub(crate) struct RedbAllocatorStateCharge {
 }
 
 impl RedbAllocatorStateCharge {
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn new(accountant: AccountantHandle) -> Self {
         Self {
@@ -7367,13 +7269,6 @@ impl RedbAllocatorStateCharge {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
     )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn resize(
@@ -7440,13 +7335,6 @@ mod redb_allocator_state_tests {
 
 /// A fixed native provider pins the actual original writer, not a current role.
 /// It has no payload/root/invoice back-reference, so retained sources are acyclic.
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature"
-    )
-)]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 struct NativeSourceProvider {
     accountant: Option<AccountantHandle>,
@@ -7457,13 +7345,6 @@ impl NativeSourceProvider {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature; used from statement_rows.rs"
-        )
     )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn native_origin(&self) -> contextdb_core::Result<contextdb_tx::NativeSourceOrigin> {
@@ -7501,13 +7382,6 @@ impl NativeSourceProvider {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn paired_receiver(self: &Arc<Self>) -> contextdb_core::Result<contextdb_tx::SourceFunder> {
         let origin = self.native_origin()?;
@@ -7516,13 +7390,6 @@ impl NativeSourceProvider {
         // only that opaque count enters returned invoices and bridges.
         Ok(unsafe { contextdb_tx::SourceFunder::adopt_native_receiver(self.clone(), origin) })
     }
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn lease(&self) -> contextdb_tx::SourceLease {
         let writer = self.writer.as_ref().expect("live native source writer");
@@ -7531,13 +7398,6 @@ impl NativeSourceProvider {
             epoch: writer.epoch,
         }
     }
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        allow(
-            dead_code,
-            reason = "KEEP-SEAM: live only under the test-seams feature"
-        )
-    )]
     #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn assert_lease(&self, lease: contextdb_tx::SourceLease) {
         let original = self.lease();
@@ -11543,13 +11403,6 @@ fn reserve_preparation_for_use(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-)]
-#[cfg_attr(
-    not(feature = "test-seams"),
-    allow(
-        dead_code,
-        reason = "KEEP-SEAM: live only under the test-seams feature"
-    )
 )]
 #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn reserve_preparation_from_writer_use(
