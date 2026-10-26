@@ -1,5 +1,3 @@
-#[cfg(feature = "test-seams")]
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use contextdb_core::Direction;
 #[cfg(feature = "test-seams")]
 use contextdb_core::RowId;
@@ -22,6 +20,8 @@ use contextdb_engine::sync_types::NaturalKey;
 use contextdb_engine::sync_types::RowChange;
 #[cfg(feature = "test-seams")]
 use contextdb_engine::sync_types::VectorChange;
+#[cfg(feature = "test-seams")]
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -585,10 +585,19 @@ fn t21_05_subscriber_observes_consistent_snapshot_after_event() {
     );
 
     let index = VectorIndexRef::new("entities", "embedding");
-    let mutate_existing = db.begin_or_panic();
-    db.delete_edge(mutate_existing, source_id, target_id, "LINKS")
-        .unwrap();
-    db.commit(mutate_existing).unwrap();
+    // The original edge is a row of the SQL edges table, so it is removed as
+    // that row: deleting the row removes its relational binding and its graph
+    // edge together.
+    assert_eq!(
+        db.execute(
+            "DELETE FROM edges WHERE id = $eid",
+            &HashMap::from([("eid".to_string(), Value::Uuid(Uuid::from_u128(750)))]),
+        )
+        .unwrap()
+        .rows_affected(),
+        1,
+        "the original edge row is deleted through SQL"
+    );
     let mut mutate_target = HashMap::new();
     mutate_target.insert("target".into(), Value::Uuid(target_id));
     mutate_target.insert("vcurrent".into(), Value::Vector(vec![0.0, 0.0, 1.0]));
