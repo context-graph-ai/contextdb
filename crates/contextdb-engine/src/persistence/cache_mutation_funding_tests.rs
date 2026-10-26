@@ -31,7 +31,7 @@ fn reader(budget: usize, share: Option<u8>) -> (tempfile::TempDir, ReadSession) 
 fn a_zero_share_discloses_its_prepaid_index_inside_the_reader_budget() {
     let budget = 1024 * 1024 * 1024;
     let (_directory, reader) = reader(budget, Some(0));
-    let status = reader.read_cache_share_status();
+    let status = reader.read_cache_share_status().unwrap();
     assert_eq!(status.declared, Some(0));
     assert_eq!(status.effective_bytes, 0);
     let index = status
@@ -44,12 +44,18 @@ fn a_zero_share_discloses_its_prepaid_index_inside_the_reader_budget() {
     );
     reader.set_read_cache_share(Some(40)).unwrap();
     assert_eq!(
-        reader.read_cache_share_status().prepaid_index_bytes,
+        reader
+            .read_cache_share_status()
+            .unwrap()
+            .prepaid_index_bytes,
         Some(index)
     );
     reader.set_read_cache_share(Some(0)).unwrap();
     assert_eq!(
-        reader.read_cache_share_status().prepaid_index_bytes,
+        reader
+            .read_cache_share_status()
+            .unwrap()
+            .prepaid_index_bytes,
         Some(index)
     );
 }
@@ -62,7 +68,14 @@ fn a_shrink_keeps_a_detached_page_paid_until_its_final_cross_thread_free() {
     assert_eq!(payer, "cache");
     reader.set_read_cache_share(Some(0)).unwrap();
     let before = reader.charged_bytes().unwrap();
-    assert!(reader.read_cache_share_status().held_page_bytes.unwrap() >= bytes);
+    assert!(
+        reader
+            .read_cache_share_status()
+            .unwrap()
+            .held_page_bytes
+            .unwrap()
+            >= bytes
+    );
     std::thread::spawn(move || drop(held)).join().unwrap();
     let after = reader.charged_bytes().unwrap();
     assert_eq!(
@@ -75,7 +88,7 @@ fn a_shrink_keeps_a_detached_page_paid_until_its_final_cross_thread_free() {
 #[test]
 fn refused_cache_growth_keeps_the_old_declaration_capacity_and_charge() {
     let (_directory, reader) = reader(64 * 1024 * 1024, Some(2));
-    let before = reader.read_cache_share_status();
+    let before = reader.read_cache_share_status().unwrap();
     let charge = reader.charged_bytes().unwrap();
     let error = reader.set_read_cache_share(Some(100)).unwrap_err();
     assert!(
@@ -85,7 +98,7 @@ fn refused_cache_growth_keeps_the_old_declaration_capacity_and_charge() {
     drop(error);
     assert_eq!(reader.options().read_cache_share, Some(2));
     assert_eq!(
-        reader.read_cache_share_status().effective_bytes,
+        reader.read_cache_share_status().unwrap().effective_bytes,
         before.effective_bytes
     );
     assert_eq!(reader.charged_bytes().unwrap(), charge);
@@ -116,12 +129,21 @@ fn two_readers_share_the_declared_cache_through_capacity_changes() {
             answers
         }));
     }
-    let index = reader.read_cache_share_status().prepaid_index_bytes;
+    let index = reader
+        .read_cache_share_status()
+        .unwrap()
+        .prepaid_index_bytes;
     for percent in [Some(2), Some(40), Some(0), None] {
         reader.set_read_cache_share(percent).unwrap();
         ready.wait();
         done.wait();
-        assert_eq!(reader.read_cache_share_status().prepaid_index_bytes, index);
+        assert_eq!(
+            reader
+                .read_cache_share_status()
+                .unwrap()
+                .prepaid_index_bytes,
+            index
+        );
     }
     for worker in workers {
         assert!(worker.join().unwrap().into_iter().all(|correct| correct));

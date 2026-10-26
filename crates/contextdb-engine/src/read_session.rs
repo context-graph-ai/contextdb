@@ -3374,7 +3374,11 @@ impl ReadSession {
     }
 
     /// Inspect the current declaration and physical file-cache funding.
-    pub fn read_cache_share_status(&self) -> ReadCacheShareStatus {
+    #[expect(
+        clippy::result_large_err,
+        reason = "Route selection retains typed inline refusal diagnostics."
+    )]
+    pub fn read_cache_share_status(&self) -> Result<ReadCacheShareStatus> {
         let _mutation = self
             .cache_policy_mutation
             .lock()
@@ -3384,7 +3388,7 @@ impl ReadSession {
             status.prepaid_index_bytes = Some(reader.prepaid_cache_index_bytes());
             status.held_page_bytes = Some(reader.held_cache_page_bytes());
         }
-        status
+        Ok(status)
     }
 
     /// Change the file-cache share immediately without reopening
@@ -3529,7 +3533,7 @@ impl ReadSession {
                     .owner()
             }
         };
-        let status = self.read_cache_share_status();
+        let status = self.read_cache_share_status()?;
         let refusal = *self
             .resources
             .last_cache_refusal
