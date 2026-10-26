@@ -442,6 +442,34 @@ pub fn recovery_action(
     unimplemented!("{UNBOUND}: the recovery action")
 }
 
+/// Opens a read-only session on the store at `path`. It never writes the
+/// store; damage it detects is quarantined in its own memory.
+pub fn open_reader(_path: &Path) -> Database {
+    unimplemented!("{UNBOUND}: a read-only session on a store")
+}
+
+/// The Context's row of `SHOW VECTOR_PARTITIONS`, as an operator reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionInspection {
+    /// The `recovery_action` column.
+    pub recovery_action: String,
+    /// The inspection note: the state / quarantine-reason column that says,
+    /// in plain words, why the partition is not served as usual; `None` when
+    /// the column is empty.
+    pub note: Option<String>,
+    /// Every text value of the row, for checks that span all columns.
+    pub texts: Vec<String>,
+}
+
+pub fn partition_inspection(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> PartitionInspection {
+    unimplemented!("{UNBOUND}: the SHOW VECTOR_PARTITIONS row")
+}
+
 /// Durability boundaries of publishing a newly built generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicationCut {

@@ -4,7 +4,8 @@
 //! snapshot isolation, deletes and PURGE, per-Context cost, exact and indexed
 //! work, per-depth coverage, the calibration source, the replacement switch,
 //! reader memory, small partitions, the removed graph options, the WITH
-//! policy carrier, damaged index pages, non-finite vectors, objective changes,
+//! policy carrier, damaged index pages and their read-only inspection,
+//! non-finite vectors, objective changes,
 //! retired legacy runs, the training seed, and the SQL declaration surface.
 
 #![expect(
@@ -47,6 +48,8 @@ mod objective_change;
 mod parse_surface;
 #[path = "clustered_vector_index/per_context_cost.rs"]
 mod per_context_cost;
+#[path = "clustered_vector_index/read_only_damage_inspection.rs"]
+mod read_only_damage_inspection;
 #[path = "clustered_vector_index/reader_memory.rs"]
 mod reader_memory;
 #[path = "clustered_vector_index/retired_run_visibility.rs"]
