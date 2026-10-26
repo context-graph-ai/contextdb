@@ -223,6 +223,43 @@ fn f05c_vector_data_survives_persistence_reopen() {
     assert!(row.is_some());
 }
 
+/// I stored vectors, quit, reopened, and the first thing I did was look one row up by its key:
+/// the row came back with its stored vector, read through the reader's own memory, without any
+/// vector search having loaded the partition first.
+#[test]
+fn f05m_a_point_lookup_right_after_reopen_returns_the_row_and_its_vector() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = temp_db_file(&tmp, "f05m.db");
+    let db = Database::open(&db_path).expect("open db");
+    setup_vector_table(&db, 384);
+    let target_id = Uuid::new_v4();
+    let mut target_vector = vec![0.0_f32; 384];
+    target_vector[3] = 1.0;
+    for idx in 0..5 {
+        let mut vector = vec![0.0_f32; 384];
+        vector[idx] = 1.0;
+        let id = if idx == 3 { target_id } else { Uuid::new_v4() };
+        insert_embedding(&db, id, vector);
+    }
+    db.close().expect("close db");
+
+    let reopened = Database::open(&db_path).expect("reopen db");
+    let row = reopened
+        .point_lookup(
+            "embeddings",
+            "id",
+            &Value::Uuid(target_id),
+            reopened.snapshot(),
+        )
+        .expect("a point lookup is the first read after reopen and needs no vector search first")
+        .expect("the looked-up row exists");
+    assert_eq!(
+        row.values.get("embedding"),
+        Some(&Value::Vector(target_vector)),
+        "the row comes back with the vector it stored, not a missing or default one"
+    );
+}
+
 /// I created a state machine with draft->review->archived, inserted a draft row, quit, reopened, and an illegal draft->archived transition was still rejected.
 #[test]
 fn f05d_constraint_enforcement_survives_persistence_reopen() {
