@@ -28305,6 +28305,17 @@ impl RedbPersistence {
         cache_bytes: usize,
         runtime_dir: Option<&Path>,
     ) -> Result<Self> {
+        // This constructor declares the same default as the raw open doors;
+        // an enclosing operation keeps its existing payer.
+        let _decode_scope = match crate::read_image_memory::active_owner() {
+            Ok(owner) => owner.enter(),
+            Err(_) => crate::read_image_memory::ImageMemory::enter_writer_operation(
+                crate::memory_accounting::AccountantHandle::standalone(
+                    crate::read_session::DatabaseOpenOptions::default().memory_limit,
+                    true,
+                )?,
+            )?,
+        };
         Self::open_inner(path, AbsentStoreAnswer::Taxonomy, cache_bytes, runtime_dir)
     }
 
@@ -28325,6 +28336,17 @@ impl RedbPersistence {
         cache_bytes: usize,
         runtime_dir: Option<&Path>,
     ) -> Result<Self> {
+        // This constructor declares the same default as the raw open doors;
+        // an enclosing operation keeps its existing payer.
+        let _decode_scope = match crate::read_image_memory::active_owner() {
+            Ok(owner) => owner.enter(),
+            Err(_) => crate::read_image_memory::ImageMemory::enter_writer_operation(
+                crate::memory_accounting::AccountantHandle::standalone(
+                    crate::read_session::DatabaseOpenOptions::default().memory_limit,
+                    true,
+                )?,
+            )?,
+        };
         Self::open_inner(path, AbsentStoreAnswer::Typed, cache_bytes, runtime_dir)
     }
 
