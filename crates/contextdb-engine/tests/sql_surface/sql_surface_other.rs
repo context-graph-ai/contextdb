@@ -1,4 +1,4 @@
-#[cfg_attr(not(feature = "test-seams"), allow(unused_imports))] #[rustfmt::skip]
+#[rustfmt::skip]
 use contextdb_core::{ContextId, Error, Lsn, Principal, RowId, ScopeLabel, Value, VectorIndexRef};
 #[cfg(feature = "test-seams")]
 use contextdb_engine::memory_accounting::MemoryAccountant;

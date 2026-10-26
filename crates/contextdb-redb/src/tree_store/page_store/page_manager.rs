@@ -2219,7 +2219,6 @@ impl TransactionalMemory {
             .try_into()
             .unwrap();
 
-        #[allow(unused_mut)]
         let mut mem = self.storage.write(address_range.start, len, true)?;
         debug_assert!(mem.mem().len() >= allocation_size);
 

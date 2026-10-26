@@ -81,7 +81,6 @@ pub(crate) fn r1_database_cleanup_rows_for_test() {
 #[cfg(test)]
 pub(crate) fn returned_loader_rows_for_test() {
     use std::mem::{align_of, offset_of, size_of};
-    #[allow(dead_code)]
     struct Pre2RawLoader {
         source: DurableRawVectorSource,
         accountant: Arc<MemoryAccountant>,

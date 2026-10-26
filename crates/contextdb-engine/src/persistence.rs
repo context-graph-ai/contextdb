@@ -121,9 +121,7 @@ mod writer_recovery;
 mod writer_row_heads;
 pub(crate) mod writer_source;
 use writer_file::{LockedWriterFile, OpenedWriterDatabase};
-#[allow(unused_imports)] // Recovery types are consumed by writer integration.
 pub(crate) use writer_recovery::{WriterOpenBounds, WriterRecoveryBounds};
-#[allow(unused_imports)] // Internal source surface for the store adapters.
 pub(crate) use writer_source::{WriterSnapshot, WriterSnapshotHandle, WriterSnapshotWeak};
 
 use crate::blob_repository::{
@@ -608,7 +606,6 @@ struct ReaderStoreHold {
 /// The committed image reconstructed by the side-effect-free persistence
 /// loader. The direct backend will consume this type instead of reopening the
 /// writable database path.
-#[allow(dead_code)]
 /// How many entries one sink's durable queue holds and the newest entry's
 /// id: what a read image needs to report and continue the queue without
 /// copying its payloads.
@@ -1044,7 +1041,6 @@ enum AbsentStoreAnswer {
     Typed,
 }
 
-#[allow(dead_code)]
 struct ReadImageSource {
     database_path: PathBuf,
     runtime_dir: Option<PathBuf>,
@@ -2896,7 +2892,6 @@ pub mod read_persistence_test_scaffold {
         pause_reader_at(store_path, ReaderPausePoint::AfterProbe);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn pause_reader_at_point(store_path: &Path, point: ReaderPausePoint) {
         pause_reader_at(store_path, point);
     }
@@ -3012,7 +3007,6 @@ pub mod read_persistence_test_scaffold {
     }
 
     /// The fault armed for this store's direct readers while its guard lives.
-    #[allow(dead_code)]
     pub(crate) fn registration_fault_for_test(store_path: &Path) -> Option<RegistrationFault> {
         REGISTRATION_FAULTS
             .get_or_init(Default::default)
@@ -3045,7 +3039,6 @@ pub mod read_persistence_test_scaffold {
             .unwrap_or_default()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn count_registration_attempt_for_test(
         identity: (u64, u64),
         change: impl FnOnce(&mut RegistrationAttemptCounts),
@@ -3337,7 +3330,6 @@ pub mod read_persistence_test_scaffold {
     }
 
     /// The waiting writer reaches its linearization point.
-    #[allow(dead_code)]
     pub(crate) fn writer_wait_linearization_point_for_test(store_path: &Path) {
         let (holds, changed) = writer_wait_holds();
         let mut holds = holds
@@ -3499,7 +3491,6 @@ pub mod read_persistence_test_scaffold {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn wait_fault_for_test(store_path: &Path) -> Option<WaitFault> {
         WAIT_FAULTS
             .get_or_init(Default::default)

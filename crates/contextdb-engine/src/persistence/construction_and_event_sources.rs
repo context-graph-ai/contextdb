@@ -539,7 +539,6 @@ pub(crate) fn returned_loader_rows_for_test() {
     use std::mem::{align_of, offset_of, size_of};
     // This predecessor is the exact immediately prior owner representation,
     // including the retained writer_use field, not a guessed word-count price.
-    #[allow(dead_code)]
     struct PriorProofOwner {
         accountant: Option<Arc<MemoryAccountant>>,
         writer_use: Option<crate::memory_accounting::WriterUse>,

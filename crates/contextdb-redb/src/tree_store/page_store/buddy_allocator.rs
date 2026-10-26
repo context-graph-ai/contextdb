@@ -373,7 +373,6 @@ impl BuddyAllocator {
         self.debug_check_consistency();
     }
 
-    #[allow(unused_variables)]
     fn debug_check_consistency(&self) {
         if self.poisoned() {
             return;

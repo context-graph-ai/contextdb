@@ -22,7 +22,6 @@ pub(super) fn write_companion_region(
 /// Durable companion updates use this primitive for the inactive slot's
 /// payload. The crash checkpoint cannot be moved away from the write without
 /// replacing the operation the companion writer is required to call.
-#[allow(dead_code)]
 pub(super) fn write_companion_slot_payload(
     file: &mut File,
     offset: u64,
@@ -36,7 +35,6 @@ pub(super) fn write_companion_slot_payload(
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(super) fn sync_companion_slot_payload(file: &File) -> std::io::Result<()> {
     file.sync_data()?;
     #[cfg(any(test, feature = "test-seams"))]
@@ -46,7 +44,6 @@ pub(super) fn sync_companion_slot_payload(file: &File) -> std::io::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(super) fn write_companion_slot_checksum(
     file: &mut File,
     offset: u64,
@@ -60,7 +57,6 @@ pub(super) fn write_companion_slot_checksum(
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(super) fn sync_companion_slot_checksum(file: &File) -> std::io::Result<()> {
     file.sync_data()?;
     #[cfg(any(test, feature = "test-seams"))]
@@ -70,7 +66,6 @@ pub(super) fn sync_companion_slot_checksum(file: &File) -> std::io::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(super) fn write_companion_active_slot(
     file: &mut File,
     offset: u64,
@@ -84,7 +79,6 @@ pub(super) fn write_companion_active_slot(
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(super) fn sync_companion_active_slot(file: &File) -> std::io::Result<()> {
     file.sync_data()?;
     #[cfg(any(test, feature = "test-seams"))]

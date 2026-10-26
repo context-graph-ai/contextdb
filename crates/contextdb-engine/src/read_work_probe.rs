@@ -457,10 +457,6 @@ pub(crate) fn note_manifest_member_visited() {
     });
 }
 
-#[allow(
-    dead_code,
-    reason = "the group-seeking historical scan that steps dead groups notes them"
-)]
 pub(crate) fn note_dead_group_stepped() {
     with_active(|counters| {
         counters.dead_groups_stepped.fetch_add(1, Ordering::Relaxed);

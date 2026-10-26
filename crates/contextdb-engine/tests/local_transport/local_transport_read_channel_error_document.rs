@@ -563,14 +563,12 @@ fn the_document_bytes_are_the_written_tag_and_not_a_variant_position() {
     // document removes, and the reason the engine's enum is no longer
     // serializable at all.
     #[derive(serde::Serialize)]
-    #[allow(dead_code)]
     enum Taxonomy {
         _First,
         Second,
         _Third,
     }
     #[derive(serde::Serialize)]
-    #[allow(dead_code)]
     enum TaxonomyAfterAnInsertion {
         _First,
         _Inserted,

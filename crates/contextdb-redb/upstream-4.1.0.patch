@@ -6404,19 +6404,18 @@
      pub const fn new(name: &'a str) -> Self {
          assert!(!name.is_empty());
          Self {
-@@ -562,7 +633,10 @@
+@@ -562,7 +633,9 @@
  }
  
  struct TableNamespace<'db> {
 -    open_tables: HashMap<String, &'static panic::Location<'static>>,
 +    open_tables: crate::table_registry::OpenTables,
 +    // Read only through the hidden `contextdb-internal` funding surface.
-+    #[cfg_attr(not(feature = "contextdb-internal"), allow(dead_code))]
 +    registry_funding: Arc<crate::table_registry::RegistryFunding>,
      allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
      table_tree: TableTreeMut<'db>,
-@@ -585,8 +659,10 @@
+@@ -585,8 +658,10 @@
              freed_pages.clone(),
              allocated.clone(),
          );
@@ -6428,7 +6427,7 @@
              table_tree,
              freed_pages,
              allocated_pages: allocated,
-@@ -620,8 +696,9 @@
+@@ -620,8 +695,9 @@
          let root = self
              .table_tree
              .get_or_create_table::<K, V>(name, table_type)?;
@@ -6439,7 +6438,7 @@
  
          Ok(root)
      }
-@@ -748,9 +825,126 @@
+@@ -748,10 +824,127 @@
          table: &BtreeMut<K, V>,
          length: u64,
      ) {
@@ -6447,7 +6446,7 @@
          self.open_tables.remove(name).unwrap();
          self.table_tree
              .stage_update_table_root(name, table.get_root(), length);
-+    }
+     }
 +
 +    /// The exact layout a reserve of `additional` open tables would allocate,
 +    /// learned by refusing it: the registry keeps its entries and allocation.
@@ -6563,14 +6562,14 @@
 +        let freed = previous.allocation_size();
 +        drop(previous);
 +        Ok(freed)
++    }
+ }
+ 
+ // Transaction-local savepoint lifecycle state.
+@@ -816,6 +1009,22 @@
      }
  }
  
-@@ -815,6 +1009,22 @@
-         self.invalidated.clear();
-     }
- }
-+
 +/// Transaction-local normal-table root lifecycle. Policy and witness storage belong to callers.
 +#[cfg(feature = "contextdb-internal")]
 +#[doc(hidden)]
@@ -6586,10 +6585,11 @@
 +
 +#[cfg(feature = "contextdb-internal")]
 +type TableRootHook = fn(&WriteTransaction, &str, TableRootEvent) -> Result<(), StorageError>;
- 
++
  /// A read/write transaction
  ///
-@@ -832,9 +1042,253 @@
+ /// Only a single [`WriteTransaction`] may exist at a time
+@@ -832,9 +1041,253 @@
      two_phase_commit: bool,
      shrink_policy: ShrinkPolicy,
      quick_repair: bool,
@@ -6843,7 +6843,7 @@
  }
  
  impl WriteTransaction {
-@@ -850,8 +1304,16 @@
+@@ -850,8 +1303,16 @@
          let system_page = mem.get_system_root();
  
          let tables = TableNamespace::new(root_page, guard.clone(), mem.clone());
@@ -6860,7 +6860,7 @@
          Ok(Self {
              transaction_tracker,
              mem: mem.clone(),
-@@ -864,9 +1326,181 @@
+@@ -864,11 +1325,183 @@
              durability: InternalDurability::Immediate,
              two_phase_commit: false,
              quick_repair: false,
@@ -6872,8 +6872,8 @@
 +            table_root_hook: None,
 +            table_root_hook_error: Mutex::new(None),
          })
-+    }
-+
+     }
+ 
 +    /// Install fixed transaction-local lifecycle policy; no inventory is retained.
 +    #[cfg(feature = "contextdb-internal")]
 +    #[doc(hidden)]
@@ -7039,16 +7039,15 @@
 +    // Explicit whole-file compaction retains its upstream full-drain semantics.
 +    pub(crate) fn reclaim_all_deferred_pages(&mut self) {
 +        self.deferred_free_budget = (usize::MAX, usize::MAX);
-     }
- 
-     pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
-@@ -892,6 +1526,31 @@
-             return Ok(true);
-         }
- 
-+        Ok(false)
 +    }
 +
+     pub(crate) fn set_shrink_policy(&mut self, shrink_policy: ShrinkPolicy) {
+         self.shrink_policy = shrink_policy;
+     }
+@@ -895,6 +1528,31 @@
+         Ok(false)
+     }
+ 
 +    /// Inspect only the oldest entry in each free tree using the same fence
 +    /// as `durable_commit`. A live reader protects newer entries, not every
 +    /// deferred allocation in the file.
@@ -7071,10 +7070,13 @@
 +                return Ok(true);
 +            }
 +        }
-         Ok(false)
-     }
- 
-@@ -1130,6 +1789,10 @@
++        Ok(false)
++    }
++
+     #[cfg(debug_assertions)]
+     pub fn print_allocated_page_debug(&self) {
+         let mut all_allocated: HashSet<PageNumber> =
+@@ -1130,6 +1788,10 @@
              return Err(SavepointError::InvalidSavepoint);
          }
  
@@ -7085,15 +7087,15 @@
          let (id, transaction_id) = self.allocate_savepoint()?;
          #[cfg(feature = "logging")]
          debug!("Creating savepoint id={id:?}, txn_id={transaction_id:?}");
-@@ -1349,7 +2012,225 @@
+@@ -1349,9 +2011,227 @@
          &'txn self,
          definition: TableDefinition<K, V>,
      ) -> Result<Table<'txn, K, V>, TableError> {
 +        #[cfg(feature = "contextdb-internal")]
 +        self.call_table_root_hook(definition.name(), TableRootEvent::BeforeOpen)?;
          self.tables.lock().unwrap().open_table(self, definition)
-+    }
-+
+     }
+ 
 +    /// Check a user family's directory entry without finalizing dirty payload pages.
 +    #[cfg(feature = "contextdb-internal")]
 +    #[doc(hidden)]
@@ -7308,10 +7310,12 @@
 +        })();
 +        self.poison_failed_capture(&result);
 +        result
-     }
- 
++    }
++
      /// Open the given table
-@@ -1373,6 +2254,13 @@
+     ///
+     /// The table will be created if it does not exist
+@@ -1373,6 +2253,13 @@
          length: u64,
      ) {
          self.tables.lock().unwrap().close_table(name, table, length);
@@ -7325,7 +7329,7 @@
      }
  
      /// Rename the given table
-@@ -1384,10 +2272,21 @@
+@@ -1384,10 +2271,21 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` to rename, without getting a TableAlreadyOpen error
          drop(definition);
@@ -7348,7 +7352,7 @@
      }
  
      /// Rename the given multimap table
-@@ -1412,7 +2311,29 @@
+@@ -1412,7 +2310,29 @@
          let name = definition.name().to_string();
          // Drop the definition so that callers can pass in a `Table` or `MultimapTable` to delete, without getting a TableAlreadyOpen error
          drop(definition);
@@ -7379,7 +7383,7 @@
      }
  
      /// Delete the given table
-@@ -1458,9 +2379,159 @@
+@@ -1458,22 +2378,206 @@
      /// All writes performed in this transaction will be visible to future transactions, and are
      /// durable as consistent with the [`Durability`] level set by [`Self::set_durability`]
      pub fn commit(mut self) -> Result<(), CommitError> {
@@ -7389,8 +7393,8 @@
          // Set completed flag first, so that we don't go through the abort() path on drop, if this fails
          self.completed = true;
          self.commit_inner()
-+    }
-+
+     }
+ 
 +    /// Bind a stack marker to this database instance and actual write id.
 +    #[cfg(feature = "contextdb-internal")]
 +    #[doc(hidden)]
@@ -7536,10 +7540,11 @@
 +        // Match consuming commit: no abort of possibly published pages on drop.
 +        self.completed = true;
 +        self.commit_inner_publishing(marker)
-     }
- 
++    }
++
      fn commit_inner(&mut self) -> Result<(), CommitError> {
-@@ -1469,11 +2540,45 @@
+         // Quick-repair requires 2-phase commit
+         if self.quick_repair {
              self.two_phase_commit = true;
          }
  
@@ -7587,11 +7592,10 @@
  
          #[cfg(feature = "logging")]
          debug!(
-@@ -1484,6 +2589,117 @@
-             InternalDurability::None => self.non_durable_commit(user_root)?,
+@@ -1485,6 +2589,117 @@
              InternalDurability::Immediate => self.durable_commit(user_root)?,
          }
-+
+ 
 +        #[cfg(feature = "test-seams")]
 +        crate::commit_work::set_tag(restore_tag);
 +
@@ -7702,10 +7706,11 @@
 +
 +        #[cfg(feature = "test-seams")]
 +        crate::commit_work::set_tag(restore_tag);
- 
++
          self.savepoint_state
              .lock()
-@@ -1609,7 +2825,7 @@
+             .unwrap()
+@@ -1609,7 +2824,7 @@
          debug!("Aborting transaction id={:?}", self.transaction_id);
          self.tables
              .lock()
@@ -7714,7 +7719,7 @@
              .table_tree
              .clear_root_updates_and_close();
          // Release all transaction-local savepoint state. The on-disk mutations
-@@ -1618,7 +2834,7 @@
+@@ -1618,7 +2833,7 @@
          // in-memory TransactionTracker state that rollback cannot see.
          self.savepoint_state
              .lock()
@@ -7723,7 +7728,7 @@
              .apply_on_abort(&self.transaction_tracker);
          self.mem.rollback_uncommitted_writes()?;
          #[cfg(feature = "logging")]
-@@ -1627,18 +2843,41 @@
+@@ -1627,18 +2842,41 @@
      }
  
      pub(crate) fn durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
@@ -7770,11 +7775,10 @@
  
          if self.quick_repair {
              system_tree.create_table_and_flush_table_root(
-@@ -1680,7 +2919,17 @@
+@@ -1680,7 +2918,17 @@
          }
  
          let system_root = system_tree.finalize_dirty_checksums()?;
--
 +        #[cfg(feature = "test-seams")]
 +        {
 +            crate::commit_work::observe_commit_span(
@@ -7783,13 +7787,13 @@
 +            );
 +            span_started = std::time::Instant::now();
 +        }
-+
+ 
 +        #[cfg(all(feature = "test-seams", unix))]
 +        self.pause_reclaim_step_before_durable_publication_from_env()?;
          self.mem.commit(
              user_root,
              system_root,
-@@ -1688,6 +2937,11 @@
+@@ -1688,6 +2936,11 @@
              self.two_phase_commit,
              self.shrink_policy,
          )?;
@@ -7801,13 +7805,10 @@
  
          // Mark any pending non-durable commits as fully committed.
          self.transaction_tracker.clear_pending_non_durable_commits();
-@@ -1698,6 +2952,148 @@
-             self.mem.free(page, &mut PageTrackerPolicy::Ignore);
-         }
+@@ -1701,6 +2954,148 @@
+         Ok(())
+     }
  
-+        Ok(())
-+    }
-+
 +    #[cfg(feature = "contextdb-internal")]
 +    fn durable_commit_publishing(
 +        &mut self,
@@ -7947,10 +7948,13 @@
 +        stream.send(MARKER)?;
 +        let mut release = [0];
 +        stream.recv(&mut release)?;
-         Ok(())
-     }
- 
-@@ -1766,6 +3162,9 @@
++        Ok(())
++    }
++
+     // Commit without a durability guarantee
+     pub(crate) fn non_durable_commit(&mut self, user_root: Option<BtreeHeader>) -> Result {
+         let mut free_until_transaction = self
+@@ -1766,6 +3161,9 @@
      // Relocate pages to lower number regions/pages
      // Returns true if a page(s) was moved
      pub(crate) fn compact_pages(&mut self) -> Result<bool> {
@@ -7960,7 +7964,7 @@
          let mut progress = false;
  
          // Find the 1M highest pages
-@@ -1823,46 +3222,384 @@
+@@ -1823,46 +3221,384 @@
          Ok(progress)
      }
  
@@ -8160,8 +8164,6 @@
      fn process_freed_pages(&mut self, free_until: TransactionId) -> Result {
 -        // We assume below that PageNumber is length 8
 -        assert_eq!(PageNumber::serialized_size(), 8);
--
--        // Handle the data freed tree
 +        let (pages, entries) = self.deferred_free_budget;
 +        // Give each tree half the shared cap. The odd unit follows the oldest
 +        // durable pending key, so a one-unit budget cannot starve either tree
@@ -8229,7 +8231,8 @@
 +        }
 +        Ok(())
 +    }
-+
+ 
+-        // Handle the data freed tree
 +    fn process_freed_pages_bounded(
 +        &self,
 +        free_until: TransactionId,
@@ -8249,6 +8252,7 @@
 -                for i in 0..page_list.value().len() {
 -                    self.mem
 -                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore);
+-                }
 +        let mut freed = system_tables.open_system_table(self, definition)?;
 +        while pages_remaining > 0 && entries_remaining > 0 {
 +            let next = freed.tree.first()?.map(|(key, _)| key.value());
@@ -8279,11 +8283,23 @@
 +            drop(entry);
 +            if empty {
 +                freed.remove(&key)?;
-+            }
-+        }
+             }
+         }
 +        Ok((pages_remaining, entries_remaining))
 +    }
-+
+ 
+-        // Handle the system freed tree
+-        {
+-            let mut system_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
+-            let key = TransactionIdWithPagination {
+-                transaction_id: free_until.raw_id(),
+-                pagination_id: 0,
+-            };
+-            for entry in system_freed.extract_from_if(..key, |_, _| true)? {
+-                let (_, page_list) = entry?;
+-                for i in 0..page_list.value().len() {
+-                    self.mem
+-                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore);
 +    /// Inspect the exact root-page intersection with the deferred-free table
 +    /// on demand. The transaction floor may also defer unrelated pages; this
 +    /// diagnostic deliberately does not inventory them on writer admission.
@@ -8308,19 +8324,6 @@
                  }
              }
          }
--
--        // Handle the system freed tree
--        {
--            let mut system_freed = system_tables.open_system_table(self, SYSTEM_FREED_TABLE)?;
--            let key = TransactionIdWithPagination {
--                transaction_id: free_until.raw_id(),
--                pagination_id: 0,
--            };
--            for entry in system_freed.extract_from_if(..key, |_, _| true)? {
--                let (_, page_list) = entry?;
--                for i in 0..page_list.value().len() {
--                    self.mem
--                        .free(page_list.value().get(i), &mut PageTrackerPolicy::Ignore);
 +        let page_size = u32::try_from(self.mem.get_page_size())
 +            .expect("redb page size is represented by a 32-bit header field");
 +        let reachable_bytes = protected
@@ -8347,7 +8350,8 @@
 +            retained_bytes,
 +        })
 +    }
-+
+ 
+-        Ok(())
 +    #[cfg(any(test, feature = "test-seams"))]
 +    #[doc(hidden)]
 +    pub fn external_snapshot_retained_pages_for_test(&self) -> Result<Vec<[u8; 8]>> {
@@ -8366,16 +8370,14 @@
 +                let page = pages.value().get(index);
 +                if protected.contains(&page) {
 +                    retained.insert(page);
-                 }
-             }
-         }
--
--        Ok(())
++                }
++            }
++        }
 +        Ok(retained.into_iter().map(PageNumber::to_le_bytes).collect())
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +3774,18 @@
+@@ -2037,6 +3773,18 @@
          })
      }
  
@@ -8394,7 +8396,7 @@
      #[allow(dead_code)]
      pub(crate) fn print_debug(&self) -> Result {
          // Flush any pending updates to make sure we get the latest root
-@@ -2107,18 +3856,148 @@
+@@ -2107,20 +3855,150 @@
      tree: TableTree,
  }
  
@@ -8528,8 +8530,8 @@
 +            tree: TableTree::new(root, PageHint::Verified, guard, mem)
                  .map_err(TransactionError::Storage)?,
          })
-+    }
-+
+     }
+ 
 +    /// Name the exact committed user-tree root this transaction reads.
 +    #[doc(hidden)]
 +    pub fn storage_snapshot_identity(&self) -> StorageSnapshotIdentity {
@@ -8541,10 +8543,12 @@
 +                length: root.length,
 +            }),
 +        }
-     }
- 
++    }
++
      /// Open the given table
-@@ -2135,12 +4014,69 @@
+     pub fn open_table<K: Key + 'static, V: Value + 'static>(
+         &self,
+@@ -2135,7 +4013,7 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -8553,10 +8557,10 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-             InternalTableDefinition::Multimap { .. } => unreachable!(),
+@@ -2143,6 +4021,63 @@
          }
-+    }
-+
+     }
+ 
 +    /// Open a byte table for reject-only bounded inspection. Selected records
 +    /// still use ordinary complete-page admission and checksum verification.
 +    #[cfg(feature = "contextdb-internal")]
@@ -8612,10 +8616,12 @@
 +                }
 +                InternalTableDefinition::Multimap { .. } => unreachable!(),
 +            }))
-     }
- 
++    }
++
      /// Open the given table without a type
-@@ -2161,7 +4097,7 @@
+     pub fn open_untyped_table(
+         &self,
+@@ -2161,7 +4096,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -8624,7 +8630,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +4125,7 @@
+@@ -2189,7 +4124,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -8633,7 +8639,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +4153,7 @@
+@@ -2217,7 +4152,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -8642,7 +8648,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +4199,15 @@
+@@ -2263,7 +4198,15 @@
  
  #[cfg(test)]
  mod test {
@@ -8659,11 +8665,10 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +4228,1144 @@
+@@ -2284,4 +4227,1144 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
--}
 +
 +    #[test]
 +    fn external_roots_retain_only_reachable_allocation_versions_and_release_them_for_reuse() {
@@ -9804,7 +9809,7 @@
 +        self.tree
 +            .next_native_u64_bytes_range(name, lower, exclusive, before)
 +    }
-+}
+ }
 --- /dev/null
 +++ b/src/tree_store/bounded_bytes.rs
 @@ -0,0 +1,2115 @@
@@ -15519,20 +15524,20 @@
  
  const MAX_ORDER_OFFSET: usize = 0;
  const PADDING: usize = 3;
-@@ -22,6 +24,13 @@
- 
- fn buddy_page(page_number: u32) -> u32 {
+@@ -24,6 +26,13 @@
      page_number ^ 1
-+}
-+
+ }
+ 
 +#[cfg(test)]
 +thread_local! {
 +    /// Blocks `alloc_lowest` allocated at a higher order only to compare
 +    /// positions, for the work-count test.
 +    pub(super) static TENTATIVE_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
- }
- 
++}
++
  // Handles allocation of dynamically sized pages, supports pages of up to page_size * 2^max_order bytes
+ //
+ // Pages are marked free at only a single order, and it must always be the largest order
 @@ -34,6 +43,64 @@
  }
  
@@ -15605,21 +15610,15 @@
 +    #[cfg(test)]
      pub(crate) fn to_vec(&self) -> Vec<u8> {
 -        let serialized: Vec<Vec<u8>> = self.free.iter().map(BtreeBitmap::to_vec).collect();
--
 +        let mut result = vec![0; self.encoded_len()];
 +        self.encode_into(&mut result);
 +        result
 +    }
-+
+ 
 +    pub(crate) fn encoded_len(&self) -> usize {
          let header_bytes = 1 + 3 + size_of::<u32>();
          let offsets_bytes = (self.max_order as usize + 1) * size_of::<u32>();
 -        let data_bytes: usize = serialized.iter().map(Vec::len).sum();
--
--        let mut result = Vec::with_capacity(header_bytes + offsets_bytes + data_bytes);
--        result.push(self.max_order);
--        result.extend([0u8; 3]);
--        result.extend(self.len.to_le_bytes());
 +        header_bytes
 +            + offsets_bytes
 +            + self
@@ -15628,7 +15627,11 @@
 +                .map(BtreeBitmap::encoded_len)
 +                .sum::<usize>()
 +    }
-+
+ 
+-        let mut result = Vec::with_capacity(header_bytes + offsets_bytes + data_bytes);
+-        result.push(self.max_order);
+-        result.extend([0u8; 3]);
+-        result.extend(self.len.to_le_bytes());
 +    pub(crate) fn encode_into(&self, out: &mut [u8]) {
 +        assert!(out.len() >= self.encoded_len());
 +        let header_bytes = 1 + 3 + size_of::<u32>();
@@ -15645,32 +15648,31 @@
 -        }
 -        for bitmap in &serialized {
 -            result.extend_from_slice(bitmap);
--        }
--
--        result
 +        for (order, bitmap) in self.free.iter().enumerate() {
 +            let end = data_offset + bitmap.encoded_len();
 +            let field = header_bytes + order * size_of::<u32>();
 +            out[field..field + 4].copy_from_slice(&u32::try_from(end).unwrap().to_le_bytes());
 +            bitmap.encode_into(&mut out[data_offset..end]);
 +            data_offset = end;
-+        }
+         }
+-
+-        result
      }
  
      pub(crate) fn from_bytes(data: &[u8]) -> Self {
-@@ -174,6 +253,12 @@
-             page = next_higher_order(page);
-         }
+@@ -176,6 +255,12 @@
          None
-+    }
-+
+     }
+ 
 +    #[cfg(debug_assertions)]
 +    pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
 +        self.find_free_order(page.page_index << page.page_order)
 +            .is_none()
-     }
- 
++    }
++
      pub(crate) fn trailing_free_pages(&self) -> u32 {
+         let mut free_pages = 0;
+         let mut next_page = self.len() - 1;
 @@ -218,6 +303,9 @@
      }
  
@@ -15681,9 +15683,11 @@
          self.debug_check_consistency();
          if new_size > self.len() {
              let mut processed_pages = self.len();
-@@ -287,6 +375,9 @@
+@@ -285,8 +373,10 @@
+         self.debug_check_consistency();
+     }
  
-     #[allow(unused_variables)]
+-    #[allow(unused_variables)]
      fn debug_check_consistency(&self) {
 +        if self.poisoned() {
 +            return;
@@ -15691,7 +15695,7 @@
          // Don't enable when fuzzing, because this is kind of expensive
          #[cfg(all(debug_assertions, not(fuzzing)))]
          {
-@@ -318,7 +409,7 @@
+@@ -318,7 +408,7 @@
                          let buddy = buddy_page(page);
                          if buddy < allocator.len() {
                              let buddy_allocated = allocator.get(buddy);
@@ -15700,7 +15704,7 @@
                          }
                      }
                  }
-@@ -328,16 +419,57 @@
+@@ -328,16 +418,57 @@
  
      // Allocates a page of the given order at the lowest index possible. Will split a higher order page,
      // to get one of lower index
@@ -15762,7 +15766,7 @@
                  let index_at_order = index * multiplier;
                  if index_at_order < best_index_at_order {
                      self.free_inner(best.0, best.1);
-@@ -349,19 +481,12 @@
+@@ -349,19 +480,12 @@
              }
              multiplier *= 2;
          }
@@ -15783,7 +15787,7 @@
          Some(best.0)
      }
  
-@@ -370,6 +495,9 @@
+@@ -370,6 +494,9 @@
      }
  
      pub(crate) fn alloc_inner(&mut self, order: u8) -> Option<u32> {
@@ -15793,7 +15797,7 @@
          if order > self.max_order {
              return None;
          }
-@@ -397,8 +525,14 @@
+@@ -397,8 +524,14 @@
      }
  
      pub(crate) fn record_alloc_inner(&mut self, page_number: u32, order: u8) {
@@ -15810,7 +15814,7 @@
              // Need to split parent page
              let upper_page = next_higher_order(page_number);
              self.record_alloc_inner(upper_page, order + 1);
-@@ -412,7 +546,7 @@
+@@ -412,7 +545,7 @@
                  allocator.clear(free1);
              }
          } else {
@@ -15819,7 +15823,7 @@
          }
      }
  
-@@ -425,6 +559,9 @@
+@@ -425,6 +558,9 @@
      }
  
      pub(crate) fn free_inner(&mut self, page_number: u32, order: u8) {
@@ -15829,7 +15833,7 @@
          if order == self.max_order {
              let allocator = self.get_order_free_mut(order);
              allocator.clear(page_number);
-@@ -453,7 +590,61 @@
+@@ -453,7 +589,61 @@
  
  #[cfg(test)]
  mod test {
@@ -20415,7 +20419,7 @@
 +pub use cached_file::CheckedWriterBackendForTest;
 --- /dev/null
 +++ b/src/tree_store/page_store/page_allocation.rs
-@@ -0,0 +1,790 @@
+@@ -0,0 +1,788 @@
 +//! Concrete, weakless owners for the legacy page cache. No byte/control Arc can
 +//! escape independently of the payer. Native copies retain their separate owner.
 +use crate::atomic_compat::AtomicUpdate as _;
@@ -20650,14 +20654,12 @@
 +
 +enum PagePayer {
 +    // Field is owned for its destructor, never inspected or substituted.
-+    #[allow(dead_code)]
 +    Source(ReadMemoryCharge),
 +    // Beyond the fixed reserve, the actual source receipt pays for this whole
 +    // write backing. Occupancy remains visible and blocks further cache growth;
 +    // it is not a second invoice against the fixed reserve.
 +    SourceCounted {
 +        // Owned for its destructor; never downcast, substituted or re-invoiced.
-+        #[allow(dead_code)]
 +        charge: ReadMemoryCharge,
 +        occupancy: CachePayment,
 +    },
@@ -21396,17 +21398,13 @@
  struct InMemoryState {
      header: DatabaseHeader,
      // TODO: we should make this an Option because it is only valid after the Database initializes it
-@@ -82,22 +232,95 @@
+@@ -82,17 +232,27 @@
  }
  
  impl InMemoryState {
 -    fn new(header: DatabaseHeader) -> Self {
 -        let allocators = Allocators::new(header.layout());
 -        Self { header, allocators }
--    }
--
--    fn get_region(&self, region: u32) -> &BuddyAllocator {
--        &self.allocators.region_allocators[region as usize]
 +    fn new(
 +        header: DatabaseHeader,
 +        scratch: Option<Box<dyn ScratchBackend>>,
@@ -21420,8 +21418,10 @@
 +            Allocators::new(header.layout())
 +        };
 +        Ok(Self { header, allocators })
-+    }
-+
+     }
+ 
+-    fn get_region(&self, region: u32) -> &BuddyAllocator {
+-        &self.allocators.region_allocators[region as usize]
 +    fn get_region(&mut self, region: u32) -> &BuddyAllocator {
 +        self.allocators.get_region(region)
      }
@@ -21432,10 +21432,10 @@
      }
  
      fn get_region_tracker_mut(&mut self) -> &mut RegionTracker {
-         &mut self.allocators.region_tracker
+@@ -100,6 +260,69 @@
      }
-+}
-+
+ }
+ 
 +// Armed throughout header publication until that same header is installed.
 +// Drop must remain infallible and independent of every storage mutex.
 +#[cfg(feature = "contextdb-internal")]
@@ -21497,9 +21497,11 @@
 +        ((1075 - shift) << 52) | (mantissa & ((1 << 52) - 1))
 +    };
 +    Some(f64::from_bits(bits))
- }
- 
++}
++
  pub(crate) struct TransactionalMemory {
+     // Pages allocated since the last commit
+     // TODO: maybe this should be moved to WriteTransaction?
 @@ -108,7 +331,14 @@
      // True if the allocator state was corrupted when the file was opened
      // TODO: maybe we can remove this flag now that CheckedBackend exists?
@@ -21528,8 +21530,8 @@
 +    // The fixed cache invoice also covers allocator windows in state. Free
 +    // that state before storage releases its final genuine reserve owner.
 +    storage: PagedCachedFile,
- }
- 
++}
++
 +/// One commit slot of a crashed store's header.
 +#[cfg(feature = "contextdb-internal")]
 +#[derive(Debug, Clone, Copy)]
@@ -21583,8 +21585,8 @@
 +    }
 +    file.write_all_at(&header.to_bytes(true), 0)?;
 +    file.sync_all()
-+}
-+
+ }
+ 
  impl TransactionalMemory {
 +    #[cfg(feature = "test-seams")]
 +    pub(crate) fn write_control_for_test(&self) -> crate::CacheWriteControlForTest {
@@ -21856,15 +21858,15 @@
              storage,
              state: Mutex::new(state),
              #[cfg(debug_assertions)]
-@@ -277,7 +776,141 @@
+@@ -277,41 +776,227 @@
              page_size: page_size.try_into().unwrap(),
              region_size,
              region_header_with_padding_size: region_header_size,
 +            #[cfg(feature = "contextdb-internal")]
 +            read_budget: Mutex::new(None),
          })
-+    }
-+
+     }
+ 
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn retire_read_cache_request(&self, request: u64) {
 +        self.storage.retire_read_cache_request(request);
@@ -21995,10 +21997,10 @@
 +            })
 +            .count();
 +        resident as f64 / page_ids.len() as f64
-     }
- 
++    }
++
      pub(crate) fn cache_stats(&self) -> CacheStats {
-@@ -285,7 +918,52 @@
+         self.storage.cache_stats()
      }
  
      pub(crate) fn check_io_errors(&self) -> Result {
@@ -22013,9 +22015,9 @@
 +            return Err(error);
 +        }
          self.storage.check_io_errors()
-+    }
-+
-+    #[cfg(debug_assertions)]
+     }
+ 
+     #[cfg(debug_assertions)]
 +    pub(crate) fn uses_paged_allocator(&self) -> bool {
 +        self.state.lock().unwrap().allocators.pager().is_some()
 +    }
@@ -22048,10 +22050,12 @@
 +            return Err(error);
 +        }
 +        Ok(retired)
++    }
++
++    #[cfg(debug_assertions)]
+     pub(crate) fn mark_debug_allocated_page(&self, page: PageNumber) {
+         assert!(self.allocated_pages.lock().unwrap().insert(page));
      }
- 
-     #[cfg(debug_assertions)]
-@@ -295,23 +973,30 @@
  
      #[cfg(debug_assertions)]
      pub(crate) fn all_allocated_pages(&self) -> Vec<PageNumber> {
@@ -22222,12 +22226,6 @@
 -                &AllocatorStateKey::Region(i),
 -                &vec![0; region_bytes_len].as_ref(),
 -            )?;
--        }
--
--        tree.insert(
--            &AllocatorStateKey::RegionTracker,
--            &vec![0; region_tracker_len].as_ref(),
--        )?;
 +            let region_bytes_len = self
 +                .state
 +                .lock()
@@ -22236,8 +22234,12 @@
 +                .get_region(i)
 +                .encoded_len();
 +            drop(tree.insert_zeroed_reserve(&AllocatorStateKey::Region(i), region_bytes_len)?);
-+        }
-+
+         }
+ 
+-        tree.insert(
+-            &AllocatorStateKey::RegionTracker,
+-            &vec![0; region_tracker_len].as_ref(),
+-        )?;
 +        drop(tree.insert_zeroed_reserve(&AllocatorStateKey::RegionTracker, region_tracker_len)?);
 +        // Reserved before anything is encoded, so the encode allocates nothing.
 +        #[cfg(feature = "test-seams")]
@@ -22285,8 +22287,11 @@
                  return Ok(false);
              }
 -            tree.insert_inplace(&AllocatorStateKey::Region(i), &region_bytes.as_ref())?;
--        }
--
++            region.encode_into(destination.value_mut());
++            drop(state);
++            drop(destination);
+         }
+ 
 -        let region_tracker_bytes = state.allocators.region_tracker.to_vec();
 -        if tree
 -            .get(&AllocatorStateKey::RegionTracker)?
@@ -22295,11 +22300,6 @@
 -            .len()
 -            < region_tracker_bytes.len()
 -        {
-+            region.encode_into(destination.value_mut());
-+            drop(state);
-+            drop(destination);
-+        }
-+
 +        let mut destination = tree.get_mut(&AllocatorStateKey::RegionTracker)?.unwrap();
 +        let state = self.state.lock().unwrap();
 +        if destination.value().len() < state.allocators.region_tracker.encoded_len() {
@@ -22310,7 +22310,6 @@
 -            &AllocatorStateKey::RegionTracker,
 -            &region_tracker_bytes.as_ref(),
 -        )?;
--
 +        state
 +            .allocators
 +            .region_tracker
@@ -22352,7 +22351,7 @@
 +            let len = encoded.len();
 +            destination.value_mut()[..len].copy_from_slice(&encoded);
 +        }
-+
+ 
 +        let state = self.state.lock().unwrap();
 +        if let Some(error) = state
 +            .allocators
@@ -22656,11 +22655,10 @@
      #[allow(clippy::too_many_arguments)]
      fn commit_inner(
          &self,
-@@ -612,7 +1645,13 @@
+@@ -612,13 +1645,112 @@
          // Copy the header so that we can release the state lock, while we flush the file
          let mut header = state.header.clone();
          drop(state);
--
 +        self.check_io_errors()?;
 +
 +        // Every page this commit wrote reaches the file before any header
@@ -22668,13 +22666,51 @@
 +        // below, so a process that dies at any point leaves a header whose
 +        // commit is complete in the file it names. Same writes, same one sync.
 +        self.storage.write_barrier()?;
-         let old_transaction_id = header.secondary_slot().transaction_id;
-         let secondary = header.secondary_slot_mut();
-         secondary.transaction_id = transaction_id;
-@@ -658,6 +1697,101 @@
-         );
-         state.header = header;
-         self.read_from_secondary.store(false, Ordering::Release);
++        let old_transaction_id = header.secondary_slot().transaction_id;
++        let secondary = header.secondary_slot_mut();
++        secondary.transaction_id = transaction_id;
++        secondary.user_root = data_root;
++        secondary.system_root = system_root;
++
++        self.write_header(&header)?;
++
++        // Use 2-phase commit, if checksums are disabled
++        if two_phase {
++            self.storage.flush()?;
++        }
++
++        // Make our new commit the primary, and record whether it was a 2-phase commit.
++        // These two bits need to be written atomically
++        header.swap_primary_slot();
++        header.two_phase_commit = two_phase;
++
++        // Write the new header to disk
++        self.write_header(&header)?;
++        self.storage.flush()?;
++
++        if shrunk {
++            let result = self.storage.resize(header.layout().len());
++            if result.is_err() {
++                // TODO: it would be nice to have a more cohesive approach to setting this.
++                // we do it in commit() & rollback() on failure, but there are probably other places that need it
++                self.needs_recovery.store(true, Ordering::Release);
++                return result;
++            }
++        }
++        let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
++        allocated_since_commit.clear();
++        allocated_since_commit.shrink_to_fit();
++        let mut unpersisted = self.unpersisted.lock().unwrap();
++        unpersisted.clear();
++        unpersisted.shrink_to_fit();
++
++        let mut state = self.state.lock().unwrap();
++        assert_eq!(
++            state.header.secondary_slot().transaction_id,
++            old_transaction_id
++        );
++        state.header = header;
++        self.read_from_secondary.store(false, Ordering::Release);
 +        // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
 +        // TODO: maybe we can remove the whole read_from_secondary flag?
 +        drop(state);
@@ -22711,64 +22747,39 @@
 +        let mut header = state.header.clone();
 +        drop(state);
 +        self.check_io_errors()?;
-+
+ 
 +        // Every page this commit wrote reaches the file before any header
 +        // naming it does: the header leaves the buffer last, in the flush
 +        // below, so a process that dies at any point leaves a header whose
 +        // commit is complete in the file it names. Same writes, same one sync.
 +        self.storage.write_barrier()?;
-+        let old_transaction_id = header.secondary_slot().transaction_id;
-+        let secondary = header.secondary_slot_mut();
-+        secondary.transaction_id = transaction_id;
-+        secondary.user_root = data_root;
-+        secondary.system_root = system_root;
-+
+         let old_transaction_id = header.secondary_slot().transaction_id;
+         let secondary = header.secondary_slot_mut();
+         secondary.transaction_id = transaction_id;
+         secondary.user_root = data_root;
+         secondary.system_root = system_root;
+ 
 +        let mut recovery_guard = PublicationRecoveryGuard {
 +            needs_recovery: &self.needs_recovery,
 +            publication_needs_recovery: &self.publication_needs_recovery,
 +            armed: true,
 +        };
 +        marker.header_begun();
-+        self.write_header(&header)?;
-+
-+        // Use 2-phase commit, if checksums are disabled
-+        if two_phase {
-+            self.storage.flush()?;
-+        }
-+
-+        // Make our new commit the primary, and record whether it was a 2-phase commit.
-+        // These two bits need to be written atomically
-+        header.swap_primary_slot();
-+        header.two_phase_commit = two_phase;
-+
-+        // Write the new header to disk
-+        self.write_header(&header)?;
-+        self.storage.flush()?;
+         self.write_header(&header)?;
+ 
+         // Use 2-phase commit, if checksums are disabled
+@@ -634,6 +1766,7 @@
+         // Write the new header to disk
+         self.write_header(&header)?;
+         self.storage.flush()?;
 +        marker.durable();
-+
-+        if shrunk {
-+            let result = self.storage.resize(header.layout().len());
-+            if result.is_err() {
-+                // TODO: it would be nice to have a more cohesive approach to setting this.
-+                // we do it in commit() & rollback() on failure, but there are probably other places that need it
-+                self.needs_recovery.store(true, Ordering::Release);
-+                return result;
-+            }
-+        }
-+        let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-+        allocated_since_commit.clear();
-+        allocated_since_commit.shrink_to_fit();
-+        let mut unpersisted = self.unpersisted.lock().unwrap();
-+        unpersisted.clear();
-+        unpersisted.shrink_to_fit();
-+
-+        let mut state = self.state.lock().unwrap();
-+        assert_eq!(
-+            state.header.secondary_slot().transaction_id,
-+            old_transaction_id
-+        );
-+        state.header = header;
-+        self.read_from_secondary.store(false, Ordering::Release);
+ 
+         if shrunk {
+             let result = self.storage.resize(header.layout().len());
+@@ -658,6 +1791,7 @@
+         );
+         state.header = header;
+         self.read_from_secondary.store(false, Ordering::Release);
 +        recovery_guard.armed = false;
          // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
          // TODO: maybe we can remove the whole read_from_secondary flag?
@@ -22928,7 +22939,7 @@
 +                StorageError::Corrupted("allocator growth yielded no free page".into())
 +            })?
          };
-+
+ 
 +        if let Some(error) = state
 +            .allocators
 +            .pager()
@@ -22936,7 +22947,7 @@
 +        {
 +            return Err(error);
 +        }
- 
++
          #[cfg(debug_assertions)]
          {
 -            assert!(self.allocated_pages.lock().unwrap().insert(page_number));
@@ -22946,7 +22957,15 @@
              assert!(
                  !self
                      .read_page_ref_counts
-@@ -1024,7 +2256,28 @@
+@@ -987,7 +2219,6 @@
+             .try_into()
+             .unwrap();
+ 
+-        #[allow(unused_mut)]
+         let mut mem = self.storage.write(address_range.start, len, true)?;
+         debug_assert!(mem.mem().len() >= allocation_size);
+ 
+@@ -1024,7 +2255,28 @@
              } else {
                  region.alloc(required_order)
              };
@@ -22975,7 +22994,7 @@
                  return Ok(Some(PageNumber::new(
                      candidate_region,
                      page,
-@@ -1061,7 +2314,7 @@
+@@ -1061,7 +2313,7 @@
  
          let mut new_layout = layout;
          new_layout.reduce_last_region(reduce_by);
@@ -22984,7 +23003,7 @@
          assert!(new_layout.len() <= layout.len());
          state.header.set_layout(new_layout);
  
-@@ -1093,27 +2346,52 @@
+@@ -1093,27 +2345,52 @@
                  layout.usable_bytes() + required_growth * 2,
              )
          };
@@ -23049,7 +23068,7 @@
          state.header.set_layout(new_layout);
          Ok(())
      }
-@@ -1123,7 +2401,12 @@
+@@ -1123,7 +2400,12 @@
          allocation_size: usize,
          allocated: &mut PageTrackerPolicy,
      ) -> Result<PageMut<'txn>> {
@@ -23063,7 +23082,7 @@
          if let Ok(ref page) = result {
              allocated.insert(page.get_page_number());
          }
-@@ -1135,7 +2418,7 @@
+@@ -1135,7 +2417,7 @@
      }
  
      pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -23072,7 +23091,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_allocated_pages());
-@@ -1145,7 +2428,7 @@
+@@ -1145,7 +2427,7 @@
      }
  
      pub(crate) fn count_free_pages(&self) -> Result<u64> {
@@ -23081,7 +23100,7 @@
          let mut count = 0u64;
          for i in 0..state.header.layout().num_regions() {
              count += u64::from(state.get_region(i).count_free_pages());
-@@ -1158,8 +2441,41 @@
+@@ -1158,8 +2440,41 @@
          self.page_size.try_into().unwrap()
      }
  
@@ -23124,7 +23143,7 @@
              let mut state = self.state.lock()?;
              if self.storage.flush().is_ok() {
                  state.header.recovery_required = false;
-@@ -1228,4 +2544,469 @@
+@@ -1228,4 +2543,469 @@
          let mut db = Database::open(tmpfile).unwrap();
          assert!(db.check_integrity().unwrap());
      }
@@ -23227,7 +23246,7 @@
 +            }
 +        }
 +    }
- }
++}
 +
 +#[cfg(feature = "contextdb-internal")]
 +impl TransactionalMemory {
@@ -23593,7 +23612,7 @@
 +        );
 +        assert!(state.allocators.has_saved_source());
 +    }
-+}
+ }
 --- a/src/tree_store/page_store/region.rs
 +++ b/src/tree_store/page_store/region.rs
 @@ -1,10 +1,27 @@

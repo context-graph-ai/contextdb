@@ -2681,7 +2681,6 @@ impl Drop for TransitionHeadroomScope {
 /// Budget enforcer for memory-constrained edge devices.
 /// All methods are &self — interior mutability via atomics.
 #[derive(Debug)]
-#[allow(dead_code)]
 #[repr(align(8))]
 pub struct MemoryAccountant {
     limit: LimitHandle,
@@ -4206,10 +4205,6 @@ impl OwnedMemoryReservation {
     #[allow(
         clippy::wrong_self_convention,
         reason = "the method consumes funding held behind &mut self and cannot take self by value"
-    )]
-    #[allow(
-        dead_code,
-        reason = "native delivery code is staged ahead of its first non-test caller"
     )]
     #[expect(
         clippy::result_large_err,
@@ -11464,7 +11459,6 @@ pub(crate) fn reserve_preparation_from_writer_use(
 /// projected this tagged handle from that same held use. This private companion
 /// never rediscovers a current registration or constructs a typed heap error.
 /// Keeps the existing give-back-then-excess admission policy through scalar kernels.
-#[allow(dead_code)] // Staged until the funded typed error can retain its backing credit.
 pub(crate) fn reserve_native_storage_from_writer_use(
     original: &WriterUse,
     projection: &StoreAccountantHandle,
@@ -12605,10 +12599,6 @@ impl MemoryAccountant {
 }
 
 impl StoreAccountantHandle {
-    #[allow(
-        dead_code,
-        reason = "native delivery code is staged ahead of its first non-test caller"
-    )]
     pub(crate) fn try_allocate_for_original_native(
         &self,
         bytes: usize,

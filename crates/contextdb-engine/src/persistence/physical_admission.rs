@@ -650,7 +650,7 @@ impl Drop for SignalsBlocked {
 pub(crate) fn acquire_for_writer(
     file: &File,
     wait: &WriterWait<'_>,
-    #[allow(unused_variables)] store_path: &std::path::Path,
+    store_path: &std::path::Path,
 ) -> Result<(), WriterAcquireRefusal> {
     let mut held = Acquiring {
         file,

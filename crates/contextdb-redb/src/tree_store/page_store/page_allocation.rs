@@ -232,14 +232,12 @@ impl Drop for CachePayment {
 
 enum PagePayer {
     // Field is owned for its destructor, never inspected or substituted.
-    #[allow(dead_code)]
     Source(ReadMemoryCharge),
     // Beyond the fixed reserve, the actual source receipt pays for this whole
     // write backing. Occupancy remains visible and blocks further cache growth;
     // it is not a second invoice against the fixed reserve.
     SourceCounted {
         // Owned for its destructor; never downcast, substituted or re-invoiced.
-        #[allow(dead_code)]
         charge: ReadMemoryCharge,
         occupancy: CachePayment,
     },

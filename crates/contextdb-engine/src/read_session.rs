@@ -3139,12 +3139,8 @@ impl ReadSession {
         options: ReadSessionOptions,
         runtime_dir: Option<PathBuf>,
         requirement: RouteRequirement,
-        #[cfg_attr(not(feature = "test-seams"), allow(unused_variables))] session_observer: Option<
-            Arc<dyn ReadSessionTestObserver>,
-        >,
-        #[cfg_attr(not(feature = "test-seams"), allow(unused_variables))] kernel_observer: Option<
-            Arc<dyn ReadKernelTestObserver>,
-        >,
+        session_observer: Option<Arc<dyn ReadSessionTestObserver>>,
+        kernel_observer: Option<Arc<dyn ReadKernelTestObserver>>,
         mismatch: Option<OwnerHandshakeMismatchForTest>,
         progress: Option<Arc<dyn ReadProgressObserver>>,
     ) -> Result<Self> {

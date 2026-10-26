@@ -141,7 +141,6 @@ pub struct VectorPartitionLimitAuditForTest {
 }
 
 #[derive(Default)]
-#[cfg_attr(not(any(test, feature = "test-seams")), allow(dead_code))]
 struct VectorCapWork {
     projected_routes: AtomicU64,
     cap_edge_route_visits: AtomicU64,

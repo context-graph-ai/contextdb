@@ -3670,7 +3670,6 @@ pub(crate) fn close_bounded_cursor(
 pub(crate) enum BoundedExecutionError {
     /// Compatibility variant retained for the owner-protocol error mapping;
     /// approved read plans no longer return it from the bounded kernel.
-    #[allow(dead_code)]
     Unimplemented,
     /// A limit refusal preserves canonical typed detail rather than turning a
     /// completed eager collection into an opaque error string.

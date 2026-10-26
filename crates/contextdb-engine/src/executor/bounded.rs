@@ -2085,10 +2085,6 @@ impl RequestContext {
         }
         let first_observation = !state.telemetry.cancellation_observed;
         state.telemetry.cancellation_observed = true;
-        #[allow(
-            unused_variables,
-            reason = "The same production measurement also feeds the optional read probe"
-        )]
         let completed = state.telemetry.work_units;
         drop(state);
         #[cfg(not(any(test, feature = "test-seams")))]
@@ -2191,10 +2187,6 @@ impl RequestContext {
         if let Some(cancelled) = self.pending_failure() {
             return Err(cancelled);
         }
-        #[allow(
-            unused_variables,
-            reason = "The source position also feeds the optional read probe"
-        )]
         let (completed_source, started_ms) = {
             let state = self.state();
             let elapsed = self.elapsed_since(state.started_ms)?;
@@ -2251,10 +2243,6 @@ impl RequestContext {
         if let Some(cancelled) = self.pending_failure() {
             return Err(cancelled);
         }
-        #[allow(
-            unused_variables,
-            reason = "The same production measurement also feeds the optional read probe"
-        )]
         let (completed_work, completed_source, started_ms) = {
             let state = self.state();
             if state.telemetry.work_units >= self.limits.work {
@@ -2344,10 +2332,6 @@ impl RequestContext {
         if let Some(cancelled) = self.pending_failure() {
             return Err(cancelled);
         }
-        #[allow(
-            unused_variables,
-            reason = "The same production measurement also feeds the optional read probe"
-        )]
         let (completed_work, started_ms) = {
             let state = self.state();
             if state.telemetry.work_units >= self.limits.work {
@@ -2425,10 +2409,6 @@ impl RequestContext {
         crate::read_work_probe::note_metadata_reservation();
         let requested_u64 = u64::try_from(requested)
             .map_err(|_| Self::limit_failure(ReadFailureLimit::Memory, self.limits.memory))?;
-        #[allow(
-            unused_variables,
-            reason = "The same production measurement also feeds the optional read probe"
-        )]
         let held = {
             let state = self.state();
             let held = u64::try_from(self.held_memory_bytes(&state))
@@ -2451,10 +2431,6 @@ impl RequestContext {
         if let Some(probe) = self.probe() {
             probe.before_temporary_reservation(source, requested_u64, held);
         }
-        #[allow(
-            unused_variables,
-            reason = "The same production measurement also feeds the optional read probe"
-        )]
         let held_after = {
             let mut state = self.state();
             // Named, so a store-budget refusal tells the operator WHICH part of
@@ -18692,7 +18668,6 @@ fn planned_value_clone_bytes(value: &Value) -> std::result::Result<usize, Bounde
     }
 }
 
-#[allow(dead_code)]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
@@ -18842,7 +18817,6 @@ pub(crate) fn cursor_page_capacity_bytes(
     Ok(bytes)
 }
 
-#[allow(dead_code)]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

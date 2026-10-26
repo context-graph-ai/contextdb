@@ -6,10 +6,6 @@ use crate::persistence::{
 };
 use contextdb_core::read_memory::{NativeRefusal, ReadCredit, ReadMemoryOwner};
 #[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "the invalid kind is read only through the Debug diagnostic"
-)]
 pub(crate) enum Failure {
     Invalid(Invalid),
     Refused(NativeRefusal),

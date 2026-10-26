@@ -1783,7 +1783,6 @@ pub(super) fn charged_count_group_boundary(
 
 // Check and charge before advancing the physical iterator, including its
 // terminal probe. A refused charge must leave the source untouched.
-#[allow(dead_code)] // Exercised by the unit-level precharge contract.
 pub(super) fn charged_ordered_next<I: Iterator, E>(
     entries: &mut I,
     check_boundary: &mut dyn FnMut() -> std::result::Result<(), E>,

@@ -10794,7 +10794,6 @@ impl EngineGuard<'_> {
         self.prepare_vector_slot_inner(self.eager_preparation(), entry, scalar, invoice)
     }
     // activated by bounded-storage S3/S4; remove allow at activation
-    #[allow(dead_code)]
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

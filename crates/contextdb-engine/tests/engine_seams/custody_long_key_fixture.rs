@@ -1,7 +1,6 @@
 //! A delivery-manifest root table with a very long name, beside the custody
 //! fixture's own tables. A root's ownership key and its life render the
 //! table's name, so every root key of this table is kilobytes long.
-#![allow(dead_code)]
 use crate::custody_fixture::*;
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::Database;

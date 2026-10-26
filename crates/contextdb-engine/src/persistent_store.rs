@@ -849,10 +849,6 @@ struct OriginalMetadataPublicationReservation {
     root: Option<crate::memory_accounting::OwnedMemoryReservation>,
 }
 thread_local! {static ORIGINAL_METADATA_PUBLICATION:std::cell::Cell<*mut OriginalMetadataPublicationOwner>=const{std::cell::Cell::new(std::ptr::null_mut())};}
-#[allow(
-    dead_code,
-    reason = "native delivery code is staged ahead of its first non-test caller"
-)]
 struct OriginalMetadataPublicationScope {
     prior: *mut OriginalMetadataPublicationOwner,
     owner: *mut OriginalMetadataPublicationOwner,
@@ -1384,10 +1380,6 @@ impl WriteSetApplicator for OwnedPersistentCompositeStore {
 /// Memory-only Native hosts use the same erase/source/history publication
 /// kernel. Preparation is completed while the original source is still lent;
 /// no combined-stage guard crosses the actual memory apply.
-#[allow(
-    dead_code,
-    reason = "native delivery code is staged ahead of its first non-test caller"
-)]
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."

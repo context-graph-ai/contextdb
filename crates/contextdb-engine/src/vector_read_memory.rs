@@ -279,7 +279,6 @@ impl RequestOwnerFailure {
 pub struct RequestReadOwner(RequestReadRoute);
 
 #[derive(Debug)]
-#[allow(dead_code)] // Consumed by the separately owned native dispatch integration.
 pub(crate) enum RequestReadRoute {
     Legacy(Arc<dyn ReadMemoryBudget>),
     Native(NativeReadChildReceipt),
@@ -287,7 +286,6 @@ pub(crate) enum RequestReadRoute {
 
 #[derive(Debug)]
 pub(crate) struct NativeReadChildReceipt {
-    #[allow(dead_code)] // Retained now; native dispatch will consume this owner.
     owner: ReadMemoryOwner,
 }
 impl NativeReadChildReceipt {
@@ -317,7 +315,6 @@ impl RequestReadOwner {
     pub(crate) fn native(receipt: NativeReadChildReceipt) -> Self {
         Self(RequestReadRoute::Native(receipt))
     }
-    #[allow(dead_code)] // Additive companion ahead of native dispatch integration.
     pub(crate) fn into_route(self) -> RequestReadRoute {
         self.0
     }
@@ -2695,7 +2692,6 @@ pub mod statement_child_proof {
         layout: std::alloc::Layout,
         _before: usize,
     ) -> ControlAllocation {
-        #[allow(unused_mut)]
         let mut capture = ControlAllocation {
             payload,
             layout: (layout.size(), layout.align()),

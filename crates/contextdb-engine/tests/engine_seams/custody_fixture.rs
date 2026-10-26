@@ -1,6 +1,5 @@
 //! A file-backed edge bound to an in-process hub, with delivery-manifest
 //! tables, shared by the custody journal checks.
-#![allow(dead_code)]
 use contextdb_core::{TenantId, Value};
 use contextdb_engine::database::DeliveryManifest;
 use contextdb_engine::sync_client::ApplicationTablePolicyExpectation;

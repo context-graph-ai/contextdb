@@ -5,8 +5,6 @@
 //! directory and each harness asks for it by size, so a harness seeds what it
 //! needs instead of depending on a sibling having run first.
 
-#![allow(dead_code)]
-
 use contextdb_core::read_contract::ReadRoute;
 use contextdb_core::types::ContextId;
 use contextdb_core::{Value, VectorIndexRef};

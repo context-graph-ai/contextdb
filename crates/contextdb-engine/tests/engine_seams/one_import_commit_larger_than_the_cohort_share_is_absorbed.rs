@@ -536,5 +536,4 @@ fn a_crash_after_the_rebuild_completes_publishes_it_on_resume() {
     );
 }
 
-#[allow(dead_code)]
 fn _types(_: Lsn, _: TxId) {}

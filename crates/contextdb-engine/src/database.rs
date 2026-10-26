@@ -482,7 +482,6 @@ struct ReceivedSchemaOrderEntry {
 /// Durable values whose order and bytes are fixed before Redb starts its
 /// transaction.  Later phases hand this whole payload to the existing single
 /// transaction; they must not encode, repartition, or category-sort it there.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 struct ReceivedSchemaPersistencePayload {
     ddl_log_replacement: Vec<(Lsn, DdlChange)>,
@@ -519,7 +518,6 @@ struct ReceivedSchemaAuxiliaryWrites {
 /// history and replaces only the affected tables' mutable mirrors under the
 /// existing schema gate, leaving unrelated committed state borrowed throughout
 /// preparation.
-#[allow(dead_code)]
 #[derive(Default)]
 struct ReceivedSchemaMemoryMirrors {
     table_generations: HashMap<String, u64>,
@@ -1274,7 +1272,6 @@ struct PreparedMemorySwapAccounting {
     retired_bytes_released_by_store: usize,
 }
 
-#[allow(dead_code)] // its table view is consumed by received-schema source-order projection
 struct ReceivedSchemaSemanticProjection {
     tables: HashMap<String, TableMeta>,
     event_bus: event_bus::EventBusDefinitions,

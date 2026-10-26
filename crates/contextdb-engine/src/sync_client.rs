@@ -4583,7 +4583,6 @@ impl SyncClient {
         // progress. Preserve this call-start cursor unless an entry survives
         // direction and retention filtering below.
         let mut empty_call_baseline = durable_call_cursor;
-        #[allow(unused_assignments)]
         let mut last_server_lsn = since_lsn;
         let mut saw_deliverable_changes = false;
         let mut total = ApplyResult {

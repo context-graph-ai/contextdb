@@ -844,7 +844,6 @@ pub(super) fn bounded_companion_status(status: OwnerReadStatus) -> OwnerReadStat
     }
 }
 
-#[allow(dead_code)]
 pub(super) fn prepare_companion_record_for_publication(
     fields: &CompanionRecord,
 ) -> std::result::Result<EncodedCompanionRecord, String> {
@@ -854,7 +853,6 @@ pub(super) fn prepare_companion_record_for_publication(
     Ok(record)
 }
 
-#[allow(dead_code)]
 pub(super) fn recover_companion_record(
     payload: &[u8],
     stored_checksum: [u8; 32],
@@ -1654,7 +1652,6 @@ pub(super) fn writer_holds_companion(file: &File, database_path: &Path) -> Optio
     Some(held)
 }
 
-#[allow(dead_code)]
 pub(super) fn inspect_companion_record(
     database_path: &Path,
 ) -> std::result::Result<EncodedCompanionRecord, String> {
@@ -2088,7 +2085,6 @@ impl LoadReadImageError {
 /// Test adapters resolve the established session limits and clock here;
 /// production callers must supply their active open context.
 #[cfg(any(test, feature = "test-seams"))]
-#[allow(dead_code)]
 pub(crate) fn load_read_image(
     path: &Path,
 ) -> std::result::Result<ReadPersistenceLoad, LoadReadImageError> {
@@ -2233,7 +2229,6 @@ pub(crate) fn load_read_image_at_registration_with_cache_share(
 
 /// Sole identity source for the companion record's owner-user field. The
 /// record writer must not substitute database-file metadata for this value.
-#[allow(dead_code)]
 pub(super) fn companion_effective_user_identity() -> LocalUserIdentity {
     #[cfg(any(test, feature = "test-seams"))]
     read_persistence_test_scaffold::note_companion_effective_user_source_call_for_test();
@@ -2268,7 +2263,6 @@ pub(super) fn encode_channel_address(address: ChannelAddress) -> String {
 /// Both the runtime directory and the address are derived by local transport
 /// from the runtime ROOT every caller here is handed, so a reader publishing
 /// its identity and a writer looking for it reach the same directory.
-#[allow(dead_code)]
 pub(super) fn reader_breadcrumb_directory(
     database_path: &Path,
     runtime_root: &Path,

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use contextdb_core::{Value, VectorIndexRef, VectorPartitionKey};
 use contextdb_engine::{Database, DatabaseOpenOptions, MaintenancePolicy};
 use std::{collections::HashMap, path::Path};

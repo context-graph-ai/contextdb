@@ -5851,7 +5851,6 @@ impl Database {
     /// resolving against the receiver's current declaration exactly as
     /// before, which is what protects an in-flight vector shape change from
     /// seeing its own arriving shape early.
-    #[allow(dead_code)]
     #[must_use = "an unheld registration removes the stage again immediately"]
     #[expect(
         clippy::result_large_err,
@@ -5912,7 +5911,6 @@ impl Database {
         Ok(registration)
     }
 
-    #[allow(dead_code)]
     pub(super) fn take_received_schema_stage(&self, local_lsn: Lsn) -> Option<ReceivedSchemaStage> {
         self.received_schema_stages.lock().remove(&local_lsn)
     }
