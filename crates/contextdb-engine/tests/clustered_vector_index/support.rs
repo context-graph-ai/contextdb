@@ -714,6 +714,65 @@ pub fn legacy_runs(_db: &Database, _table: &str, _column: &str, _context: &[Valu
     unimplemented!("{UNBOUND}: legacy runs remaining")
 }
 
+/// One physical page a generation holds, of any kind, by its role and its
+/// logical identity within the generation.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GenerationPage {
+    pub role: GenerationPageRole,
+    /// The page's logical identity within the generation (its ordinal for
+    /// the role), stable across copy-on-write rewrites of the same page. A
+    /// released page leaves the set; a page allocated later joins it.
+    pub page: u64,
+}
+
+/// What a generation's page holds.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GenerationPageRole {
+    ListPage,
+    RunDirectory,
+    Visibility,
+    Canonical,
+    JournalLink,
+    Codebook,
+    Other(String),
+}
+
+/// Every physical page the Context's `generation` still holds, of every
+/// kind, each by its native identity.
+pub fn generation_pages(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _generation: u64,
+) -> std::collections::BTreeSet<GenerationPage> {
+    unimplemented!("{UNBOUND}: a generation's physical pages")
+}
+
+/// The primary keys of rows whose old copies sit in legacy runs the
+/// Context's remap has already retired, while other legacy runs remain.
+pub fn retired_legacy_rows(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+) -> Vec<Value> {
+    unimplemented!("{UNBOUND}: rows in retired legacy runs")
+}
+
+/// Whether the row's copy in `generation` is visible in that generation's
+/// own visibility pages; `None` when the generation holds no copy of it.
+pub fn old_copy_visible(
+    _db: &Database,
+    _table: &str,
+    _column: &str,
+    _context: &[Value],
+    _generation: u64,
+    _primary_key: Value,
+) -> Option<bool> {
+    unimplemented!("{UNBOUND}: an old-generation copy's visibility")
+}
+
 /// Progress of assigning or remapping one Context's sealed runs to its
 /// serving codebook.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

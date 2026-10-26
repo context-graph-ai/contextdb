@@ -1,17 +1,22 @@
 //! While a replacement's remap still has legacy runs to retire, an update or
-//! delete of a row whose old copy sat in an already-retired legacy run is
-//! served exactly once with its current vector (or not at all), and no page
-//! of the old generation is reclaimed until the last legacy run retires.
-//! After that, the old generation's pages go, none is recreated by a later
-//! update, and every row is still answered once, through reopen.
+//! delete of a row whose old copy sits in an already-retired legacy run is
+//! served exactly once with its current vector (or not at all). It clears
+//! that old copy's visibility in the old generation's own pages, which stay
+//! exactly the pages they were at publication, none released and none
+//! allocated, until the last legacy run retires. A run reclaimed early, or
+//! one of its pages recreated by the change, shows as the set changing. After that the old
+//! generation's pages are reclaimed, every one of them, none is recreated by
+//! later updates, and every row is still answered once, through reopen.
 
 use super::support::{
-    IndexTestOptions, PhysicalPlace, drive_until_serving, empty, int_ids, ivf, legacy_runs,
-    observe_search, open_with_index_test_options, params, physical_pages, retained_generations,
-    serving, switch_state, unit_vector,
+    GenerationPage, IndexTestOptions, MAX_MAINTENANCE_CYCLES, drive_until_serving, empty,
+    generation_pages, int_ids, ivf, legacy_runs, observe_search, old_copy_visible,
+    open_with_index_test_options, params, retained_generations, retired_legacy_rows, serving,
+    switch_state, unit_vector,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 const DIMENSIONS: usize = 16;
@@ -20,40 +25,46 @@ const OPTIONS: IndexTestOptions = IndexTestOptions {
     build_batch_rows: Some(8),
 };
 const BUILT: std::ops::Range<i64> = 0..200;
-/// Committed one per transaction while the replacement builds: several
-/// sealed runs that become the legacy runs at publication.
-const DURING: std::ops::Range<i64> = 1_000..1_060;
-const CHANGED: i64 = DURING.start;
-const DELETED: i64 = DURING.start + 1;
+/// Committed one per maintenance cycle while the replacement builds:
+/// several sealed runs that become the legacy runs at publication.
+const DURING: std::ops::Range<i64> = 1_000..1_100;
+const TABLE: &str = "retired_items";
 
 fn open(path: &Path) -> Database {
     open_with_index_test_options(path, OPTIONS)
 }
 
-fn insert(db: &Database, id: i64, vector: Vec<f32>) {
+fn vector(id: i64) -> Vec<f32> {
+    unit_vector(id as u64, DIMENSIONS)
+}
+
+fn write(db: &Database, sql: &str, id: i64, vector: Vec<f32>) {
     db.execute(
-        "INSERT INTO retired_items (id, embedding) VALUES ($id, $embedding)",
+        sql,
         &params([
             ("id", Value::Int64(id)),
             ("embedding", Value::Vector(vector)),
         ]),
     )
-    .unwrap_or_else(|error| panic!("row {id} commits: {error:?}"));
+    .unwrap_or_else(|error| panic!("{sql} for row {id}: {error:?}"));
+}
+
+fn insert(db: &Database, id: i64) {
+    write(
+        db,
+        "INSERT INTO retired_items (id, embedding) VALUES ($id, $embedding)",
+        id,
+        vector(id),
+    );
 }
 
 fn update(db: &Database, id: i64, vector: Vec<f32>) {
-    db.execute(
+    write(
+        db,
         "UPDATE retired_items SET embedding = $embedding WHERE id = $id",
-        &params([
-            ("id", Value::Int64(id)),
-            ("embedding", Value::Vector(vector)),
-        ]),
-    )
-    .unwrap_or_else(|error| panic!("row {id} updates: {error:?}"));
-}
-
-fn vector(id: i64) -> Vec<f32> {
-    unit_vector(id as u64, DIMENSIONS)
+        id,
+        vector,
+    );
 }
 
 fn answers(db: &Database, query: Vec<f32>, mode: &str, limit: usize) -> Vec<i64> {
@@ -69,50 +80,46 @@ fn answers(db: &Database, query: Vec<f32>, mode: &str, limit: usize) -> Vec<i64>
     int_ids(&result)
 }
 
-/// The changed row is answered once, nearest to its new vector, the deleted
-/// row never, and an untouched row from the same runs still finds itself.
-fn assert_current(db: &Database, when: &str) {
+/// The changed row is answered once, nearest to its new vector and never at
+/// its old one, the deleted row never, and an untouched row still finds
+/// itself.
+fn assert_current(db: &Database, changed: i64, deleted: i64, untouched: i64, when: &str) {
     for mode in ["EXACT", "INDEXED"] {
         let near_new = answers(db, vector(9_000), mode, 20);
         assert_eq!(
             near_new.first(),
-            Some(&CHANGED),
+            Some(&changed),
             "{when}: {mode} finds the changed row at its new vector"
         );
         assert_eq!(
-            near_new.iter().filter(|id| **id == CHANGED).count(),
+            near_new.iter().filter(|id| **id == changed).count(),
             1,
             "{when}: {mode} answers the changed row once"
         );
-        let near_old = answers(db, vector(CHANGED), mode, 20);
+        let near_old = answers(db, vector(changed), mode, 20);
         assert!(
-            near_old.first() != Some(&CHANGED)
-                && near_old.iter().filter(|id| **id == CHANGED).count() <= 1,
+            near_old.first() != Some(&changed)
+                && near_old.iter().filter(|id| **id == changed).count() <= 1,
             "{when}: {mode} never serves the changed row's old vector: {near_old:?}"
         );
         assert!(
-            !answers(db, vector(DELETED), mode, 20).contains(&DELETED),
+            !answers(db, vector(deleted), mode, 20).contains(&deleted),
             "{when}: {mode} never answers the deleted row"
         );
         assert_eq!(
-            answers(db, vector(DURING.end - 1), mode, 1),
-            vec![DURING.end - 1],
+            answers(db, vector(untouched), mode, 1),
+            vec![untouched],
             "{when}: {mode} still finds an untouched row"
         );
     }
 }
 
-fn old_generation_pages(db: &Database, old: u64) -> usize {
-    physical_pages(db, "retired_items", "embedding")
-        .iter()
-        .filter(|page| {
-            matches!(
-                page.place,
-                PhysicalPlace::ListPage { generation } | PhysicalPlace::SealedRun { generation }
-                    if generation == old
-            )
-        })
-        .count()
+fn pages(db: &Database, generation: u64) -> BTreeSet<GenerationPage> {
+    generation_pages(db, TABLE, "embedding", &[], generation)
+}
+
+fn cycle(db: &Database) {
+    db.run_maintenance_cycle().expect("one maintenance cycle");
 }
 
 #[test]
@@ -129,106 +136,163 @@ fn a_change_to_a_row_in_a_retired_legacy_run_keeps_old_pages_until_state_c() {
     )
     .expect("declare the clustered index");
     for id in BUILT {
-        insert(&db, id, vector(id));
+        insert(&db, id);
     }
     drive_until_serving(&db);
-    let old = serving(&db, "retired_items", "embedding", &[])
+    let old = serving(&db, TABLE, "embedding", &[])
         .expect("a generation serves")
         .generation;
     // Enough change to make a replacement due; while it builds, each commit
     // seals into the old generation's delta runs.
     for id in 200..240 {
-        insert(&db, id, vector(id));
+        insert(&db, id);
     }
     let mut during = DURING;
     let mut published = false;
-    for _ in 0..256 {
-        db.run_maintenance_cycle().expect("one maintenance cycle");
-        if serving(&db, "retired_items", "embedding", &[])
-            .is_some_and(|serving| serving.generation > old)
-        {
+    for _ in 0..MAX_MAINTENANCE_CYCLES * 4 {
+        cycle(&db);
+        if serving(&db, TABLE, "embedding", &[]).is_some_and(|serving| serving.generation > old) {
             published = true;
             break;
         }
         if let Some(id) = during.next() {
-            insert(&db, id, vector(id));
+            insert(&db, id);
         }
     }
     assert!(published, "fixture: the replacement publishes");
     assert!(
-        during.start > DELETED + 1,
-        "fixture: the changed and deleted rows were committed while the replacement built"
-    );
-    assert!(
-        switch_state(&db, "retired_items", "embedding", &[])
-            .legacy
-            .is_some(),
+        switch_state(&db, TABLE, "embedding", &[]).legacy.is_some(),
         "fixture: the replacement serves in state B"
     );
-    let at_publication = legacy_runs(&db, "retired_items", "embedding", &[]);
+    let at_publication = legacy_runs(&db, TABLE, "embedding", &[]);
     assert!(
         at_publication >= 2,
         "fixture: at least two legacy runs to retire, got {at_publication}"
     );
+    let held = pages(&db, old);
+    assert!(
+        !held.is_empty(),
+        "fixture: the old generation holds pages at publication"
+    );
 
     // Retire legacy runs one maintenance cycle at a time until at least one
-    // has retired and at least one remains.
-    for _ in 0..256 {
-        let remaining = legacy_runs(&db, "retired_items", "embedding", &[]);
+    // has retired and at least one remains; no old-generation page is
+    // released or allocated meanwhile.
+    for step in 0..MAX_MAINTENANCE_CYCLES * 4 {
+        let remaining = legacy_runs(&db, TABLE, "embedding", &[]);
         if remaining < at_publication && remaining > 0 {
             break;
         }
-        db.run_maintenance_cycle().expect("one maintenance cycle");
+        cycle(&db);
+        assert_eq!(
+            pages(&db, old),
+            held,
+            "retirement step {step}: the old generation's pages are exactly those at publication"
+        );
     }
-    let remaining = legacy_runs(&db, "retired_items", "embedding", &[]);
+    let remaining = legacy_runs(&db, TABLE, "embedding", &[]);
     assert!(
         remaining > 0 && remaining < at_publication,
         "fixture: a legacy run has retired and another remains ({remaining} of {at_publication})"
     );
 
-    // The changed and deleted rows were the first committed during the
-    // build, so their old copies sat in the oldest legacy run.
-    update(&db, CHANGED, vector(9_000));
+    // Rows the engine reports as having their old copies in retired legacy
+    // runs.
+    let retired = retired_legacy_rows(&db, TABLE, "embedding", &[])
+        .into_iter()
+        .map(|id| match id {
+            Value::Int64(id) => id,
+            other => panic!("a retired legacy row id is an integer: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        retired.len() >= 3,
+        "fixture: retired legacy runs hold at least three rows, got {retired:?}"
+    );
+    let (changed, deleted, untouched) = (retired[0], retired[1], retired[2]);
+    for id in [changed, deleted] {
+        assert_eq!(
+            old_copy_visible(&db, TABLE, "embedding", &[], old, Value::Int64(id)),
+            Some(true),
+            "fixture: row {id}'s old copy is still visible in the old generation's pages"
+        );
+    }
+
+    update(&db, changed, vector(9_000));
     db.execute(
-        &format!("DELETE FROM retired_items WHERE id = {DELETED}"),
+        &format!("DELETE FROM retired_items WHERE id = {deleted}"),
         &empty(),
     )
-    .expect("delete a row whose old copy sat in a retired legacy run");
-    assert_current(&db, "with a legacy run remaining");
-    assert!(
-        retained_generations(&db, "retired_items", "embedding", &[]).contains(&old),
-        "the old generation's pages are retained while a legacy run remains"
+    .expect("delete a row whose old copy sits in a retired legacy run");
+    for id in [changed, deleted] {
+        assert_eq!(
+            old_copy_visible(&db, TABLE, "embedding", &[], old, Value::Int64(id)),
+            Some(false),
+            "row {id}'s old copy is cleared in the old generation's own pages"
+        );
+    }
+    assert_eq!(
+        pages(&db, old),
+        held,
+        "the change clears visibility in the same old-generation pages: none released, none allocated"
+    );
+    assert_current(
+        &db,
+        changed,
+        deleted,
+        untouched,
+        "with a legacy run remaining",
     );
     assert!(
-        old_generation_pages(&db, old) > 0,
-        "no old-generation page is reclaimed before state C"
+        retained_generations(&db, TABLE, "embedding", &[]).contains(&old),
+        "the old generation is retained while a legacy run remains"
     );
 
-    drive_until_serving(&db);
-    assert!(
-        switch_state(&db, "retired_items", "embedding", &[])
-            .legacy
-            .is_none(),
-        "the remap reaches state C"
-    );
-    assert_current(&db, "in state C");
-    for _ in 0..8 {
-        db.run_maintenance_cycle().expect("reclamation cycle");
+    let mut reached_c = false;
+    for step in 0..MAX_MAINTENANCE_CYCLES * 4 {
+        if switch_state(&db, TABLE, "embedding", &[]).legacy.is_none() {
+            reached_c = true;
+            break;
+        }
+        assert_eq!(
+            pages(&db, old),
+            held,
+            "remap step {step}: the old generation's pages are unchanged until state C"
+        );
+        cycle(&db);
     }
-    assert!(
-        !retained_generations(&db, "retired_items", "embedding", &[]).contains(&old),
-        "after state C the old generation is reclaimed"
-    );
-    update(&db, CHANGED, vector(9_001));
-    update(&db, CHANGED, vector(9_000));
+    assert!(reached_c, "the remap reaches state C");
+    assert_current(&db, changed, deleted, untouched, "in state C");
+
+    let mut reclaimed = false;
+    for _ in 0..MAX_MAINTENANCE_CYCLES * 4 {
+        if !retained_generations(&db, TABLE, "embedding", &[]).contains(&old) {
+            reclaimed = true;
+            break;
+        }
+        cycle(&db);
+    }
+    assert!(reclaimed, "after state C the old generation is reclaimed");
     assert_eq!(
-        old_generation_pages(&db, old),
-        0,
-        "a later update recreates no page of the reclaimed generation"
+        pages(&db, old),
+        BTreeSet::new(),
+        "no page of any kind remains in the reclaimed generation"
     );
-    assert_current(&db, "after reclamation");
+    update(&db, changed, vector(9_001));
+    update(&db, changed, vector(9_000));
+    assert_eq!(
+        pages(&db, old),
+        BTreeSet::new(),
+        "later updates recreate no page of the reclaimed generation"
+    );
+    assert_current(&db, changed, deleted, untouched, "after reclamation");
     db.close().expect("close the store");
     drop(db);
     let db = open(&path);
-    assert_current(&db, "after reopen");
+    assert_eq!(
+        pages(&db, old),
+        BTreeSet::new(),
+        "after reopen the generation stays reclaimed"
+    );
+    assert_current(&db, changed, deleted, untouched, "after reopen");
 }
