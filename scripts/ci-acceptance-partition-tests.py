@@ -9,7 +9,7 @@ import re
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE_MODULE_SHA256 = "797bbab6c2f5fb0ad39cb44887813322e36c714aff3a40e407f2d324072c6348"
+BASELINE_MODULE_SHA256 = "8e63a05c17941066eb4ac8a59f678ac3a24c35f55f8d9ed3247b580b50bb6149"
 BASELINE_HELPERS_SHA256 = "9905e54b79db77270853f14542c5d525b5da1b33a37ca9889d0a28e3941eafbf"
 BASELINE_HELPER_TESTS_SHA256 = "9883a4313ce70e8a444b3a7237e587d618fbdc163d2eac86d9acafe40a84d269"
 ACCEPTANCE_TARGETS = {
@@ -99,8 +99,8 @@ for proved, physical in ((True, 49), (False, 53)):
         combined = integration.combined_matrix(rows, True, decision)
         bundles = integration.bundle_matrix(combined, rows, True, decision)
         assert len(combined["include"]) == physical
-        assert len(bundles["include"]) == 18
-        assert all(sum(bundle[f"slot{slot}"] is not None for slot in range(1, 4)) <= 3
+        assert len(bundles["include"]) == 16
+        assert all(sum(bundle[f"slot{slot}"] is not None for slot in range(1, 5)) <= 4
                    for bundle in bundles["include"])
 
 read_text = Path.read_text
@@ -138,12 +138,15 @@ with patch.object(integration, "source_identity", return_value=identity), \
     selected = integration.active_rows(rows, False, "normal", decision)
     combined = integration.combined_matrix(rows, True, decision)
     bundles = integration.bundle_matrix(combined, rows, True, decision)["include"]
-    assert bundles[6]["slot3"]["id"] == "pr-contextdb-server-test-seams"
-    assert [bundles[8][f"slot{slot}"]["id"] for slot in (1, 2)] == ["pr-contextdb-core-test-seams", "pr-contextdb-core"]
-    for row_id, bundle_number in (("acceptance-long-running-transfer-test", 2), ("acceptance-long-running-test", 12)):
+    placed = [bundle[f"slot{slot}"] for bundle in bundles for slot in range(1, 5)
+              if bundle[f"slot{slot}"] is not None]
+    for row_id in ("pr-contextdb-server-test-seams", "pr-contextdb-core-test-seams", "pr-contextdb-core"):
+        assert sum(slot["id"] == row_id for slot in placed) == 1
+    for row_id in ("acceptance-long-running-transfer-test", "acceptance-long-running-test"):
         row = next(row for row in selected if row["id"] == row_id)
-        slot = bundles[bundle_number - 1]["slot3"]
-        assert slot["id"] == "integration-" + row_id
+        matches = [slot for slot in placed if slot["id"] == "integration-" + row_id]
+        assert len(matches) == 1
+        slot = matches[0]
         assert slot["cache_key"] == "integration-acceptance-long-running-test-debug0-jobs2-test"
         command = integration.commands(row, mode="normal")[0]
         assert command[:10] == ["cargo", "test", "--locked", "-p", "contextdb-engine", "--features", integration.FEATURES, "--test", "acceptance_long_running", "--"]

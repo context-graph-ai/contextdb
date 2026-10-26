@@ -772,20 +772,18 @@ pub(crate) fn snapshot_is_failed(snapshot: &redb::StorageSnapshotIdentity) -> bo
 /// says nothing about whether the store is free; and a store nobody is holding
 /// is released at once, whatever can or cannot be read about readers.
 ///
-/// It is EVENT-DRIVEN, and deliberately has no timer anywhere in it. The
-/// blocking acquisition puts this thread to sleep in the kernel until the last
-/// holder lets go -- or dies, which the kernel treats as the same event. The
-/// wake IS the release; nothing polls, and no interval decides how quickly a
-/// waiter learns. Nothing in the store folder is opened, read, or locked.
+/// Linux waits on companion notifications; macOS waits on the cancellation
+/// pipe with a private lock-recheck interval of at most 10 ms. Each wake returns
+/// to the trusted nonblocking companion probe: only taking the hold establishes
+/// release. Nothing in the store folder is opened, read, or locked.
 ///
 /// Known runtime directories can name an unobservable hold. The wait verdict
 /// itself comes from the companion hold.
 ///
-/// `stop` ends the wait immediately: the caller is told the moment the token
-/// is cancelled, through the token's own listener, so an interrupt is as
-/// prompt as a release. A wait ended that way answers `Stopped` while the
-/// kernel wait it started finishes on its own; that helper releases nothing
-/// and holds nothing once it does.
+/// On Linux and macOS, `stop` wakes the caller's own waiting thread through
+/// the token's listener and answers `Stopped`; no helper or queued lock remains.
+/// Other Unix targets retain their blocking fallback and observe cancellation
+/// only when that acquisition returns.
 /// The same wait, told the runtime ROOT an operator supplied.
 ///
 /// The root selects the breadcrumbs used to explain an unobservable hold.
@@ -795,9 +793,8 @@ pub(crate) fn snapshot_is_failed(snapshot: &redb::StorageSnapshotIdentity) -> bo
 /// A root that cannot be read does not turn a released companion hold into
 /// `Unobservable`; open validation reports the root's configuration refusal.
 ///
-/// Every other part of the contract is [`wait_for_reader_release`]'s -- the
-/// kernel wake IS the event, there is no timer anywhere in it, and `stop` is
-/// answered as promptly as a release.
+/// Every other part of the contract, including platform-specific wake behavior,
+/// is [`wait_for_reader_release`]'s.
 pub fn wait_for_reader_release_in_runtime_dir(
     path: &Path,
     runtime_root: Option<&Path>,
@@ -822,9 +819,9 @@ pub fn wait_for_reader_release(
         Ok(file) => file,
         Err(error) => return unobservable_reader_hold(path, runtime, error),
     };
-    // Armed BEFORE the first ask, so a reader that lets go in the gap between
-    // the ask and the sleep has already left a notification queued rather than
-    // slipping past unseen.
+    // Arm BEFORE the first ask so cancellation cannot slip between the probe
+    // and sleep. Linux also queues release notifications; macOS bounds the next
+    // trusted release probe by its private recheck interval.
     let watch = match CoordinationWatch::arm(&companion, Some(stop)) {
         Ok(watch) => watch,
         Err(error) => return unobservable_reader_hold(path, runtime, error),
@@ -845,15 +842,10 @@ pub fn wait_for_reader_release(
         read_persistence_test_scaffold::note_reader_release_block_for_test(
             read_persistence_test_scaffold::ReaderReleaseBlockForTest::UntilHolderReleased,
         );
-        // The sleep IS the wait: this thread wakes when the kernel says
-        // something happened to the companion -- a holder closing its
-        // descriptor, which is what letting go looks like and what the kernel
-        // does for a holder that dies -- or when this caller asks to stop. No
-        // deadline of this wait's own is supplied, because a deadline is a poll
-        // interval and a poll interval is how long a caller keeps a free store
-        // hostage after it is free. And the sleeping is done HERE, on the
-        // caller's own thread, so a caller that stops waiting leaves nothing
-        // anywhere still queued for a hold nobody wants.
+        // The caller owns its deadline through `stop`; this wait adds none.
+        // Linux wakes on companion events or cancellation. macOS watches the
+        // cancellation pipe and schedules a trusted lock recheck within 10 ms.
+        // Both sleep here on the caller's thread, without a queued acquisition.
         if let Err(error) = watch.sleep(&held, COMPANION_READER_HOLD_LOCK_OFFSET, None) {
             return unobservable_reader_hold(path, runtime, error);
         }

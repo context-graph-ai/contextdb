@@ -17,7 +17,7 @@ import yaml
 spec = importlib.util.spec_from_file_location('required', Path(__file__).with_name('ci-required.py'))
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
-REQUIRED = {'lint', 'test-bundles', 'build', 'features',
+REQUIRED = {'lint', 'lint-macos', 'test-bundles', 'build', 'features',
             'installed-smoke', 'cross-compile', 'impact', 'integration'}
 WRITE = {'contents': 'write', 'actions': 'read'}
 CALLER = {'needs': ['required'],
@@ -60,7 +60,7 @@ class RequiredControls(unittest.TestCase):
         doc = current()
         self.assertEqual(r.REQUIRED, REQUIRED)
         self.assertEqual(doc['jobs']['required']['needs'],
-                         ['lint', 'test-bundles', 'build', 'features',
+                         ['lint', 'lint-macos', 'test-bundles', 'build', 'features',
                           'installed-smoke', 'cross-compile', 'impact', 'integration'])
         release = load(RELEASE_JOB)['build']
         self.assertEqual(doc['jobs']['build']['steps'], release['steps'])
@@ -159,8 +159,12 @@ class RequiredControls(unittest.TestCase):
         doc = current()['jobs']
         self.assertNotIn('needs', doc['lint'])
         self.assertNotIn('needs', doc['installed-smoke'])
-        for name, predecessor in [('features', 'lint'), ('build', 'features'),
-                                  ('cross-compile', 'build')]:
+        self.assertNotIn('needs', doc['lint-macos'])
+        self.assertEqual(doc['lint-macos']['runs-on'], 'macos-latest')
+        self.assertEqual(doc['lint-macos']['steps'][-1]['run'], 'bash scripts/verify pr lint')
+        self.assertNotIn('needs', doc['cross-compile'])
+        self.assertNotIn('if', doc['cross-compile'])
+        for name, predecessor in [('features', 'lint'), ('build', 'lint')]:
             self.assertEqual(doc[name]['needs'], predecessor)
             self.assertEqual(doc[name]['if'], 'always() && !cancelled()')
         for name, result in [('features', 'failure'), ('build', 'cancelled'),

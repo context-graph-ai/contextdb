@@ -4373,6 +4373,16 @@ impl Database {
         }
     }
 
+    /// Waits for a real same-database trigger contender to enter the wait gate.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seams"))]
+    pub fn wait_until_trigger_wait_observed_for_test(&self, minimum: u64) {
+        let mut guard = self.trigger.wait_lock.lock();
+        while self.trigger.wait_observed_count.load(Ordering::SeqCst) < minimum {
+            self.trigger.wait_observed_changed.wait(&mut guard);
+        }
+    }
+
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-seams"))]
     pub fn __inject_raw_joined_row_value_for_test(

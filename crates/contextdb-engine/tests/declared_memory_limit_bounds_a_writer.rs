@@ -17,6 +17,9 @@
 //! mapped, so resident bytes over-state what is live, and allocator slack is
 //! not something a charge model can be asked to predict.
 
+#[path = "fixtures/isolated_process.rs"]
+mod isolated_process;
+
 use contextdb_core::Error;
 use contextdb_core::Value;
 use contextdb_engine::database::ReceivedSchemaApplyObserverForTest;
@@ -143,6 +146,12 @@ fn measure_thread_peak<T>(action: impl FnOnce() -> T) -> (T, i64) {
 /// rows, so a whole-metadata clone cannot hide behind the table-copy cost.
 #[test]
 fn a_received_table_alter_does_not_clone_unrelated_event_metadata_before_admission() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_received_table_alter_does_not_clone_unrelated_event_metadata_before_admission",
+    ) {
+        return;
+    }
     const ROUTES: usize = 8;
     const FILTER_VALUES: usize = 512;
     const VALUE_BYTES: usize = 320;
@@ -593,6 +602,12 @@ fn charged_for_rows(db: &Database, accountant: &MemoryAccountant) -> usize {
 /// write, and still has every committed row after a close and reopen.
 #[test]
 fn a_declared_memory_limit_refuses_before_the_writer_retains_more_than_it() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_declared_memory_limit_refuses_before_the_writer_retains_more_than_it",
+    ) {
+        return;
+    }
     // Size the budget from what an event actually costs the accountant, so
     // the limit is one an operator could plausibly have set: room for about
     // PROOF_ROWS events on top of the schema.
@@ -772,6 +787,12 @@ fn a_declared_memory_limit_refuses_before_the_writer_retains_more_than_it() {
 /// grows with the schema.
 #[test]
 fn what_one_more_index_costs_the_writer_per_row() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "what_one_more_index_costs_the_writer_per_row",
+    ) {
+        return;
+    }
     const ROWS: usize = 400;
     eprintln!(
         "{:<21}  {:>7}  {:>11}  {:>11}  {:>13}  {:>11}",
@@ -824,6 +845,12 @@ fn what_one_more_index_costs_the_writer_per_row() {
 /// either.
 #[test]
 fn every_charge_a_row_takes_comes_back_when_the_row_does() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "every_charge_a_row_takes_comes_back_when_the_row_does",
+    ) {
+        return;
+    }
     const ROWS: usize = 120;
     const DDL: &str = "CREATE TABLE notes (id UUID PRIMARY KEY, context_id UUID NOT NULL,                        author TEXT NOT NULL, kind TEXT NOT NULL, seq INTEGER NOT NULL, body                        TEXT NOT NULL, UNIQUE (context_id, seq)) SYNC OFF";
     const INSERT: &str = "INSERT INTO notes (id, context_id, author, kind, seq, body) VALUES                           ($id, $context_id, $author, $kind, $seq, $body)";
@@ -1196,6 +1223,12 @@ fn charged_for_an_empty_table_after_with_staging(
 /// refusing work the store has room for.
 #[test]
 fn changing_the_index_set_over_existing_rows_settles_what_its_rows_now_cost() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "changing_the_index_set_over_existing_rows_settles_what_its_rows_now_cost",
+    ) {
+        return;
+    }
     const ROWS: usize = 60;
     let mut drifted = Vec::new();
     for door in [
@@ -1349,6 +1382,12 @@ fn charged_before_and_after(door: ReleaseDoor, rows: usize) -> (usize, usize) {
 /// `fallback_retained_row_bytes` in `database.rs`, and its unit test there.
 #[test]
 fn every_door_that_gives_a_row_back_returns_what_storing_it_took() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "every_door_that_gives_a_row_back_returns_what_storing_it_took",
+    ) {
+        return;
+    }
     const ROWS: usize = 40;
     let mut stranded = Vec::new();
     for door in [
@@ -1385,6 +1424,12 @@ fn every_door_that_gives_a_row_back_returns_what_storing_it_took() {
 /// for one per declaration, and not for four while a schema commits.
 #[test]
 fn a_table_is_charged_for_the_exact_probe_filters_it_actually_holds() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_table_is_charged_for_the_exact_probe_filters_it_actually_holds",
+    ) {
+        return;
+    }
     const DDL: &str = "CREATE TABLE holders (id UUID PRIMARY KEY, owner UUID NOT NULL UNIQUE, \
                        note TEXT NOT NULL) SYNC OFF";
     let root = tempfile::tempdir().expect("task-scoped fixture root");
@@ -1432,6 +1477,12 @@ fn a_table_is_charged_for_the_exact_probe_filters_it_actually_holds() {
 /// against a declared limit, and refuses work the machine has room for.
 #[test]
 fn a_schema_installed_in_one_transaction_reserves_what_it_keeps() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_schema_installed_in_one_transaction_reserves_what_it_keeps",
+    ) {
+        return;
+    }
     const TABLES: usize = 6;
     /// Room for the genuine transient staging of a six-table schema commit, and
     /// not room for three more copies of every filter in it.
@@ -1512,6 +1563,12 @@ fn a_schema_installed_in_one_transaction_reserves_what_it_keeps() {
 /// linear growth, and one that falls is something with a ceiling.
 #[test]
 fn what_the_durable_writer_holds_per_event_as_an_import_grows() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "what_the_durable_writer_holds_per_event_as_an_import_grows",
+    ) {
+        return;
+    }
     const SCALES: [usize; 3] = [300, 900, 2_700];
     eprintln!(
         "{:<8}  {:>12}  {:>12}  {:>14}  {:>16}",
@@ -1569,6 +1626,12 @@ fn what_the_durable_writer_holds_per_event_as_an_import_grows() {
 /// store open -- Redb's own page cache, which Redb caps and evicts at 8 MiB.
 #[test]
 fn a_durable_writer_is_refused_before_the_process_holds_more_than_its_limit() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_durable_writer_is_refused_before_the_process_holds_more_than_its_limit",
+    ) {
+        return;
+    }
     /// A store costs something to open whatever it then stores. This is that
     /// one-time cost, and it is the only fixed allowance this test gives:
     /// everything else it permits has to fall per event as the import grows.
@@ -1677,6 +1740,12 @@ fn a_durable_writer_is_refused_before_the_process_holds_more_than_its_limit() {
 /// mid-transaction, one too few after a DROP INDEX.
 #[test]
 fn a_transaction_open_across_an_index_set_change_settles_the_rows_it_staged() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_transaction_open_across_an_index_set_change_settles_the_rows_it_staged",
+    ) {
+        return;
+    }
     const COMMITTED: usize = 40;
     const STAGED: usize = 20;
     let mut drifted = Vec::new();
@@ -1714,6 +1783,12 @@ fn a_transaction_open_across_an_index_set_change_settles_the_rows_it_staged() {
 /// group. The whole group must be admitted before any part becomes durable.
 #[test]
 fn a_received_schema_group_refused_for_memory_installs_none_of_itself() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_received_schema_group_refused_for_memory_installs_none_of_itself",
+    ) {
+        return;
+    }
     // Durable rows populate the index fixture; catalog preparation is admitted separately.
     const ROWS: usize = 150;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
@@ -1923,6 +1998,12 @@ fn wide_params(row: usize) -> HashMap<String, Value> {
 /// bigger than that is refused, and installs none of itself.
 #[test]
 fn a_received_unit_priced_far_too_low_is_refused_not_installed_past_the_limit() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_received_unit_priced_far_too_low_is_refused_not_installed_past_the_limit",
+    ) {
+        return;
+    }
     // Enough wide rows that the index the unit brings is under-priced by more
     // than the bound -- asserted below rather than assumed.
     const ROWS: usize = 400;
@@ -2051,6 +2132,12 @@ fn a_received_unit_priced_far_too_low_is_refused_not_installed_past_the_limit() 
 /// written to it at all.
 #[test]
 fn a_received_alter_priced_far_too_low_leaves_the_old_shape_the_log_and_the_restart() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_received_alter_priced_far_too_low_leaves_the_old_shape_the_log_and_the_restart",
+    ) {
+        return;
+    }
     const ROWS: usize = 400;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
 
@@ -2187,6 +2274,12 @@ fn a_received_alter_priced_far_too_low_leaves_the_old_shape_the_log_and_the_rest
 /// covers.
 #[test]
 fn a_tiny_declared_limit_still_opens_an_empty_store_that_answers_and_can_raise_itself() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_tiny_declared_limit_still_opens_an_empty_store_that_answers_and_can_raise_itself",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let path = root.path().join("tiny-limit.db");
 
@@ -2240,6 +2333,12 @@ fn a_tiny_declared_limit_still_opens_an_empty_store_that_answers_and_can_raise_i
 /// kind, and refused ahead of all of them.
 #[test]
 fn a_mixed_kind_received_unit_refused_for_memory_installs_none_of_itself() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_mixed_kind_received_unit_refused_for_memory_installs_none_of_itself",
+    ) {
+        return;
+    }
     const ROWS: usize = 150;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let accountant = Arc::new(MemoryAccountant::no_limit());
@@ -2373,6 +2472,12 @@ fn label_params(row: usize) -> HashMap<String, Value> {
 /// its automatic primary key, so the whole 64 KiB lands on the arriving index.
 #[test]
 fn a_received_index_the_declared_limit_can_hold_is_installed_rather_than_parked() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_received_index_the_declared_limit_can_hold_is_installed_rather_than_parked",
+    ) {
+        return;
+    }
     const ROWS: usize = 60;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -2538,6 +2643,12 @@ fn a_received_index_the_declared_limit_can_hold_is_installed_rather_than_parked(
 /// and a hold left behind is cleared by the next delivery for that table.
 #[test]
 fn a_received_unit_that_installed_is_reported_applied_even_when_its_hold_will_not_clear() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_received_unit_that_installed_is_reported_applied_even_when_its_hold_will_not_clear",
+    ) {
+        return;
+    }
     const ROWS: usize = 150;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -3039,6 +3150,12 @@ fn measured_held_retry_room(include_later: bool, include_other: bool, other_only
 
 #[test]
 fn a_later_unit_for_a_held_table_waits_until_the_held_one_lands() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_later_unit_for_a_held_table_waits_until_the_held_one_lands",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let held = a_receiver_holding_a_table_back_for_memory(root.path());
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -3158,6 +3275,12 @@ fn a_later_unit_for_a_held_table_waits_until_the_held_one_lands() {
 /// hold exists to prevent -- and nothing would report the table as waiting.
 #[test]
 fn a_memory_hold_on_a_table_survives_the_receiver_closing_and_reopening() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_memory_hold_on_a_table_survives_the_receiver_closing_and_reopening",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let held = a_receiver_holding_a_table_back_for_memory(root.path());
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -3224,6 +3347,12 @@ const HELD_INCARNATION: contextdb_core::Incarnation = contextdb_core::Incarnatio
 /// record, and the author is never told the unit landed.
 #[test]
 fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried",
+    ) {
+        return;
+    }
     const ROWS: usize = 150;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -3509,6 +3638,12 @@ fn a_received_unit_held_for_memory_blocks_only_its_table_and_is_retried() {
 /// because for a moment both copies of those rows exist.
 #[test]
 fn taking_delivery_of_a_received_unit_is_charged_to_the_receivers_declared_limit() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "taking_delivery_of_a_received_unit_is_charged_to_the_receivers_declared_limit",
+    ) {
+        return;
+    }
     const ROWS: usize = 400;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -3623,6 +3758,12 @@ fn taking_delivery_of_a_received_unit_is_charged_to_the_receivers_declared_limit
 /// an accurate bill either way; only the peak tells the two apart.
 #[test]
 fn an_oversized_received_units_row_copy_is_refused_before_it_is_allocated() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "an_oversized_received_units_row_copy_is_refused_before_it_is_allocated",
+    ) {
+        return;
+    }
     const ROWS: usize = 4_000;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -3792,6 +3933,12 @@ fn an_oversized_received_units_row_copy_is_refused_before_it_is_allocated() {
 /// instead of absorbed.
 #[test]
 fn preparations_own_charges_draw_the_units_reservation_and_its_bounded_excess() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "preparations_own_charges_draw_the_units_reservation_and_its_bounded_excess",
+    ) {
+        return;
+    }
     const ROWS: usize = 40;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     // Comfortably inside `ADMITTED_SCHEMA_UNIT_EXCESS_BYTES`: a receiver's
@@ -3922,6 +4069,12 @@ fn preparations_own_charges_draw_the_units_reservation_and_its_bounded_excess() 
 /// large has somewhere to come from and shows up as a number below the start.
 #[test]
 fn a_refused_delivery_leaves_the_receivers_memory_bill_exactly_as_it_was() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_refused_delivery_leaves_the_receivers_memory_bill_exactly_as_it_was",
+    ) {
+        return;
+    }
     const ROWS: usize = 250;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -4097,6 +4250,12 @@ fn a_refused_delivery_leaves_the_receivers_memory_bill_exactly_as_it_was() {
 /// without publishing a partial unit.
 #[test]
 fn a_panic_between_staging_and_the_durable_commit_leaves_no_stage_behind() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_panic_between_staging_and_the_durable_commit_leaves_no_stage_behind",
+    ) {
+        return;
+    }
     const ROWS: usize = 120;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -4236,6 +4395,12 @@ fn a_panic_between_staging_and_the_durable_commit_leaves_no_stage_behind() {
 /// trace of the arriving unit anywhere.
 #[test]
 fn a_panic_immediately_before_the_durable_commit_leaves_no_stage_behind() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_panic_immediately_before_the_durable_commit_leaves_no_stage_behind",
+    ) {
+        return;
+    }
     const ROWS: usize = 120;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -4408,6 +4573,12 @@ fn assert_refuses_service_after_interrupted_publication(db: &Database) {
 /// always re-derives from regardless of what the live process was doing.
 #[test]
 fn a_panic_after_the_durable_commit_before_publication_is_recovered_by_restart() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_panic_after_the_durable_commit_before_publication_is_recovered_by_restart",
+    ) {
+        return;
+    }
     const ROWS: usize = 30;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -4518,6 +4689,12 @@ fn a_panic_after_the_durable_commit_before_publication_is_recovered_by_restart()
 /// components.
 #[test]
 fn a_panic_between_publication_components_is_recovered_by_restart() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_panic_between_publication_components_is_recovered_by_restart",
+    ) {
+        return;
+    }
     const ROWS: usize = 30;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -4784,6 +4961,12 @@ fn spawn_received_schema_crash_child(fault_point: &str) -> std::path::PathBuf {
 /// RESTART OF A DIFFERENT PROCESS.
 #[test]
 fn a_process_crash_immediately_before_the_durable_commit_leaves_the_old_complete_state() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_process_crash_immediately_before_the_durable_commit_leaves_the_old_complete_state",
+    ) {
+        return;
+    }
     let receiver_path = spawn_received_schema_crash_child("BeforeDurableCommit");
     let restarted = Database::open(&receiver_path).expect("reopen the crashed receiver");
     assert!(
@@ -4808,6 +4991,12 @@ fn a_process_crash_immediately_before_the_durable_commit_leaves_the_old_complete
 /// PROCESS NEVER RAN.
 #[test]
 fn a_process_crash_after_the_durable_commit_before_publication_is_recovered_by_restart() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_process_crash_after_the_durable_commit_before_publication_is_recovered_by_restart",
+    ) {
+        return;
+    }
     let receiver_path = spawn_received_schema_crash_child("AfterDurableCommitBeforePublish");
     let restarted = Database::open(&receiver_path).expect("reopen the crashed receiver");
     assert!(
@@ -4834,6 +5023,12 @@ fn a_process_crash_after_the_durable_commit_before_publication_is_recovered_by_r
 /// OWN COMPONENTS IS ALSO RECOVERED BY A REAL RESTART OF A DIFFERENT PROCESS.
 #[test]
 fn a_process_crash_between_publication_components_is_recovered_by_restart() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_process_crash_between_publication_components_is_recovered_by_restart",
+    ) {
+        return;
+    }
     let receiver_path = spawn_received_schema_crash_child("BetweenPublicationComponents");
     let restarted = Database::open(&receiver_path).expect("reopen the crashed receiver");
     assert!(
@@ -4903,6 +5098,12 @@ fn author_add_then_drop_column(path: &std::path::Path) -> Database {
 #[cfg(unix)]
 #[test]
 fn add_then_drop_column_history_answer_keeps_the_authored_order_after_a_change_log_gap() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "add_then_drop_column_history_answer_keeps_the_authored_order_after_a_change_log_gap",
+    ) {
+        return;
+    }
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
 
@@ -4952,6 +5153,12 @@ fn add_then_drop_column_history_answer_keeps_the_authored_order_after_a_change_l
 
 #[test]
 fn received_add_then_drop_column_installs_the_authors_final_schema() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "received_add_then_drop_column_installs_the_authors_final_schema",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("task-scoped schema fixture");
     let author = author_add_then_drop_column(&root.path().join("author.db"));
     let unit = author
@@ -5015,6 +5222,12 @@ fn received_add_then_drop_column_installs_the_authors_final_schema() {
 
 #[test]
 fn a_received_drop_column_and_rename_column_install_whole_and_survive_restart() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_received_drop_column_and_rename_column_install_whole_and_survive_restart",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
 
@@ -5385,6 +5598,12 @@ fn rename_evidence_journey(
 
 #[test]
 fn a_receiver_renames_a_column_only_when_the_authors_signed_change_says_so() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_receiver_renames_a_column_only_when_the_authors_signed_change_says_so",
+    ) {
+        return;
+    }
     // A divergent peer: the author never had `old`, and sends only a policy
     // change restating its own full shape. Nothing was renamed: partial
     // alterations preserve the columns they omit, whether or not the
@@ -5440,6 +5659,12 @@ fn a_receiver_renames_a_column_only_when_the_authors_signed_change_says_so() {
 /// that already landed.
 #[test]
 fn a_duplicate_delivery_after_restart_replays_the_stored_result_and_applies_nothing_twice() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_duplicate_delivery_after_restart_replays_the_stored_result_and_applies_nothing_twice",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
 
@@ -5559,6 +5784,12 @@ fn a_duplicate_delivery_after_restart_replays_the_stored_result_and_applies_noth
 /// is prepared off to one side and a refusal discards the stage.
 #[test]
 fn a_unit_with_no_provenance_installs_whole_or_not_at_all() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_unit_with_no_provenance_installs_whole_or_not_at_all",
+    ) {
+        return;
+    }
     const ROWS: usize = 300;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
 
@@ -5915,11 +6146,23 @@ fn a_unit_refused_while_staging_holds_its_table(door: ReceivedDoor) {
 
 #[test]
 fn an_authenticated_unit_refused_while_staging_holds_its_table() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "an_authenticated_unit_refused_while_staging_holds_its_table",
+    ) {
+        return;
+    }
     a_unit_refused_while_staging_holds_its_table(ReceivedDoor::Authenticated);
 }
 
 #[test]
 fn a_unit_with_no_provenance_refused_while_staging_holds_its_table() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_unit_with_no_provenance_refused_while_staging_holds_its_table",
+    ) {
+        return;
+    }
     a_unit_refused_while_staging_holds_its_table(ReceivedDoor::Unattested);
 }
 
@@ -6180,11 +6423,23 @@ fn a_refused_index_rebuild_returns_the_rows_charge(resident: bool) {
 
 #[test]
 fn a_refused_index_rebuild_returns_the_rows_charge_in_memory() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_refused_index_rebuild_returns_the_rows_charge_in_memory",
+    ) {
+        return;
+    }
     a_refused_index_rebuild_returns_the_rows_charge(true);
 }
 
 #[test]
 fn a_refused_index_rebuild_returns_the_rows_charge_on_disk() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_refused_index_rebuild_returns_the_rows_charge_on_disk",
+    ) {
+        return;
+    }
     a_refused_index_rebuild_returns_the_rows_charge(false);
 }
 
@@ -6438,16 +6693,34 @@ fn a_vector_copy_is_admitted_before_it_is_allocated(resident: bool, saved: bool)
 
 #[test]
 fn a_vector_copy_is_admitted_before_it_is_allocated_in_memory() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_vector_copy_is_admitted_before_it_is_allocated_in_memory",
+    ) {
+        return;
+    }
     a_vector_copy_is_admitted_before_it_is_allocated(true, false);
 }
 
 #[test]
 fn a_vector_copy_is_admitted_before_it_is_allocated_on_disk() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_vector_copy_is_admitted_before_it_is_allocated_on_disk",
+    ) {
+        return;
+    }
     a_vector_copy_is_admitted_before_it_is_allocated(false, false);
 }
 
 #[test]
 fn a_saved_vector_copy_is_admitted_before_it_is_loaded() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_saved_vector_copy_is_admitted_before_it_is_loaded",
+    ) {
+        return;
+    }
     a_vector_copy_is_admitted_before_it_is_allocated(false, true);
 }
 
@@ -6467,6 +6740,12 @@ fn a_saved_vector_copy_is_admitted_before_it_is_loaded() {
 /// delivery with room installs.
 #[test]
 fn a_file_backed_receiver_obtains_memory_before_loading_the_table_it_copies() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "a_file_backed_receiver_obtains_memory_before_loading_the_table_it_copies",
+    ) {
+        return;
+    }
     const ROWS: usize = 4_000;
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let tenant = contextdb_core::TenantId::from(HELD_TENANT);
@@ -6744,6 +7023,12 @@ fn authored_schema_unit(author: &SchemaPeer, statement: &str) -> ChangeSet {
 
 #[test]
 fn an_edge_refuses_schema_a_hub_forwards_under_another_authors_name() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "an_edge_refuses_schema_a_hub_forwards_under_another_authors_name",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let author = SchemaPeer::open(root.path(), "author");
     let hub = SchemaPeer::open(root.path(), "hub");
@@ -6798,6 +7083,12 @@ fn an_edge_refuses_schema_a_hub_forwards_under_another_authors_name() {
 
 #[test]
 fn an_edge_refuses_a_statement_that_was_swapped_in_flight() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "an_edge_refuses_a_statement_that_was_swapped_in_flight",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let author = SchemaPeer::open(root.path(), "swap-author");
     let edge = SchemaPeer::open(root.path(), "swap-edge");
@@ -6848,6 +7139,12 @@ fn an_edge_refuses_a_statement_that_was_swapped_in_flight() {
 
 #[test]
 fn an_authors_signature_travels_two_hops_a_restart_and_a_third_peer() {
+    if isolated_process::run_in_own_process(
+        module_path!(),
+        "an_authors_signature_travels_two_hops_a_restart_and_a_third_peer",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().expect("task-scoped fixture root");
     let author = SchemaPeer::open(root.path(), "journey-author");
     let hub = SchemaPeer::open(root.path(), "journey-hub");

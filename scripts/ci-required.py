@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import sys
 
-REQUIRED = {"lint", "test-bundles", "build", "features",
+REQUIRED = {"lint", "lint-macos", "test-bundles", "build", "features",
             "installed-smoke", "cross-compile", "impact", "integration"}
 
 
@@ -94,8 +94,9 @@ def integration_caller(workflow):
 
 
 def root_chain(workflow):
-    expected = {'lint': None, 'features': 'lint', 'build': 'features',
-                'cross-compile': 'build', 'installed-smoke': None}
+    expected = {'lint': None, 'features': 'lint', 'build': 'lint',
+                'cross-compile': None, 'installed-smoke': None,
+                'lint-macos': None}
     for name, predecessor in expected.items():
         block = re.search(r"^  " + re.escape(name) + r":\n(.*?)(?=^  [\w-]+:|\Z)",
                           workflow, re.M | re.S)
