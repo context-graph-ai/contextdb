@@ -1112,7 +1112,7 @@ fn process_meta_line(
             session.had_error = true;
         }
     } else if is_explain_command(line) {
-        if !handle_explain_command(session_handle, line, input) {
+        if !handle_explain_command(session_handle, line, input, session) {
             session.had_error = true;
         }
     } else {
@@ -2340,7 +2340,12 @@ fn handle_trace_command(line: &str, input: InputContext, trace_enabled: &mut boo
     true
 }
 
-fn handle_explain_command(session_handle: &Session, line: &str, input: InputContext) -> bool {
+fn handle_explain_command(
+    session_handle: &Session,
+    line: &str,
+    input: InputContext,
+    session: &mut SessionState,
+) -> bool {
     let rest = line.strip_prefix(".explain").unwrap_or("").trim();
     if rest.is_empty() {
         report_failure(ErrorClass::Usage, "Usage: .explain <sql>", input);
@@ -2363,7 +2368,9 @@ fn handle_explain_command(session_handle: &Session, line: &str, input: InputCont
     let bound_params = HashMap::new();
 
     if path == ExplainPath::RuntimeRead {
-        return match session_handle.reader().execute(rest, &bound_params) {
+        let result = session_handle.reader().execute(rest, &bound_params);
+        note_read_route(session_handle, input, session);
+        return match result {
             Ok(result) => {
                 if input.output.json {
                     json_output::print_document(&json_output::explain_document(&result));
@@ -2411,6 +2418,7 @@ fn handle_explain_command(session_handle: &Session, line: &str, input: InputCont
             })
         });
 
+    note_read_route(session_handle, input, session);
     match explained {
         Ok(explained) if path == ExplainPath::PassiveVector => {
             if input.output.json {
