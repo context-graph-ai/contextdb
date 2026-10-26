@@ -221,3 +221,7 @@ mod a_file_session_observes_a_writer_that_already_closed;
 #[cfg(unix)]
 #[path = "read/a_companionless_reader_adopts_an_unchanged_first_writer.rs"]
 mod a_companionless_reader_adopts_an_unchanged_first_writer;
+
+#[cfg(unix)]
+#[path = "read/an_erased_reader_keeps_its_erasure_answer_when_asking_for_its_owner.rs"]
+mod an_erased_reader_keeps_its_erasure_answer_when_asking_for_its_owner;

@@ -2294,7 +2294,10 @@ impl ReadSession {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
-    fn after_writer_turnover(&self, cancellation: &OwnerReadCancellation) -> Result<()> {
+    fn after_writer_turnover(
+        &self,
+        cancellation: &OwnerReadCancellation,
+    ) -> Result<Option<contextdb_core::read_contract::ReadFailure>> {
         let (previous, file_writer_run) = {
             let selected = self.state.read().expect("selected read route");
             (Arc::clone(&selected.state), selected.file_writer_run)
@@ -2312,7 +2315,7 @@ impl ReadSession {
             )
         };
         let (path, identity, runtime_dir, observed, memory) = match previous.as_ref() {
-            ReadSessionState::LiveDatabase(_) => return Ok(()),
+            ReadSessionState::LiveDatabase(_) => return Ok(None),
             ReadSessionState::OwnerChannel(owner) => {
                 let observed = crate::persistence::observed_writer_state(&owner.path);
                 if let Some(observed) = &observed {
@@ -2326,7 +2329,7 @@ impl ReadSession {
                                 contextdb_core::read_contract::OwnerServingReason::ShutdownDraining,
                             );
                     if observed.run == owner.writer_run && observed.held && !draining {
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
                 (
@@ -2352,12 +2355,12 @@ impl ReadSession {
                         return Err(mismatch());
                     }
                     if !observed.held && Some(observed.run) == file_writer_run {
-                        return Ok(());
+                        return Ok(None);
                     }
                 } else if crate::persistence::observe_unsettled_claim(path).is_none() {
                     // An unchanged idle image needs no new backend. A verified
                     // opening claim instead enters the selector's bounded wait.
-                    return Ok(());
+                    return Ok(None);
                 }
                 (
                     path,
@@ -2384,6 +2387,50 @@ impl ReadSession {
             #[cfg(not(any(test, feature = "test-seams")))]
             let _ = event;
         };
+        let retained_erasure = || -> Result<Option<contextdb_core::read_contract::ReadFailure>> {
+            let ReadSessionState::DirectFile(reader) = previous.as_ref() else {
+                return Ok(None);
+            };
+            let budget = crate::executor::ReadPublicationBudget {
+                clock: Arc::clone(&clock),
+                cancellation: cancellation.clone(),
+                started_ms,
+                // Publication expires strictly after active_ms; use the
+                // handover's original absolute routing deadline here too.
+                active_ms: self.options.timeouts.routing_retry_ms.saturating_sub(1),
+            };
+            match reader.check_turnover_with_budget(&budget) {
+                Ok(()) => Ok(None),
+                Err(Error::ReadFailure(failure))
+                    if failure.kind() == contextdb_core::read_contract::ReadFailureKind::AuthoritativeErasure =>
+                {
+                    // Keep the original snapshot and its fences. Bounded
+                    // reads let the kernel decide which tables are affected;
+                    // owner-only requests preserve this exact erasure answer.
+                    Ok(Some(failure))
+                }
+                Err(Error::ReadFailure(failure))
+                    if matches!(failure.detail(),
+                        contextdb_core::read_contract::ReadFailureDetail::OwnerLimitExceeded(detail)
+                            if detail.limit == contextdb_core::read_contract::ReadFailureLimit::ActiveMs) =>
+                {
+                    Err(Error::ReadFailure(
+                        contextdb_core::read_contract::ReadFailure::new(
+                            contextdb_core::read_contract::ReadFailureKind::OwnerNotServing,
+                            contextdb_core::read_contract::ReadFailureDetail::Reason {
+                                reason: "the caller's routing deadline expired while checking authoritative erasure before changing read routes".to_owned(),
+                            },
+                        ).expect("owner-not-serving refusal carries a reason"),
+                    ))
+                }
+                Err(other) => Err(other),
+            }
+        };
+        // Check before dialing too: an unavailable replacement channel must
+        // not hide an erasure the retained file reader already knows about.
+        if let Some(failure) = retained_erasure()? {
+            return Ok(Some(failure));
+        }
         let selected = select_route_with_ownership_retry(
             path,
             &self.options(),
@@ -2396,6 +2443,9 @@ impl ReadSession {
         )?;
         if cancellation.is_cancelled() {
             return Err(Error::ReadCancelled);
+        }
+        if let Some(failure) = retained_erasure()? {
+            return Ok(Some(failure));
         }
         let snapshot_floor = match previous.as_ref() {
             ReadSessionState::DirectFile(reader) => Some(reader.snapshot_lsn()),
@@ -2451,7 +2501,7 @@ impl ReadSession {
         if installed {
             observe(ReadSessionEvent::RouteSelected(route));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Open a read-only session by selecting its initial owner or file route.
@@ -3252,7 +3302,7 @@ impl ReadSession {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn charged_bytes(&self) -> Result<u64> {
-        self.after_writer_turnover(&OwnerReadCancellation::new())?;
+        let _ = self.after_writer_turnover(&OwnerReadCancellation::new())?;
         match self.selected_state().as_ref() {
             ReadSessionState::LiveDatabase(database) => Ok(database.declared_read_charged_bytes()),
             ReadSessionState::DirectFile(reader) => Ok(reader.charged_bytes()),
@@ -3353,7 +3403,7 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<QueryResult> {
-        with_progress_observer(self.progress.as_ref(), || {
+        let _ = with_progress_observer(self.progress.as_ref(), || {
             with_route_source_counter(&self.resources, || self.after_writer_turnover(cancellation))
         })?;
         let selected = self.selected_state();
@@ -3563,7 +3613,7 @@ impl ReadSession {
         continuation: Option<&str>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<MetadataAnswer> {
-        self.after_writer_turnover(cancellation)?;
+        let _ = self.after_writer_turnover(cancellation)?;
         self.metadata_on_selected_route(request, continuation, cancellation)
     }
 
@@ -3821,7 +3871,7 @@ impl ReadSession {
         params: &HashMap<String, Value>,
         cancellation: &OwnerReadCancellation,
     ) -> Result<ReadCursor> {
-        self.after_writer_turnover(cancellation)?;
+        let _ = self.after_writer_turnover(cancellation)?;
         self.open_cursor_on_selected_route(sql, params, cancellation)
     }
 
@@ -4276,7 +4326,9 @@ impl ReadSession {
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
     pub fn request_owner(&self, namespace: &str, request: &[u8]) -> Result<Vec<u8>> {
-        self.after_writer_turnover(&OwnerReadCancellation::new())?;
+        if let Some(failure) = self.after_writer_turnover(&OwnerReadCancellation::new())? {
+            return Err(Error::ReadFailure(failure));
+        }
         match self.selected_state().as_ref() {
             // The embedded caller already holds the owner, so it asks the
             // handler directly rather than dialling its own channel.

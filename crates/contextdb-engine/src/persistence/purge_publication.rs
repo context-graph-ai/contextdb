@@ -1338,6 +1338,39 @@ impl Fence {
         value: T,
         budget: Option<&crate::executor::ReadPublicationBudget>,
     ) -> Result<T> {
+        self.publish_tables_with_budget(
+            snapshot_lsn,
+            tables.iter().map(String::as_str),
+            value,
+            budget,
+            true,
+        )
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn check_turnover_with_budget(
+        &mut self,
+        snapshot_lsn: Lsn,
+        budget: &crate::executor::ReadPublicationBudget,
+    ) -> Result<()> {
+        self.publish_tables_with_budget(snapshot_lsn, ["*"], (), Some(budget), false)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn publish_tables_with_budget<'a, T>(
+        &mut self,
+        snapshot_lsn: Lsn,
+        tables: impl IntoIterator<Item = &'a str>,
+        value: T,
+        budget: Option<&crate::executor::ReadPublicationBudget>,
+        #[allow(unused_variables)] publishing_result: bool,
+    ) -> Result<T> {
         #[cfg(any(test, feature = "test-seams"))]
         super::read_persistence_test_scaffold::note_erasure_publication_for_test();
         self.acquire_reader_admission(budget)?;
@@ -1402,7 +1435,9 @@ impl Fence {
             Ok(value)
         })();
         #[cfg(feature = "test-seams")]
-        pause_before_publication_unlock_for_test();
+        if publishing_result {
+            pause_before_publication_unlock_for_test();
+        }
         release_companion_range_lock(&self.file, PUBLICATION_LOCK_OFFSET);
         release_companion_range_lock(&self.file, PUBLICATION_ADMISSION_LOCK_OFFSET);
         verdict

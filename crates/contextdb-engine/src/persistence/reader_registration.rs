@@ -4788,6 +4788,41 @@ impl ReadSnapshotRegistrationGuard {
         scope: &crate::executor::ReadPublicationScope,
         value: T,
     ) -> Result<T> {
+        self.with_publication_fences(value, |fence, value| {
+            fence.publish_with_budget(
+                scope.snapshot_lsn,
+                &scope.tables,
+                value,
+                Some(&scope.budget),
+            )
+        })
+    }
+
+    /// A replacement route cannot discard an erasure published since the
+    /// retained reader's snapshot, even when the new writer has newer rows.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn check_turnover_with_budget(
+        &self,
+        snapshot_lsn: Lsn,
+        budget: &crate::executor::ReadPublicationBudget,
+    ) -> Result<()> {
+        self.with_publication_fences((), |fence, ()| {
+            fence.check_turnover_with_budget(snapshot_lsn, budget)
+        })
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    fn with_publication_fences<T>(
+        &self,
+        value: T,
+        mut publish: impl FnMut(&mut purge_publication::Fence, T) -> Result<T>,
+    ) -> Result<T> {
         // A fence exists when a trusted companion named the writer incarnation
         // this reader is racing. Without one there is no such writer and no
         // erasure to be caught by, so the result is the reader's own and goes
@@ -4810,12 +4845,7 @@ impl ReadSnapshotRegistrationGuard {
                     .expect("authoritative-erasure refusal carries ordinary reason detail"),
                 )
             })?;
-            value = fence.publish_with_budget(
-                scope.snapshot_lsn,
-                &scope.tables,
-                value,
-                Some(&scope.budget),
-            )?;
+            value = publish(&mut fence, value)?;
         }
         Ok(value)
     }

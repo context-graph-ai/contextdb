@@ -1480,6 +1480,19 @@ impl DirectFileReader {
             .publish_bounded_result(scope, value)
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    pub(crate) fn check_turnover_with_budget(
+        &self,
+        budget: &crate::executor::ReadPublicationBudget,
+    ) -> contextdb_core::Result<()> {
+        self.retained_source
+            .registration()
+            .check_turnover_with_budget(self.snapshot_lsn(), budget)
+    }
+
     pub(crate) fn database_path(&self) -> &Path {
         self.retained_source.database_path()
     }
