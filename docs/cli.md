@@ -253,6 +253,8 @@ A `--write` session may use the cursor while no transaction is open; `.cursor op
 active transaction refuses with `cursor_transaction_active` without disturbing the transaction.
 <!-- enforced by: read_cli_journeys_cursor::a_write_session_may_page_outside_a_transaction_but_not_inside_one -->
 
+A cursor you opened while the writer was running keeps its results after the writer stops; it uses the memory you gave the reader, not the writer's.
+
 #### Metadata: bounded and resumable
 
 `.tables` and `.events status` return as many complete items as fit in `result_bytes`, plus
@@ -291,22 +293,14 @@ throughout is never skipped, and an item created or dropped between pages may or
 (as psql's catalog listings behave under concurrent DDL).
 <!-- enforced by: read_cli_journeys_metadata::tables_under_json_is_a_namespaced_page_document, read_cli_journeys_metadata::events_status_pages_under_its_own_namespaced_key, read_cli_journeys_metadata::tables_resumes_through_its_own_continuation_until_exhausted, read_cli_journeys_metadata::a_human_metadata_page_prints_the_exact_follow_up_command, read_cli_journeys_metadata::a_continuation_is_refused_by_a_command_that_did_not_issue_it, read_cli_journeys_metadata::a_complete_metadata_response_that_does_not_fit_refuses_with_the_setting_that_would -->
 
-A read session spans writer reopens within the same store incarnation. New operations
-follow the current writer. If an operation selects the file while no writer is serving,
-later operations re-select when a writer appears or its published run changes; the
-reported file snapshot time advances when a fresh file image is selected. Unchanged
-idle files keep their selected image. A cursor already in progress keeps its captured
-snapshot and continues that same read, independently of later session route changes.
+A reader keeps working while the writer restarts. If the writer is down, the reader answers from what was last saved. When the writer is back, the reader switches to it on its own. You never have to reopen a reader because the writer came and went. In the read shell you see a short line each time this happens, with the point in the data it is reading from.
 
 ### Declared limits
 
 Every read threshold is declared configuration. A direct reader spends its own process resources
 and uses its requested values; on the owner route the effective value is, field by field, the
 stricter of your request and the owner's advertised maximum — you can lower owner policy, never
-raise it. Once that owner has exited and its cursor continues through a direct file
-reader, MEMORY uses the reader session's own declared limit, capped by its explicit
-memory limit and less the resources it already retains. Every other negotiated cursor
-limit stays in force. <!-- enforced by: read_cli_journeys_invocation::a_valid_lowered_configuration_is_accepted, read_cli_journeys_live_owner::the_owners_ceiling_applies_and_a_caller_cannot_raise_it --> The writer/server side declares its policy
+raise it. <!-- enforced by: read_cli_journeys_invocation::a_valid_lowered_configuration_is_accepted, read_cli_journeys_live_owner::the_owners_ceiling_applies_and_a_caller_cannot_raise_it --> The writer/server side declares its policy
 with the mirrored `--owner-read-*` flags plus `--owner-read-concurrency` (default 4),
 `--owner-read-request-ms` (10,000), `--owner-read-shutdown-drain-ms` (10,000),
 `--no-owner-reads`, and `--owner-read-runtime-dir <absolute-path>`.
