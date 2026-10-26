@@ -4343,7 +4343,7 @@ impl ReadSnapshotRegistrationGuard {
                     })?;
                 continue;
             }
-            #[allow(unreachable_code)]
+            #[cfg(not(any(test, feature = "test-seams")))]
             {
                 let _ = index;
                 registration

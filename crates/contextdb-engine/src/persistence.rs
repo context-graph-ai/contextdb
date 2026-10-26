@@ -25,19 +25,6 @@ macro_rules! observed_graph_key {
     ($family:expr, "get", $key:expr) => {
         crate::read_work_probe::graph_storage_key($family, "get", $key)
     };
-    ($family:expr, $operation:expr, $key:expr) => {{
-        if matches!($operation, "insert" | "remove") {
-            let boundary = match $family {
-                "graph_fwd" | "graph_rev" => 5,
-                "graph_lifecycle" => 6,
-                "graph_location" => 7,
-                "history" => 8,
-                _ => 4,
-            };
-            retention_reclaim_checkpoint_for_test(boundary);
-        }
-        crate::read_work_probe::graph_storage_key($family, $operation, $key)
-    }};
 }
 #[cfg(not(any(test, feature = "test-seams")))]
 macro_rules! observed_graph_key {

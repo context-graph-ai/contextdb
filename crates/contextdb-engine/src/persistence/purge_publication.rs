@@ -1376,7 +1376,11 @@ impl Fence {
         tables: impl IntoIterator<Item = &'a str>,
         value: T,
         budget: Option<&crate::executor::ReadPublicationBudget>,
-        #[allow(unused_variables)] publishing_result: bool,
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(unused_variables, reason = "KEEP-SEAM: only the test-seams build pauses on it")
+        )]
+        publishing_result: bool,
     ) -> Result<T> {
         #[cfg(any(test, feature = "test-seams"))]
         super::read_persistence_test_scaffold::note_erasure_publication_for_test();

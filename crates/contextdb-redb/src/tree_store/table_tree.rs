@@ -397,7 +397,10 @@ impl TableTreeMut<'_> {
         self.pending_table_updates.clear();
     }
 
-    #[cfg_attr(not(debug_assertions), expect(dead_code))]
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(dead_code, reason = "KEEP-FEATURE: called only by debug-assertion checks")
+    )]
     pub(crate) fn visit_all_pages<F>(&self, mut visitor: F) -> Result
     where
         F: FnMut(&PagePath) -> Result,

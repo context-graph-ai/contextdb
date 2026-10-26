@@ -1181,10 +1181,7 @@ fn regression23() {
     let txn = db.begin_write().unwrap();
     {
         // List the savepoints to ensure the system table is created and occupies a page
-        #[allow(unused_must_use)]
-        {
-            txn.list_persistent_savepoints().unwrap();
-        }
+        let _ = txn.list_persistent_savepoints().unwrap();
         let mut table = txn.open_table(U64_TABLE).unwrap();
         table.insert(0, 0).unwrap();
     }
@@ -1254,10 +1251,7 @@ fn regression24() {
         let id = txn.persistent_savepoint().unwrap();
         txn.delete_persistent_savepoint(id).unwrap();
         // List the savepoints to ensure the system table is created and occupies a page
-        #[allow(unused_must_use)]
-        {
-            txn.list_persistent_savepoints().unwrap();
-        }
+        let _ = txn.list_persistent_savepoints().unwrap();
         let mut table = txn.open_table(U64_TABLE).unwrap();
         table.insert(0, 0).unwrap();
     }

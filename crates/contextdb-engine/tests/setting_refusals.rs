@@ -14,7 +14,6 @@
 #![cfg(unix)]
 
 #[path = "read/reader_proof_support.rs"]
-#[allow(dead_code)]
 mod reader_proof_support;
 
 use contextdb_core::read_contract::ReadLimits;

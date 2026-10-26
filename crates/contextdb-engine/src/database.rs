@@ -2,7 +2,6 @@
 #![allow(clippy::field_reassign_with_default)] // Existing compatibility and test seam shape.
 #![allow(clippy::too_many_arguments)] // Existing compatibility and test seam shape.
 #![allow(clippy::type_complexity)] // Existing compatibility and test seam shape.
-#![allow(unused_doc_comments)] // Existing compatibility and test seam shape.
 // Custody-only persistence seam.
 #[cfg(feature = "sync-orchestration")]
 pub(crate) mod custody_pull;
@@ -1060,11 +1059,11 @@ const RECEIVED_SCHEMA_MEMORY_HOLDBACK_OPERATION: &str = "received_schema_memory_
 const STAGE_RECEIVED_UNIT_COPY_HINT: &str = "Raise MEMORY_LIMIT on the receiver, or send the schema change over smaller tables: taking \
      delivery copies every table the unit reshapes before it publishes anything.";
 
-/// Set while a test needs the receiver's durable memory-hold record to refuse
-/// every write, so the answer an installed unit's author gets can be observed
-/// rather than argued.
 #[cfg(any(test, feature = "test-seams"))]
 thread_local! {
+    /// Set while a test needs the receiver's durable memory-hold record to refuse
+    /// every write, so the answer an installed unit's author gets can be observed
+    /// rather than argued.
     static REFUSE_MEMORY_HOLDBACK_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

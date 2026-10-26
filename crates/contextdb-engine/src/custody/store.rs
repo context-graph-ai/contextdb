@@ -570,22 +570,21 @@ pub(crate) fn bracket(_label: &'static str, _phase: u8, _invoice: usize, _held: 
 #[inline]
 pub(crate) fn refusal_injected(_label: &'static str) -> bool {
     #[cfg(feature = "test-seams")]
-    {
-        return REFUSE_AT.with(|cell| match cell.get() {
-            Some((label, count)) if label == _label => {
-                if count <= 1 {
-                    cell.set(None);
-                    true
-                } else {
-                    cell.set(Some((label, count - 1)));
-                    false
-                }
+    let refused = REFUSE_AT.with(|cell| match cell.get() {
+        Some((label, count)) if label == _label => {
+            if count <= 1 {
+                cell.set(None);
+                true
+            } else {
+                cell.set(Some((label, count - 1)));
+                false
             }
-            _ => false,
-        });
-    }
-    #[allow(unreachable_code)]
-    false
+        }
+        _ => false,
+    });
+    #[cfg(not(feature = "test-seams"))]
+    let refused = false;
+    refused
 }
 /// The typed refusal of one labelled admission, built from static texts
 /// inside the operation's error reserve.

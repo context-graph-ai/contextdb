@@ -2065,7 +2065,10 @@ impl Database {
             .is_allocated(crate::tree_store::PageNumber::from_le_bytes(page))
     }
 
-    #[cfg_attr(not(debug_assertions), expect(dead_code))]
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(dead_code, reason = "KEEP-FEATURE: called only by debug-assertion checks")
+    )]
     fn check_repaired_allocated_pages_table(
         system_root: Option<BtreeHeader>,
         mem: Arc<TransactionalMemory>,

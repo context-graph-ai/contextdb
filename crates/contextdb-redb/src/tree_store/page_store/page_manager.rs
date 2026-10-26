@@ -1550,7 +1550,10 @@ impl TransactionalMemory {
         Ok(())
     }
 
-    #[cfg_attr(not(debug_assertions), expect(unused_variables))]
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(unused_variables, reason = "KEEP-FEATURE: read only by debug-assertion checks")
+    )]
     pub(crate) fn is_allocated(&self, page: PageNumber) -> bool {
         #[cfg(debug_assertions)]
         {

@@ -7126,7 +7126,7 @@ impl IndexState {
     /// insertion cannot complete, the old graph is retired so no query can
     /// mistake a stale route for a complete one; the authoritative vectors
     /// remain available to exact search and maintenance can build a new graph.
-    #[allow(dead_code)] // Retain the materialized-index insertion path for loader fallbacks.
+    #[allow(dead_code, reason = "HNSW: the materialized-index insertion path goes with the HNSW index when it is replaced")]
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
