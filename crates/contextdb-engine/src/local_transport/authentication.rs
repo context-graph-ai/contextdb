@@ -80,6 +80,13 @@ pub fn peer_user_from_stream<T>(_: &T) -> Result<LocalUserIdentity, LocalTranspo
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from mod.rs"
+    )
+)]
 pub fn authenticate_stream_handshake(
     stream: &std::os::unix::net::UnixStream,
     expected: &LocalHandshake,
@@ -122,6 +129,13 @@ pub struct AdmittedReader {
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_authentication.rs"
+    )
 )]
 pub fn authenticate_framed_stream_handshake<'a>(
     stream: &'a mut std::os::unix::net::UnixStream,

@@ -868,6 +868,13 @@ pub(super) fn validate_read_version_bounds(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from retained_read_source.rs"
+    )
+)]
 pub(super) fn decode_read_relational_table(
     read_txn: &redb::ReadTransaction,
     name: &str,
@@ -1028,6 +1035,13 @@ pub(super) fn remove_quantized_placeholders(row: &mut VersionedRow, meta: &Table
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from retained_read_source.rs"
+    )
 )]
 pub(super) fn decode_read_vectors(
     read_txn: &redb::ReadTransaction,
@@ -3283,6 +3297,13 @@ pub(super) fn decode_read_open_config(
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from reader_registration.rs"
+    )
+)]
 pub(super) fn decode_read_trigger_audit_stamps(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<Vec<(String, u64)>, LoadReadImageError> {
@@ -3355,6 +3376,13 @@ pub(super) fn decode_read_sink_queue_extents(
 
 #[cfg(any(test, feature = "test-seams"))]
 #[allow(clippy::type_complexity)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from reader_registration.rs"
+    )
+)]
 pub(super) fn decode_read_sink_queues(
     read_txn: &redb::ReadTransaction,
 ) -> std::result::Result<BTreeMap<String, Vec<(u64, Vec<u8>)>>, LoadReadImageError> {

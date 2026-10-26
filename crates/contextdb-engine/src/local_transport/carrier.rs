@@ -143,6 +143,13 @@ impl UnixLocalCarrier {
         )
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn connect<'a>(
         &'a self,
         path: &'a std::path::Path,
@@ -231,6 +238,13 @@ impl UnixLocalCarrier {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_service_contract.rs"
+        )
     )]
     pub fn receive_message(
         &self,
@@ -393,6 +407,13 @@ impl UnixLocalCarrier {
         )
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+        )
+    )]
     pub fn retry_connect<'a>(
         &'a self,
         path: &'a std::path::Path,
@@ -418,6 +439,13 @@ impl UnixLocalCarrier {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
     )]
     pub fn probe_stale(
         &self,
@@ -1342,6 +1370,13 @@ fn classify_connect_error(error: nix::errno::Errno) -> Result<ConnectAttempt, Lo
 }
 
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 fn wait_for_wake<T>(future: impl Future<Output = T>) -> T {
     struct ThreadWake(std::thread::Thread);
 

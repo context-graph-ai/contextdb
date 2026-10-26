@@ -156,6 +156,7 @@ impl Database {
     /// status exchange so the hub can key its per-edge record by
     /// `(node_id, incarnation)`.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature"))]
     fn sync_incarnation(&self, tenant_id: &TenantId) -> Result<Incarnation> {
         let read_memory = self.declared_reader_memory()?;
         self.sync_incarnation_with_read_memory(tenant_id, read_memory)
@@ -281,6 +282,7 @@ impl Database {
     /// monotonic advancement; this only writes the config value or the
     /// in-memory equivalent for ephemeral databases.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from main.rs"))]
     fn persist_sync_applied_push_watermark(
         &self,
         tenant_id: &TenantId,

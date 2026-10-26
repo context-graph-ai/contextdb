@@ -921,6 +921,13 @@ fn consolidation_publication_preserves_work_and_rechecks_obsolete_failure_marks(
 // compares the decoder's own original-funded row window for identical shapes.
 #[derive(Clone, Copy, Default)]
 struct ProjectionDecodeWindows {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     active: bool,
     starts: [usize; 2],
     finishes: [usize; 2],
@@ -929,6 +936,13 @@ struct ProjectionDecodeWindows {
     peak: [usize; 2],
 }
 thread_local! { static DECODE_WINDOWS: Cell<ProjectionDecodeWindows> = const { Cell::new(ProjectionDecodeWindows { active: false, starts: [0;2], finishes: [0;2], dirty_start: false, empty_finish: false, peak: [0;2] }) }; }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from schema_projection.rs"
+    )
+)]
 pub(crate) fn observe_projection_decode_window(pass: usize, before: bool, held: usize) {
     DECODE_WINDOWS.with(|slot| {
         let mut work = slot.get();

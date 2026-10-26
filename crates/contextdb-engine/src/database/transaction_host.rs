@@ -1922,6 +1922,13 @@ impl VectorSearchTraceObservation {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from native_buffer_transfer_tests.rs"
+        )
+    )]
     pub(super) fn copy_from(
         trace: &contextdb_vector::mem::OwnedVectorSearchTrace,
         read_memory: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
@@ -3237,6 +3244,13 @@ impl DatabaseTransactionHost {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from received_schema_atomic_retry_tests.rs"
+        )
+    )]
     pub(super) fn commit_index_snapshot(&self) -> BTreeMap<Lsn, TxId> {
         match self {
             Self::Legacy(manager) => manager.commit_index_snapshot(),
@@ -3261,6 +3275,13 @@ impl DatabaseTransactionHost {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from manager.rs"
+        )
+    )]
     pub(super) fn try_commit_index_census(&self) -> Result<(usize, Lsn)> {
         match self {
             Self::Legacy(manager) => manager.try_commit_index_census(),
@@ -3274,6 +3295,13 @@ impl DatabaseTransactionHost {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from manager.rs"
+        )
     )]
     pub(super) fn try_commit_index_census_with_context(
         &self,
@@ -3306,6 +3334,13 @@ impl DatabaseTransactionHost {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from manager.rs"
+        )
     )]
     pub(super) fn try_commit_index_contains_with_context(
         &self,
@@ -3343,6 +3378,13 @@ impl DatabaseTransactionHost {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from manager.rs"
+        )
+    )]
     pub(super) fn try_commit_index_floor_with_context(
         &self,
         upper: std::ops::Bound<Lsn>,
@@ -3361,6 +3403,13 @@ impl DatabaseTransactionHost {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from manager.rs"
+        )
     )]
     pub(super) fn try_commit_index_get_with_context(
         &self,
@@ -4193,6 +4242,13 @@ impl DatabaseTransactionHost {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_and_row_writes.rs"
+        )
+    )]
     pub(super) fn write_set_lock_is_held_for_test(&self) -> bool {
         match self {
             Self::Legacy(manager) => manager.write_set_lock_is_held_for_test(),

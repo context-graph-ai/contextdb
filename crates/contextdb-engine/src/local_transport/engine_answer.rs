@@ -243,6 +243,13 @@ pub const fn body_grammar(tag: u16) -> Option<&'static [BodyField]> {
 
 /// Every tag this channel writes, in ascending order. Tests walk this to prove
 /// each class encodes under the grammar its tag declares.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_read_channel_error_document.rs"
+    )
+)]
 pub const ALL_TAGS: &[u16] = &[
     TAG_READ_SESSION_NOT_IMPLEMENTED,
     TAG_OWNER_READ_DRAIN_TIMEOUT,

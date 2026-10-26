@@ -2,7 +2,6 @@
 #![allow(clippy::field_reassign_with_default)] // Existing compatibility and test seam shape.
 #![allow(clippy::too_many_arguments)] // Existing compatibility and test seam shape.
 #![allow(clippy::type_complexity)] // Existing compatibility and test seam shape.
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 #![allow(unused_doc_comments)] // Existing compatibility and test seam shape.
 // Custody-only persistence seam.
 #[cfg(feature = "sync-orchestration")]
@@ -779,6 +778,10 @@ pub(crate) struct LocalSchemaStage {
     native_trigger: Option<trigger::OriginalPreparedTriggerPublication>,
     table_generations: Vec<(String, u64)>,
     ddl_generations: Vec<(DdlGenerationKey, DdlGenerationValue)>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     ddl_log: Vec<(Lsn, DdlChange)>,
     memory_swap: PreparedMemorySwap,
     pub(crate) durable_projection: LocalSchemaPersistenceProjection,
@@ -2444,6 +2447,13 @@ struct AuthoritativePurgePublicationReplacements {
 
 struct AuthoritativePurgeKernelOutcome {
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     frontier: Lsn,
     survivor_report: OwnedQueryResult,
 }
@@ -4496,6 +4506,13 @@ struct SnapshotFloorRegistry {
 /// Fixed, open-time-funded capacity for public caller-held snapshot pins.
 struct SnapshotPinPool {
     available: AtomicUsize,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     slots: usize,
     slot_bytes: usize,
     _credit: crate::memory_accounting::ControlCredit,
@@ -10809,12 +10826,17 @@ struct OriginalPurgeNonEventPreparedSet {
     durable_sink_entries: Vec<AuthoritativePurgeSinkEntryKey>,
     graph_arrival_config_keys: Vec<String>,
     publication_replacements: OriginalPurgeNonEventPublication,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     survivor_report: OwnedQueryResult,
 }
 
 /// A held slice of a store's writer budget, released when dropped.
 #[cfg(feature = "test-seams")]
 #[doc(hidden)]
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper used by sync")]
 pub struct WriterMemoryHoldForTest(crate::memory_accounting::OwnedMemoryReservation);
 #[cfg(test)]
 mod received_row_graph_tests;

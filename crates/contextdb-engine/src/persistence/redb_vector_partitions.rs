@@ -8,6 +8,13 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from erasure_frontier_contract_tests.rs"
+        )
+    )]
     pub(crate) fn load_config_values_raw_with_prefix(
         &self,
         prefix: &str,
@@ -715,6 +722,13 @@ impl RedbPersistence {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from empty_declared_index_readiness_tests.rs"
+        )
     )]
     pub(crate) fn load_relational_row_version(
         &self,
@@ -1888,6 +1902,13 @@ impl RedbPersistence {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_public_cycle_admission_tests.rs"
+        )
+    )]
     pub(crate) fn encode_maintenance_catalog_for_test(
         catalog: &VectorPartitionGenerationCatalogRecord,
     ) -> Vec<u8> {
@@ -4566,6 +4587,13 @@ impl RedbPersistence {
     // Preserve the existing framing-only fixture entry. An unbound frame can
     // never pass the transactional publication guard.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from generation_admission_tests.rs"
+        )
+    )]
     pub(super) fn prepare_vector_partition_graph_pages(
         index: &VectorIndexRef,
         partition_key: &VectorPartitionKey,

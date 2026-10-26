@@ -1922,6 +1922,10 @@ impl WorkingVectorCatalogOwner {
 
 pub(crate) struct WorkingVectorFactoryOwner {
     factory: Arc<WorkingVectorColumnFactory>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     control: contextdb_tx::SourceCharge,
 }
 impl WorkingVectorFactoryOwner {

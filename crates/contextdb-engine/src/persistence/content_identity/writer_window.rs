@@ -2494,6 +2494,13 @@ fn replay(
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
+    )
+)]
 pub(super) fn update_family(
     table: &mut redb::Table<'_, &'static [u8], &'static [u8]>,
     admission: &mut ProofAdmission,

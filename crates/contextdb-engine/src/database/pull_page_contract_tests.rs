@@ -90,6 +90,10 @@ struct Pulled {
     purges: serde_json::Value,
     ddl: usize,
     through: Option<Lsn>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     work: Work,
     admitted: usize,
     peak: usize,

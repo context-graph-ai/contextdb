@@ -279,6 +279,7 @@ impl Database {
     /// held. Every production pull states its role through the sync client's
     /// own entry point.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature"))]
     fn apply_changes(
         &self,
         changes: ChangeSet,
@@ -290,6 +291,7 @@ impl Database {
     }
 
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from resident_history_test_seams.rs"))]
     pub(crate) fn apply_changes_with_read_memory(
         &self,
         changes: ChangeSet,

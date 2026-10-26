@@ -1283,6 +1283,13 @@ impl RedbPersistence {
 
     /// `(capacity, reserve)` of the native cache as last installed.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from maintenance_and_limits.rs"
+        )
+    )]
     pub(crate) fn cache_installation_for_test(&self) -> (usize, usize) {
         (
             self.cache_installation.capacity().unwrap_or(0),
@@ -1300,6 +1307,13 @@ impl RedbPersistence {
     }
 
     /// Writer cache charge metadata; physical owners alone release its invoice.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from independent_cache_reserve_lifetime_tests.rs"
+        )
+    )]
     pub(crate) fn cache_charge(&self) -> usize {
         self.cache_charge_bytes.get().copied().unwrap_or(0)
     }
@@ -1307,6 +1321,13 @@ impl RedbPersistence {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from relational_posting_prune.rs"
+        )
     )]
     pub(crate) fn open_with_cache(path: &Path, cache_bytes: usize) -> Result<Self> {
         Self::open_with_cache_in_runtime_dir(path, cache_bytes, None)
@@ -1338,6 +1359,13 @@ impl RedbPersistence {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from persistence.rs"
+        )
     )]
     pub(crate) fn open_existing_only_with_cache(path: &Path, cache_bytes: usize) -> Result<Self> {
         Self::open_existing_only_with_cache_in_runtime_dir(path, cache_bytes, None)

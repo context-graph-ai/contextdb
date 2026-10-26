@@ -10,7 +10,21 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleIdentityEvidence {
     VerifiedOwner,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
+    )]
     WrongResponder,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
+    )]
     Unverifiable,
 }
 
@@ -19,6 +33,13 @@ pub enum StaleIdentityEvidence {
 pub enum LivenessEvidence {
     NoResponderBeforeDeadline,
     LiveResponder,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
+    )]
     Unverifiable,
 }
 
@@ -45,6 +66,13 @@ impl FinalStaleIdentityObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleFilesystemEvidence {
     Exact(ChannelFilesystemIdentity),
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+        )
+    )]
     Unverifiable,
 }
 
@@ -65,6 +93,13 @@ pub enum StaleChannelAction {
 /// never reads a durable coordination record itself.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from open_and_owner_reads.rs"
+    )
+)]
 pub struct StaleChannelProbe {
     pub path: PathBuf,
     pub expected_owner: LocalHandshake,
@@ -176,6 +211,13 @@ pub(super) fn observe_final_stale_identity(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from open_and_owner_reads.rs"
+    )
+)]
 pub fn reconcile_stale_channel(
     carrier: &UnixLocalCarrier,
     probe: &StaleChannelProbe,
@@ -192,6 +234,13 @@ pub fn reconcile_stale_channel(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+    )
 )]
 pub fn decide_stale_channel_action(
     evidence: StaleChannelEvidence,

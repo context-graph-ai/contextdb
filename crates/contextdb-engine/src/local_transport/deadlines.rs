@@ -39,6 +39,13 @@ pub fn reset_timer_threads_started_for_test() {
 /// Refuse the next timer arms on this thread, including a fallback clock.
 #[cfg(any(test, feature = "test-seams"))]
 #[doc(hidden)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from mod.rs"
+    )
+)]
 pub fn fail_next_timer_arms_for_test(count: usize) {
     FAILED_TIMER_ARMS.with(|remaining| remaining.set(count));
 }
@@ -56,15 +63,43 @@ pub enum DeadlineStage {
     Handshake,
     RequestWrite,
     Response,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+        )
+    )]
     RoutingRetry,
     StaleProbe,
     Request,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+        )
+    )]
     CursorIdle,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+        )
+    )]
     CursorLifetime,
     ShutdownDrain,
 }
 
 #[derive(Default)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract_types.rs"
+    )
+)]
 struct ManualDeadlineState {
     now_ms: u64,
     next_registration: u64,
@@ -73,6 +108,13 @@ struct ManualDeadlineState {
     native_parked: NativeParkList,
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct RegisteredWaiter {
     deadline_ms: u64,
     waker: Waker,
@@ -81,11 +123,25 @@ struct RegisteredWaiter {
 /// Deterministic clock for channel deadline tests. Production callers supply
 /// their own `DeadlineClock`; this type is only the hidden test seam.
 #[derive(Clone, Default)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub struct ManualDeadlineClock {
     state: Arc<Mutex<ManualDeadlineState>>,
 }
 
 impl ManualDeadlineClock {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn at(now_ms: u64) -> Self {
         Self {
             state: Arc::new(Mutex::new(ManualDeadlineState {
@@ -102,6 +158,13 @@ impl ManualDeadlineClock {
     /// A caller asking for an earlier time is refused: monotonic time is left
     /// where it was, no waiter is woken, and the clock keeps answering every
     /// later caller.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+        )
+    )]
     pub fn advance_to(&self, now_ms: u64) {
         let mut state = Self::locked(&self.state);
         if now_ms < state.now_ms {
@@ -128,6 +191,13 @@ impl ManualDeadlineClock {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn wake_native_due(&self) {
         loop {
             let wake = {
@@ -163,11 +233,25 @@ impl ManualDeadlineClock {
     }
 
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+        )
+    )]
     pub fn registered_waiter_count(&self) -> usize {
         Self::locked(&self.state).waiters.len()
     }
 
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+        )
+    )]
     pub fn registrations_created(&self) -> u64 {
         Self::locked(&self.state).registrations_created
     }
@@ -175,6 +259,13 @@ impl ManualDeadlineClock {
     /// A caller that failed part-way through an update leaves the state
     /// readable rather than unusable, so every later caller still gets an
     /// answer from the clock.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn locked(
         state: &Mutex<ManualDeadlineState>,
     ) -> std::sync::MutexGuard<'_, ManualDeadlineState> {
@@ -262,6 +353,13 @@ impl DeadlineClock for ManualDeadlineClock {
 
 // One fixed list-head slot in the existing engine-created manual clock.
 // This changes its private layout. No native registry allocation is created.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct NativeParkList {
     head: *const NativeParkNode,
 }
@@ -276,10 +374,24 @@ impl Default for NativeParkList {
 // ManualDeadlineState mutex; the pinned caller guard removes every node before
 // its stack storage ends. Moving the list head cannot move its pinned nodes.
 unsafe impl Send for NativeParkList {}
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct NativeParkLinks {
     next: *const NativeParkNode,
     linked: bool,
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct NativeParkNode {
     deadline_ms: u64,
     wake: contextdb_core::read_memory::NativeReadWakeLease,
@@ -288,6 +400,13 @@ struct NativeParkNode {
 }
 impl NativeParkList {
     // Caller holds the exact state mutex. No user code or drop occurs here.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_image_decode.rs"
+        )
+    )]
     unsafe fn unlink(&mut self, node: *const NativeParkNode) {
         // SAFETY: all nodes in this list have a live pinned registration guard;
         // links are UnsafeCell, never an illicit write through a shared reference.
@@ -310,6 +429,13 @@ impl NativeParkList {
         }
     }
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct NativeParkRegistration<'a> {
     state: &'a Mutex<ManualDeadlineState>,
     node: Pin<&'a NativeParkNode>,
@@ -325,6 +451,13 @@ impl Drop for NativeParkRegistration<'_> {
     }
 }
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct ManualNativeSource {
     state: Arc<Mutex<ManualDeadlineState>>,
 }
@@ -373,6 +506,13 @@ impl contextdb_core::read_contract::NativeDeadlineSource for ManualNativeSource 
     }
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract_types.rs"
+    )
+)]
 struct ManualDeadlineWait {
     state: Arc<Mutex<ManualDeadlineState>>,
     deadline_ms: u64,
@@ -895,6 +1035,10 @@ pub type LocalDeadlineOperation<'a, T = ()> =
 /// A deadline is attached to a concrete transport or owner operation. Tests
 /// can inspect the stage, but callers cannot start a bare stage-only timer.
 pub struct DeadlineOperationWait<'a, T = ()> {
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     stage: DeadlineStage,
     inner: Option<DeadlineInner<'a, T>>,
     admission_error: Option<LocalTransportError>,
@@ -904,6 +1048,13 @@ pub struct DeadlineOperationWait<'a, T = ()> {
 }
 
 impl<T> DeadlineOperationWait<'_, T> {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub const fn stage(&self) -> DeadlineStage {
         self.stage
     }
@@ -1107,6 +1258,13 @@ fn owned_shared<T>(
         NativeProduce::Producer(error) => error,
     })
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct ManualFutureWake {
     waker: Mutex<Option<Waker>>,
     reached: std::sync::atomic::AtomicBool,
@@ -1121,6 +1279,13 @@ impl contextdb_core::read_memory::NativeReadWake for ManualFutureWake {
         }
     }
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct OwnedManualWait {
     state: Arc<Mutex<ManualDeadlineState>>,
     node: NativeParkNode,
@@ -1619,6 +1784,13 @@ enum LegacyMonotonicWait<'a> {
     #[cfg(any(test, feature = "test-seams"))]
     Injected(InjectedTimerArmFailureWait<'a>),
     #[cfg(not(any(test, feature = "test-seams")))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract_types.rs"
+        )
+    )]
     Lifetime(std::marker::PhantomData<&'a ()>),
 }
 impl Future for LegacyMonotonicWait<'_> {

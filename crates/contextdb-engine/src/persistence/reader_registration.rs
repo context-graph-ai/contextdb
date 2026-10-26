@@ -147,6 +147,13 @@ pub(super) fn observe_index_posting(table: &str, declaration: &IndexDecl) {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn take_index_postings_for_test() -> Vec<IndexPostingTouch> {
     INDEX_POSTINGS.with(|postings| {
         std::mem::take(&mut *postings.borrow_mut())
@@ -251,16 +258,37 @@ pub(crate) fn observe_append_stage(stage: AppendStage, started: &mut std::time::
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub(crate) fn reset_append_stages_for_test() {
     APPEND_STAGE_NANOS.with(|stages| stages.set(AppendStageNanos::default()));
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn take_append_stages_for_test() -> AppendStageNanos {
     APPEND_STAGE_NANOS.with(|stages| stages.replace(AppendStageNanos::default()))
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn reset_index_prefix_counts_for_test() {
     INDEX_PREFIX_COUNT_TOUCHES.with(|touches| touches.borrow_mut().clear());
     INDEX_PREFIX_COUNT_VALUES.with(|values| values.borrow_mut().clear());
@@ -269,6 +297,13 @@ pub(crate) fn reset_index_prefix_counts_for_test() {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn take_index_prefix_counts_for_test() -> Vec<IndexPrefixCountTouch> {
     let values = INDEX_PREFIX_COUNT_VALUES.with(|values| std::mem::take(&mut *values.borrow_mut()));
     INDEX_PREFIX_COUNT_TOUCHES.with(|touches| {
@@ -1715,6 +1750,13 @@ impl content_identity::ProofPoolGrowth for ReadHistoryProofOwner {
 
 impl ReadPersistenceImage {
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_content_test_adapter.rs"
+        )
+    )]
     pub(crate) fn content_identity_for_test(&self) -> DirectTypedImageDigest {
         self.content_identity.clone()
     }
@@ -1722,6 +1764,13 @@ impl ReadPersistenceImage {
     /// The newest committed transaction this image's snapshot holds, whether
     /// the open kept the commit index or left it in the store.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
+        )
+    )]
     pub(crate) fn newest_committed_tx_for_test(&self) -> Option<TxId> {
         self.commit_index.values().max().copied().or_else(|| {
             self.history_on_request
@@ -1731,6 +1780,13 @@ impl ReadPersistenceImage {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_content_test_adapter.rs"
+        )
+    )]
     pub(crate) fn hydrate_logical_content_for_test(
         &mut self,
         retained_source: &RetainedReadSource,
@@ -2067,6 +2123,13 @@ pub(crate) fn load_read_image_with_memory(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from empty_declared_index_readiness_tests.rs"
+    )
 )]
 pub(crate) fn load_read_image_at_registration_with_context(
     path: &Path,
@@ -3997,6 +4060,13 @@ impl ReadSnapshotRegistrationGuard {
     /// prevents a replacement writer from reclaiming any deferred page until
     /// the exact root is registered or this request ends.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_cursor_admission_tests.rs"
+        )
+    )]
     pub(crate) fn owner_handoff_start(
         path: &Path,
         identity: DatabaseIdentity,

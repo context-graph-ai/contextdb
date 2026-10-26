@@ -249,6 +249,13 @@ pub(super) fn reset_vector_bytes(write: &redb::WriteTransaction) -> Result<()> {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_membership_pages.rs"
+    )
+)]
 pub(super) fn reset_memberships(write: &redb::WriteTransaction) -> Result<()> {
     reset_bodies(write, false)
 }
@@ -826,6 +833,13 @@ fn reconcile_row_heads_holding<'name, 'txn, A: writer_row_heads::RowHeadAdmissio
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from transaction_repair.rs"
+    )
+)]
 pub(super) fn repair_row_value(
     write: &redb::WriteTransaction,
     table: &str,
@@ -885,6 +899,13 @@ pub(super) fn repair_row_value(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from transaction_repair.rs"
+    )
 )]
 pub(super) fn repair_vector_value(
     write: &redb::WriteTransaction,

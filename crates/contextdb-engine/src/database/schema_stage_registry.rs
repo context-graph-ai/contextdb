@@ -339,6 +339,13 @@ impl LocalRegistry {
         self.0.release_if_empty();
         removed
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn len(&self) -> usize {
         self.0.map.len()
     }
@@ -409,6 +416,13 @@ impl<K: Eq + Hash + Copy, V, P> OccupiedRegistry<K, V, P> {
     pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.get(key).is_some()
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn len(&self) -> usize {
         self.0
             .map

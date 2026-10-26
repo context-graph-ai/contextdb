@@ -70,6 +70,13 @@ pub fn channel_socket_path(
 pub struct ChannelKernelAddress {
     /// Held for as long as the address is: the address names this descriptor,
     /// so closing it would unname the address.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     held_directory: Option<std::os::fd::OwnedFd>,
     address: PathBuf,
 }
@@ -100,6 +107,13 @@ impl ChannelKernelAddress {
     /// channel's own pathname. A caller cannot tell from the address alone,
     /// and the difference is the whole point: it is what an over-long
     /// pathname costs, and what an ordinary one does not.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deep_runtime_directory.rs"
+        )
+    )]
     pub fn holds_its_directory(&self) -> bool {
         self.held_directory.is_some()
     }

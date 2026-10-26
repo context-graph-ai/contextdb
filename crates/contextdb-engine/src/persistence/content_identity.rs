@@ -171,6 +171,13 @@ pub(crate) fn observe_identity_span(span: IdentitySpan, started: std::time::Inst
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn take_identity_spans_for_test() -> IdentitySpans {
     IDENTITY_SPANS.with(|spans| spans.replace(IdentitySpans::default()))
 }
@@ -228,6 +235,13 @@ fn publish_directory_binding_work() {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn last_directory_binding_work_for_test() -> DirectoryBindingWork {
     DIRECTORY_BINDING_LAST.with(|work| work.get())
 }
@@ -254,6 +268,13 @@ thread_local! {
 /// Chunk rewrites and copied pages by the level of the chunk, since the last
 /// reset.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn take_writes_by_level_for_test() -> Vec<(u8, u64, u64)> {
     WRITES_BY_LEVEL.with(|levels| {
         std::mem::take(&mut *levels.borrow_mut())
@@ -352,6 +373,13 @@ fn forget_status_namespace(logical_key: &[u8]) {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn reset_family_work_for_test() {
     WRITTEN_KEYS_ACTIVE.with(|active| active.set(true));
     FAMILY_WORK.with(|work| work.borrow_mut().clear());
@@ -365,6 +393,13 @@ pub(crate) fn reset_family_work_for_test() {
 
 /// Per-family work since the last reset, as `(tag, family name, counts)`.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn take_family_work_for_test() -> Vec<(u8, &'static str, FamilyWork)> {
     WRITTEN_KEYS_ACTIVE.with(|active| active.set(false));
     WRITTEN_KEYS.with(|written| written.borrow_mut().clear());
@@ -384,6 +419,13 @@ pub(crate) fn take_family_work_for_test() -> Vec<(u8, &'static str, FamilyWork)>
 /// Coalesced `Status` mutations by namespace literal since the last reset.
 /// The family a page tag names, for the storage engine's per-tag page counts.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn family_name_for_tag(tag: u8) -> &'static str {
     LogicalFamily::from_tag(tag)
         .map(LogicalFamily::name_for_test)
@@ -391,6 +433,13 @@ pub(crate) fn family_name_for_tag(tag: u8) -> &'static str {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from append_work.rs"
+    )
+)]
 pub(crate) fn take_status_namespaces_for_test() -> Vec<(String, u64)> {
     STATUS_NAMESPACES.with(|counts| {
         std::mem::take(&mut *counts.borrow_mut())
@@ -605,6 +654,13 @@ pub(crate) enum LogicalFamily {
 impl LogicalFamily {
     /// Measurement-only display name.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) const fn name_for_test(self) -> &'static str {
         match self {
             Self::Relational => "Relational",
@@ -638,6 +694,13 @@ impl LogicalFamily {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
     )]
     fn from_tag(tag: u8) -> Result<Self> {
         Self::ALL
@@ -2230,6 +2293,13 @@ fn validated_directed_order(left: (bool, Value), right: (bool, Value)) -> Result
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_authentication_tests.rs"
+    )
+)]
 fn decode_posting_position(bytes: &[u8]) -> Result<super::EncodedRelationalIndexPosition> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     RedbPersistence::decode_exact::<super::EncodedRelationalIndexPosition>(bytes).map_err(|error| {
@@ -3306,6 +3376,13 @@ fn encoded_key_in<'a>(
     reference
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from delivery_outcome_contract.rs"
+    )
+)]
 fn encoded_key(level: u32, key: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     if encoded_key_len(level, key) == key.len() {
         return key.into();
@@ -3440,6 +3517,13 @@ fn chunk_id(level: u32, last: &[u8]) -> [u8; 32] {
     id
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
+    )
+)]
 fn entry_bytes(level: u32, entry: &PageEntry) -> usize {
     4 + encoded_key(level, &entry.key).len() + 32
 }
@@ -3490,6 +3574,13 @@ fn node_hash(family: LogicalFamily, level: u32, entries: &[PageEntry]) -> [u8; 3
     *hash.finalize().as_bytes()
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from writer_window.rs"
+    )
+)]
 fn encode_node(node: &Node) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(
         NODE_HEADER_BYTES
@@ -3645,6 +3736,13 @@ fn decode_node(family: LogicalFamily, bytes: &[u8]) -> Result<Node> {
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
+    )
+)]
 fn read_node(
     table: &impl ReadableTable<&'static [u8], &'static [u8]>,
     family: LogicalFamily,
@@ -4157,6 +4255,13 @@ impl Drop for ProofAdmission {
 // Existing fixture comparison vocabulary only; production admission never
 // uses this predecessor estimate. TEST-B owns adaptation of those assertions.
 #[cfg(test)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
+    )
+)]
 fn mutation_entry_bytes(key_len: usize) -> usize {
     key_len + std::mem::size_of::<Vec<u8>>() + std::mem::size_of::<Option<[u8; 32]>>() + 64
 }
@@ -4444,6 +4549,13 @@ use writer_window::update_family;
 
 /// Reader-test ceiling retained for comparisons with the writer's resident
 /// original path and bounded builder; no storage is allocated from it.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
+    )
+)]
 const fn proof_path_bytes(height: u32) -> usize {
     (height as usize + 3) * (MAX_NODE_BYTES + 4096)
 }
@@ -5384,6 +5496,13 @@ impl ResidentProofChunkSet {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn observed(&self) -> (usize, usize, usize) {
         let state = self.locked();
         (state.len(), state.bytes(), state.charged_bytes)
@@ -5578,6 +5697,13 @@ impl ProofMemory {
 
     /// For callers that hold no reservation of their own, such as the
     /// engine-internal contracts. The charge is still measured.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from declared_memory_limit_bounds_a_writer.rs"
+        )
+    )]
     pub(super) fn unlimited() -> Self {
         Self::with_limit(usize::MAX)
     }
@@ -5713,16 +5839,37 @@ impl ProofMemory {
         self.exhausted.set(false);
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(super) fn peak(&self) -> usize {
         self.peak.get()
     }
 
     /// What the descent itself held at its deepest, without the pages it chose
     /// to keep or the caller's payload.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
+        )
+    )]
     pub(super) fn live_peak(&self) -> usize {
         self.live_peak.get()
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(super) fn live_bytes(&self) -> usize {
         self.live.get()
     }
@@ -5808,9 +5955,31 @@ impl OrderedProofBatch {
 
 /// Authenticated logical pages reused within one immutable query batch.
 pub(super) struct ReadAuthenticationBatch<'a> {
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     verifier: &'a ContentIdentityReadVerifier,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     nodes: BTreeMap<[u8; 33], Arc<VerifiedReadNode>>,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     bytes: usize,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from framing.rs"
+        )
+    )]
     byte_limit: usize,
 }
 
@@ -5947,6 +6116,13 @@ impl ReadAuthenticationNodes {
     /// is reset (`reset`): one live charge per shared page until its last
     /// holder drops it.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from retained_read_source.rs"
+        )
+    )]
     pub(super) fn own_charge_for_test(&self) -> usize {
         self.charge.held()
     }
@@ -5956,6 +6132,13 @@ impl ReadAuthenticationBatch<'_> {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
     )]
     pub(super) fn verify(&mut self, mutation: &ContentIdentityMutation) -> Result<()> {
         self.verifier
@@ -6161,6 +6344,13 @@ impl ContentIdentityReadVerifier {
     /// How many authenticated chunks this reader is holding, their bytes, and
     /// how many of those bytes are charged to the declared session.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
+        )
+    )]
     pub(super) fn resident_proof_chunks_for_test(&self) -> (usize, usize, usize) {
         self.resident.observed()
     }
@@ -9449,6 +9639,13 @@ pub(super) mod test_access {
     /// self-consistent but is no longer the chunk its parent names: the last
     /// entry's value hash changes, and the chunk is re-hashed to match itself.
     /// A walk that reaches it must refuse, resident siblings or not.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
+        )
+    )]
     pub(crate) fn damage_one_leaf_chunk_in_write(write: &redb::WriteTransaction) -> bool {
         let family = LogicalFamily::Relational;
         let mut nodes = write
@@ -9855,6 +10052,10 @@ pub(crate) mod original_writer {
     }
     pub(crate) struct AdmittedBytes {
         bytes: usize,
+        #[allow(
+            dead_code,
+            reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+        )]
         reservation: OwnedMemoryReservation,
     }
     impl ProofAdmission {

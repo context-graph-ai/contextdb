@@ -28,6 +28,13 @@ thread_local! {
     static EVICT_AFTER_CACHED_POSTINGS: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from retained_read_source.rs"
+    )
+)]
 pub(crate) fn arm_eviction_after_cached_postings_for_test(postings: usize) {
     EVICT_AFTER_CACHED_POSTINGS.with(|armed| {
         armed.set((postings > 0).then_some((postings, postings)));

@@ -205,6 +205,13 @@ impl CacheInstallation {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(super) fn reserve(&self) -> usize {
         self.reserve.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -344,10 +351,24 @@ pub(super) fn take_authoritative_purge_point_remove_persistence_failure_for_test
 }
 
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from fixtures.rs"
+    )
+)]
 pub(crate) fn arm_erasure_first_table_fault_for_test() {
     ERASURE_FIRST_TABLE_FAULT.with(|state| state.set((true, false)));
 }
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from fixtures.rs"
+    )
+)]
 pub(crate) fn erasure_first_table_fault_reached_for_test() -> bool {
     ERASURE_FIRST_TABLE_FAULT.with(|state| state.get().1)
 }

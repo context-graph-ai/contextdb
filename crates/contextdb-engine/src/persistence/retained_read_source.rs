@@ -2673,6 +2673,13 @@ impl RetainedReadSource {
     }
 
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from verified_ordered_run_work_resume_contract.rs"
+        )
+    )]
     pub(crate) fn arm_verified_ordered_run_eviction_for_test(&self, postings: usize) {
         let _ = self;
         verified_ordered_run_test_seams::arm_eviction_after_cached_postings_for_test(postings);
@@ -3462,6 +3469,13 @@ impl RetainedReadSource {
     /// The authenticated chunks this pinned snapshot is holding, their bytes,
     /// and how many of those bytes are charged to the declared session.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
+        )
+    )]
     pub(crate) fn resident_proof_chunks_for_test(&self) -> (usize, usize, usize) {
         self.content_identity.resident_proof_chunks_for_test()
     }
@@ -3495,6 +3509,13 @@ impl RetainedReadSource {
     /// Released together with the resident set's own charge when both are
     /// cleared (`evict_resident_proof_chunks_for_test`).
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from history_request_memory.rs"
+        )
+    )]
     pub(crate) fn statement_own_charge_for_test(&self) -> usize {
         let proof = self
             .content_proof
@@ -4030,6 +4051,13 @@ impl RetainedReadSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from persistence.rs"
+        )
+    )]
     pub(crate) fn load_raw_vector_entries_for_memberships(
         &self,
         memberships: &[VectorPartitionMembershipRecord],
@@ -4057,6 +4085,13 @@ impl RetainedReadSource {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
     )]
     pub(super) fn load_raw_vector_entries_for_memberships_in_read(
         &self,
@@ -4443,6 +4478,13 @@ impl RetainedReadSource {
     /// The private history commitment includes its durable deletion witness,
     /// which the public change projection intentionally does not carry.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_content_test_adapter.rs"
+        )
+    )]
     pub(crate) fn change_history_bodies_for_test(&self) -> Result<Vec<(String, Vec<u8>)>> {
         self.with_read(|read| {
             let table = match read.open_table(CHANGE_LOG_TABLE) {
@@ -4462,6 +4504,13 @@ impl RetainedReadSource {
     /// Disposable oracle input: physical row bodies from the pinned root,
     /// independent of the maintained identity records and vector projection.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_content_test_adapter.rs"
+        )
+    )]
     pub(crate) fn relational_version_bodies_for_test(
         &self,
         table_meta: &HashMap<String, TableMeta>,
@@ -4526,6 +4575,13 @@ impl RetainedReadSource {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
+        )
     )]
     pub(super) fn row_by_id_in_read(
         &self,
@@ -4634,6 +4690,13 @@ impl RetainedReadSource {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
+        )
     )]
     pub(super) fn row_identity_by_id_in_read(
         &self,
@@ -6080,6 +6143,13 @@ impl RetainedReadSource {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_run_integrity_tests.rs"
+        )
+    )]
     pub(crate) fn bounded_relational_ordered_next<E>(
         &self,
         table: &str,

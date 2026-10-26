@@ -70,6 +70,13 @@ impl QueryResult {
         }
     }
     /// Reuse the originating operation capability for later canonical output.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_contract.rs"
+        )
+    )]
     pub(crate) fn encoding_owner(&self) -> Option<ReadMemoryOwner> {
         match &self.inner {
             QueryResultInner::Empty { .. } | QueryResultInner::Application(_) => None,

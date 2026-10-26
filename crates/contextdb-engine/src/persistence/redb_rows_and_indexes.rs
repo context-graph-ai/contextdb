@@ -1377,6 +1377,13 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from persistence.rs"
+        )
+    )]
     pub(super) fn load_graph_table(
         &self,
         definition: TableDefinition<&[u8], &[u8]>,
@@ -6238,6 +6245,13 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from transaction_repair.rs"
+        )
+    )]
     pub(crate) fn rebuild_read_open_config_in_write(
         write_txn: &redb::WriteTransaction,
     ) -> Result<()> {
@@ -6268,6 +6282,13 @@ impl RedbPersistence {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from erasure_frontier_contract_tests.rs"
+        )
     )]
     pub(crate) fn rebuild_read_lineage_config_in_write(
         write_txn: &redb::WriteTransaction,
@@ -6316,6 +6337,13 @@ impl RedbPersistence {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from custody_source.rs"
+        )
     )]
     pub(crate) fn rebuild_read_custody_config_in_write(
         write_txn: &redb::WriteTransaction,
@@ -6374,6 +6402,13 @@ impl RedbPersistence {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from transaction_repair.rs"
+        )
     )]
     pub(crate) fn rebuild_open_vector_directory_in_write(
         &self,
@@ -6574,6 +6609,13 @@ impl RedbPersistence {
     /// its candidate's.
     #[cfg(any(test, feature = "test-seams"))]
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_import_tail.rs"
+        )
+    )]
     pub(crate) fn vector_pending_counters_for_test(
         &self,
         partition: &VectorPartitionRef,

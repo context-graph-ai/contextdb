@@ -69,6 +69,13 @@ impl<T> Funded<T> {
 
     /// Only call at an actual public consumer boundary. The value moves;
     /// its engine invoice returns as custody leaves the engine.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session.rs"
+        )
+    )]
     pub(crate) fn into_public(self) -> T {
         self.value
     }

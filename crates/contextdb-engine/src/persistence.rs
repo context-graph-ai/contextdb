@@ -3,7 +3,6 @@
 #![allow(clippy::match_like_matches_macro)] // Existing compatibility and test seam shape.
 #![allow(clippy::too_many_arguments)] // Existing compatibility and test seam shape.
 #![allow(clippy::type_complexity)] // Existing compatibility and test seam shape.
-#![allow(dead_code)] // Existing compatibility and test seam shape.
 
 mod reader_registration;
 pub(crate) use reader_registration::*;
@@ -2292,6 +2291,13 @@ pub mod read_persistence_test_scaffold {
     #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug, Default)]
     struct ReaderSnapshotRegistryScanState {
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from durable_vector_loading.rs"
+            )
+        )]
         next_token: u64,
         active: BTreeMap<(u64, u64), ReaderSnapshotRegistryScanRun>,
     }
@@ -2392,6 +2398,13 @@ pub mod read_persistence_test_scaffold {
     #[cfg(any(test, feature = "test-seams"))]
     #[derive(Debug, Default)]
     struct ReaderRegistrationLockPauseState {
+        #[cfg_attr(
+            not(feature = "test-seams"),
+            allow(
+                dead_code,
+                reason = "KEEP-SEAM: live only under the test-seams feature; used from durable_vector_loading.rs"
+            )
+        )]
         next_token: u64,
         active: BTreeMap<(u64, u64), ReaderRegistrationLockPauseRun>,
     }
@@ -7297,6 +7310,10 @@ pub(crate) struct AuthoritativePurgePersistenceProjection {
     pub(crate) vector_generation_candidates: Vec<VectorPartitionGenerationCandidate>,
     pub(crate) graph_entries: Vec<AdjEntry>,
     pub(crate) row_graph_entries: Vec<contextdb_tx::OwnedAdjEntry>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     pub(crate) row_graph_credit: contextdb_core::read_memory::ReadCredit,
     /// Selected sink entries: sink, id and the BLAKE3 digest of the durable
     /// value the selection saw.
@@ -8483,13 +8500,25 @@ struct OwnedEventEncodedLength(usize);
 
 pub(crate) struct OwnedEventKey {
     pub(crate) value: String,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     allocation: crate::memory_accounting::OwnedMemoryReservation,
 }
 
 pub(crate) struct OwnedSinkQueueRemovals {
     pub(crate) mutations: Vec<content_identity::ContentIdentityMutation>,
     credits: Vec<crate::memory_accounting::OwnedMemoryReservation>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     mutations_allocation: crate::memory_accounting::OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     credits_allocation: crate::memory_accounting::OwnedMemoryReservation,
 }
 

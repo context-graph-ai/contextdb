@@ -784,6 +784,13 @@ impl FrozenGraphErasure {
         }
         Ok(())
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(super) fn retained_memory_bytes(&self) -> usize {
         self._memory.bytes()
     }

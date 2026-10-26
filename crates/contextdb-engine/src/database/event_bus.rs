@@ -1097,6 +1097,13 @@ impl EventBusState {
     }
 
     /// Bytes the resident sink windows hold on the writer accountant.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from maintenance_and_limits.rs"
+        )
+    )]
     pub(crate) fn sink_window_charge(&self) -> usize {
         self.queues
             .lock()
@@ -4922,8 +4929,20 @@ impl<T> Drop for OwnedEventSharedWeak<T> {
 pub(super) struct OwnedEventValueCredits {
     keys: Vec<OwnedMemoryReservation>,
     values: Vec<OriginalCopyGrant>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     map: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     key_array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     value_array: OwnedMemoryReservation,
 }
 #[expect(
@@ -4964,8 +4983,20 @@ fn copy_owned_event_values(
 pub(super) struct OwnedEventGateCredits {
     rows: Vec<OwnedEventValueCredits>,
     children: Vec<OwnedEventGateCredits>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     row_array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     child_array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     metadata: OwnedMemoryReservation,
 }
 #[expect(
@@ -5077,7 +5108,15 @@ fn copy_owned_event_gate(
 pub(super) struct OwnedSinkEventCredit {
     // Copies keep their structured invoices; startup decoding retains one
     // invoice for the complete decoded body in metadata, without recopying it.
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     row: Option<OwnedEventValueCredits>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     gate: Option<OwnedEventGateCredits>,
     metadata: OwnedMemoryReservation,
 }
@@ -5132,8 +5171,20 @@ pub(super) struct OwnedPreparedSinkEvents {
     events: Vec<PreparedSinkEvent>,
     credits: Vec<OwnedSinkEventCredit>,
     sink_keys: Vec<OwnedMemoryReservation>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     event_array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     credit_array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     key_array: OwnedMemoryReservation,
     publication: Option<OwnedAppendCustody>,
 }
@@ -5223,6 +5274,10 @@ pub(super) struct OwnedSinkQueue {
 }
 pub(super) struct OwnedQueueMap {
     values: HashMap<String, OwnedSinkQueue>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     allocation: OwnedMemoryReservation,
 }
 pub(super) struct OwnedCommitEventStage {
@@ -5242,6 +5297,10 @@ pub(super) struct OwnedStagedEventBusDdlCommit {
 }
 pub(super) struct OwnedStageMap {
     values: HashMap<Lsn, OwnedEventShared<OwnedCommitEventStage>>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     allocation: OwnedMemoryReservation,
 }
 pub(crate) struct OwnedStageBorrow<'e> {
@@ -5610,11 +5669,19 @@ impl OwnedEventBusHandle {
 }
 pub(crate) struct OwnedEventStageRegistration {
     storage: OwnedEventBusHandle,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     append: Option<OwnedDiscardAppendHandle>,
     lsn: Lsn,
     identity: EngineTerminalIdentity,
     installed: OwnedEventShared<OwnedCommitEventStage>,
     armed: bool,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     control: OwnedMemoryReservation,
 }
 impl OwnedEventStageRegistration {
@@ -5642,6 +5709,10 @@ pub(super) enum OwnedEscrowState {
 }
 pub(super) struct OwnedQueueAppendSlot {
     sink: String,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     key: OwnedMemoryReservation,
     count: usize,
     retired: Option<(String, OwnedSinkQueue)>,
@@ -6181,6 +6252,10 @@ pub(super) struct OwnedPurgeQueuePublication {
 
     queues: OwnedQueueMap,
     sink_names: OwnedEventBody<Vec<String>, OwnedMemoryReservation>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     name_keys: OwnedEventBody<Vec<OwnedMemoryReservation>, OwnedMemoryReservation>,
     transfer: Option<OwnedPurgeAppendTransfer>,
     transferred_lease: Option<QueueMutationLease>,
@@ -6706,7 +6781,15 @@ impl OwnedDefinitionsProjection {
 pub(super) struct OwnedEncodedEventBusConfig {
     pub(super) values: Vec<(String, Vec<u8>)>,
     bodies: Vec<OwnedMemoryReservation>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     values_memory: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     body_array: OwnedMemoryReservation,
 }
 pub(super) struct OwnedEventSequence<'a, T> {
@@ -7229,6 +7312,10 @@ fn owned_event_visible(access: &AccessConstraints, entry: &SinkQueueEntry) -> bo
 struct OwnedCheckoutKeyCredit {
     name: OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>,
     id: u64,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     memory: OwnedMemoryReservation,
 }
 struct OwnedCheckoutAddition {
@@ -7237,13 +7324,25 @@ struct OwnedCheckoutAddition {
 }
 pub(super) struct OwnedCheckoutAllocation {
     keys: Vec<OwnedCheckoutKeyCredit>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     buckets: OwnedMemoryReservation,
 }
 pub(super) struct OwnedCheckoutLookup {
     name: OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>,
     source: OwnedEventShared<OwnedSinkQueueEntry>,
     key: (String, u64),
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     memory: OwnedMemoryReservation,
     finished: Cell<bool>,
     // Inline capacity is paid by the lookup array before source capture.
@@ -7258,6 +7357,10 @@ pub(super) struct OwnedCheckoutLookup {
 struct OwnedCheckoutBodyLifetime {
     storage: OwnedEventBusHandle,
     active: bool,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     control: OwnedMemoryReservation,
 }
 impl Drop for OwnedCheckoutBodyLifetime {
@@ -7278,10 +7381,30 @@ pub(super) struct OwnedSinkDispatchBatch {
     pub(super) acked: Vec<u64>,
     removable: Vec<u64>,
     retired: Vec<OwnedEventShared<OwnedSinkQueueEntry>>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     entry_array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     lookup_array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     ack_array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     removal_array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     retired_array: OwnedMemoryReservation,
     storage: OwnedEventBusWeak,
     denied_rotation: bool,
@@ -7309,6 +7432,10 @@ struct OwnedQueueMutationClaim {
     name: OwnedEventShared<OwnedEventBody<String, OwnedMemoryReservation>>,
     source: OwnedEventShared<OwnedSinkQueueEntry>,
     active: bool,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     control: OwnedMemoryReservation,
 }
 impl Drop for OwnedQueueMutationClaim {
@@ -7417,7 +7544,15 @@ pub(crate) struct OwnedNativeQueueFailure {
     error: Option<OriginalError>,
     carrier: Option<crate::funded_error::PreparedDiagnosticRoute>,
     pub(crate) cleanup: OwnedQueueCommitCleanup,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     control: Option<OwnedMemoryReservation>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     diagnostic: Option<OwnedMemoryReservation>,
 }
 impl std::fmt::Display for OwnedNativeQueueFailure {
@@ -8594,8 +8729,20 @@ impl OwnedSinkQueuePersistence for OwnedMemoryQueuePersistence {
 
 struct OwnedRuntimeAllocation {
     controls: Vec<OwnedMemoryReservation>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     runtime_buckets: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     starts_buckets: OwnedMemoryReservation,
 }
 struct OwnedRuntimeRetirement {
@@ -8739,7 +8886,15 @@ impl Database {
 
 pub(super) struct OwnedMetricsAllocation {
     keys: Vec<OwnedMemoryReservation>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     array: OwnedMemoryReservation,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     buckets: OwnedMemoryReservation,
 }
 impl OwnedEventBusHandle {
@@ -8923,6 +9078,10 @@ impl OwnedEventBusHandle {
 }
 pub(super) struct OwnedSinkRegistration {
     registration: SinkRegistration,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     allocation: OwnedMemoryReservation,
 }
 pub(super) struct OwnedEventBusWorker<P> {
@@ -8930,6 +9089,10 @@ pub(super) struct OwnedEventBusWorker<P> {
     events: OwnedEventBusHandle,
     persistence: P,
     tx_mgr: DatabaseTransactionHost,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     control: OwnedMemoryReservation,
 }
 impl<P: OwnedSinkQueuePersistence> OwnedEventBusWorker<P> {
@@ -9651,6 +9814,10 @@ struct OwnedColdRefillClaim {
     generation: u64,
     after: Option<u64>,
     upper: Option<u64>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     control: OwnedMemoryReservation,
 }
 impl Drop for OwnedColdRefillClaim {
@@ -11950,10 +12117,18 @@ impl OwnedDefinitionsProjection {
 
 struct OwnedOriginalEventPreimage {
     values: HashMap<String, Value>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     credit: OriginalCopyGrant,
 }
 struct OwnedOrdinaryEventCandidates<'a> {
     deleted: HashMap<(&'a str, RowId), OwnedOriginalEventPreimage>,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     deleted_memory: OwnedMemoryReservation,
     database: &'a Database,
     ws: &'a contextdb_tx::WriteSet,

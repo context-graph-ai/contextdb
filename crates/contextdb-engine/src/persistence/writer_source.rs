@@ -273,6 +273,10 @@ pub(crate) struct WriterSnapshot {
 
 // Legacy retains its existing contained control and observation API. Native
 // descriptors leave this empty; their external invoice precedes allocation.
+#[allow(
+    dead_code,
+    reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+)]
 struct WriterSnapshotControl(std::sync::OnceLock<ContainedMemoryReservation>);
 impl WriterSnapshotControl {
     fn empty() -> Self {
@@ -1917,6 +1921,13 @@ impl WriterSnapshot {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(crate) fn cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1973,6 +1984,13 @@ impl WriterSnapshot {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_staged.rs"
+        )
     )]
     pub(crate) fn exact_row(
         self: &Arc<Self>,
@@ -5598,8 +5616,16 @@ impl NativeConfigBytes {
 /// while this returned window lives. The general serde-owned decoder is intact.
 #[cfg(feature = "sync-orchestration")]
 pub(crate) struct NativeConfigWindow {
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     stored: NativeConfigBytes,
     text: NativeConfigBytes,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     metadata: contextdb_core::read_memory::ReadShared<
         super::native_storage_admission::ColdSnapshotMetadata,
     >,

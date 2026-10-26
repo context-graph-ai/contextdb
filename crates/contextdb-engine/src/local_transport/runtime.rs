@@ -94,6 +94,13 @@ pub enum RuntimeDirectorySource {
     Explicit,
     Xdg,
     PerUserFallback,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+        )
+    )]
     MacosTemporary,
 }
 
@@ -104,6 +111,13 @@ pub struct RuntimeDirectoryRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+    )
+)]
 pub struct ResolvedRuntimeDirectory {
     pub path: PathBuf,
     pub source: RuntimeDirectorySource,
@@ -187,6 +201,13 @@ pub trait RuntimeDirectoryEnvironment {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+        )
     )]
     fn macos_user_temporary_directory(&self) -> Result<PathBuf, LocalTransportError>;
 }
@@ -511,6 +532,13 @@ pub fn validate_channel_addressability(path: &Path) -> Result<(), LocalTransport
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+    )
+)]
 pub fn resolve_runtime_directory(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -524,6 +552,13 @@ pub fn resolve_runtime_directory(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+    )
 )]
 pub fn resolve_runtime_directory_with_environment(
     request: &RuntimeDirectoryRequest,
@@ -659,6 +694,13 @@ pub fn runtime_directory_for_store(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+    )
+)]
 pub fn prepare_runtime_directory(
     request: &RuntimeDirectoryRequest,
     inspector: &dyn RuntimeDirectoryInspector,
@@ -672,6 +714,13 @@ pub fn prepare_runtime_directory(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+    )
 )]
 pub fn prepare_runtime_directory_with_environment(
     request: &RuntimeDirectoryRequest,
@@ -894,6 +943,13 @@ fn create_owner_only_runtime_child(path: &Path) -> Result<(), LocalTransportErro
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+    )
+)]
 pub fn inspect_channel_path(
     path: &Path,
     runtime_directory: &Path,
@@ -954,6 +1010,13 @@ fn inspect_system_runtime_root(_root: &Path) -> Result<RuntimeDirectoryFacts, Lo
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
 )]
 fn inspect_system_channel_path(
     path: &Path,

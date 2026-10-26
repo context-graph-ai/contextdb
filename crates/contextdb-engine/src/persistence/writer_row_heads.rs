@@ -697,6 +697,10 @@ pub(super) struct HeldRelations<'name, 'txn, 'a, A: RowHeadAdmission> {
     replacement: Option<redb::RegistryReplacement>,
     /// Counts registry allocations outside a funded reserve for the whole
     /// pass; dropped last.
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     monitor: redb::RegistryMonitor,
 }
 

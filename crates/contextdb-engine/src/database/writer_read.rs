@@ -1355,6 +1355,13 @@ impl Database {
     }
 
     /// Visit only owners already held by this operation's captured root.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from maintenance_and_limits.rs"
+        )
+    )]
     pub(super) fn visit_writer_output_copy_credits(
         &self,
         visit: &mut dyn FnMut(usize, usize, bool),

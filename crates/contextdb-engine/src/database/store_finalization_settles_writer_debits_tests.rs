@@ -15,6 +15,13 @@ use crate::local_transport::ManualDeadlineClock;
 #[derive(Clone, Copy)]
 enum Construction {
     /// The construction every production open uses.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     Public,
     /// The engine's own writer-owned host construction.
     Owned,

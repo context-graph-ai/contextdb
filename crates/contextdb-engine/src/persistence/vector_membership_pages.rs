@@ -1677,6 +1677,13 @@ pub(super) fn occupancy_visible_at_any_in_read(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from redb_rows_and_indexes.rs"
+    )
+)]
 pub(super) fn reset_in_write(write: &redb::WriteTransaction) -> Result<()> {
     content_size::reset_memberships(write)?;
     write

@@ -3697,6 +3697,7 @@ impl Database {
     /// state across restart, while memory carries it only for this database
     /// life.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from in_memory_lineage_tests.rs"))]
     fn append_destination_reupload_deletes(
         &self,
         changes: ChangeSet,
@@ -4420,6 +4421,7 @@ impl Database {
     /// state change one boundary. A concurrent local write cannot be
     /// accidentally reclassified after this method chose its entries.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from sync_receipt_atomicity_tests.rs"))]
     fn invalidate_accepted_local_ordering_after_hub_regression(
         &self,
         hub_applied_source_watermark: Lsn,
@@ -4490,6 +4492,7 @@ impl Database {
     /// intentionally includes later local writes too: a restored-hub ordinary
     /// pull must not overwrite any current local work past its frontier.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from sync_receipt_atomicity_tests.rs"))]
     fn mark_outbound_rows_pending(
         &self,
         after_exclusive: Lsn,
@@ -4791,6 +4794,7 @@ impl Database {
     /// lineage matches; retained history keeps evidence if a later page edit
     /// has already replaced the visible row.
     #[expect(clippy::result_large_err, reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating.")]
+    #[cfg_attr(not(feature = "test-seams"), allow(dead_code, reason = "KEEP-SEAM: live only under the test-seams feature; used from sync_receipt_atomicity_tests.rs"))]
     fn refresh_confirmed_pending_rows(
         &self,
         rows: &[RowChange],

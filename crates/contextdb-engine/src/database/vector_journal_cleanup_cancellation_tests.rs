@@ -379,6 +379,13 @@ thread_local! {
     static PUBLISHED_CLEANUP_HOOK: RefCell<Option<PublishedCleanupHook>> = const { RefCell::new(None) };
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 struct PublishedCleanupHookGuard(Option<PublishedCleanupHook>);
 
 impl Drop for PublishedCleanupHookGuard {
@@ -387,6 +394,13 @@ impl Drop for PublishedCleanupHookGuard {
     }
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 fn on_published_cleanup_boundary(
     hook: impl FnMut(&VectorPartitionGenerationCatalogRecord) + 'static,
 ) -> PublishedCleanupHookGuard {

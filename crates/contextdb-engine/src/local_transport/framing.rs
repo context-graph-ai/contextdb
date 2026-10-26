@@ -21,6 +21,13 @@ pub enum FrameViolation {
     LengthExceedsMaximum,
     TruncatedLength,
     TruncatedPayload,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_protocol.rs"
+        )
+    )]
     TrailingBytes,
 }
 
@@ -547,6 +554,13 @@ impl LocalEngineFailure {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub fn from_error(
         error: &contextdb_core::Error,
         owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -648,6 +662,13 @@ pub enum LocalInboundMessage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalInboundKind {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_protocol.rs"
+        )
+    )]
     Handshake,
     Request,
     Response(LocalResponseExpectation),
@@ -841,6 +862,13 @@ impl LocalProtocolBoundary {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
+    )]
     pub fn encode_frame(
         &self,
         message: LocalOutboundMessage<'_>,
@@ -949,6 +977,13 @@ impl LocalProtocolBoundary {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_protocol.rs"
+        )
+    )]
     pub fn receive_frame(
         &self,
         kind: LocalInboundKind,
@@ -995,6 +1030,13 @@ impl LocalProtocolBoundary {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
+    )]
     pub(crate) fn receive_frame_preserving_refusal(
         &self,
         kind: LocalInboundKind,
@@ -1012,6 +1054,13 @@ impl LocalProtocolBoundary {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+        )
     )]
     pub fn receive_ordinary_result_frame(
         &self,
@@ -1427,9 +1476,37 @@ pub struct AssembledOrdinaryResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultReceiveOutcome {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     Pending,
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_paged.rs"
+        )
+    )]
     Published(AssembledOrdinaryResult),
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     Failed(ReadFailure),
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from read_session.rs"
+        )
+    )]
     EngineFailed(LocalEngineFailure),
     Disconnected,
 }
@@ -2131,6 +2208,13 @@ pub(crate) fn split_canonical_result_funded(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
 pub fn split_canonical_result(
     canonical_bytes: &[u8],
 ) -> Result<Vec<LocalResponse>, LocalTransportError> {
@@ -2239,6 +2323,13 @@ pub(crate) fn split_payload_answer_funded(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from mod.rs"
+    )
+)]
 pub fn split_payload_answer(
     payload: Vec<u8>,
     terminal: impl Fn(Vec<u8>) -> LocalResponse,
@@ -2326,6 +2417,13 @@ impl OrdinaryResultReceiver {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_read_client_contract.rs"
+        )
+    )]
     pub fn with_byte_limit(byte_limit: u64) -> Result<Self, LocalTransportError> {
         if byte_limit == 0 {
             return Err(invalid_channel_data());
@@ -2345,6 +2443,13 @@ impl OrdinaryResultReceiver {
     }
 
     #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+        )
+    )]
     pub fn buffered_byte_count(&self) -> usize {
         self.buffered_bytes
     }
@@ -2594,6 +2699,13 @@ impl OrdinaryResultReceiver {
         self.state = Some(ResultReceiveState::Discarded);
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn discard_if_receiving(&mut self) {
         if self.state() == ResultReceiveState::Receiving {
             self.discard_buffered();
@@ -2617,6 +2729,13 @@ impl OrdinaryResultReceiver {
     #[expect(
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+    )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
     )]
     pub fn receive(
         &mut self,
@@ -2841,6 +2960,13 @@ impl OrdinaryResultReceiver {
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from inbound.rs"
+    )
 )]
 pub fn encode_message<T: Serialize>(
     message: &T,
@@ -3920,6 +4046,13 @@ pub fn frame_length_prefix(payload_len: usize) -> Result<[u8; 4], LocalTransport
 
 /// A reader/allocator split makes it possible to prove that a hostile length
 /// prefix is rejected before any payload-sized allocation is requested.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
 pub trait FrameReader {
     #[expect(
         clippy::result_large_err,
@@ -3928,6 +4061,13 @@ pub trait FrameReader {
     fn read_exact(&mut self, bytes: &mut [u8]) -> Result<(), LocalTransportError>;
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_protocol.rs"
+    )
+)]
 pub trait FrameBufferAllocator {
     #[expect(
         clippy::result_large_err,
@@ -3940,6 +4080,13 @@ pub trait FrameBufferAllocator {
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
 pub fn read_payload_with_admission(
     reader: &mut dyn FrameReader,
     allocator: &mut dyn FrameBufferAllocator,
@@ -3950,6 +4097,13 @@ pub fn read_payload_with_admission(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
 )]
 fn read_payload_with_memory_admission(
     reader: &mut dyn FrameReader,
@@ -3986,6 +4140,13 @@ fn read_payload_with_memory_admission(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_refusal_taxonomy.rs"
+    )
+)]
 pub fn receive_framed_ordinary_result(
     receiver: &mut OrdinaryResultReceiver,
     reader: &mut dyn FrameReader,
@@ -4015,6 +4176,13 @@ pub fn receive_framed_ordinary_result(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
 pub fn encode_payload_frame(
     payload: &[u8],
     owner: contextdb_core::read_memory::ReadMemoryOwner,
@@ -4038,6 +4206,13 @@ pub fn encode_payload_frame(
 #[expect(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
 )]
 pub fn decode_frame_exact(frame: &[u8]) -> Result<Vec<u8>, LocalTransportError> {
     let Some(prefix) = frame.get(..4) else {

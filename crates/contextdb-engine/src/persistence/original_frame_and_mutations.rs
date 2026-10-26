@@ -341,6 +341,13 @@ impl<'o> OriginalPersistenceFrame<'o> {
 /// Arm (or disarm with `None`) a refusal at one named identity-mutation site
 /// for the calling thread.
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from native_commit_paths.rs"
+    )
+)]
 pub(crate) fn refuse_identity_growth_at_for_test(site: Option<&'static str>) {
     REFUSED_IDENTITY_GROWTH_SITE.with(|armed| armed.set(site));
 }
@@ -3042,6 +3049,13 @@ graph_commit_result }.map_err(Self::storage_error)?;
     /// Measurement only: run the owned no-op received-schema flush for one
     /// DDL entry at `lsn` on this store, exactly as its producer would.
     #[cfg(any(test, feature = "test-seams"))]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from native_commit_paths.rs"
+        )
+    )]
     pub(crate) fn flush_received_schema_noop_ddl_for_test(
         &self,
         accountant: crate::memory_accounting::AccountantHandle,

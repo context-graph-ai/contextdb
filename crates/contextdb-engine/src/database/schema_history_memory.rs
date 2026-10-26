@@ -250,6 +250,13 @@ impl SchemaHistoryMemory {
         }
         Ok(())
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     pub(super) fn bytes(&self) -> usize {
         self.backing
             .bytes()
@@ -525,6 +532,13 @@ impl Database {
         }
         self.publish_memory_schema_history(Some(prepared));
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from maintenance_and_limits.rs"
+        )
+    )]
     pub(super) fn schema_history_retained_bytes(&self) -> usize {
         self.finalization
             .schema_history_memory
@@ -532,6 +546,13 @@ impl Database {
             .as_ref()
             .map_or(0, SchemaHistoryMemory::bytes)
     }
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from constraint_validation.rs"
+        )
+    )]
     pub(super) fn clear_memory_schema_log(&self) {
         let mut retained = self.finalization.schema_history_memory.lock();
         let mut log = self.ddl_log.write();

@@ -28,7 +28,6 @@
 // integration proofs. Its reexports and the child APIs those proofs exercise
 // intentionally have no default-build consumer; production uses the private
 // operational subset instead.
-#![cfg_attr(not(feature = "test-seams"), allow(unused_imports, dead_code))]
 
 mod address;
 mod authentication;
@@ -47,14 +46,63 @@ pub(crate) use terminal::{write_query_diagnostic, write_query_error, write_query
 
 #[cfg(unix)]
 pub use address::ChannelKernelAddress;
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+    )
+)]
 pub use address::{channel_socket_path, derive_channel_address, opaque_channel_basename};
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from authentication.rs"
+    )
+)]
 pub use authentication::{
     AdmittedReader, authenticate_framed_stream_handshake, authenticate_stream_handshake,
 };
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from authentication.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_authentication.rs"
+    )
+)]
 pub use authentication::{ReadPrincipal, authenticate_peer, peer_user_from_stream};
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from carrier.rs"
+    )
+)]
 pub use carrier::{StaleRemovalInterlock, UnixLocalCarrier};
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deadlines.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub use deadlines::{
     DeadlineOperationWait, DeadlineStage, LocalDeadlineOperation, ManualDeadlineClock,
     MonotonicDeadlineClock, connect_with_deadline, drain_shutdown_with_deadline,
@@ -63,10 +111,38 @@ pub use deadlines::{
     retry_route_with_deadline, serve_request_with_deadline, write_request_with_deadline,
 };
 #[cfg(any(test, feature = "test-seams"))]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from deadlines.rs"
+    )
+)]
 pub use deadlines::{
     fail_next_timer_arms_for_test, reset_timer_threads_started_for_test,
     timer_threads_started_for_test,
 };
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from engine_answer.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_read_channel_error_document.rs"
+    )
+)]
 pub use engine_answer::{
     ALL_TAGS, BodyField, ReadChannelError, TAG_ACL_DENIED, TAG_BFS_DEPTH_EXCEEDED,
     TAG_BFS_VISITED_EXCEEDED, TAG_COLUMN_NOT_FOUND, TAG_COLUMN_TYPE_MISMATCH,
@@ -91,6 +167,41 @@ pub use engine_answer::{
     TAG_VECTOR_WHOLE_INDEX_INSPECTION_DENIED, TAG_WINDOW_FUNCTION_NOT_SUPPORTED, body_grammar,
 };
 pub(crate) use engine_answer::{BLOB_SOURCE_REFUSAL_MAX_BYTES, encode_read_error_into_slice};
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_refusal_taxonomy.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from inbound.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_wire_values.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_framing.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from framing.rs"
+    )
+)]
 pub use framing::{
     AssembledOrdinaryResult, CursorCloseAcknowledgement, CursorOpenedResponse, CursorPageResponse,
     FrameBufferAllocator, FrameReader, FrameViolation, LocalConfigurationSource,
@@ -113,8 +224,43 @@ pub(crate) use framing::{
 };
 pub use runtime::RuntimeDirectory;
 #[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature"
+    )
+)]
 pub use runtime::linux_filesystem_type_is_local;
 pub(crate) use runtime::runtime_directory_for_store;
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_deep_runtime_directory.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from runtime.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_runtime.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_containment.rs"
+    )
+)]
 pub use runtime::{
     ChannelPathFacts, ChannelPathViolation, LocalPlatformAvailability, OWNER_ONLY_MODE,
     ProcessRuntimeDirectoryEnvironment, ResolvedRuntimeDirectory, RuntimeDirectoryEnvironment,
@@ -126,12 +272,33 @@ pub use runtime::{
     validate_channel_addressability, validate_channel_path, validate_runtime_root,
     validate_socket_path_length,
 };
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from local_transport_stale.rs"
+    )
+)]
 pub use stale::{
     ChannelFilesystemIdentity, FinalStaleIdentityObservation, LivenessEvidence, StaleChannelAction,
     StaleChannelEvidence, StaleFilesystemEvidence, StaleIdentityEvidence,
     decide_stale_channel_action,
 };
 #[cfg(unix)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from open_and_owner_reads.rs"
+    )
+)]
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        unused_imports,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from stale.rs"
+    )
+)]
 pub use stale::{
     StaleChannelProbe, channel_filesystem_identity, reconcile_stale_channel,
     remove_own_bound_channel,
@@ -170,6 +337,13 @@ pub enum LocalTransportError {
     #[error(
         "reader memory admission failed for {subsystem}/{operation}: requested {requested_bytes}, available {available_bytes}, limit {budget_limit_bytes}; {hint}"
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     MemoryAdmission {
         subsystem: contextdb_core::error::DiagnosticLabel,
         operation: contextdb_core::error::DiagnosticLabel,
@@ -179,8 +353,22 @@ pub enum LocalTransportError {
         hint: contextdb_core::error::DiagnosticLabel,
     },
     #[error("native reader admission failed: {0:?}")]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from iroh.rs"
+        )
+    )]
     NativeAdmission(contextdb_core::read_memory::NativeRefusal),
     #[error("local transport is not implemented")]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from bounded.rs"
+        )
+    )]
     Unimplemented,
     #[error("peer credentials are unavailable")]
     CredentialsUnavailable,

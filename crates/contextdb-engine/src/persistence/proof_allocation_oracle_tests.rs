@@ -373,11 +373,22 @@ thread_local! {
 #[derive(Debug)]
 pub(crate) struct DeclarationObservation {
     reset_counter: bool,
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     writer: Option<crate::memory_accounting::AccountantHandle>,
 }
 impl DeclarationObservation {
     // This parent is the one debited by the ordinary production child. Owning
     // the parent makes sampling safe without keeping the tested copy alive.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from currency_version_compaction_tests.rs"
+        )
+    )]
     pub(crate) fn funded_by_reader(
         parent: crate::vector_read_memory::DeclaredReadRoot,
         baseline: usize,
@@ -399,6 +410,13 @@ impl DeclarationObservation {
     // Retain only the actual store's existing accountant; no reservation or
     // producer control is created. Needed to distinguish an independent writer
     // debit from this reader parent's standing and sibling credits.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from saved_search_and_append_work_ceiling.rs"
+        )
+    )]
     pub(crate) fn observe_writer(&mut self, writer: crate::memory_accounting::AccountantHandle) {
         DECLARATION_WRITER.with(|slot| {
             slot.set((
@@ -756,6 +774,13 @@ pub(crate) fn source_unfunded_peak_for_test() -> (usize, (usize, usize, usize, b
 }
 // Same original pre-System counter sample as the bounded prefix recorder,
 // retained for the actual latest constructor even beyond that prefix.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from ordinary_native_owner_tests.rs"
+    )
+)]
 pub(crate) fn last_source_request_credit_for_test() -> (usize, usize, usize) {
     LAST_SOURCE_REQUEST_CREDIT.with(std::cell::Cell::get)
 }
@@ -820,6 +845,13 @@ pub(crate) fn source_free_for_test(count: usize) -> [(usize, usize, usize); 128]
 
 /// Independently recorded live allocator obligations on each watched counter.
 /// Reading them changes no watch, event, admission, free or existing tuple.
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from ordinary_native_owner_tests.rs"
+    )
+)]
 pub(crate) fn source_live_at_free_for_test(count: usize) -> [usize; 128] {
     assert!(count <= NATIVE_FREE.len());
     std::array::from_fn(|index| NATIVE_FREE[index].live_at_free.load(AtomicOrdering::SeqCst))
@@ -979,6 +1011,13 @@ impl PurgeProducerSnapshot {
     }
 }
 impl Measurement {
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     fn reserve_purge_producer_snapshot(&mut self) -> PurgeProducerSnapshotHandle {
         let index = self.purge_producer_snapshots_used;
         let Some(generation) = index.checked_add(1) else {
@@ -1065,6 +1104,13 @@ pub(crate) fn note_purge_publication_frontier(frontier: u64) {
         measurement.purge_receipt.publication_frontier = Some(frontier);
     }
 }
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_public_contract_tests.rs"
+    )
+)]
 pub(crate) fn measured_purge<T>(
     operation: impl FnOnce() -> T,
 ) -> (T, usize, usize, PurgePeakReceipt) {
@@ -1117,6 +1163,13 @@ struct Measurement {
     purge_live_producers: [PurgeProducer; 1024],
     purge_receipt: PurgePeakReceipt,
     purge_producer_snapshots: [PurgeProducerSnapshot; 4],
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature"
+        )
+    )]
     purge_producer_snapshots_used: usize,
     last_window: usize,
     active_window: usize,
@@ -2397,6 +2450,13 @@ pub(crate) fn assert_graph_freed_before_workspace_refund(repair: bool) {
     });
 }
 
+#[cfg_attr(
+    not(feature = "test-seams"),
+    allow(
+        dead_code,
+        reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_public_cycle_admission_tests.rs"
+    )
+)]
 pub(crate) fn assert_saved_export_identities(expected: usize) {
     GRAPH_ALLOCATIONS.with(|slot| {
         let state = slot.get().expect("identity observation scope");

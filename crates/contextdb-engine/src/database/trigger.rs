@@ -5302,6 +5302,10 @@ struct RetiredOriginalTriggerState {
 }
 
 struct RetiredOriginalCallbackMap {
+    #[allow(
+        dead_code,
+        reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops"
+    )]
     callbacks: HashMap<String, TriggerCallback>,
     _original: Option<OwnedMemoryReservation>,
 }

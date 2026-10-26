@@ -12,6 +12,13 @@ impl Database {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from executor.rs"
+        )
+    )]
     pub(crate) fn ensure_image_history(&self) -> Result<()> {
         self.ensure_image_history_with_read_memory(&|| Ok(()), self.declared_reader_memory()?)
             .map_err(ImageHistoryError::into_engine_error)

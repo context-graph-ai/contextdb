@@ -847,6 +847,13 @@ impl Database {
     // Production-dead extension of the existing compaction observation for
     // reader-admission schedules: inspect the real cursor and interval.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from owner_cursor_admission_tests.rs"
+        )
+    )]
     pub(crate) fn maintenance_publication_state_for_test(
         &self,
     ) -> (&RedbPersistence, Option<std::time::Instant>, bool) {
@@ -1972,6 +1979,13 @@ impl Database {
     // Frozen checkpoint controls retain this former convenience call. Production
     // consumers use the bounded verification operation; no public API is restored.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from historical_index_commitment.rs"
+        )
+    )]
     pub(super) fn verify_historical_indexes(
         &self,
         table: &str,
@@ -4024,6 +4038,13 @@ impl Database {
     }
     }
 
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from stable_funder_identity_proof_tests.rs"
+        )
+    )]
     pub(super) fn visit_source_copy_credits(&self, visit: &mut dyn FnMut(usize, usize, bool)) {
         self.vector_store
             .visit_retained_copy_credits(self.finalization.vector_accountant.as_ref(), visit);

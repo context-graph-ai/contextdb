@@ -2113,6 +2113,13 @@ impl Database {
 
     /// Private singular wrapper retained for the immutable-root test seam.
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_kernel_tests.rs"
+        )
+    )]
     pub(super) fn commit_authoritative_purge_kernel(
         &self,
         selection: &AuthoritativePurgeSelection,
@@ -2564,6 +2571,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_blob_storage_contract_tests.rs"
+        )
+    )]
     pub(super) fn install_authoritative_purge_complete_blob_fixture_for_test(
         &self,
         hash: &[u8; 32],
@@ -2576,6 +2590,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_blob_storage_contract_tests.rs"
+        )
+    )]
     pub(super) fn install_authoritative_purge_interrupted_blob_fixture_for_test(
         &self,
         hash: &[u8; 32],
@@ -2593,6 +2614,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_blob_storage_contract_tests.rs"
+        )
+    )]
     pub(super) fn authoritative_purge_blob_roles_for_test(
         &self,
         hash: &[u8; 32],
@@ -2604,6 +2632,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_blob_storage_contract_tests.rs"
+        )
+    )]
     pub(super) fn authoritative_purge_blob_bytes_for_test(
         &self,
         hash: &[u8; 32],
@@ -2616,6 +2651,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_blob_storage_contract_tests.rs"
+        )
+    )]
     pub(super) fn authoritative_purge_next_missing_range_for_test(
         &self,
         hash: &[u8; 32],
@@ -2627,6 +2669,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_blob_storage_contract_tests.rs"
+        )
+    )]
     pub(super) fn arm_authoritative_purge_blob_commit_failure_for_test(&self) {
         let _operation = self.assert_open_operation();
         self.blob_repository
@@ -2861,6 +2910,13 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        allow(
+            dead_code,
+            reason = "KEEP-SEAM: live only under the test-seams feature; used from authoritative_purge_kernel_tests.rs"
+        )
+    )]
     pub(super) fn authoritative_purge_live_row_sidecar_for_test(
         &self,
         selection: &AuthoritativePurgeSelection,
