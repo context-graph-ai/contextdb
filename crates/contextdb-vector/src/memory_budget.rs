@@ -942,9 +942,11 @@ impl Drop for VectorCopyAdmission {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct UnlimitedMemoryBudget;
 
+#[cfg(test)]
 impl MemoryBudget for UnlimitedMemoryBudget {
     fn try_allocate_for(
         &self,

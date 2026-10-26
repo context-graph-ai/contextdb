@@ -1144,6 +1144,7 @@ impl SyncServer {
         // `record_contact`; push records after the admission decision so a
         // database write cannot strand a retry outside its leader's fanout.
         // An unauthenticated request records nothing.
+        #[cfg_attr(not(feature = "test-seams"), allow(unused_mut, reason = "KEEP-SEAM: the test-seams build pushes its seam handlers onto this list"))]
         let mut handlers = vec![
             HandlerRegistration {
                 subject: crate::subjects::binding_subject(self.tenant_id.as_str()),

@@ -10,6 +10,7 @@ const FORMAT: u8 = 1;
 const FIXED_KEY_BYTES: usize = 72;
 
 #[derive(Clone, Copy)]
+#[allow(dead_code, reason = "WIRE-FIELD: part of a fixed encoded format")]
 pub(in super::super) struct VersionManifest<'a> {
     pub(in super::super) table: &'a str,
     pub(in super::super) identity: [u8; 24],
@@ -2165,6 +2166,7 @@ pub(in super::super) mod commit_row_work {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(in super::super::super) fn take_group_versions_authenticated() -> u64 {
         GROUP_VERSIONS_AUTHENTICATED.with(|count| count.replace(0))
     }
@@ -2183,6 +2185,7 @@ pub(in super::super) mod commit_row_work {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(in super::super::super) fn take_retention_clock_steps() -> u64 {
         RETENTION_CLOCK_STEPS.with(|count| count.replace(0))
     }
@@ -2194,6 +2197,7 @@ pub(in super::super) mod commit_row_work {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(in super::super::super) fn take_declared_table_visits() -> u64 {
         DECLARED_TABLE_VISITS.with(|count| count.replace(0))
     }
@@ -2212,6 +2216,7 @@ pub(in super::super) mod commit_row_work {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(in super::super::super) fn take_protected_root_events() -> u64 {
         PROTECTED_ROOT_EVENTS.with(|count| count.replace(0))
     }
@@ -2231,6 +2236,7 @@ pub(in super::super) mod commit_row_work {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(in super::super::super) fn take_overlay_comparisons() -> u64 {
         OVERLAY_COMPARISONS.with(|count| count.replace(0))
     }
@@ -2255,6 +2261,7 @@ pub(in super::super) mod commit_row_work {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(in super::super::super) fn take_held_relation_work() -> u64 {
         HELD_RELATION_WORK.with(|count| count.replace(0))
     }
@@ -2268,6 +2275,7 @@ pub(in super::super) mod commit_row_work {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(in super::super::super) fn watch_held_first_uses() {
         HELD_FIRST_USES.with(|uses| *uses.borrow_mut() = Some(Vec::new()));
     }
@@ -2279,6 +2287,7 @@ pub(in super::super) mod commit_row_work {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from commit_row_scaling_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(in super::super::super) fn take_held_first_uses() -> Vec<Vec<String>> {
         HELD_FIRST_USES.with(|uses| uses.borrow_mut().take().unwrap_or_default())
     }

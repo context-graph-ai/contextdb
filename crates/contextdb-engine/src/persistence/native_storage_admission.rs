@@ -3,13 +3,12 @@
 //! Joined Original callbacks move private diagnostic custody; legacy callbacks
 //! and lower producers retain their explicit unqualified coverage.
 use crate::memory_accounting::{
-    ControlCredit, OwnedMemoryReservation, StoreAccountantHandle, WriterUse,
-    clone_persistence_original_writer, persistence_original_projection,
+    OwnedMemoryReservation, StoreAccountantHandle, WriterUse, clone_persistence_original_writer,
+    persistence_original_projection,
 };
 use contextdb_core::read_memory::ReadMemoryBudget as _;
 use contextdb_core::read_memory::{NativeRefusal, ReadCredit, ReadMemoryOwner};
 use contextdb_core::{Error, Lsn, Result, SnapshotId};
-use contextdb_tx::SourceFunder;
 use redb::{NativeStorageAdmission, NativeStorageCredit, NativeStorageRefused};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::mem::ManuallyDrop;
@@ -64,9 +63,10 @@ unsafe fn inspect_scope_failure(
 }
 
 pub(crate) enum StorageAllocation {
+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
     Writer(OwnedMemoryReservation),
+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
     Read(ReadCredit),
-    Store(ControlCredit),
 }
 #[cfg(feature = "test-seams")]
 unsafe fn inspect_scope_allocation_funding(raw: NonNull<()>) -> Option<(usize, usize)> {
@@ -74,10 +74,7 @@ unsafe fn inspect_scope_allocation_funding(raw: NonNull<()>) -> Option<(usize, u
     let scope = &unsafe { raw.cast::<StorageScopeBlock>().as_ref() }.payload;
     let owner = match &scope.funding {
         StorageFunding::Original(original) => Some(original.accountant().as_ptr() as usize),
-        StorageFunding::Writer {
-            original_handle, ..
-        }
-        | StorageFunding::PreparedWriter {
+        StorageFunding::PreparedWriter {
             original_handle, ..
         } => Some(original_handle.as_handle().as_ptr() as usize),
         StorageFunding::Read(reader) | StorageFunding::ReadUnqualified(reader) => {
@@ -90,11 +87,6 @@ unsafe fn inspect_scope_allocation_funding(raw: NonNull<()>) -> Option<(usize, u
 
 enum StorageFunding {
     Original(OwnedMemoryReservation),
-    Writer {
-        original_use: WriterUse,
-        original_handle: StoreAccountantHandle,
-        genuine_funder: SourceFunder,
-    },
     // Preparation already holds the authenticated Original. It does not need
     // a newly discovered SourceFunder or a current writer registration.
     PreparedWriter {
@@ -117,24 +109,6 @@ impl StorageFunding {
         match self {
             Self::Original(original) => {
                 reserve_original_bootstrap(original, layout.size()).map(StorageAllocation::Writer)
-            }
-            Self::Writer {
-                original_use,
-                original_handle,
-                genuine_funder,
-            } => {
-                debug_assert!(original_handle.is_writer());
-                // writer_unqualified/prepare_writer validated this immutable
-                // funder against the held use before building StorageFunding.
-                // Keep it alive with the scope; never rediscover a registration.
-                let _ = genuine_funder;
-                crate::memory_accounting::reserve_native_storage_from_writer_use(
-                    original_use,
-                    original_handle,
-                    layout.size(),
-                )
-                .map(StorageAllocation::Writer)
-                .map_err(|failure| original_storage_error(NativeStorageFailure::Refused(failure)))
             }
             Self::PreparedWriter { .. } => {
                 unreachable!("prepared storage uses scalar admission exclusively")
@@ -182,12 +156,7 @@ impl StorageFunding {
                 )
                 .map(StorageAllocation::Writer)
             }
-            Self::Writer {
-                original_use,
-                original_handle,
-                ..
-            }
-            | Self::PreparedWriter {
+            Self::PreparedWriter {
                 original_use,
                 original_handle,
             } => crate::memory_accounting::reserve_native_storage_from_writer_use(
@@ -752,45 +721,6 @@ pub(crate) struct ColdSnapshotMetadata {
     pub(crate) identity: redb::StorageSnapshotIdentity,
     pub(crate) snapshot: SnapshotId,
     pub(crate) lsn: Lsn,
-}
-struct ColdMetadataBlock {
-    owners: AtomicUsize,
-    metadata: ColdSnapshotMetadata,
-    invoice: ManuallyDrop<ControlCredit>,
-}
-pub(super) struct ColdMetadataOwner {
-    pointer: NonNull<ColdMetadataBlock>,
-}
-unsafe impl Send for ColdMetadataOwner {}
-unsafe impl Sync for ColdMetadataOwner {}
-impl ColdMetadataOwner {}
-impl Clone for ColdMetadataOwner {
-    fn clone(&self) -> Self {
-        retain(&unsafe { self.pointer.as_ref() }.owners);
-        Self {
-            pointer: self.pointer,
-        }
-    }
-}
-impl Drop for ColdMetadataOwner {
-    fn drop(&mut self) {
-        if unsafe { self.pointer.as_ref() }
-            .owners
-            .fetch_sub(1, Ordering::Release)
-            != 1
-        {
-            return;
-        }
-        fence(Ordering::Acquire);
-        let invoice = unsafe { ManuallyDrop::take(&mut self.pointer.as_mut().invoice) };
-        unsafe {
-            dealloc(
-                self.pointer.as_ptr().cast(),
-                Layout::new::<ColdMetadataBlock>(),
-            )
-        };
-        drop(invoice);
-    }
 }
 
 impl StorageAdmissionScope {}

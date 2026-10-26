@@ -836,6 +836,7 @@ fn a_lowered_partition_limit_arriving_over_sync_is_refused_and_changes_nothing()
 
 #[cfg(feature = "test-seams")]
 struct RunningPartitionLimitServer {
+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
     server: Arc<SyncServer>,
     shutdown: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,

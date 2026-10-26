@@ -54,6 +54,7 @@ pub(crate) struct WriterOpenBounds {
     pub(crate) max_row_id: RowId,
     pub(crate) max_tx: TxId,
     pub(crate) max_lsn: Lsn,
+    #[cfg(test)]
     pub(crate) commit_count: u64,
 }
 
@@ -1246,7 +1247,7 @@ impl RedbPersistence {
                 path: "writer_recovery".into(),
                 reason: "missing writer recovery bounds".into(),
             })?;
-        let (count, _commit_first, commit_last) =
+        let (_count, _commit_first, commit_last) =
             Self::read_commit_directory_bounds_in_read(read, stored)?;
         let mut bounds = WriterOpenBounds {
             max_row_id: RowId(stored.external_row_id_floor),
@@ -1258,7 +1259,8 @@ impl RedbPersistence {
             max_lsn: Lsn(stored
                 .source_lsn_floor
                 .max(commit_last.map_or(0, |(lsn, _)| lsn.0))),
-            commit_count: count,
+            #[cfg(test)]
+            commit_count: _count,
         };
         match read.open_table(DDL_LOG_TABLE) {
             Ok(ddl) => {

@@ -54,6 +54,7 @@ thread_local! {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from correction_counterexample_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn arm_verified_run_memory_exhaustion_for_test(armed: bool) {
     REFUSE_RUN_MEMORY.with(|refuse| refuse.set(armed));
 }
@@ -90,6 +91,7 @@ thread_local! {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from correction_counterexample_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn arm_config_write_failure_for_test(armed: bool) {
     REFUSE_CONFIG_WRITE.with(|refuse| refuse.set(armed));
 }

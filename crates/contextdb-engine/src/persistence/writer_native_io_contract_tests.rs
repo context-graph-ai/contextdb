@@ -347,7 +347,7 @@ fn actual_writer_funded_diagnosis_prepays_and_keeps_original_invoice_through_fre
 #[serial]
 fn actual_legacy_and_os_sources_cannot_borrow_native_or_disk_tls_qualification() {
     let writer = MemoryAccountant::writer_no_limit().unwrap();
-    let owner = writer.accountant();
+    let _owner = writer.accountant();
     let funder = writer.prepare_source_funder().unwrap();
     let original = writer.reserve_assembly_original(&funder).unwrap();
     // Each legacy view has the same concrete producer and matching kind/text,

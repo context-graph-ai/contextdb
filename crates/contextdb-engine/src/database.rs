@@ -10658,6 +10658,7 @@ struct ProjectedSyncApply {
 }
 
 #[derive(Debug)]
+#[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
 struct SyncParentKeyProjectionOwner(OwnedMemoryReservation);
 
 /// The most one distinct LSN's entry in `change_log_lsn_refcounts` occupies:

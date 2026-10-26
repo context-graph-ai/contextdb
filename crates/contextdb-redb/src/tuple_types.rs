@@ -155,6 +155,7 @@ macro_rules! from_bytes_fixed_impl {
                     offset += len;
                 }
             )+
+            let _ = offset;
 
             ($(
                 $v,
@@ -211,6 +212,7 @@ macro_rules! compare_fixed_impl {
                     offset1 += len;
                 }
             )+
+            let _ = (offset0, offset1);
 
             Ordering::Equal
         }

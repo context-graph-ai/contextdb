@@ -197,6 +197,7 @@ impl WriterSnapshotHandle {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn control_bytes(&self) -> usize {
         self.descriptor_control_bytes()
             .saturating_add(self.schema._memory.bytes())
@@ -1600,6 +1601,7 @@ impl WriterSnapshot {
         owner.reserve(bytes, "store_adapter")
     }
     #[cfg(any(test, feature = "test-seams"))]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn control_bytes(&self) -> usize {
         self._control
             .bytes()
@@ -1845,6 +1847,7 @@ impl WriterSnapshot {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn cursor(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -1882,6 +1885,7 @@ impl WriterSnapshot {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from ordered_staged.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn exact_row(
         self: &Arc<Self>,
         owner: SourceWindowOwner,
@@ -4480,7 +4484,7 @@ impl WriterSnapshotHandle {
         reason = "Native refusal diagnostics stay inline under exhausted budgets."
     )]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn visit_historical_row_headers_with_proof(
+    pub(in crate::persistence) fn visit_historical_row_headers_with_proof(
         &self,
         table: &str,
         row_id: Option<RowId>,

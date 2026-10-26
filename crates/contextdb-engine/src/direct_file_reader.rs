@@ -935,7 +935,6 @@ pub struct DirectStorageRegistrationObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectReaderPrerequisite {
-    PersistenceLoadReadImage,
     PersistenceSealedReleaseReceipt,
     VerifiedImageIdentityObservation,
     #[cfg_attr(

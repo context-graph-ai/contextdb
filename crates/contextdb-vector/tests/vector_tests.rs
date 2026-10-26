@@ -464,6 +464,7 @@ fn maintain_until_hnsw_ready(
 }
 
 #[cfg(feature = "test-seams")]
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 fn hnsw_final_estimate(entry_count: usize, dimension: usize) -> usize {
     contextdb_vector::hnsw::HnswIndex::estimated_resident_bytes_for_count(
         entry_count,
@@ -473,6 +474,7 @@ fn hnsw_final_estimate(entry_count: usize, dimension: usize) -> usize {
 }
 
 #[cfg(feature = "test-seams")]
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 fn hnsw_build_reservation_estimate(entry_count: usize, dimension: usize) -> usize {
     let policy = contextdb_vector::store::VectorIndexLayout::unpartitioned(
         dimension,

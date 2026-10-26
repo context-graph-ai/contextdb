@@ -1630,7 +1630,7 @@ fn ce22_vector_index_completeness_at_scale() {
         .collect()
     };
     let top1 = |db: &Database, axis: usize, what: &str| -> Value {
-        let mut result = db
+        let result = db
             .execute(
                 "SELECT id FROM corpus ORDER BY embedding <=> $q LIMIT 1",
                 &params(vec![("q", Value::Vector(beacon(axis)))]),

@@ -760,6 +760,7 @@ impl<'name, 'txn, 'a, A: RowHeadAdmission> HeldRelations<'name, 'txn, 'a, A> {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn ledger(&self) -> HoldLedger {
         self.ledger
     }
@@ -1134,6 +1135,7 @@ pub(super) enum HoldFault {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     Error,
     #[cfg_attr(
         not(feature = "test-seams"),
@@ -1142,6 +1144,7 @@ pub(super) enum HoldFault {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from event_bus_self_join.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     Panic,
     /// The next registry array allocation fails as the global allocator would.
     #[cfg_attr(
@@ -1151,6 +1154,7 @@ pub(super) enum HoldFault {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     GlobalAllocation,
 }
 
@@ -1173,6 +1177,7 @@ thread_local! {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(super) fn inject_hold_fault(step: HoldStep, fault: HoldFault, skip: usize) {
     HOLD_FAULT.with(|slot| slot.set(Some((step, fault, skip))));
 }
@@ -1186,6 +1191,7 @@ pub(super) fn inject_hold_fault(step: HoldStep, fault: HoldFault, skip: usize) {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(super) fn clear_hold_fault() -> bool {
     HOLD_FAULT.with(|slot| slot.take().is_some())
 }
@@ -1200,6 +1206,7 @@ pub(super) fn clear_hold_fault() -> bool {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(super) fn take_held_overdraft() -> usize {
     HELD_OVERDRAFT.with(|total| total.replace(0))
 }
@@ -1233,6 +1240,7 @@ fn take_hold_fault(step: HoldStep) -> Option<HoldFault> {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from held_relations_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(super) fn take_hold_arrivals() -> [usize; 16] {
     HOLD_ARRIVALS.with(|arrivals| arrivals.replace([0; 16]))
 }

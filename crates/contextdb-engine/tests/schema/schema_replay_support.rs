@@ -196,6 +196,7 @@ fn cost_receipt(label: &str, observation: &ReceivedSchemaApplyObservationForTest
 include!("schema_replay_exchange_helpers.rs");
 
 // The full targets retain the frozen row-count assertion through their root constant.
+#[allow(dead_code, reason = "KEEP-SHARED: shared test helper; other test targets or modules use it")]
 fn replay_resident_rows(db: &Database, row_count: i64) -> RetainedRows {
     if row_count == 10_000 {
         return resident_rows(db);

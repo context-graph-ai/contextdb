@@ -93,8 +93,8 @@ thread_local! {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn named_image_child_call(
-    payload: usize, counter: usize, subsystem: &'static str, operation: &'static str,
-    site: &'static str, bytes: usize, before: u64, after: u64, refused: bool,
+    payload: usize, counter: usize, _subsystem: &'static str, _operation: &'static str,
+    _site: &'static str, _bytes: usize, _before: u64, _after: u64, _refused: bool,
 ) {
     update(|capture| {
         if payload != capture.named_image_child || capture.named_image_child == 0 { return; }

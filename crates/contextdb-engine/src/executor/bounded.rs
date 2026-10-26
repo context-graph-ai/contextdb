@@ -807,6 +807,7 @@ impl RequestContext {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn new(
         reader_budget: impl Into<contextdb_core::read_memory::ReadMemoryOwner>,
         limits: ReadLimits,
@@ -20720,6 +20721,7 @@ fn default_page_rows(
         reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(super) fn open_cursor(
     db: Arc<dyn ReadExecutionTarget>,
     sql: &str,
@@ -22394,20 +22396,6 @@ fn window_capacity_bytes(
     }
     Ok(bytes)
 }
-
-// Private native control prototype. Logical strong lifetimes own T; every
-// strong or weak alias owns one physical count in the unchanged shared cell.
-// No caller is switched to this kernel until request/cursor integration exists.
-struct NativeControlCell<T> {
-    strong: std::sync::atomic::AtomicUsize,
-    payload: std::cell::UnsafeCell<Option<contextdb_core::read_memory::OwnedReadBox<T>>>,
-}
-
-// SAFETY: weak aliases never inspect payload. Initialization happens before
-// Release publication; successful upgrades acquire it. Only the final logical
-// strong takes payload after its Release decrement and Acquire fence. Every
-// borrowed T is protected by a logical strong; T handles its own shared mutation.
-unsafe impl<T: Send + Sync> Sync for NativeControlCell<T> {}
 
 /// The actual Native invocation owns the same bounded RequestContext used by
 /// vector adapters, decoder scopes, page admissions and ordinary checkpoints.

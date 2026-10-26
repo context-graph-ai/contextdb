@@ -1359,14 +1359,8 @@ fn direct_error(path: &Path, error: crate::direct_file_reader::DirectFileReaderE
         Direct::Contended { .. } => {
             crate::persistence::RedbPersistence::held_by_writer_error_from_record(path)
         }
-        // "Not implemented" is one answer and it means one thing: there is no
-        // production path for this route. Every other prerequisite the direct
-        // reader can find missing is an internal invariant that failed on a
-        // route that IS implemented, and saying it is unimplemented tells the
-        // caller to stop asking instead of what went wrong.
-        Direct::MissingPrerequisite(
-            crate::direct_file_reader::DirectReaderPrerequisite::PersistenceLoadReadImage,
-        ) => Error::ReadSessionNotImplemented,
+        // A missing prerequisite is an internal invariant that failed on a
+        // route that IS implemented; the caller is told what went wrong.
         error @ Direct::MissingPrerequisite(_) => Error::Other(error.to_string().into()),
     }
 }

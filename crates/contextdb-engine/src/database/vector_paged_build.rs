@@ -1129,6 +1129,7 @@ impl MaintenanceContext {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
     pub(super) fn start_paged_vector_build(
         &self,
         partition: &VectorPartitionRef,

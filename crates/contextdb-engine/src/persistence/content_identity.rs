@@ -504,6 +504,7 @@ fn observe_read_proof_memory(bytes: usize) {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn take_proof_memory_peak_for_test() -> (usize, usize, usize) {
     PROOF_MEMORY_PEAK.with(|peak| peak.replace((0, 0, 0)))
 }
@@ -528,6 +529,7 @@ thread_local! {
         reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) struct ResolvedKeyCopyWatchForTest(std::marker::PhantomData<std::rc::Rc<()>>);
 
 #[cfg(any(test, feature = "test-seams"))]
@@ -546,6 +548,7 @@ impl Drop for ResolvedKeyCopyWatchForTest {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn watch_resolved_key_copies_for_test() -> ResolvedKeyCopyWatchForTest {
     RESOLVED_KEY_WATCH_ENABLED.with(|enabled| {
         assert!(!enabled.get(), "referenced-key watches must not overlap");
@@ -563,6 +566,7 @@ pub(crate) fn watch_resolved_key_copies_for_test() -> ResolvedKeyCopyWatchForTes
         reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn take_resolved_key_copy_observations_for_test() -> Vec<(&'static str, usize)> {
     RESOLVED_KEY_EVENTS.with(|obs| std::mem::take(&mut *obs.borrow_mut()))
 }
@@ -588,6 +592,7 @@ thread_local! {
         reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn reset_touch_work_for_test() {
     TOUCH_WORK.with(|work| work.set(0));
 }
@@ -600,6 +605,7 @@ pub(crate) fn reset_touch_work_for_test() {
         reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn take_touch_work_for_test() -> u64 {
     TOUCH_WORK.with(|work| work.replace(0))
 }
@@ -2289,6 +2295,7 @@ fn parse_posting_tree_key(key: &[u8]) -> Result<PostingTreeKeyParts<'_>> {
         reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_authentication_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 fn decode_posting_position(bytes: &[u8]) -> Result<super::EncodedRelationalIndexPosition> {
     let _decode_scope = crate::read_image_memory::ImageMemory::enter_decode_call()?;
     RedbPersistence::decode_exact::<super::EncodedRelationalIndexPosition>(bytes).map_err(|error| {
@@ -4554,6 +4561,7 @@ use writer_window::update_family;
         reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 const fn proof_path_bytes(height: u32) -> usize {
     (height as usize + 3) * (MAX_NODE_BYTES + 4096)
 }
@@ -5265,6 +5273,7 @@ impl ResidentProofChunks {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn lru_keys(&self) -> Vec<[u8; 33]> {
         let mut keys = Vec::new();
         let mut cur = self.oldest;
@@ -5494,6 +5503,7 @@ impl ResidentProofChunkSet {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn charged_for_test(
         accountant: Arc<crate::memory_accounting::MemoryAccountant>,
         ceiling: usize,
@@ -5517,6 +5527,7 @@ impl ResidentProofChunkSet {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn free_for_test(floor: usize) -> Self {
         Self {
             state: Mutex::new(ResidentProofChunks::default()),
@@ -5535,6 +5546,7 @@ impl ResidentProofChunkSet {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn lru_keys_for_test(&self) -> Vec<[u8; 33]> {
         self.locked().lru_keys()
     }
@@ -5687,6 +5699,7 @@ impl ProofMemory {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from declared_memory_limit_bounds_a_writer.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn unlimited() -> Self {
         Self::with_limit(usize::MAX)
     }
@@ -5842,6 +5855,7 @@ impl ProofMemory {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from proof_memory_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn live_peak(&self) -> usize {
         self.live_peak.get()
     }
@@ -5853,6 +5867,7 @@ impl ProofMemory {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn live_bytes(&self) -> usize {
         self.live.get()
     }
@@ -5955,6 +5970,7 @@ pub(super) struct ReadAuthenticationBatch<'a> {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     bytes: usize,
     #[cfg_attr(
         not(feature = "test-seams"),
@@ -5963,6 +5979,7 @@ pub(super) struct ReadAuthenticationBatch<'a> {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from framing.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     byte_limit: usize,
 }
 
@@ -6123,6 +6140,7 @@ impl ReadAuthenticationBatch<'_> {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn verify(&mut self, mutation: &ContentIdentityMutation) -> Result<()> {
         self.verifier
             .verify_with_batch(
@@ -6358,6 +6376,7 @@ impl ContentIdentityReadVerifier {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn resident_proof_chunk_ceiling_for_test(&self) -> usize {
         self.resident.ceiling
     }
@@ -6374,6 +6393,7 @@ impl ContentIdentityReadVerifier {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from search_page_reuse_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn evict_record_witnesses_for_test(&self) -> usize {
         let mut records = self
             .verified_records
@@ -6392,6 +6412,7 @@ impl ContentIdentityReadVerifier {
         self.resident.clear()
     }
 
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn batch(&self, reserved_bytes: usize) -> ReadAuthenticationBatch<'_> {
         ReadAuthenticationBatch {
             verifier: self,
@@ -15276,6 +15297,7 @@ pub(crate) mod original_version_manifest {
     const FIXED_KEY_BYTES: usize = 72;
 
     #[derive(Clone, Copy)]
+    #[allow(dead_code, reason = "WIRE-FIELD: part of a fixed encoded format")]
     pub(crate) struct VersionManifest<'a> {
         pub(crate) table: &'a str,
         pub(crate) identity: [u8; 24],

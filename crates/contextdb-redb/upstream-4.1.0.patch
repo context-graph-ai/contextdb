@@ -4478,7 +4478,7 @@
 +}
 --- /dev/null
 +++ b/src/read_admission.rs
-@@ -0,0 +1,684 @@
+@@ -0,0 +1,688 @@
 +//! Operation-scoped admission before allocating a source page. The caller
 +//! keeps admitted bytes owned until its read handles have been released.
 +use crate::StorageError;
@@ -4563,10 +4563,13 @@
 +// Preserve opaque foreign callers exactly, without silently treating their Box
 +// as the concrete free-before-refund protocol used by the closed engine factory.
 +pub(crate) enum ReadMemoryCharge {
++    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
 +    Legacy(ReadPageCharge),
 +    #[cfg(feature = "contextdb-internal")]
++    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
 +    Native(crate::native_storage_admission::NativePageCharge),
 +    #[cfg(feature = "contextdb-internal")]
++    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
 +    Owned(OwnedReadPageCharge),
 +}
 +
@@ -4813,6 +4816,7 @@
 +enum ScanNodeInvoice {
 +    Legacy,
 +    #[cfg(feature = "contextdb-internal")]
++    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
 +    Native(crate::NativeStorageCredit),
 +}
 +struct ScanScopeNode {
@@ -26316,7 +26320,7 @@
 +}
 --- a/src/tuple_types.rs
 +++ b/src/tuple_types.rs
-@@ -151,7 +151,6 @@
+@@ -151,11 +151,11 @@
              $(
                  let len = <$t>::fixed_width().unwrap();
                  let $v = <$t>::from_bytes(&$data[offset..(offset + len)]);
@@ -26324,7 +26328,12 @@
                  {
                      offset += len;
                  }
-@@ -207,7 +206,6 @@
+             )+
++            let _ = offset;
+ 
+             ($(
+                 $v,
+@@ -207,12 +207,12 @@
                  ) {
                      return order;
                  }
@@ -26332,3 +26341,9 @@
                  {
                      offset0 += len;
                      offset1 += len;
+                 }
+             )+
++            let _ = (offset0, offset1);
+ 
+             Ordering::Equal
+         }

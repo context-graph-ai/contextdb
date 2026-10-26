@@ -11,6 +11,7 @@ mod durable_observation {
             .expect("file-backed published root")
     }
 
+    #[allow(dead_code, reason = "KEEP-SHARED: shared test helper; other test targets or modules use it")]
     pub(super) fn version_count(db: &Database, table: &str) -> usize {
         let root = root(db);
         let source_fixture_reader_1 = db
@@ -35,6 +36,7 @@ mod durable_observation {
         count
     }
 
+    #[allow(dead_code, reason = "KEEP-SHARED: shared test helper; other test targets or modules use it")]
     pub(super) fn rows(db: &Database, table: &str) -> Vec<VersionedRow> {
         let root = root(db);
         let source_fixture_reader_2 = db
@@ -58,6 +60,7 @@ mod durable_observation {
         rows
     }
 
+    #[allow(dead_code, reason = "KEEP-SHARED: shared test helper; other test targets or modules use it")]
     pub(super) fn changes(db: &Database) -> Vec<ChangeLogEntry> {
         let root = root(db);
         let source_fixture_reader_3 = db
@@ -78,6 +81,7 @@ mod durable_observation {
         changes
     }
 
+    #[allow(dead_code, reason = "KEEP-SHARED: shared test helper; other test targets or modules use it")]
     pub(super) fn table_index(db: &Database, table: &str) -> Vec<(Lsn, RowId)> {
         let root = root(db);
         let source_fixture_reader_4 = db

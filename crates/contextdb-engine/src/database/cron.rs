@@ -2381,7 +2381,7 @@ mod tests {
         assert_eq!(db.cron.pause_count.load(Ordering::SeqCst), 0);
         assert!(db.cron.runtime.lock().handle.is_none());
 
-        db.start_cron_tickler_if_schedules_present();
+        db.start_cron_tickler_if_schedules_present()?;
         assert!(db.cron.runtime.lock().handle.is_some());
 
         db.close()

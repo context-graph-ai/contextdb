@@ -234,6 +234,7 @@ impl MaintenanceContext {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     fn maintenance_inventory_phase_locked(&self) -> Result<InventoryPhase> {
         self.maintenance_inventory_phase_with_catalog_retention_locked(true)
     }
@@ -890,6 +891,7 @@ impl MaintenanceContext {
             reason = "KEEP-SEAM: live only under the test-seams feature"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn maintenance_catalog_inventory_locked(
         &self,
     ) -> Result<MaintenanceCatalogInventory> {
@@ -908,6 +910,7 @@ impl MaintenanceContext {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from vector_public_cycle_admission_tests.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(super) fn maintenance_catalog_inventory(&self) -> Result<MaintenanceCatalogInventory> {
         self.tx_mgr
             .with_commit_lock(|| self.maintenance_catalog_inventory_locked())

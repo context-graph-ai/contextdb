@@ -22,6 +22,7 @@ pub(crate) enum CapturedGraphReadRoot<R> {
         reason = "KEEP-SEAM: live only under the test-seams feature"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) type GraphReadRoot = CapturedGraphReadRoot<Arc<WriterSnapshot>>;
 pub(crate) type EngineGraphReadRoot = CapturedGraphReadRoot<WriterSnapshotHandle>;
 impl<R> CapturedGraphReadRoot<R>
@@ -1038,6 +1039,7 @@ impl RetainedReadSource {
             reason = "KEEP-SEAM: live only under the test-seams feature; used from redb_vector_partitions.rs"
         )
     )]
+    #[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
     pub(crate) fn verify_stored_graph_history(
         &self,
         key: &str,

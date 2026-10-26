@@ -7,11 +7,6 @@
 //! They are not production entry points and cannot certify native storage.
 use super::*;
 
-/// Private identity captured from the retained view. It cannot mint a root,
-/// a publication capability or a durable commit outcome.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ColdRootIdentity(redb::StorageSnapshotIdentity);
-
 /// Borrow the published descriptor; the private handle is the same immutable
 /// redb transaction already retained by that descriptor, never a reopened root.
 pub(crate) struct ColdCommittedProvider<'root> {
@@ -31,9 +26,6 @@ impl<'root> ColdCommittedProvider<'root> {
         })
     }
 
-    pub(crate) fn identity(&self) -> ColdRootIdentity {
-        ColdRootIdentity(self.read.storage_snapshot_identity())
-    }
 }
 
 impl RedbPersistence {}

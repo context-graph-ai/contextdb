@@ -1041,6 +1041,7 @@ pub(super) trait PageSource {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
     fn admitted_page(
         &self,
         key: &[u8],
@@ -1978,10 +1979,12 @@ impl NativePagedGeneration {
         }
     }
 
+    #[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
     pub(crate) fn storage_id(&self) -> u64 {
         self.storage_id
     }
 
+    #[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
     pub(crate) fn declaration(&self) -> &PagedDeclaration {
         &self.declaration
     }
@@ -5035,6 +5038,7 @@ impl RedbPersistence {
         clippy::result_large_err,
         reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
     )]
+    #[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
     pub(crate) fn load_construction_floors(&self) -> Result<Vec<(VectorPartitionRef, TxId)>> {
         self.with_db(|db| {
             let read = db.begin_read().map_err(Self::storage_error)?;
@@ -6212,6 +6216,7 @@ mod native_namespace_tests;
 /// callers still owe a same-root generation/backing binding before a census.
 #[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 pub(crate) enum PhysicalPagedIdentity<'a> {
     Point {
         storage_id: u64,
@@ -6241,6 +6246,7 @@ pub(crate) enum PhysicalPagedIdentity<'a> {
 }
 
 #[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 pub(crate) fn physical_identity<'a>(
     key: &[u8],
     stored: &'a [u8],

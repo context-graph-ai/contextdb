@@ -1035,6 +1035,7 @@ pub(crate) fn graph_storage_key<K: AsRef<[u8]>>(family: &str, operation: &str, k
         reason = "KEEP-SEAM: live only under the test-seams feature; used from graph_publication_root_tests.rs"
     )
 )]
+#[allow(dead_code, reason = "KEEP-SEAM: test helper behind a test cfg; unit tests or the test-seams build use it")]
 pub(crate) fn bind_graph_write_root(write: &redb::WriteTransaction) {
     bind_graph_write_root_with(write, |root| {
         GRAPH_ROOT.with(|r| {

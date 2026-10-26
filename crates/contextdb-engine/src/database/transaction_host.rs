@@ -4064,42 +4064,6 @@ impl DatabaseTransactionHost {
         }
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
-    )]
-    pub(super) fn with_ordered_staged_cursor<F, R>(
-        &self,
-        tx: TxId,
-        table: &str,
-        index: &str,
-        bounds: contextdb_tx::ordered_staged::OrderedStagedBounds<'_>,
-        reverse: bool,
-        f: F,
-    ) -> Result<R>
-    where
-        F: FnOnce(Option<contextdb_tx::ordered_staged::OrderedStagedCursor<'_>>, &WriteSet) -> R,
-    {
-        match self {
-            Self::Legacy(manager) => {
-                manager.with_ordered_staged_cursor(tx, table, index, bounds, reverse, f)
-            }
-            Self::Owned(handle) => handle.with_host(|host| {
-                host.transactions.with_transactions(|transactions| {
-                    transactions.with_engine(tx, |guard| {
-                        Ok(guard.with_legacy(|ws| {
-                            f(
-                                ws.ordered_staged_rows
-                                    .cursor(table, index, bounds.0, bounds.1, reverse),
-                                ws,
-                            )
-                        }))
-                    })
-                })
-            }),
-        }
-    }
-
     pub(super) fn producer_gap(operation: &str) -> Error {
         Error::InvalidStateTransition(format!(
             "owned transaction host requires a migrated {operation} producer"

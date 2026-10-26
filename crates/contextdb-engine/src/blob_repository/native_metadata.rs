@@ -343,6 +343,7 @@ fn scan(reader: &mut Reader<'_, '_>, depth: usize) -> Result<usize> {
 
 #[derive(serde::Deserialize)]
 pub(super) struct Tag {
+    #[allow(dead_code, reason = "WIRE-FIELD: decoded from stored bytes; its fields fix the encoded format")]
     pub version: u8,
     pub hash: [u8; 32],
     pub generation: u64,

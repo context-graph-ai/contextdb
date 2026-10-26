@@ -2,6 +2,7 @@
 use super::*;
 
 #[derive(Deserialize, PartialEq, Eq)]
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 pub(crate) struct BorrowedProgress<'a> {
     pub(crate) generation_id: u64,
     declaration_digest: u64,
@@ -22,6 +23,7 @@ pub(crate) struct BorrowedProgress<'a> {
     member_cursor: Option<(u64, u64, u64)>,
 }
 #[derive(Deserialize, PartialEq, Eq)]
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 pub(crate) struct BorrowedMeta<'a> {
     magic: [u8; 8],
     pub(crate) storage_id: u64,
@@ -33,6 +35,7 @@ pub(crate) struct BorrowedMeta<'a> {
     pub(crate) page_set: PageSetRoot,
 }
 impl<'a> BorrowedMeta<'a> {
+    #[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
     pub(crate) fn decode(bytes: &'a [u8]) -> Result<Self> {
         let (meta, consumed): (Self, usize) =
             bincode::serde::borrow_decode_from_slice(bytes, bincode::config::standard())
@@ -54,6 +57,7 @@ impl<'a> BorrowedMeta<'a> {
 /// Every original field, including route, source digest, logical generation,
 /// topology and schema lifetime, participates in the normalized comparison.
 /// No owned descriptor decode, re-encoding, or Legacy accounting is used.
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 pub(crate) fn borrowed_change_backing<'a>(
     storage: u64,
     frame: &'a [u8],
@@ -96,6 +100,7 @@ pub(crate) fn borrowed_change_backing<'a>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 pub(crate) struct PhysicalOwner {
     pub(crate) storage_id: u64,
     pub(crate) point: PointId,
@@ -109,6 +114,7 @@ pub(crate) struct PhysicalOwner {
 
 /// This codec does not decode point values or links. The producer's fixed-int
 /// point prefix is origin:u64, layer:u8, rank:i32, all little endian.
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 pub(crate) fn point_origin(encoded: &[u8], expected: PointId) -> Result<usize> {
     let header = encoded
         .get(..13)
@@ -122,6 +128,7 @@ pub(crate) fn point_origin(encoded: &[u8], expected: PointId) -> Result<usize> {
         .map_err(|_| corruption("physical point origin exceeds usize"))
 }
 
+#[allow(dead_code, reason = "HNSW: goes with the HNSW index when it is replaced")]
 pub(crate) fn owner_from_identity(key: &[u8], frame: &[u8]) -> Result<PhysicalOwner> {
     let Some(PhysicalPagedIdentity::Identity {
         storage_id,

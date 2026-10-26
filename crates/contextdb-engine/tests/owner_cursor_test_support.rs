@@ -20,6 +20,7 @@ impl OwnerPageFixture {
     pub fn rows(&self) -> &[Vec<contextdb_core::Value>] {
         &self.rows
     }
+    #[allow(dead_code, reason = "KEEP-SHARED: shared test helper; other test targets or modules use it")]
     pub fn columns(&self) -> &[String] {
         &self.columns
     }

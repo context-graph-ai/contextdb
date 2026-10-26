@@ -1869,21 +1869,6 @@ impl Database {
         Ok(row)
     }
 
-    pub(crate) fn bounded_index_next<E>(
-        &self,
-        table: &str,
-        index: &str,
-        cursor: &mut contextdb_relational::mem::BoundedIndexCursor,
-        before_touch: impl FnMut() -> std::result::Result<(), E>,
-        before_clone: impl FnOnce(usize) -> std::result::Result<(), E>,
-    ) -> std::result::Result<Option<(IndexKey, contextdb_relational::IndexEntry)>, E>
-    where
-        E: From<Error>,
-    {
-        self.relational
-            .bounded_index_next(table, index, cursor, before_touch, before_clone)
-    }
-
     #[allow(clippy::too_many_arguments)]
     #[expect(
         clippy::result_large_err,

@@ -558,10 +558,6 @@ impl Terminal {
         }
     }
 
-    pub fn contains(&self, marker: &str) -> bool {
-        self.transcript().contains(marker)
-    }
-
     /// End the session the way a person does and collect its exit code.
     #[allow(
         dead_code,
@@ -584,10 +580,6 @@ impl Terminal {
         (status.code(), text)
     }
 
-    pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 #[allow(

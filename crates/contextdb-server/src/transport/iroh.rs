@@ -4833,6 +4833,7 @@ pub(crate) enum NativeReplyEvent {
         edge: usize,
     },
     /// A further holder of the live control, handed to the probe.
+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
     Hold(Box<dyn std::any::Any + Send>),
 }
 

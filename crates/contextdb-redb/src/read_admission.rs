@@ -82,10 +82,13 @@ impl Drop for OwnedReadPageCharge {
 // Preserve opaque foreign callers exactly, without silently treating their Box
 // as the concrete free-before-refund protocol used by the closed engine factory.
 pub(crate) enum ReadMemoryCharge {
+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
     Legacy(ReadPageCharge),
     #[cfg(feature = "contextdb-internal")]
+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
     Native(crate::native_storage_admission::NativePageCharge),
     #[cfg(feature = "contextdb-internal")]
+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
     Owned(OwnedReadPageCharge),
 }
 
@@ -332,6 +335,7 @@ impl ScanAllowance {
 enum ScanNodeInvoice {
     Legacy,
     #[cfg(feature = "contextdb-internal")]
+    #[allow(dead_code, reason = "KEEP-GUARD: held for its Drop; releases what it holds when the owner drops")]
     Native(crate::NativeStorageCredit),
 }
 struct ScanScopeNode {

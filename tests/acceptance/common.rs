@@ -1,4 +1,4 @@
-use contextdb_core::{Direction, Error, Value, VectorIndexRef, VersionedRow};
+use contextdb_core::{Error, Value, VersionedRow};
 use contextdb_engine::{Database, QueryResult};
 use contextdb_server::transport::iroh::IrohServer;
 use std::collections::HashMap;
@@ -625,15 +625,6 @@ pub(crate) fn insert_embedding(db: &Database, id: Uuid, vector: Vec<f32>) -> i64
     .expect("insert embedding vector");
     db.commit(tx).expect("commit embedding row");
     row_id.0 as i64
-}
-
-pub(crate) fn bfs_ids(db: &Database, start: Uuid) -> Vec<Uuid> {
-    db.query_bfs(start, None, Direction::Outgoing, 5, db.snapshot())
-        .expect("bfs should succeed")
-        .nodes
-        .iter()
-        .map(|node| node.id)
-        .collect()
 }
 
 #[cfg(target_os = "linux")]

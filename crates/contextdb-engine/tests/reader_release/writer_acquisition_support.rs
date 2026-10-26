@@ -483,7 +483,7 @@ impl QueuedWriter {
     /// back open: whoever arrived behind it is answered by it.
     pub fn release_and_open(self) -> OpenedWriter {
         let QueuedWriter {
-            path,
+            path: _,
             directory,
             reader,
             writer,

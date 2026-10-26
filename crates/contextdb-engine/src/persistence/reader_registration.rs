@@ -1930,8 +1930,6 @@ impl LoadReadImageError {
         match self {
             Self::Funded(diagnostic) => diagnostic.kind(),
             Self::Memory(_) => LoadReadImageErrorKind::Memory,
-            Self::NotImplemented => LoadReadImageErrorKind::NotImplemented,
-            Self::Source(_) => LoadReadImageErrorKind::Io,
             Self::Release(_) => LoadReadImageErrorKind::Release,
             Self::RequiresWriter { cause, .. } => LoadReadImageErrorKind::RequiresWriter(*cause),
             Self::StoreMissing { .. } => LoadReadImageErrorKind::StoreMissing,
@@ -1958,8 +1956,7 @@ impl LoadReadImageError {
         self,
     ) -> crate::direct_file_reader::DirectFileReaderError {
         use crate::direct_file_reader::{
-            DirectFileReaderError, DirectReaderPrerequisite, DirectRepairRequiredCause,
-            DirectStoreDiagnostic,
+            DirectFileReaderError, DirectRepairRequiredCause, DirectStoreDiagnostic,
         };
 
         // Memory refusals must not format (or copy static labels) on their way
@@ -2042,17 +2039,11 @@ impl LoadReadImageError {
                     reason: error.to_string(),
                 }
             }
-            // Only an absent production load path is a missing prerequisite.
-            // A source that failed, a release proof that failed, durable state
-            // that is invalid and an I/O error are each something that WENT
-            // WRONG, with words saying what; renaming them "prerequisite
-            // missing" told the caller the route was unimplemented and threw
-            // away the one sentence that says what to do about it.
-            Self::NotImplemented => DirectFileReaderError::MissingPrerequisite(
-                DirectReaderPrerequisite::PersistenceLoadReadImage,
-            ),
-            error @ (Self::Source(_)
-            | Self::Release(_)
+            // A release proof that failed, durable state that is invalid and an
+            // I/O error are each something that WENT WRONG, with words saying
+            // what; the caller gets that sentence, never a "prerequisite
+            // missing" label.
+            error @ (Self::Release(_)
             | Self::InvalidState { .. }
             | Self::Io { .. }
             | Self::IoAtPath { .. }) => DirectFileReaderError::Engine(error.to_string().into()),
@@ -3611,7 +3602,7 @@ impl ReaderSnapshotFileGuard {
             }
             Ok(metadata)
         })();
-        let metadata = match publish {
+        let _metadata = match publish {
             Ok(metadata) => metadata,
             Err(error) => {
                 let _ = std::fs::remove_file(&path);

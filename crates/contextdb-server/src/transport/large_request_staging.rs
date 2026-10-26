@@ -2053,8 +2053,11 @@ fn reset_errno() {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PausePoint {
+    #[allow(dead_code, reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build")]
     CreateDirectory,
+    #[allow(dead_code, reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build")]
     Publish,
+    #[allow(dead_code, reason = "KEEP-SEAM: constructed only by unit tests and the test-seams build")]
     Read,
     Cleanup,
     Pressure,

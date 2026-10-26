@@ -193,7 +193,7 @@ fn staged_cursor_keeps_old_and_new_views_after_write(operation: &str) {
     db.execute(statement, &values)
         .expect("valid staged write must succeed while its earlier cursor is open");
     let mut new = open();
-    let mut collect = |cursor: &mut _| {
+    let collect = |cursor: &mut _| {
         let mut nodes = Vec::new();
         while let Some(node) = db
             .bounded_graph_bfs_next(
