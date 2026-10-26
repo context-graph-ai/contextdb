@@ -947,14 +947,14 @@ teaching its recovery: <!-- enforced by: read_cli_journeys_machine_surface::ever
 | `store_not_found` | io | The store does not exist; `--write` creates it. |
 | `held_by_writer` | io | A writer owns the store; a read session (drop `--write`) reaches its channel. The refusal names the store in `store_path` and, when the holder has published a record about itself, the holding process in `process_id`. |
 | `held_by_readers` | io | The caller's expired writer-open deadline ended admission while starting readers held the snapshot-selection window; includes the real observed reader count and identifiable names. |
-| `owner_not_running` | io | Rust `request_owner` was called on a direct-file route. |
+| `owner_not_running` | io | No writer is running for this store right now. |
 | `owner_not_serving` | io | A writer holds the store but has no usable inspection channel — including a writer that has claimed the store and not published its serving decision inside the caller's declared deadlines, or a draining owner that released the requested cursor/page before delivery. |
 | `owner_user_mismatch` | io | The owner belongs to a different operating-system user. |
 | `owner_mismatch` | io | The responder does not own this database/run. |
 | `owner_at_capacity` | io | Every reader slot is occupied; retry, close a session, or raise `--owner-read-concurrency`. |
 | `owner_limit_exceeded` | io | A read ceiling was crossed; carries `limit`, the ceiling in `value`, the refused `statement`, and the route-aware remedy. |
 | `owner_timeout` | io | A connected owner missed a configured deadline. |
-| `owner_disconnected` | io | The owner disappeared mid-session; no partial result; start a new invocation. |
+| `owner_disconnected` | io | The in-flight statement or cursor aborts. The next command on the same session reads the committed file image or follows a returning writer. |
 | `invalid_channel_data` | io | A malformed or oversized local frame. |
 | `local_protocol_mismatch` | io | Caller and owner use different local protocol versions. |
 | `invalid_continuation` | usage | A continuation was malformed or given to a command that did not issue it. |
