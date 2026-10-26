@@ -1,13 +1,17 @@
 //! A bounded cursor over an exact vector search answers what the same
-//! statement answers when executed, however many rows the scan admits.
+//! statement answers when executed, and settles exactly the reader credit it
+//! charged, however many rows the scan visits.
 //!
 //! The statement is the shape an application's default read uses: one
 //! Context and generation partition of a 768-dimension vector column,
 //! filtered on two flags and ranked by distance, read through a read session
 //! at a 1 GiB memory limit. Every page the cursor builds is charged to the
-//! request's reader credit and must release only what that credit holds.
-//! A 16-passage scan is the small control; the larger rows make the scan
-//! admit more of the partition before it ranks.
+//! request's reader credit and must release only what that credit holds. The
+//! session's charge therefore returns to its settled value when the cursor
+//! drops, never falls below it while the cursor is open, and stays within the
+//! session's memory limit. The charge an open cursor holds for its first page
+//! depends on that page, so a store whose scan visits more rows must not
+//! leave the cursor holding less for the same ten-row page.
 
 use contextdb_core::Value;
 use contextdb_core::read_contract::ReadLimits;
@@ -106,34 +110,106 @@ fn params() -> HashMap<String, Value> {
     ])
 }
 
-/// The cursor opens, pages to its end, and yields exactly the rows the
-/// executed statement answers.
-fn assert_cursor_matches_execute(session: &ReadSession) {
-    let executed = session
+/// Warm the session with one executed search and one cursor, so loaded
+/// state the reader keeps across statements is in place, and return the
+/// charge it then settles at.
+fn settled_charge(session: &ReadSession) -> u64 {
+    session
         .execute(SEARCH, &params())
-        .expect("the executed search answers")
-        .rows()
-        .to_vec();
-    assert_eq!(executed.len(), 10);
-    let mut cursor = session
+        .expect("the executed search answers");
+    drop(open(session));
+    session
+        .charged_bytes()
+        .expect("the session reports its charge")
+}
+
+fn open(session: &ReadSession) -> contextdb_engine::ReadCursor {
+    session
         .open_cursor(SEARCH, &params())
         .unwrap_or_else(|error| {
             panic!(
                 "a cursor over the exact search must answer; every page it builds releases \
              only the reader credit it charged: {error:?}"
             )
-        });
+        })
+}
+
+/// The cursor opens, pages to its end and yields exactly the rows the
+/// executed statement answers, and the session's charge settles exactly.
+fn assert_cursor_matches_execute(session: &ReadSession) {
+    let settled = settled_charge(session);
+    let charged = || {
+        session
+            .charged_bytes()
+            .expect("the session reports its charge")
+    };
+    let executed = session
+        .execute(SEARCH, &params())
+        .expect("the executed search answers")
+        .rows()
+        .to_vec();
+    assert_eq!(executed.len(), 10);
+    assert_eq!(
+        charged(),
+        settled,
+        "an executed search returns its whole charge"
+    );
+    let within_limit = |at: &str, held: u64| {
+        assert!(
+            held >= settled && held <= settled + GIB as u64,
+            "{at}: the open cursor holds between the settled charge {settled} and the \
+             1 GiB limit above it, not {held}"
+        );
+    };
+    let mut cursor = open(session);
+    within_limit("first page", charged());
     let mut paged = cursor.first_page().rows().to_vec();
     let mut more = cursor.first_page().has_more();
     while more {
         let page = cursor
             .fetch(None)
             .unwrap_or_else(|error| panic!("a later page answers: {error:?}"));
+        within_limit("later page", charged());
         paged.extend(page.rows().iter().cloned());
         more = page.has_more();
     }
     drop(cursor);
+    assert_eq!(
+        charged(),
+        settled,
+        "dropping the cursor returns exactly the reader credit its pages charged"
+    );
     assert_eq!(paged, executed, "the cursor yields the executed answer");
+}
+
+/// What an open cursor's first page holds above the settled charge, on a
+/// closed store of `rows` passages.
+fn first_page_charge(rows: u64, search_mode: &str) -> u64 {
+    let directory = tempfile::tempdir().expect("store directory");
+    let path = directory.path().join("passages.db");
+    let db = store(&path, rows, search_mode);
+    db.close().expect("close the writer");
+    drop(db);
+    let session = session(&path);
+    let settled = settled_charge(&session);
+    let cursor = open(&session);
+    assert_eq!(cursor.first_page().rows().len(), 10);
+    let held = session
+        .charged_bytes()
+        .expect("the session reports its charge");
+    drop(cursor);
+    held.checked_sub(settled)
+        .unwrap_or_else(|| panic!("an open cursor holds {held}, below the settled {settled}"))
+}
+
+fn assert_first_page_charge_holds(search_mode: &str, larger: u64) {
+    let reference = first_page_charge(10, search_mode);
+    let held = first_page_charge(larger, search_mode);
+    assert!(
+        held >= reference,
+        "the same ten-row first page holds {reference} bytes over a 10-passage scan but only \
+         {held} over a {larger}-passage scan: the scan released reader credit its page still holds"
+    );
 }
 
 fn file_route(rows: u64, search_mode: &str) {
@@ -172,4 +248,14 @@ fn an_automatic_search_cursor_over_512_passages_answers_through_the_owner() {
 #[test]
 fn an_exact_search_cursor_over_16_passages_answers_on_the_file_route() {
     file_route(16, "EXACT");
+}
+
+#[test]
+fn an_exact_search_cursor_holds_its_first_page_charge_as_the_scan_visits_more_rows() {
+    assert_first_page_charge_holds("EXACT", 16);
+}
+
+#[test]
+fn an_automatic_search_cursor_holds_its_first_page_charge_as_the_scan_visits_more_rows() {
+    assert_first_page_charge_holds("AUTO", 384);
 }
