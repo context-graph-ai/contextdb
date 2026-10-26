@@ -28,6 +28,9 @@ struct Inner {
     routes_changed: tokio::sync::Notify,
     request_attempts: Mutex<HashMap<String, usize>>,
     request_attempted: tokio::sync::Notify,
+    /// Serve loops wait on `shutdown_changed` instead of polling their flag.
+    event_driven_shutdown: AtomicBool,
+    shutdown_changed: tokio::sync::Notify,
     /// The identity the served side presents, set by
     /// [`InProcessBroker::server_as`]. A client dialing this broker knows it
     /// the same way the real transport knows the endpoint it dialed by key.
@@ -261,8 +264,20 @@ impl ServerTransport for InProcessServer {
             }
             self.inner.routes_changed.notify_waiters();
 
-            while !shutdown.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            if self.inner.event_driven_shutdown.load(Ordering::SeqCst) {
+                loop {
+                    let changed = self.inner.shutdown_changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    changed.await;
+                }
+            } else {
+                while !shutdown.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
 
             let mut routes = self
@@ -303,6 +318,8 @@ impl InProcessBroker {
                 routes_changed: tokio::sync::Notify::new(),
                 request_attempts: Mutex::new(HashMap::new()),
                 request_attempted: tokio::sync::Notify::new(),
+                event_driven_shutdown: AtomicBool::new(false),
+                shutdown_changed: tokio::sync::Notify::new(),
                 server_node_id: Mutex::new(None),
                 #[cfg(target_os = "linux")]
                 native: Mutex::new(None),
@@ -357,6 +374,28 @@ impl InProcessBroker {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
+    }
+
+    /// A broker whose serve loops stop by event rather than by polling their
+    /// shutdown flag: [`Self::stop_serving_for_test`] sets the flag and wakes
+    /// them, so nothing on a harness's stop path waits on a timer.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn with_event_driven_shutdown_for_test() -> Self {
+        let broker = Self::new();
+        broker
+            .inner
+            .event_driven_shutdown
+            .store(true, Ordering::SeqCst);
+        broker
+    }
+
+    /// Set `shutdown` and wake every serve loop of this broker waiting on it.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn stop_serving_for_test(&self, shutdown: &AtomicBool) {
+        shutdown.store(true, Ordering::SeqCst);
+        self.inner.shutdown_changed.notify_waiters();
     }
 
     /// Exchange one request with the served route as `node_id`, to completion

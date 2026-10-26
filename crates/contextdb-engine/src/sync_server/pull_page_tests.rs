@@ -94,7 +94,7 @@ struct Pulled {
 /// which funds serving a pull.
 async fn pull_all(db: Arc<Database>) -> contextdb_core::Result<Pulled> {
     let hub = db.clone();
-    let broker = InProcessBroker::new();
+    let broker = InProcessBroker::with_event_driven_shutdown_for_test();
     let hub_identity = Arc::new(crate::identity::FabricIdentity::generate());
     let hub_node = hub_identity.node_id();
     let provider = Arc::new(PerRequestReader {
@@ -190,7 +190,7 @@ async fn pull_all(db: Arc<Database>) -> contextdb_core::Result<Pulled> {
         }
         assert!(pulled.pages < 10_000, "the pull makes progress");
     };
-    shutdown.store(true, Ordering::SeqCst);
+    broker.stop_serving_for_test(&shutdown);
     task.await.expect("hub stops");
     outcome.map(|()| pulled)
 }
