@@ -3741,10 +3741,6 @@ impl WriterReadCursor {
     }
 }
 
-impl RedbPersistence {}
-
-impl WriterSnapshot {}
-
 impl WriterSnapshotHandle {
     #[expect(
         clippy::result_large_err,
@@ -3775,8 +3771,6 @@ impl WriterSnapshotHandle {
         )
     }
 }
-
-impl WriterSnapshot {}
 
 impl WriterSnapshotHandle {
     #[expect(
@@ -4363,8 +4357,6 @@ mod tests {
         );
     }
 }
-
-impl WriterSnapshot {}
 
 impl WriterSnapshotHandle {
     #[expect(
@@ -5785,11 +5777,6 @@ impl WriterSnapshotHandle {
         .map_err(|r| NativeConfigFailure::Storage(NativeStorageFailure::Refused(r)))
     }
 }
-
-/// A bounded walk of the existing live-root registry. A position is merely a
-/// traversal cursor, never a root identity or a claim that lifetimes are closed.
-#[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]
-impl RedbPersistence {}
 
 impl AsRef<WriterSnapshot> for WriterSnapshotHandle {
     fn as_ref(&self) -> &WriterSnapshot {

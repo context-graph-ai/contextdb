@@ -3,8 +3,6 @@ use super::writer_source::SourceWindowOwner;
 use super::*;
 use std::ops::Bound;
 
-impl WriterSnapshot {}
-
 impl WriterSnapshotHandle {
     #[expect(
         clippy::result_large_err,

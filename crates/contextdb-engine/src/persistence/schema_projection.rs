@@ -2861,7 +2861,6 @@ impl<'o> OriginalProjectedIndexes<'o> {
         Ok(())
     }
 }
-impl RedbPersistence {}
 
 // The native received kernel stages its derived placement image inside the
 // same unpublished Redb transaction. These relations never cross commit.

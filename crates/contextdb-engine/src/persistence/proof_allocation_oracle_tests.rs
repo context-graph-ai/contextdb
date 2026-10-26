@@ -3443,8 +3443,6 @@ mod row_check_cache_ownership_contract {
         row_touches: AtomicU64,
     }
 
-    impl RowCheckCacheFundingProbe {}
-
     impl bounded::ExecutionProbe for RowCheckCacheFundingProbe {
         fn before_work(&self, _source: bounded::TestWorkSource, _completed_work: u64) {}
 
@@ -4680,7 +4678,24 @@ mod original_failure_contract {
     #[serial]
     fn decoder_failure_preserves_diagnosis_when_error_text_cannot_be_admitted() {
         use std::io::Write;
-        struct CompactCarrier {}
+        // Compare actual travelling layouts with the scalar bootstrap plus the
+        // minimum enum/pointer custody representation, including ABI padding.
+        #[allow(
+            dead_code,
+            reason = "LAYOUT-ONLY: never constructed; the size checks below measure this minimum representation"
+        )]
+        enum ScalarOrPointer {
+            Native(contextdb_core::read_memory::NativeRefusal),
+            Prepared(std::ptr::NonNull<()>),
+        }
+        #[allow(
+            dead_code,
+            reason = "LAYOUT-ONLY: never constructed; the size checks below measure this minimum representation"
+        )]
+        struct CompactCarrier {
+            diagnostic: ScalarOrPointer,
+            scope: Option<std::ptr::NonNull<()>>,
+        }
         assert_eq!(
             std::mem::size_of::<crate::funded_error::OriginalError>(),
             std::mem::size_of::<CompactCarrier>()

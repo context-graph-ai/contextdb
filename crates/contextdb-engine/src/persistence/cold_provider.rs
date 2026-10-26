@@ -28,8 +28,6 @@ impl<'root> ColdCommittedProvider<'root> {
 
 }
 
-impl RedbPersistence {}
-
 impl ColdCommittedProvider<'_> {}
 
 #[cfg(feature = "sync-orchestration")]

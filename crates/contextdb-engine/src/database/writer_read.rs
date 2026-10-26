@@ -3823,9 +3823,6 @@ impl Database {
 }
 
 #[cfg(feature = "sync-orchestration")]
-impl Database {}
-
-#[cfg(feature = "sync-orchestration")]
 impl Database {
     /// Pin once for both custody count and construction passes. Each cursor
     /// remains funded by the same request/context; no Legacy TLS is consulted.

@@ -3753,8 +3753,6 @@ impl Database {
     }
 }
 
-impl Database {}
-
 #[cfg(test)]
 mod sync_effect_tests {
     use super::*;

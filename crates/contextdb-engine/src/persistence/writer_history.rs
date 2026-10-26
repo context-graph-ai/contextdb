@@ -228,8 +228,6 @@ impl RedbPersistence {
     }
 }
 
-impl super::writer_source::WriterSnapshot {}
-
 impl WriterSnapshotHandle {
     #[expect(
         clippy::result_large_err,

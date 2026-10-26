@@ -4642,8 +4642,6 @@ mod quiescent_queue_tests {
     }
 }
 
-impl Database {}
-
 /// Assembly helper for the approved immutable companion seed loan. Frozen
 /// companion storage supplies its authentic stable original field outside
 /// queue/stage/state guards; the borrowing private handle retains that physical
@@ -11165,7 +11163,6 @@ impl OwnedEventBusHandle {
         Ok((out, next))
     }
 }
-impl Database {}
 
 #[derive(Clone, Copy)]
 pub(super) enum OwnedRowEventKind {
@@ -11251,10 +11248,6 @@ impl OwnedPreparedEventGate {
         Ok(owner)
     }
 }
-impl Database {}
-
-impl OwnedEventBusHandle {}
-impl Database {}
 
 struct OwnedEventNames {
     names: Vec<String>,
@@ -11813,8 +11806,6 @@ impl OwnedEventBusHandle {
         with_owned_persistence_original_seed(&self.storage.get().original, f)
     }
 }
-
-impl Database {}
 
 #[cfg(test)]
 #[path = "sink_window_tests.rs"]

@@ -1323,7 +1323,6 @@ impl RedbPersistence {
     }
 }
 
-impl RetainedReadSource {}
 impl std::io::Write for OwnedEventEncodedLength {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0 = self

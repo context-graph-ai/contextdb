@@ -331,4 +331,3 @@ impl CommitDirectory for RedbPersistence {
     }
 }
 
-impl RedbPersistence {}

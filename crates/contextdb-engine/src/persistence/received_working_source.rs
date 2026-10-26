@@ -1927,7 +1927,6 @@ impl WorkingReadSource {
         })
     }
 }
-impl WorkingReadSource {}
 
 impl WorkingReadSource {
     #[expect(
@@ -2023,8 +2022,6 @@ impl WorkingReadSource {
         })
     }
 }
-
-impl WorkingReadSource {}
 
 pub(crate) struct OriginalGraphDeclarations {
     pub(crate) types: Vec<String>,

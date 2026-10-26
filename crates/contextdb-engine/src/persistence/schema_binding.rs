@@ -603,8 +603,6 @@ impl RedbPersistence {
     }
 }
 
-impl WriterSnapshot {}
-
 impl WriterSnapshotHandle {
     #[expect(
         clippy::result_large_err,

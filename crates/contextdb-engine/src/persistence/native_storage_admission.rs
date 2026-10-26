@@ -723,8 +723,6 @@ pub(crate) struct ColdSnapshotMetadata {
     pub(crate) lsn: Lsn,
 }
 
-impl StorageAdmissionScope {}
-
 // Native failures retain only scalar/static data. Inherited allocating Errors
 // keep their original owner; this conversion does not certify their provenance.
 pub(crate) fn original_storage_error(failure: NativeStorageFailure) -> Error {

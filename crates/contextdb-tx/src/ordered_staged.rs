@@ -4028,9 +4028,6 @@ impl OrderedStagedRows {
     }
 }
 
-impl NativeOrderedCheckpoint {}
-impl OrderedStagedRows {}
-
 impl OrderedStagedRows {
     #[expect(
         clippy::result_large_err,

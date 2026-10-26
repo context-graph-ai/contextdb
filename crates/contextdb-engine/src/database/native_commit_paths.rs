@@ -855,8 +855,6 @@ pub(super) fn initialized_received_access_for_test() {
     );
 }
 
-impl Database {}
-
 impl Database {
     #[expect(
         clippy::result_large_err,
@@ -3410,7 +3408,6 @@ impl Database {
     }
 }
 
-impl Database {}
 impl Database {
     #[expect(
         clippy::result_large_err,
@@ -4114,10 +4111,6 @@ impl Database {
         Ok(entries)
     }
 }
-
-impl PreparedMemorySwap {}
-
-impl EngineDatabaseTransactions {}
 
 #[cfg(feature = "sync-orchestration")]
 impl Database {
@@ -5102,5 +5095,3 @@ impl Database {
     }
 }
 
-#[cfg(all(feature = "sync-orchestration", any(test, feature = "test-seams")))]
-impl Database {}

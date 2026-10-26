@@ -1181,8 +1181,6 @@ impl ReceivedWorkingWrite {
     }
 }
 
-impl ReceivedWorkingWrite {}
-
 // Bodies of accepted occurrences live in native scratch, before the pending
 // logical-identity overlay can replace or delete them. They are never a second
 // resident history image.
