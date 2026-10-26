@@ -7,7 +7,6 @@ use contextdb_core::{Direction, Value};
 use contextdb_core::{Lsn, RowId, TxId};
 use contextdb_engine::Database;
 use contextdb_engine::memory_accounting::MemoryAccountant;
-#[allow(unused_imports)]
 use contextdb_engine::sync_types::{
     ChangeSet, Conflict, ConflictPolicies, ConflictPolicy, NaturalKey, RowChange, SyncAdoption,
     VectorChange,
