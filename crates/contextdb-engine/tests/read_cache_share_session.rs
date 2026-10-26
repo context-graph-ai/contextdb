@@ -567,8 +567,9 @@ fn shown(session: &ReadSession, column: &str) -> Value {
 
 /// A cursor continuing on its own file reader under a tight declared budget
 /// keeps returning its rows when its session declares a share that reader
-/// cannot admit: the fetch never fails for it, the session reports the
-/// refusal, and a later shrink applies without needing any admission.
+/// cannot admit: the fetch never fails for it, the session's declared share
+/// stays what the user set, the reported refusal names the cursor that could
+/// not follow, and a later shrink applies without needing any admission.
 #[test]
 fn a_continuing_cursor_keeps_its_rows_when_a_declared_share_cannot_be_admitted() {
     const TIGHT_BUDGET: usize = 32 * MIB;
@@ -616,10 +617,20 @@ fn a_continuing_cursor_keeps_its_rows_when_a_declared_share_cannot_be_admitted()
          refusal",
     );
     rows.extend(after_growth.rows().iter().cloned());
+    let refusal = match shown(&session, "last_refusal") {
+        Value::Text(text) => text,
+        other => panic!(
+            "the session reports the share the cursor's file reader could not admit, got {other:?}"
+        ),
+    };
     assert!(
-        matches!(shown(&session, "last_refusal"), Value::Text(_)),
-        "the session reports the share the cursor's file reader could not admit: {:?}",
-        shown(&session, "last_refusal")
+        refusal.to_lowercase().contains("cursor"),
+        "the reported refusal names the cursor that could not follow the share: {refusal}"
+    );
+    assert_eq!(
+        shown(&session, "declared"),
+        Value::Int64(95),
+        "the session's own reader admitted 95%, so its declared share stays what the user set"
     );
 
     session
