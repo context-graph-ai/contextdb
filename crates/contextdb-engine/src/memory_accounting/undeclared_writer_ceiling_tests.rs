@@ -39,28 +39,14 @@ fn insert(db: &Database, first: i64, rows: i64) -> contextdb_core::Result<()> {
 
 /// Run `case` in a child of this test binary with the process ceiling set.
 fn in_child(test: &str, case: &str, ceiling: usize, body: impl FnOnce(&std::path::Path)) {
-    if let Ok(path) = std::env::var(CHILD) {
+    if let Some(path) = std::env::var_os(CHILD) {
         crate::memory_accounting::set_process_ceiling_for_test(Some(ceiling));
         body(std::path::Path::new(&path));
         return;
     }
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join(format!("{case}.db"));
-    let name = format!(
-        "{}::{test}",
-        module_path!().trim_start_matches("contextdb_engine::")
-    );
-    let child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD, &path)
-        .output()
-        .unwrap();
-    assert!(
-        child.status.success(),
-        "{case} child failed:\n{}\n{}",
-        String::from_utf8_lossy(&child.stdout),
-        String::from_utf8_lossy(&child.stderr)
-    );
+    crate::test_process::rerun_alone(module_path!(), test, &[(CHILD, path.as_os_str())]);
 }
 
 #[test]

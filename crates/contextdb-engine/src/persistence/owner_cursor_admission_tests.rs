@@ -83,6 +83,13 @@ fn snapshot_paths(runtime: &Path, identity: (u64, u64)) -> Vec<PathBuf> {
 // Exclusive guards intentionally force contention with the admission read locks.
 #[allow(clippy::readonly_write_lock)]
 fn owner_cursor_persistence_guard_contention_refuses_before_lock_release() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "owner_cursor_persistence_guard_contention_refuses_before_lock_release",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
@@ -138,6 +145,13 @@ fn owner_cursor_persistence_guard_contention_refuses_before_lock_release() {
 
 #[test]
 fn owner_cursor_refresh_contention_refuses_before_refresh_release() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "owner_cursor_refresh_contention_refuses_before_refresh_release",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
@@ -193,6 +207,13 @@ fn owner_cursor_refresh_contention_refuses_before_refresh_release() {
 
 #[test]
 fn owner_cursor_registry_contention_is_retryable_before_lock_release() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "owner_cursor_registry_contention_is_retryable_before_lock_release",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
@@ -228,6 +249,13 @@ fn owner_cursor_registry_contention_is_retryable_before_lock_release() {
 
 #[test]
 fn owner_cursor_fence_contention_refuses_before_either_lock_release() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "owner_cursor_fence_contention_refuses_before_either_lock_release",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
@@ -267,6 +295,13 @@ fn owner_cursor_fence_contention_refuses_before_either_lock_release() {
 
 #[test]
 fn owner_cursor_provider_contention_retains_and_admits() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "owner_cursor_provider_contention_retains_and_admits",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
@@ -422,6 +457,13 @@ fn untrusted_provider_scan_registry_is_a_terminal_typed_refusal() {
 
 #[test]
 fn reader_departing_during_registry_scan_releases_its_stale_registration() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "reader_departing_during_registry_scan_releases_its_stale_registration",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
@@ -461,6 +503,13 @@ fn reader_departing_during_registry_scan_releases_its_stale_registration() {
 
 #[test]
 fn locked_registry_snapshot_without_its_data_descriptor_refuses_terminally() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "locked_registry_snapshot_without_its_data_descriptor_refuses_terminally",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
@@ -973,12 +1022,26 @@ fn maintenance_contention_row(contention: MaintenanceContention, retention: bool
 #[cfg(target_os = "linux")]
 #[test]
 fn automatic_compaction_defers_registry_contention() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "automatic_compaction_defers_registry_contention",
+        &[],
+    ) {
+        return;
+    }
     maintenance_contention_row(MaintenanceContention::Registry, false);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn automatic_compaction_defers_physical_publication_hold() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "automatic_compaction_defers_physical_publication_hold",
+        &[],
+    ) {
+        return;
+    }
     maintenance_contention_row(MaintenanceContention::PhysicalHold, false);
 }
 
@@ -1004,6 +1067,13 @@ pub(super) fn before_physical_presence_probe() {
 #[cfg(target_os = "linux")]
 #[test]
 fn inventory_excludes_publication_until_its_physical_probe_finishes() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "inventory_excludes_publication_until_its_physical_probe_finishes",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
@@ -1118,6 +1188,13 @@ fn purge_without_registered_readers_keeps_physical_custody() {
 #[cfg(target_os = "linux")]
 #[test]
 fn audited_reader_snapshots_under_hold_succeeds_under_unrelated_root_contention() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "audited_reader_snapshots_under_hold_succeeds_under_unrelated_root_contention",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),
@@ -1186,6 +1263,13 @@ fn audited_reader_snapshots_under_hold_succeeds_under_unrelated_root_contention(
 /// is released, it returns Complete with own registered reader present.
 #[test]
 fn generic_reader_registry_scanner_fails_closed_under_root_serializer_contention() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "generic_reader_registry_scanner_fails_closed_under_root_serializer_contention",
+        &[],
+    ) {
+        return;
+    }
     // The raw codec fixture owns this explicitly declared operation.
     let _fixture_decode_scope = crate::read_image_memory::ImageMemory::enter_writer_operation(
         crate::memory_accounting::AccountantHandle::standalone(None, true).unwrap(),

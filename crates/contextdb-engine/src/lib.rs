@@ -123,6 +123,8 @@ pub mod read_work_probe;
 pub mod schema_enforcer;
 pub mod sync;
 pub mod sync_types;
+#[cfg(test)]
+mod test_process;
 pub mod vector_read_memory;
 pub mod work_ledger;
 

@@ -132,6 +132,13 @@ fn missing_companion_refuses_recovery_and_cursor_pin_with_typed_database_path() 
 
 #[test]
 fn unusable_publication_fence_refuses_recovery_and_cursor_registration_with_typed_paths() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "unusable_publication_fence_refuses_recovery_and_cursor_registration_with_typed_paths",
+        &[],
+    ) {
+        return;
+    }
     let (directory, mut persistence) = writer();
     let runtime = directory.path().join("runtime");
     std::fs::create_dir(&runtime).unwrap();

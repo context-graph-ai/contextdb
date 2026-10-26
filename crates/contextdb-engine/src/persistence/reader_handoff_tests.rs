@@ -124,6 +124,13 @@ fn a_commit_that_meets_a_busy_registry_succeeds_and_retains_and_purge_is_refused
 /// data-lock race to a writer detaches and routes to the writer.
 #[test]
 fn a_provisional_registration_is_visible_to_a_scan_then_detached_when_the_data_lock_race_is_lost() {
+    if crate::test_process::rerun_alone(
+        module_path!(),
+        "a_provisional_registration_is_visible_to_a_scan_then_detached_when_the_data_lock_race_is_lost",
+        &[],
+    ) {
+        return;
+    }
     use read_persistence_test_scaffold::{ReaderPausePoint, pause_readers_at_for_test};
 
     let (_directory, path, runtime) = fixture();
