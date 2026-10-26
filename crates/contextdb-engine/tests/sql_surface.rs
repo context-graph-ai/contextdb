@@ -11,6 +11,8 @@ pub(crate) fn child_test_filter(module_path: &str, fn_name: &str) -> String {
 mod a_dag_table_keeps_one_copy_of_a_duplicate_edge;
 #[path = "sql_surface/an_edge_keeps_the_identity_its_table_declares.rs"]
 mod an_edge_keeps_the_identity_its_table_declares;
+#[path = "sql_surface/one_edge_through_both_doors_reads_the_same_through_every_door.rs"]
+mod one_edge_through_both_doors_reads_the_same_through_every_door;
 #[cfg(not(feature = "test-seams"))]
 #[path = "sql_surface/production_layout_inventory.rs"]
 mod production_layout_inventory;
