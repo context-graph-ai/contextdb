@@ -18936,10 +18936,16 @@ pub(crate) fn canonical_query_capacity_bytes(
     clippy::result_large_err,
     reason = "Public Error keeps inline NativeRefusal diagnostics so an exhausted budget can return its error without allocating."
 )]
-fn encoded_query_size(
-    context: &ControlArc<RequestContext>,
+pub(crate) fn encoded_query_size(
+    limits: ReadLimits,
     result: &QueryResultData,
 ) -> std::result::Result<u64, BoundedExecutionError> {
+    if u64::try_from(result.rows.len()).unwrap_or(u64::MAX) > limits.result_rows {
+        return Err(RequestContext::limit_failure(
+            ReadFailureLimit::ResultRows,
+            limits.result_rows,
+        ));
+    }
     for row in &result.rows {
         if row.len() != result.columns.len() {
             return Err(
@@ -18955,9 +18961,16 @@ fn encoded_query_size(
     let measured = serialized_size(&crate::read_contract::CanonicalQueryResultView::from(
         result,
     ))?;
-    u64::try_from(measured).map_err(|_| {
-        RequestContext::limit_failure(ReadFailureLimit::ResultBytes, context.limits.result_bytes)
-    })
+    let encoded = u64::try_from(measured).map_err(|_| {
+        RequestContext::limit_failure(ReadFailureLimit::ResultBytes, limits.result_bytes)
+    })?;
+    if encoded > limits.result_bytes {
+        return Err(RequestContext::limit_failure(
+            ReadFailureLimit::ResultBytes,
+            limits.result_bytes,
+        ));
+    }
+    Ok(encoded)
 }
 
 #[expect(
@@ -19785,13 +19798,7 @@ pub(super) fn execute_with_native_trace_refund(
             context.replace_answer_vector(&mut result.trace, root.published_vector_search())?;
             result.trace.rows_examined = context.rows_examined()?;
             context.refresh_group_trace(&mut result.trace)?;
-            let encoded = encoded_query_size(&context, &result)?;
-            if encoded > limits.result_bytes {
-                return Err(RequestContext::limit_failure(
-                    ReadFailureLimit::ResultBytes,
-                    limits.result_bytes,
-                ));
-            }
+            let encoded = encoded_query_size(limits, &result)?;
             context.note_result_shape(result.rows.len(), encoded);
         }
 
@@ -19799,13 +19806,7 @@ pub(super) fn execute_with_native_trace_refund(
         context.replace_answer_vector(&mut result.trace, root.published_vector_search())?;
         result.trace.rows_examined = context.rows_examined()?;
         context.refresh_group_trace(&mut result.trace)?;
-        let encoded = encoded_query_size(&context, &result)?;
-        if encoded > limits.result_bytes {
-            return Err(RequestContext::limit_failure(
-                ReadFailureLimit::ResultBytes,
-                limits.result_bytes,
-            ));
-        }
+        let encoded = encoded_query_size(limits, &result)?;
         context.set_encoded_bytes(encoded);
         context.check_final_boundary()?;
         // Every read says what it did at least once, however short it was.

@@ -3582,6 +3582,8 @@ impl ReadSession {
                     .map_or(Value::Null, |value| Value::Int64(value as i64)),
                 Value::Int64(i64::from(status.default_percent)),
             ]];
+            crate::executor::bounded::encoded_query_size(self.options.limits, &result)
+                .map_err(read_error)?;
             let mut answer = OwnedQueryResult::new(result);
             answer.answer_charge = charge;
             answer.retained_read_memory = Some(owner);

@@ -38,3 +38,40 @@ fn a_cancelled_cache_statement_keeps_the_previous_declaration() {
     }
     assert_eq!(reader.options().read_cache_share, Some(40));
 }
+
+#[test]
+fn cache_inspection_honours_the_declared_result_byte_limit() {
+    use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureLimit};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("bounded-cache-inspection.db");
+    let db = Database::open(&path).unwrap();
+    db.execute(
+        "CREATE TABLE small (id INTEGER PRIMARY KEY)",
+        &HashMap::new(),
+    )
+    .unwrap();
+    db.close().unwrap();
+    let reader = fixture::open_file(
+        &path,
+        ReadSessionOptions {
+            memory_limit: Some(64 * 1024 * 1024),
+            limits: ReadLimits {
+                memory: 64 * 1024 * 1024,
+                result_bytes: 1,
+                cursor_page_bytes: 1,
+                ..fixture::limits()
+            },
+            ..Default::default()
+        },
+        Arc::new(fixture::Routes::default()),
+    );
+    let error = reader
+        .execute("SHOW READ_CACHE_SHARE", &HashMap::new())
+        .unwrap_err();
+    match error {
+        Error::ReadFailure(failure) => assert!(
+            matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(detail) if detail.limit == ReadFailureLimit::ResultBytes && detail.value == 1)
+        ),
+        other => panic!("inspection keeps the typed result-byte refusal: {other:?}"),
+    }
+}
