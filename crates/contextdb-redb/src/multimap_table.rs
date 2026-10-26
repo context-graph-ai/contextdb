@@ -1020,11 +1020,6 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
-        self.tree.print_debug(include_values)
-    }
-
     /// Add the given value to the mapping of the key
     ///
     /// Returns `true` if the key-value pair was present

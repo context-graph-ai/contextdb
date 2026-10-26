@@ -633,15 +633,6 @@ impl<T> WriteCache<T> {
         self.insert_at(key, value, false)
     }
 
-    /// A one-pass page has lowest priority until another access grants a second chance.
-    #[expect(
-        dead_code,
-        reason = "the write buffer retains the original cache implementation"
-    )]
-    pub(crate) fn insert_lowest_priority(&mut self, key: u64, value: T) -> Option<T> {
-        self.insert_at(key, value, true)
-    }
-
     pub(crate) fn remove(&mut self, key: u64) -> Option<T> {
         let entry = self.cache.remove(&key)?;
         if let Some(previous) = entry.previous {
@@ -986,7 +977,6 @@ pub(crate) mod arena_index_tests {
 
     // Independent published pre-arena implementation, SHA f062c990.
     // Kept verbatim; the comparison tests exercise only part of its surface.
-    #[allow(dead_code)]
     mod old_reference {
         use crate::tree_store::page_store::fast_hash::FastHasher64;
         type FastHashMapU64<T> =
@@ -1094,22 +1084,6 @@ pub(crate) mod arena_index_tests {
                 Some(&entry.value)
             }
 
-            pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
-                let entry = self.cache.get_mut(&key)?;
-                entry.second_chance.store(true, Ordering::Release);
-                Some(&mut entry.value)
-            }
-
-            pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
-                self.cache.iter().map(|(key, entry)| (key, &entry.value))
-            }
-
-            pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
-                self.cache
-                    .iter_mut()
-                    .map(|(key, entry)| (key, &mut entry.value))
-            }
-
             pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
                 self.pop_lowest_priority_where(|_| true)
             }
@@ -1140,10 +1114,6 @@ pub(crate) mod arena_index_tests {
                     }
                 }
                 None
-            }
-
-            pub(crate) fn clear(&mut self) {
-                *self = Self::new();
             }
         }
     }

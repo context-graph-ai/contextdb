@@ -3784,55 +3784,11 @@ impl WriteTransaction {
             free_pages: self.mem.count_free_pages()?,
         })
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn print_debug(&self) -> Result {
-        // Flush any pending updates to make sure we get the latest root
-        let mut tables = self.tables.lock().unwrap();
-        if let Some(page) = tables
-            .table_tree
-            .flush_table_root_updates()
-            .unwrap()
-            .finalize_dirty_checksums()
-            .unwrap()
-        {
-            eprintln!("Master tree:");
-            let master_tree: Btree<&str, InternalTableDefinition> = Btree::new(
-                Some(page),
-                PageHint::None,
-                self.transaction_guard.clone(),
-                self.mem.clone(),
-            )?;
-            master_tree.print_debug(true)?;
-        }
-
-        // Flush any pending updates to make sure we get the latest root
-        let mut system_tables = self.system_tables.lock().unwrap();
-        if let Some(page) = system_tables
-            .table_tree
-            .flush_table_root_updates()
-            .unwrap()
-            .finalize_dirty_checksums()
-            .unwrap()
-        {
-            eprintln!("System tree:");
-            let master_tree: Btree<&str, InternalTableDefinition> = Btree::new(
-                Some(page),
-                PageHint::None,
-                self.transaction_guard.clone(),
-                self.mem.clone(),
-            )?;
-            master_tree.print_debug(true)?;
-        }
-
-        Ok(())
-    }
 }
 
 impl Drop for WriteTransaction {
     fn drop(&mut self) {
         if !self.completed && !thread::panicking() && !self.mem.storage_failure() {
-            #[allow(unused_variables)]
             if let Err(error) = self.abort_inner() {
                 #[cfg(feature = "logging")]
                 warn!("Failure automatically aborting transaction: {error}");

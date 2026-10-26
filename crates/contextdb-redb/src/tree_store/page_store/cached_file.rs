@@ -23,12 +23,6 @@ pub(crate) enum PageMemory {
     Native(PageAllocation),
 }
 
-// Private representation names retained for source-adoption diagnostics.
-#[allow(dead_code)]
-type CachedPage = PageAllocation;
-#[allow(dead_code)]
-type ChargedPage = PageAllocation;
-
 fn cached_page_bytes(len: usize) -> usize {
     PageAllocation::quote(len)
 }

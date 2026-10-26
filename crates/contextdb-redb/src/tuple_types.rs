@@ -151,7 +151,6 @@ macro_rules! from_bytes_fixed_impl {
             $(
                 let len = <$t>::fixed_width().unwrap();
                 let $v = <$t>::from_bytes(&$data[offset..(offset + len)]);
-                #[allow(unused_assignments)]
                 {
                     offset += len;
                 }
@@ -207,7 +206,6 @@ macro_rules! compare_fixed_impl {
                 ) {
                     return order;
                 }
-                #[allow(unused_assignments)]
                 {
                     offset0 += len;
                     offset1 += len;

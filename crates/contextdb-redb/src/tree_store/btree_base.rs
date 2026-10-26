@@ -487,17 +487,6 @@ impl<'a> LeafAccessor<'a> {
         }
     }
 
-    pub(super) fn print_node<K: Key, V: Value>(&self, include_value: bool) {
-        let mut i = 0;
-        while let Some(entry) = self.entry(i) {
-            eprint!(" key_{i}={:?}", K::from_bytes(entry.key()));
-            if include_value {
-                eprint!(" value_{i}={:?}", V::from_bytes(entry.value()));
-            }
-            i += 1;
-        }
-    }
-
     pub(crate) fn position<K: Key>(&self, query: &[u8]) -> (usize, bool) {
         // inclusive
         let mut min_entry = 0;
@@ -1350,22 +1339,6 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
             fixed_key_size,
             _page_lifetime: Default::default(),
         }
-    }
-
-    pub(super) fn print_node<K: Key>(&self) {
-        eprint!(
-            "Internal[ (page={:?}), child_0={:?}",
-            self.page.get_page_number(),
-            self.child_page(0).unwrap()
-        );
-        for i in 0..(self.count_children() - 1) {
-            if let Some(child) = self.child_page(i + 1) {
-                let key = self.key(i).unwrap();
-                eprint!(" key_{i}={:?}", K::from_bytes(key));
-                eprint!(" child_{}={child:?}", i + 1);
-            }
-        }
-        eprint!("]");
     }
 
     pub(crate) fn total_length(&self) -> usize {

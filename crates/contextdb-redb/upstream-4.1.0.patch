@@ -3093,6 +3093,18 @@
                  }
              }
          }
+@@ -1018,11 +1020,6 @@
+         }
+     }
+ 
+-    #[allow(dead_code)]
+-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
+-        self.tree.print_debug(include_values)
+-    }
+-
+     /// Add the given value to the mapping of the key
+     ///
+     /// Returns `true` if the key-value pair was present
 --- /dev/null
 +++ b/src/native_storage_admission.rs
 @@ -0,0 +1,1018 @@
@@ -4929,7 +4941,19 @@
              transaction,
              tree: BtreeMut::new(
                  table_root,
-@@ -215,7 +215,23 @@
+@@ -93,11 +93,6 @@
+         }
+     }
+ 
+-    #[allow(dead_code)]
+-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
+-        self.tree.print_debug(include_values)
+-    }
+-
+     /// Returns an accessor, which allows mutation, to the value corresponding to the given key
+     pub fn get_mut<'k>(
+         &mut self,
+@@ -215,7 +210,23 @@
          if value_len + key_len > MAX_PAIR_LENGTH {
              return Err(StorageError::ValueTooLarge(value_len + key_len));
          }
@@ -4954,7 +4978,7 @@
      }
  
      /// Removes the given key
-@@ -225,7 +241,23 @@
+@@ -225,7 +236,23 @@
          &mut self,
          key: impl Borrow<K::SelfType<'a>>,
      ) -> Result<Option<AccessGuard<'_, V>>> {
@@ -4979,7 +5003,7 @@
      }
  }
  
-@@ -250,7 +282,66 @@
+@@ -250,7 +277,66 @@
          if value_length + key_len > MAX_PAIR_LENGTH {
              return Err(StorageError::ValueTooLarge(value_length + key_len));
          }
@@ -5047,7 +5071,7 @@
      }
  }
  
-@@ -668,3 +759,81 @@
+@@ -668,3 +754,81 @@
          })
      }
  }
@@ -8377,10 +8401,51 @@
      }
  
      fn process_freed_pages_nondurable_helper(
-@@ -2037,6 +3773,18 @@
+@@ -2037,54 +3773,22 @@
          })
      }
  
+-    #[allow(dead_code)]
+-    pub(crate) fn print_debug(&self) -> Result {
+-        // Flush any pending updates to make sure we get the latest root
+-        let mut tables = self.tables.lock().unwrap();
+-        if let Some(page) = tables
+-            .table_tree
+-            .flush_table_root_updates()
+-            .unwrap()
+-            .finalize_dirty_checksums()
+-            .unwrap()
+-        {
+-            eprintln!("Master tree:");
+-            let master_tree: Btree<&str, InternalTableDefinition> = Btree::new(
+-                Some(page),
+-                PageHint::None,
+-                self.transaction_guard.clone(),
+-                self.mem.clone(),
+-            )?;
+-            master_tree.print_debug(true)?;
+-        }
+-
+-        // Flush any pending updates to make sure we get the latest root
+-        let mut system_tables = self.system_tables.lock().unwrap();
+-        if let Some(page) = system_tables
+-            .table_tree
+-            .flush_table_root_updates()
+-            .unwrap()
+-            .finalize_dirty_checksums()
+-            .unwrap()
+-        {
+-            eprintln!("System tree:");
+-            let master_tree: Btree<&str, InternalTableDefinition> = Btree::new(
+-                Some(page),
+-                PageHint::None,
+-                self.transaction_guard.clone(),
+-                self.mem.clone(),
+-            )?;
+-            master_tree.print_debug(true)?;
+-        }
+-
+-        Ok(())
 +    pub(crate) fn storage_statistics_snapshot(
 +        &self,
 +        read: ReadTransaction,
@@ -8391,12 +8456,17 @@
 +            system,
 +            free_pages: self.mem.count_free_pages()?,
 +        })
-+    }
-+
-     #[allow(dead_code)]
-     pub(crate) fn print_debug(&self) -> Result {
-         // Flush any pending updates to make sure we get the latest root
-@@ -2107,20 +3855,150 @@
+     }
+ }
+ 
+ impl Drop for WriteTransaction {
+     fn drop(&mut self) {
+         if !self.completed && !thread::panicking() && !self.mem.storage_failure() {
+-            #[allow(unused_variables)]
+             if let Err(error) = self.abort_inner() {
+                 #[cfg(feature = "logging")]
+                 warn!("Failure automatically aborting transaction: {error}");
+@@ -2107,20 +3811,150 @@
      tree: TableTree,
  }
  
@@ -8548,7 +8618,7 @@
      /// Open the given table
      pub fn open_table<K: Key + 'static, V: Value + 'static>(
          &self,
-@@ -2135,7 +4013,7 @@
+@@ -2135,7 +3969,7 @@
              InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                  definition.name().to_string(),
                  table_root,
@@ -8557,7 +8627,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2143,6 +4021,63 @@
+@@ -2143,6 +3977,63 @@
          }
      }
  
@@ -8621,7 +8691,7 @@
      /// Open the given table without a type
      pub fn open_untyped_table(
          &self,
-@@ -2161,7 +4096,7 @@
+@@ -2161,7 +4052,7 @@
                  ..
              } => Ok(ReadOnlyUntypedTable::new(
                  table_root,
@@ -8630,7 +8700,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2189,7 +4124,7 @@
+@@ -2189,7 +4080,7 @@
              } => Ok(ReadOnlyMultimapTable::new(
                  table_root,
                  table_length,
@@ -8639,7 +8709,7 @@
                  self.tree.transaction_guard().clone(),
                  self.mem.clone(),
              )?),
-@@ -2217,7 +4152,7 @@
+@@ -2217,7 +4108,7 @@
              } => Ok(ReadOnlyUntypedMultimapTable::new(
                  table_root,
                  table_length,
@@ -8648,7 +8718,7 @@
                  fixed_key_size,
                  fixed_value_size,
                  self.mem.clone(),
-@@ -2263,7 +4198,15 @@
+@@ -2263,7 +4154,15 @@
  
  #[cfg(test)]
  mod test {
@@ -8665,7 +8735,7 @@
  
      const X: TableDefinition<&str, &str> = TableDefinition::new("x");
  
-@@ -2284,4 +4227,1144 @@
+@@ -2284,4 +4183,1144 @@
          let write_txn = db2.begin_write().unwrap();
          assert!(write_txn.transaction_id > first_txn_id);
      }
@@ -12181,21 +12251,21 @@
      fn visit_pages_helper<F>(&self, path: PagePath, visitor: &mut F) -> Result
      where
          F: FnMut(&PagePath) -> Result,
-@@ -124,6 +343,14 @@
- 
-         Ok(())
+@@ -126,6 +345,14 @@
      }
-+}
-+
+ }
+ 
 +struct PageBatch<'a> {
 +    resume: &'a [usize],
 +    maximum: usize,
 +    pages: Vec<PagePath>,
 +    next: Option<Vec<usize>>,
 +    examined: usize,
- }
- 
++}
++
  pub(crate) struct UntypedBtreeMut {
+     mem: Arc<TransactionalMemory>,
+     root: Option<BtreeHeader>,
 @@ -179,6 +406,13 @@
      fn finalize_dirty_checksums_helper(&mut self, page_number: PageNumber) -> Result<Checksum> {
          assert!(self.mem.uncommitted(page_number));
@@ -12249,7 +12319,29 @@
      transaction_guard: Arc<TransactionGuard>,
      root: Option<BtreeHeader>,
      freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-@@ -454,7 +691,10 @@
+@@ -364,21 +601,6 @@
+         Ok(self.root)
+     }
+ 
+-    #[allow(dead_code)]
+-    pub(crate) fn all_pages_iter(&self) -> Result<Option<AllPageNumbersBtreeIter>> {
+-        if let Some(root) = self.root.map(|x| x.root) {
+-            Ok(Some(AllPageNumbersBtreeIter::new(
+-                root,
+-                K::fixed_width(),
+-                V::fixed_width(),
+-                self.mem.clone(),
+-                PageHint::None,
+-            )?))
+-        } else {
+-            Ok(None)
+-        }
+-    }
+-
+     pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
+     where
+         F: FnMut(&PagePath) -> Result,
+@@ -454,7 +676,10 @@
              fake_allocated_pages,
          );
          operation.insert_inplace(key, value)?;
@@ -12261,7 +12353,19 @@
          Ok(())
      }
  
-@@ -522,6 +762,8 @@
+@@ -472,11 +697,6 @@
+         Ok(result)
+     }
+ 
+-    #[allow(dead_code)]
+-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
+-        self.read_tree()?.print_debug(include_values)
+-    }
+-
+     pub(crate) fn stats(&self) -> Result<BtreeStats> {
+         btree_stats(
+             self.get_root().map(|x| x.root),
+@@ -522,6 +742,8 @@
                  new_page.memory_mut().copy_from_slice(old_page.memory());
                  drop(old_page);
                  freed_pages.push(root.root);
@@ -12270,7 +12374,7 @@
  
                  root.root = new_page.get_page_number();
                  root.checksum = DEFERRED;
-@@ -582,6 +824,8 @@
+@@ -582,6 +804,8 @@
                          .copy_from_slice(old_child_page.memory());
                      drop(old_child_page);
                      freed_pages.push(child_page);
@@ -12279,7 +12383,7 @@
  
                      let mut mutator = BranchMutator::new(page.memory_mut());
                      mutator.write_child_page(child_index, new_page.get_page_number(), DEFERRED);
-@@ -672,6 +916,8 @@
+@@ -672,6 +896,8 @@
          for page in freed {
              if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
                  freed_pages.push(page);
@@ -12288,7 +12392,7 @@
              }
          }
  
-@@ -711,6 +957,28 @@
+@@ -711,6 +937,28 @@
      }
  }
  
@@ -12317,12 +12421,10 @@
  pub(crate) struct RawBtree {
      mem: Arc<TransactionalMemory>,
      root: Option<BtreeHeader>,
-@@ -760,6 +1028,22 @@
-         } else {
-             Ok(true)
+@@ -762,6 +1010,22 @@
          }
-+    }
-+
+     }
+ 
 +    /// Authenticate only the saved root page during external admission.
 +    /// Its descendants remain protected by the transaction floor and are
 +    /// checked when the retained reader actually visits them.
@@ -12337,10 +12439,12 @@
 +            _ => return Ok(false),
 +        };
 +        Ok(computed.is_ok_and(|computed| computed == header.checksum))
-     }
- 
++    }
++
      fn verify_checksum_helper(
-@@ -804,12 +1088,12 @@
+         &self,
+         page_number: PageNumber,
+@@ -804,12 +1068,12 @@
  }
  
  pub(crate) struct Btree<K: Key + 'static, V: Value + 'static> {
@@ -12355,7 +12459,7 @@
      _key_type: PhantomData<K>,
      _value_type: PhantomData<V>,
  }
-@@ -822,7 +1106,16 @@
+@@ -822,7 +1086,16 @@
          mem: Arc<TransactionalMemory>,
      ) -> Result<Self> {
          let cached_root = if let Some(header) = root {
@@ -12373,7 +12477,7 @@
          } else {
              None
          };
-@@ -837,6 +1130,24 @@
+@@ -837,6 +1110,24 @@
          })
      }
  
@@ -12398,12 +12502,10 @@
      pub(crate) fn transaction_guard(&self) -> &Arc<TransactionGuard> {
          &self.transaction_guard
      }
-@@ -858,6 +1169,17 @@
-             self.hint,
-         )
+@@ -860,6 +1151,17 @@
          .verify_checksum()
-+    }
-+
+     }
+ 
 +    pub(crate) fn verify_root_checksum(&self) -> Result<bool> {
 +        RawBtree::new(
 +            self.get_root(),
@@ -12413,10 +12515,12 @@
 +            self.hint,
 +        )
 +        .verify_root_checksum()
-     }
- 
++    }
++
      pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
-@@ -877,6 +1199,10 @@
+     where
+         F: FnMut(&PagePath) -> Result,
+@@ -877,6 +1179,10 @@
      pub(crate) fn get(&self, key: &K::SelfType<'_>) -> Result<Option<AccessGuard<'static, V>>> {
          if let Some(ref root_page) = self.cached_root {
              self.get_helper(root_page, K::as_bytes(key).as_ref())
@@ -12427,7 +12531,7 @@
          } else {
              Ok(None)
          }
-@@ -898,8 +1224,10 @@
+@@ -898,8 +1204,10 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(page, K::fixed_width());
@@ -12439,7 +12543,7 @@
                  self.get_helper(&child_page, query)
              }
              _ => unreachable!(),
-@@ -911,6 +1239,10 @@
+@@ -911,6 +1219,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.first_helper(root.clone())
@@ -12450,7 +12554,7 @@
          } else {
              Ok(None)
          }
-@@ -932,7 +1264,10 @@
+@@ -932,7 +1244,10 @@
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
                  let child_page = accessor.child_page(0).unwrap();
@@ -12462,7 +12566,7 @@
              }
              _ => unreachable!(),
          }
-@@ -943,6 +1278,10 @@
+@@ -943,6 +1258,10 @@
      ) -> Result<Option<(AccessGuard<'static, K>, AccessGuard<'static, V>)>> {
          if let Some(ref root) = self.cached_root {
              self.last_helper(root.clone())
@@ -12473,7 +12577,7 @@
          } else {
              Ok(None)
          }
-@@ -964,8 +1303,12 @@
+@@ -964,8 +1283,12 @@
              }
              BRANCH => {
                  let accessor = BranchAccessor::new(&page, K::fixed_width());
@@ -12488,7 +12592,7 @@
              }
              _ => unreachable!(),
          }
-@@ -975,12 +1318,35 @@
+@@ -975,14 +1298,37 @@
          &self,
          range: &'_ T,
      ) -> Result<BtreeRangeIter<K, V>> {
@@ -12511,8 +12615,8 @@
              self.mem.clone(),
              self.hint,
          )
-+    }
-+
+     }
+ 
 +    fn verify_path_page(&self, page: &PageImpl, expected: Checksum) -> Result<()> {
 +        if self.hint.verifies_path()
 +            && page_checksum(page, K::fixed_width(), V::fixed_width())? != expected
@@ -12523,10 +12627,55 @@
 +            )));
 +        }
 +        Ok(())
-     }
- 
++    }
++
      pub(crate) fn len(&self) -> Result<u64> {
-@@ -1118,3 +1484,521 @@
+         Ok(self.root.map_or(0, |x| x.length))
+     }
+@@ -996,42 +1342,6 @@
+             self.hint,
+         )
+     }
+-
+-    #[allow(dead_code)]
+-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
+-        if let Some(p) = self.root.map(|x| x.root) {
+-            let mut pages = vec![self.mem.get_page(p, self.hint)?];
+-            while !pages.is_empty() {
+-                let mut next_children = vec![];
+-                for page in pages.drain(..) {
+-                    let node_mem = page.memory();
+-                    match node_mem[0] {
+-                        LEAF => {
+-                            eprint!("Leaf[ (page={:?})", page.get_page_number());
+-                            LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width())
+-                                .print_node::<K, V>(include_values);
+-                            eprint!("]");
+-                        }
+-                        BRANCH => {
+-                            let accessor = BranchAccessor::new(&page, K::fixed_width());
+-                            for i in 0..accessor.count_children() {
+-                                let child = accessor.child_page(i).unwrap();
+-                                next_children.push(self.mem.get_page(child, self.hint)?);
+-                            }
+-                            accessor.print_node::<K>();
+-                        }
+-                        _ => unreachable!(),
+-                    }
+-                    eprint!("  ");
+-                }
+-                eprintln!();
+-
+-                pages = next_children;
+-            }
+-        }
+-
+-        Ok(())
+-    }
+ }
+ 
+ impl<K: Key, V: Value> Drop for Btree<K, V> {
+@@ -1118,3 +1428,521 @@
          _ => unreachable!(),
      }
  }
@@ -13140,20 +13289,38 @@
          ) {
              let mut mutator =
                  LeafMutator::new(self.page.memory_mut(), self.key_width, V::fixed_width());
-@@ -358,6 +394,12 @@
-         self.len = new_end - new_start;
- 
-         Ok(())
-+    }
-+}
-+
-+impl<V: MutInPlaceValue + 'static> AccessGuardMut<'_, V> {
-+    pub(crate) fn value_mut(&mut self) -> &mut V::BaseRefType {
-+        V::from_bytes_mut(&mut self.page.memory_mut()[self.offset..self.offset + self.len])
+@@ -361,6 +397,12 @@
      }
  }
  
-@@ -618,8 +660,32 @@
++impl<V: MutInPlaceValue + 'static> AccessGuardMut<'_, V> {
++    pub(crate) fn value_mut(&mut self) -> &mut V::BaseRefType {
++        V::from_bytes_mut(&mut self.page.memory_mut()[self.offset..self.offset + self.len])
++    }
++}
++
+ impl<V: Value + 'static> Drop for AccessGuardMut<'_, V> {
+     fn drop(&mut self) {
+         // no-op. This Drop impl is only here to ensure that self is dropped before the transaction
+@@ -445,17 +487,6 @@
+         }
+     }
+ 
+-    pub(super) fn print_node<K: Key, V: Value>(&self, include_value: bool) {
+-        let mut i = 0;
+-        while let Some(entry) = self.entry(i) {
+-            eprint!(" key_{i}={:?}", K::from_bytes(entry.key()));
+-            if include_value {
+-                eprint!(" value_{i}={:?}", V::from_bytes(entry.value()));
+-            }
+-            i += 1;
+-        }
+-    }
+-
+     pub(crate) fn position<K: Key>(&self, query: &[u8]) -> (usize, bool) {
+         // inclusive
+         let mut min_entry = 0;
+@@ -618,8 +649,32 @@
      }
  }
  
@@ -13187,7 +13354,7 @@
      fixed_key_size: Option<usize>,
      fixed_value_size: Option<usize>,
      total_key_bytes: usize,
-@@ -657,6 +723,10 @@
+@@ -657,6 +712,10 @@
      }
  
      pub(super) fn push(&mut self, key: &'a [u8], value: &'a [u8]) {
@@ -13198,7 +13365,7 @@
          self.total_key_bytes += key.len();
          self.total_value_bytes += value.len();
          self.pairs.push((key, value));
-@@ -712,7 +782,7 @@
+@@ -712,7 +771,7 @@
              first_split_key_bytes,
          );
          for (key, value) in self.pairs.iter().take(division) {
@@ -13207,7 +13374,7 @@
          }
          drop(builder);
  
-@@ -731,7 +801,7 @@
+@@ -731,7 +790,7 @@
              self.total_key_bytes - first_split_key_bytes,
          );
          for (key, value) in &self.pairs[division..] {
@@ -13216,7 +13383,7 @@
          }
          drop(builder);
  
-@@ -753,7 +823,7 @@
+@@ -753,7 +812,7 @@
              self.total_key_bytes,
          );
          for (key, value) in self.pairs {
@@ -13225,7 +13392,7 @@
          }
          drop(builder);
          Ok(page)
-@@ -877,6 +947,10 @@
+@@ -877,6 +936,10 @@
      }
  
      pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) {
@@ -13236,7 +13403,7 @@
          if let Some(key_width) = self.fixed_key_size {
              assert_eq!(key_width, key.len());
          }
-@@ -915,7 +989,7 @@
+@@ -915,7 +978,7 @@
                      .to_le_bytes(),
              );
          }
@@ -13245,7 +13412,7 @@
          self.pairs_written += 1;
      }
  }
-@@ -959,7 +1033,7 @@
+@@ -959,7 +1022,7 @@
          position: usize,
          fixed_key_size: Option<usize>,
          fixed_value_size: Option<usize>,
@@ -13254,7 +13421,7 @@
      ) -> bool {
          let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
          let remaining = page.memory().len() - accessor.total_length();
-@@ -967,7 +1041,7 @@
+@@ -967,7 +1030,7 @@
              .value_range(position)
              .map(|(s, e)| e - s)
              .unwrap_or_default();
@@ -13263,7 +13430,7 @@
              - isize::try_from(existing_value_len).unwrap();
          required_delta <= isize::try_from(remaining).unwrap()
      }
-@@ -978,7 +1052,7 @@
+@@ -978,7 +1041,7 @@
          fixed_key_size: Option<usize>,
          fixed_value_size: Option<usize>,
          new_key: &[u8],
@@ -13272,7 +13439,7 @@
      ) -> bool {
          let accessor = LeafAccessor::new(page.memory(), fixed_key_size, fixed_value_size);
          // If this is a large page, only allow in-place appending to avoid write amplification
-@@ -989,7 +1063,7 @@
+@@ -989,7 +1052,7 @@
              return false;
          }
          let remaining = page.memory().len() - accessor.total_length();
@@ -13281,7 +13448,7 @@
          if fixed_key_size.is_none() {
              required_delta += size_of::<u32>();
          }
-@@ -1001,6 +1075,10 @@
+@@ -1001,6 +1064,10 @@
  
      // Replace the value at index `i` with `value`, leaving the key unchanged.
      pub(crate) fn replace(&mut self, i: usize, value: &[u8]) {
@@ -13292,7 +13459,7 @@
          let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
          let num_pairs = accessor.num_pairs();
          let last_value_end = accessor.value_end(num_pairs - 1).unwrap();
-@@ -1031,11 +1109,11 @@
+@@ -1031,11 +1098,11 @@
  
          // Write the new value
          dest -= value.len();
@@ -13306,7 +13473,7 @@
          let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
          let required_delta = {
              let mut delta = key.len() + value.len();
-@@ -1093,7 +1171,7 @@
+@@ -1093,7 +1160,7 @@
          // Insert the value
          let inserted_value_end: u32 = dest.try_into().unwrap();
          dest -= value.len();
@@ -13315,6 +13482,29 @@
  
          // Right shift the trailing key data & preceding value data
          let start = shift_key_start;
+@@ -1274,22 +1341,6 @@
+         }
+     }
+ 
+-    pub(super) fn print_node<K: Key>(&self) {
+-        eprint!(
+-            "Internal[ (page={:?}), child_0={:?}",
+-            self.page.get_page_number(),
+-            self.child_page(0).unwrap()
+-        );
+-        for i in 0..(self.count_children() - 1) {
+-            if let Some(child) = self.child_page(i + 1) {
+-                let key = self.key(i).unwrap();
+-                eprint!(" key_{i}={:?}", K::from_bytes(key));
+-                eprint!(" child_{}={child:?}", i + 1);
+-            }
+-        }
+-        eprint!("]");
+-    }
+-
+     pub(crate) fn total_length(&self) -> usize {
+         // Keys are stored at the end
+         self.key_end(self.num_keys() - 1).unwrap()
 --- a/src/tree_store/btree_iters.rs
 +++ b/src/tree_store/btree_iters.rs
 @@ -1,10 +1,12 @@
@@ -16216,7 +16406,7 @@
 +}
 --- a/src/tree_store/page_store/cached_file.rs
 +++ b/src/tree_store/page_store/cached_file.rs
-@@ -1,24 +1,143 @@
+@@ -1,24 +1,137 @@
 +use super::page_allocation::{CacheShared, cache_array_prepaid};
  use crate::tree_store::page_store::base::PageHint;
 -use crate::tree_store::page_store::lru_cache::LRUCache;
@@ -16230,14 +16420,13 @@
  use std::sync::atomic::AtomicU64;
  use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 -use std::sync::{Arc, Mutex, MutexGuard, RwLock};
--
++use std::sync::{Mutex, MutexGuard, RwLock};
+ 
 -// Allocates an `Arc<[u8]>` in one step. `Arc::<[u8]>::from(vec![0; len])` would
 -// allocate the Vec and then allocate a new Arc and memcpy into it.
 -fn zero_filled_arc(len: usize) -> Arc<[u8]> {
 -    // This is documented to do a single allocation: https://doc.rust-lang.org/std/sync/struct.Arc.html#iterators-of-known-length
 -    std::iter::repeat_n(0u8, len).collect()
-+use std::sync::{Mutex, MutexGuard, RwLock};
-+
 +use super::page_allocation::{CacheCounter, CachePayment, PageAllocation};
 +
 +/// Every alias retains the same complete physical backing and its payer.
@@ -16251,12 +16440,6 @@
 +    #[cfg(feature = "contextdb-internal")]
 +    Native(PageAllocation),
 +}
-+
-+// Private representation names retained for source-adoption diagnostics.
-+#[allow(dead_code)]
-+type CachedPage = PageAllocation;
-+#[allow(dead_code)]
-+type ChargedPage = PageAllocation;
 +
 +fn cached_page_bytes(len: usize) -> usize {
 +    PageAllocation::quote(len)
@@ -16362,7 +16545,7 @@
 +        }
 +    }
  }
-
+ 
  pub(super) struct WritablePage {
 -    buffer: Arc<Mutex<LRUWriteCache>>,
 +    buffer: CacheShared<Mutex<LRUWriteCache>>,
@@ -16372,7 +16555,7 @@
  }
  
  impl WritablePage {
-@@ -27,7 +146,7 @@
+@@ -27,7 +140,7 @@
      }
  
      pub(super) fn mem_mut(&mut self) -> &mut [u8] {
@@ -16381,7 +16564,7 @@
      }
  }
  
-@@ -56,7 +175,7 @@
+@@ -56,7 +169,7 @@
  
  #[derive(Default)]
  struct LRUWriteCache {
@@ -16390,7 +16573,7 @@
  }
  
  impl LRUWriteCache {
-@@ -66,15 +185,15 @@
+@@ -66,15 +179,15 @@
          }
      }
  
@@ -16409,7 +16592,7 @@
          if let Some(value) = self.cache.remove(key) {
              assert!(value.is_some());
              return value;
-@@ -82,11 +201,11 @@
+@@ -82,11 +195,11 @@
          None
      }
  
@@ -16423,7 +16606,7 @@
          if let Some(value) = self.cache.get_mut(key) {
              let result = value.take().unwrap();
              return Some(result);
-@@ -94,7 +213,7 @@
+@@ -94,7 +207,7 @@
          None
      }
  
@@ -16432,7 +16615,7 @@
          for _ in 0..self.cache.len() {
              if let Some((k, v)) = self.cache.pop_lowest_priority() {
                  if let Some(v_inner) = v {
-@@ -117,15 +236,15 @@
+@@ -117,15 +230,15 @@
  
  #[derive(Debug)]
  struct CheckedBackend {
@@ -16451,7 +16634,7 @@
              io_failed: AtomicBool::new(false),
              closed: AtomicBool::new(false),
          }
-@@ -157,7 +276,7 @@
+@@ -157,7 +270,7 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -16460,15 +16643,14 @@
      }
  
      fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
-@@ -165,17 +284,25 @@
+@@ -165,17 +278,25 @@
          let result = self.file.read(offset, out);
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
--        }
--        result.map_err(StorageError::from)
 +        } else {
 +            crate::read_admission::record_backend_read(out.len());
-+        }
+         }
+-        result.map_err(StorageError::from)
 +        result
      }
  
@@ -16490,7 +16672,7 @@
      }
  
      fn sync_data(&self) -> Result<()> {
-@@ -184,7 +311,7 @@
+@@ -184,7 +305,7 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -16499,7 +16681,7 @@
      }
  
      fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
-@@ -193,11 +320,34 @@
+@@ -193,11 +314,34 @@
          if result.is_err() {
              self.io_failed.store(true, Ordering::Release);
          }
@@ -16535,7 +16717,7 @@
      file: CheckedBackend,
      page_size: u64,
      // Dynamic cache partitioning.  Three invariants:
-@@ -218,9 +368,7 @@
+@@ -218,9 +362,7 @@
      // soft limit and momentary over-/under-counting by one page is harmless.
      // A third "total" counter would add contention on every insert/remove for
      // negligible accuracy gain.
@@ -16546,7 +16728,7 @@
      // Rotates the starting stripe for read-cache eviction
      next_eviction_stripe: AtomicUsize,
      #[cfg(feature = "cache_metrics")]
-@@ -233,27 +381,168 @@
+@@ -233,27 +375,168 @@
      writes_hits: AtomicU64,
      #[cfg(feature = "cache_metrics")]
      evictions: AtomicU64,
@@ -16621,7 +16803,7 @@
 +        self.0.allocation_for_test()
 +    }
  }
-
+ 
  impl PagedCachedFile {
 +    #[cfg(feature = "test-seams")]
 +    pub(crate) fn write_control_for_test(&self) -> CacheWriteControlForTest {
@@ -16708,7 +16890,7 @@
 +        crate::read_admission::prepare_cache_allocation(Self::write_buffer_control_layout())?;
 +        let read_cache =
 +            Self::prepare_read_index(max_cache_size, usize::try_from(page_size).unwrap(), 0)?;
-
+ 
          Ok(Self {
              file: CheckedBackend::new(file),
 +            no_victim_generation: AtomicU64::new(0),
@@ -16724,13 +16906,13 @@
              next_eviction_stripe: AtomicUsize::new(0),
              #[cfg(feature = "cache_metrics")]
              reads_total: Default::default(),
-@@ -266,8 +555,130 @@
+@@ -266,10 +549,132 @@
              #[cfg(feature = "cache_metrics")]
              evictions: Default::default(),
              read_cache,
 -            write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
 +            write_buffer: CacheShared::new_prepaid(Mutex::new(LRUWriteCache::new()))?,
-         })
++        })
 +    }
 +
 +    #[cfg(feature = "contextdb-internal")]
@@ -16804,9 +16986,9 @@
 +            .next_power_of_two();
 +        cache_array_prepaid(usize::try_from(Self::lock_stripes()).unwrap(), |_| {
 +            LRUCache::try_new(arena.clone(), heads).map(RwLock::new)
-+        })
-+    }
-+
+         })
+     }
+ 
 +    #[cfg(feature = "contextdb-internal")]
 +    pub(crate) fn begin_page_window(&self) -> ReadCachePageWindow {
 +        let arena = self.read_cache[0].read().unwrap().page_window_arena();
@@ -16853,10 +17035,12 @@
 +            .unwrap()
 +            .peek(offset)
 +            .is_some_and(|page| page.len() == len)
-     }
- 
++    }
++
      #[allow(clippy::unused_self)]
-@@ -303,6 +714,110 @@
+     pub(crate) fn cache_stats(&self) -> CacheStats {
+         #[cfg(not(feature = "cache_metrics"))]
+@@ -303,6 +708,110 @@
          }
      }
  
@@ -16967,7 +17151,7 @@
      pub(crate) fn close(&self) -> Result {
          self.file.close()
      }
-@@ -329,27 +844,43 @@
+@@ -329,28 +838,44 @@
          bytes_needed: usize,
          _write_lock: &MutexGuard<'_, LRUWriteCache>,
      ) {
@@ -17008,14 +17192,15 @@
                      break;
                  }
              }
-+        }
+         }
 +        if freed < bytes_needed {
 +            self.no_victim_generation
 +                .store(generation, Ordering::Release);
-         }
++        }
      }
  
-@@ -364,25 +895,49 @@
+     fn flush_write_buffer(&self) -> Result {
+@@ -364,25 +889,49 @@
          // drained, so the total check only considers the read cache size.
          for (offset, buffer) in write_buffer.cache.iter_mut() {
              let buffer = buffer.take().unwrap();
@@ -17077,7 +17262,7 @@
          write_buffer.clear();
  
          Ok(())
-@@ -390,10 +945,28 @@
+@@ -390,12 +939,30 @@
  
      // Caller should invalidate all cached pages that are no longer valid
      pub(super) fn resize(&self, len: u64) -> Result {
@@ -17089,8 +17274,8 @@
 +        self.invalidate_cache_beyond(len);
  
          self.file.set_len(len)
-+    }
-+
+     }
+ 
 +    fn invalidate_cache_beyond(&self, len: u64) {
 +        for stripe in &self.read_cache {
 +            let mut lock = stripe.write().unwrap();
@@ -17105,10 +17290,12 @@
 +                drop(lock.remove(offset));
 +            }
 +        }
-     }
- 
++    }
++
      pub(super) fn flush(&self) -> Result {
-@@ -409,6 +982,20 @@
+         self.flush_write_buffer()?;
+ 
+@@ -409,6 +976,20 @@
          self.flush_write_buffer()
      }
  
@@ -17129,7 +17316,7 @@
      // Read directly from the file, ignoring any cached data
      pub(super) fn read_direct(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
          let mut buffer = vec![0; len];
-@@ -416,18 +1003,28 @@
+@@ -416,18 +997,28 @@
          Ok(buffer)
      }
  
@@ -17166,7 +17353,7 @@
          debug_assert_eq!(0, offset % self.page_size);
          #[cfg(feature = "cache_metrics")]
          self.reads_total.fetch_add(1, Ordering::AcqRel);
-@@ -438,7 +1035,7 @@
+@@ -438,7 +1029,7 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
@@ -17175,20 +17362,17 @@
              }
          }
  
-@@ -449,54 +1046,141 @@
+@@ -449,54 +1040,141 @@
                  #[cfg(feature = "cache_metrics")]
                  self.reads_hits.fetch_add(1, Ordering::Release);
                  debug_assert_eq!(cached.len(), len);
 -                return Ok(cached.clone());
--            }
--        }
--
++                return Ok(PageMemory::Cached(cached.clone()));
+             }
+         }
+ 
 -        let buffer = self.read_direct_into_arc(offset, len)?;
 -        let cache_size = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
-+                return Ok(PageMemory::Cached(cached.clone()));
-+            }
-+        }
-+
 +        let buffer = self.read_direct_into_page(offset, len)?;
 +        let scan_replace = crate::read_admission::scan_reads_active()
 +            && !crate::read_admission::declared_scan_reads_active()
@@ -17260,31 +17444,6 @@
 -            cache_size
 +            write_lock.try_insert(offset, buffer.clone())
          };
--
--        // Rule 3: evict from this read-cache slot if the total exceeds the
--        // budget.  We evict exactly `len` bytes (one page) per miss to avoid
--        // over-eviction spikes.
--        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
--        let over_total = cache_size + len + write_bytes > self.max_cache_size;
--        let mut removed = 0;
--        if over_total {
--            while removed < len {
--                if let Some((_, v)) = write_lock.pop_lowest_priority() {
--                    #[cfg(feature = "cache_metrics")]
--                    {
--                        self.evictions.fetch_add(1, Ordering::Relaxed);
--                    }
--                    removed += v.len();
--                } else {
--                    break;
--                }
--            }
--        }
--        if removed > 0 {
--            self.read_cache_bytes.fetch_sub(removed, Ordering::AcqRel);
--        }
--
--        Ok(buffer)
 +        match inserted {
 +            Ok(displaced) => {
 +                // All new holders retain this same source payer until transfer.
@@ -17304,7 +17463,24 @@
 +            }
 +        }
 +    }
-+
+ 
+-        // Rule 3: evict from this read-cache slot if the total exceeds the
+-        // budget.  We evict exactly `len` bytes (one page) per miss to avoid
+-        // over-eviction spikes.
+-        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
+-        let over_total = cache_size + len + write_bytes > self.max_cache_size;
+-        let mut removed = 0;
+-        if over_total {
+-            while removed < len {
+-                if let Some((_, v)) = write_lock.pop_lowest_priority() {
+-                    #[cfg(feature = "cache_metrics")]
+-                    {
+-                        self.evictions.fetch_add(1, Ordering::Relaxed);
+-                    }
+-                    removed += v.len();
+-                } else {
+-                    break;
+-                }
 +    // A reject-only window never enters the full-page cache. Its admission
 +    // remains owned until the window is released, including cached sources.
 +    pub(super) fn read_window(
@@ -17330,8 +17506,10 @@
 +            if let Some(source) = lock.get(offset) {
 +                output.copy_from_slice(&source[range.clone()]);
 +                copied = true;
-+            }
-+        }
+             }
+         }
+-        if removed > 0 {
+-            self.read_cache_bytes.fetch_sub(removed, Ordering::AcqRel);
 +        if !copied {
 +            let slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
 +            let lock = self.read_cache[slot].read().unwrap();
@@ -17339,7 +17517,9 @@
 +                output.copy_from_slice(&source[range.clone()]);
 +                copied = true;
 +            }
-+        }
+         }
+-
+-        Ok(buffer)
 +        if !copied {
 +            self.file.read(offset + range.start as u64, output)?;
 +        }
@@ -17357,16 +17537,15 @@
      }
  
      // Invalidate any caching of the given range. After this call overlapping reads of the range are allowed
-@@ -507,104 +1191,172 @@
+@@ -507,104 +1185,172 @@
          let mut lock = self.read_cache[cache_slot].write().unwrap();
          if let Some(removed) = lock.remove(offset) {
              assert_eq!(len, removed.len());
 -            self.read_cache_bytes
 -                .fetch_sub(removed.len(), Ordering::AcqRel);
--        }
-+        }
-+    }
-+
+         }
+     }
+ 
 +    /// Detach only the map entry whose physical allocation the guard retains.
 +    /// The coordinate comes from the real cache map, never a SQL row ordinal.
 +    #[cfg(feature = "test-seams")]
@@ -17404,20 +17583,14 @@
 +            "exact held identity must be absent after invalidation"
 +        );
 +        (offset, len, identity, absent)
-     }
- 
++    }
++
      pub(super) fn invalidate_cache_all(&self) {
          for cache_slot in 0..self.read_cache.len() {
              let mut lock = self.read_cache[cache_slot].write().unwrap();
 -            while let Some((_, removed)) = lock.pop_lowest_priority() {
 -                self.read_cache_bytes
 -                    .fetch_sub(removed.len(), Ordering::AcqRel);
--            }
--        }
--    }
--
--    // If overwrite is true, the page is initialized to zero
--    // cache_policy takes the existing data as an argument and returns the priority. The priority should be stable and not change after WritablePage is dropped
 +            while lock.pop_lowest_priority().is_some() {}
 +        }
 +    }
@@ -17449,7 +17622,7 @@
 +                #[cfg(feature = "cache_metrics")]
 +                self.evictions.fetch_add(1, Ordering::Relaxed);
 +                flushed += removed_bytes;
-+            }
+             }
 +            // A detached dirty reader can keep flushed backing paid. Use the
 +            // real counter, not the sum of entries removed from the map.
 +            write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
@@ -17461,10 +17634,12 @@
 +                    - self.max_cache_size.load(Ordering::Acquire),
 +                lock,
 +            );
-+        }
+         }
 +        Ok(payment)
-+    }
-+
+     }
+ 
+-    // If overwrite is true, the page is initialized to zero
+-    // cache_policy takes the existing data as an argument and returns the priority. The priority should be stable and not change after WritablePage is dropped
 +    // If overwrite is true, the page is initialized to zero.
      pub(super) fn write(&self, offset: u64, len: usize, overwrite: bool) -> Result<WritablePage> {
          assert_eq!(0, offset % self.page_size);
@@ -17489,6 +17664,12 @@
 -            } else {
 -                None
 -            }
+-        };
+-
+-        let data = if let Some(removed) = lock.take_value(offset) {
+-            #[cfg(feature = "cache_metrics")]
+-            self.writes_hits.fetch_add(1, Ordering::AcqRel);
+-            removed
 +        let existing_read = self.read_cache[cache_slot].write().unwrap().remove(offset);
 +        if let Some(page) = &existing_read {
 +            assert_eq!(len, page.len(), "cache inconsistency for offset {offset}");
@@ -17510,29 +17691,6 @@
 +                .is_none_or(|page| !page.counted_by(&self.write_buffer_bytes));
 +        let payment = if needs_payment {
 +            Some(self.reserve_write_backing(cached_page_bytes(len), &mut lock)?)
-+        } else {
-+            None
-         };
--
--        let data = if let Some(removed) = lock.take_value(offset) {
--            #[cfg(feature = "cache_metrics")]
--            self.writes_hits.fetch_add(1, Ordering::AcqRel);
--            removed
-+        let data = if needs_copy {
-+            // The old dirty entry stays in the map across fallible admission
-+            // and copying (or has already been successfully flushed). Locals
-+            // retain the old payer and roll back the new payment on Err/unwind.
-+            let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
-+            let mut page = PageAllocation::zeroed(len, charge)?;
-+            if let Some(source) = &existing {
-+                PageAllocation::get_mut(&mut page)
-+                    .unwrap()
-+                    .copy_from_slice(source);
-+            } else if !overwrite {
-+                self.file
-+                    .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
-+            }
-+            page
          } else {
 -            let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
 -            let mut write_bytes = previous + len;
@@ -17570,11 +17728,39 @@
 -            let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
 -            if write_bytes + read_bytes > self.max_cache_size {
 -                self.evict_from_read_cache(write_bytes + read_bytes - self.max_cache_size, &lock);
--            }
++            None
++        };
++        let data = if needs_copy {
++            // The old dirty entry stays in the map across fallible admission
++            // and copying (or has already been successfully flushed). Locals
++            // retain the old payer and roll back the new payment on Err/unwind.
++            let charge = crate::read_admission::admit_read_memory(admitted_page_bytes(len))?;
++            let mut page = PageAllocation::zeroed(len, charge)?;
++            if let Some(source) = &existing {
++                PageAllocation::get_mut(&mut page)
++                    .unwrap()
++                    .copy_from_slice(source);
++            } else if !overwrite {
++                self.file
++                    .read(offset, PageAllocation::get_mut(&mut page).unwrap())?;
+             }
 -            let result = if let Some(data) = existing {
 -                #[cfg(feature = "cache_metrics")]
+-                self.writes_hits.fetch_add(1, Ordering::AcqRel);
+-                data
+-            } else if overwrite {
+-                #[cfg(feature = "cache_metrics")]
+-                self.writes_hits.fetch_add(1, Ordering::AcqRel);
+-                zero_filled_arc(len)
+-            } else {
+-                self.read_direct_into_arc(offset, len)?
+-            };
+-            lock.insert(offset, result);
+-            lock.take_value(offset).unwrap()
++            page
++        } else {
 +            existing.unwrap()
-+        };
+         };
 +        if let Some(payment) = payment {
 +            let fixed_room = self
 +                .read_cache_bytes
@@ -17591,23 +17777,11 @@
 +        lock.insert(offset, data);
 +        let mut data = lock.take_value(offset).unwrap();
 +        PageAllocation::get_mut(&mut data).expect("writable backing is exclusive");
-+        #[cfg(feature = "cache_metrics")]
+         #[cfg(feature = "cache_metrics")]
+-        self.writes_total.fetch_add(1, Ordering::AcqRel);
 +        {
 +            if is_hit {
-                 self.writes_hits.fetch_add(1, Ordering::AcqRel);
--                data
--            } else if overwrite {
--                #[cfg(feature = "cache_metrics")]
--                self.writes_hits.fetch_add(1, Ordering::AcqRel);
--                zero_filled_arc(len)
--            } else {
--                self.read_direct_into_arc(offset, len)?
--            };
--            lock.insert(offset, result);
--            lock.take_value(offset).unwrap()
--        };
--        #[cfg(feature = "cache_metrics")]
--        self.writes_total.fetch_add(1, Ordering::AcqRel);
++                self.writes_hits.fetch_add(1, Ordering::AcqRel);
 +            }
 +            self.writes_total.fetch_add(1, Ordering::AcqRel);
 +        }
@@ -17616,7 +17790,7 @@
          Ok(WritablePage {
              buffer: self.write_buffer.clone(),
              offset,
-@@ -614,13 +1366,383 @@
+@@ -614,13 +1360,383 @@
  }
  
  #[cfg(test)]
@@ -18002,11 +18176,10 @@
  
      #[test]
      fn cache_leak() {
-@@ -653,4 +1775,840 @@
+@@ -653,4 +1769,840 @@
          cached_file.invalidate_cache(0, 128);
          assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
      }
--}
 +    #[test]
 +    fn immutable_byte_checksum_owners_are_charged_and_release_at_final_holder() {
 +        struct Charge(Arc<std::sync::atomic::AtomicUsize>, usize);
@@ -18843,7 +19016,7 @@
 +            }
 +        }
 +    }
-+}
+ }
 --- a/src/tree_store/page_store/file_backend/fallback.rs
 +++ b/src/tree_store/page_store/file_backend/fallback.rs
 @@ -1,13 +1,15 @@
@@ -19078,8 +19251,6 @@
  use crate::tree_store::page_store::fast_hash::FastHashMapU64;
 -use std::collections::VecDeque;
 -use std::sync::atomic::{AtomicBool, Ordering};
--
--#[derive(Default)]
 +use crate::tree_store::page_store::fast_hash::FastHasher64;
 +use std::hash::Hasher;
 +use std::ops::Deref;
@@ -19087,7 +19258,8 @@
 +use std::sync::atomic::AtomicUsize;
 +use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 +use std::sync::{Mutex, RwLock, RwLockReadGuard};
-+
+ 
+-#[derive(Default)]
 +const NONE: u32 = u32::MAX;
 +
 +struct Entry<T> {
@@ -19677,10 +19849,17 @@
          }
      }
  
-@@ -21,83 +597,623 @@
+@@ -21,83 +597,593 @@
          self.cache.len()
      }
  
+-    pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
+-        let result = self
+-            .cache
+-            .insert(key, (value, AtomicBool::new(false)))
+-            .map(|(x, _)| x);
+-        if result.is_none() {
+-            self.lru_queue.push_back(key);
 +    fn insert_at(&mut self, key: u64, value: T, lowest: bool) -> Option<T> {
 +        if let Some(entry) = self.cache.get_mut(&key) {
 +            entry.second_chance.store(false, Ordering::Release);
@@ -19704,7 +19883,8 @@
 +            self.cache.get_mut(&previous).unwrap().next = Some(key);
 +        } else {
 +            self.first = Some(key);
-+        }
+         }
+-        result
 +        if let Some(next) = next {
 +            self.cache.get_mut(&next).unwrap().previous = Some(key);
 +        } else {
@@ -19713,25 +19893,8 @@
 +        None
 +    }
 +
-     pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
--        let result = self
--            .cache
--            .insert(key, (value, AtomicBool::new(false)))
--            .map(|(x, _)| x);
--        if result.is_none() {
--            self.lru_queue.push_back(key);
--        }
--        result
++    pub(crate) fn insert(&mut self, key: u64, value: T) -> Option<T> {
 +        self.insert_at(key, value, false)
-+    }
-+
-+    /// A one-pass page has lowest priority until another access grants a second chance.
-+    #[expect(
-+        dead_code,
-+        reason = "the write buffer retains the original cache implementation"
-+    )]
-+    pub(crate) fn insert_lowest_priority(&mut self, key: u64, value: T) -> Option<T> {
-+        self.insert_at(key, value, true)
      }
  
      pub(crate) fn remove(&mut self, key: u64) -> Option<T> {
@@ -19744,6 +19907,10 @@
 -                    {
 -                        second_chance.store(false, Ordering::Release);
 -                        self.lru_queue.push_back(removed_key);
+-                    }
+-                }
+-            }
+-            Some(value)
 +        let entry = self.cache.remove(&key)?;
 +        if let Some(previous) = entry.previous {
 +            self.cache.get_mut(&previous).unwrap().next = entry.next;
@@ -19752,7 +19919,8 @@
 +        }
 +        if let Some(next) = entry.next {
 +            self.cache.get_mut(&next).unwrap().previous = entry.previous;
-+        } else {
+         } else {
+-            None
 +            self.last = entry.previous;
 +        }
 +        // Geometric reclamation keeps metadata proportional to live cache entries
@@ -19761,33 +19929,58 @@
 +            self.cache = Default::default();
 +        } else if self.cache.capacity() > self.cache.len().saturating_mul(4) {
 +            self.cache.shrink_to_fit();
-+        }
+         }
 +        Some(entry.value)
-+    }
-+
-+    pub(crate) fn get(&self, key: u64) -> Option<&T> {
+     }
+ 
+     pub(crate) fn get(&self, key: u64) -> Option<&T> {
+-        if let Some((value, second_chance)) = self.cache.get(&key) {
+-            second_chance.store(true, Ordering::Release);
+-            Some(value)
+-        } else {
+-            None
+-        }
 +        let entry = self.cache.get(&key)?;
 +        entry.second_chance.store(true, Ordering::Release);
 +        Some(&entry.value)
-+    }
-+
-+    pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
+     }
+ 
+     pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
+-        if let Some((value, second_chance)) = self.cache.get_mut(&key) {
+-            second_chance.store(true, Ordering::Release);
+-            Some(value)
+-        } else {
+-            None
+-        }
 +        let entry = self.cache.get_mut(&key)?;
 +        entry.second_chance.store(true, Ordering::Release);
 +        Some(&mut entry.value)
-+    }
-+
-+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
+     }
+ 
+     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
+-        self.cache.iter().map(|(k, (v, _))| (k, v))
 +        self.cache.iter().map(|(key, entry)| (key, &entry.value))
-+    }
-+
-+    pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
+     }
+ 
+     pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
+-        self.cache.iter_mut().map(|(k, (v, _))| (k, v))
 +        self.cache
 +            .iter_mut()
 +            .map(|(key, entry)| (key, &mut entry.value))
-+    }
-+
-+    pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
+     }
+ 
+     pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
+-        while let Some(key) = self.lru_queue.pop_front() {
+-            if let Some((_, second_chance)) = self.cache.get(&key) {
+-                if second_chance
+-                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+-                    .is_ok()
+-                {
+-                    self.lru_queue.push_back(key);
+-                } else {
+-                    let (value, _) = self.cache.remove(&key).unwrap();
+-                    return Some((key, value));
+-                }
 +        self.pop_lowest_priority_where(|_| true)
 +    }
 +
@@ -19813,12 +20006,16 @@
 +                entry.next = None;
 +                self.first = Some(next);
 +                self.last = Some(key);
-+            }
-+        }
-+        None
-+    }
-+
-+    pub(crate) fn clear(&mut self) {
+             }
+         }
+         None
+     }
+ 
+     pub(crate) fn clear(&mut self) {
+-        self.cache.shrink_to_fit();
+-        self.cache.clear();
+-        self.lru_queue.shrink_to_fit();
+-        self.lru_queue.clear();
 +        *self = Self::new();
 +    }
 +}
@@ -20009,49 +20206,8 @@
 +                for stripe in &mut stripes {
 +                    while let Some((key, value)) = stripe.pop_lowest_priority() {
 +                        assert_eq!(key, value);
-                     }
-                 }
--            }
--            Some(value)
--        } else {
--            None
--        }
--    }
--
--    pub(crate) fn get(&self, key: u64) -> Option<&T> {
--        if let Some((value, second_chance)) = self.cache.get(&key) {
--            second_chance.store(true, Ordering::Release);
--            Some(value)
--        } else {
--            None
--        }
--    }
--
--    pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
--        if let Some((value, second_chance)) = self.cache.get_mut(&key) {
--            second_chance.store(true, Ordering::Release);
--            Some(value)
--        } else {
--            None
--        }
--    }
--
--    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
--        self.cache.iter().map(|(k, (v, _))| (k, v))
--    }
--
--    pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
--        self.cache.iter_mut().map(|(k, (v, _))| (k, v))
--    }
--
--    pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
--        while let Some(key) = self.lru_queue.pop_front() {
--            if let Some((_, second_chance)) = self.cache.get(&key) {
--                if second_chance
--                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
--                    .is_ok()
--                {
--                    self.lru_queue.push_back(key);
++                    }
++                }
 +                assert!(stripes.iter().all(|s| s.len() == 0));
 +                assert_eq!(
 +                    arena.index_bytes() + stripes.iter().map(|s| s.index_bytes()).sum::<usize>(),
@@ -20128,7 +20284,6 @@
 +
 +    // Independent published pre-arena implementation, SHA f062c990.
 +    // Kept verbatim; the comparison tests exercise only part of its surface.
-+    #[allow(dead_code)]
 +    mod old_reference {
 +        use crate::tree_store::page_store::fast_hash::FastHasher64;
 +        type FastHashMapU64<T> =
@@ -20174,9 +20329,7 @@
 +                }
 +                let (previous, next) = if lowest {
 +                    (None, self.first)
-                 } else {
--                    let (value, _) = self.cache.remove(&key).unwrap();
--                    return Some((key, value));
++                } else {
 +                    (self.last, None)
 +                };
 +                self.cache.insert(
@@ -20192,19 +20345,7 @@
 +                    self.cache.get_mut(&previous).unwrap().next = Some(key);
 +                } else {
 +                    self.first = Some(key);
-                 }
--            }
--        }
--        None
--    }
--
--    pub(crate) fn clear(&mut self) {
--        self.cache.shrink_to_fit();
--        self.cache.clear();
--        self.lru_queue.shrink_to_fit();
--        self.lru_queue.clear();
--    }
--}
++                }
 +                if let Some(next) = next {
 +                    self.cache.get_mut(&next).unwrap().previous = Some(key);
 +                } else {
@@ -20250,22 +20391,6 @@
 +                Some(&entry.value)
 +            }
 +
-+            pub(crate) fn get_mut(&mut self, key: u64) -> Option<&mut T> {
-+                let entry = self.cache.get_mut(&key)?;
-+                entry.second_chance.store(true, Ordering::Release);
-+                Some(&mut entry.value)
-+            }
-+
-+            pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &T)> {
-+                self.cache.iter().map(|(key, entry)| (key, &entry.value))
-+            }
-+
-+            pub(crate) fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = (&u64, &mut T)> {
-+                self.cache
-+                    .iter_mut()
-+                    .map(|(key, entry)| (key, &mut entry.value))
-+            }
-+
 +            pub(crate) fn pop_lowest_priority(&mut self) -> Option<(u64, T)> {
 +                self.pop_lowest_priority_where(|_| true)
 +            }
@@ -20296,10 +20421,6 @@
 +                    }
 +                }
 +                None
-+            }
-+
-+            pub(crate) fn clear(&mut self) {
-+                *self = Self::new();
 +            }
 +        }
 +    }
@@ -20371,8 +20492,8 @@
 +        assert!(cache.peek(3).is_none());
 +        assert_eq!(cache.pop_lowest_priority(), Some((1, 10)));
 +        assert_eq!(cache.pop_lowest_priority(), Some((2, 20)));
-+    }
-+}
+     }
+ }
 --- a/src/tree_store/page_store/mod.rs
 +++ b/src/tree_store/page_store/mod.rs
 @@ -1,3 +1,4 @@
@@ -25727,3 +25848,21 @@
 +    }
 +    Ok(Some(root))
 +}
+--- a/src/tuple_types.rs
++++ b/src/tuple_types.rs
+@@ -151,7 +151,6 @@
+             $(
+                 let len = <$t>::fixed_width().unwrap();
+                 let $v = <$t>::from_bytes(&$data[offset..(offset + len)]);
+-                #[allow(unused_assignments)]
+                 {
+                     offset += len;
+                 }
+@@ -207,7 +206,6 @@
+                 ) {
+                     return order;
+                 }
+-                #[allow(unused_assignments)]
+                 {
+                     offset0 += len;
+                     offset1 += len;

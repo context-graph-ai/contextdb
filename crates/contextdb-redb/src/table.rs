@@ -93,11 +93,6 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
-        self.tree.print_debug(include_values)
-    }
-
     /// Returns an accessor, which allows mutation, to the value corresponding to the given key
     pub fn get_mut<'k>(
         &mut self,

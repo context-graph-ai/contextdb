@@ -601,21 +601,6 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
         Ok(self.root)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn all_pages_iter(&self) -> Result<Option<AllPageNumbersBtreeIter>> {
-        if let Some(root) = self.root.map(|x| x.root) {
-            Ok(Some(AllPageNumbersBtreeIter::new(
-                root,
-                K::fixed_width(),
-                V::fixed_width(),
-                self.mem.clone(),
-                PageHint::None,
-            )?))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result
     where
         F: FnMut(&PagePath) -> Result,
@@ -710,11 +695,6 @@ impl<K: Key + 'static, V: Value + 'static> BtreeMut<'_, K, V> {
         );
         let result = operation.delete(key)?;
         Ok(result)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
-        self.read_tree()?.print_debug(include_values)
     }
 
     pub(crate) fn stats(&self) -> Result<BtreeStats> {
@@ -1361,42 +1341,6 @@ impl<K: Key, V: Value> Btree<K, V> {
             V::fixed_width(),
             self.hint,
         )
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn print_debug(&self, include_values: bool) -> Result {
-        if let Some(p) = self.root.map(|x| x.root) {
-            let mut pages = vec![self.mem.get_page(p, self.hint)?];
-            while !pages.is_empty() {
-                let mut next_children = vec![];
-                for page in pages.drain(..) {
-                    let node_mem = page.memory();
-                    match node_mem[0] {
-                        LEAF => {
-                            eprint!("Leaf[ (page={:?})", page.get_page_number());
-                            LeafAccessor::new(page.memory(), K::fixed_width(), V::fixed_width())
-                                .print_node::<K, V>(include_values);
-                            eprint!("]");
-                        }
-                        BRANCH => {
-                            let accessor = BranchAccessor::new(&page, K::fixed_width());
-                            for i in 0..accessor.count_children() {
-                                let child = accessor.child_page(i).unwrap();
-                                next_children.push(self.mem.get_page(child, self.hint)?);
-                            }
-                            accessor.print_node::<K>();
-                        }
-                        _ => unreachable!(),
-                    }
-                    eprint!("  ");
-                }
-                eprintln!();
-
-                pages = next_children;
-            }
-        }
-
-        Ok(())
     }
 }
 
