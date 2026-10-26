@@ -1,6 +1,9 @@
 #[cfg(unix)]
 #[path = "reader_release/a_caught_signal_does_not_interrupt_a_default_writer_wait.rs"]
 mod a_caught_signal_does_not_interrupt_a_default_writer_wait;
+#[cfg(unix)]
+#[path = "reader_release/a_change_open_refuses_at_once_while_a_reader_holds_the_store.rs"]
+mod a_change_open_refuses_at_once_while_a_reader_holds_the_store;
 // A crashed store opens for a reader only where the boot it crashed on can be
 // identified (Linux); elsewhere the reader is told the store needs its writer.
 #[cfg(target_os = "linux")]
