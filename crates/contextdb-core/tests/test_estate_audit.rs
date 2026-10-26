@@ -1003,102 +1003,193 @@ fn test_estate_default_tier_test_count_matches_its_ratchet() {
     );
 }
 
-/// Every file a `crates/*/src` source declares as an out-of-line
-/// `#[cfg(test)]` module (`#[cfg(test)] mod name;`, with or without a
-/// `#[path]`), as (declaring file, module file) relative to the workspace root.
-/// Such a file is unit-test code from its first byte but carries no
-/// `#[cfg(test)]` marker of its own.
+/// Every unit-test module a `crates/*/src` source declares out of line, as
+/// (declaring file, module file) relative to the workspace root. A module is
+/// one when its declaration is gated on `test` (`#[cfg(test)]`, or `test` as
+/// a condition of `#[cfg(all(...))]`), or when it is declared out of line from
+/// inside such a module's file and so inherits its test-only status. Such a
+/// file is unit-test code from its first byte but carries no `#[cfg(test)]`
+/// marker of its own.
 fn out_of_line_test_modules(root: &Path) -> Vec<(String, String)> {
-    let mut modules = Vec::new();
+    let mut found: BTreeMap<PathBuf, (String, bool)> = BTreeMap::new();
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
     for entry in WalkDir::new(root.join("crates"))
         .into_iter()
         .filter_entry(|entry| entry.file_name() != "target" && entry.file_name() != ".git")
         .filter_map(Result::ok)
     {
         let path = entry.path();
-        let rel = path
-            .strip_prefix(root)
-            .expect("inside the workspace")
-            .to_string_lossy()
-            .replace('\\', "/");
-        if !is_src_file(&rel) {
+        if !is_src_file(&relative(path)) {
             continue;
         }
         let Ok(source) = std::fs::read_to_string(path) else {
             continue;
         };
-        let lines: Vec<&str> = source.lines().collect();
-        for (index, line) in lines.iter().enumerate() {
-            let Some(name) = out_of_line_module_name(line) else {
-                continue;
-            };
-            let attributes: Vec<&str> = lines[..index]
+        for (name, attributes) in out_of_line_module_declarations(&source) {
+            if attributes
                 .iter()
-                .rev()
-                .map(|line| line.trim())
-                .take_while(|line| line.starts_with("#[") || line.starts_with("//"))
-                .collect();
-            if !attributes
-                .iter()
-                .any(|attribute| attribute.replace(' ', "") == "#[cfg(test)]")
+                .any(|attribute| cfg_requires_test(attribute))
             {
-                continue;
+                let (module, by_path) = module_file(path, false, &name, &attributes);
+                found.entry(module).or_insert((relative(path), by_path));
             }
-            let directory = path.parent().expect("a source file's directory");
-            let declared = attributes.iter().find_map(|attribute| {
-                attribute
-                    .strip_prefix("#[path")
-                    .and_then(|rest| rest.split('"').nth(1))
-            });
-            let module = match declared {
-                Some(declared) => directory.join(declared),
-                None => {
-                    let stem = path.file_stem().expect("a file stem").to_string_lossy();
-                    let base = if matches!(stem.as_ref(), "mod" | "lib" | "main") {
-                        directory.to_path_buf()
-                    } else {
-                        directory.join(stem.as_ref())
-                    };
-                    let flat = base.join(format!("{name}.rs"));
-                    if flat.exists() {
-                        flat
-                    } else {
-                        base.join(name).join("mod.rs")
-                    }
-                }
-            };
-            let mut normal = PathBuf::new();
-            for part in module.components() {
-                match part {
-                    std::path::Component::ParentDir => {
-                        normal.pop();
-                    }
-                    std::path::Component::CurDir => {}
-                    other => normal.push(other.as_os_str()),
-                }
-            }
-            let module = normal
-                .strip_prefix(root)
-                .unwrap_or(&normal)
-                .to_string_lossy()
-                .replace('\\', "/");
-            modules.push((rel.clone(), module));
         }
     }
-    modules.sort();
-    modules
+    let mut pending: Vec<(PathBuf, bool)> = found
+        .iter()
+        .map(|(module, (_, by_path))| (module.clone(), *by_path))
+        .collect();
+    while let Some((parent, parent_by_path)) = pending.pop() {
+        let Ok(source) = std::fs::read_to_string(&parent) else {
+            continue;
+        };
+        for (name, attributes) in out_of_line_module_declarations(&source) {
+            let (module, by_path) = module_file(&parent, parent_by_path, &name, &attributes);
+            if !found.contains_key(&module) {
+                found.insert(module.clone(), (relative(&parent), by_path));
+                pending.push((module, by_path));
+            }
+        }
+    }
+    found
+        .into_iter()
+        .map(|(module, (declared_in, _))| (declared_in, relative(&module)))
+        .collect()
+}
+
+/// Every `mod name;` declaration in `source`, with the attributes written
+/// directly above it. An attribute spanning several lines is read whole.
+fn out_of_line_module_declarations(source: &str) -> Vec<(String, Vec<String>)> {
+    let closed = |attribute: &str| attribute.matches('[').count() == attribute.matches(']').count();
+    let mut declarations = Vec::new();
+    let mut attributes = Vec::new();
+    let mut open: Option<String> = None;
+    for line in source.lines() {
+        let line = line.trim();
+        if let Some(mut attribute) = open.take() {
+            attribute.push_str(line);
+            if closed(&attribute) {
+                attributes.push(attribute);
+            } else {
+                open = Some(attribute);
+            }
+        } else if line.starts_with("#[") {
+            if closed(line) {
+                attributes.push(line.to_owned());
+            } else {
+                open = Some(line.to_owned());
+            }
+        } else if !line.starts_with("//") {
+            if let Some(name) = out_of_line_module_name(line) {
+                declarations.push((name.to_owned(), std::mem::take(&mut attributes)));
+            }
+            attributes.clear();
+        }
+    }
+    declarations
 }
 
 /// The module name of a `mod name;` line, when the line declares one out of line.
 fn out_of_line_module_name(line: &str) -> Option<&str> {
-    let declaration = line.trim();
-    let declaration = declaration
+    let declaration = line
         .strip_prefix("pub(crate) ")
-        .or_else(|| declaration.strip_prefix("pub(super) "))
-        .or_else(|| declaration.strip_prefix("pub "))
-        .unwrap_or(declaration);
+        .or_else(|| line.strip_prefix("pub(super) "))
+        .or_else(|| line.strip_prefix("pub "))
+        .unwrap_or(line);
     let name = declaration.strip_prefix("mod ")?.strip_suffix(';')?.trim();
     (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
+}
+
+/// Whether a `#[cfg(...)]` attribute compiles its item only under `test`:
+/// `cfg(test)` itself, or `cfg(all(...))` with `test` as one of its conditions.
+fn cfg_requires_test(attribute: &str) -> bool {
+    let compact: String = attribute.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(predicate) = compact
+        .strip_prefix("#[cfg(")
+        .and_then(|rest| rest.strip_suffix(")]"))
+    else {
+        return false;
+    };
+    if predicate == "test" {
+        return true;
+    }
+    let Some(conditions) = predicate
+        .strip_prefix("all(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (index, c) in conditions.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                if &conditions[start..index] == "test" {
+                    return true;
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    &conditions[start..] == "test"
+}
+
+/// The file Rust loads for `mod name;` declared in `declaring`, and whether
+/// it was loaded through `#[path]`. A `#[path]` is relative to the declaring
+/// file's directory; otherwise a `mod.rs`, `lib.rs` or `main.rs` file, or one
+/// itself loaded through `#[path]`, keeps its children beside it, and any
+/// other file keeps them in a directory named after it.
+fn module_file(
+    declaring: &Path,
+    declaring_by_path: bool,
+    name: &str,
+    attributes: &[String],
+) -> (PathBuf, bool) {
+    let directory = declaring.parent().expect("a source file's directory");
+    let declared = attributes.iter().find_map(|attribute| {
+        attribute
+            .strip_prefix("#[path")
+            .and_then(|rest| rest.split('"').nth(1))
+    });
+    let (module, by_path) = match declared {
+        Some(declared) => (directory.join(declared), true),
+        None => {
+            let stem = declaring
+                .file_stem()
+                .expect("a file stem")
+                .to_string_lossy();
+            let base = if declaring_by_path || matches!(stem.as_ref(), "mod" | "lib" | "main") {
+                directory.to_path_buf()
+            } else {
+                directory.join(stem.as_ref())
+            };
+            let flat = base.join(format!("{name}.rs"));
+            if flat.exists() {
+                (flat, false)
+            } else {
+                (base.join(name).join("mod.rs"), false)
+            }
+        }
+    };
+    let mut normal = PathBuf::new();
+    for part in module.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normal.push(other.as_os_str()),
+        }
+    }
+    (normal, by_path)
 }
 
 /// A unit-test module a source file declares out of line is test code, so the
