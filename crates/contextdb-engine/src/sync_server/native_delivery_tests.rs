@@ -51,9 +51,23 @@ fn open_with_limits(
     page_bytes: Option<u64>,
     active_ms: Option<u64>,
 ) -> Arc<Database> {
+    open_with_reader_limits(path, page_bytes, active_ms, None)
+}
+
+/// `open_with_limits`, with the reader's declared cursor page rows set when
+/// given.
+fn open_with_reader_limits(
+    path: &std::path::Path,
+    page_bytes: Option<u64>,
+    active_ms: Option<u64>,
+    page_rows: Option<u64>,
+) -> Arc<Database> {
     let mut options = crate::DatabaseOpenOptions::default();
     if let Some(active_ms) = active_ms {
         options.owner_reads.limits.limits.active_ms = active_ms;
+    }
+    if let Some(page_rows) = page_rows {
+        options.owner_reads.limits.limits.cursor_page_rows = page_rows;
     }
     // The Legacy seeding fixture and the Legacy fetch of 10,010 outcomes hold
     // whole custody history on the reader; the native request does not.
@@ -104,12 +118,23 @@ impl World {
     }
 
     fn with_hub(memory_hub: bool, page_bytes: Option<u64>) -> Self {
+        Self::with_hub_limits(memory_hub, page_bytes, CursorLimits::SHIPPED)
+    }
+
+    /// A file-backed hub whose reader declares `cursor` in place of the
+    /// shipped active time and cursor page rows.
+    fn with_cursor_limits(cursor: CursorLimits) -> Self {
+        Self::with_hub_limits(false, None, cursor)
+    }
+
+    fn with_hub_limits(memory_hub: bool, page_bytes: Option<u64>, cursor: CursorLimits) -> Self {
         let dir = tempfile::tempdir().expect("store directory");
-        let hub_db = if memory_hub {
-            open_with_page_bytes(std::path::Path::new(":memory:"), page_bytes)
+        let path = if memory_hub {
+            std::path::PathBuf::from(":memory:")
         } else {
-            open_with_page_bytes(&dir.path().join("hub.db"), page_bytes)
+            dir.path().join("hub.db")
         };
+        let hub_db = open_with_reader_limits(&path, page_bytes, cursor.active_ms, cursor.page_rows);
         hub_db
             .__seed_tenant_table_policies_for_test(TenantId::from(TENANT), expectation())
             .expect("declare the tenant policy");
@@ -914,6 +939,8 @@ fn native_pages(world: &World, since: Option<Vec<u8>>) -> Vec<Page> {
     loop {
         let parent =
             DeclaredReadMemory::from_reader_limit(LIMIT).expect("admit the declared fixture root");
+        // The root's own control stays with it; a page returns to exactly this.
+        let standing = parent.retained_bytes_for_test();
         let route = installation(&world.server(&parent));
         crate::database::native_custody_selection::NATIVE_ORDERS_EXAMINED
             .with(|seen| seen.set((0, 0)));
@@ -925,12 +952,15 @@ fn native_pages(world: &World, since: Option<Vec<u8>>) -> Vec<Page> {
         drop(route);
         let (outcomes, more) = decode_page(&reply.expect("page reply"));
         let last = outcomes.last().map(|outcome| cursor_after(world, outcome));
+        let peak = parent.file_child_high_water();
         pages.push(Page {
             examined,
             outcomes: outcomes.len(),
             more,
-            peak: parent.file_child_high_water(),
-            released: parent.retained_bytes_for_test() == 0,
+            peak,
+            // The serving side drops the page's last allocation just after its
+            // reply is published; read the count once that release event fires.
+            released: settled(&parent, standing) == standing,
             last: last.clone(),
         });
         if !more {
@@ -1001,9 +1031,33 @@ fn position_class(position: u64) -> u8 {
     }
 }
 
-async fn cursor_scaling(prior: usize, padded: u64) -> Scaling {
+/// The hub reader's declared cursor limits; `None` keeps the shipped value.
+#[derive(Clone, Copy)]
+struct CursorLimits {
+    active_ms: Option<u64>,
+    page_rows: Option<u64>,
+}
+
+impl CursorLimits {
+    const SHIPPED: Self = Self {
+        active_ms: None,
+        page_rows: None,
+    };
+
+    fn page_rows(self) -> usize {
+        self.page_rows.unwrap_or(
+            crate::DatabaseOpenOptions::default()
+                .owner_reads
+                .limits
+                .limits
+                .cursor_page_rows,
+        ) as usize
+    }
+}
+
+async fn cursor_scaling(prior: usize, padded: u64, cursor: CursorLimits) -> Scaling {
     eprintln!("S4_SCALE prior={prior} world");
-    let world = World::new();
+    let world = World::with_cursor_limits(cursor);
     world.pad_positions(padded);
     eprintln!(
         "S4_SCALE prior={prior} padded hub_lsn={} edge_lsn={}",
@@ -1112,26 +1166,45 @@ fn describe(pages: &[Page]) -> String {
 // 10 or 10,010 precede it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cursor_request_examines_only_the_orders_after_it() {
-    cursor_request_examines_only_the_orders_after_it(PADDED_POSITION, 10_010).await;
+    cursor_request_examines_only_the_orders_after_it(
+        PADDED_POSITION,
+        10_010,
+        CursorLimits::SHIPPED,
+    )
+    .await;
 }
 
 // The same contract two full pages deep, from the first position of the
 // MessagePack u16 class: a selector that scans history examines every prior
 // order at any depth beyond one page, and two full pages give the
-// full-page peak comparison its two samples.
+// full-page peak comparison its two samples. The hub's reader declares a
+// ten-row cursor page, so two full pages need thirty outcomes of history,
+// and an active-time allowance that never binds, so a slow build cannot
+// refuse a page on elapsed time; every other shipped limit stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cursor_request_examines_only_the_orders_after_it_two_full_pages_deep() {
-    let page = crate::DatabaseOpenOptions::default()
-        .owner_reads
-        .limits
-        .limits
-        .cursor_page_rows as usize;
-    cursor_request_examines_only_the_orders_after_it(U16_PADDED_POSITION, 2 * page + 10).await;
+    let cursor = CursorLimits {
+        active_ms: Some(UNBINDING_ACTIVE_MS),
+        page_rows: Some(10),
+    };
+    cursor_request_examines_only_the_orders_after_it(
+        U16_PADDED_POSITION,
+        2 * cursor.page_rows() + 10,
+        cursor,
+    )
+    .await;
 }
 
-async fn cursor_request_examines_only_the_orders_after_it(padded: u64, deep: usize) {
-    let small = cursor_scaling(10, padded).await;
-    let large = cursor_scaling(deep, padded).await;
+/// An active-time allowance no fixture page approaches.
+const UNBINDING_ACTIVE_MS: u64 = 600_000;
+
+async fn cursor_request_examines_only_the_orders_after_it(
+    padded: u64,
+    deep: usize,
+    cursor: CursorLimits,
+) {
+    let small = cursor_scaling(10, padded, cursor).await;
+    let large = cursor_scaling(deep, padded, cursor).await;
     println!(
         "S4_STEP7 prior=10 examined(count,collect)={:?} outcomes={} request_len={} reply_len={} native_peak={} transient={} own_bytes={} legacy_peak={} | prior={deep} examined(count,collect)={:?} outcomes={} request_len={} reply_len={} native_peak={} transient={} own_bytes={} legacy_peak={} | legacy_growth={}",
         small.examined,
@@ -1174,11 +1247,7 @@ async fn cursor_request_examines_only_the_orders_after_it(padded: u64, deep: usi
         large.own_bytes as i128 - small.own_bytes as i128,
         "native peak moved with history beyond the request's own bytes"
     );
-    let page = crate::DatabaseOpenOptions::default()
-        .owner_reads
-        .limits
-        .limits
-        .cursor_page_rows as usize;
+    let page = cursor.page_rows();
     for (prior, pages) in [(10, &small.catch_up), (deep, &large.catch_up)] {
         assert_eq!(pages.iter().map(|p| p.outcomes).sum::<usize>(), prior);
         assert_eq!(pages.len(), prior.div_ceil(page));
@@ -1194,6 +1263,18 @@ async fn cursor_request_examines_only_the_orders_after_it(padded: u64, deep: usi
             "a page examines at most page + 1 orders"
         );
     }
+    let full_examined: Vec<(u64, u64)> = large
+        .catch_up
+        .iter()
+        .filter(|p| p.more)
+        .map(|p| p.examined)
+        .collect();
+    assert!(
+        full_examined
+            .iter()
+            .all(|examined| *examined == full_examined[0]),
+        "a full page's examination grew with its position in history: {full_examined:?}"
+    );
     let full: Vec<u64> = large
         .catch_up
         .iter()
